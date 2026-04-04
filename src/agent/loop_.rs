@@ -2888,7 +2888,6 @@ pub(crate) async fn run_tool_call_loop(
             return Ok(accumulated_display_text);
         }
 
-        // Native tool-call providers can return assistant text separately from
         // Accumulate text from this iteration (tool calls present, loop continues).
         accumulated_display_text.push_str(&display_text);
 

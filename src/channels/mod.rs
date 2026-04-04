@@ -110,7 +110,7 @@ pub use whatsapp_web::WhatsAppWebChannel;
 use crate::agent::history_pruner::remove_orphaned_tool_messages;
 use crate::agent::loop_::{
     build_tool_instructions, clear_model_switch_request, get_model_switch_state,
-    is_model_switch_requested, run_tool_call_loop, scrub_credentials,
+    is_model_switch_requested, run_tool_call_loop, scope_thread_id, scrub_credentials,
 };
 use crate::approval::ApprovalManager;
 use crate::config::Config;
@@ -3004,6 +3004,10 @@ async fn process_channel_message(
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
                 result = tokio::time::timeout(
                     Duration::from_secs(timeout_budget_secs),
+                    scope_thread_id(
+                        msg.interruption_scope_id.clone()
+                            .or_else(|| msg.thread_ts.clone())
+                            .or_else(|| Some(msg.id.clone())),
                     crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                         cost_tracking_context.clone(),
                     run_tool_call_loop(
@@ -3037,6 +3041,7 @@ async fn process_channel_message(
                         ctx.max_tool_result_chars,
                         ctx.context_token_budget,
                         None, // shared_budget
+                    ),
                     ),
                     ),
                 ) => LlmExecutionResult::Completed(result),
@@ -4411,7 +4416,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     dc.draft_update_interval_ms,
                     dc.multi_message_delay_ms,
                 )
-                .with_transcription(config.transcription.clone()),
+                .with_transcription(config.transcription.clone())
+                .with_stall_timeout(dc.stall_timeout_secs),
             ))
         }
         "slack" => {
@@ -5755,6 +5761,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
             let mut msgs = store.load(&key);
             if msgs.is_empty() {
                 continue;
+            }
+            // Trim to MAX_CHANNEL_HISTORY turns to bound startup memory.
+            if msgs.len() > MAX_CHANNEL_HISTORY {
+                msgs.drain(..msgs.len() - MAX_CHANNEL_HISTORY);
             }
             // Remove tool messages orphaned by truncation or prior crashes.
             remove_orphaned_tool_messages(&mut msgs);
