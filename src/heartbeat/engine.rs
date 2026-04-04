@@ -199,7 +199,7 @@ impl HeartbeatEngine {
             return Ok(());
         }
 
-        let interval_mins = self.config.interval_minutes.max(5);
+        let interval_mins = self.config.interval_minutes.max(1);
         info!("💓 Heartbeat started: every {} minutes", interval_mins);
 
         let mut interval = time::interval(Duration::from_secs(u64::from(interval_mins) * 60));

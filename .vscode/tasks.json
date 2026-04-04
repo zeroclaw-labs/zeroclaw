@@ -128,6 +128,64 @@
       "command": "./dev/ci.sh",
       "args": ["security"],
       "problemMatcher": []
+    },
+    // ── Dev (hot-reload) ─────────────────────────────────
+    {
+      "label": "Dev: Kill Stale Port",
+      "type": "shell",
+      "command": "python3",
+      "args": ["${workspaceFolder}/dev/kill-port.py"],
+      "presentation": { "reveal": "silent", "panel": "shared", "group": "dev" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Dev: Vite (web dashboard)",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "dev"],
+      "options": {
+        "cwd": "${workspaceFolder}/web",
+        "env": { "PATH": "/opt/homebrew/bin:${env:PATH}" }
+      },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "vite",
+        "pattern": { "regexp": "^$" },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "VITE",
+          "endsPattern": "ready in \\d+"
+        }
+      },
+      "presentation": { "reveal": "silent", "panel": "dedicated", "group": "dev" }
+    },
+    {
+      "label": "Dev: Gateway (cargo-watch)",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["watch", "-x", "run -- gateway", "-i", "web/"],
+      "options": {
+        "env": { "ZEROCLAW_REQUIRE_PAIRING": "false" }
+      },
+      "dependsOn": ["Dev: Kill Stale Port"],
+      "dependsOrder": "sequence",
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "cargo-watch",
+        "pattern": { "regexp": "^(error\\[.*\\]): (.*)$", "line": 1, "message": 2 },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "\\[Running",
+          "endsPattern": "Gateway listening|\\[Finished"
+        }
+      },
+      "presentation": { "reveal": "silent", "panel": "dedicated", "group": "dev" }
+    },
+    {
+      "label": "Dev: Full Stack (tasks)",
+      "dependsOn": ["Dev: Vite (web dashboard)", "Dev: Gateway (cargo-watch)"],
+      "dependsOrder": "parallel",
+      "problemMatcher": []
     }
   ]
 }
