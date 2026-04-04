@@ -140,6 +140,15 @@ impl ApprovalManager {
             return false;
         }
 
+        // Support prefix wildcards (e.g. "jp-stock-analyzer__*")
+        for pattern in &self.auto_approve {
+            if let Some(prefix) = pattern.strip_suffix("*") {
+                if tool_name.starts_with(prefix) {
+                    return false;
+                }
+            }
+        }
+
         // Session allowlist (from prior "Always" responses).
         let allowlist = self.session_allowlist.lock();
         if allowlist.contains(tool_name) {
@@ -607,5 +616,15 @@ mod tests {
             mgr.needs_approval("weather"),
             "always_ask must override auto_approve"
         );
+    }
+    #[test]
+    fn non_interactive_prefix_wildcard_works() {
+        let mut config = AutonomyConfig::default();
+        config.auto_approve = vec!["jp-stock-analyzer__*".into()];
+        let mgr = ApprovalManager::for_non_interactive(&config);
+        
+        assert!(!mgr.needs_approval("jp-stock-analyzer__get_stats"));
+        assert!(!mgr.needs_approval("jp-stock-analyzer__search"));
+        assert!(mgr.needs_approval("other_tool"));
     }
 }
