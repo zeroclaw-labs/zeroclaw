@@ -1,22 +1,20 @@
 use super::AppState;
-use crate::agent::loop_::{
-    run_tool_call_loop, scrub_credentials, trim_history, DraftEvent,
-};
+use crate::agent::loop_::{DraftEvent, run_tool_call_loop, scrub_credentials, trim_history};
 use crate::approval::ApprovalManager;
 use crate::providers::ChatMessage;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolResult};
 use axum::{
     extract::State,
-    http::{header, HeaderMap, StatusCode},
-    response::{sse::Event, sse::KeepAlive, sse::Sse, IntoResponse, Json},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Json, sse::Event, sse::KeepAlive, sse::Sse},
 };
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex, OnceLock};
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -347,7 +345,14 @@ pub async fn handle_agent_sse(
             (None, None)
         };
 
-        let (built_tools, _delegate_handle, _reaction_handle, _channel_map_handle, _ask_user_handle, _escalate_handle) = tools::all_tools_with_runtime(
+        let (
+            built_tools,
+            _delegate_handle,
+            _reaction_handle,
+            _channel_map_handle,
+            _ask_user_handle,
+            _escalate_handle,
+        ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,

@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::{RwLock, broadcast};
 
 /// Global WebChannel instance shared between gateway and channel system.
 /// Initialized once when web channel is enabled in config.
