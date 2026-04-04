@@ -1098,8 +1098,8 @@ async fn main() -> Result<()> {
                     log_gateway_start(&host, port);
                     Box::pin(gateway::run_gateway(&host, port, config, None)).await
                 }
-                Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
-                    let port = config.gateway.port;
+                Some(zeroclaw::GatewayCommands::GetPaircode { new, port }) => {
+                    let port = port.unwrap_or(config.gateway.port);
                     let host = &config.gateway.host;
 
                     // Fetch live pairing code from running gateway
