@@ -1221,8 +1221,7 @@ fn sse_bytes_to_events(
                             }
                             if let Some(reasoning) = &choice.delta.reasoning_content {
                                 if !reasoning.is_empty() {
-                                    let reasoning_chunk =
-                                        StreamChunk::reasoning(reasoning.clone());
+                                    let reasoning_chunk = StreamChunk::reasoning(reasoning.clone());
                                     if tx
                                         .send(Ok(StreamEvent::TextDelta(reasoning_chunk)))
                                         .await
