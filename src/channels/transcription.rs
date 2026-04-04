@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
 
@@ -287,7 +287,15 @@ impl DeepgramProvider {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(ToOwned::to_owned)
-            .context("Missing Deepgram API key: set [transcription.deepgram].api_key")?;
+            .or_else(|| {
+                std::env::var("DEEPGRAM_API_KEY")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            })
+            .context(
+                "Missing Deepgram API key: set [transcription.deepgram].api_key or DEEPGRAM_API_KEY environment variable",
+            )?;
 
         Ok(Self {
             api_key,
