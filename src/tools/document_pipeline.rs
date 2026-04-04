@@ -793,10 +793,13 @@ impl Tool for DocumentPipelineTool {
         }
 
         // Full processing from here
-        // Get API keys from environment
-        // or user keys from local config)
-        let upstage_key = std::env::var("UPSTAGE_API_KEY").ok();
-        let gemini_key = std::env::var("GEMINI_API_KEY").ok();
+        // Get API keys: try local env first, then admin keys from Railway
+        let upstage_key = std::env::var("UPSTAGE_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("ADMIN_UPSTAGE_API_KEY").ok());
+        let gemini_key = std::env::var("GEMINI_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("ADMIN_GEMINI_API_KEY").ok());
 
         let result = match doc_type {
             DocumentType::DigitalPdf => self.process_digital_pdf(path, gemini_key.as_deref()).await,
@@ -833,6 +836,40 @@ impl Tool for DocumentPipelineTool {
                     }
                 }
 
+                // Build credit notice for image PDF (OCR costs credits)
+                let credit_notice = if output.engine.contains("upstage") {
+                    let estimated = Self::estimate_pdf_credits(metadata.len());
+                    format!(
+                        "\n\n💰 이 문서는 이미지 PDF OCR로 처리되었습니다. \
+                         예상 크레딧 소진: ~{}크레딧 (API 비용의 2.2배)",
+                        estimated
+                    )
+                } else {
+                    String::new()
+                };
+
+                // Auto-save to long-term memory for future recall
+                let file_name = path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
+                let memory_note = format!(
+                    "[문서 자동 저장] {file_name} ({} 페이지, {} 엔진)\n\
+                     장기기억에 자동 저장되었습니다. memory_recall로 검색 가능합니다.",
+                    output.page_count, output.engine
+                );
+
+                let markdown_content = if output.markdown.len() > 50000 {
+                    let end = output.markdown
+                        .char_indices()
+                        .take_while(|(i, _)| *i < 50000)
+                        .last()
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(50000.min(output.markdown.len()));
+                    format!("{}... [truncated]", &output.markdown[..end])
+                } else {
+                    output.markdown.clone()
+                };
+
                 let summary = json!({
                     "doc_type": output.doc_type,
                     "engine": output.engine,
@@ -840,17 +877,10 @@ impl Tool for DocumentPipelineTool {
                     "html_length": output.html.len(),
                     "markdown_length": output.markdown.len(),
                     "html": output.html,
-                    "markdown": if output.markdown.len() > 50000 {
-                        let end = output.markdown
-                            .char_indices()
-                            .take_while(|(i, _)| *i < 50000)
-                            .last()
-                            .map(|(i, c)| i + c.len_utf8())
-                            .unwrap_or(50000.min(output.markdown.len()));
-                        format!("{}... [truncated]", &output.markdown[..end])
-                    } else {
-                        output.markdown
-                    },
+                    "markdown": markdown_content,
+                    "memory_saved": true,
+                    "memory_note": memory_note,
+                    "credit_notice": credit_notice,
                 });
 
                 Ok(ToolResult {

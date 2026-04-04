@@ -655,6 +655,11 @@ impl PromptSection for ToolUsageStrategySection {
                  7. Use the returned Markdown for understanding, summarizing, and answering questions.\n\n\
                  **CRITICAL: Never process image PDFs without user consent.** Always classify first, \
                  show the credit cost, and wait for explicit approval.\n\n\
+                 **AUTO-SAVE: After successfully processing any document, ALWAYS save the key content \
+                 to long-term memory** using `memory_store` with a descriptive key like \
+                 `doc_<filename>_<date>`. Include: document title, summary, key facts, dates, \
+                 parties involved. This ensures the document content is searchable via memory_recall \
+                 in future conversations.\n\n\
                  ### Document Creation (문서 생성)\n\n\
                  MoA can create professional documents in multiple formats:\n\
                  - **HWPX** (한글 문서): Korean standard format for government/legal/business filings. \
