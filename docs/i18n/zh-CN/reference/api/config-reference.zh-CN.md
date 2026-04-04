@@ -376,7 +376,7 @@ methods = ["list", "get", "create", "update"]
 | `max_cost_per_day_cents` | `500` | 每个策略的支出防护 |
 | `require_approval_for_medium_risk` | `true` | 中等风险命令的审批门控 |
 | `block_high_risk_commands` | `true` | 高风险命令的硬阻止 |
-| `auto_approve` | `[]` | 始终自动批准的工具操作 |
+| `auto_approve` | `[]` | 始终自动批准的工具操作（支持后缀通配符 `*`，例如 `server__*`） |
 | `always_ask` | `[]` | 始终需要批准的工具操作 |
 
 注意事项：

@@ -312,7 +312,7 @@ methods = ["list", "get", "create", "update"]
 | `max_cost_per_day_cents` | `1000` | Giới hạn chi tiêu mỗi ngày (cent) |
 | `require_approval_for_medium_risk` | `true` | Yêu cầu phê duyệt cho lệnh rủi ro trung bình |
 | `block_high_risk_commands` | `true` | Chặn cứng lệnh rủi ro cao |
-| `auto_approve` | `[]` | Thao tác tool luôn được tự động phê duyệt |
+| `auto_approve` | `[]` | Thao tác tool luôn được tự động phê duyệt (hỗ trợ hậu tố đại diện `*`, ví dụ `server__*`) |
 | `always_ask` | `[]` | Thao tác tool luôn yêu cầu phê duyệt |
 
 Lưu ý:
