@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
@@ -15,8 +15,9 @@ use tokio::sync::{RwLock, broadcast};
 static WEB_CHANNEL_INSTANCE: OnceLock<Arc<WebChannel>> = OnceLock::new();
 
 /// Channel message sender, set by `start_channels` when the web channel is active.
-static WEB_CHANNEL_TX: OnceLock<tokio::sync::mpsc::Sender<super::traits::ChannelMessage>> =
-    OnceLock::new();
+static WEB_CHANNEL_TX: OnceLock<
+    tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
+> = OnceLock::new();
 
 /// Get or create the global WebChannel instance.
 pub fn get_or_init_web_channel() -> Arc<WebChannel> {
@@ -29,12 +30,13 @@ pub fn get_web_channel() -> Option<Arc<WebChannel>> {
 }
 
 /// Set the channel message sender (called from start_channels).
-pub fn set_web_channel_tx(tx: tokio::sync::mpsc::Sender<super::traits::ChannelMessage>) {
+pub fn set_web_channel_tx(tx: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>) {
     let _ = WEB_CHANNEL_TX.set(tx);
 }
 
 /// Get the channel message sender.
-pub fn get_web_channel_tx() -> Option<tokio::sync::mpsc::Sender<super::traits::ChannelMessage>> {
+pub fn get_web_channel_tx()
+-> Option<tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>> {
     WEB_CHANNEL_TX.get().cloned()
 }
 

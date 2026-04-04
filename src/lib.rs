@@ -80,6 +80,8 @@ pub(crate) mod tunnel;
 pub(crate) mod util;
 pub mod verifiable_intent;
 
+#[cfg(feature = "one2x")]
+pub(crate) mod one2x;
 #[cfg(feature = "plugins-wasm")]
 pub mod plugins;
 

@@ -6160,7 +6160,8 @@ pub struct ChannelsConfig {
     pub bluesky: Option<BlueskyConfig>,
     /// Voice call channel configuration (Twilio/Telnyx/Plivo).
     pub voice_call: Option<crate::channels::voice_call::VoiceCallConfig>,
-    pub web: Option<WebChannelConfig>,
+    #[cfg(feature = "one2x")]
+    pub web: Option<crate::one2x::config::WebChannelConfig>,
     /// Voice wake word detection channel configuration.
     #[cfg(feature = "voice-wake")]
     pub voice_wake: Option<VoiceWakeConfig>,
@@ -6298,6 +6299,7 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.bluesky.as_ref())),
                 self.bluesky.is_some(),
             ),
+            #[cfg(feature = "one2x")]
             (
                 Box::new(ConfigWrapper::new(self.web.as_ref())),
                 self.web.is_some(),
@@ -6366,6 +6368,7 @@ impl Default for ChannelsConfig {
             reddit: None,
             bluesky: None,
             voice_call: None,
+            #[cfg(feature = "one2x")]
             web: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
@@ -7895,22 +7898,6 @@ impl ChannelConfig for BlueskyConfig {
     }
     fn desc() -> &'static str {
         "AT Protocol"
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct WebChannelConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-impl ChannelConfig for WebChannelConfig {
-    fn name() -> &'static str {
-        "Web"
-    }
-
-    fn desc() -> &'static str {
-        "WebSocket real-time channel"
     }
 }
 
@@ -11562,6 +11549,7 @@ auto_save = true
                 discord_history: None,
                 slack: None,
                 mattermost: None,
+                #[cfg(feature = "one2x")]
                 web: None,
                 webhook: None,
                 imessage: None,
@@ -12588,6 +12576,7 @@ allowed_users = ["@ops:matrix.org"]
             discord_history: None,
             slack: None,
             mattermost: None,
+            #[cfg(feature = "one2x")]
             web: None,
             webhook: None,
             imessage: Some(IMessageConfig {
@@ -12961,6 +12950,7 @@ channel_ids = ["C123", "D456"]
             discord_history: None,
             slack: None,
             mattermost: None,
+            #[cfg(feature = "one2x")]
             web: None,
             webhook: None,
             imessage: None,

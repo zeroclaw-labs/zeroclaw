@@ -98,6 +98,8 @@ mod migration;
 mod multimodal;
 mod observability;
 mod onboard;
+#[cfg(feature = "one2x")]
+mod one2x;
 mod peripherals;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;

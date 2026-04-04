@@ -274,6 +274,8 @@ voice-wake = ["dep:cpal"]
 plugins-wasm = ["dep:extism"]
 # WebAuthn / FIDO2 hardware key authentication
 webauthn = []
+# One2X custom extensions (web channel, agent SSE, memory prefix, heartbeat)
+one2x = []
 # Meta-feature for CI: all features except those requiring system C libraries
 # not available on standard CI runners (e.g., voice-wake needs libasound2-dev).
 ci-all = [

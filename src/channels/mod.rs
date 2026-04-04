@@ -57,7 +57,6 @@ pub mod voice_call;
 #[cfg(feature = "voice-wake")]
 pub mod voice_wake;
 pub mod wati;
-pub mod web;
 pub mod webhook;
 pub mod wecom;
 pub mod whatsapp;
@@ -4523,9 +4522,9 @@ fn classify_health_result(
     }
 }
 
-struct ConfiguredChannel {
-    display_name: &'static str,
-    channel: Arc<dyn Channel>,
+pub(crate) struct ConfiguredChannel {
+    pub(crate) display_name: &'static str,
+    pub(crate) channel: Arc<dyn Channel>,
 }
 
 fn collect_configured_channels(
@@ -5047,18 +5046,8 @@ fn collect_configured_channels(
         });
     }
 
-    if config
-        .channels_config
-        .web
-        .as_ref()
-        .is_some_and(|w| w.enabled)
-    {
-        let web_channel = web::get_or_init_web_channel();
-        channels.push(ConfiguredChannel {
-            display_name: "Web",
-            channel: web_channel,
-        });
-    }
+    #[cfg(feature = "one2x")]
+    crate::one2x::extend_channels(&mut channels, config);
 
     channels
 }
@@ -5474,7 +5463,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
             max_backoff_secs,
         ));
     }
-    web::set_web_channel_tx(tx.clone());
+    #[cfg(feature = "one2x")]
+    crate::one2x::web_channel::set_web_channel_tx(tx.clone());
     drop(tx); // Drop our copy so rx closes when all channels stop
 
     let channels_by_name = Arc::new(

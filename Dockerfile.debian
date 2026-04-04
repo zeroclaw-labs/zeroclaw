@@ -27,7 +27,7 @@ RUN npm run build
 FROM rust:1.94-bookworm AS builder
 
 WORKDIR /app
-ARG ZEROCLAW_CARGO_FEATURES="channel-matrix,channel-lark,whatsapp-web,memory-postgres"
+ARG ZEROCLAW_CARGO_FEATURES="one2x,channel-matrix,channel-lark,whatsapp-web,memory-postgres"
 
 # Install build dependencies
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \

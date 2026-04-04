@@ -1,6 +1,6 @@
-use super::AppState;
 use crate::agent::loop_::{DraftEvent, run_tool_call_loop, scrub_credentials, trim_history};
 use crate::approval::ApprovalManager;
+use crate::gateway::AppState;
 use crate::providers::ChatMessage;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolResult};

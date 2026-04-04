@@ -672,47 +672,29 @@ pub(crate) async fn deliver_announcement(
                 .send(&SendMessage::new(safe_output.as_str(), target))
                 .await?;
         }
-        "lark" => {
-            #[cfg(feature = "channel-lark")]
-            {
-                let lk = config
-                    .channels_config
-                    .lark
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
-                let channel = LarkChannel::from_lark_config(lk);
-                channel
-                    .send(&SendMessage::new(safe_output.as_str(), target))
-                    .await?;
-            }
-            #[cfg(not(feature = "channel-lark"))]
-            {
-                anyhow::bail!("lark delivery channel requires `channel-lark` feature");
-            }
-        }
-        "feishu" => {
-            #[cfg(feature = "channel-lark")]
-            {
-                let fs = config
-                    .channels_config
-                    .feishu
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("feishu channel not configured"))?;
-                let channel = LarkChannel::from_feishu_config(fs);
-                channel
-                    .send(&SendMessage::new(safe_output.as_str(), target))
-                    .await?;
-            }
-            #[cfg(not(feature = "channel-lark"))]
-            {
-                anyhow::bail!("feishu delivery channel requires `channel-lark` feature");
-            }
-        }
+        #[cfg(feature = "one2x")]
         "web" => {
-            if let Some(web_channel) = crate::channels::web::get_web_channel() {
+            if let Some(web_channel) = crate::one2x::web_channel::get_web_channel() {
                 web_channel.send(&SendMessage::new(safe_output.as_str(), target)).await?;
             } else {
                 anyhow::bail!("web channel not initialized");
+            }
+        }
+        "lark" | "feishu" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                let channel = if let Some(cfg) = &config.channels_config.lark {
+                    LarkChannel::from_lark_config(cfg)
+                } else if let Some(cfg) = &config.channels_config.feishu {
+                    LarkChannel::from_feishu_config(cfg)
+                } else {
+                    anyhow::bail!("lark/feishu channel not configured");
+                };
+                channel.send(&SendMessage::new(safe_output.as_str(), target)).await?;
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            {
+                anyhow::bail!("lark/feishu delivery requires `channel-lark` feature");
             }
         }
         "lark" | "feishu" => {
