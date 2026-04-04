@@ -3,6 +3,7 @@ use crate::providers::{is_glm_alias, is_zai_alias};
 use crate::security::{AutonomyLevel, DomainMatcher};
 use anyhow::{Context, Result};
 use directories::UserDirs;
+use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -8698,6 +8699,31 @@ fn expand_tilde_path(path: &str) -> PathBuf {
     PathBuf::from(expanded_str)
 }
 
+/// Expand `${env:VAR}` patterns in config file content with environment variable values.
+///
+/// This allows config values like `app_token = "${env:SLACK_APP_TOKEN}"` to be
+/// resolved from the process environment before TOML parsing. Unset variables
+/// produce a warning and are replaced with empty strings.
+fn expand_env_vars(contents: &str) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"\$\{env:(\w+)\}").unwrap());
+
+    let mut result = contents.to_string();
+    for caps in re.captures_iter(contents) {
+        let full_match = caps.get(0).unwrap().as_str();
+        let var_name = caps.get(1).unwrap().as_str();
+        let replacement = std::env::var(var_name).unwrap_or_else(|_| {
+            tracing::warn!(
+                "Environment variable '{var_name}' referenced in config.toml via {full_match} \
+                 is not set. Replace it with an actual value or set the variable."
+            );
+            String::new()
+        });
+        result = result.replace(full_match, &replacement);
+    }
+    result
+}
+
 async fn resolve_runtime_config_dirs(
     default_zeroclaw_dir: &Path,
     default_workspace_dir: &Path,
@@ -8972,6 +8998,11 @@ impl Config {
             let contents = fs::read_to_string(&config_path)
                 .await
                 .context("Failed to read config file")?;
+
+            // Expand `${env:VAR}` patterns so env-backed tokens can be used in config.toml.
+            // For example: `app_token = "${env:SLACK_APP_TOKEN}"` is resolved from the
+            // process environment before TOML parsing. See #5183.
+            let contents = expand_env_vars(&contents);
 
             // Deserialize the config with the standard TOML parser.
             //
