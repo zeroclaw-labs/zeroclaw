@@ -1550,7 +1550,7 @@ impl Channel for MatrixChannel {
                 // Return a synthetic ID so the draft_updater task runs.
                 // Capture thread context for paragraph delivery.
                 let room_id = Self::extract_room_id(&message.recipient, &self.room_id);
-                self.multi_message_sent_len.lock().await.clear();
+                self.multi_message_sent_len.lock().await.remove(&room_id);
                 self.multi_message_thread_ts
                     .lock()
                     .await
@@ -1619,7 +1619,14 @@ impl Channel for MatrixChannel {
                     return Ok(());
                 }
 
-                let new_text = &text[sent_so_far..];
+                let new_text = match text.get(sent_so_far..) {
+                    Some(slice) => slice,
+                    None => {
+                        // sent_so_far is not on a char boundary — reset safely.
+                        sent_map.insert(room_id.clone(), 0);
+                        return Ok(());
+                    }
+                };
                 // Scan for paragraph boundaries (\n\n outside code fences).
                 let mut scan_pos = 0;
                 let mut in_fence = false;
@@ -1718,18 +1725,20 @@ impl Channel for MatrixChannel {
                 let sent_so_far = sent_map.get(&room_id).copied().unwrap_or(0);
 
                 if text.len() > sent_so_far {
-                    let remaining = text[sent_so_far..].trim().to_string();
-                    if !remaining.is_empty() {
-                        let thread_ts = self
-                            .multi_message_thread_ts
-                            .lock()
-                            .await
-                            .get(&room_id)
-                            .cloned()
-                            .flatten();
-                        let msg = SendMessage::new(&remaining, recipient).in_thread(thread_ts);
-                        if let Err(e) = self.send(&msg).await {
-                            tracing::debug!("Multi-message final flush failed: {e}");
+                    if let Some(remaining_slice) = text.get(sent_so_far..) {
+                        let remaining = remaining_slice.trim().to_string();
+                        if !remaining.is_empty() {
+                            let thread_ts = self
+                                .multi_message_thread_ts
+                                .lock()
+                                .await
+                                .get(&room_id)
+                                .cloned()
+                                .flatten();
+                            let msg = SendMessage::new(&remaining, recipient).in_thread(thread_ts);
+                            if let Err(e) = self.send(&msg).await {
+                                tracing::debug!("Multi-message final flush failed: {e}");
+                            }
                         }
                     }
                 }

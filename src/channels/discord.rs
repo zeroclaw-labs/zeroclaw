@@ -1318,7 +1318,9 @@ impl Channel for DiscordChannel {
             StreamMode::MultiMessage => {
                 // No initial draft — paragraphs are sent as new messages.
                 // Store thread context for paragraph delivery.
-                self.multi_message_sent_len.lock().clear();
+                self.multi_message_sent_len
+                    .lock()
+                    .remove(&message.recipient);
                 self.multi_message_thread_ts
                     .lock()
                     .insert(message.recipient.clone(), message.thread_ts.clone());
@@ -1408,7 +1410,14 @@ impl Channel for DiscordChannel {
                         return Ok(());
                     }
 
-                    let new_text = &text[sent_so_far..];
+                    let new_text = match text.get(sent_so_far..) {
+                        Some(slice) => slice,
+                        None => {
+                            // sent_so_far is not on a char boundary — reset safely.
+                            sent_map.insert(recipient.to_string(), 0);
+                            return Ok(());
+                        }
+                    };
                     let mut scan_pos = 0;
                     let mut in_fence = false;
                     let bytes = new_text.as_bytes();
@@ -1485,11 +1494,13 @@ impl Channel for DiscordChannel {
                 .remove(recipient)
                 .unwrap_or(0);
             if text.len() > sent_so_far {
-                let remaining = text[sent_so_far..].trim().to_string();
-                if !remaining.is_empty() {
-                    let msg = SendMessage::new(&remaining, recipient).in_thread(thread_ts);
-                    if let Err(e) = self.send(&msg).await {
-                        tracing::debug!("Discord multi-message final flush failed: {e}");
+                if let Some(remaining_slice) = text.get(sent_so_far..) {
+                    let remaining = remaining_slice.trim().to_string();
+                    if !remaining.is_empty() {
+                        let msg = SendMessage::new(&remaining, recipient).in_thread(thread_ts);
+                        if let Err(e) = self.send(&msg).await {
+                            tracing::debug!("Discord multi-message final flush failed: {e}");
+                        }
                     }
                 }
             }
