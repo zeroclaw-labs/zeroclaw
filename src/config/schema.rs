@@ -10955,13 +10955,31 @@ async fn sync_directory(path: &Path) -> Result<()> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
-        let dir = std::fs::OpenOptions::new()
+        let dir = match std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)
-            .with_context(|| format!("Failed to open directory for fsync: {}", path.display()))?;
-        dir.sync_all()
-            .with_context(|| format!("Failed to fsync directory metadata: {}", path.display()))?;
+        {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to open directory for fsync (Windows): {}: {}",
+                    path.display(),
+                    e
+                );
+                return Ok(());
+            }
+        };
+        if let Err(e) = dir.sync_all() {
+            // On Windows, fsync directory metadata can fail with Access Denied even when
+            // the user has full permissions and the actual file writes succeeded.
+            // Log a warning but don't fail since the data is already persisted.
+            tracing::warn!(
+                "Failed to fsync directory metadata (Windows, non-fatal): {}: {}",
+                path.display(),
+                e
+            );
+        }
         Ok(())
     }
 
