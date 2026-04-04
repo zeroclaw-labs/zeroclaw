@@ -971,6 +971,7 @@ pub async fn run_gateway(
         .route("/api/health", get(api::handle_api_health))
         .route("/api/projects", get(api::handle_api_projects_list).post(api::handle_api_projects_create))
         .route("/api/projects/{id}", axum::routing::patch(api::handle_api_projects_patch).delete(api::handle_api_projects_delete))
+        .route("/api/dialog/folder", get(api::handle_api_dialog_folder))
         .route("/api/sessions", get(api::handle_api_sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
         .route(

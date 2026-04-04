@@ -1709,6 +1709,35 @@ pub async fn handle_api_projects_delete(
     }
 }
 
+/// GET /api/dialog/folder — open a native macOS folder-picker dialog and return the chosen path.
+/// Returns `{"path": "/abs/path"}` on success, `{"path": null}` if cancelled or unavailable.
+pub async fn handle_api_dialog_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let result = tokio::task::spawn_blocking(|| {
+        std::process::Command::new("osascript")
+            .args(["-e", "POSIX path of (choose folder)"])
+            .output()
+    })
+    .await;
+
+    let path: Option<String> = match result {
+        Ok(Ok(output)) if output.status.success() => {
+            let raw = String::from_utf8_lossy(&output.stdout);
+            let trimmed = raw.trim().to_string();
+            if trimmed.is_empty() { None } else { Some(trimmed) }
+        }
+        _ => None,
+    };
+
+    Json(serde_json::json!({ "path": path })).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
