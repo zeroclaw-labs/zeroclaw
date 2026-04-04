@@ -43,6 +43,7 @@ pub mod notion;
 pub mod qq;
 pub mod reddit;
 pub mod session_backend;
+pub mod project_sqlite;
 pub mod session_sqlite;
 pub mod session_store;
 pub mod signal;

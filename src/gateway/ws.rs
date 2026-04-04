@@ -63,6 +63,10 @@ pub struct WsQuery {
     pub session_id: Option<String>,
     /// Optional human-readable name for the session.
     pub name: Option<String>,
+    /// Optional project ID. When set, the session_id and project_workspace_dir
+    /// are resolved from the project record — the client does not need to
+    /// manage session IDs or workspace paths directly.
+    pub project_id: Option<String>,
 }
 
 /// Extract a bearer token from WebSocket-compatible sources.
@@ -145,7 +149,8 @@ pub async fn handle_ws_chat(
 
     let session_id = params.session_id;
     let session_name = params.name;
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, session_name))
+    let project_id = params.project_id;
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, session_name, project_id))
         .into_response()
 }
 
@@ -157,15 +162,49 @@ async fn handle_socket(
     state: AppState,
     session_id: Option<String>,
     session_name: Option<String>,
+    project_id: Option<String>,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
-    // Resolve session ID: use provided or generate a new UUID
-    let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // Resolve session_id and project_workspace_dir from project record when project_id is given.
+    // This keeps workspace path injection server-side (clients cannot inject arbitrary paths).
+    let (session_id, project_workspace_dir) = if let Some(ref pid) = project_id {
+        let resolved = state
+            .project_backend
+            .as_ref()
+            .and_then(|b| b.get(pid).ok().flatten());
+        match resolved {
+            Some(project) => (
+                project
+                    .session_key
+                    .strip_prefix(GW_SESSION_PREFIX)
+                    .unwrap_or(&project.session_key)
+                    .to_string(),
+                project.project_workspace_dir,
+            ),
+            None => {
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": format!("Project not found: {pid}"),
+                    "code": "PROJECT_NOT_FOUND"
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                return;
+            }
+        }
+    } else {
+        (session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()), None)
+    };
+
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
 
     // Build a persistent Agent for this connection so history is maintained across turns.
-    let config = state.config.lock().clone();
+    // Override workspace_dir when a project_workspace_dir is set — this scopes the agent
+    // sandbox to the project directory instead of the shared gateway_workspace_dir.
+    let mut config = state.config.lock().clone();
+    if let Some(ref dir) = project_workspace_dir {
+        config.workspace_dir = std::path::PathBuf::from(dir);
+    }
     let mut agent = match crate::agent::Agent::from_config(&config).await {
         Ok(a) => a,
         Err(e) => {
@@ -280,6 +319,9 @@ async fn handle_socket(
                         let user_msg = crate::providers::ChatMessage::user(&content);
                         let _ = backend.append(&session_key, &user_msg);
                     }
+                    if let Some(ref pb) = state.project_backend {
+                        pb.touch_by_session(&session_key);
+                    }
                     process_chat_message(&state, &mut agent, &mut sender, &content, &session_key)
                         .await;
                 }
@@ -373,6 +415,9 @@ async fn handle_socket(
                 if let Some(ref backend) = state.session_backend {
                     let user_msg = crate::providers::ChatMessage::user(&content);
                     let _ = backend.append(&session_key, &user_msg);
+                }
+                if let Some(ref pb) = state.project_backend {
+                    pb.touch_by_session(&session_key);
                 }
 
                 process_chat_message(&state, &mut agent, &mut sender, &content, &session_key).await;

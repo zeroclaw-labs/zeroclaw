@@ -1534,6 +1534,181 @@ pub async fn handle_claude_code_hook(
     Json(serde_json::json!({ "ok": true }))
 }
 
+// ── Project management endpoints ─────────────────────────────────
+
+
+/// GET /api/projects — list all projects newest-first
+pub async fn handle_api_projects_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(ref backend) = state.project_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Project persistence is disabled"})),
+        )
+            .into_response();
+    };
+    match backend.list() {
+        Ok(projects) => Json(serde_json::json!({ "projects": projects })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to list projects: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct CreateProjectBody {
+    pub name: String,
+    pub project_workspace_dir: Option<String>,
+}
+
+/// POST /api/projects — create a new project (and its session atomically)
+pub async fn handle_api_projects_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateProjectBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(ref backend) = state.project_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Project persistence is disabled"})),
+        )
+            .into_response();
+    };
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "name is required"})),
+        )
+            .into_response();
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    match backend.create(&id, &name, body.project_workspace_dir.as_deref()) {
+        Ok(project) => (StatusCode::CREATED, Json(serde_json::json!(project))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to create project: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct PatchProjectBody {
+    pub name: Option<String>,
+    pub project_workspace_dir: Option<serde_json::Value>,
+}
+
+/// PATCH /api/projects/{id} — rename or update project_workspace_dir
+pub async fn handle_api_projects_patch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<PatchProjectBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(ref backend) = state.project_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Project persistence is disabled"})),
+        )
+            .into_response();
+    };
+    if let Some(name) = body.name {
+        let trimmed = name.trim().to_string();
+        if trimmed.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "name cannot be empty"})),
+            )
+                .into_response();
+        }
+        if let Err(e) = backend.rename(&id, &trimmed) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to rename project: {e}")})),
+            )
+                .into_response();
+        }
+    }
+    if let Some(wd_value) = body.project_workspace_dir {
+        let wd: Option<String> = match wd_value {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(s) => Some(s),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "project_workspace_dir must be a string or null"})),
+                )
+                    .into_response();
+            }
+        };
+        if let Err(e) = backend.set_project_workspace_dir(&id, wd.as_deref()) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to update project_workspace_dir: {e}")})),
+            )
+                .into_response();
+        }
+    }
+    match backend.get(&id) {
+        Ok(Some(project)) => Json(serde_json::json!(project)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Project not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to fetch project: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/projects/{id} — delete project and its session
+pub async fn handle_api_projects_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(ref backend) = state.project_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Project persistence is disabled"})),
+        )
+            .into_response();
+    };
+    match backend.delete(&id) {
+        Ok(true) => Json(serde_json::json!({"deleted": true, "id": id})).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Project not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to delete project: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1647,6 +1822,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             session_backend: None,
+                project_backend: None,
             session_queue: Arc::new(crate::gateway::session_queue::SessionActorQueue::new(
                 8, 30, 600,
             )),

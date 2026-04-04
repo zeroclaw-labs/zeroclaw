@@ -24,7 +24,8 @@ pub mod ws;
 
 use crate::channels::{
     Channel, GmailPushChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel,
-    WhatsAppChannel, session_backend::SessionBackend, session_sqlite::SqliteSessionBackend,
+    WhatsAppChannel, project_sqlite::ProjectBackend, session_backend::SessionBackend,
+    session_sqlite::SqliteSessionBackend,
 };
 use crate::config::Config;
 use crate::cost::CostTracker;
@@ -364,6 +365,8 @@ pub struct AppState {
     pub path_prefix: String,
     /// Session backend for persisting gateway WS chat sessions
     pub session_backend: Option<Arc<dyn SessionBackend>>,
+    /// Project backend for 1-project-1-session mapping
+    pub project_backend: Option<Arc<ProjectBackend>>,
     /// Per-session actor queue for serializing concurrent turns
     pub session_queue: Arc<session_queue::SessionActorQueue>,
     /// Device registry for paired device management
@@ -703,6 +706,22 @@ pub async fn run_gateway(
         None
     };
 
+    // ── Project backend (same sessions.db, projects table) ──
+    let project_backend: Option<Arc<ProjectBackend>> = if config.gateway.session_persistence {
+        match ProjectBackend::new(&config.workspace_dir) {
+            Ok(b) => {
+                tracing::info!("Gateway project backend enabled (SQLite)");
+                Some(Arc::new(b))
+            }
+            Err(e) => {
+                tracing::warn!("Project backend disabled: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
         config.gateway.require_pairing,
@@ -862,6 +881,7 @@ pub async fn run_gateway(
         shutdown_tx,
         node_registry,
         session_backend,
+        project_backend,
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
         device_registry,
         pending_pairings,
@@ -949,6 +969,8 @@ pub async fn run_gateway(
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
+        .route("/api/projects", get(api::handle_api_projects_list).post(api::handle_api_projects_create))
+        .route("/api/projects/{id}", axum::routing::patch(api::handle_api_projects_patch).delete(api::handle_api_projects_delete))
         .route("/api/sessions", get(api::handle_api_sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
         .route(
@@ -2354,6 +2376,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+                project_backend: None,
             session_queue: std::sync::Arc::new(
                 crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
             ),
@@ -2425,6 +2448,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+                project_backend: None,
             session_queue: std::sync::Arc::new(
                 crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
             ),
@@ -2820,6 +2844,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+                project_backend: None,
             session_queue: std::sync::Arc::new(
                 crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
             ),
@@ -2899,6 +2924,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+                project_backend: None,
             session_queue: std::sync::Arc::new(
                 crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
             ),
@@ -2990,6 +3016,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+                project_backend: None,
             session_queue: std::sync::Arc::new(
                 crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
             ),
@@ -3053,6 +3080,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+                project_backend: None,
             session_queue: std::sync::Arc::new(
                 crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
             ),
@@ -3121,6 +3149,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+                project_backend: None,
             session_queue: std::sync::Arc::new(
                 crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
             ),
@@ -3194,6 +3223,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+                project_backend: None,
             session_queue: std::sync::Arc::new(
                 crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
             ),
@@ -3264,6 +3294,7 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+                project_backend: None,
             session_queue: std::sync::Arc::new(
                 crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
             ),
