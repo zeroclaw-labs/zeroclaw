@@ -145,12 +145,11 @@ impl ToolDispatcher for XmlToolDispatcher {
     fn prompt_instructions(&self, _tools: &[Box<dyn Tool>]) -> String {
         let mut instructions = String::new();
         instructions.push_str("## Tool Use Protocol\n\n");
-        instructions
-            .push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
+        instructions.push_str("Wrap a JSON object in <tool_call></tool_call> tags:\n\n");
         instructions.push_str(
             "```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n",
         );
-        instructions.push_str("**CRITICAL**: ");
+        instructions.push_str("**CRITICAL**:\n");
         instructions.push_str(crate::agent::prompt::TOOL_CALL_INSTRUCTIONS);
         instructions.push_str("\n\n");
 

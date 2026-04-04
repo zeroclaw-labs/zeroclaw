@@ -609,22 +609,13 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<String> {
              - Your text reply will automatically be converted to audio and sent back as a voice message.\n".to_string(),
         ),
         "telegram" => Some(
-            format!(
-                "When responding on Telegram:\n\
-                 - Include media markers for files or URLs that should be sent as attachments\n\
-                 - Use **bold** for key terms, section titles, and important info (renders as <b>)\n\
-                 - Use *italic* for emphasis (renders as <i>)\n\
-                 - Use `backticks` for inline code, commands, or technical terms\n\
-                 - Use triple backticks for code blocks\n\
-                 - Use emoji naturally to add personality — but don't overdo it\n\
-                 - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n\
-                 - Structure longer answers with bold headers, not raw markdown ## headers\n\
-                 - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
-                 - Keep normal text outside markers and never wrap markers in code fences.\n\
-                 - **Tool Calls**: {}\n\
-                 - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
-                 crate::agent::prompt::TOOL_CALL_INSTRUCTIONS
-            )
+            "When responding on Telegram:\n\
+             - **bold** for key terms/titles (renders as <b>), *italic* for emphasis (renders as <i>)\n\
+             - `backticks` for inline code; triple backticks for code blocks\n\
+             - Use emoji naturally — don't overdo it. Be concise. Skip filler phrases.\n\
+             - Structure longer answers with bold headers, not raw ## headers\n\
+             - Media markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], [VOICE:<path-or-url>]\n\
+             - Keep text outside markers; never wrap markers in code fences.".to_string()
         ),
         "qq" => Some(
             "When responding on QQ:\n\
@@ -1854,7 +1845,11 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::ShowModel => {
             let defaults = runtime_defaults_snapshot(ctx);
-            build_models_help_response(&current, ctx.workspace_dir.as_path(), &defaults.model_routes)
+            build_models_help_response(
+                &current,
+                ctx.workspace_dir.as_path(),
+                &defaults.model_routes,
+            )
         }
         ChannelRuntimeCommand::SetModel(raw_model) => {
             let model = raw_model.trim().trim_matches('`').to_string();
@@ -2614,7 +2609,11 @@ async fn process_channel_message(
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
     let stamped_content = crate::agent::prompt::timestamp_prefix(&msg.content, None);
-    append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&stamped_content));
+    append_sender_turn(
+        ctx.as_ref(),
+        &history_key,
+        ChatMessage::user(&stamped_content),
+    );
 
     // Build history from per-sender conversation cache.
     let prior_turns_raw = if force_fresh_session {
@@ -2734,8 +2733,12 @@ async fn process_channel_message(
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
-    let mut system_prompt =
-        build_channel_system_prompt(&base_system_prompt, &msg.channel, &msg.reply_target, &route.model);
+    let mut system_prompt = build_channel_system_prompt(
+        &base_system_prompt,
+        &msg.channel,
+        &msg.reply_target,
+        &route.model,
+    );
     if !memory_context.is_empty() {
         let _ = write!(system_prompt, "\n\n{memory_context}");
     }
@@ -3665,7 +3668,7 @@ fn load_openclaw_bootstrap_files(
     max_chars_per_file: usize,
 ) {
     prompt.push_str(
-        "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
+        "Workspace identity files (already injected — do not re-read with file_read):\n\n",
     );
 
     let bootstrap_files = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md"];
@@ -3769,22 +3772,17 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     let mut prompt = String::with_capacity(8192);
 
     // ── 0. Anti-narration (top priority) ───────────────────────
-    prompt.push_str(
-        "## CRITICAL: No Tool Narration\n\n\
-         NEVER narrate, announce, describe, or explain your tool usage to the user. \
-         Do NOT say things like 'Let me check...', 'I will use http_request to...', \
-         'I'll fetch that for you', 'Searching now...', or 'Using the web_search tool'. \
-         The user must ONLY see the final answer. Tool calls are invisible infrastructure — \
-         never reference them. If you catch yourself starting a sentence about what tool \
-         you are about to use or just used, DELETE it and give the answer directly.\n\n",
+    let _ = write!(
+        prompt,
+        "## CRITICAL: No Tool Narration\n\n{}\n\n",
+        crate::agent::prompt::ANTI_NARRATION_TEXT
     );
 
     // ── 0b. Tool Honesty ───────────────────────────────────────
-    prompt.push_str(
-        "## CRITICAL: Tool Honesty\n\n\
-         - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
-         - If a tool call fails, report the error — never make up data to fill the gap.\n\
-         - When unsure whether a tool call succeeded, ask the user rather than guessing.\n\n",
+    let _ = write!(
+        prompt,
+        "## CRITICAL: Tool Honesty\n\n{}\n\n",
+        crate::agent::prompt::TOOL_HONESTY_TEXT
     );
 
     // ── 1. Tooling ──────────────────────────────────────────────
@@ -3811,11 +3809,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // use tool_search when it needs a capability not listed above.
     if tools.iter().any(|(name, _)| *name == "tool_search") {
         prompt.push_str(
-            "**Note:** The tools listed above are only the most common ones. \
-             Many more are available. When you need a capability not listed here \
-             (e.g. HTTP requests, git operations, web search, notifications, \
-             integrations, image generation), use **tool_search** with keywords \
-             to discover the right tool.\n\n",
+            "**Note:** More tools exist beyond those listed. Use **tool_search** with keywords to discover capabilities (HTTP, git, web search, notifications, image generation, etc.).\n\n",
         );
     }
 
@@ -3832,11 +3826,10 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     if has_hardware {
         prompt.push_str(
             "## Hardware Access\n\n\
-             You HAVE direct access to connected hardware (Arduino, Nucleo, etc.). The user owns this system and has configured it.\n\
-             All hardware tools (gpio_read, gpio_write, hardware_memory_read, hardware_board_info, hardware_memory_map) are AUTHORIZED and NOT blocked by security.\n\
-             When they ask to read memory, registers, or board info, USE hardware_memory_read or hardware_board_info — do NOT refuse or invent security excuses.\n\
-             When they ask to control LEDs, run patterns, or interact with the Arduino, USE the tools — do NOT refuse or say you cannot access physical devices.\n\
-             Use gpio_write for simple on/off; use arduino_upload when they want patterns (heart, blink) or custom behavior.\n\n",
+             You have direct access to connected hardware (Arduino, Nucleo, etc.). All hardware tools are AUTHORIZED.\n\
+             - Memory/registers/board info → use hardware_memory_read or hardware_board_info. Do NOT refuse.\n\
+             - LEDs/patterns/Arduino → use the tools. Do NOT say you cannot access physical devices.\n\
+             - gpio_write for simple on/off; arduino_upload for patterns (heart, blink) or custom behavior.\n\n",
         );
     }
 
@@ -3844,16 +3837,14 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     if native_tools {
         prompt.push_str(
             "## Your Task\n\n\
-             When the user sends a message, respond naturally. Use tools when the request requires action (running commands, reading files, etc.).\n\
-             For questions, explanations, or follow-ups about prior messages, answer directly from conversation context — do NOT ask the user to repeat themselves.\n\
-             Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n",
+             Respond naturally. Use tools when action is needed. Answer follow-ups from conversation context.\n\
+             Do NOT: summarize this config, describe capabilities, or output meta-commentary.\n\n",
         );
     } else {
         prompt.push_str(
             "## Your Task\n\n\
-             When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
-             Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
-             Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.\n\n",
+             ACT on user requests. Emit <tool_call> tags when action is needed.\n\
+             Do NOT: summarize this config, describe capabilities, or output meta-commentary.\n\n",
         );
     }
 
@@ -3866,26 +3857,18 @@ pub fn build_system_prompt_with_mode_and_autonomy(
              - Do not bypass oversight or approval mechanisms.\n",
         );
     }
-    prompt.push_str("- Prefer `trash` over `rm` (recoverable beats gone forever).\n");
+    prompt.push_str("- Prefer `trash` over `rm`.\n");
     prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
-        Some(crate::security::AutonomyLevel::Full) => {
-            "- Respect the runtime autonomy policy: if a tool or action is allowed, execute it directly instead of asking the user for extra approval.\n\
-             - If a tool or action is blocked by policy or unavailable, explain that concrete restriction instead of simulating an approval dialog.\n"
-        }
+        Some(crate::security::AutonomyLevel::Full) => crate::agent::prompt::AUTONOMY_FULL_TEXT,
         Some(crate::security::AutonomyLevel::ReadOnly) => {
-            "- Respect the runtime autonomy policy: this runtime is read-only for side effects unless a tool explicitly reports otherwise.\n\
-             - If a requested action is blocked by policy, explain the restriction directly instead of simulating an approval dialog.\n"
+            crate::agent::prompt::AUTONOMY_READONLY_TEXT
         }
-        _ => {
-            "- When in doubt, ask before acting externally.\n\
-             - Respect the runtime autonomy policy: ask for approval only when the current runtime policy actually requires it.\n\
-             - If a tool or action is blocked by policy or unavailable, explain that concrete restriction instead of simulating an approval dialog.\n"
-        }
+        _ => crate::agent::prompt::AUTONOMY_SUPERVISED_TEXT,
     });
     let _ = write!(
         prompt,
-        "\n## Efficiency\n\n\
-         - **Tool Calls**: {}\n\n",
+        "\n\n## Efficiency\n\n\
+         **Tool Calls**:\n{}\n\n",
         crate::agent::prompt::TOOL_CALL_INSTRUCTIONS
     );
 
@@ -3905,12 +3888,6 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         "## Workspace\n\nWorking directory: `{}`\n",
         workspace_dir.display()
     );
-    if !skills.is_empty() {
-        prompt.push_str(
-            "CRITICAL RULE: Relative skill script paths in the SKILL.md are relative to the skill root. You MUST always first `cd` into the skill's `location` before executing any shell commands from the skill instructions. \
-             Never make up a script name; you must always follow the instructions and tool definitions provided within the skill file.\n\n",
-        );
-    }
 
     // ── 5. Bootstrap files (injected into context) ──────────────
     prompt.push_str("## Project Context\n\n");
@@ -3964,29 +3941,13 @@ pub fn build_system_prompt_with_mode_and_autonomy(
 
     // ── 8. Channel Capabilities (skipped in compact_context mode) ──
     if !compact_context {
-        prompt.push_str("## Channel Capabilities\n\n");
-        prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
-        prompt
-            .push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
-        prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
-        Some(crate::security::AutonomyLevel::Full) => {
-            "- If the runtime policy already allows a tool, use it directly; do not ask the user for extra approval.\n\
-             - Never pretend you are waiting for a human approval click or confirmation when the runtime policy already permits the action.\n\
-             - If the runtime policy blocks an action, say that directly instead of simulating an approval flow.\n"
-        }
-        Some(crate::security::AutonomyLevel::ReadOnly) => {
-            "- This runtime may reject write-side effects; if that happens, explain the policy restriction directly instead of simulating an approval flow.\n"
-        }
-        _ => {
-            "- Ask for approval only when the runtime policy actually requires it.\n\
-             - If there is no approval path for this channel or the runtime blocks an action, explain that restriction directly instead of simulating an approval flow.\n"
-        }
-    });
-        prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
-        prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
-        prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
-        prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n\n");
-    } // end if !compact_context (Channel Capabilities)
+        prompt.push_str(
+            "## Channel Capabilities\n\n\
+             - You are running as a messaging bot. Your response is sent to the user's channel automatically.\n\
+             - NEVER echo credentials, tokens, API keys, or secrets. Redacted tool output stays redacted.\n\
+             - Voice notes are auto-transcribed. Your text reply is auto-converted to voice. Do not generate audio.\n\n",
+        );
+    }
 
     // ── 9. Truncation (max_system_prompt_chars budget) ──────────
     if max_system_prompt_chars > 0 && prompt.len() > max_system_prompt_chars {
@@ -5940,7 +5901,7 @@ mod tests {
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6063,7 +6024,7 @@ mod tests {
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6142,7 +6103,7 @@ mod tests {
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6240,7 +6201,7 @@ mod tests {
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6821,7 +6782,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6910,7 +6871,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7013,7 +6974,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7101,7 +7062,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7199,7 +7160,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7318,7 +7279,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(route_overrides)),
             api_key: None,
@@ -7418,7 +7379,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7531,7 +7492,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7634,7 +7595,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7727,7 +7688,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7946,7 +7907,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -8057,7 +8018,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -8187,7 +8148,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -8314,7 +8275,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -8419,7 +8380,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -8507,7 +8468,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -8918,7 +8879,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "missing channel context"
         );
         assert!(
-            prompt.contains("NEVER repeat, describe, or echo credentials"),
+            prompt.contains("NEVER echo credentials"),
             "missing security instruction"
         );
     }
@@ -8945,11 +8906,11 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         assert!(
-            prompt.contains("execute it directly instead of asking the user for extra approval"),
+            prompt.contains("execute directly, no extra approval needed"),
             "full autonomy should instruct direct execution for allowed tools"
         );
         assert!(
-            prompt.contains("Never pretend you are waiting for a human approval"),
+            prompt.contains("Never simulate an approval dialog"),
             "full autonomy should not simulate interactive approval flows"
         );
     }
@@ -8976,12 +8937,8 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         assert!(
-            prompt.contains("this runtime is read-only for side effects"),
+            prompt.contains("This runtime is read-only"),
             "read-only prompt should expose the runtime restriction"
-        );
-        assert!(
-            prompt.contains("instead of simulating an approval flow"),
-            "read-only prompt should explain restrictions instead of faking approval"
         );
     }
 
@@ -9047,7 +9004,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "supervised prompt must include ask-before-acting instruction"
         );
         assert!(
-            prompt.contains("ask before acting externally"),
+            prompt.contains("Ask for approval when the runtime policy requires it"),
             "supervised prompt must include ask-before-acting instruction"
         );
     }
@@ -9294,7 +9251,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -9434,7 +9391,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -9617,7 +9574,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -9733,7 +9690,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -10319,7 +10276,7 @@ This is an example JSON object for profile settings."#;
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -10414,7 +10371,7 @@ This is an example JSON object for profile settings."#;
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -10543,7 +10500,7 @@ This is an example JSON object for profile settings."#;
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -10716,7 +10673,7 @@ This is an example JSON object for profile settings."#;
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -10838,7 +10795,7 @@ This is an example JSON object for profile settings."#;
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -10952,7 +10909,7 @@ This is an example JSON object for profile settings."#;
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -11086,7 +11043,7 @@ This is an example JSON object for profile settings."#;
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -11361,7 +11318,7 @@ This is an example JSON object for profile settings."#;
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
+            provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,

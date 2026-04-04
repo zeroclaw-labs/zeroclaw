@@ -10,8 +10,34 @@ use chrono::Local;
 use std::fmt::Write;
 use std::path::Path;
 
-pub const TOOL_CALL_INSTRUCTIONS: &str =
-    "Provide ONLY the JSON object inside <tool_call> tags. Do NOT include comments, explanations, or any other text inside the tags. Comments are a waste of context. Before calling a tool, check your conversation history. If the exact tool and arguments were already used and returned a result, DO NOT call it again. Instead, use the existing result to answer or move to the next step.";
+pub const TOOL_CALL_INSTRUCTIONS: &str = "\
+- Inside <tool_call> tags: JSON only. No comments, no explanations.\n\
+- Before calling a tool: check history. If same tool+args already returned a result, reuse it.\n\
+- After results: answer or proceed. Do not repeat the tool call.";
+
+pub const TOOL_HONESTY_TEXT: &str = "\
+- NEVER fabricate or guess tool results. Empty results → say \"No results found.\"\n\
+- Failed tool call → report the error. Never invent data.\n\
+- Unsure if a tool call succeeded → ask the user.";
+
+pub const ANTI_NARRATION_TEXT: &str = "\
+- NEVER mention, narrate, or describe tool usage to the user.\n\
+- Bad: \"Let me check...\", \"I will use http_request to...\", \"Searching now...\"\n\
+- Give the FINAL ANSWER only. Tool calls are invisible.";
+
+pub const AUTONOMY_FULL_TEXT: &str = "\
+- Allowed tools/actions: execute directly, no extra approval needed.\n\
+- You have full access to all configured tools. Use them confidently.\n\
+- Blocked tools/actions: explain the concrete restriction. Never simulate an approval dialog.";
+
+pub const AUTONOMY_READONLY_TEXT: &str = "\
+- This runtime is read-only. Write operations will be rejected.\n\
+- Use read-only tools freely and confidently.";
+
+pub const AUTONOMY_SUPERVISED_TEXT: &str = "\
+- Ask for approval when the runtime policy requires it for the specific action.\n\
+- Do not preemptively refuse — attempt actions and let the runtime enforce restrictions.\n\
+- Use available tools confidently; the security policy will enforce boundaries.";
 
 /// Prefix a user message with the current local timestamp so the LLM has an
 /// accurate sense of "now" on every turn (system prompt stays stable for caching).
@@ -144,13 +170,7 @@ impl PromptSection for ToolHonestySection {
     }
 
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-        Ok(
-            "## CRITICAL: Tool Honesty\n\n\
-             - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
-             - If a tool call fails, report the error — never make up data to fill the gap.\n\
-             - When unsure whether a tool call succeeded, ask the user rather than guessing."
-                .into(),
-        )
+        Ok(["## CRITICAL: Tool Honesty\n\n", TOOL_HONESTY_TEXT].concat())
     }
 }
 
@@ -201,20 +221,9 @@ impl PromptSection for SafetySection {
 
         out.push_str("- Prefer `trash` over `rm`.\n");
         out.push_str(match ctx.autonomy_level {
-            AutonomyLevel::Full => {
-                "- Execute tools and actions directly — no extra approval needed.\n\
-                 - You have full access to all configured tools. Use them confidently to accomplish tasks.\n\
-                 - Only refuse an action if the runtime explicitly rejects it — do not preemptively decline."
-            }
-            AutonomyLevel::ReadOnly => {
-                "- This runtime is read-only. Write operations will be rejected by the runtime if attempted.\n\
-                 - Use read-only tools freely and confidently."
-            }
-            AutonomyLevel::Supervised => {
-                "- Ask for approval when the runtime policy requires it for the specific action.\n\
-                 - Do not preemptively refuse actions — attempt them and let the runtime enforce restrictions.\n\
-                 - Use available tools confidently; the security policy will enforce boundaries."
-            }
+            AutonomyLevel::Full => AUTONOMY_FULL_TEXT,
+            AutonomyLevel::ReadOnly => AUTONOMY_READONLY_TEXT,
+            AutonomyLevel::Supervised => AUTONOMY_SUPERVISED_TEXT,
         });
 
         // Append concrete security policy constraints when available (#2404).
@@ -223,15 +232,15 @@ impl PromptSection for SafetySection {
             out.push_str(summary);
         }
 
-        out.push_str(&format!(
-            "\n\n## Efficiency\n\n- **Tool Calls**: {}",
+        let _ = write!(
+            out,
+            "\n\n## Efficiency\n\n**Tool Calls**:\n{}",
             TOOL_CALL_INSTRUCTIONS
-        ));
+        );
 
         Ok(out)
     }
 }
-
 
 impl PromptSection for SkillsSection {
     fn name(&self) -> &str {
@@ -283,10 +292,9 @@ impl PromptSection for ChannelMediaSection {
 
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
         Ok("## Channel Media Markers\n\n\
-            Messages from channels may contain media markers:\n\
-            - `[Voice] <text>` — The user sent a voice/audio message that has already been transcribed to text. Respond to the transcribed content directly.\n\
-            - `[IMAGE:<path>]` — An image attachment, processed by the vision pipeline.\n\
-            - `[Document: <name>] <path>` — A file attachment saved to the workspace."
+            - `[Voice] <text>` — transcribed voice/audio; respond to content directly.\n\
+            - `[IMAGE:<path>]` — image attachment (vision pipeline).\n\
+            - `[Document: <name>] <path>` — file attachment saved to workspace."
             .into())
     }
 }
@@ -306,7 +314,6 @@ impl PromptSection for ModelGuidanceSection {
         Ok(guidance)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -692,7 +699,7 @@ mod tests {
             "full autonomy should NOT include 'bypass oversight' instructions"
         );
         assert!(
-            output.contains("Execute tools and actions directly"),
+            output.contains("execute directly, no extra approval needed"),
             "full autonomy should instruct to execute directly"
         );
         assert!(

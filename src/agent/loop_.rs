@@ -3459,18 +3459,13 @@ pub(crate) fn build_tool_instructions(
 ) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
-    instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
+    instructions.push_str("Wrap a JSON object in <tool_call></tool_call> tags:\n\n");
     instructions.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
-    instructions.push_str(
-        "CRITICAL: Output actual <tool_call> tags—never describe steps or give examples. ",
-    );
+    instructions.push_str("CRITICAL: Output actual <tool_call> tags — never describe steps.\n");
     instructions.push_str(crate::agent::prompt::TOOL_CALL_INSTRUCTIONS);
     instructions.push_str("\n\n");
-    instructions.push_str("Example: User says \"what's the date?\". You MUST respond with:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n\n");
-    instructions.push_str("You may use multiple tool calls in a single response. ");
-    instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
-    instructions
-        .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
+    instructions.push_str("Example: User says \"what's the date?\" → respond:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n\n");
+    instructions.push_str("Multiple tool calls per response allowed. Results appear in <tool_result> tags. Continue reasoning until you can give a final answer.\n\n");
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools_registry {
@@ -3689,20 +3684,19 @@ pub async fn run(
     let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
 
     let run_session_id = uuid::Uuid::new_v4().to_string();
-    let create_provider =
-        |name: &str, model: &str| -> anyhow::Result<Box<dyn Provider>> {
-            let p = providers::create_routed_provider_with_options(
-                name,
-                config.api_key.as_deref(),
-                config.api_url.as_deref(),
-                &config.reliability,
-                &config.model_routes,
-                model,
-                &provider_runtime_options,
-            )?;
-            p.set_session_id(Some(&run_session_id));
-            Ok(p)
-        };
+    let create_provider = |name: &str, model: &str| -> anyhow::Result<Box<dyn Provider>> {
+        let p = providers::create_routed_provider_with_options(
+            name,
+            config.api_key.as_deref(),
+            config.api_url.as_deref(),
+            &config.reliability,
+            &config.model_routes,
+            model,
+            &provider_runtime_options,
+        )?;
+        p.set_session_id(Some(&run_session_id));
+        Ok(p)
+    };
     let mut provider = create_provider(&provider_name, &model_name)?;
 
     let model_switch_callback = get_model_switch_state();

@@ -851,23 +851,17 @@ pub fn skills_to_prompt_with_mode(
     let mut prompt = match mode {
         crate::config::SkillsPromptInjectionMode::Full => String::from(
             "## Available Skills\n\n\
-             Skill instructions and tool metadata are preloaded below.\n\
-             Follow these instructions directly; do not read skill files at runtime unless the user asks. \
-             Never make up a script name; you must always follow the instructions and tool definitions provided within the skill file.\n\
-             Each skill's <description> defines when to use it. \
-             When the user's request matches a skill description — including when they mention a skill by name or use a slash command — \
-             you MUST call `use_skill` with that skill's name BEFORE generating any other response.\n\n\
+             Skill instructions are preloaded below. Follow them directly.\n\
+             - Never fabricate script names. Use only the tool definitions in each skill.\n\
+             - When a user request matches a skill's <description> or name, call `use_skill(name)` BEFORE any other response.\n\n\
              <available_skills>\n",
         ),
         crate::config::SkillsPromptInjectionMode::Compact => String::from(
             "## Available Skills\n\n\
-             Skill summaries are preloaded below to keep context compact.\n\
-             Skill instructions are loaded on demand via `use_skill(name)`.\n\
-             The `location` field is the skill's root directory. \
-             Never make up a script name; you must always follow the instructions and tool definitions provided within the skill file.\n\
-             Each skill's <description> defines when to use it. \
-             When the user's request matches a skill description — including when they mention a skill by name or use a slash command — \
-             you MUST call `use_skill` with that skill's name BEFORE generating any other response.\n\n\
+             Skill summaries preloaded; full instructions via `use_skill(name)`.\n\
+             - The `location` field is the skill's root directory.\n\
+             - Never fabricate script names. Use only the tool definitions in each skill.\n\
+             - When a user request matches a skill's <description> or name, call `use_skill(name)` BEFORE any other response.\n\n\
              <available_skills>\n",
         ),
     };
