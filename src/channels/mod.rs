@@ -5096,7 +5096,10 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
-pub async fn start_channels(config: Config) -> Result<()> {
+pub async fn start_channels(
+    config: Config,
+    canvas_store: Option<crate::tools::canvas::CanvasStore>,
+) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -5189,7 +5192,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-        None,
+        canvas_store,
     );
 
     // Wire MCP tools into the registry before freezing — non-fatal.
