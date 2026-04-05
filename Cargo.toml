@@ -77,6 +77,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # URL encoding for web search
 urlencoding = "2.1"
 
+# Shell-style argument tokenization (google_workspace helper commands)
+shell-words = "1.1"
+
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"
 

@@ -6,6 +6,10 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
+// Used to tokenize helper command strings (e.g. `+send --to a@b.com --subject "Hi"`)
+// into individual arguments for safe subprocess execution without shell interpolation.
+use shell_words;
+
 /// Default `gws` command execution time before kill (overridden by config).
 const DEFAULT_GWS_TIMEOUT_SECS: u64 = 30;
 /// Maximum output size in bytes (1MB).
@@ -107,6 +111,60 @@ impl GoogleWorkspaceTool {
         args
     }
 
+    /// Process subprocess output into a `ToolResult`, truncating if necessary.
+    fn process_output(
+        result: Result<Result<std::process::Output, std::io::Error>, tokio::time::error::Elapsed>,
+        timeout_secs: u64,
+    ) -> anyhow::Result<ToolResult> {
+        match result {
+            Ok(Ok(output)) => {
+                let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+                if stdout.len() > MAX_OUTPUT_BYTES {
+                    let mut boundary = MAX_OUTPUT_BYTES;
+                    while boundary > 0 && !stdout.is_char_boundary(boundary) {
+                        boundary -= 1;
+                    }
+                    stdout.truncate(boundary);
+                    stdout.push_str("\n... [output truncated at 1MB]");
+                }
+                if stderr.len() > MAX_OUTPUT_BYTES {
+                    let mut boundary = MAX_OUTPUT_BYTES;
+                    while boundary > 0 && !stderr.is_char_boundary(boundary) {
+                        boundary -= 1;
+                    }
+                    stderr.truncate(boundary);
+                    stderr.push_str("\n... [stderr truncated at 1MB]");
+                }
+
+                Ok(ToolResult {
+                    success: output.status.success(),
+                    output: stdout,
+                    error: if stderr.is_empty() {
+                        None
+                    } else {
+                        Some(stderr)
+                    },
+                })
+            }
+            Ok(Err(e)) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Failed to execute gws: {e}. Is gws installed? Run: npm install -g @googleworkspace/cli"
+                )),
+            }),
+            Err(_) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "gws command timed out after {timeout_secs}s and was killed"
+                )),
+            }),
+        }
+    }
+
     fn is_operation_allowed(
         &self,
         service: &str,
@@ -134,7 +192,16 @@ impl Tool for GoogleWorkspaceTool {
 
     fn description(&self) -> &str {
         "Interact with Google Workspace services (Drive, Gmail, Calendar, Sheets, Docs, etc.) \
-         via the gws CLI. Requires gws to be installed and authenticated."
+         via the gws CLI. Requires gws to be installed and authenticated. \
+         Two modes: (1) API mode — set service, resource, method for raw API calls. \
+         (2) Helper mode — set service and args for convenient helper commands. \
+         Gmail helpers: \
+         args=\"+triage\" (list unread inbox), \
+         args=\"+read <message-id>\" (read email body), \
+         args=\"+send --to addr --subject subj --body text --from name\" (send email), \
+         args=\"+reply <message-id> --body text --from name\" (reply to email), \
+         args=\"+forward <message-id> --to addr\" (forward email). \
+         Prefer helpers over raw API calls — they are simpler and handle MIME/threading automatically."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -145,17 +212,21 @@ impl Tool for GoogleWorkspaceTool {
                     "type": "string",
                     "description": "Google Workspace service (e.g. drive, gmail, calendar, sheets, docs, slides, tasks, people, chat, classroom, forms, keep, meet, events)"
                 },
+                "args": {
+                    "type": "string",
+                    "description": "Helper command string (e.g. \"+triage\", \"+send --to user@example.com --subject Hi --body Hello\", \"+read 19d5c77adfdd8399\", \"+reply 19d5c77a --body Thanks --from \\\"Name <email>\\\"\" ). When args is set, resource and method are not needed."
+                },
                 "resource": {
                     "type": "string",
-                    "description": "Service resource (e.g. files, messages, events, spreadsheets)"
+                    "description": "Service resource for raw API mode (e.g. files, users, events). Not needed when using args."
                 },
                 "method": {
                     "type": "string",
-                    "description": "Method to call on the resource (e.g. list, get, create, update, delete)"
+                    "description": "Method for raw API mode (e.g. list, get, create, update, delete). Not needed when using args."
                 },
                 "sub_resource": {
                     "type": "string",
-                    "description": "Optional sub-resource for nested operations"
+                    "description": "Optional sub-resource for nested API operations"
                 },
                 "params": {
                     "type": "object",
@@ -179,7 +250,7 @@ impl Tool for GoogleWorkspaceTool {
                     "description": "Max pages to fetch when using page_all (default: 10)"
                 }
             },
-            "required": ["service", "resource", "method"]
+            "required": ["service"]
         })
     }
 
@@ -189,14 +260,127 @@ impl Tool for GoogleWorkspaceTool {
             .get("service")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'service' parameter"))?;
+
+        // Security checks
+        if self.security.is_rate_limited() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+            });
+        }
+
+        // Validate service is in the allowlist
+        if !self.allowed_services.iter().any(|s| s == service) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Service '{service}' is not in the allowed services list. \
+                     Allowed: {}",
+                    self.allowed_services.join(", ")
+                )),
+            });
+        }
+
+        // Validate service contains no shell metacharacters
+        if !service
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "Invalid characters in 'service': only lowercase alphanumeric, underscore, and hyphen are allowed"
+                        .into(),
+                ),
+            });
+        }
+
+        // ── Helper mode: when `args` is provided, tokenize and pass directly ──
+        if let Some(args_value) = args.get("args") {
+            let args_str = match args_value.as_str() {
+                Some(s) => s,
+                None => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some("'args' must be a string".into()),
+                    })
+                }
+            };
+
+            let tokens = match shell_words::split(args_str) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Failed to parse 'args': {e}")),
+                    })
+                }
+            };
+
+            if tokens.is_empty() {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("'args' must not be empty".into()),
+                });
+            }
+
+            // Charge action budget
+            if !self.security.record_action() {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("Rate limit exceeded: action budget exhausted".into()),
+                });
+            }
+
+            let mut cmd_args: Vec<String> = vec![service.to_string()];
+            cmd_args.extend(tokens);
+
+            if self.audit_log {
+                tracing::info!(
+                    tool = "google_workspace",
+                    service = service,
+                    args = args_str,
+                    "gws audit: executing helper command"
+                );
+            }
+
+            let mut cmd = tokio::process::Command::new("gws");
+            cmd.args(&cmd_args);
+            cmd.env_clear();
+            for key in &["PATH", "HOME", "APPDATA", "USERPROFILE", "LANG", "TERM"] {
+                if let Ok(val) = std::env::var(key) {
+                    cmd.env(key, val);
+                }
+            }
+            if let Some(ref creds) = self.credentials_path {
+                cmd.env("GOOGLE_APPLICATION_CREDENTIALS", creds);
+            }
+            if let Some(ref account) = self.default_account {
+                cmd.args(["--account", account]);
+            }
+
+            let result =
+                tokio::time::timeout(Duration::from_secs(self.timeout_secs), cmd.output()).await;
+
+            return Self::process_output(result, self.timeout_secs);
+        }
+
+        // ── API mode: service + resource + method ──
         let resource = args
             .get("resource")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'resource' parameter"))?;
+            .ok_or_else(|| anyhow::anyhow!("Missing 'resource' parameter (required in API mode when 'args' is not set)"))?;
         let method = args
             .get("method")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'method' parameter"))?;
+            .ok_or_else(|| anyhow::anyhow!("Missing 'method' parameter (required in API mode when 'args' is not set)"))?;
 
         // Extract and validate sub_resource early so the allowlist check can account for it.
         let sub_resource: Option<&str> = if let Some(sub_resource_value) = args.get("sub_resource")
@@ -229,28 +413,6 @@ impl Tool for GoogleWorkspaceTool {
             None
         };
 
-        // Security checks
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
-        // Validate service is in the allowlist
-        if !self.allowed_services.iter().any(|s| s == service) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Service '{service}' is not in the allowed services list. \
-                     Allowed: {}",
-                    self.allowed_services.join(", ")
-                )),
-            });
-        }
-
         if !self.is_operation_allowed(service, resource, sub_resource, method) {
             let op_path = match sub_resource {
                 Some(sub) => format!("{service}/{resource}/{sub}/{method}"),
@@ -267,7 +429,6 @@ impl Tool for GoogleWorkspaceTool {
 
         // Validate inputs contain no shell metacharacters
         for (label, value) in [
-            ("service", service),
             ("resource", resource),
             ("method", method),
         ] {
@@ -411,54 +572,7 @@ impl Tool for GoogleWorkspaceTool {
         let result =
             tokio::time::timeout(Duration::from_secs(self.timeout_secs), cmd.output()).await;
 
-        match result {
-            Ok(Ok(output)) => {
-                let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-                if stdout.len() > MAX_OUTPUT_BYTES {
-                    // Find a valid char boundary at or before MAX_OUTPUT_BYTES
-                    let mut boundary = MAX_OUTPUT_BYTES;
-                    while boundary > 0 && !stdout.is_char_boundary(boundary) {
-                        boundary -= 1;
-                    }
-                    stdout.truncate(boundary);
-                    stdout.push_str("\n... [output truncated at 1MB]");
-                }
-                if stderr.len() > MAX_OUTPUT_BYTES {
-                    let mut boundary = MAX_OUTPUT_BYTES;
-                    while boundary > 0 && !stderr.is_char_boundary(boundary) {
-                        boundary -= 1;
-                    }
-                    stderr.truncate(boundary);
-                    stderr.push_str("\n... [stderr truncated at 1MB]");
-                }
-
-                Ok(ToolResult {
-                    success: output.status.success(),
-                    output: stdout,
-                    error: if stderr.is_empty() {
-                        None
-                    } else {
-                        Some(stderr)
-                    },
-                })
-            }
-            Ok(Err(e)) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Failed to execute gws: {e}. Is gws installed? Run: npm install -g @googleworkspace/cli"
-                )),
-            }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "gws command timed out after {}s and was killed", self.timeout_secs
-                )),
-            }),
-        }
+        Self::process_output(result, self.timeout_secs)
     }
 }
 
@@ -497,12 +611,14 @@ mod tests {
         assert!(schema["properties"]["service"].is_object());
         assert!(schema["properties"]["resource"].is_object());
         assert!(schema["properties"]["method"].is_object());
+        assert!(schema["properties"]["args"].is_object());
         let required = schema["required"]
             .as_array()
             .expect("required should be an array");
         assert!(required.contains(&json!("service")));
-        assert!(required.contains(&json!("resource")));
-        assert!(required.contains(&json!("method")));
+        // resource and method are only required in API mode (not when args is used)
+        assert!(!required.contains(&json!("resource")));
+        assert!(!required.contains(&json!("method")));
     }
 
     #[test]
@@ -739,6 +855,7 @@ mod tests {
     async fn missing_required_param_returns_error() {
         let tool =
             GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        // Without args or resource+method, API mode should error
         let result = tool.execute(json!({"service": "drive"})).await;
         assert!(result.is_err());
     }
