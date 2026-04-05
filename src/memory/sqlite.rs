@@ -616,6 +616,13 @@ impl Memory for SqliteMemory {
                 .await;
         }
 
+        // Wildcard query: return all memories (up to limit)
+        if query.trim() == "*" {
+            let mut all = self.list(None, session_id).await?;
+            all.truncate(limit);
+            return Ok(all);
+        }
+
         // Compute query embedding only when needed (skip for BM25-only mode)
         let query_embedding = if self.search_mode == SearchMode::Bm25 {
             None

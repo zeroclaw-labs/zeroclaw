@@ -178,6 +178,16 @@ impl Memory for MarkdownMemory {
             }
         }
 
+        // Wildcard query: return all memories (up to limit)
+        if query.trim() == "*" {
+            let mut all = self.read_all_entries().await?;
+            for entry in &mut all {
+                entry.score = Some(1.0);
+            }
+            all.truncate(limit);
+            return Ok(all);
+        }
+
         let all = self.read_all_entries().await?;
         let query_lower = query.to_lowercase();
         let keywords: Vec<&str> = query_lower.split_whitespace().collect();
