@@ -1,7 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::CodexCliConfig;
-use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
+use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -13,13 +13,14 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
-/// Delegates coding tasks to the Codex CLI (`codex -q`).
+/// Delegates coding tasks to the Codex CLI (`codex exec`).
 ///
 /// This creates a two-tier agent architecture: ZeroClaw orchestrates high-level
 /// tasks and delegates complex coding work to Codex, which has its own
 /// agent loop with file editing and shell tools.
 ///
-/// Authentication uses the `codex` binary's own session by default. No API key
+/// Authentication uses the `codex` binary's own session (`~/.codex/auth.json`)
+/// by default, supporting both API key and ChatGPT OAuth flows. No API key
 /// is needed unless `env_passthrough` includes `OPENAI_API_KEY`.
 pub struct CodexCliTool {
     security: Arc<SecurityPolicy>,
@@ -39,7 +40,7 @@ impl Tool for CodexCliTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a coding task to Codex CLI (codex -q). Supports file editing and bash execution. Use for complex coding work that benefits from Codex's full agent loop."
+        "Delegate a coding task to Codex CLI (codex exec). Supports file editing and bash execution. Use for complex coding work that benefits from Codex's full agent loop."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -145,14 +146,24 @@ impl Tool for CodexCliTool {
             });
         }
 
-        // Build CLI command
+        // Build CLI command: `codex exec [extra_args...] <prompt>`
         let codex_bin = if cfg!(target_os = "windows") {
             "codex.cmd"
         } else {
             "codex"
         };
         let mut cmd = Command::new(codex_bin);
-        cmd.arg("-q").arg(prompt);
+        cmd.arg("exec");
+
+        // Append user-configured extra arguments (e.g. --sandbox, --skip-git-repo-check)
+        for arg in &self.config.extra_args {
+            let trimmed = arg.trim();
+            if !trimmed.is_empty() {
+                cmd.arg(trimmed);
+            }
+        }
+
+        cmd.arg(prompt);
 
         // Environment: clear everything, pass only safe vars + configured passthrough.
         cmd.env_clear();
@@ -265,12 +276,10 @@ mod tests {
         let tool = CodexCliTool::new(test_security(AutonomyLevel::Supervised), test_config());
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["prompt"].is_object());
-        assert!(
-            schema["required"]
-                .as_array()
-                .expect("schema required should be an array")
-                .contains(&json!("prompt"))
-        );
+        assert!(schema["required"]
+            .as_array()
+            .expect("schema required should be an array")
+            .contains(&json!("prompt")));
         assert!(schema["properties"]["working_directory"].is_object());
     }
 
@@ -299,13 +308,11 @@ mod tests {
             .await
             .expect("readonly should return a result");
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("read-only mode")
-        );
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("read-only mode"));
     }
 
     #[tokio::test]
@@ -327,13 +334,11 @@ mod tests {
             .await
             .expect("should return a result for path validation");
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("outside the workspace")
-        );
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("outside the workspace"));
     }
 
     #[test]
@@ -342,6 +347,15 @@ mod tests {
         assert!(
             config.env_passthrough.is_empty(),
             "env_passthrough should default to empty"
+        );
+    }
+
+    #[test]
+    fn codex_cli_extra_args_defaults() {
+        let config = CodexCliConfig::default();
+        assert!(
+            config.extra_args.is_empty(),
+            "extra_args should default to empty"
         );
     }
 
