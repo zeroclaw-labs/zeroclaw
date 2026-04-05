@@ -6221,6 +6221,10 @@ impl ChannelsConfig {
                 self.imessage.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.gchat.as_ref())),
+                self.gchat.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.matrix.as_ref())),
                 self.matrix.is_some(),
             ),
