@@ -121,9 +121,20 @@ impl ApprovalManager {
             return false;
         }
 
-        // always_ask overrides everything.
+        // Priority: always_ask (exact/prefix) > auto_approve (exact/prefix) > session_allowlist.
+
+        // 1. always_ask (exact or global wildcard "*")
         if self.always_ask.contains("*") || self.always_ask.contains(tool_name) {
             return true;
+        }
+
+        // 2. always_ask prefix wildcards (e.g. "mcp-tools__*")
+        for pattern in &self.always_ask {
+            if let Some(prefix) = pattern.strip_suffix("*") {
+                if tool_name.starts_with(prefix) {
+                    return true;
+                }
+            }
         }
 
         // Channel-driven shell execution is still guarded by the shell tool's
@@ -135,12 +146,12 @@ impl ApprovalManager {
             return false;
         }
 
-        // auto_approve skips the prompt.
+        // 3. auto_approve (exact or global wildcard "*")
         if self.auto_approve.contains("*") || self.auto_approve.contains(tool_name) {
             return false;
         }
 
-        // Support prefix wildcards (e.g. "jp-stock-analyzer__*")
+        // 4. auto_approve prefix wildcards (e.g. "jp-stock-analyzer__*")
         for pattern in &self.auto_approve {
             if let Some(prefix) = pattern.strip_suffix("*") {
                 if tool_name.starts_with(prefix) {
@@ -626,5 +637,62 @@ mod tests {
         assert!(!mgr.needs_approval("jp-stock-analyzer__get_stats"));
         assert!(!mgr.needs_approval("jp-stock-analyzer__search"));
         assert!(mgr.needs_approval("other_tool"));
+    }
+
+    #[test]
+    fn always_ask_prefix_wildcard_works() {
+        let mut config = AutonomyConfig::default();
+        config.always_ask = vec!["mcp-tools__*".into()];
+        let mgr = ApprovalManager::from_config(&config);
+
+        assert!(mgr.needs_approval("mcp-tools__dangerous_tool"));
+        assert!(mgr.needs_approval("mcp-tools__any"));
+        // unknown tool still needs approval in Supervised (default).
+        assert!(mgr.needs_approval("other_tool"));
+    }
+
+    #[test]
+    fn always_ask_wildcard_overrides_auto_approve_exact() {
+        let mut config = AutonomyConfig::default();
+        config.always_ask = vec!["mcp-tools__*".into()];
+        config.auto_approve = vec!["mcp-tools__safe_tool".into()];
+        let mgr = ApprovalManager::from_config(&config);
+
+        // always_ask prefix should win over auto_approve exact.
+        assert!(mgr.needs_approval("mcp-tools__safe_tool"));
+    }
+
+    #[test]
+    fn always_ask_exact_overrides_auto_approve_wildcard() {
+        let mut config = AutonomyConfig::default();
+        config.always_ask = vec!["mcp-tools__dangerous_tool".into()];
+        config.auto_approve = vec!["mcp-tools__*".into()];
+        let mgr = ApprovalManager::from_config(&config);
+
+        // always_ask exact should win over auto_approve prefix.
+        assert!(mgr.needs_approval("mcp-tools__dangerous_tool"));
+        // other tools in the prefix are still auto-approved.
+        assert!(!mgr.needs_approval("mcp-tools__other_tool"));
+    }
+
+    #[test]
+    fn always_ask_prefix_overrides_auto_approve_prefix() {
+        let mut config = AutonomyConfig::default();
+        config.always_ask = vec!["mcp-tools__*".into()];
+        config.auto_approve = vec!["mcp-tools__*".into()];
+        let mgr = ApprovalManager::from_config(&config);
+
+        // always_ask prefix should win.
+        assert!(mgr.needs_approval("mcp-tools__anything"));
+    }
+
+    #[test]
+    fn edge_case_prefix_only_wildcard() {
+        let mut config = AutonomyConfig::default();
+        config.auto_approve = vec!["__*".into()];
+        let mgr = ApprovalManager::from_config(&config);
+
+        assert!(!mgr.needs_approval("__something"));
+        assert!(mgr.needs_approval("something__"));
     }
 }
