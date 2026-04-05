@@ -133,6 +133,43 @@ pub async fn handle_api_status(
     Json(body).into_response()
 }
 
+/// GET /api/channels — list configured channels with basic status info.
+///
+/// Returns a list of channels from the config. Runtime metrics (message_count,
+/// last_message_at, health) are not tracked at the gateway level and are returned
+/// as defaults. See #5244.
+pub async fn handle_api_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let channels_config = &config.channels_config;
+
+    // Build channel list from the config's channels() iterator, which handles
+    // feature-gated fields (e.g. nostr, voice-wake) automatically.
+    let channels: Vec<serde_json::Value> = channels_config
+        .channels()
+        .into_iter()
+        .map(|(channel, present)| {
+            serde_json::json!({
+                "name": channel.name(),
+                "type": channel.name(),
+                "enabled": present,
+                "status": if present { "active" } else { "inactive" },
+                "message_count": 0,
+                "last_message_at": null,
+                "health": if present { "healthy" } else { "down" },
+            })
+        })
+        .collect();
+
+    Json(channels).into_response()
+}
+
 /// GET /api/config — current config (api_key masked)
 pub async fn handle_api_config_get(
     State(state): State<AppState>,
