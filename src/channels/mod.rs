@@ -389,6 +389,8 @@ struct ChannelRuntimeContext {
     model_routes: Arc<Vec<crate::config::ModelRouteConfig>>,
     query_classification: crate::config::QueryClassificationConfig,
     ack_reactions: bool,
+    mention_only: bool,
+    reply_precheck: bool,
     show_tool_calls: bool,
     session_store: Option<Arc<session_store::SessionStore>>,
     /// Non-interactive approval manager for channel-driven runs.
@@ -2778,15 +2780,23 @@ async fn process_channel_message(
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
-    let reply_intent = classify_channel_reply_intent(
-        active_provider.as_ref(),
-        history[0].content.as_str(),
-        &history,
-        route.model.as_str(),
-        runtime_defaults.temperature,
-    )
-    .await
-    .unwrap_or(AssistantChannelOutcome::Reply(String::new()));
+    // DMs always get a reply — no precheck needed.
+    // Groups only run the precheck when `reply_precheck` is enabled in
+    // `[channels_config]`.  Without it, group behaviour depends solely
+    // on `mention_only` (upstream filtering) or replies to everything.
+    let reply_intent = if msg.is_dm || !ctx.reply_precheck {
+        AssistantChannelOutcome::Reply(String::new())
+    } else {
+        classify_channel_reply_intent(
+            active_provider.as_ref(),
+            history[0].content.as_str(),
+            &history,
+            route.model.as_str(),
+            runtime_defaults.temperature,
+        )
+        .await
+        .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
+    };
 
     if let AssistantChannelOutcome::NoReply { reason } = reply_intent {
         let history_response = AssistantChannelOutcome::NoReply {
@@ -5568,6 +5578,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model_routes: Arc::new(config.model_routes.clone()),
         query_classification: config.query_classification.clone(),
         ack_reactions: config.channels_config.ack_reactions,
+        mention_only: false,
+        reply_precheck: config.channels_config.reply_precheck,
         show_tool_calls: config.channels_config.show_tool_calls,
         session_store: if config.channels_config.session_persistence {
             match session_store::SessionStore::new(&config.workspace_dir) {
@@ -6022,6 +6034,8 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -6146,6 +6160,8 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -6227,6 +6243,8 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -6325,6 +6343,8 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: Some(Arc::clone(&store)),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -6924,6 +6944,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -6949,6 +6971,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -7014,6 +7037,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7039,6 +7064,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -7118,6 +7144,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7143,6 +7171,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -7207,6 +7236,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7232,6 +7263,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -7306,6 +7338,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7331,6 +7365,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -7426,6 +7461,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7451,6 +7488,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -7527,6 +7565,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7552,6 +7592,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -7643,6 +7684,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7668,6 +7711,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -7744,6 +7788,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7772,6 +7818,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -7838,6 +7885,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7866,6 +7915,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -8058,6 +8108,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8082,6 +8134,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            is_dm: true,
         })
         .await
         .unwrap();
@@ -8095,6 +8148,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            is_dm: true,
         })
         .await
         .unwrap();
@@ -8170,6 +8224,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8195,6 +8251,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             })
             .await
             .unwrap();
@@ -8209,6 +8266,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             })
             .await
             .unwrap();
@@ -8292,6 +8350,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 matrix: false,
             },
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             multimodal: crate::config::MultimodalConfig::default(),
@@ -8326,6 +8386,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: Some("1741234567.100001".to_string()),
                 interruption_scope_id: Some("1741234567.100001".to_string()),
                 attachments: vec![],
+                is_dm: true,
             })
             .await
             .unwrap();
@@ -8340,6 +8401,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: Some("1741234567.100001".to_string()),
                 interruption_scope_id: Some("1741234567.100001".to_string()),
                 attachments: vec![],
+                is_dm: true,
             })
             .await
             .unwrap();
@@ -8429,6 +8491,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8454,6 +8518,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             })
             .await
             .unwrap();
@@ -8468,6 +8533,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             })
             .await
             .unwrap();
@@ -8535,6 +8601,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8560,6 +8628,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -8622,6 +8691,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8647,6 +8718,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -8709,6 +8781,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8734,6 +8808,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -9270,6 +9345,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            is_dm: true,
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -9287,6 +9363,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: Some("1741234567.123456".into()),
             interruption_scope_id: None,
             attachments: vec![],
+            is_dm: true,
         };
 
         assert_eq!(
@@ -9307,6 +9384,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            is_dm: true,
         };
 
         assert_eq!(followup_thread_id(&msg).as_deref(), Some("msg_abc123"));
@@ -9324,6 +9402,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            is_dm: true,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -9335,6 +9414,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            is_dm: true,
         };
 
         assert_ne!(
@@ -9358,6 +9438,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            is_dm: true,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -9369,6 +9450,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            is_dm: true,
         };
 
         mem.store(
@@ -9501,6 +9583,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -9526,6 +9610,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -9543,6 +9628,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -9642,6 +9728,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -9667,6 +9755,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -9700,6 +9789,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -9739,6 +9829,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -9826,6 +9917,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -9851,6 +9944,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -9942,6 +10036,8 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -9967,6 +10063,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -10529,6 +10626,8 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -10555,6 +10654,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -10625,6 +10725,8 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -10650,6 +10752,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -10667,6 +10770,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -10753,6 +10857,8 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -10780,6 +10886,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -10797,6 +10904,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -10929,6 +11037,8 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(model_routes),
             query_classification: classification_config,
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -10954,6 +11064,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -11049,6 +11160,8 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(model_routes),
             query_classification: classification_config,
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -11074,6 +11187,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -11161,6 +11275,8 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(model_routes),
             query_classification: classification_config,
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -11186,6 +11302,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -11293,6 +11410,8 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(model_routes),
             query_classification: classification_config,
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -11318,6 +11437,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             },
             CancellationToken::new(),
         )
@@ -11476,6 +11596,7 @@ This is an example JSON object for profile settings."#;
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            is_dm: true,
         };
         assert_eq!(interruption_scope_key(&msg), "matrix_room_alice");
     }
@@ -11492,6 +11613,7 @@ This is an example JSON object for profile settings."#;
             thread_ts: Some("$thread1".into()),
             interruption_scope_id: Some("$thread1".into()),
             attachments: vec![],
+            is_dm: true,
         };
         assert_eq!(interruption_scope_key(&msg), "matrix_room_alice_$thread1");
     }
@@ -11509,6 +11631,7 @@ This is an example JSON object for profile settings."#;
             thread_ts: Some("1234567890.000100".into()), // Slack top-level fallback
             interruption_scope_id: None,                 // but NOT a thread reply
             attachments: vec![],
+            is_dm: true,
         };
         assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
     }
@@ -11566,6 +11689,8 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
+            mention_only: false,
+            reply_precheck: false,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -11593,6 +11718,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: Some("1741234567.100001".to_string()),
                 interruption_scope_id: Some("1741234567.100001".to_string()),
                 attachments: vec![],
+                is_dm: true,
             })
             .await
             .unwrap();
@@ -11607,6 +11733,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: Some("1741234567.200002".to_string()),
                 interruption_scope_id: Some("1741234567.200002".to_string()),
                 attachments: vec![],
+                is_dm: true,
             })
             .await
             .unwrap();

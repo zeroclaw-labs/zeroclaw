@@ -500,6 +500,7 @@ impl Channel for DiscordHistoryChannel {
                             thread_ts: None,
                             interruption_scope_id: None,
                             attachments: Vec::new(),
+                            is_dm: is_dm_event,
                         };
                         if tx.send(channel_msg).await.is_err() {
                             break;

@@ -240,6 +240,7 @@ impl Channel for VoiceWakeChannel {
                                         interruption_scope_id: None,
                                         attachments: vec![],
                                         observe_group: false,
+                                        is_dm: true,
                                     };
 
                                     if let Err(e) = tx.send(msg).await {
