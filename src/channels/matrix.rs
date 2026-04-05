@@ -2368,12 +2368,7 @@ mod tests {
             .await
             .expect("update_draft should not error on fallback");
 
-        let sent_len = *ch
-            .multi_message_sent_len
-            .lock()
-            .await
-            .get(room_id)
-            .unwrap();
+        let sent_len = *ch.multi_message_sent_len.lock().await.get(room_id).unwrap();
         assert_eq!(
             sent_len, 0,
             "Counter should be reset to 0 after hitting invalid boundary"

@@ -2470,14 +2470,21 @@ mod tests {
 
         let recipient = "123";
         let text = "🦀文字"; // 🦀(4 bytes), 文(3 bytes), 字(3 bytes). boundaries: 0, 4, 7, 10
-        
+
         // Setup initial sent_len at an invalid boundary (index 2 is middle of 🦀)
-        ch.multi_message_sent_len.lock().insert(recipient.to_string(), 2);
-        
+        ch.multi_message_sent_len
+            .lock()
+            .insert(recipient.to_string(), 2);
+
         // This should trigger the safe fallback in update_draft
-        ch.update_draft(recipient, "msg", text).await.expect("update_draft should not error on fallback");
-        
+        ch.update_draft(recipient, "msg", text)
+            .await
+            .expect("update_draft should not error on fallback");
+
         let sent_len = *ch.multi_message_sent_len.lock().get(recipient).unwrap();
-        assert_eq!(sent_len, 0, "Counter should be reset to 0 after hitting invalid boundary");
+        assert_eq!(
+            sent_len, 0,
+            "Counter should be reset to 0 after hitting invalid boundary"
+        );
     }
 }
