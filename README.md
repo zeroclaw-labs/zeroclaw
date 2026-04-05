@@ -97,6 +97,24 @@ Runtime: Rust stable toolchain. Single binary, no runtime dependencies.
 brew install zeroclaw
 ```
 
+### Cargo Binstall (recommended for Rust users)
+
+If you have [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall), the fastest way to install ZeroClaw:
+
+```bash
+cargo binstall zeroclaw
+```
+
+### Nix (NixOS / Nix users)
+
+ZeroClaw is available as a Nix flake. Run directly without installing:
+
+```bash
+nix run github:zeroclaw-labs/zeroclaw
+```
+
+Or add to your `flake.nix` inputs and use the `zeroclaw` package.
+
 ### One-click bootstrap
 
 ```bash
