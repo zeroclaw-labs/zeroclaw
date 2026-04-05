@@ -58,6 +58,10 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     // heartbeat) can publish real-time events to dashboard clients.
     let (event_tx, _rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
 
+    // Shared canvas store so gateway WebSocket/REST and channel agent tools
+    // operate on the same canvas state.
+    let canvas_store = crate::tools::canvas::CanvasStore::new();
+
     if config.heartbeat.enabled {
         let _ =
             crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir)
@@ -70,6 +74,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
         let gateway_event_tx = event_tx.clone();
+        let gateway_canvas_store = canvas_store.clone();
         handles.push(spawn_component_supervisor(
             "gateway",
             initial_backoff,
@@ -78,8 +83,10 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
                 let tx = gateway_event_tx.clone();
+                let cs = gateway_canvas_store.clone();
                 async move {
-                    Box::pin(crate::gateway::run_gateway(&host, port, cfg, Some(tx))).await
+                    Box::pin(crate::gateway::run_gateway(&host, port, cfg, Some(tx), Some(cs)))
+                        .await
                 }
             },
         ));
@@ -88,13 +95,15 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     {
         if has_supervised_channels(&config) {
             let channels_cfg = config.clone();
+            let channels_canvas_store = canvas_store.clone();
             handles.push(spawn_component_supervisor(
                 "channels",
                 initial_backoff,
                 max_backoff,
                 move || {
                     let cfg = channels_cfg.clone();
-                    async move { Box::pin(crate::channels::start_channels(cfg)).await }
+                    let cs = channels_canvas_store.clone();
+                    async move { Box::pin(crate::channels::start_channels(cfg, Some(cs))).await }
                 },
             ));
         } else {
