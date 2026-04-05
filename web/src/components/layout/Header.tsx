@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
-import { LogOut, Settings, ChevronDown, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
+import { LogOut, Settings, ChevronDown, PanelLeftClose, PanelLeftOpen, Menu } from 'lucide-react';
 import { t, SUPPORTED_LOCALES } from '@/lib/i18n';
 import { useLocaleContext } from '@/App';
 import { useAuth } from '@/hooks/useAuth';
@@ -62,7 +62,7 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
             onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; e.currentTarget.style.background = 'transparent'; }}
             aria-label="Open menu"
           >
-            <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h16M4 18h16" /></svg>
+            <Menu className="h-5 w-5" />
           </button>
 
           {/* Collapse toggle — visible only on desktop */}
