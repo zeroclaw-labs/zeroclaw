@@ -853,7 +853,7 @@ const MINIMAX_ONBOARD_MODELS: [(&str, &str); 7] = [
     ("MiniMax-M2", "MiniMax M2 (legacy)"),
 ];
 
-fn default_model_for_provider(provider: &str) -> String {
+pub(crate) fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "openai" => "gpt-5.2".into(),
