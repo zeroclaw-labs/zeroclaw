@@ -141,13 +141,19 @@ restarting the gateway. Requires the gateway to be running.
 With --new, generates a fresh pairing code even if the gateway \
 was previously paired (useful for adding additional clients).
 
+Use --port to target a gateway running on a non-default port.
+
 Examples:
-  zeroclaw gateway get-paircode       # show current pairing code
-  zeroclaw gateway get-paircode --new # generate a new pairing code")]
+  zeroclaw gateway get-paircode            # show current pairing code
+  zeroclaw gateway get-paircode --new      # generate a new pairing code
+  zeroclaw gateway get-paircode --port 3001 # target gateway on port 3001")]
     GetPaircode {
         /// Generate a new pairing code (even if already paired)
         #[arg(long)]
         new: bool,
+        /// Port of the gateway to connect to (defaults to config gateway.port)
+        #[arg(short, long)]
+        port: Option<u16>,
     },
 }
 
