@@ -202,10 +202,29 @@ async fn handle_clear(
         }
     }
 
+    // Try purge_namespace first for bulk deletion (more efficient, works with SQLite)
     let mut deleted = 0usize;
-    for entry in &entries {
-        if mem.forget(&entry.key).await? {
-            deleted += 1;
+    if let Some(ref cat) = cat {
+        match mem.purge_namespace(&cat.to_string()).await {
+            Ok(n) => {
+                deleted = n;
+            }
+            Err(_) => {
+                // Fall back to individual forget calls (for backends like markdown that
+                // don't support purge_namespace)
+                for entry in &entries {
+                    if mem.forget(&entry.key).await? {
+                        deleted += 1;
+                    }
+                }
+            }
+        }
+    } else {
+        // No category filter - delete all entries individually
+        for entry in &entries {
+            if mem.forget(&entry.key).await? {
+                deleted += 1;
+            }
         }
     }
 
