@@ -568,7 +568,10 @@ impl App {
 }
 
 fn provider_supports_keyless_local_usage(provider_id: &str) -> bool {
-    matches!(provider_id, "ollama" | "llamacpp" | "sglang" | "vllm" | "osaurus")
+    matches!(
+        provider_id,
+        "ollama" | "llamacpp" | "sglang" | "vllm" | "osaurus"
+    )
 }
 
 fn provider_uses_oauth_without_api_key(provider_id: &str) -> bool {
