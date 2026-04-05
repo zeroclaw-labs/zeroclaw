@@ -25,6 +25,23 @@ ZeroClaw supports **WASM plugins** that extend the agent with custom tools, capa
 3. Plugin tools become available to the agent alongside built-in tools.
 4. At runtime, host functions enforce capability boundaries -- a plugin that didn't declare `memory.write` simply cannot call `zeroclaw_memory_store`.
 
+## Safeguards
+
+ZeroClaw plugins include multiple layers of protection:
+
+| Layer | Protection |
+|---|---|
+| **WASM sandbox** | Each plugin runs in an isolated WebAssembly runtime with no shared memory, no filesystem escape, and enforced timeouts |
+| **Capability enforcement** | Host functions verify declared capabilities before executing -- undeclared calls are denied |
+| **Network security levels** | Operators choose from `relaxed`, `default`, `strict`, or `paranoid` to control wildcard usage and context access |
+| **Signature verification** | Ed25519 signatures ensure plugins come from trusted publishers |
+| **Integrity verification** | SHA-256 hashes detect tampering with WASM binaries |
+| **Rate limiting** | Messaging and tool calls are throttled per plugin |
+| **CLI allowlists** | Command execution is restricted to explicit allowlists with argument validation |
+| **Risk level ceiling** | Operators can reject tools above a configured risk threshold |
+
+See [Security Model](security.md) for detailed configuration.
+
 ## Documentation map
 
 | Page | Audience | What's covered |

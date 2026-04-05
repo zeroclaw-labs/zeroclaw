@@ -25,13 +25,14 @@ crate-type = ["cdylib"]
 
 ## Modules
 
-The SDK exports four modules matching the four host capability groups:
+The SDK exports five modules matching the host capability groups:
 
 ```rust
 use zeroclaw_plugin_sdk::memory;
 use zeroclaw_plugin_sdk::tools;
 use zeroclaw_plugin_sdk::messaging;
 use zeroclaw_plugin_sdk::context;
+use zeroclaw_plugin_sdk::cli;
 ```
 
 Each function returns `Result<T, extism_pdk::Error>`.
@@ -236,6 +237,74 @@ let tone = if config.personality_traits.contains(&"formal".into()) {
 } else {
     "casual"
 };
+```
+
+---
+
+## `cli` -- command execution
+
+Execute shell commands with security constraints. Requires `capabilities.cli` in the manifest.
+
+### `cli::cli_exec(command, args, working_dir, env)`
+
+```rust
+pub fn cli_exec(
+    command: &str,
+    args: &[&str],
+    working_dir: Option<&str>,
+    env: Option<HashMap<String, String>>,
+) -> Result<CliResponse, Error>
+```
+
+Execute a CLI command. Returns stdout, stderr, exit code, and flags indicating truncation or timeout.
+
+**Manifest requirement:** command must be in `capabilities.cli.allowed_commands`, arguments must match `allowed_args` patterns, and `working_dir` must be within `allowed_paths`.
+
+```rust
+use zeroclaw_plugin_sdk::cli::cli_exec;
+
+// Simple command
+let response = cli_exec("git", &["status"], None, None)?;
+println!("Exit: {}, Output: {}", response.exit_code, response.stdout);
+
+// With working directory
+let response = cli_exec(
+    "cargo",
+    &["build", "--release"],
+    Some("/workspace/my-project"),
+    None,
+)?;
+
+// With environment variables
+use std::collections::HashMap;
+let mut env = HashMap::new();
+env.insert("GIT_AUTHOR_NAME".to_string(), "Bot".to_string());
+let response = cli_exec("git", &["commit", "-m", "Auto"], Some("/repo"), Some(env))?;
+```
+
+### `CliResponse` struct
+
+```rust
+pub struct CliResponse {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub truncated: bool,   // Output exceeded size limits
+    pub timed_out: bool,   // Command exceeded timeout
+}
+```
+
+### `CliError` enum
+
+```rust
+pub enum CliError {
+    PermissionDenied,                        // Command/args not allowed
+    RateLimited { retry_after_secs: u64 },   // Too many requests
+    CommandNotFound,                         // Binary not on system
+    ExecutionFailed { stderr: String },      // Non-zero exit
+    Timeout,                                 // Exceeded time limit
+    OutputTruncated,                         // Output too large
+}
 ```
 
 ---

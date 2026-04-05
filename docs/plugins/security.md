@@ -19,6 +19,17 @@ ZeroClaw plugins run in a multi-layered security sandbox. This page documents ea
 
 Configured via `[plugins.security].network_security_level` in `config.toml`.
 
+| Level | Wildcards | Context access | Use case |
+|-------|-----------|----------------|----------|
+| `relaxed` | Allowed silently | Allowed | Development, trusted environments |
+| `default` | Allowed with warnings | Allowed | General use |
+| `strict` | Rejected | Allowed | Production |
+| `paranoid` | Rejected | Denied | High-security deployments |
+
+### Relaxed
+
+Most permissive level. All declared capabilities are allowed without warnings. Suitable for development or fully trusted plugin environments.
+
 ### Default
 
 Standard validation. Wildcard `allowed_hosts` and `allowed_tools` produce warnings but are permitted.
@@ -90,6 +101,7 @@ Host functions check the plugin's declared capabilities before executing:
 | `context_session` | `context.session = true` |
 | `context_user_identity` | `context.user_identity = true` |
 | `context_agent_config` | `context.agent_config = true` |
+| `zeroclaw_cli_exec` | Command in `capabilities.cli.allowed_commands` + args match `allowed_args` |
 
 Calls without the required capability return a JSON error:
 

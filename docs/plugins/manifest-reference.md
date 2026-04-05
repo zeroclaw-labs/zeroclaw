@@ -143,6 +143,37 @@ agent_config = true
 
 > **Note:** All context access is denied in Paranoid security level regardless of manifest declarations.
 
+### `[capabilities.cli]`
+
+Allow the plugin to execute shell commands with strict security constraints.
+
+```toml
+[capabilities.cli]
+allowed_commands = ["git", "npm", "cargo"]
+allowed_paths = ["/workspace", "/tmp"]
+allowed_env = ["PATH", "HOME", "GIT_AUTHOR_NAME"]
+
+[capabilities.cli.allowed_args]
+git = ["^(status|log|diff|branch|checkout)$", "^--[a-z-]+$"]
+npm = ["^(install|run|test)$"]
+cargo = ["^(build|test|check)$", "^--release$"]
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `allowed_commands` | array | `[]` | Commands the plugin can execute |
+| `allowed_paths` | array | `[]` | Directories usable as working directory |
+| `allowed_env` | array | `[]` | Environment variables the plugin can pass |
+| `allowed_args.<cmd>` | array | `[]` | Regex patterns for validating arguments per command |
+
+**Security enforcement:**
+- Only listed commands can be executed; others return `PermissionDenied`
+- Each argument is validated against the regex patterns in `allowed_args`
+- Working directory must be within `allowed_paths`
+- Only variables in `allowed_env` are passed to the command
+- Commands are subject to rate limiting and timeouts
+- Large outputs are truncated to prevent memory exhaustion
+
 ---
 
 ## Tools
