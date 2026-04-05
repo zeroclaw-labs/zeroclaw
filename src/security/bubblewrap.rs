@@ -45,6 +45,16 @@ impl Sandbox for BubblewrapSandbox {
             "--ro-bind",
             "/usr",
             "/usr",
+            // Create symlinks for merged-usr systems (Debian Bookworm, etc.)
+            // where /lib and /lib64 point to /usr/lib and /usr/lib64.
+            // Without these, the dynamic linker at /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+            // is unreachable, causing "No such file or directory" on every execvp.
+            "--symlink",
+            "usr/lib",
+            "/lib",
+            "--symlink",
+            "usr/lib64",
+            "/lib64",
             "--dev",
             "/dev",
             "--proc",
