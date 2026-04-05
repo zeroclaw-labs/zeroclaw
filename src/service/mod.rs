@@ -750,7 +750,7 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
          After=network.target\n\
          \n\
          [Service]\n\
-         Type=simple\n\
+         Type=forking\n\
          ExecStart={exe} daemon\n\
          Restart=always\n\
          RestartSec=3\n\
