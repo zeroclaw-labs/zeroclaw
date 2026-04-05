@@ -227,6 +227,8 @@ impl RedditChannel {
             thread_ts: item.parent_id.clone(),
             interruption_scope_id: None,
             attachments: vec![],
+            is_dm: item.message_type.as_deref() != Some("comment_reply")
+                && item.parent_id.is_none(),
         })
     }
 }

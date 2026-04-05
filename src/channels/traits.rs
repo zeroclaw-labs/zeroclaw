@@ -22,6 +22,8 @@ pub struct ChannelMessage {
     /// Channels populate this when they receive media alongside a text message.
     /// Defaults to empty — existing channels are unaffected.
     pub attachments: Vec<super::media_pipeline::MediaAttachment>,
+    /// Whether this is a direct message (true) or group chat message (false).
+    pub is_dm: bool,
 }
 
 /// Message to send through a channel
@@ -257,6 +259,7 @@ mod tests {
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                is_dm: true,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -275,6 +278,7 @@ mod tests {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            is_dm: true,
         };
 
         let cloned = message.clone();
