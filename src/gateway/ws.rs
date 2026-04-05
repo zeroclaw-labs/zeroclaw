@@ -280,8 +280,16 @@ async fn handle_socket(
                         let user_msg = crate::providers::ChatMessage::user(&content);
                         let _ = backend.append(&session_key, &user_msg);
                     }
-                    process_chat_message(&state, &mut agent, &mut sender, &content, &session_key)
-                        .await;
+                    let model = parsed["model"].as_str();
+                    process_chat_message(
+                        &state,
+                        &mut agent,
+                        &mut sender,
+                        &content,
+                        &session_key,
+                        model,
+                    )
+                    .await;
                 }
             } else {
                 let unknown_type = parsed["type"].as_str().unwrap_or("unknown");

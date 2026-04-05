@@ -781,7 +781,9 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = model.map(String::from).unwrap_or_else(|| self.classify_model(user_message));
+        let effective_model = model
+            .map(String::from)
+            .unwrap_or_else(|| self.classify_model(user_message));
 
         for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
@@ -960,7 +962,9 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = model.map(String::from).unwrap_or_else(|| self.classify_model(user_message));
+        let effective_model = model
+            .map(String::from)
+            .unwrap_or_else(|| self.classify_model(user_message));
 
         // ── Turn loop ──────────────────────────────────────────────────
         for _ in 0..self.config.max_tool_iterations {

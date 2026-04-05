@@ -1166,7 +1166,11 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Daemon { port, host, no_fork: _ } => {
+        Commands::Daemon {
+            port,
+            host,
+            no_fork: _,
+        } => {
             if let Ok(exe) = std::env::current_exe() {
                 let exe_str = exe.to_string_lossy();
                 if exe_str.contains(".cargo/bin") || exe_str.contains("/home/") {
