@@ -1058,7 +1058,12 @@ impl SecurityPolicy {
         for segment in &segments {
             let cmd_part = skip_env_assignments(segment);
             let mut words = cmd_part.split_whitespace();
-            let executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
+                &raw_executable[..idx]
+            } else {
+                raw_executable
+            };
             let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
             let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
 
@@ -1192,7 +1197,15 @@ impl SecurityPolicy {
             let cmd_part = skip_env_assignments(segment);
 
             let mut words = cmd_part.split_whitespace();
-            let executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            // Strip inline redirections from the executable token, e.g.
+            // `cat</dev/null` -> `cat`, so the allowlist check sees the real
+            // command name rather than the redirect target path.
+            let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
+                &raw_executable[..idx]
+            } else {
+                raw_executable
+            };
             let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
             let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
 

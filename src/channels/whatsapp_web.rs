@@ -31,6 +31,7 @@ use super::whatsapp_storage::RusqliteStore;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::select;
 use wa_rs_proto::whatsapp::device_props::PlatformType;
@@ -1121,7 +1122,7 @@ impl Channel for WhatsAppWebChannel {
                                 let sender_jid = info.source.sender.clone();
                                 let sender_alt = info.source.sender_alt.clone();
                                 let sender = sender_jid.user().to_string();
-                                let is_group = info.source.chat.is_group();
+                                let _is_group = info.source.chat.is_group();
                                 let chat = info.source.chat.to_string();
 
                                 let mapped_phone = if sender_jid.is_lid() {
@@ -1144,6 +1145,12 @@ impl Channel for WhatsAppWebChannel {
 
                                 let is_group = info.source.is_group;
 
+                                // Phone-based reply target for self-chat.
+                                // LID JIDs (e.g. 76188559093817@lid) are internal
+                                // identifiers that cannot receive messages; replies
+                                // must go to the phone JID (digits@s.whatsapp.net).
+                                let mut reply_target = chat.clone();
+
                                 // ── Personal-mode chat-type policy filtering ──
                                 if wa_mode == crate::config::WhatsAppWebMode::Personal {
                                     // Self-chat: the chat JID user part matches
@@ -1163,7 +1170,23 @@ impl Channel for WhatsAppWebChannel {
                                             );
                                             return;
                                         }
-                                        // self_chat_mode=true: always process, skip further policy checks
+                                        // self_chat_mode=true: always process, skip further policy checks.
+                                        //
+                                        // When the chat JID is LID-based, replies
+                                        // won't be delivered. Convert to a phone
+                                        // JID so the reply shows up in the self-chat.
+                                        if info.source.chat.is_lid() {
+                                            let phone_digits = normalized
+                                                .as_ref()
+                                                .map(|n| n.chars().filter(|c| c.is_ascii_digit()).collect::<String>())
+                                                .filter(|d| !d.is_empty());
+                                            if let Some(digits) = phone_digits {
+                                                reply_target = format!("{digits}@s.whatsapp.net");
+                                                tracing::debug!(
+                                                    "WhatsApp Web: self-chat LID→phone reply target: {reply_target}"
+                                                );
+                                            }
+                                        }
                                     } else if is_group {
                                         match wa_group_policy {
                                             crate::config::WhatsAppChatPolicy::Ignore => {
@@ -1339,7 +1362,9 @@ impl Channel for WhatsAppWebChannel {
                                         channel: "whatsapp".to_string(),
                                         sender: normalized.clone(),
                                         // Reply to the originating chat JID (DM or group).
-                                        reply_target: chat,
+                                        // For self-chat with LID JIDs, this is the
+                                        // resolved phone JID (see above).
+                                        reply_target,
                                         content,
                                         timestamp: chrono::Utc::now().timestamp() as u64,
                                         thread_ts: None,

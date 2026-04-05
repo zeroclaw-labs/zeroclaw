@@ -110,6 +110,7 @@ mod skills;
 mod sop;
 mod tools;
 mod trust;
+mod tui;
 mod tunnel;
 mod util;
 mod verifiable_intent;
@@ -195,6 +196,10 @@ enum Commands {
         /// Skip interactive prompts and use quick setup with defaults
         #[arg(long)]
         quick: bool,
+
+        /// Use the ratatui-based TUI onboarding wizard
+        #[arg(long)]
+        tui: bool,
     },
 
     /// Start the AI agent loop
@@ -873,6 +878,7 @@ async fn main() -> Result<()> {
         model,
         memory,
         quick,
+        tui: use_tui,
     } = &cli.command
     {
         let force = *force;
@@ -883,6 +889,7 @@ async fn main() -> Result<()> {
         let model = model.clone();
         let memory = memory.clone();
         let quick = *quick;
+        let use_tui = *use_tui;
 
         if reinit && channels_only {
             bail!("--reinit and --channels-only cannot be used together");
@@ -946,6 +953,12 @@ async fn main() -> Result<()> {
             api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some();
         let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
         let env_interactive = std::env::var("ZEROCLAW_INTERACTIVE").as_deref() == Ok("1");
+
+        // TUI onboarding mode (ratatui-based)
+        if use_tui {
+            Box::pin(tui::run_tui_onboarding()).await?;
+            return Ok(());
+        }
 
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
@@ -1083,7 +1096,7 @@ async fn main() -> Result<()> {
                     }
 
                     log_gateway_start(&host, port);
-                    Box::pin(gateway::run_gateway(&host, port, config)).await
+                    Box::pin(gateway::run_gateway(&host, port, config, None)).await
                 }
                 Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
                     let port = config.gateway.port;
@@ -1136,13 +1149,13 @@ async fn main() -> Result<()> {
                 Some(zeroclaw::GatewayCommands::Start { port, host }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     log_gateway_start(&host, port);
-                    Box::pin(gateway::run_gateway(&host, port, config)).await
+                    Box::pin(gateway::run_gateway(&host, port, config, None)).await
                 }
                 None => {
                     let port = config.gateway.port;
                     let host = config.gateway.host.clone();
                     log_gateway_start(&host, port);
-                    Box::pin(gateway::run_gateway(&host, port, config)).await
+                    Box::pin(gateway::run_gateway(&host, port, config, None)).await
                 }
             }
         }
