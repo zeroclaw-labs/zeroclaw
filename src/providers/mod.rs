@@ -857,7 +857,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
                 if let Some(credential) = resolve_minimax_oauth_refresh_token(name) {
                     return Some(credential);
                 }
-            } else if name == "anthropic" || name == "openai" || name == "groq" {
+            } else if name == "anthropic" || name == "openai" || name == "groq" || name == "bedrock" || name == "aws-bedrock" {
                 // For well-known providers, prefer provider-specific env vars over the
                 // global api_key override, since the global key may belong to a different
                 // provider (e.g. a custom: gateway). This enables multi-provider setups
@@ -866,6 +866,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
                     "anthropic" => &["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
                     "openai" => &["OPENAI_API_KEY"],
                     "groq" => &["GROQ_API_KEY"],
+                    "bedrock" | "aws-bedrock" => &["BEDROCK_API_KEY"],
                     _ => &[],
                 };
                 for env_var in env_candidates {
@@ -876,6 +877,21 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
                         }
                     }
                 }
+
+                // For Bedrock, we only use the override if it's NOT a generic generic API_KEY override.
+                // If it looks generic, we return None here to fall through to the internal
+                // SigV4 fallback logic.
+                if name == "bedrock" || name == "aws-bedrock" {
+                    let generic_vars = ["API_KEY", "ZEROCLAW_API_KEY"];
+                    let looks_generic = generic_vars.iter().any(|&var| {
+                        std::env::var(var).ok().map(|val| val.trim().to_string())
+                            == Some(trimmed_override.to_owned())
+                    });
+                    if looks_generic {
+                        return None;
+                    }
+                }
+
                 return Some(trimmed_override.to_owned());
             } else {
                 return Some(trimmed_override.to_owned());
@@ -2425,6 +2441,17 @@ mod tests {
         let resolved = resolve_provider_credential("minimax", Some(MINIMAX_OAUTH_PLACEHOLDER));
 
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_provider_credential_bedrock_ignores_generic_api_key_override() {
+        let _env_lock = env_lock();
+        let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
+        let _bedrock_guard = EnvGuard::set("BEDROCK_API_KEY", None);
+
+        // This is the bug! It currently returns Some("generic-key") instead of None.
+        let resolved = resolve_provider_credential("bedrock", Some("generic-key"));
+        assert!(resolved.is_none(), "Bedrock should have ignored the generic API_KEY override to fall back to SigV4, but got {:?}", resolved);
     }
 
     #[test]
