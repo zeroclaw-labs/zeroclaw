@@ -1554,6 +1554,12 @@ pub struct SkillsConfig {
     /// Default: `false` (secure by default).
     #[serde(default)]
     pub allow_scripts: bool,
+    /// When non-empty, only skills whose name matches one of these entries are
+    /// loaded into the system prompt. Other skills remain installed but are not
+    /// injected. An empty list (default) means all discovered skills are loaded.
+    /// Skill names are matched case-insensitively.
+    #[serde(default)]
+    pub whitelist: Vec<String>,
     /// Controls how skills are injected into the system prompt.
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
