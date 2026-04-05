@@ -6219,6 +6219,12 @@ pub struct ChannelsConfig {
     /// Default: `false`.
     #[serde(default)]
     pub reply_precheck: bool,
+    /// Maximum concurrent LLM requests per channel. Controls how many messages
+    /// can be processed simultaneously. Lower values prevent saturating
+    /// backends with limited slots (e.g. llama.cpp `--parallel 3`).
+    /// Default: `4`.
+    #[serde(default = "default_max_concurrent_per_channel")]
+    pub max_concurrent_per_channel: usize,
 }
 
 impl ChannelsConfig {
@@ -6343,6 +6349,10 @@ impl ChannelsConfig {
 
 fn default_channel_message_timeout_secs() -> u64 {
     300
+}
+
+fn default_max_concurrent_per_channel() -> usize {
+    4
 }
 
 fn default_session_backend() -> String {

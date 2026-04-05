@@ -211,8 +211,7 @@ const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
 const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
 /// Cap timeout scaling so large max_tool_iterations values do not create unbounded waits.
 const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
-const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
-const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
+const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 2;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
@@ -358,6 +357,7 @@ struct ChannelCostTrackingState {
 }
 
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)]
 struct ChannelRuntimeContext {
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
     provider: Arc<dyn Provider>,
@@ -2401,9 +2401,9 @@ fn spawn_supervised_listener_with_health_interval(
     })
 }
 
-fn compute_max_in_flight_messages(channel_count: usize) -> usize {
+fn compute_max_in_flight_messages(channel_count: usize, per_channel: usize) -> usize {
     channel_count
-        .saturating_mul(CHANNEL_PARALLELISM_PER_CHANNEL)
+        .saturating_mul(per_channel)
         .clamp(
             CHANNEL_MIN_IN_FLIGHT_MESSAGES,
             CHANNEL_MAX_IN_FLIGHT_MESSAGES,
@@ -5501,7 +5501,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
-    let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
+    let max_in_flight_messages = compute_max_in_flight_messages(
+        channels.len(),
+        config.channels_config.max_concurrent_per_channel,
+    );
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
 
