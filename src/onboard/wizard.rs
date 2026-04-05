@@ -3145,6 +3145,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => "NVIDIA_API_KEY",
         "astrai" => "ASTRAI_API_KEY",
         "avian" => "AVIAN_API_KEY",
+        "copilot" => "GITHUB_TOKEN",
         _ => "API_KEY",
     }
 }
@@ -7210,9 +7211,9 @@ mod tests {
         assert!(ids.contains(&"gpt-4o".to_string()));
         assert!(ids.contains(&"gpt-4.1".to_string()));
         assert!(ids.contains(&"gpt-5-mini".to_string()));
-        assert!(ids.contains(&"claude-sonnet-4-6".to_string()));
+        assert!(ids.contains(&"claude-sonnet-4.6".to_string()));
         assert!(ids.contains(&"gpt-5.3-codex".to_string()));
-        assert!(ids.contains(&"claude-opus-4-6".to_string()));
+        assert!(ids.contains(&"claude-opus-4.6".to_string()));
     }
 
     #[test]
