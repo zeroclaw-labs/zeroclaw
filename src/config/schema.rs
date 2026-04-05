@@ -2777,6 +2777,21 @@ pub struct WebSearchConfig {
     /// SearXNG instance URL (required if provider is "searxng"), e.g. "https://searx.example.com"
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
+    /// SearXNG authentication token
+    #[serde(default)]
+    pub searxng_auth_token: Option<String>,
+    /// SearXNG language (e.g. "en-US", "ja-JP", or "auto")
+    #[serde(default = "default_searxng_language")]
+    pub searxng_language: String,
+    /// CSV list of SearXNG engines to search (e.g. "google,bing")
+    #[serde(default)]
+    pub searxng_engines: String,
+    /// SearXNG SafeSearch level (0=none, 1=moderate, 2=strict)
+    #[serde(default)]
+    pub searxng_safesearch: u8,
+    /// Maximum number of retries for SearXNG
+    #[serde(default = "default_searxng_max_retries")]
+    pub searxng_max_retries: usize,
     /// Maximum results per search (1-10)
     #[serde(default = "default_web_search_max_results")]
     pub max_results: usize,
@@ -2797,6 +2812,14 @@ fn default_web_search_timeout_secs() -> u64 {
     15
 }
 
+fn default_searxng_language() -> String {
+    "auto".into()
+}
+
+fn default_searxng_max_retries() -> usize {
+    3
+}
+
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
@@ -2804,6 +2827,11 @@ impl Default for WebSearchConfig {
             provider: default_web_search_provider(),
             brave_api_key: None,
             searxng_instance_url: None,
+            searxng_auth_token: None,
+            searxng_language: default_searxng_language(),
+            searxng_engines: String::new(),
+            searxng_safesearch: 0,
+            searxng_max_retries: default_searxng_max_retries(),
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
         }
@@ -9053,6 +9081,11 @@ impl Config {
                 &mut config.web_search.brave_api_key,
                 "config.web_search.brave_api_key",
             )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.web_search.searxng_auth_token,
+                "config.web_search.searxng_auth_token",
+            )?;
 
             decrypt_optional_secret(
                 &store,
@@ -10526,6 +10559,11 @@ impl Config {
             &store,
             &mut config_to_save.web_search.brave_api_key,
             "config.web_search.brave_api_key",
+        )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.web_search.searxng_auth_token,
+            "config.web_search.searxng_auth_token",
         )?;
 
         encrypt_optional_secret(
