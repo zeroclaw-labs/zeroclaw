@@ -129,12 +129,22 @@ pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
 
 /// Load skills using runtime config values (preferred at runtime).
 pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Config) -> Vec<Skill> {
-    load_skills_with_open_skills_config(
+    let mut skills = load_skills_with_open_skills_config(
         workspace_dir,
         Some(config.skills.open_skills_enabled),
         config.skills.open_skills_dir.as_deref(),
         Some(config.skills.allow_scripts),
-    )
+    );
+
+    // Apply whitelist filter: when non-empty, only keep skills whose name
+    // matches one of the whitelist entries (case-insensitive).
+    let whitelist = &config.skills.whitelist;
+    if !whitelist.is_empty() {
+        let lower: Vec<String> = whitelist.iter().map(|s| s.to_lowercase()).collect();
+        skills.retain(|skill| lower.contains(&skill.name.to_lowercase()));
+    }
+
+    skills
 }
 
 /// Load skills using explicit open-skills settings.
