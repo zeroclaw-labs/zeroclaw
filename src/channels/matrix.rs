@@ -1622,7 +1622,9 @@ impl Channel for MatrixChannel {
                 let new_text = match text.get(sent_so_far..) {
                     Some(slice) => slice,
                     None => {
-                        // sent_so_far is not on a char boundary — reset safely.
+                        // Falling back to 0 if sent_so_far is not on a char boundary. While this
+                        // prevents a panic, it may cause re-delivery of already sent paragraphs.
+                        // Note: In practice, offsets originate from \n boundaries and should be safe.
                         sent_map.insert(room_id.clone(), 0);
                         return Ok(());
                     }
@@ -1647,13 +1649,15 @@ impl Channel for MatrixChannel {
                         in_fence = !in_fence;
                     }
 
-                    // Detect \n\n paragraph boundary outside fences.
                     if !in_fence
                         && ch == b'\n'
                         && scan_pos + 1 < bytes.len()
                         && bytes[scan_pos + 1] == b'\n'
                     {
-                        let paragraph = new_text[..scan_pos].trim().to_string();
+                        let Some(para) = new_text.get(..scan_pos) else {
+                            continue;
+                        };
+                        let paragraph = para.trim().to_string();
                         if !paragraph.is_empty() {
                             let msg = SendMessage::new(&paragraph, recipient)
                                 .in_thread(thread_ts.clone());
@@ -2325,5 +2329,54 @@ mod tests {
         let sanitized = MatrixChannel::sanitize_error_for_log(&"auth failed: sk-proj-abc123xyz");
         assert!(!sanitized.contains("sk-proj-abc123xyz"));
         assert!(sanitized.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn channel_name_is_matrix() {
+        let ch = make_channel();
+        assert_eq!(ch.name(), "matrix");
+    }
+
+    #[test]
+    fn matrix_allowlist_filters() {
+        let ch = MatrixChannel::new(
+            "h".into(),
+            "t".into(),
+            "r".into(),
+            vec!["@alice:m".into(), "@bob:m".into()],
+        );
+        assert!(ch.is_user_allowed("@alice:m"));
+        assert!(ch.is_user_allowed("@bob:m"));
+        assert!(!ch.is_user_allowed("@eve:m"));
+    }
+
+    #[tokio::test]
+    async fn update_draft_multibyte_boundary_safety() {
+        let ch = make_channel().with_streaming(crate::config::StreamMode::MultiMessage, 1000, 800);
+
+        let room_id = "!room:matrix.org";
+        let text = "🦀文字"; // 🦀(4 bytes), 文(3 bytes), 字(3 bytes). boundaries: 0, 4, 7, 10
+
+        // Setup initial sent_len at an invalid boundary (index 2 is middle of 🦀)
+        ch.multi_message_sent_len
+            .lock()
+            .await
+            .insert(room_id.to_string(), 2);
+
+        // This should trigger the safe fallback in update_draft
+        ch.update_draft(room_id, "msg", text)
+            .await
+            .expect("update_draft should not error on fallback");
+
+        let sent_len = *ch
+            .multi_message_sent_len
+            .lock()
+            .await
+            .get(room_id)
+            .unwrap();
+        assert_eq!(
+            sent_len, 0,
+            "Counter should be reset to 0 after hitting invalid boundary"
+        );
     }
 }

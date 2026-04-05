@@ -1413,7 +1413,9 @@ impl Channel for DiscordChannel {
                     let new_text = match text.get(sent_so_far..) {
                         Some(slice) => slice,
                         None => {
-                            // sent_so_far is not on a char boundary — reset safely.
+                            // Falling back to 0 if sent_so_far is not on a char boundary. While this
+                            // prevents a panic, it may cause re-delivery of already sent paragraphs.
+                            // Note: In practice, offsets originate from \n boundaries and should be safe.
                             sent_map.insert(recipient.to_string(), 0);
                             return Ok(());
                         }
@@ -1440,7 +1442,10 @@ impl Channel for DiscordChannel {
                             && scan_pos + 1 < bytes.len()
                             && bytes[scan_pos + 1] == b'\n'
                         {
-                            let paragraph = new_text[..scan_pos].trim().to_string();
+                            let Some(para) = new_text.get(..scan_pos) else {
+                                continue;
+                            };
+                            let paragraph = para.trim().to_string();
                             let consumed = scan_pos + 2;
                             *sent_map.entry(recipient.to_string()).or_insert(0) += consumed;
                             if !paragraph.is_empty() {
@@ -2452,5 +2457,27 @@ mod tests {
     fn split_message_for_discord_multi_empty_input() {
         let chunks = split_message_for_discord_multi("", 2000);
         assert!(chunks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_draft_multibyte_boundary_safety() {
+        use crate::config::StreamMode;
+        let ch = DiscordChannel::new("t".into(), None, vec![], false, false).with_streaming(
+            StreamMode::MultiMessage,
+            1000,
+            800,
+        );
+
+        let recipient = "123";
+        let text = "🦀文字"; // 🦀(4 bytes), 文(3 bytes), 字(3 bytes). boundaries: 0, 4, 7, 10
+        
+        // Setup initial sent_len at an invalid boundary (index 2 is middle of 🦀)
+        ch.multi_message_sent_len.lock().insert(recipient.to_string(), 2);
+        
+        // This should trigger the safe fallback in update_draft
+        ch.update_draft(recipient, "msg", text).await.expect("update_draft should not error on fallback");
+        
+        let sent_len = *ch.multi_message_sent_len.lock().get(recipient).unwrap();
+        assert_eq!(sent_len, 0, "Counter should be reset to 0 after hitting invalid boundary");
     }
 }
