@@ -1299,7 +1299,11 @@ if [[ "$SKIP_BUILD" == false ]]; then
   fi
 
   step_dot "Building release binary"
-  cargo build --release --locked "${CARGO_FEATURE_ARGS[@]}"
+  if [[ ${#CARGO_FEATURE_ARGS[@]} -gt 0 ]]; then
+    cargo build --release --locked "${CARGO_FEATURE_ARGS[@]}"
+  else
+    cargo build --release --locked
+  fi
   step_ok "Release binary built"
 else
   step_dot "Skipping build"
@@ -1318,7 +1322,11 @@ if [[ "$SKIP_INSTALL" == false ]]; then
     fi
   fi
 
-  cargo install --path "$WORK_DIR" --force --locked "${CARGO_FEATURE_ARGS[@]}"
+  if [[ ${#CARGO_FEATURE_ARGS[@]} -gt 0 ]]; then
+    cargo install --path "$WORK_DIR" --force --locked "${CARGO_FEATURE_ARGS[@]}"
+  else
+    cargo install --path "$WORK_DIR" --force --locked
+  fi
   step_ok "ZeroClaw installed"
 
   # Sync binary to ~/.local/bin so PATH lookups find the fresh version
