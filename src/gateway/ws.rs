@@ -280,8 +280,16 @@ async fn handle_socket(
                         let user_msg = crate::providers::ChatMessage::user(&content);
                         let _ = backend.append(&session_key, &user_msg);
                     }
-                    process_chat_message(&state, &mut agent, &mut sender, &content, &session_key)
-                        .await;
+                    let model = parsed["model"].as_str();
+                    process_chat_message(
+                        &state,
+                        &mut agent,
+                        &mut sender,
+                        &content,
+                        &session_key,
+                        model,
+                    )
+                    .await;
                 }
             } else {
                 let unknown_type = parsed["type"].as_str().unwrap_or("unknown");
@@ -355,6 +363,10 @@ async fn handle_socket(
                     continue;
                 }
 
+                // Optional model override from the UI: allows per-request model
+                // selection when the user switches models in the UI.
+                let model = parsed["model"].as_str();
+
                 // Acquire session lock to serialize concurrent turns
                 let _session_guard = match state.session_queue.acquire(&session_key).await {
                     Ok(guard) => guard,
@@ -375,7 +387,7 @@ async fn handle_socket(
                     let _ = backend.append(&session_key, &user_msg);
                 }
 
-                process_chat_message(&state, &mut agent, &mut sender, &content, &session_key).await;
+                process_chat_message(&state, &mut agent, &mut sender, &content, &session_key, model).await;
             }
 
             // ── Broadcast event (cron/heartbeat results) ──────────────
@@ -392,12 +404,16 @@ async fn handle_socket(
 ///
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
 /// and tool results are forwarded to the WebSocket client in real time.
+///
+/// The `model` parameter, when provided, overrides the agent's default model,
+/// enabling per-request model selection (e.g., when a user switches models in the UI).
 async fn process_chat_message(
     state: &AppState,
     agent: &mut crate::agent::Agent,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     content: &str,
     session_key: &str,
+    model: Option<&str>,
 ) {
     use crate::agent::TurnEvent;
 
@@ -430,7 +446,7 @@ async fn process_chat_message(
     // instead — `turn_streamed` writes to the channel and we drain it
     // from the other branch.
     let content_owned = content.to_string();
-    let turn_fut = async { agent.turn_streamed(&content_owned, event_tx).await };
+    let turn_fut = async { agent.turn_streamed(&content_owned, event_tx, model).await };
 
     // Drive both futures concurrently: the agent turn produces events
     // and we relay them over WebSocket.
