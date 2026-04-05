@@ -794,6 +794,65 @@ pub async fn handle_api_health(
     Json(serde_json::json!({"health": snapshot})).into_response()
 }
 
+/// Channel detail information for the dashboard
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChannelDetail {
+    pub name: String,
+    pub r#type: String,
+    pub enabled: bool,
+    pub status: String, // "active", "inactive", "error"
+    pub message_count: u64,
+    pub last_message_at: Option<String>,
+    pub health: String, // "healthy", "degraded", "down"
+}
+
+/// GET /api/channels — list all configured channels with status
+pub async fn handle_api_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let health_snapshot = crate::health::snapshot();
+
+    let mut channels: Vec<ChannelDetail> = Vec::new();
+
+    for (channel_config, enabled) in config.channels_config.channels() {
+        let name = channel_config.name().to_string();
+        let channel_type = name.clone();
+
+        // Determine health status from health snapshot
+        let (status, health) = if enabled {
+            if let Some(component_health) = health_snapshot.components.get(&name) {
+                match component_health.status.as_str() {
+                    "ok" => ("active".to_string(), "healthy".to_string()),
+                    "error" => ("error".to_string(), "down".to_string()),
+                    _ => ("inactive".to_string(), "degraded".to_string()),
+                }
+            } else {
+                ("active".to_string(), "healthy".to_string())
+            }
+        } else {
+            ("inactive".to_string(), "down".to_string())
+        };
+
+        channels.push(ChannelDetail {
+            name,
+            r#type: channel_type,
+            enabled,
+            status,
+            message_count: 0,
+            last_message_at: None,
+            health,
+        });
+    }
+
+    Json(serde_json::json!({"channels": channels})).into_response()
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn is_masked_secret(value: &str) -> bool {
@@ -1292,10 +1351,22 @@ pub async fn handle_api_sessions_list(
         .into_iter()
         .filter_map(|meta| {
             let session_id = meta.key.strip_prefix("gw_")?;
+            // Extract channel from session key if present (format: gw_{channel}_{id})
+            // Otherwise default to "gateway"
+            let channel = "gateway";
+            // Determine status based on session state
+            let status = backend.get_session_state(&meta.key)
+                .ok()
+                .flatten()
+                .map(|s| s.state)
+                .unwrap_or_else(|| "idle".to_string());
+
             let mut entry = serde_json::json!({
-                "session_id": session_id,
-                "created_at": meta.created_at.to_rfc3339(),
+                "id": session_id,
+                "channel": channel,
+                "started_at": meta.created_at.to_rfc3339(),
                 "last_activity": meta.last_activity.to_rfc3339(),
+                "status": status,
                 "message_count": meta.message_count,
             });
             if let Some(name) = meta.name {
@@ -1449,9 +1520,11 @@ pub async fn handle_api_sessions_running(
         .filter_map(|meta| {
             let session_id = meta.key.strip_prefix("gw_")?;
             Some(serde_json::json!({
-                "session_id": session_id,
-                "created_at": meta.created_at.to_rfc3339(),
+                "id": session_id,
+                "channel": "gateway",
+                "started_at": meta.created_at.to_rfc3339(),
                 "last_activity": meta.last_activity.to_rfc3339(),
+                "status": "running",
                 "message_count": meta.message_count,
             }))
         })
