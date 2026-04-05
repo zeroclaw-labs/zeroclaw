@@ -8949,6 +8949,13 @@ impl Config {
             .await
             .context("Failed to create workspace directory")?;
 
+        // Create the `home` directory required by firejail's --private=home option.
+        // Firejail will fail with "invalid private directory" if this directory
+        // does not exist when the firejail backend is active.
+        fs::create_dir_all(&workspace_dir.join("home"))
+            .await
+            .context("Failed to create workspace/home directory for firejail")?;
+
         ensure_bootstrap_files(&workspace_dir).await?;
 
         if config_path.exists() {
