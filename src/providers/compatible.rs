@@ -446,12 +446,13 @@ impl OpenAiCompatibleProvider {
         tools
             .iter()
             .map(|tool| {
+                let params = crate::tools::SchemaCleanr::clean_for_openai(tool.parameters.clone());
                 serde_json::json!({
                     "type": "function",
                     "function": {
                         "name": tool.name,
                         "description": tool.description,
-                        "parameters": tool.parameters
+                        "parameters": params
                     }
                 })
             })
@@ -1390,12 +1391,14 @@ impl OpenAiCompatibleProvider {
             items
                 .iter()
                 .map(|tool| {
+                    let params =
+                        crate::tools::SchemaCleanr::clean_for_openai(tool.parameters.clone());
                     serde_json::json!({
                         "type": "function",
                         "function": {
                             "name": tool.name,
                             "description": tool.description,
-                            "parameters": tool.parameters,
+                            "parameters": params,
                         }
                     })
                 })
