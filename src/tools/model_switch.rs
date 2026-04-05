@@ -211,12 +211,40 @@ impl ModelSwitchTool {
         // Return common models for known providers
         let models = match provider.to_lowercase().as_str() {
             "openai" => vec![
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-4.1",
                 "gpt-4o",
                 "gpt-4o-mini",
                 "gpt-4-turbo",
                 "gpt-4",
                 "gpt-3.5-turbo",
             ],
+            "copilot" | "github-copilot" => {
+                vec![
+                    "gpt-5.4",
+                    "gpt-5.4-mini",
+                    "gpt-5.3",
+                    "gpt-5.3-codex",
+                    "gpt-5.2",
+                    "gpt-5.2-codex",
+                    "gpt-5.1",
+                    "gpt-5.1-codex",
+                    "gpt-5.1-codex-max",
+                    "gpt-5-mini",
+                    "gpt-4.1",
+                    "gpt-4o",
+                    "claude-opus-4.6",
+                    "claude-opus-4.5",
+                    "claude-sonnet-4.5",
+                    "claude-haiku-4.5",
+                    "gemini-3.1-pro",
+                    "gemini-3-pro",
+                    "gemini-3-flash",
+                    "gemini-2.5-pro",
+                    "grok-code-fast-1",
+                ]
+            }
             "anthropic" => vec![
                 "claude-sonnet-4-6",
                 "claude-sonnet-4-5",
@@ -242,7 +270,15 @@ impl ModelSwitchTool {
                 "mistral-small-latest",
                 "mistral-nemo",
             ],
-            "google" | "gemini" => vec!["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
+            "google" | "gemini" => vec![
+                "gemini-3.1-pro",
+                "gemini-3-pro",
+                "gemini-3-flash",
+                "gemini-2.5-pro",
+                "gemini-2.0-flash",
+                "gemini-1.5-pro",
+                "gemini-1.5-flash",
+            ],
             "xai" | "grok" => vec!["grok-2", "grok-2-vision", "grok-beta"],
             _ => vec![],
         };

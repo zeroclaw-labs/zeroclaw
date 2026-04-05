@@ -129,6 +129,12 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("    2. Run: zeroclaw onboard");
             println!("    Access 200+ models with one key.");
         }
+        "GitHub Copilot" => {
+            println!("  Setup:");
+            println!("    1. Run: zeroclaw models auth login-github-copilot");
+            println!("    2. Set provider to 'copilot' in config.toml");
+            println!("    3. Pick a Copilot model from the Configuration dropdown");
+        }
         "Ollama" => {
             println!("  Setup:");
             println!("    1. Install: brew install ollama");

@@ -11,6 +11,8 @@
 //! GitHub could change or revoke this at any time, which would break all
 //! third-party integrations simultaneously.
 
+use crate::auth::{self, AuthService};
+use crate::providers::ProviderRuntimeOptions;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     Provider, TokenUsage, ToolCall as ProviderToolCall,
@@ -19,45 +21,41 @@ use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::warn;
 
-/// GitHub OAuth client ID for Copilot (VS Code extension).
-const GITHUB_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
-const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
-const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const GITHUB_API_KEY_URL: &str = "https://api.github.com/copilot_internal/v2/token";
 const DEFAULT_API: &str = "https://api.githubcopilot.com";
+const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 8_192;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopilotTransportApi {
+    AnthropicMessages,
+    OpenAiResponses,
+}
+
+fn resolve_copilot_transport_api(model_id: &str) -> CopilotTransportApi {
+    if model_id.trim().to_ascii_lowercase().contains("claude") {
+        CopilotTransportApi::AnthropicMessages
+    } else {
+        CopilotTransportApi::OpenAiResponses
+    }
+}
+
+fn normalize_model_id(model_id: &str) -> String {
+    model_id
+        .rsplit('/')
+        .next()
+        .unwrap_or(model_id)
+        .trim()
+        .to_string()
+}
 
 // ── Token types ──────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct DeviceCodeResponse {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
-    #[serde(default = "default_interval")]
-    interval: u64,
-    #[serde(default = "default_expires_in")]
-    expires_in: u64,
-}
-
-fn default_interval() -> u64 {
-    5
-}
-
-fn default_expires_in() -> u64 {
-    900
-}
-
-#[derive(Debug, Deserialize)]
-struct AccessTokenResponse {
-    access_token: Option<String>,
-    error: Option<String>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ApiKeyInfo {
@@ -181,6 +179,119 @@ struct ResponseMessage {
     tool_calls: Option<Vec<NativeToolCall>>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct CacheControlOut {
+    #[serde(rename = "type")]
+    cache_type: &'static str,
+}
+
+impl CacheControlOut {
+    fn ephemeral() -> Self {
+        Self {
+            cache_type: "ephemeral",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CopilotAnthropicSystemBlock {
+    #[serde(rename = "type")]
+    block_type: &'static str,
+    text: String,
+    cache_control: CacheControlOut,
+}
+
+#[derive(Debug, Serialize)]
+struct CopilotAnthropicRequest<'a> {
+    model: String,
+    max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<Vec<CopilotAnthropicSystemBlock>>,
+    messages: Vec<CopilotAnthropicMessage>,
+    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<CopilotAnthropicToolSpec<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct CopilotAnthropicMessage {
+    role: String,
+    content: Vec<CopilotAnthropicContentOut>,
+}
+
+#[derive(Debug, Serialize)]
+struct CopilotImageSource {
+    #[serde(rename = "type")]
+    source_type: &'static str,
+    media_type: String,
+    data: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum CopilotAnthropicContentOut {
+    #[serde(rename = "text")]
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControlOut>,
+    },
+    #[serde(rename = "image")]
+    Image { source: CopilotImageSource },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct CopilotAnthropicToolSpec<'a> {
+    name: &'a str,
+    description: &'a str,
+    input_schema: &'a serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct CopilotAnthropicResponse {
+    #[serde(default)]
+    content: Vec<CopilotAnthropicContentIn>,
+    #[serde(default)]
+    usage: Option<CopilotAnthropicUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CopilotAnthropicUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CopilotAnthropicContentIn {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    input: Option<serde_json::Value>,
+}
+
 // ── Provider ─────────────────────────────────────────────────────
 
 /// GitHub Copilot provider with automatic OAuth and token refresh.
@@ -190,14 +301,29 @@ struct ResponseMessage {
 /// automatically.
 pub struct CopilotProvider {
     github_token: Option<String>,
+    auth: AuthService,
+    auth_profile_override: Option<String>,
     /// Mutex ensures only one caller refreshes tokens at a time,
     /// preventing duplicate device flow prompts or redundant API calls.
     refresh_lock: Arc<Mutex<Option<CachedApiKey>>>,
     token_dir: PathBuf,
 }
 
+fn default_zeroclaw_dir() -> PathBuf {
+    directories::UserDirs::new().map_or_else(
+        || PathBuf::from(".zeroclaw"),
+        |dirs| dirs.home_dir().join(".zeroclaw"),
+    )
+}
+
 impl CopilotProvider {
-    pub fn new(github_token: Option<&str>) -> Self {
+    pub fn new(options: &ProviderRuntimeOptions, github_token: Option<&str>) -> Self {
+        let state_dir = options
+            .zeroclaw_dir
+            .clone()
+            .unwrap_or_else(default_zeroclaw_dir);
+        let auth = AuthService::new(&state_dir, options.secrets_encrypt);
+
         let token_dir = directories::ProjectDirs::from("", "", "zeroclaw")
             .map(|dir| dir.config_dir().join("copilot"))
             .unwrap_or_else(|| {
@@ -234,6 +360,8 @@ impl CopilotProvider {
             github_token: github_token
                 .filter(|token| !token.is_empty())
                 .map(String::from),
+            auth,
+            auth_profile_override: options.auth_profile_override.clone(),
             refresh_lock: Arc::new(Mutex::new(None)),
             token_dir,
         }
@@ -244,12 +372,29 @@ impl CopilotProvider {
     }
 
     /// Required headers for Copilot API requests (editor identification).
-    const COPILOT_HEADERS: [(&str, &str); 4] = [
-        ("Editor-Version", "vscode/1.85.1"),
-        ("Editor-Plugin-Version", "copilot/1.155.0"),
-        ("User-Agent", "GithubCopilot/1.155.0"),
-        ("Accept", "application/json"),
+    const COPILOT_HEADERS: [(&str, &str); 3] = [
+        ("Editor-Version", "vscode/1.96.2"),
+        ("User-Agent", "GitHubCopilotChat/0.26.7"),
+        ("X-Github-Api-Version", "2025-04-01"),
     ];
+
+    fn apply_copilot_headers(mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        for (header, value) in &Self::COPILOT_HEADERS {
+            req = req.header(*header, *value);
+        }
+        req
+    }
+
+    fn profile_name_for_store(&self) -> String {
+        self.auth_profile_override
+            .as_deref()
+            .and_then(|override_id| override_id.split_once(':').map(|(_, profile)| profile))
+            .or(self.auth_profile_override.as_deref())
+            .map(str::trim)
+            .filter(|profile| !profile.is_empty())
+            .unwrap_or("github")
+            .to_string()
+    }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec<'_>>> {
         tools.map(|items| {
@@ -363,8 +508,248 @@ impl CopilotProvider {
             .collect()
     }
 
-    /// Send a chat completions request with required Copilot headers.
-    async fn send_chat_request(
+    fn convert_anthropic_tools(
+        tools: Option<&[ToolSpec]>,
+    ) -> Option<Vec<CopilotAnthropicToolSpec<'_>>> {
+        let items = tools?;
+        if items.is_empty() {
+            return None;
+        }
+
+        Some(
+            items
+                .iter()
+                .map(|tool| CopilotAnthropicToolSpec {
+                    name: &tool.name,
+                    description: &tool.description,
+                    input_schema: &tool.parameters,
+                })
+                .collect(),
+        )
+    }
+
+    fn parse_assistant_anthropic_message(content: &str) -> Option<Vec<CopilotAnthropicContentOut>> {
+        let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+        let tool_calls = value
+            .get("tool_calls")
+            .and_then(|v| serde_json::from_value::<Vec<ProviderToolCall>>(v.clone()).ok())?;
+
+        let mut blocks = Vec::new();
+        if let Some(text) = value
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            blocks.push(CopilotAnthropicContentOut::Text {
+                text: text.to_string(),
+                cache_control: None,
+            });
+        }
+
+        for call in tool_calls {
+            let input = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+            blocks.push(CopilotAnthropicContentOut::ToolUse {
+                id: call.id,
+                name: call.name,
+                input,
+            });
+        }
+
+        Some(blocks)
+    }
+
+    fn parse_anthropic_tool_result_message(content: &str) -> Option<CopilotAnthropicMessage> {
+        let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+        let tool_use_id = value
+            .get("tool_call_id")
+            .and_then(serde_json::Value::as_str)?
+            .to_string();
+        let output = value
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        Some(CopilotAnthropicMessage {
+            role: "user".to_string(),
+            content: vec![CopilotAnthropicContentOut::ToolResult {
+                tool_use_id,
+                content: output,
+            }],
+        })
+    }
+
+    fn anthropic_image_block(image_ref: &str) -> Option<CopilotAnthropicContentOut> {
+        if image_ref.starts_with("data:") {
+            let comma = image_ref.find(',')?;
+            let header = &image_ref[5..comma];
+            let mime = header.split(';').next().unwrap_or("image/jpeg").to_string();
+            let data = image_ref[comma + 1..].trim().to_string();
+            if data.is_empty() {
+                return None;
+            }
+            return Some(CopilotAnthropicContentOut::Image {
+                source: CopilotImageSource {
+                    source_type: "base64",
+                    media_type: mime,
+                    data,
+                },
+            });
+        }
+
+        let path = std::path::Path::new(image_ref.trim());
+        if !path.exists() {
+            return None;
+        }
+
+        let bytes = std::fs::read(path).ok()?;
+        let data = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        };
+
+        let media_type = match path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("jpg")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            _ => "image/jpeg",
+        }
+        .to_string();
+
+        Some(CopilotAnthropicContentOut::Image {
+            source: CopilotImageSource {
+                source_type: "base64",
+                media_type,
+                data,
+            },
+        })
+    }
+
+    fn anthropic_user_content(content: &str) -> Vec<CopilotAnthropicContentOut> {
+        let (text, image_refs) = crate::multimodal::parse_image_markers(content);
+        let mut blocks = Vec::new();
+
+        for image_ref in image_refs {
+            if let Some(image_block) = Self::anthropic_image_block(&image_ref) {
+                blocks.push(image_block);
+            }
+        }
+
+        if blocks.is_empty() || !text.trim().is_empty() {
+            let text_value = if text.trim().is_empty() {
+                content.to_string()
+            } else {
+                text
+            };
+            blocks.push(CopilotAnthropicContentOut::Text {
+                text: text_value,
+                cache_control: None,
+            });
+        }
+
+        blocks
+    }
+
+    fn push_or_merge_anthropic_message(
+        messages: &mut Vec<CopilotAnthropicMessage>,
+        message: CopilotAnthropicMessage,
+    ) {
+        if messages
+            .last()
+            .is_some_and(|existing| existing.role == message.role)
+        {
+            if let Some(last) = messages.last_mut() {
+                last.content.extend(message.content);
+            }
+        } else {
+            messages.push(message);
+        }
+    }
+
+    fn convert_messages_for_anthropic(
+        messages: &[ChatMessage],
+    ) -> (
+        Option<Vec<CopilotAnthropicSystemBlock>>,
+        Vec<CopilotAnthropicMessage>,
+    ) {
+        let mut system_text: Option<String> = None;
+        let mut native_messages = Vec::new();
+
+        for message in messages {
+            match message.role.as_str() {
+                "system" => {
+                    if system_text.is_none() {
+                        system_text = Some(message.content.clone());
+                    }
+                }
+                "assistant" => {
+                    let assistant_message = if let Some(blocks) =
+                        Self::parse_assistant_anthropic_message(&message.content)
+                    {
+                        if blocks.is_empty() {
+                            None
+                        } else {
+                            Some(CopilotAnthropicMessage {
+                                role: "assistant".to_string(),
+                                content: blocks,
+                            })
+                        }
+                    } else if !message.content.trim().is_empty() {
+                        Some(CopilotAnthropicMessage {
+                            role: "assistant".to_string(),
+                            content: vec![CopilotAnthropicContentOut::Text {
+                                text: message.content.clone(),
+                                cache_control: None,
+                            }],
+                        })
+                    } else {
+                        None
+                    };
+
+                    if let Some(assistant_message) = assistant_message {
+                        Self::push_or_merge_anthropic_message(
+                            &mut native_messages,
+                            assistant_message,
+                        );
+                    }
+                }
+                "tool" => {
+                    if let Some(tool_message) =
+                        Self::parse_anthropic_tool_result_message(&message.content)
+                    {
+                        Self::push_or_merge_anthropic_message(&mut native_messages, tool_message);
+                    }
+                }
+                _ => {
+                    let user_message = CopilotAnthropicMessage {
+                        role: "user".to_string(),
+                        content: Self::anthropic_user_content(&message.content),
+                    };
+                    Self::push_or_merge_anthropic_message(&mut native_messages, user_message);
+                }
+            }
+        }
+
+        let system = system_text.map(|text| {
+            vec![CopilotAnthropicSystemBlock {
+                block_type: "text",
+                text,
+                cache_control: CacheControlOut::ephemeral(),
+            }]
+        });
+
+        (system, native_messages)
+    }
+
+    async fn send_openai_chat_request(
         &self,
         messages: Vec<ApiMessage>,
         tools: Option<&[ToolSpec]>,
@@ -383,15 +768,14 @@ impl CopilotProvider {
             tools: native_tools,
         };
 
-        let mut req = self
+        let req = self
             .http_client()
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/json")
             .json(&request);
 
-        for (header, value) in &Self::COPILOT_HEADERS {
-            req = req.header(*header, *value);
-        }
+        let req = Self::apply_copilot_headers(req);
 
         let response = req.send().await?;
 
@@ -433,6 +817,125 @@ impl CopilotProvider {
         })
     }
 
+    async fn send_anthropic_chat_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[ToolSpec]>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let (token, endpoint) = self.get_api_key().await?;
+        let url = format!("{}/v1/messages", endpoint.trim_end_matches('/'));
+
+        let (system, native_messages) = Self::convert_messages_for_anthropic(messages);
+        let native_tools = Self::convert_anthropic_tools(tools);
+
+        let request = CopilotAnthropicRequest {
+            model: model.to_string(),
+            max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
+            system,
+            messages: native_messages,
+            temperature,
+            tools: native_tools,
+            tool_choice: tools
+                .filter(|items| !items.is_empty())
+                .map(|_| serde_json::json!({ "type": "auto" })),
+        };
+
+        let req = self
+            .http_client()
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("anthropic-version", "2023-06-01")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&request);
+
+        let req = Self::apply_copilot_headers(req);
+
+        let response = req.send().await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("GitHub Copilot", response).await);
+        }
+
+        let api_response: CopilotAnthropicResponse = response.json().await?;
+
+        let usage = api_response.usage.map(|u| TokenUsage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cached_input_tokens: u.cache_read_input_tokens,
+        });
+
+        let mut text_parts = Vec::new();
+        let mut tool_calls = Vec::new();
+
+        for block in api_response.content {
+            match block.kind.as_str() {
+                "text" => {
+                    if let Some(text) = block.text.map(|value| value.trim().to_string()) {
+                        if !text.is_empty() {
+                            text_parts.push(text);
+                        }
+                    }
+                }
+                "tool_use" => {
+                    let name = block.name.unwrap_or_default();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    tool_calls.push(ProviderToolCall {
+                        id: block.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        name,
+                        arguments: block
+                            .input
+                            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
+                            .to_string(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        Ok(ProviderChatResponse {
+            text: if text_parts.is_empty() {
+                None
+            } else {
+                Some(text_parts.join("\n"))
+            },
+            tool_calls,
+            usage,
+            reasoning_content: None,
+        })
+    }
+
+    /// Send a Copilot request, selecting API transport from the model id.
+    async fn send_chat_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[ToolSpec]>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let normalized_model = normalize_model_id(model);
+
+        match resolve_copilot_transport_api(&normalized_model) {
+            CopilotTransportApi::OpenAiResponses => {
+                self.send_openai_chat_request(
+                    Self::convert_messages(messages),
+                    tools,
+                    &normalized_model,
+                    temperature,
+                )
+                .await
+            }
+            CopilotTransportApi::AnthropicMessages => {
+                self.send_anthropic_chat_request(messages, tools, &normalized_model, temperature)
+                    .await
+            }
+        }
+    }
+
     /// Get a valid Copilot API key, refreshing or re-authenticating as needed.
     /// Uses a Mutex to ensure only one caller refreshes at a time.
     async fn get_api_key(&self) -> anyhow::Result<(String, String)> {
@@ -446,11 +949,8 @@ impl CopilotProvider {
 
         if let Some(info) = self.load_api_key_from_disk().await {
             if chrono::Utc::now().timestamp() + 120 < info.expires_at {
-                let endpoint = info
-                    .endpoints
-                    .as_ref()
-                    .and_then(|e| e.api.clone())
-                    .unwrap_or_else(|| DEFAULT_API.to_string());
+                let endpoint =
+                    Self::resolve_copilot_api_endpoint(&info.token, info.endpoints.as_ref());
                 let token = info.token;
 
                 *cached = Some(CachedApiKey {
@@ -466,11 +966,10 @@ impl CopilotProvider {
         let api_key_info = self.exchange_for_api_key(&access_token).await?;
         self.save_api_key_to_disk(&api_key_info).await;
 
-        let endpoint = api_key_info
-            .endpoints
-            .as_ref()
-            .and_then(|e| e.api.clone())
-            .unwrap_or_else(|| DEFAULT_API.to_string());
+        let endpoint = Self::resolve_copilot_api_endpoint(
+            &api_key_info.token,
+            api_key_info.endpoints.as_ref(),
+        );
 
         *cached = Some(CachedApiKey {
             token: api_key_info.token.clone(),
@@ -481,10 +980,54 @@ impl CopilotProvider {
         Ok((api_key_info.token, endpoint))
     }
 
+    fn derive_copilot_api_base_url_from_token(token: &str) -> Option<String> {
+        let proxy_endpoint = token
+            .split(';')
+            .find_map(|part| part.trim().strip_prefix("proxy-ep="))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+
+        let parsed =
+            if proxy_endpoint.starts_with("http://") || proxy_endpoint.starts_with("https://") {
+                reqwest::Url::parse(proxy_endpoint).ok()?
+            } else {
+                reqwest::Url::parse(&format!("https://{proxy_endpoint}")).ok()?
+            };
+
+        let scheme = parsed.scheme();
+        let host = parsed.host_str()?.trim();
+        if host.is_empty() {
+            return None;
+        }
+
+        let normalized_host = host.strip_prefix("proxy.").unwrap_or(host);
+        Some(format!("{scheme}://api.{normalized_host}"))
+    }
+
+    fn resolve_copilot_api_endpoint(token: &str, endpoints: Option<&ApiEndpoints>) -> String {
+        endpoints
+            .and_then(|entry| entry.api.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| Self::derive_copilot_api_base_url_from_token(token))
+            .unwrap_or_else(|| DEFAULT_API.to_string())
+    }
+
     /// Get a GitHub access token from config, cache, or device flow.
     async fn get_github_access_token(&self) -> anyhow::Result<String> {
         if let Some(token) = &self.github_token {
             return Ok(token.clone());
+        }
+
+        if let Some(token) = self
+            .auth
+            .get_provider_bearer_token("github-copilot", self.auth_profile_override.as_deref())
+            .await?
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+        {
+            return Ok(token);
         }
 
         let access_token_path = self.token_dir.join("access-token");
@@ -495,30 +1038,40 @@ impl CopilotProvider {
             }
         }
 
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "GitHub Copilot requires interactive device login. Run `zeroclaw models auth login-github-copilot` first."
+            );
+        }
+
         let token = self.device_code_login().await?;
+
+        let profile_name = self.profile_name_for_store();
+        if let Err(err) = self
+            .auth
+            .store_provider_token(
+                "github-copilot",
+                &profile_name,
+                &token,
+                HashMap::new(),
+                true,
+            )
+            .await
+        {
+            warn!(
+                "Failed to store GitHub Copilot auth profile (github-copilot:{profile_name}): {err}"
+            );
+        }
+
         write_file_secure(&access_token_path, &token).await;
         Ok(token)
     }
 
     /// Run GitHub OAuth device code flow.
     async fn device_code_login(&self) -> anyhow::Result<String> {
-        let response: DeviceCodeResponse = self
-            .http_client()
-            .post(GITHUB_DEVICE_CODE_URL)
-            .header("Accept", "application/json")
-            .json(&serde_json::json!({
-                "client_id": GITHUB_CLIENT_ID,
-                "scope": "read:user"
-            }))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-
-        let mut poll_interval = Duration::from_secs(response.interval.max(5));
-        let expires_in = response.expires_in.max(1);
-        let expires_at = tokio::time::Instant::now() + Duration::from_secs(expires_in);
+        let client = self.http_client();
+        let response =
+            auth::github_copilot_oauth::request_device_code(&client, "read:user").await?;
 
         eprintln!(
             "\nGitHub Copilot authentication is required.\n\
@@ -528,50 +1081,20 @@ impl CopilotProvider {
             response.verification_uri, response.user_code
         );
 
-        while tokio::time::Instant::now() < expires_at {
-            tokio::time::sleep(poll_interval).await;
-
-            let token_response: AccessTokenResponse = self
-                .http_client()
-                .post(GITHUB_ACCESS_TOKEN_URL)
-                .header("Accept", "application/json")
-                .json(&serde_json::json!({
-                    "client_id": GITHUB_CLIENT_ID,
-                    "device_code": response.device_code,
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
-                }))
-                .send()
-                .await?
-                .json()
-                .await?;
-
-            if let Some(token) = token_response.access_token {
-                eprintln!("Authentication succeeded.\n");
-                return Ok(token);
-            }
-
-            match token_response.error.as_deref() {
-                Some("slow_down") => {
-                    poll_interval += Duration::from_secs(5);
-                }
-                Some("authorization_pending") | None => {}
-                Some("expired_token") => {
-                    anyhow::bail!("GitHub device authorization expired")
-                }
-                Some(error) => anyhow::bail!("GitHub auth failed: {error}"),
-            }
-        }
-
-        anyhow::bail!("Timed out waiting for GitHub authorization")
+        let token = auth::github_copilot_oauth::poll_for_access_token(&client, &response).await?;
+        eprintln!("Authentication succeeded.\n");
+        Ok(token)
     }
 
     /// Exchange a GitHub access token for a Copilot API key.
     async fn exchange_for_api_key(&self, access_token: &str) -> anyhow::Result<ApiKeyInfo> {
-        let mut request = self.http_client().get(GITHUB_API_KEY_URL);
-        for (header, value) in &Self::COPILOT_HEADERS {
-            request = request.header(*header, *value);
-        }
-        request = request.header("Authorization", format!("token {access_token}"));
+        let request = self
+            .http_client()
+            .get(GITHUB_API_KEY_URL)
+            .header("Accept", "application/json")
+            .header("Authorization", format!("token {access_token}"));
+
+        let request = Self::apply_copilot_headers(request);
 
         let response = request.send().await?;
 
@@ -583,6 +1106,11 @@ impl CopilotProvider {
             if status.as_u16() == 401 || status.as_u16() == 403 {
                 let access_token_path = self.token_dir.join("access-token");
                 tokio::fs::remove_file(&access_token_path).await.ok();
+                let profile_name = self.profile_name_for_store();
+                let _ = self
+                    .auth
+                    .remove_profile("github-copilot", &profile_name)
+                    .await;
             }
 
             anyhow::bail!(
@@ -656,24 +1184,14 @@ impl Provider for CopilotProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let mut messages = Vec::new();
+        let mut messages: Vec<ChatMessage> = Vec::new();
         if let Some(system) = system_prompt {
-            messages.push(ApiMessage {
-                role: "system".to_string(),
-                content: Some(ApiContent::Text(system.to_string())),
-                tool_call_id: None,
-                tool_calls: None,
-            });
+            messages.push(ChatMessage::system(system));
         }
-        messages.push(ApiMessage {
-            role: "user".to_string(),
-            content: Self::to_api_content("user", message),
-            tool_call_id: None,
-            tool_calls: None,
-        });
+        messages.push(ChatMessage::user(message));
 
         let response = self
-            .send_chat_request(messages, None, model, temperature)
+            .send_chat_request(&messages, None, model, temperature)
             .await?;
         Ok(response.text.unwrap_or_default())
     }
@@ -685,7 +1203,7 @@ impl Provider for CopilotProvider {
         temperature: f64,
     ) -> anyhow::Result<String> {
         let response = self
-            .send_chat_request(Self::convert_messages(messages), None, model, temperature)
+            .send_chat_request(messages, None, model, temperature)
             .await?;
         Ok(response.text.unwrap_or_default())
     }
@@ -696,13 +1214,8 @@ impl Provider for CopilotProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        self.send_chat_request(
-            Self::convert_messages(request.messages),
-            request.tools,
-            model,
-            temperature,
-        )
-        .await
+        self.send_chat_request(request.messages, request.tools, model, temperature)
+            .await
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -719,27 +1232,31 @@ impl Provider for CopilotProvider {
 mod tests {
     use super::*;
 
+    fn provider(github_token: Option<&str>) -> CopilotProvider {
+        CopilotProvider::new(&ProviderRuntimeOptions::default(), github_token)
+    }
+
     #[test]
     fn new_without_token() {
-        let provider = CopilotProvider::new(None);
+        let provider = provider(None);
         assert!(provider.github_token.is_none());
     }
 
     #[test]
     fn new_with_token() {
-        let provider = CopilotProvider::new(Some("ghp_test"));
+        let provider = provider(Some("ghp_test"));
         assert_eq!(provider.github_token.as_deref(), Some("ghp_test"));
     }
 
     #[test]
     fn empty_token_treated_as_none() {
-        let provider = CopilotProvider::new(Some(""));
+        let provider = provider(Some(""));
         assert!(provider.github_token.is_none());
     }
 
     #[tokio::test]
     async fn cache_starts_empty() {
-        let provider = CopilotProvider::new(None);
+        let provider = provider(None);
         let cached = provider.refresh_lock.lock().await;
         assert!(cached.is_none());
     }
@@ -752,24 +1269,53 @@ mod tests {
                 .iter()
                 .any(|(header, _)| *header == "Editor-Version")
         );
+        assert!(headers.iter().any(|(header, _)| *header == "User-Agent"));
         assert!(
             headers
                 .iter()
-                .any(|(header, _)| *header == "Editor-Plugin-Version")
+                .any(|(header, _)| *header == "X-Github-Api-Version")
         );
-        assert!(headers.iter().any(|(header, _)| *header == "User-Agent"));
     }
 
     #[test]
-    fn default_interval_and_expiry() {
-        assert_eq!(default_interval(), 5);
-        assert_eq!(default_expires_in(), 900);
+    fn resolves_transport_api_from_model_id() {
+        assert_eq!(
+            resolve_copilot_transport_api("claude-sonnet-4.6"),
+            CopilotTransportApi::AnthropicMessages
+        );
+        assert_eq!(
+            resolve_copilot_transport_api("gpt-4o"),
+            CopilotTransportApi::OpenAiResponses
+        );
+        assert_eq!(
+            resolve_copilot_transport_api("github-copilot/claude-sonnet-4.6"),
+            CopilotTransportApi::AnthropicMessages
+        );
     }
 
     #[test]
     fn supports_native_tools() {
-        let provider = CopilotProvider::new(None);
+        let provider = provider(None);
         assert!(provider.supports_native_tools());
+    }
+
+    #[test]
+    fn normalize_model_id_strips_provider_prefix() {
+        assert_eq!(normalize_model_id("github-copilot/gpt-4o"), "gpt-4o");
+        assert_eq!(normalize_model_id("gpt-4.1"), "gpt-4.1");
+    }
+
+    #[test]
+    fn derive_base_url_from_proxy_token_hint() {
+        let derived = CopilotProvider::derive_copilot_api_base_url_from_token(
+            "token;proxy-ep=proxy.example.com;",
+        );
+        assert_eq!(derived.as_deref(), Some("https://api.example.com"));
+
+        let derived = CopilotProvider::derive_copilot_api_base_url_from_token(
+            "token;proxy-ep=https://proxy.foo.bar;",
+        );
+        assert_eq!(derived.as_deref(), Some("https://api.foo.bar"));
     }
 
     #[test]

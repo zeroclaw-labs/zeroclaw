@@ -709,9 +709,9 @@ enum EstopSubcommands {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommands {
-    /// Login with OAuth (OpenAI Codex or Gemini)
+    /// Login with OAuth (OpenAI Codex, Gemini, or GitHub Copilot)
     Login {
-        /// Provider (`openai-codex` or `gemini`)
+        /// Provider (`openai-codex`, `gemini`, or `github-copilot`)
         #[arg(long)]
         provider: String,
         /// Profile name (default: default)
@@ -823,6 +823,21 @@ enum ModelCommands {
     },
     /// Show current model configuration and cache status
     Status,
+    /// Manage model auth profiles
+    Auth {
+        #[command(subcommand)]
+        auth_command: ModelAuthCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ModelAuthCommands {
+    /// Login to GitHub Copilot via GitHub device flow (TTY required)
+    LoginGithubCopilot {
+        /// Overwrite existing profile without confirmation
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1425,6 +1440,9 @@ async fn main() -> Result<()> {
                 Box::pin(onboard::run_models_set(&config, &model)).await
             }
             ModelCommands::Status => onboard::run_models_status(&config).await,
+            ModelCommands::Auth { auth_command } => {
+                handle_models_auth_command(auth_command, &config).await
+            }
         },
 
         Commands::Providers => {
@@ -2398,6 +2416,44 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
     }
 }
 
+async fn handle_models_auth_command(
+    model_auth_command: ModelAuthCommands,
+    config: &Config,
+) -> Result<()> {
+    match model_auth_command {
+        ModelAuthCommands::LoginGithubCopilot { yes } => {
+            let auth_service = auth::AuthService::from_config(config);
+            let profile_id = auth::profiles::profile_id("github-copilot", "github");
+            let profiles = auth_service.load_profiles().await?;
+
+            if profiles.profiles.contains_key(&profile_id) && !yes {
+                let overwrite = dialoguer::Confirm::new()
+                    .with_prompt(format!(
+                        "Auth profile {profile_id} already exists. Overwrite it?"
+                    ))
+                    .default(false)
+                    .interact()?;
+
+                if !overwrite {
+                    println!("Canceled.");
+                    return Ok(());
+                }
+            }
+
+            handle_auth_command(
+                AuthCommands::Login {
+                    provider: "github-copilot".to_string(),
+                    profile: "github".to_string(),
+                    device_code: true,
+                    import: None,
+                },
+                config,
+            )
+            .await
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
     let auth_service = auth::AuthService::from_config(config);
@@ -2593,9 +2649,45 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                     println!("Active profile for openai-codex: {profile}");
                     Ok(())
                 }
+                "github-copilot" => {
+                    if !std::io::stdin().is_terminal() {
+                        bail!("github-copilot login requires an interactive TTY");
+                    }
+
+                    if !device_code {
+                        println!(
+                            "GitHub Copilot login uses device-code flow automatically; continuing."
+                        );
+                    }
+
+                    let device =
+                        auth::github_copilot_oauth::request_device_code(&client, "read:user")
+                            .await?;
+
+                    println!("GitHub Copilot device-code login started.");
+                    println!("Visit: {}", device.verification_uri);
+                    println!("Code:  {}", device.user_code);
+
+                    let access_token =
+                        auth::github_copilot_oauth::poll_for_access_token(&client, &device).await?;
+
+                    auth_service
+                        .store_provider_token(
+                            "github-copilot",
+                            &profile,
+                            &access_token,
+                            std::collections::HashMap::new(),
+                            true,
+                        )
+                        .await?;
+
+                    println!("Saved profile {profile}");
+                    println!("Active profile for github-copilot: {profile}");
+                    Ok(())
+                }
                 _ => {
                     bail!(
-                        "`auth login` supports --provider openai-codex or gemini, got: {provider}"
+                        "`auth login` supports --provider openai-codex, gemini, or github-copilot, got: {provider}"
                     );
                 }
             }
@@ -2955,6 +3047,28 @@ mod tests {
             script.contains("zeroclaw"),
             "completion script should reference binary name"
         );
+    }
+
+    #[test]
+    fn models_auth_login_github_copilot_parses() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "models",
+            "auth",
+            "login-github-copilot",
+            "--yes",
+        ])
+        .expect("models auth login-github-copilot should parse");
+
+        match cli.command {
+            Commands::Models {
+                model_command:
+                    ModelCommands::Auth {
+                        auth_command: ModelAuthCommands::LoginGithubCopilot { yes },
+                    },
+            } => assert!(yes),
+            other => panic!("expected models auth login-github-copilot, got {other:?}"),
+        }
     }
 
     #[test]

@@ -771,10 +771,10 @@ async fn run_quick_setup_with_home(
             println!("    3. Status:   zeroclaw status");
         } else if provider_supports_device_flow(&provider_name) {
             if canonical_provider_name(&provider_name) == "copilot" {
-                println!("    1. Chat:              zeroclaw agent -m \"Hello!\"");
-                println!("       (device / OAuth auth will prompt on first run)");
-                println!("    2. Gateway:           zeroclaw gateway");
-                println!("    3. Status:            zeroclaw status");
+                println!("    1. Login:             zeroclaw models auth login-github-copilot");
+                println!("    2. Chat:              zeroclaw agent -m \"Hello!\"");
+                println!("    3. Gateway:           zeroclaw gateway");
+                println!("    4. Status:            zeroclaw status");
             } else {
                 println!(
                     "    1. Login:             zeroclaw auth login --provider {}",
@@ -858,6 +858,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "openai" => "gpt-5.2".into(),
         "openai-codex" => "gpt-5-codex".into(),
+        "copilot" => "gpt-5.4-mini".into(),
         "venice" => "zai-org-glm-5".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "mistral" => "mistral-large-latest".into(),
@@ -959,6 +960,70 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "GPT-5.2 Codex (agentic coding)".to_string(),
             ),
             ("o4-mini".to_string(), "o4-mini (fallback)".to_string()),
+        ],
+        "copilot" => vec![
+            (
+                "gpt-5.4".to_string(),
+                "GPT-5.4 (latest flagship)".to_string(),
+            ),
+            (
+                "gpt-5.4-mini".to_string(),
+                "GPT-5.4 Mini (recommended: balanced cost/latency)".to_string(),
+            ),
+            ("gpt-5.3".to_string(), "GPT-5.3 (high-quality)".to_string()),
+            (
+                "gpt-5.3-codex".to_string(),
+                "GPT-5.3 Codex (coding specialist)".to_string(),
+            ),
+            ("gpt-5.2".to_string(), "GPT-5.2".to_string()),
+            (
+                "gpt-5.2-codex".to_string(),
+                "GPT-5.2 Codex (agentic coding)".to_string(),
+            ),
+            ("gpt-5.1".to_string(), "GPT-5.1".to_string()),
+            ("gpt-5.1-codex".to_string(), "GPT-5.1 Codex".to_string()),
+            (
+                "gpt-5.1-codex-max".to_string(),
+                "GPT-5.1 Codex Max".to_string(),
+            ),
+            ("gpt-5-mini".to_string(), "GPT-5 Mini".to_string()),
+            ("gpt-4.1".to_string(), "GPT-4.1".to_string()),
+            ("gpt-4o".to_string(), "GPT-4o".to_string()),
+            ("claude-opus-4.6".to_string(), "Claude Opus 4.6".to_string()),
+            ("claude-opus-4.5".to_string(), "Claude Opus 4.5".to_string()),
+            (
+                "claude-sonnet-4.5".to_string(),
+                "Claude Sonnet 4.5".to_string(),
+            ),
+            (
+                "claude-haiku-4.5".to_string(),
+                "Claude Haiku 4.5".to_string(),
+            ),
+            ("gemini-3.1-pro".to_string(), "Gemini 3.1 Pro".to_string()),
+            ("gemini-3-pro".to_string(), "Gemini 3 Pro".to_string()),
+            ("gemini-3-flash".to_string(), "Gemini 3 Flash".to_string()),
+            ("gemini-2.5-pro".to_string(), "Gemini 2.5 Pro".to_string()),
+            (
+                "grok-code-fast-1".to_string(),
+                "Grok Code Fast 1".to_string(),
+            ),
+            (
+                "gpt-4.1-mini".to_string(),
+                "GPT-4.1 Mini (fast)".to_string(),
+            ),
+            (
+                "gpt-4.1-nano".to_string(),
+                "GPT-4.1 Nano (ultra-fast)".to_string(),
+            ),
+            ("o1".to_string(), "o1 (reasoning)".to_string()),
+            (
+                "o1-mini".to_string(),
+                "o1-mini (smaller reasoning)".to_string(),
+            ),
+            (
+                "o3-mini".to_string(),
+                "o3-mini (efficient reasoning)".to_string(),
+            ),
         ],
         "venice" => vec![
             (
@@ -2359,6 +2424,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 "openai-codex",
                 "OpenAI Codex (ChatGPT subscription OAuth, no API key)",
             ),
+            (
+                "github-copilot",
+                "GitHub Copilot (GitHub OAuth subscription, no API key)",
+            ),
             ("deepseek", "DeepSeek — V3 & R1 (affordable)"),
             ("mistral", "Mistral — Large & Codestral"),
             ("xai", "xAI — Grok 3 & 4"),
@@ -3081,6 +3150,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "openrouter" => "OPENROUTER_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai-codex" | "openai" => "OPENAI_API_KEY",
+        "copilot" => "COPILOT_GITHUB_TOKEN",
         "ollama" => "OLLAMA_API_KEY",
         "llamacpp" => "LLAMACPP_API_KEY",
         "sglang" => "SGLANG_API_KEY",
@@ -7083,6 +7153,8 @@ mod tests {
         );
         assert_eq!(default_model_for_provider("openai"), "gpt-5.2");
         assert_eq!(default_model_for_provider("openai-codex"), "gpt-5-codex");
+        assert_eq!(default_model_for_provider("copilot"), "gpt-5.4-mini");
+        assert_eq!(default_model_for_provider("github-copilot"), "gpt-5.4-mini");
         assert_eq!(
             default_model_for_provider("anthropic"),
             "claude-sonnet-4-5-20250929"
@@ -7162,6 +7234,22 @@ mod tests {
 
         assert!(ids.contains(&"gpt-5.2".to_string()));
         assert!(ids.contains(&"gpt-5-mini".to_string()));
+    }
+
+    #[test]
+    fn curated_models_for_copilot_include_latest_choices() {
+        let ids: Vec<String> = curated_models_for_provider("github-copilot")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert_eq!(ids.first().map(String::as_str), Some("gpt-5.4-mini"));
+        assert!(ids.contains(&"gpt-5.4-mini".to_string()));
+        assert!(ids.contains(&"gpt-5.4".to_string()));
+        assert!(ids.contains(&"gpt-4.1".to_string()));
+        assert!(ids.contains(&"gpt-4o".to_string()));
+        assert!(ids.contains(&"gemini-2.5-pro".to_string()));
+        assert!(ids.contains(&"gemini-3.1-pro".to_string()));
     }
 
     #[test]
@@ -7677,6 +7765,8 @@ mod tests {
         assert_eq!(provider_env_var("anthropic"), "ANTHROPIC_API_KEY");
         assert_eq!(provider_env_var("openai-codex"), "OPENAI_API_KEY");
         assert_eq!(provider_env_var("openai"), "OPENAI_API_KEY");
+        assert_eq!(provider_env_var("copilot"), "COPILOT_GITHUB_TOKEN");
+        assert_eq!(provider_env_var("github-copilot"), "COPILOT_GITHUB_TOKEN");
         assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
         assert_eq!(provider_env_var("llamacpp"), "LLAMACPP_API_KEY");
         assert_eq!(provider_env_var("llama.cpp"), "LLAMACPP_API_KEY");

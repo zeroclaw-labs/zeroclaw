@@ -924,6 +924,9 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "novita" => vec!["NOVITA_API_KEY"],
         "perplexity" => vec!["PERPLEXITY_API_KEY"],
         "cohere" => vec!["COHERE_API_KEY"],
+        "copilot" | "github-copilot" => {
+            vec!["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
+        }
         name if is_moonshot_alias(name) => vec!["MOONSHOT_API_KEY"],
         "kimi-code" | "kimi_coding" | "kimi_for_coding" => {
             vec!["KIMI_CODE_API_KEY", "MOONSHOT_API_KEY"]
@@ -1438,7 +1441,7 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
+        "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(options, key))),
         "claude-code" => Ok(Box::new(claude_code::ClaudeCodeProvider::new())),
         "gemini-cli" => Ok(Box::new(gemini_cli::GeminiCliProvider::new())),
         "kilocli" | "kilo" => Ok(Box::new(kilocli::KiloCliProvider::new())),
