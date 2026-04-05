@@ -10960,8 +10960,22 @@ async fn sync_directory(path: &Path) -> Result<()> {
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)
             .with_context(|| format!("Failed to open directory for fsync: {}", path.display()))?;
-        dir.sync_all()
-            .with_context(|| format!("Failed to fsync directory metadata: {}", path.display()))?;
+        // FlushFileBuffers on directory handles returns ERROR_ACCESS_DENIED on
+        // Windows (OS Error 5). This is expected — NTFS does not support
+        // flushing directory metadata the same way Unix does. The individual
+        // files have already been synced, so it is safe to ignore this error.
+        if let Err(e) = dir.sync_all() {
+            if e.raw_os_error() == Some(5) {
+                tracing::trace!(
+                    "Ignoring expected ACCESS_DENIED when fsyncing directory on Windows: {}",
+                    path.display()
+                );
+            } else {
+                return Err(e).with_context(|| {
+                    format!("Failed to fsync directory metadata: {}", path.display())
+                });
+            }
+        }
         Ok(())
     }
 
