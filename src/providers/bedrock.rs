@@ -610,7 +610,9 @@ impl BedrockProvider {
                             role: "assistant".to_string(),
                             content: blocks,
                         });
-                    } else {
+                    } else if !msg.content.trim().is_empty() {
+                        // Only create a text block if there's actual content.
+                        // Empty content would cause Bedrock "blank text" 400 error.
                         converse_messages.push(ConverseMessage {
                             role: "assistant".to_string(),
                             content: vec![ContentBlock::Text(TextBlock {
@@ -618,6 +620,8 @@ impl BedrockProvider {
                             })],
                         });
                     }
+                    // If msg.content is empty, skip this message entirely to avoid
+                    // Bedrock rejecting it as a blank text block.
                 }
                 "tool" => {
                     let tool_result_msg = Self::parse_tool_result_message(&msg.content)
@@ -667,6 +671,11 @@ impl BedrockProvider {
                 }
                 _ => {
                     let content_blocks = Self::parse_user_content_blocks(&msg.content);
+                    // Skip empty user messages to prevent Bedrock "blank text" errors.
+                    // An empty content array would also cause a 400 error.
+                    if content_blocks.is_empty() {
+                        continue;
+                    }
                     converse_messages.push(ConverseMessage {
                         role: "user".to_string(),
                         content: content_blocks,
@@ -800,7 +809,7 @@ impl BedrockProvider {
             }));
         }
 
-        if blocks.is_empty() {
+        if blocks.is_empty() && !content.trim().is_empty() {
             blocks.push(ContentBlock::Text(TextBlock {
                 text: content.to_string(),
             }));
