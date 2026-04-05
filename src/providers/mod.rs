@@ -963,11 +963,17 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         return None;
     }
 
-    for env_var in ["ZEROCLAW_API_KEY", "API_KEY"] {
-        if let Ok(value) = std::env::var(env_var) {
-            let value = value.trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
+    // Skip generic API_KEY fallback for Bedrock — it uses AWS SigV4, not bearer tokens.
+    // If BEDROCK_API_KEY is not set, BedrockProvider will resolve credentials internally
+    // via AWS SDK (EC2 IMDS, env vars, etc.).
+    let is_bedrock = name.eq_ignore_ascii_case("bedrock") || name.eq_ignore_ascii_case("aws-bedrock");
+    if !is_bedrock {
+        for env_var in ["ZEROCLAW_API_KEY", "API_KEY"] {
+            if let Ok(value) = std::env::var(env_var) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
             }
         }
     }
