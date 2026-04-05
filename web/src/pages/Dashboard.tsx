@@ -429,7 +429,7 @@ function SessionsTab() {
   const loadSessions = useCallback(() => {
     getSessions()
       .then((data) => {
-        setSessions(data);
+        setSessions(Array.isArray(data) ? data : []);
         setLoading(false);
       })
       .catch((err) => {
@@ -531,7 +531,7 @@ function SessionsTab() {
                       className="text-sm font-medium font-mono truncate"
                       style={{ color: "var(--pc-text-primary)" }}
                     >
-                      {session.session_id.slice(0, 8)}...
+                      {session.session_id?.slice(0, 8) ?? '???'}...
                     </span>
                   </div>
                   <div className="flex items-center gap-3 text-xs" style={{ color: "var(--pc-text-muted)" }}>
@@ -612,7 +612,7 @@ function ChannelsTab() {
   const loadChannels = useCallback(() => {
     getChannels()
       .then((data) => {
-        setChannels(data);
+        setChannels(Array.isArray(data) ? data : []);
         setLoading(false);
       })
       .catch((err) => {
