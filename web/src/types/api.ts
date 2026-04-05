@@ -107,12 +107,11 @@ export interface CliTool {
 }
 
 export interface Session {
-  id: string;
-  channel: string;
-  started_at: string;
+  session_id: string;
+  created_at: string;
   last_activity: string;
-  status: 'active' | 'idle' | 'closed';
   message_count: number;
+  name?: string;
 }
 
 export interface ChannelDetail {

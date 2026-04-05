@@ -846,12 +846,14 @@ impl Provider for OllamaProvider {
                 let tools: Vec<serde_json::Value> = specs
                     .iter()
                     .map(|s| {
+                        let params =
+                            crate::tools::SchemaCleanr::clean_for_openai(s.parameters.clone());
                         serde_json::json!({
                             "type": "function",
                             "function": {
                                 "name": s.name,
                                 "description": s.description,
-                                "parameters": s.parameters
+                                "parameters": params
                             }
                         })
                     })
