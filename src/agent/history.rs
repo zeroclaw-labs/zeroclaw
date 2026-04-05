@@ -21,13 +21,47 @@ pub(crate) fn floor_char_boundary(s: &str, i: usize) -> usize {
     pos
 }
 
+/// JSON envelope for OpenAI-compatible tool result messages that carries tool_call_id
+/// as a top-level field (required by DeepSeek and other providers).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolResultEnvelope {
+    tool_call_id: String,
+    content: String,
+}
+
 /// Truncate a tool result to `max_chars`, keeping head (2/3) + tail (1/3)
 /// with a marker in the middle. Returns input unchanged if within limit or
 /// `max_chars == 0` (disabled).
+///
+/// Special handling for JSON-wrapped tool results: if the content is a JSON object
+/// with `tool_call_id` and `content` fields (OpenAI-compatible format used by
+/// DeepSeek), only the inner `content` string is truncated while preserving
+/// the `tool_call_id` at the top level.
 pub(crate) fn truncate_tool_result(output: &str, max_chars: usize) -> String {
     if max_chars == 0 || output.len() <= max_chars {
         return output.to_string();
     }
+
+    // Try to parse as JSON envelope with tool_call_id
+    if let Ok(envelope) = serde_json::from_str::<ToolResultEnvelope>(output) {
+        let inner_max = max_chars.saturating_sub(60); // Leave room for JSON overhead
+        let truncated_content = truncate_plain_text(&envelope.content, inner_max);
+        // Re-serialize preserving tool_call_id
+        let new_envelope = ToolResultEnvelope {
+            tool_call_id: envelope.tool_call_id,
+            content: truncated_content,
+        };
+        if let Ok(new_output) = serde_json::to_string(&new_envelope) {
+            return new_output;
+        }
+        // If serialization failed, fall through to simple truncation
+    }
+
+    truncate_plain_text(output, max_chars)
+}
+
+/// Truncate plain text to max_chars, keeping head (2/3) + tail (1/3) with a marker.
+fn truncate_plain_text(output: &str, max_chars: usize) -> String {
     let head_len = max_chars * 2 / 3;
     let tail_len = max_chars.saturating_sub(head_len);
     let head_end = floor_char_boundary(output, head_len);
