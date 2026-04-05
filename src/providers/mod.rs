@@ -1666,13 +1666,16 @@ fn create_provider_with_url_and_options(
                 "Custom provider",
                 "custom:https://your-api.com",
             )?;
-            Ok(compat(OpenAiCompatibleProvider::new_with_vision(
-                "Custom",
-                &base_url,
-                key,
-                AuthStyle::Bearer,
-                true,
-            )))
+            Ok(compat(
+                OpenAiCompatibleProvider::new_with_vision(
+                    "Custom",
+                    &base_url,
+                    key,
+                    AuthStyle::Bearer,
+                    true,
+                )
+                .without_native_tools(),
+            ))
         }
 
         // ── Anthropic-compatible custom endpoints ───────────
@@ -3086,6 +3089,13 @@ mod tests {
     fn factory_custom_no_key() {
         let p = create_provider("custom:https://my-llm.example.com", None);
         assert!(p.is_ok());
+    }
+
+    #[test]
+    fn factory_custom_disables_native_tool_calling() {
+        let custom = create_provider("custom:https://my-llm.example.com", Some("key"))
+            .expect("provider should resolve");
+        assert!(!custom.supports_native_tools());
     }
 
     #[test]
