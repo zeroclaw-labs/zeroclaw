@@ -1,5 +1,7 @@
+use crate::channels::media_pipeline::MediaAttachment;
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -48,6 +50,31 @@ fn gws_call(
     Ok(serde_json::from_str(&stdout)?)
 }
 
+/// Download an attachment to /tmp and return the file bytes.
+fn gws_download_attachment(resource_name: &str, filename: &str) -> anyhow::Result<Vec<u8>> {
+    // gws saves to /tmp/{filename} when --output is used
+    let cmd = format!(
+        "cd /tmp && GWS_PARAMS={:?} gws chat media download --params \"$GWS_PARAMS\" --output {}",
+        serde_json::json!({ "resourceName": resource_name, "alt": "media" }).to_string(),
+        filename,
+    );
+
+    let output = std::process::Command::new("zsh")
+        .arg("-lc")
+        .arg(&cmd)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gws download error: {stderr}");
+    }
+
+    let path = format!("/tmp/{filename}");
+    let bytes = std::fs::read(&path)?;
+    let _ = std::fs::remove_file(&path);
+    Ok(bytes)
+}
+
 #[derive(Debug, Deserialize)]
 struct GChatMessage {
     name: String,
@@ -55,6 +82,7 @@ struct GChatMessage {
     create_time: String,
     text: Option<String>,
     sender: Option<GChatSender>,
+    attachment: Option<Vec<GChatAttachment>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +92,67 @@ struct GChatSender {
     display_name: Option<String>,
     #[serde(rename = "type")]
     sender_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GChatAttachment {
+    #[serde(rename = "contentName")]
+    content_name: Option<String>,
+    #[serde(rename = "contentType")]
+    content_type: Option<String>,
+    #[serde(rename = "attachmentDataRef")]
+    attachment_data_ref: Option<GChatAttachmentDataRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GChatAttachmentDataRef {
+    #[serde(rename = "resourceName")]
+    resource_name: String,
+}
+
+/// Process a single GChat attachment.
+/// Returns (image_marker, audio_attachment) — at most one of the two is Some.
+fn process_attachment(
+    att: &GChatAttachment,
+    idx: usize,
+) -> (Option<String>, Option<MediaAttachment>) {
+    let resource_name = match att.attachment_data_ref.as_ref().map(|r| r.resource_name.as_str()) {
+        Some(r) => r,
+        None => return (None, None),
+    };
+
+    let content_name = att.content_name.as_deref().unwrap_or("attachment");
+    let content_type = att.content_type.as_deref().unwrap_or("");
+    let ext = content_name.rsplit('.').next().unwrap_or("bin");
+    let filename = format!("zchat-att-{}-{}.{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs(), idx, ext);
+
+    let bytes = match gws_download_attachment(resource_name, &filename) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("gchat: attachment download failed: {e}");
+            return (None, None);
+        }
+    };
+
+    if content_type.starts_with("image/") {
+        // Inject as base64 data URI for Bedrock multimodal
+        let b64 = BASE64.encode(&bytes);
+        let marker = format!("[IMAGE:data:{content_type};base64,{b64}]");
+        (Some(marker), None)
+    } else if content_type.starts_with("audio/") || content_type.starts_with("video/audio") {
+        let media = MediaAttachment {
+            file_name: content_name.to_string(),
+            data: bytes,
+            mime_type: Some(content_type.to_string()),
+        };
+        (None, Some(media))
+    } else {
+        tracing::debug!("gchat: skipping unsupported attachment type: {content_type}");
+        (None, None)
+    }
 }
 
 /// Google Chat channel — polls a space via `gws` CLI.
@@ -189,14 +278,37 @@ impl Channel for GChatChannel {
                     continue;
                 }
 
+                // Process attachments: images → base64 markers, audio → MediaAttachment
+                let mut image_markers: Vec<String> = Vec::new();
+                let mut audio_attachments: Vec<MediaAttachment> = Vec::new();
+
+                for (idx, att) in msg.attachment.as_deref().unwrap_or(&[]).iter().enumerate() {
+                    let (img, audio) = process_attachment(att, idx);
+                    if let Some(m) = img { image_markers.push(m); }
+                    if let Some(a) = audio { audio_attachments.push(a); }
+                }
+
                 let text = msg.text.unwrap_or_default();
-                if text.trim().is_empty() {
+
+                // Build content: image markers first, then text
+                let content = if image_markers.is_empty() {
+                    text.clone()
+                } else {
+                    let mut c = image_markers.join("\n");
+                    if !text.trim().is_empty() {
+                        c.push('\n');
+                        c.push_str(&text);
+                    }
+                    c
+                };
+
+                // Skip if no content and no attachments
+                if content.trim().is_empty() && audio_attachments.is_empty() {
                     continue;
                 }
 
                 // Track name and advance timestamp
                 seen_names.insert(msg.name.clone());
-                // Bound set size to prevent unbounded growth
                 if seen_names.len() > 500 {
                     seen_names.clear();
                 }
@@ -218,7 +330,7 @@ impl Channel for GChatChannel {
                     id: msg.name.clone(),
                     sender: display_name,
                     reply_target: self.space_id.clone(),
-                    content: text,
+                    content,
                     channel: "gchat".to_string(),
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -226,7 +338,7 @@ impl Channel for GChatChannel {
                         .as_secs(),
                     thread_ts: None,
                     interruption_scope_id: None,
-                    attachments: vec![],
+                    attachments: audio_attachments,
                 };
 
                 if tx.send(channel_msg).await.is_err() {
