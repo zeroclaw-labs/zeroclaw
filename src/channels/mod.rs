@@ -2395,12 +2395,10 @@ fn spawn_supervised_listener_with_health_interval(
 }
 
 fn compute_max_in_flight_messages(channel_count: usize, per_channel: usize) -> usize {
-    channel_count
-        .saturating_mul(per_channel)
-        .clamp(
-            CHANNEL_MIN_IN_FLIGHT_MESSAGES,
-            CHANNEL_MAX_IN_FLIGHT_MESSAGES,
-        )
+    channel_count.saturating_mul(per_channel).clamp(
+        CHANNEL_MIN_IN_FLIGHT_MESSAGES,
+        CHANNEL_MAX_IN_FLIGHT_MESSAGES,
+    )
 }
 
 fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
