@@ -194,6 +194,7 @@ temperature = 0.2
 | `open_skills_enabled` | `false` | 选择加入社区 `open-skills` 仓库的加载/同步 |
 | `open_skills_dir` | 未设置 | `open-skills` 的可选本地路径（启用时默认为 `$HOME/open-skills`） |
 | `prompt_injection_mode` | `full` | 技能提示详细程度：`full`（内联指令/工具）或 `compact`（仅名称/描述/位置） |
+| `whitelist` | `[]` | 技能名称白名单。空列表加载所有技能（默认）。非空时仅加载指定技能。适用于减少低上下文模型的系统提示大小。 |
 
 注意事项：
 
@@ -423,6 +424,7 @@ allowed_roots = [\"~/Desktop/projects\", \"/opt/shared-repo\"]
 | `provider` | _必填_ | 要路由到的提供商（必须匹配已知提供商名称） |
 | `model` | _必填_ | 与该提供商一起使用的模型 |
 | `api_key` | 未设置 | 此路由提供商的可选 API 密钥覆盖 |
+| `context_window` | 未设置 | 此路由的可选上下文窗口大小覆盖（token 数）。适用于限制 VRAM 有限后端的上下文。 |
 
 ### `[[embedding_routes]]`
 
@@ -511,6 +513,8 @@ priority = 5
 | 键 | 默认值 | 用途 |
 |---|---|---|
 | `message_timeout_secs` | `300` | 渠道消息处理的基本超时（秒）；运行时会根据工具循环深度扩展（最多 4 倍） |
+| `reply_precheck` | `false` | 在群组对话中回复前运行 LLM 回复意图预检。为 `true` 时，代理会进行轻量分类调用以决定是否回复。私聊始终绕过此检查。 |
+| `max_concurrent_per_channel` | `4` | 每个渠道的最大并发 LLM 请求数。较低的值可防止后端 slot 饱和（例如 llama.cpp `--parallel 3`）。 |
 
 示例：
 
