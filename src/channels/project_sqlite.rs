@@ -29,8 +29,8 @@ pub struct GatewayProject {
     /// Human-readable display name.
     pub name: String,
     /// Project workspace directory (project_workspace_dir).
-    /// `Some` → used as `config.workspace_dir` for the agent (project sandbox).
-    /// `None` → gateway_workspace_dir is used (default zeroclaw behaviour).
+    /// `Some` → added to `allowed_roots` at creation; used as `project_dir` for shell cwd and file resolution.
+    /// `None` → agent uses global workspace only.
     pub project_workspace_dir: Option<String>,
     /// Session key in the sessions table — always `gw_{id}`.
     pub session_key: String,
@@ -161,20 +161,6 @@ impl ProjectBackend {
         let n = conn.execute(
             "UPDATE projects SET name = ?1 WHERE id = ?2",
             params![name, id],
-        )?;
-        Ok(n > 0)
-    }
-
-    /// Update project_workspace_dir. Pass `None` to clear. Returns `true` if updated.
-    pub fn set_project_workspace_dir(
-        &self,
-        id: &str,
-        project_workspace_dir: Option<&str>,
-    ) -> Result<bool> {
-        let conn = self.conn.lock();
-        let n = conn.execute(
-            "UPDATE projects SET project_workspace_dir = ?1 WHERE id = ?2",
-            params![project_workspace_dir, id],
         )?;
         Ok(n > 0)
     }
