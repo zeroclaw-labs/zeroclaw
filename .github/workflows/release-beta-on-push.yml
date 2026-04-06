@@ -210,10 +210,14 @@ jobs:
             artifact: zeroclaw
             ext: tar.gz
             ndk: true
+            experimental: true
+            # wa-rs crates don't compile for Android; exclude whatsapp-web
+            cargo_features: "channel-matrix,channel-lark"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: zeroclaw.exe
             ext: zip
+    continue-on-error: ${{ matrix.experimental || false }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -246,7 +250,8 @@ jobs:
           if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
-          cargo build --release --locked --features "${{ env.RELEASE_CARGO_FEATURES }}" --target ${{ matrix.target }}
+          FEATURES="${{ matrix.cargo_features || env.RELEASE_CARGO_FEATURES }}"
+          cargo build --release --locked --features "${FEATURES}" --target ${{ matrix.target }}
 
       - name: Check binary size
         shell: bash

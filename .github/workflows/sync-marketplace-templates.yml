@@ -98,14 +98,21 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           BRANCH="zeroclaw/update-v${VERSION}"
-          git checkout -b "$BRANCH"
+          git fetch origin "$BRANCH" 2>/dev/null && git checkout "$BRANCH" && git pull origin "$BRANCH" || git checkout -b "$BRANCH"
           git add -A
           git diff --cached --quiet && echo "No changes" && exit 0
 
           git config user.name "ZeroClaw Bot"
           git config user.email "bot@zeroclaw.com"
           git commit -m "feat: add/update ZeroClaw service template (v${VERSION})"
-          git push -u origin "$BRANCH"
+          git push -u origin "$BRANCH" --force-with-lease
+
+          # Skip PR creation if one already exists
+          EXISTING_PR=$(gh pr list --repo coollabsio/coolify --head "zeroclaw-labs:${BRANCH}" --json url --jq '.[0].url' 2>/dev/null || true)
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR already exists: $EXISTING_PR"
+            exit 0
+          fi
 
           gh pr create \
             --repo coollabsio/coolify \
@@ -246,14 +253,21 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           BRANCH="zeroclaw/update-v${VERSION}"
-          git checkout -b "$BRANCH"
+          git fetch origin "$BRANCH" 2>/dev/null && git checkout "$BRANCH" && git pull origin "$BRANCH" || git checkout -b "$BRANCH"
           git add -A
           git diff --cached --quiet && echo "No changes" && exit 0
 
           git config user.name "ZeroClaw Bot"
           git config user.email "bot@zeroclaw.com"
           git commit -m "feat: add/update ZeroClaw template (v${VERSION})"
-          git push -u origin "$BRANCH"
+          git push -u origin "$BRANCH" --force-with-lease
+
+          # Skip PR creation if one already exists
+          EXISTING_PR=$(gh pr list --repo Dokploy/templates --head "zeroclaw-labs:${BRANCH}" --json url --jq '.[0].url' 2>/dev/null || true)
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR already exists: $EXISTING_PR"
+            exit 0
+          fi
 
           gh pr create \
             --repo Dokploy/templates \
@@ -479,14 +493,21 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           BRANCH="zeroclaw/update-v${VERSION}"
-          git checkout -b "$BRANCH"
+          git fetch origin "$BRANCH" 2>/dev/null && git checkout "$BRANCH" && git pull origin "$BRANCH" || git checkout -b "$BRANCH"
           git add -A
           git diff --cached --quiet && echo "No changes" && exit 0
 
           git config user.name "ZeroClaw Bot"
           git config user.email "bot@zeroclaw.com"
           git commit -m "feat: add/update ZeroClaw template (v${VERSION})"
-          git push -u origin "$BRANCH"
+          git push -u origin "$BRANCH" --force-with-lease
+
+          # Skip PR creation if one already exists
+          EXISTING_PR=$(gh pr list --repo easypanel-io/templates --head "zeroclaw-labs:${BRANCH}" --json url --jq '.[0].url' 2>/dev/null || true)
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR already exists: $EXISTING_PR"
+            exit 0
+          fi
 
           gh pr create \
             --repo easypanel-io/templates \
