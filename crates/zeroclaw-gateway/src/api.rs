@@ -689,7 +689,9 @@ pub async fn handle_api_memory_list(
     }
 }
 
-fn sanitize_memory_entries_for_api(entries: Vec<crate::memory::MemoryEntry>) -> Vec<crate::memory::MemoryEntry> {
+fn sanitize_memory_entries_for_api(
+    entries: Vec<crate::memory::MemoryEntry>,
+) -> Vec<crate::memory::MemoryEntry> {
     entries
         .into_iter()
         .map(|mut entry| {
