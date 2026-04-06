@@ -196,15 +196,17 @@ async fn handle_socket(
         (session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()), None)
     };
 
-    let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+    let session_key = if session_id.starts_with(GW_SESSION_PREFIX) {
+        session_id.clone()
+    } else {
+        format!("{GW_SESSION_PREFIX}{session_id}")
+    };
 
     // Build a persistent Agent for this connection so history is maintained across turns.
-    // Override workspace_dir when a project_workspace_dir is set — this scopes the agent
-    // sandbox to the project directory instead of the shared gateway_workspace_dir.
+    // Set project_dir for this session. workspace_dir stays as the global workspace
+    // (skills, memory, personality). project_dir is used for shell cwd and file resolution.
     let mut config = state.config.lock().clone();
-    if let Some(ref dir) = project_workspace_dir {
-        config.workspace_dir = std::path::PathBuf::from(dir);
-    }
+    config.project_dir = project_workspace_dir.map(std::path::PathBuf::from);
     let mut agent = match crate::agent::Agent::from_config(&config).await {
         Ok(a) => a,
         Err(e) => {

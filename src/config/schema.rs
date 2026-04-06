@@ -68,6 +68,10 @@ pub struct Config {
     /// Workspace directory - computed from home, not serialized
     #[serde(skip)]
     pub workspace_dir: PathBuf,
+    /// Per-session project directory. Set by gateway when a project has a workspace path.
+    /// Not serialized to config.toml — only set at runtime via ws.rs.
+    #[serde(skip)]
+    pub project_dir: Option<PathBuf>,
     /// Path to config.toml - computed from home, not serialized
     #[serde(skip)]
     pub config_path: PathBuf,
@@ -8362,6 +8366,7 @@ impl Default for Config {
 
         Self {
             workspace_dir: zeroclaw_dir.join("workspace"),
+            project_dir: None,
             config_path: zeroclaw_dir.join("config.toml"),
             api_key: None,
             api_url: None,

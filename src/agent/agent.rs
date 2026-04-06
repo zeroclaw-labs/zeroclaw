@@ -386,7 +386,7 @@ impl Agent {
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
-            None,
+            config.project_dir.as_deref(),
         ));
 
         let memory: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
@@ -541,7 +541,7 @@ impl Agent {
             None
         };
 
-        Agent::builder()
+        let mut builder = Agent::builder()
             .provider(provider)
             .tools(tools)
             .memory(memory)
@@ -556,7 +556,13 @@ impl Agent {
             .config(config.agent.clone())
             .model_name(model_name)
             .temperature(config.default_temperature)
-            .workspace_dir(config.workspace_dir.clone())
+            .workspace_dir(config.workspace_dir.clone());
+
+        if let Some(ref dir) = config.project_dir {
+            builder = builder.project_dir(dir.clone());
+        }
+
+        builder
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
             .route_model_by_hint(route_model_by_hint)

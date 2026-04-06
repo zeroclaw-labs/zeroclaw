@@ -128,6 +128,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
     let config = Config {
         workspace_dir: workspace_dir.clone(),
+        project_dir: None,
         config_path: config_path.clone(),
         api_key: if api_key.is_empty() {
             None
@@ -586,6 +587,7 @@ async fn run_quick_setup_with_home(
 
     let config = Config {
         workspace_dir: workspace_dir.clone(),
+        project_dir: None,
         config_path: config_path.clone(),
         api_key: credential_override.map(|c| {
             let mut s = String::with_capacity(c.len());
