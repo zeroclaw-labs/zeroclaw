@@ -556,7 +556,21 @@ impl Tool for WebSearchTool {
 
         let result = match resolution.route {
             WebSearchProviderRoute::DuckDuckGo | WebSearchProviderRoute::Tavily => {
-                self.search_duckduckgo(query).await?
+                match self.search_duckduckgo(query).await {
+                    Ok(res) => res,
+                    Err(e) => {
+                        if let Ok(searxng_url) = self.resolve_searxng_instance_url() {
+                            tracing::warn!(
+                                "DuckDuckGo search failed or was blocked: {}. Falling back to SearXNG ({})...",
+                                e,
+                                searxng_url
+                            );
+                            self.search_searxng(query).await?
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
             } // TODO: implement Tavily search
             WebSearchProviderRoute::Brave => self.search_brave(query).await?,
             WebSearchProviderRoute::SearXNG => self.search_searxng(query).await?,
