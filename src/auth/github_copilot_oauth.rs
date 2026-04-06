@@ -161,12 +161,37 @@ pub async fn poll_for_access_token(client: &Client, device: &DeviceCodeStart) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    struct EnvVarRestore {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarRestore {
+        fn set(key: &'static str, value: impl AsRef<str>) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var(key, value.as_ref()) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            if let Some(ref original) = self.original {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var(self.key, original) };
+            } else {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn request_and_poll_device_flow_mocked() {
+    async fn request_and_poll_device_flow_handles_authorization_pending() {
         let server = MockServer::start().await;
 
         let device_json = serde_json::json!({
@@ -183,28 +208,38 @@ mod tests {
             .mount(&server)
             .await;
 
-        let token_json = serde_json::json!({ "access_token": "testtoken" });
         Mock::given(method("POST"))
             .and(path("/login/oauth/access_token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(token_json))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": "authorization_pending"
+            })))
+            .up_to_n_times(1)
             .mount(&server)
             .await;
 
-        unsafe {
-            std::env::set_var(
-                "GITHUB_COPILOT_DEVICE_CODE_URL",
-                format!("{}/login/device/code", server.uri()),
-            );
-            std::env::set_var(
-                "GITHUB_COPILOT_ACCESS_TOKEN_URL",
-                format!("{}/login/oauth/access_token", server.uri()),
-            );
-            std::env::set_var("GITHUB_COPILOT_POLL_INTERVAL_MS", "10");
-        }
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "testtoken"
+            })))
+            .mount(&server)
+            .await;
+
+        let _device_code_url_guard = EnvVarRestore::set(
+            "GITHUB_COPILOT_DEVICE_CODE_URL",
+            format!("{}/login/device/code", server.uri()),
+        );
+        let _access_token_url_guard = EnvVarRestore::set(
+            "GITHUB_COPILOT_ACCESS_TOKEN_URL",
+            format!("{}/login/oauth/access_token", server.uri()),
+        );
+        let _poll_interval_guard = EnvVarRestore::set("GITHUB_COPILOT_POLL_INTERVAL_MS", "10");
 
         let client = reqwest::Client::new();
         let device = request_device_code(&client, "read:user").await.unwrap();
         assert_eq!(device.device_code, "device123");
+        assert_eq!(device.user_code, "USERCODE");
+        assert_eq!(device.verification_uri, "https://example.com/verify");
 
         let token = poll_for_access_token(&client, &device).await.unwrap();
         assert_eq!(token, "testtoken");

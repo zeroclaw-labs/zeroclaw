@@ -15,9 +15,9 @@ use crate::memory::{
     default_memory_backend_key, memory_backend_profile, selectable_memory_backends,
 };
 use crate::providers::{
-    canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias,
-    is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_zai_alias,
-    is_zai_cn_alias,
+    canonical_china_provider_name, copilot::COPILOT_MODEL_CHOICES, is_glm_alias, is_glm_cn_alias,
+    is_minimax_alias, is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias,
+    is_zai_alias, is_zai_cn_alias,
 };
 use anyhow::{Context, Result, bail};
 use console::style;
@@ -961,70 +961,10 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             ),
             ("o4-mini".to_string(), "o4-mini (fallback)".to_string()),
         ],
-        "copilot" => vec![
-            (
-                "gpt-5.4-mini".to_string(),
-                "GPT-5.4 Mini (recommended: balanced cost/latency)".to_string(),
-            ),
-            (
-                "gpt-5.4".to_string(),
-                "GPT-5.4 (latest flagship)".to_string(),
-            ),
-            ("gpt-5.3".to_string(), "GPT-5.3 (high-quality)".to_string()),
-            (
-                "gpt-5.3-codex".to_string(),
-                "GPT-5.3 Codex (coding specialist)".to_string(),
-            ),
-            ("gpt-5.2".to_string(), "GPT-5.2".to_string()),
-            (
-                "gpt-5.2-codex".to_string(),
-                "GPT-5.2 Codex (agentic coding)".to_string(),
-            ),
-            ("gpt-5.1".to_string(), "GPT-5.1".to_string()),
-            ("gpt-5.1-codex".to_string(), "GPT-5.1 Codex".to_string()),
-            (
-                "gpt-5.1-codex-max".to_string(),
-                "GPT-5.1 Codex Max".to_string(),
-            ),
-            ("gpt-5-mini".to_string(), "GPT-5 Mini".to_string()),
-            ("gpt-4.1".to_string(), "GPT-4.1".to_string()),
-            ("gpt-4o".to_string(), "GPT-4o".to_string()),
-            ("claude-opus-4.6".to_string(), "Claude Opus 4.6".to_string()),
-            ("claude-opus-4.5".to_string(), "Claude Opus 4.5".to_string()),
-            (
-                "claude-sonnet-4.5".to_string(),
-                "Claude Sonnet 4.5".to_string(),
-            ),
-            (
-                "claude-haiku-4.5".to_string(),
-                "Claude Haiku 4.5".to_string(),
-            ),
-            ("gemini-3.1-pro".to_string(), "Gemini 3.1 Pro".to_string()),
-            ("gemini-3-pro".to_string(), "Gemini 3 Pro".to_string()),
-            ("gemini-3-flash".to_string(), "Gemini 3 Flash".to_string()),
-            ("gemini-2.5-pro".to_string(), "Gemini 2.5 Pro".to_string()),
-            (
-                "grok-code-fast-1".to_string(),
-                "Grok Code Fast 1".to_string(),
-            ),
-            (
-                "gpt-4.1-mini".to_string(),
-                "GPT-4.1 Mini (fast)".to_string(),
-            ),
-            (
-                "gpt-4.1-nano".to_string(),
-                "GPT-4.1 Nano (ultra-fast)".to_string(),
-            ),
-            ("o1".to_string(), "o1 (reasoning)".to_string()),
-            (
-                "o1-mini".to_string(),
-                "o1-mini (smaller reasoning)".to_string(),
-            ),
-            (
-                "o3-mini".to_string(),
-                "o3-mini (efficient reasoning)".to_string(),
-            ),
-        ],
+        "copilot" => COPILOT_MODEL_CHOICES
+            .iter()
+            .map(|(id, label)| ((*id).to_string(), (*label).to_string()))
+            .collect(),
         "venice" => vec![
             (
                 "zai-org-glm-5".to_string(),
@@ -7243,13 +7183,12 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
 
-        assert_eq!(ids.first().map(String::as_str), Some("gpt-5.4-mini"));
-        assert!(ids.contains(&"gpt-5.4-mini".to_string()));
-        assert!(ids.contains(&"gpt-5.4".to_string()));
-        assert!(ids.contains(&"gpt-4.1".to_string()));
-        assert!(ids.contains(&"gpt-4o".to_string()));
-        assert!(ids.contains(&"gemini-2.5-pro".to_string()));
-        assert!(ids.contains(&"gemini-3.1-pro".to_string()));
+        let expected: Vec<String> = COPILOT_MODEL_CHOICES
+            .iter()
+            .map(|(id, _)| (*id).to_string())
+            .collect();
+
+        assert_eq!(ids, expected);
     }
 
     #[test]

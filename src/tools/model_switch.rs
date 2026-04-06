@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::get_model_switch_state;
-use crate::providers;
+use crate::providers::{self, copilot::COPILOT_MODEL_CHOICES};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
@@ -221,29 +221,7 @@ impl ModelSwitchTool {
                 "gpt-3.5-turbo",
             ],
             "copilot" | "github-copilot" => {
-                vec![
-                    "gpt-5.4",
-                    "gpt-5.4-mini",
-                    "gpt-5.3",
-                    "gpt-5.3-codex",
-                    "gpt-5.2",
-                    "gpt-5.2-codex",
-                    "gpt-5.1",
-                    "gpt-5.1-codex",
-                    "gpt-5.1-codex-max",
-                    "gpt-5-mini",
-                    "gpt-4.1",
-                    "gpt-4o",
-                    "claude-opus-4.6",
-                    "claude-opus-4.5",
-                    "claude-sonnet-4.5",
-                    "claude-haiku-4.5",
-                    "gemini-3.1-pro",
-                    "gemini-3-pro",
-                    "gemini-3-flash",
-                    "gemini-2.5-pro",
-                    "grok-code-fast-1",
-                ]
+                COPILOT_MODEL_CHOICES.iter().map(|(id, _)| *id).collect()
             }
             "anthropic" => vec![
                 "claude-sonnet-4-6",

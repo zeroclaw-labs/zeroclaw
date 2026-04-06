@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 const MASKED_SECRET: &str = "***MASKED***";
 
@@ -66,18 +66,6 @@ pub struct MemoryStoreBody {
 #[derive(Deserialize)]
 pub struct CronRunsQuery {
     pub limit: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ChannelDetailResponse {
-    name: String,
-    #[serde(rename = "type")]
-    channel_type: String,
-    enabled: bool,
-    status: String,
-    message_count: usize,
-    last_message_at: Option<String>,
-    health: String,
 }
 
 #[derive(Deserialize)]
@@ -143,99 +131,6 @@ pub async fn handle_api_status(
     });
 
     Json(body).into_response()
-}
-
-fn channel_health_summary(
-    enabled: bool,
-    component: Option<&crate::health::ComponentHealth>,
-) -> (String, String) {
-    if !enabled {
-        return ("inactive".to_string(), "down".to_string());
-    }
-
-    match component.map(|c| c.status.as_str()) {
-        Some("error") => ("error".to_string(), "down".to_string()),
-        Some("ok") => ("active".to_string(), "healthy".to_string()),
-        Some(_) | None => ("active".to_string(), "degraded".to_string()),
-    }
-}
-
-fn channel_health_key(name: &str) -> String {
-    name.to_ascii_lowercase().replace([' ', '-'], "_")
-}
-
-fn build_channel_details(
-    config: &crate::config::Config,
-    health: &crate::health::HealthSnapshot,
-    session_metadata: &[crate::channels::session_backend::SessionMetadata],
-) -> Vec<ChannelDetailResponse> {
-    config
-        .channels_config
-        .channels()
-        .into_iter()
-        .map(|(channel, enabled)| {
-            let name = channel.name();
-            let channel_type = channel.desc();
-            let health_key = channel_health_key(name);
-            let health_component = health
-                .components
-                .get(&health_key)
-                .or_else(|| health.components.get("channels"));
-
-            let (status, health_label) = channel_health_summary(enabled, health_component);
-
-            let prefix = format!("{health_key}_");
-            let mut message_count = 0usize;
-            let mut last_message_at: Option<String> = None;
-
-            for session in session_metadata
-                .iter()
-                .filter(|session| session.key.starts_with(&prefix))
-            {
-                message_count += session.message_count;
-                let last_activity = session.last_activity.to_rfc3339();
-                if last_message_at
-                    .as_ref()
-                    .map(|current| last_activity > *current)
-                    .unwrap_or(true)
-                {
-                    last_message_at = Some(last_activity);
-                }
-            }
-
-            ChannelDetailResponse {
-                name: name.to_string(),
-                channel_type: channel_type.to_string(),
-                enabled,
-                status,
-                message_count,
-                last_message_at,
-                health: health_label,
-            }
-        })
-        .collect()
-}
-
-/// GET /api/channels — detailed channel health and usage for the dashboard
-pub async fn handle_api_channels(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
-    let config = state.config.lock().clone();
-    let health = crate::health::snapshot();
-    let session_metadata = state
-        .session_backend
-        .as_ref()
-        .map(|backend| backend.list_sessions_with_metadata())
-        .unwrap_or_default();
-
-    let channels = build_channel_details(&config, &health, &session_metadata);
-
-    Json(serde_json::json!({ "channels": channels })).into_response()
 }
 
 /// GET /api/config — current config (api_key masked)
@@ -1650,7 +1545,6 @@ mod tests {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use parking_lot::Mutex;
-    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1773,118 +1667,6 @@ mod tests {
             .expect("response body")
             .to_bytes();
         serde_json::from_slice(&body).expect("valid json response")
-    }
-
-    fn utc(ts: &str) -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::parse_from_rfc3339(ts)
-            .expect("valid RFC3339 timestamp")
-            .with_timezone(&chrono::Utc)
-    }
-
-    #[test]
-    fn build_channel_details_aggregates_sessions_and_maps_health() {
-        let mut config = crate::config::Config::default();
-        config.channels_config.telegram = Some(crate::config::schema::TelegramConfig {
-            bot_token: "telegram-token".to_string(),
-            allowed_users: vec!["*".to_string()],
-            stream_mode: crate::config::schema::StreamMode::Off,
-            draft_update_interval_ms: 1000,
-            interrupt_on_new_message: false,
-            mention_only: false,
-            ack_reactions: None,
-            proxy_url: None,
-        });
-        config.channels_config.webhook = Some(crate::config::schema::WebhookConfig {
-            port: 8080,
-            listen_path: Some("/webhook".to_string()),
-            send_url: None,
-            send_method: None,
-            auth_header: None,
-            secret: None,
-        });
-
-        let health = crate::health::HealthSnapshot {
-            pid: 1234,
-            updated_at: "2026-04-05T00:00:00Z".to_string(),
-            uptime_seconds: 42,
-            components: BTreeMap::from([
-                (
-                    "channels".to_string(),
-                    crate::health::ComponentHealth {
-                        status: "ok".to_string(),
-                        updated_at: "2026-04-05T00:00:00Z".to_string(),
-                        last_ok: Some("2026-04-05T00:00:00Z".to_string()),
-                        last_error: None,
-                        restart_count: 0,
-                    },
-                ),
-                (
-                    "telegram".to_string(),
-                    crate::health::ComponentHealth {
-                        status: "error".to_string(),
-                        updated_at: "2026-04-05T00:01:00Z".to_string(),
-                        last_ok: Some("2026-04-04T23:59:00Z".to_string()),
-                        last_error: Some("boom".to_string()),
-                        restart_count: 1,
-                    },
-                ),
-            ]),
-        };
-
-        let sessions = vec![
-            crate::channels::session_backend::SessionMetadata {
-                key: "telegram_123".to_string(),
-                name: None,
-                created_at: utc("2026-04-05T12:00:00Z"),
-                last_activity: utc("2026-04-05T12:05:00Z"),
-                message_count: 2,
-            },
-            crate::channels::session_backend::SessionMetadata {
-                key: "telegram_456".to_string(),
-                name: None,
-                created_at: utc("2026-04-05T12:10:00Z"),
-                last_activity: utc("2026-04-05T12:15:00Z"),
-                message_count: 3,
-            },
-            crate::channels::session_backend::SessionMetadata {
-                key: "webhook_abc".to_string(),
-                name: None,
-                created_at: utc("2026-04-05T13:00:00Z"),
-                last_activity: utc("2026-04-05T13:01:00Z"),
-                message_count: 1,
-            },
-        ];
-
-        let details = build_channel_details(&config, &health, &sessions);
-        assert!(details.len() >= 2);
-
-        let telegram = details
-            .iter()
-            .find(|entry| entry.name == "Telegram")
-            .unwrap();
-        assert_eq!(telegram.channel_type, "connect your bot");
-        assert!(telegram.enabled);
-        assert_eq!(telegram.status, "error");
-        assert_eq!(telegram.message_count, 5);
-        assert_eq!(telegram.health, "down");
-        assert_eq!(
-            telegram.last_message_at.as_deref(),
-            Some("2026-04-05T12:15:00+00:00")
-        );
-
-        let webhook = details
-            .iter()
-            .find(|entry| entry.name == "Webhook")
-            .unwrap();
-        assert_eq!(webhook.channel_type, "HTTP endpoint");
-        assert!(webhook.enabled);
-        assert_eq!(webhook.status, "active");
-        assert_eq!(webhook.message_count, 1);
-        assert_eq!(webhook.health, "healthy");
-        assert_eq!(
-            webhook.last_message_at.as_deref(),
-            Some("2026-04-05T13:01:00+00:00")
-        );
     }
 
     #[test]

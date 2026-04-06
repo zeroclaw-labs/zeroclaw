@@ -31,6 +31,39 @@ use tracing::warn;
 const GITHUB_API_KEY_URL: &str = "https://api.github.com/copilot_internal/v2/token";
 const DEFAULT_API: &str = "https://api.githubcopilot.com";
 
+/// Canonical Copilot model choices shared by onboarding and runtime model selection.
+pub const COPILOT_MODEL_CHOICES: &[(&str, &str)] = &[
+    (
+        "gpt-5.4-mini",
+        "GPT-5.4 Mini (recommended: balanced cost/latency)",
+    ),
+    ("gpt-5.4", "GPT-5.4 (latest flagship)"),
+    ("gpt-5.3", "GPT-5.3 (high-quality)"),
+    ("gpt-5.3-codex", "GPT-5.3 Codex (coding specialist)"),
+    ("gpt-5.2", "GPT-5.2"),
+    ("gpt-5.2-codex", "GPT-5.2 Codex (agentic coding)"),
+    ("gpt-5.1", "GPT-5.1"),
+    ("gpt-5.1-codex", "GPT-5.1 Codex"),
+    ("gpt-5.1-codex-max", "GPT-5.1 Codex Max"),
+    ("gpt-5-mini", "GPT-5 Mini"),
+    ("gpt-4.1", "GPT-4.1"),
+    ("gpt-4o", "GPT-4o"),
+    ("claude-opus-4.6", "Claude Opus 4.6"),
+    ("claude-opus-4.5", "Claude Opus 4.5"),
+    ("claude-sonnet-4.5", "Claude Sonnet 4.5"),
+    ("claude-haiku-4.5", "Claude Haiku 4.5"),
+    ("gemini-3.1-pro", "Gemini 3.1 Pro"),
+    ("gemini-3-pro", "Gemini 3 Pro"),
+    ("gemini-3-flash", "Gemini 3 Flash"),
+    ("gemini-2.5-pro", "Gemini 2.5 Pro"),
+    ("grok-code-fast-1", "Grok Code Fast 1"),
+    ("gpt-4.1-mini", "GPT-4.1 Mini (fast)"),
+    ("gpt-4.1-nano", "GPT-4.1 Nano (ultra-fast)"),
+    ("o1", "o1 (reasoning)"),
+    ("o1-mini", "o1-mini (smaller reasoning)"),
+    ("o3-mini", "o3-mini (efficient reasoning)"),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CopilotTransportApi {
     AnthropicMessages,
@@ -1384,6 +1417,69 @@ mod tests {
 
         let result = CopilotProvider::to_api_content("assistant", "sure").unwrap();
         assert!(matches!(result, ApiContent::Text(ref s) if s == "sure"));
+    }
+
+    #[tokio::test]
+    async fn convert_messages_for_anthropic_hoists_system_and_merges_roles() {
+        let messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::system("ignored later system prompt"),
+            ChatMessage::user("first user turn"),
+            ChatMessage::user("second user turn"),
+            ChatMessage::assistant("assistant turn"),
+            ChatMessage::tool(r#"{"tool_call_id":"tool-123","content":"tool output"}"#),
+        ];
+
+        let (system, native_messages) =
+            CopilotProvider::convert_messages_for_anthropic(&messages).await;
+
+        let system = system.expect("system prompt should be hoisted");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].block_type, "text");
+        assert_eq!(system[0].text, "system prompt");
+        assert_eq!(system[0].cache_control.cache_type, "ephemeral");
+
+        assert_eq!(native_messages.len(), 3);
+        assert_eq!(native_messages[0].role, "user");
+        assert_eq!(native_messages[0].content.len(), 2);
+        assert!(
+            matches!(&native_messages[0].content[0], CopilotAnthropicContentOut::Text { text, cache_control } if text == "first user turn" && cache_control.is_none())
+        );
+        assert!(
+            matches!(&native_messages[0].content[1], CopilotAnthropicContentOut::Text { text, cache_control } if text == "second user turn" && cache_control.is_none())
+        );
+
+        assert_eq!(native_messages[1].role, "assistant");
+        assert_eq!(native_messages[1].content.len(), 1);
+        assert!(
+            matches!(&native_messages[1].content[0], CopilotAnthropicContentOut::Text { text, cache_control } if text == "assistant turn" && cache_control.is_none())
+        );
+
+        assert_eq!(native_messages[2].role, "user");
+        assert_eq!(native_messages[2].content.len(), 1);
+        assert!(
+            matches!(&native_messages[2].content[0], CopilotAnthropicContentOut::ToolResult { tool_use_id, content } if tool_use_id == "tool-123" && content == "tool output")
+        );
+    }
+
+    #[tokio::test]
+    async fn convert_messages_for_anthropic_preserves_assistant_tool_calls() {
+        let messages = vec![ChatMessage::assistant(
+            r#"{"content":"assistant summary","tool_calls":[{"id":"call_1","name":"search","arguments":"{\"query\":\"rust\"}"}]}"#,
+        )];
+
+        let (_system, native_messages) =
+            CopilotProvider::convert_messages_for_anthropic(&messages).await;
+
+        assert_eq!(native_messages.len(), 1);
+        assert_eq!(native_messages[0].role, "assistant");
+        assert_eq!(native_messages[0].content.len(), 2);
+        assert!(
+            matches!(&native_messages[0].content[0], CopilotAnthropicContentOut::Text { text, cache_control } if text == "assistant summary" && cache_control.is_none())
+        );
+        assert!(
+            matches!(&native_messages[0].content[1], CopilotAnthropicContentOut::ToolUse { id, name, input } if id == "call_1" && name == "search" && input == &serde_json::json!({"query": "rust"}))
+        );
     }
 
     #[tokio::test]
