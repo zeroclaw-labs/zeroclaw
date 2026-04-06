@@ -1080,6 +1080,7 @@ mod tests {
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
+            None,
         ));
         let component = unique_component("scheduler-idle");
 
@@ -1101,6 +1102,7 @@ mod tests {
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
+            None,
         ));
         let component = unique_component("scheduler-fail");
 
@@ -1480,6 +1482,7 @@ mod tests {
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
+            None,
         ));
         let component = unique_component("broadcast-ok");
 
@@ -1504,6 +1507,7 @@ mod tests {
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
+            None,
         ));
         let component = unique_component("broadcast-fail");
 
@@ -1527,6 +1531,7 @@ mod tests {
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
+            None,
         ));
         let component = unique_component("broadcast-none");
 
@@ -1542,6 +1547,7 @@ mod tests {
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
+            None,
         ));
         let component = unique_component("broadcast-no-sub");
 

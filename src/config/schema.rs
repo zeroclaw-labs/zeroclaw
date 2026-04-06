@@ -11450,6 +11450,7 @@ auto_save = true
     async fn config_toml_roundtrip() {
         let config = Config {
             workspace_dir: PathBuf::from("/tmp/test/workspace"),
+            project_dir: None,
             config_path: PathBuf::from("/tmp/test/config.toml"),
             api_key: Some("sk-test-key".into()),
             api_url: None,
@@ -12059,6 +12060,7 @@ default_temperature = 0.7
         let config_path = dir.join("config.toml");
         let config = Config {
             workspace_dir: dir.join("workspace"),
+            project_dir: None,
             config_path: config_path.clone(),
             api_key: Some("sk-roundtrip".into()),
             api_url: None,

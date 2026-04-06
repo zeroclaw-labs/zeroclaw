@@ -397,6 +397,7 @@ mod tests {
         Arc::new(SecurityPolicy::from_config(
             &cfg.autonomy,
             &cfg.workspace_dir,
+            None,
         ))
     }
 
@@ -760,6 +761,7 @@ mod tests {
         let security = Arc::new(SecurityPolicy::from_config(
             &cfg.autonomy,
             &cfg.workspace_dir,
+            None,
         ));
         let tool = CronAddTool::new(cfg, security);
         let schema = tool.parameters_schema();
