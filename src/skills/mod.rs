@@ -878,7 +878,7 @@ pub fn skills_to_tools(
         for tool in &skill.tools {
             match tool.kind.as_str() {
                 "shell" | "script" => {
-                    tools.push(Box::new(crate::tools::skill_tool::SkillShellTool::new(
+                    tools.push(Box::new(crate::tools::skill_tool::wrapped_skill_tool(
                         &skill.name,
                         tool,
                         security.clone(),

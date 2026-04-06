@@ -99,15 +99,6 @@ impl Tool for SkillShellTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = self.substitute_args(&args);
 
-        // Rate limit check
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
         // Security validation — always requires explicit approval (approved=true)
         // since skill tools are user-defined and should be treated as medium-risk.
         match self.security.validate_command_execution(&command, true) {
@@ -126,14 +117,6 @@ impl Tool for SkillShellTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Path blocked by security policy: {path}")),
-            });
-        }
-
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
             });
         }
 
@@ -201,6 +184,18 @@ impl Tool for SkillShellTool {
             }),
         }
     }
+}
+
+/// Construct a `SkillShellTool` wrapped in a `RateLimitedTool`.
+pub fn wrapped_skill_tool(
+    skill_name: &str,
+    tool: &crate::skills::SkillTool,
+    security: Arc<SecurityPolicy>,
+) -> super::wrappers::RateLimitedTool<SkillShellTool> {
+    super::wrappers::RateLimitedTool::new(
+        SkillShellTool::new(skill_name, tool, security.clone()),
+        security,
+    )
 }
 
 #[cfg(test)]

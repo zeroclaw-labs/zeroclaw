@@ -1047,14 +1047,6 @@ impl Tool for BrowserTool {
             });
         }
 
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: rate limit exceeded".into()),
-            });
-        }
-
         let backend = match self.resolve_backend().await {
             Ok(selected) => selected,
             Err(error) => {
@@ -2192,6 +2184,32 @@ fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
             host == pattern || host.ends_with(&format!(".{pattern}"))
         }
     })
+}
+
+/// Construct a `BrowserTool` wrapped in a `RateLimitedTool`.
+pub fn wrapped_browser(
+    security: Arc<SecurityPolicy>,
+    allowed_domains: Vec<String>,
+    session_name: Option<String>,
+    backend: String,
+    native_headless: bool,
+    native_webdriver_url: String,
+    native_chrome_path: Option<String>,
+    computer_use: ComputerUseConfig,
+) -> super::wrappers::RateLimitedTool<BrowserTool> {
+    super::wrappers::RateLimitedTool::new(
+        BrowserTool::new_with_backend(
+            security.clone(),
+            allowed_domains,
+            session_name,
+            backend,
+            native_headless,
+            native_webdriver_url,
+            native_chrome_path,
+            computer_use,
+        ),
+        security,
+    )
 }
 
 #[cfg(test)]

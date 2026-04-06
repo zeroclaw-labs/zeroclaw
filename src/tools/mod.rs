@@ -115,7 +115,8 @@ pub mod wrappers;
 
 pub use ask_user::AskUserTool;
 pub use backup_tool::BackupTool;
-pub use browser::{BrowserTool, ComputerUseConfig};
+#[allow(unused_imports)]
+pub use browser::{BrowserTool, ComputerUseConfig, wrapped_browser};
 #[allow(unused_imports)]
 pub use browser_delegate::{BrowserDelegateConfig, BrowserDelegateTool};
 pub use browser_open::BrowserOpenTool;
@@ -154,7 +155,8 @@ pub use hardware_board_info::HardwareBoardInfoTool;
 pub use hardware_memory_map::HardwareMemoryMapTool;
 #[cfg(feature = "hardware")]
 pub use hardware_memory_read::HardwareMemoryReadTool;
-pub use http_request::HttpRequestTool;
+#[allow(unused_imports)]
+pub use http_request::{HttpRequestTool, wrapped_http_request};
 pub use image_gen::ImageGenTool;
 pub use image_info::ImageInfoTool;
 pub use jira_tool::JiraTool;
@@ -194,7 +196,7 @@ pub use shell::ShellTool;
 #[allow(unused_imports)]
 pub use skill_http::SkillHttpTool;
 #[allow(unused_imports)]
-pub use skill_tool::SkillShellTool;
+pub use skill_tool::{SkillShellTool, wrapped_skill_tool};
 pub use sop_advance::SopAdvanceTool;
 pub use sop_approve::SopApproveTool;
 pub use sop_execute::SopExecuteTool;
@@ -208,7 +210,8 @@ pub use traits::Tool;
 pub use traits::{ToolResult, ToolSpec};
 pub use verifiable_intent::VerifiableIntentTool;
 pub use weather_tool::WeatherTool;
-pub use web_fetch::WebFetchTool;
+#[allow(unused_imports)]
+pub use web_fetch::{WebFetchTool, wrapped_web_fetch};
 pub use web_search_tool::WebSearchTool;
 pub use workspace_tool::WorkspaceTool;
 pub use wrappers::{PathGuardedTool, RateLimitedTool};
@@ -506,7 +509,7 @@ pub fn all_tools_with_runtime(
             browser_config.allowed_domains.clone(),
         )));
         // Add full browser automation tool (pluggable backend)
-        tool_arcs.push(Arc::new(BrowserTool::new_with_backend(
+        tool_arcs.push(Arc::new(wrapped_browser(
             security.clone(),
             browser_config.allowed_domains.clone(),
             browser_config.session_name.clone(),
@@ -541,7 +544,7 @@ pub fn all_tools_with_runtime(
     }
 
     if http_config.enabled {
-        tool_arcs.push(Arc::new(HttpRequestTool::new(
+        tool_arcs.push(Arc::new(wrapped_http_request(
             security.clone(),
             http_config.allowed_domains.clone(),
             http_config.max_response_size,
@@ -551,7 +554,7 @@ pub fn all_tools_with_runtime(
     }
 
     if web_fetch_config.enabled {
-        tool_arcs.push(Arc::new(WebFetchTool::new(
+        tool_arcs.push(Arc::new(wrapped_web_fetch(
             security.clone(),
             web_fetch_config.allowed_domains.clone(),
             web_fetch_config.blocked_domains.clone(),
