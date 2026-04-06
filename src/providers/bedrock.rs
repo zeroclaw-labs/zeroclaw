@@ -605,12 +605,14 @@ impl BedrockProvider {
                     }
                 }
                 "assistant" => {
-                    if let Some(blocks) = Self::parse_assistant_tool_call_message(&msg.content) {
+                    if let Some(blocks) = Self::parse_assistant_tool_call_message(&msg.content)
+                        .filter(|b| !b.is_empty())
+                    {
                         converse_messages.push(ConverseMessage {
                             role: "assistant".to_string(),
                             content: blocks,
                         });
-                    } else {
+                    } else if !msg.content.trim().is_empty() {
                         converse_messages.push(ConverseMessage {
                             role: "assistant".to_string(),
                             content: vec![ContentBlock::Text(TextBlock {
@@ -618,6 +620,8 @@ impl BedrockProvider {
                             })],
                         });
                     }
+                    // Empty assistant messages (e.g. from interrupted streaming)
+                    // are silently dropped — Bedrock rejects empty TextBlocks.
                 }
                 "tool" => {
                     let tool_result_msg = Self::parse_tool_result_message(&msg.content)
@@ -667,10 +671,12 @@ impl BedrockProvider {
                 }
                 _ => {
                     let content_blocks = Self::parse_user_content_blocks(&msg.content);
-                    converse_messages.push(ConverseMessage {
-                        role: "user".to_string(),
-                        content: content_blocks,
-                    });
+                    if !content_blocks.is_empty() {
+                        converse_messages.push(ConverseMessage {
+                            role: "user".to_string(),
+                            content: content_blocks,
+                        });
+                    }
                 }
             }
         }
@@ -800,7 +806,7 @@ impl BedrockProvider {
             }));
         }
 
-        if blocks.is_empty() {
+        if blocks.is_empty() && !content.trim().is_empty() {
             blocks.push(ContentBlock::Text(TextBlock {
                 text: content.to_string(),
             }));
@@ -1495,6 +1501,39 @@ mod tests {
         let (_, msgs) = BedrockProvider::convert_messages(&messages);
         assert_eq!(msgs.len(), 1);
         assert!(matches!(msgs[0].content[0], ContentBlock::Text(_)));
+    }
+
+    #[test]
+    fn convert_messages_drops_empty_assistant() {
+        let messages = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant(""),
+            ChatMessage::assistant("   "),
+            ChatMessage::user("Follow-up"),
+        ];
+        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[1].role, "user");
+    }
+
+    #[test]
+    fn convert_messages_drops_empty_user() {
+        let messages = vec![ChatMessage::user("")];
+        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn convert_messages_assistant_empty_tool_calls_falls_back_to_text() {
+        // JSON with empty tool_calls and empty content: parsed blocks are empty
+        // so the filter drops them, but the raw JSON string is non-blank so it
+        // falls through to the plain-text branch (still valid for Bedrock).
+        let messages = vec![ChatMessage::assistant(r#"{"content":"","tool_calls":[]}"#)];
+        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "assistant");
+        assert!(matches!(&msgs[0].content[0], ContentBlock::Text(_)));
     }
 
     // ── Cache tests ─────────────────────────────────────────────
