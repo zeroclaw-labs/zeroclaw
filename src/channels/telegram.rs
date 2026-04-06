@@ -643,7 +643,10 @@ impl TelegramChannel {
     /// Check whether a voice reply should be queued for the given recipient and
     /// content. This is shared between `send()` and `finalize_draft()` so the
     /// TTS voice-reply path works regardless of `stream_mode`.
-    fn try_queue_voice_reply(&self, recipient: &str, content: &str) {
+    ///
+    /// When `immediate` is `true` (called from `finalize_draft`), the 10-second
+    /// debounce is skipped and `synthesize_and_send_voice` is called directly.
+    fn try_queue_voice_reply(&self, recipient: &str, content: &str, immediate: bool) {
         let is_voice_chat = self
             .voice_chats
             .lock()
@@ -681,6 +684,42 @@ impl TelegramChannel {
             return;
         }
 
+        let (chat_id, thread_id) = Self::parse_reply_target(recipient);
+        let voice_chats = self.voice_chats.clone();
+        let api_base = self.api_base.clone();
+        let bot_token = self.bot_token.clone();
+        let tts_config = self.tts_config.clone().unwrap();
+
+        if immediate {
+            tracing::debug!("TTS: immediate voice reply triggered");
+
+            let text = content.to_string();
+            let recipient = recipient.to_string();
+            tokio::spawn(async move {
+                if let Ok(mut vc) = voice_chats.lock() {
+                    vc.remove(&recipient);
+                }
+                match Self::synthesize_and_send_voice(
+                    &api_base,
+                    &bot_token,
+                    &chat_id,
+                    thread_id.as_deref(),
+                    &text,
+                    &tts_config,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!("Telegram: voice reply sent ({} chars)", text.len());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Telegram: TTS voice reply failed: {e}");
+                    }
+                }
+            });
+            return;
+        }
+
         if let Ok(mut pv) = self.pending_voice.lock() {
             pv.insert(
                 recipient.to_string(),
@@ -694,13 +733,8 @@ impl TelegramChannel {
             "TTS voice reply queued"
         );
 
-        let (chat_id, thread_id) = Self::parse_reply_target(recipient);
         let pending = self.pending_voice.clone();
-        let voice_chats = self.voice_chats.clone();
-        let api_base = self.api_base.clone();
-        let bot_token = self.bot_token.clone();
         let recipient = recipient.to_string();
-        let tts_config = self.tts_config.clone().unwrap();
         tokio::spawn(async move {
             // Wait 10 seconds — long enough for the agent to finish its
             // full tool chain and send the final answer.
@@ -2586,7 +2620,7 @@ impl Channel for TelegramChannel {
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
 
         // Queue TTS voice reply when streaming mode finalises a draft
-        self.try_queue_voice_reply(recipient, text);
+        self.try_queue_voice_reply(recipient, text, true);
 
         // Clean up rate-limit tracking for this chat
         self.last_draft_edit.lock().remove(&chat_id);
@@ -2783,7 +2817,7 @@ impl Channel for TelegramChannel {
 
         // Voice chat mode: send text normally AND queue a voice note of the
         // final answer. Text in → text out. Voice in → text + voice out.
-        self.try_queue_voice_reply(&message.recipient, &content);
+        self.try_queue_voice_reply(&message.recipient, &content, false);
 
         // Always send text reply (voice chat gets both text and voice)
         let (text_without_markers, attachments) = parse_attachment_markers(&content);
