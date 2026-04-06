@@ -363,10 +363,65 @@ Notes:
 
 ZeroClaw can delegate coding work to external agent CLIs. There are two integration styles:
 
-- inline subprocess tools such as `codex_cli`, which block until the CLI returns
-- runner tools such as `codex_runner`, which start the harness in `tmux` and return an attach command immediately
+- inline subprocess tools such as `claude_code` and `codex_cli`, which block until the CLI returns
+- runner tools such as `claude_code_runner` and `codex_runner`, which start the harness in `tmux` and return an attach command immediately
 
 These tools are disabled by default.
+
+### `[claude_code]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable the `claude_code` tool |
+| `timeout_secs` | `600` | Maximum runtime for a single inline `claude -p` call |
+| `allowed_tools` | `["Read", "Edit", "Bash", "Write"]` | Default Claude Code tool allowlist |
+| `system_prompt` | unset | Optional system prompt appended to the harness invocation |
+| `max_output_bytes` | `2097152` | Maximum captured stdout size before truncation |
+| `env_passthrough` | `[]` | Extra environment variables passed to the Claude subprocess |
+
+Notes:
+
+- `claude_code` runs `claude -p --output-format json`.
+- Authentication uses the local Claude Code login/session by default.
+- Add `ANTHROPIC_API_KEY` to `env_passthrough` only when you intentionally want ZeroClaw to use API-key billing instead of the local Claude session.
+- The tool supports per-call `session_id` resume, structured output via JSON Schema, and working-directory overrides within the workspace boundary.
+
+Example:
+
+```toml
+[claude_code]
+enabled = true
+timeout_secs = 900
+allowed_tools = ["Read", "Edit", "Bash", "Write"]
+max_output_bytes = 2097152
+env_passthrough = ["ANTHROPIC_API_KEY"]
+```
+
+### `[claude_code_runner]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable the `claude_code_runner` tool |
+| `ssh_host` | unset | Host used when returning an SSH attach command |
+| `tmux_prefix` | `zc-claude-` | Prefix for spawned tmux session names |
+| `session_ttl` | `3600` | Auto-cleanup TTL for spawned tmux sessions |
+
+Notes:
+
+- `claude_code_runner` starts Claude Code in a detached `tmux` session and returns immediately with an attach command.
+- The runner configures Claude Code HTTP hooks pointed at ZeroClaw's `/hooks/claude-code` gateway endpoint.
+- When a `slack_channel` is provided on the tool call, hook events can be correlated for progress reporting and operator handoff.
+- `tmux` must be installed on the host where ZeroClaw runs.
+
+Example:
+
+```toml
+[claude_code_runner]
+enabled = true
+ssh_host = "devbox.example.com"
+tmux_prefix = "zc-claude-"
+session_ttl = 7200
+```
 
 ### `[codex_cli]`
 
