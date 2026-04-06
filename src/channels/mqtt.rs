@@ -12,7 +12,7 @@ use tracing::{info, warn};
 use crate::config::MqttConfig;
 use crate::sop::audit::SopAuditLogger;
 use crate::sop::dispatch::{dispatch_sop_event, process_headless_results};
-use crate::sop::engine::{now_iso8601, SopEngine};
+use crate::sop::engine::{SopEngine, now_iso8601};
 use crate::sop::types::{SopEvent, SopTriggerSource};
 
 /// Run the MQTT SOP listener loop.
@@ -73,7 +73,7 @@ pub async fn run_mqtt_sop_listener(
                 };
 
                 let results = dispatch_sop_event(&engine, &audit, event).await;
-                process_headless_results(&results).await;
+                process_headless_results(&results);
             }
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 crate::health::mark_component_ok("mqtt");

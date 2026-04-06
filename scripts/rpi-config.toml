@@ -366,7 +366,7 @@ enabled = false
 rules = []
 
 [heartbeat]
-enabled = false
+enabled = true
 interval_minutes = 30
 
 [cron]

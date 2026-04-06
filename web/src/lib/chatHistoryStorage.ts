@@ -10,6 +10,7 @@ export interface PersistedChatBubble {
   content: string;
   thinking?: string;
   markdown?: boolean;
+  toolCall?: { name: string; args?: unknown; output?: string };
   timestamp: string;
 }
 
@@ -83,6 +84,7 @@ export function persistedToUiMessages(
   content: string;
   thinking?: string;
   markdown?: boolean;
+  toolCall?: { name: string; args?: unknown; output?: string };
   timestamp: Date;
 }> {
   return rows.map((m) => ({
@@ -91,6 +93,7 @@ export function persistedToUiMessages(
     content: m.content,
     thinking: m.thinking,
     markdown: m.markdown,
+    toolCall: m.toolCall,
     timestamp: new Date(m.timestamp),
   }));
 }
@@ -102,6 +105,7 @@ export function uiMessagesToPersisted(
     content: string;
     thinking?: string;
     markdown?: boolean;
+    toolCall?: { name: string; args?: unknown; output?: string };
     timestamp: Date;
   }>,
 ): PersistedChatBubble[] {
@@ -111,6 +115,7 @@ export function uiMessagesToPersisted(
     content: m.content,
     thinking: m.thinking,
     markdown: m.markdown,
+    toolCall: m.toolCall,
     timestamp: m.timestamp.toISOString(),
   }));
 }

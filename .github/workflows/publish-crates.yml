@@ -46,6 +46,9 @@ jobs:
     needs: [validate]
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/zeroclawlabs
     steps:
       - uses: actions/checkout@v4
 

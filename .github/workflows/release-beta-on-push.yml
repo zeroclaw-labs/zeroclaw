@@ -332,6 +332,9 @@ jobs:
     name: Publish Beta Release
     needs: [version, release-notes, build, build-desktop]
     runs-on: ubuntu-latest
+    environment:
+      name: github-releases
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ needs.version.outputs.tag }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -420,6 +423,9 @@ jobs:
     needs: [version, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment:
+      name: docker
+      url: https://github.com/${{ github.repository }}/pkgs/container/zeroclaw
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 

@@ -3,6 +3,7 @@ mod agent_robustness;
 mod backup_cron_scheduling;
 mod channel_matrix;
 mod channel_routing;
+mod email_attachments;
 mod hooks;
 mod memory_comparison;
 mod memory_loop_continuity;

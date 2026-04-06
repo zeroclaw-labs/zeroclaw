@@ -1257,14 +1257,14 @@ fn create_provider_with_url_and_options(
             "Z.AI",
             zai_base_url(name).expect("checked in guard"),
             key,
-            AuthStyle::Bearer,
+            AuthStyle::ZhipuJwt,
         ))),
         name if glm_base_url(name).is_some() => {
             Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
                 "GLM",
                 glm_base_url(name).expect("checked in guard"),
                 key,
-                AuthStyle::Bearer,
+                AuthStyle::ZhipuJwt,
             )))
         }
         name if minimax_base_url(name).is_some() => Ok(compat(
@@ -2330,27 +2330,39 @@ pub fn list_providers() -> Vec<ProviderInfo> {
     ]
 }
 
+/// Shared test utilities for provider modules.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{Mutex, OnceLock};
+pub(crate) mod test_util {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    struct EnvGuard {
-        key: &'static str,
+    /// Process-wide lock for tests that mutate environment variables.
+    pub fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned")
+    }
+
+    /// RAII guard that sets or unsets an env var and restores the original
+    /// value on drop. Always acquire [`env_lock`] before creating guards.
+    pub struct EnvGuard {
+        key: String,
         original: Option<String>,
     }
 
     impl EnvGuard {
-        fn set(key: &'static str, value: Option<&str>) -> Self {
+        pub fn set(key: &str, value: Option<&str>) -> Self {
             let original = std::env::var(key).ok();
             match value {
                 // SAFETY: test-only, single-threaded test runner.
-                Some(next) => unsafe { std::env::set_var(key, next) },
+                Some(v) => unsafe { std::env::set_var(key, v) },
                 // SAFETY: test-only, single-threaded test runner.
                 None => unsafe { std::env::remove_var(key) },
             }
-
-            Self { key, original }
+            Self {
+                key: key.to_string(),
+                original,
+            }
         }
     }
 
@@ -2358,20 +2370,19 @@ mod tests {
         fn drop(&mut self) {
             if let Some(original) = self.original.as_deref() {
                 // SAFETY: test-only, single-threaded test runner.
-                unsafe { std::env::set_var(self.key, original) };
+                unsafe { std::env::set_var(&self.key, original) };
             } else {
                 // SAFETY: test-only, single-threaded test runner.
-                unsafe { std::env::remove_var(self.key) };
+                unsafe { std::env::remove_var(&self.key) };
             }
         }
     }
+}
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock poisoned")
-    }
+#[cfg(test)]
+mod tests {
+    use super::test_util::{EnvGuard, env_lock};
+    use super::*;
 
     #[test]
     fn resolve_provider_credential_prefers_explicit_argument() {

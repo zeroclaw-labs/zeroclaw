@@ -358,8 +358,13 @@ jobs:
     name: Publish Stable Release
     needs: [validate, release-notes, build, build-desktop]
     runs-on: ubuntu-latest
+    environment:
+      name: github-releases
+      url: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.validate.outputs.version }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          token: ${{ secrets.RELEASE_TOKEN }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -421,6 +426,8 @@ jobs:
         env:
           TAG: ${{ needs.validate.outputs.tag }}
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$TAG" -m "zeroclaw $TAG"
           git push origin "$TAG"
 
@@ -440,6 +447,9 @@ jobs:
     needs: [validate, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/zeroclawlabs/${{ needs.validate.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -512,6 +522,9 @@ jobs:
     needs: [validate, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment:
+      name: docker
+      url: https://github.com/${{ github.repository }}/pkgs/container/zeroclaw
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
