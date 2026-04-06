@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cargo fmt --check -- src/skills/improver.rs 2>&1\"}",
+  "error": "Exit code 1\nDiff in /home/blitz/development/agents/zeroclaw/src/agent/loop_.rs:4049:\n         #[cfg(feature = \"skill-creation\")]\n         if config.skills.skill_improvement.enabled {\n             // extract_skill_executions_from_history returns Vec<(slug, succeeded)>\n\u001b[31m-            let executions = crate::skills::improver::extract_skill_executions_from_history(&history);\n\u001b(B\u001b[m\u001b[32m+            let executions =\n\u001b(B\u001b[m\u001b[32m+                crate::skills::improver::extract_skill_executions_from...",
+  "timestamp": "2026-04-06T22:50:04.164Z",
+  "retry_count": 5
+}

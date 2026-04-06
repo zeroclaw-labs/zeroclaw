@@ -1,0 +1,10 @@
+{
+  "active": true,
+  "started_at": "2026-04-05T00:31:36.140Z",
+  "original_prompt": "hazlo con ultrawork, pero recuerda, si es dm por cualquier canal, no hay precheck. Si es en un grupo, tenemos que poder decidir entre 2 opciones: \"responder sólo si se menciona\" o \"responder si cree que tiene que responder\", esta última es la que debe hacer ese precheck.",
+  "session_id": "2b844c7a-72ed-40c5-b309-20532b536945",
+  "project_path": "/home/blitz/development/agents/zeroclaw",
+  "reinforcement_count": 0,
+  "awaiting_confirmation": true,
+  "last_checked_at": "2026-04-05T00:31:36.140Z"
+}

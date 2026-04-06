@@ -1,0 +1,333 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1775258948579,
+  "projectRoot": "/home/blitz/development/agents/zeroclaw",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Rust",
+        "version": "1.87",
+        "confidence": "high",
+        "markers": [
+          "Cargo.toml"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "axum",
+        "version": null,
+        "category": "backend"
+      }
+    ],
+    "packageManager": "cargo",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "cargo build",
+    "testCommand": "cargo test",
+    "lintCommand": "cargo clippy",
+    "devCommand": "cargo run",
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs",
+      "scripts",
+      "src",
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "master",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "apps": {
+      "path": "apps",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1775258948571,
+      "keyFiles": []
+    },
+    "benches": {
+      "path": "benches",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1775258948571,
+      "keyFiles": [
+        "agent_benchmarks.rs"
+      ]
+    },
+    "crates": {
+      "path": "crates",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1775258948574,
+      "keyFiles": []
+    },
+    "dev": {
+      "path": "dev",
+      "purpose": null,
+      "fileCount": 12,
+      "lastAccessed": 1775258948575,
+      "keyFiles": [
+        "README.md",
+        "ci.sh",
+        "cli.sh",
+        "config.harness-test.toml",
+        "config.template.toml"
+      ]
+    },
+    "dist": {
+      "path": "dist",
+      "purpose": "Distribution/build output",
+      "fileCount": 0,
+      "lastAccessed": 1775258948575,
+      "keyFiles": []
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 5,
+      "lastAccessed": 1775258948575,
+      "keyFiles": [
+        "README.md",
+        "SUMMARY.md",
+        "aardvark-integration.md",
+        "browser-setup.md",
+        "openai-temperature-compatibility.md"
+      ]
+    },
+    "firmware": {
+      "path": "firmware",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1775258948575,
+      "keyFiles": []
+    },
+    "fuzz": {
+      "path": "fuzz",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1775258948575,
+      "keyFiles": [
+        "Cargo.toml"
+      ]
+    },
+    "marketplace": {
+      "path": "marketplace",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1775258948576,
+      "keyFiles": [
+        "README.md",
+        "sync-marketplace-templates.yml"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 5,
+      "lastAccessed": 1775258948576,
+      "keyFiles": [
+        "99-act-led.rules",
+        "README.md",
+        "deploy-rpi.sh",
+        "rpi-config.toml",
+        "zeroclaw.service"
+      ]
+    },
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 8,
+      "lastAccessed": 1775258948576,
+      "keyFiles": [
+        "cli_input.rs",
+        "i18n.rs",
+        "identity.rs",
+        "lib.rs",
+        "main.rs"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 4,
+      "lastAccessed": 1775258948576,
+      "keyFiles": [
+        "test_component.rs",
+        "test_integration.rs",
+        "test_live.rs",
+        "test_system.rs"
+      ]
+    },
+    "tool_descriptions": {
+      "path": "tool_descriptions",
+      "purpose": null,
+      "fileCount": 31,
+      "lastAccessed": 1775258948577,
+      "keyFiles": [
+        "ar.toml",
+        "bn.toml",
+        "cs.toml",
+        "da.toml",
+        "de.toml"
+      ]
+    },
+    "web": {
+      "path": "web",
+      "purpose": null,
+      "fileCount": 8,
+      "lastAccessed": 1775258948577,
+      "keyFiles": [
+        "index.html",
+        "package-lock.json",
+        "package.json",
+        "tsconfig.app.json",
+        "tsconfig.json"
+      ]
+    },
+    "docs/assets": {
+      "path": "docs/assets",
+      "purpose": "Static assets",
+      "fileCount": 10,
+      "lastAccessed": 1775258948578,
+      "keyFiles": [
+        "Hardware_architecture.jpg",
+        "architecture-diagrams.md",
+        "architecture.svg"
+      ]
+    },
+    "src/config": {
+      "path": "src/config",
+      "purpose": "Configuration files",
+      "fileCount": 4,
+      "lastAccessed": 1775258948579,
+      "keyFiles": [
+        "mod.rs",
+        "schema.rs",
+        "traits.rs"
+      ]
+    },
+    "tests/fixtures": {
+      "path": "tests/fixtures",
+      "purpose": "Test fixtures",
+      "fileCount": 3,
+      "lastAccessed": 1775258948579,
+      "keyFiles": [
+        "hello.mp3",
+        "test_document.pdf",
+        "test_photo.jpg"
+      ]
+    },
+    "web/dist": {
+      "path": "web/dist",
+      "purpose": "Distribution/build output",
+      "fileCount": 1,
+      "lastAccessed": 1775258948579,
+      "keyFiles": [
+        "logo.png"
+      ]
+    },
+    "web/public": {
+      "path": "web/public",
+      "purpose": "Public files",
+      "fileCount": 1,
+      "lastAccessed": 1775258948579,
+      "keyFiles": [
+        "logo.png"
+      ]
+    },
+    "web/src": {
+      "path": "web/src",
+      "purpose": "Source code",
+      "fileCount": 4,
+      "lastAccessed": 1775258948579,
+      "keyFiles": [
+        "App.tsx",
+        "index.css",
+        "main.tsx"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "src/agent/loop_.rs",
+      "accessCount": 20,
+      "lastAccessed": 1775259429138,
+      "type": "file"
+    },
+    {
+      "path": "src/channels/mod.rs",
+      "accessCount": 13,
+      "lastAccessed": 1775259572936,
+      "type": "file"
+    },
+    {
+      "path": "src/agent/context_compressor.rs",
+      "accessCount": 5,
+      "lastAccessed": 1775259495834,
+      "type": "file"
+    },
+    {
+      "path": "src/config/schema.rs",
+      "accessCount": 4,
+      "lastAccessed": 1775259477380,
+      "type": "file"
+    },
+    {
+      "path": "src/providers/mod.rs",
+      "accessCount": 2,
+      "lastAccessed": 1775259404562,
+      "type": "file"
+    },
+    {
+      "path": "src/agent",
+      "accessCount": 1,
+      "lastAccessed": 1775259220575,
+      "type": "directory"
+    },
+    {
+      "path": "",
+      "accessCount": 1,
+      "lastAccessed": 1775259234752,
+      "type": "directory"
+    },
+    {
+      "path": "src/channels/cli.rs",
+      "accessCount": 1,
+      "lastAccessed": 1775259246159,
+      "type": "file"
+    },
+    {
+      "path": "src/agent/history.rs",
+      "accessCount": 1,
+      "lastAccessed": 1775259287935,
+      "type": "file"
+    },
+    {
+      "path": "dev/config.harness-test.toml",
+      "accessCount": 1,
+      "lastAccessed": 1775259296221,
+      "type": "file"
+    },
+    {
+      "path": "src/providers/router.rs",
+      "accessCount": 1,
+      "lastAccessed": 1775259478060,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

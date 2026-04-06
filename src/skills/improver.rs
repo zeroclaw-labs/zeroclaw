@@ -297,7 +297,13 @@ pub fn extract_skill_slugs_from_history(
     let mut seen = std::collections::HashSet::new();
     extract_skill_executions_from_history(history)
         .into_iter()
-        .filter_map(|(slug, _)| if seen.insert(slug.clone()) { Some(slug) } else { None })
+        .filter_map(|(slug, _)| {
+            if seen.insert(slug.clone()) {
+                Some(slug)
+            } else {
+                None
+            }
+        })
         .collect()
 }
 

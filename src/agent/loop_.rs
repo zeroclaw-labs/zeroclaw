@@ -4049,7 +4049,8 @@ pub async fn run(
         #[cfg(feature = "skill-creation")]
         if config.skills.skill_improvement.enabled {
             // extract_skill_executions_from_history returns Vec<(slug, succeeded)>
-            let executions = crate::skills::improver::extract_skill_executions_from_history(&history);
+            let executions =
+                crate::skills::improver::extract_skill_executions_from_history(&history);
             let failed_skills: Vec<&str> = executions
                 .iter()
                 .filter(|(_, succeeded)| !succeeded)
@@ -4063,7 +4064,11 @@ pub async fn run(
                 );
 
                 for slug in failed_skills {
-                    let toml_path = config.workspace_dir.join("skills").join(slug).join("SKILL.toml");
+                    let toml_path = config
+                        .workspace_dir
+                        .join("skills")
+                        .join(slug)
+                        .join("SKILL.toml");
                     let current_content = match std::fs::read_to_string(&toml_path) {
                         Ok(c) => c,
                         Err(e) => {
@@ -4078,23 +4083,41 @@ pub async fn run(
                         .rev()
                         .take(6)
                         .rev()
-                        .map(|m| format!("[{}]: {}", m.role, &m.content[..m.content.len().min(500)]))
+                        .map(|m| {
+                            format!("[{}]: {}", m.role, &m.content[..m.content.len().min(500)])
+                        })
                         .collect::<Vec<_>>()
                         .join("\n");
 
                     // Ask LLM to generate improved content
-                    match improver.generate_improved_content(
-                        slug,
-                        &current_content,
-                        &failure_context,
-                        provider.as_ref(),
-                        &model_name,
-                    ).await {
+                    match improver
+                        .generate_improved_content(
+                            slug,
+                            &current_content,
+                            &failure_context,
+                            provider.as_ref(),
+                            &model_name,
+                        )
+                        .await
+                    {
                         Ok(improved) => {
-                            match improver.improve_skill(slug, &improved, "Auto-fix after skill execution failure").await {
-                                Ok(Some(s)) => tracing::info!(slug = %s, "Auto-improved skill after failure"),
-                                Ok(None) => tracing::debug!(slug = %slug, "Skill improvement skipped"),
-                                Err(e) => tracing::warn!(slug = %slug, "Skill improvement write failed: {e}"),
+                            match improver
+                                .improve_skill(
+                                    slug,
+                                    &improved,
+                                    "Auto-fix after skill execution failure",
+                                )
+                                .await
+                            {
+                                Ok(Some(s)) => {
+                                    tracing::info!(slug = %s, "Auto-improved skill after failure")
+                                }
+                                Ok(None) => {
+                                    tracing::debug!(slug = %slug, "Skill improvement skipped")
+                                }
+                                Err(e) => {
+                                    tracing::warn!(slug = %slug, "Skill improvement write failed: {e}")
+                                }
                             }
                         }
                         Err(e) => {
