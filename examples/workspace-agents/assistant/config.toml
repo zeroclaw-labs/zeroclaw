@@ -1,0 +1,36 @@
+# Workspace Agent Configuration
+# Copy this folder to your workspace/agents/ directory and customize.
+#
+# All fields are optional — unset values fall back to the global defaults
+# from your main config.toml.
+
+# Provider override (e.g. "openai", "anthropic", "ollama")
+# provider = "openai"
+
+# Model override
+# model = "gpt-4o"
+
+# Enable multi-turn tool-call loop (default: true)
+agentic = true
+
+# Maximum tool-call iterations in agentic mode
+max_iterations = 15
+
+# Tools this agent can use (empty = all safe tools)
+allowed_tools = [
+    "file_read",
+    "file_write",
+    "file_edit",
+    "shell",
+    "memory_recall",
+    "memory_store",
+    "web_search",
+    "web_fetch",
+    "calculator",
+]
+
+# Max recursion depth for nested delegation
+max_depth = 3
+
+# Memory namespace isolation (default: agent folder name)
+# memory_namespace = "assistant"
