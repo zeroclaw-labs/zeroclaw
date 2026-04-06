@@ -2787,7 +2787,7 @@ pub struct WebSearchConfig {
     #[serde(default)]
     pub searxng_engines: String,
     /// SearXNG SafeSearch level (0=none, 1=moderate, 2=strict)
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_searxng_safesearch")]
     pub searxng_safesearch: u8,
     /// Maximum number of retries for SearXNG
     #[serde(default = "default_searxng_max_retries")]
@@ -2806,6 +2806,19 @@ fn default_web_search_provider() -> String {
 
 fn default_web_search_max_results() -> usize {
     5
+}
+
+fn deserialize_searxng_safesearch<'de, D>(deserializer: D) -> std::result::Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: u8 = serde::Deserialize::deserialize(deserializer)?;
+    if value > 2 {
+        return Err(serde::de::Error::custom(format!(
+            "searxng_safesearch {value} is invalid (expected 0, 1, or 2)"
+        )));
+    }
+    Ok(value)
 }
 
 fn default_web_search_timeout_secs() -> u64 {

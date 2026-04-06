@@ -21,6 +21,16 @@ pub struct WebSearchTool {
     boot_brave_api_key: Option<String>,
     /// SearXNG instance base URL (e.g. "https://searx.example.com").
     searxng_instance_url: Option<String>,
+    /// SearXNG authentication token.
+    searxng_auth_token: Option<String>,
+    /// SearXNG language (e.g. "en-US", "ja-JP").
+    searxng_language: Option<String>,
+    /// SearXNG engines to search (comma-separated).
+    searxng_engines: Option<String>,
+    /// SearXNG SafeSearch preference (0, 1, 2).
+    searxng_safesearch: Option<usize>,
+    /// SearXNG max retries on failure.
+    searxng_max_retries: Option<usize>,
     max_results: usize,
     timeout_secs: u64,
     /// Path to `config.toml` for lazy re-read of keys at execution time.
@@ -40,6 +50,11 @@ impl WebSearchTool {
             provider: provider.trim().to_lowercase(),
             boot_brave_api_key: brave_api_key,
             searxng_instance_url: None,
+            searxng_auth_token: None,
+            searxng_language: None,
+            searxng_engines: None,
+            searxng_safesearch: None,
+            searxng_max_retries: None,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             config_path: PathBuf::new(),
@@ -56,6 +71,11 @@ impl WebSearchTool {
         provider: String,
         brave_api_key: Option<String>,
         searxng_instance_url: Option<String>,
+        searxng_auth_token: Option<String>,
+        searxng_language: Option<String>,
+        searxng_engines: Option<String>,
+        searxng_safesearch: Option<usize>,
+        searxng_max_retries: Option<usize>,
         max_results: usize,
         timeout_secs: u64,
         config_path: PathBuf,
@@ -65,6 +85,11 @@ impl WebSearchTool {
             provider: provider.trim().to_lowercase(),
             boot_brave_api_key: brave_api_key,
             searxng_instance_url,
+            searxng_auth_token,
+            searxng_language,
+            searxng_engines,
+            searxng_safesearch,
+            searxng_max_retries,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             config_path,
@@ -121,6 +146,71 @@ impl WebSearchTool {
         } else {
             Ok(raw_key)
         }
+    }
+
+    fn resolve_searxng_instance_url(&self) -> anyhow::Result<String> {
+        if let Some(ref url) = self.searxng_instance_url {
+            if !url.is_empty() {
+                return Ok(url.clone());
+            }
+        }
+        self.reload_searxng_instance_url()
+    }
+
+    fn reload_searxng_instance_url(&self) -> anyhow::Result<String> {
+        let contents = std::fs::read_to_string(&self.config_path)?;
+        let config: crate::config::Config = toml::from_str(&contents)?;
+        config
+            .web_search
+            .searxng_instance_url
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("SearXNG instance URL not configured"))
+    }
+
+    fn resolve_searxng_auth_token(&self) -> anyhow::Result<Option<String>> {
+        if let Some(ref token) = self.searxng_auth_token {
+            if !token.is_empty() && !crate::security::SecretStore::is_encrypted(token) {
+                return Ok(Some(token.clone()));
+            }
+        }
+        self.reload_searxng_auth_token()
+    }
+
+    fn reload_searxng_auth_token(&self) -> anyhow::Result<Option<String>> {
+        let contents = std::fs::read_to_string(&self.config_path)?;
+        let config: crate::config::Config = toml::from_str(&contents)?;
+        let raw_token = match config.web_search.searxng_auth_token {
+            Some(t) if !t.is_empty() => t,
+            _ => return Ok(None),
+        };
+
+        if crate::security::SecretStore::is_encrypted(&raw_token) {
+            let zeroclaw_dir = self.config_path.parent().unwrap_or_else(|| Path::new("."));
+            let store = crate::security::SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
+            let plaintext = store.decrypt(&raw_token)?;
+            Ok(Some(plaintext))
+        } else {
+            Ok(Some(raw_token))
+        }
+    }
+
+    fn resolve_searxng_language(&self) -> String {
+        if let Some(ref lang) = self.searxng_language {
+            return lang.clone();
+        }
+        "auto".to_string()
+    }
+
+    fn resolve_searxng_engines(&self) -> String {
+        self.searxng_engines.clone().unwrap_or_default()
+    }
+
+    fn resolve_searxng_safesearch(&self) -> usize {
+        self.searxng_safesearch.unwrap_or(0)
+    }
+
+    fn resolve_searxng_max_retries(&self) -> usize {
+        self.searxng_max_retries.unwrap_or(3)
     }
 
     async fn search_duckduckgo(&self, query: &str) -> anyhow::Result<String> {
@@ -256,70 +346,65 @@ impl WebSearchTool {
         Ok(lines.join("\n"))
     }
 
-    /// Resolve the SearXNG instance URL from the boot-time config or by
-    /// re-reading `config.toml` at runtime.
-    fn resolve_searxng_instance_url(&self) -> anyhow::Result<String> {
-        if let Some(ref url) = self.searxng_instance_url {
-            if !url.is_empty() {
-                return Ok(url.clone());
+    async fn search_searxng(&self, query: &str) -> anyhow::Result<String> {
+        let instance_url = self.resolve_searxng_instance_url()?;
+        let auth_token = self.resolve_searxng_auth_token()?;
+        let language = self.resolve_searxng_language();
+        let engines = self.resolve_searxng_engines();
+        let safesearch = self.resolve_searxng_safesearch();
+        let max_retries = self.resolve_searxng_max_retries();
+
+        let mut search_url = format!(
+            "{}/search?q={}&format=json&language={}&safesearch={}",
+            instance_url.trim_end_matches('/'),
+            urlencoding::encode(query),
+            language,
+            safesearch
+        );
+
+        if !engines.is_empty() {
+            search_url.push_str(&format!("&engines={}", engines));
+        }
+
+        let mut backoff = Duration::from_millis(500);
+        let mut last_error = None;
+
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                tracing::warn!("SearXNG retry attempt {}/{}...", attempt, max_retries);
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+
+            let mut builder = reqwest::Client::builder()
+                .timeout(Duration::from_secs(self.timeout_secs))
+                .user_agent("ZeroClaw/1.0");
+            builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_search");
+            let client = builder.build()?;
+
+            let mut request = client.get(&search_url);
+            if let Some(ref token) = auth_token {
+                request = request.header("Authorization", format!("Bearer {}", token));
+            }
+
+            match request.send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        let json: serde_json::Value = response.json().await?;
+                        return self.parse_searxng_results(&json, query);
+                    } else {
+                        let status = response.status();
+                        let text = response.text().await.unwrap_or_default();
+                        last_error = Some(anyhow::anyhow!("SearXNG error {}: {}", status, text));
+                    }
+                }
+                Err(e) => {
+                    last_error = Some(anyhow::anyhow!("SearXNG request failed: {}", e));
+                }
             }
         }
 
-        // Slow path: re-read config.toml to pick up values set after boot.
-        let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to read config file {} for SearXNG instance URL: {e}",
-                self.config_path.display()
-            )
-        })?;
-
-        let config: crate::config::Config = toml::from_str(&contents).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to parse config file {} for SearXNG instance URL: {e}",
-                self.config_path.display()
-            )
-        })?;
-
-        config
-            .web_search
-            .searxng_instance_url
-            .filter(|u| !u.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "SearXNG instance URL not configured. Set [web_search] searxng_instance_url \
-                     in config.toml or the SEARXNG_INSTANCE_URL environment variable."
-                )
-            })
-    }
-
-    async fn search_searxng(&self, query: &str) -> anyhow::Result<String> {
-        let instance_url = self.resolve_searxng_instance_url()?;
-        let base_url = instance_url.trim_end_matches('/');
-
-        let encoded_query = urlencoding::encode(query);
-        let search_url = format!(
-            "{}/search?q={}&format=json&pageno=1",
-            base_url, encoded_query
-        );
-
-        let builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent("ZeroClaw/1.0");
-        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_search");
-        let client = builder.build()?;
-
-        let response = client
-            .get(&search_url)
-            .header("Accept", "application/json")
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            anyhow::bail!("SearXNG search failed with status: {}", response.status());
-        }
-
-        let json: serde_json::Value = response.json().await?;
-        self.parse_searxng_results(&json, query)
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("SearXNG search failed after retries")))
     }
 
     fn parse_searxng_results(
@@ -557,6 +642,11 @@ mod tests {
             "brave".to_string(),
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
             5,
             15,
             config_path,
@@ -584,6 +674,11 @@ mod tests {
             "brave".to_string(),
             Some(encrypted),
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
             5,
             15,
             config_path,
@@ -601,6 +696,11 @@ mod tests {
 
         let tool = WebSearchTool::new_with_config(
             "searxng".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             5,
@@ -670,6 +770,11 @@ mod tests {
             provider: "searxng".to_string(),
             boot_brave_api_key: None,
             searxng_instance_url: Some("https://searx.example.com".to_string()),
+            searxng_auth_token: None,
+            searxng_language: None,
+            searxng_engines: None,
+            searxng_safesearch: None,
+            searxng_max_retries: None,
             max_results: 5,
             timeout_secs: 15,
             config_path: PathBuf::new(),
@@ -693,6 +798,11 @@ mod tests {
             "searxng".to_string(),
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
             5,
             15,
             config_path,
@@ -712,6 +822,11 @@ mod tests {
 
         let tool = WebSearchTool::new_with_config(
             "brave".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             5,
