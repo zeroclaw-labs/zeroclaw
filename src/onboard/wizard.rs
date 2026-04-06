@@ -963,12 +963,12 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "copilot" => vec![
             (
-                "gpt-5.4".to_string(),
-                "GPT-5.4 (latest flagship)".to_string(),
-            ),
-            (
                 "gpt-5.4-mini".to_string(),
                 "GPT-5.4 Mini (recommended: balanced cost/latency)".to_string(),
+            ),
+            (
+                "gpt-5.4".to_string(),
+                "GPT-5.4 (latest flagship)".to_string(),
             ),
             ("gpt-5.3".to_string(), "GPT-5.3 (high-quality)".to_string()),
             (

@@ -30,7 +30,6 @@ use tracing::warn;
 
 const GITHUB_API_KEY_URL: &str = "https://api.github.com/copilot_internal/v2/token";
 const DEFAULT_API: &str = "https://api.githubcopilot.com";
-const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 8_192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CopilotTransportApi {
@@ -581,7 +580,7 @@ impl CopilotProvider {
         })
     }
 
-    fn anthropic_image_block(image_ref: &str) -> Option<CopilotAnthropicContentOut> {
+    async fn anthropic_image_block(image_ref: &str) -> Option<CopilotAnthropicContentOut> {
         if image_ref.starts_with("data:") {
             let comma = image_ref.find(',')?;
             let header = &image_ref[5..comma];
@@ -604,7 +603,7 @@ impl CopilotProvider {
             return None;
         }
 
-        let bytes = std::fs::read(path).ok()?;
+        let bytes = tokio::fs::read(path).await.ok()?;
         let data = {
             use base64::Engine as _;
             base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -633,12 +632,12 @@ impl CopilotProvider {
         })
     }
 
-    fn anthropic_user_content(content: &str) -> Vec<CopilotAnthropicContentOut> {
+    async fn anthropic_user_content(content: &str) -> Vec<CopilotAnthropicContentOut> {
         let (text, image_refs) = crate::multimodal::parse_image_markers(content);
         let mut blocks = Vec::new();
 
         for image_ref in image_refs {
-            if let Some(image_block) = Self::anthropic_image_block(&image_ref) {
+            if let Some(image_block) = Self::anthropic_image_block(&image_ref).await {
                 blocks.push(image_block);
             }
         }
@@ -674,7 +673,7 @@ impl CopilotProvider {
         }
     }
 
-    fn convert_messages_for_anthropic(
+    async fn convert_messages_for_anthropic(
         messages: &[ChatMessage],
     ) -> (
         Option<Vec<CopilotAnthropicSystemBlock>>,
@@ -729,9 +728,10 @@ impl CopilotProvider {
                     }
                 }
                 _ => {
+                    let user_blocks = Self::anthropic_user_content(&message.content).await;
                     let user_message = CopilotAnthropicMessage {
                         role: "user".to_string(),
-                        content: Self::anthropic_user_content(&message.content),
+                        content: user_blocks,
                     };
                     Self::push_or_merge_anthropic_message(&mut native_messages, user_message);
                 }
@@ -827,12 +827,12 @@ impl CopilotProvider {
         let (token, endpoint) = self.get_api_key().await?;
         let url = format!("{}/v1/messages", endpoint.trim_end_matches('/'));
 
-        let (system, native_messages) = Self::convert_messages_for_anthropic(messages);
+        let (system, native_messages) = Self::convert_messages_for_anthropic(messages).await;
         let native_tools = Self::convert_anthropic_tools(tools);
 
         let request = CopilotAnthropicRequest {
             model: model.to_string(),
-            max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
+            max_tokens: Self::anthropic_max_tokens(),
             system,
             messages: native_messages,
             temperature,
@@ -1012,6 +1012,15 @@ impl CopilotProvider {
             .map(ToString::to_string)
             .or_else(|| Self::derive_copilot_api_base_url_from_token(token))
             .unwrap_or_else(|| DEFAULT_API.to_string())
+    }
+
+    /// Determine Anthropic max tokens for Copilot requests.
+    /// Allows overriding via ZEROCLAW_ANTHROPIC_MAX_TOKENS env var; falls back to 4096.
+    fn anthropic_max_tokens() -> u32 {
+        std::env::var("ZEROCLAW_ANTHROPIC_MAX_TOKENS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(4096)
     }
 
     /// Get a GitHub access token from config, cache, or device flow.
