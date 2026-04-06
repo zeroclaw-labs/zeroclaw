@@ -488,7 +488,7 @@ impl Tool for SpawnAgentTool {
             provider: self.default_provider.clone(),
             model: model.unwrap_or_else(|| self.default_model.clone()),
             system_prompt: Some(system_prompt),
-            api_key: None,
+            api_key: self.fallback_credential.clone(),
             temperature: None,
             max_depth: 3,
             agentic: true,
