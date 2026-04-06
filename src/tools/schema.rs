@@ -465,7 +465,11 @@ impl SchemaCleanr {
         })
     }
 
-    /// Clean type array, removing null.
+    /// Clean type array by removing null and collapsing to a single type string.
+    ///
+    /// Many LLM backends (llama.cpp, Gemini, etc.) do not support JSON Schema
+    /// type arrays and will error when `"type"` is not a plain string.
+    /// When multiple non-null types remain, the first one is used.
     fn clean_type_array(value: Value) -> Value {
         if let Value::Array(types) = value {
             let non_null: Vec<Value> = types
@@ -475,11 +479,11 @@ impl SchemaCleanr {
 
             match non_null.len() {
                 0 => Value::String("null".to_string()),
-                1 => non_null
+                // One or more: always collapse to a single string type.
+                _ => non_null
                     .into_iter()
                     .next()
                     .unwrap_or(Value::String("null".to_string())),
-                _ => Value::Array(non_null),
             }
         } else {
             value
@@ -776,6 +780,20 @@ mod tests {
         let cleaned = SchemaCleanr::clean_for_gemini(schema);
 
         assert_eq!(cleaned["type"], "null");
+    }
+
+    #[test]
+    fn test_type_array_multi_collapses_to_first() {
+        let schema = json!({
+            "type": ["string", "integer"]
+        });
+
+        // All strategies should collapse multi-type arrays to the first type.
+        let cleaned_openai = SchemaCleanr::clean_for_openai(schema.clone());
+        assert_eq!(cleaned_openai["type"], "string");
+
+        let cleaned_gemini = SchemaCleanr::clean_for_gemini(schema);
+        assert_eq!(cleaned_gemini["type"], "string");
     }
 
     #[test]
