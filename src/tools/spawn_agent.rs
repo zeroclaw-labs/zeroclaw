@@ -282,8 +282,8 @@ impl SpawnAgentTool {
                 None, // activated_tools
                 None, // model_switch_callback
                 &crate::config::PacingConfig::default(),
-                0,    // max_tool_result_chars
-                0,    // context_token_budget
+                agent_config.max_tool_result_chars.unwrap_or(0),
+                agent_config.max_context_tokens.unwrap_or(0),
                 None, // shared_budget
             ),
         )
@@ -513,6 +513,8 @@ impl Tool for SpawnAgentTool {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: Some(name.clone()),
+            max_context_tokens: None,
+            max_tool_result_chars: None,
         };
 
         // Register in shared agents map

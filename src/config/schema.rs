@@ -597,6 +597,14 @@ pub struct DelegateAgentConfig {
     /// preventing cross-contamination with memory from other agents.
     #[serde(default)]
     pub memory_namespace: Option<String>,
+    /// Maximum context window in tokens for this agent.
+    /// When `None` or `0`, the sub-agent runs without a context budget limit.
+    #[serde(default)]
+    pub max_context_tokens: Option<usize>,
+    /// Maximum characters per tool result for this agent.
+    /// When `None` or `0`, tool results are not truncated.
+    #[serde(default)]
+    pub max_tool_result_chars: Option<usize>,
 }
 
 fn default_delegate_timeout_secs() -> u64 {
@@ -647,6 +655,12 @@ pub struct WorkspaceAgentConfig {
     /// Optional memory namespace for isolation (defaults to agent name).
     #[serde(default)]
     pub memory_namespace: Option<String>,
+    /// Maximum context window in tokens for this agent.
+    #[serde(default)]
+    pub max_context_tokens: Option<usize>,
+    /// Maximum characters per tool result for this agent.
+    #[serde(default)]
+    pub max_tool_result_chars: Option<usize>,
 }
 
 fn default_workspace_agent_agentic() -> bool {
@@ -680,6 +694,8 @@ impl WorkspaceAgentConfig {
             memory_namespace: self
                 .memory_namespace
                 .or_else(|| Some(agent_name.to_owned())),
+            max_context_tokens: self.max_context_tokens,
+            max_tool_result_chars: self.max_tool_result_chars,
         }
     }
 }

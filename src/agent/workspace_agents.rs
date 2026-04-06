@@ -300,6 +300,8 @@ impl WorkspaceAgentManager {
             timeout_secs: delegate.timeout_secs,
             agentic_timeout_secs: delegate.agentic_timeout_secs,
             memory_namespace: delegate.memory_namespace.clone(),
+            max_context_tokens: delegate.max_context_tokens,
+            max_tool_result_chars: delegate.max_tool_result_chars,
         };
 
         let toml_str =
