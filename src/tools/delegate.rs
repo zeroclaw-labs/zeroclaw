@@ -53,7 +53,7 @@ pub enum BackgroundTaskStatus {
 /// Background results are persisted to `workspace/delegate_results/{task_id}.json`
 /// and can be retrieved via `action: "check_result"`.
 pub struct DelegateTool {
-    agents: Arc<HashMap<String, DelegateAgentConfig>>,
+    agents: Arc<RwLock<HashMap<String, DelegateAgentConfig>>>,
     security: Arc<SecurityPolicy>,
     /// Global credential fallback (from config.api_key)
     fallback_credential: Option<String>,
@@ -73,6 +73,9 @@ pub struct DelegateTool {
     cancellation_token: CancellationToken,
     /// Optional memory instance for namespace isolation on delegate agents.
     memory: Option<Arc<dyn Memory>>,
+    /// Skills prompt injection mode inherited from root config.
+    /// Fixes #5155: sub-agents now respect the global `skills.prompt_injection_mode`.
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
 }
 
 impl DelegateTool {
@@ -96,7 +99,7 @@ impl DelegateTool {
         provider_runtime_options: providers::ProviderRuntimeOptions,
     ) -> Self {
         Self {
-            agents: Arc::new(agents),
+            agents: Arc::new(RwLock::new(agents)),
             security,
             fallback_credential,
             provider_runtime_options,
@@ -107,6 +110,7 @@ impl DelegateTool {
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
             memory: None,
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
         }
     }
 
@@ -136,7 +140,7 @@ impl DelegateTool {
         provider_runtime_options: providers::ProviderRuntimeOptions,
     ) -> Self {
         Self {
-            agents: Arc::new(agents),
+            agents: Arc::new(RwLock::new(agents)),
             security,
             fallback_credential,
             provider_runtime_options,
@@ -147,6 +151,7 @@ impl DelegateTool {
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
             memory: None,
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
         }
     }
 
@@ -198,6 +203,25 @@ impl DelegateTool {
         self
     }
 
+    /// Set the skills prompt injection mode for sub-agent system prompts.
+    /// Fixes #5155: propagates `skills.prompt_injection_mode` from root config.
+    pub fn with_skills_prompt_mode(
+        mut self,
+        mode: crate::config::SkillsPromptInjectionMode,
+    ) -> Self {
+        self.skills_prompt_mode = mode;
+        self
+    }
+
+    /// Inject a pre-existing shared agent registry (used by WorkspaceAgentManager).
+    pub fn with_shared_agents(
+        mut self,
+        agents: Arc<RwLock<HashMap<String, DelegateAgentConfig>>>,
+    ) -> Self {
+        self.agents = agents;
+        self
+    }
+
     /// Wrap memory with namespace isolation if configured for the given agent.
     /// Returns the namespaced memory if memory_namespace is set, otherwise returns
     /// the original memory.
@@ -242,7 +266,7 @@ impl Tool for DelegateTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        let agent_names: Vec<&str> = self.agents.keys().map(|s: &String| s.as_str()).collect();
+        let agent_names: Vec<String> = self.agents.read().keys().cloned().collect();
         json!({
             "type": "object",
             "additionalProperties": false,
@@ -263,7 +287,7 @@ impl Tool for DelegateTool {
                         if agent_names.is_empty() {
                             "(none configured)".to_string()
                         } else {
-                            agent_names.join(", ")
+                            agent_names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
                         }
                     )
                 },
@@ -385,11 +409,11 @@ impl DelegateTool {
             .unwrap_or("");
 
         // Look up agent config
-        let agent_config = match self.agents.get(agent_name) {
+        let agent_config = match self.agents.read().get(agent_name).cloned() {
             Some(cfg) => cfg,
             None => {
-                let available: Vec<&str> =
-                    self.agents.keys().map(|s: &String| s.as_str()).collect();
+                let available: Vec<String> =
+                    self.agents.read().keys().cloned().collect::<Vec<String>>();
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -470,7 +494,7 @@ impl DelegateTool {
             return self
                 .execute_agentic(
                     agent_name,
-                    agent_config,
+                    &agent_config,
                     &*provider,
                     &full_prompt,
                     temperature,
@@ -480,7 +504,7 @@ impl DelegateTool {
 
         // Build enriched system prompt for non-agentic sub-agent.
         let enriched_system_prompt =
-            self.build_enriched_system_prompt(agent_config, &[], &self.workspace_dir);
+            self.build_enriched_system_prompt(&agent_config, &[], &self.workspace_dir);
         let system_prompt_ref = enriched_system_prompt.as_deref();
 
         // Wrap the provider call in a timeout to prevent indefinite blocking
@@ -549,11 +573,11 @@ impl DelegateTool {
         args: &serde_json::Value,
     ) -> anyhow::Result<ToolResult> {
         // Validate agent exists and check depth/security before spawning
-        let agent_config = match self.agents.get(agent_name) {
-            Some(cfg) => cfg.clone(),
+        let agent_config = match self.agents.read().get(agent_name).cloned() {
+            Some(cfg) => cfg,
             None => {
-                let available: Vec<&str> =
-                    self.agents.keys().map(|s: &String| s.as_str()).collect();
+                let available: Vec<String> =
+                    self.agents.read().keys().cloned().collect::<Vec<String>>();
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -651,6 +675,7 @@ impl DelegateTool {
                 workspace_dir: workspace_dir.clone(),
                 cancellation_token: child_token.clone(),
                 memory: None,
+                skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             };
 
             let args_inner = json!({
@@ -761,9 +786,9 @@ impl DelegateTool {
 
         // Validate all agents exist before starting any
         for name in &agent_names {
-            if !self.agents.contains_key(name) {
-                let available: Vec<&str> =
-                    self.agents.keys().map(|s: &String| s.as_str()).collect();
+            if !self.agents.read().contains_key(name) {
+                let available: Vec<String> =
+                    self.agents.read().keys().cloned().collect::<Vec<String>>();
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -809,6 +834,7 @@ impl DelegateTool {
                     workspace_dir,
                     cancellation_token,
                     memory: None,
+                    skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
                 };
                 let result = Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)).await;
                 (agent_name, result)
@@ -1048,7 +1074,7 @@ impl DelegateTool {
             model_name: &agent_config.model,
             tools: sub_tools,
             skills: &skills,
-            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            skills_prompt_mode: self.skills_prompt_mode,
             identity_config: None,
             dispatcher_instructions: "",
             tool_descriptions: None,

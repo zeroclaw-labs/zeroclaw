@@ -97,6 +97,7 @@ pub mod shell;
 pub mod skill_http;
 pub mod skill_tool;
 pub mod sop_advance;
+pub mod spawn_agent;
 pub mod sop_approve;
 pub mod sop_execute;
 pub mod sop_list;
@@ -197,6 +198,8 @@ pub use skill_http::SkillHttpTool;
 pub use skill_tool::SkillShellTool;
 pub use sop_advance::SopAdvanceTool;
 pub use sop_approve::SopApproveTool;
+#[allow(unused_imports)]
+pub use spawn_agent::SpawnAgentTool;
 pub use sop_execute::SopExecuteTool;
 pub use sop_list::SopListTool;
 pub use sop_status::SopStatusTool;
@@ -898,7 +901,7 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // Add delegation tool when agents are configured
+    // Add delegation + spawn tools with workspace agent support
     let delegate_fallback_credential = fallback_api_key.and_then(|value| {
         let trimmed_value = value.trim();
         (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
@@ -906,28 +909,65 @@ pub fn all_tools_with_runtime(
     let provider_runtime_options =
         crate::providers::provider_runtime_options_from_config(root_config);
 
-    let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
+    // Create WorkspaceAgentManager — merges config agents + workspace/agents/ folder.
+    // Creates workspace/agents/ and workspace/agents/common/ directories if missing.
+    let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
+        .iter()
+        .map(|(name, cfg)| (name.clone(), cfg.clone()))
+        .collect();
+    let mut workspace_agent_manager =
+        crate::agent::workspace_agents::WorkspaceAgentManager::new(
+            workspace_dir.to_path_buf(),
+            delegate_agents,
+            root_config.default_provider.clone().unwrap_or_default(),
+            root_config.default_model.clone().unwrap_or_default(),
+        );
+    // Start file watcher for hot-reload of workspace agent definitions.
+    if let Err(e) = workspace_agent_manager.start_watcher() {
+        tracing::warn!("workspace agent file watcher failed to start: {e}");
+    }
+    let shared_agents = workspace_agent_manager.agents();
+    // Keep the manager alive for the process lifetime (owns the file watcher).
+    std::mem::forget(workspace_agent_manager);
+
+    let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
+    let delegate_handle: Option<DelegateParentToolsHandle> = if shared_agents.read().is_empty() {
         None
     } else {
-        let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
-            .iter()
-            .map(|(name, cfg)| (name.clone(), cfg.clone()))
-            .collect();
-        let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
         let delegate_tool = DelegateTool::new_with_options(
-            delegate_agents,
+            HashMap::new(), // empty — using shared_agents instead
             delegate_fallback_credential.clone(),
             security.clone(),
             provider_runtime_options.clone(),
         )
+        .with_shared_agents(Arc::clone(&shared_agents))
         .with_parent_tools(Arc::clone(&parent_tools))
         .with_multimodal_config(root_config.multimodal.clone())
         .with_delegate_config(root_config.delegate.clone())
         .with_workspace_dir(workspace_dir.to_path_buf())
-        .with_memory(memory.clone());
+        .with_memory(memory.clone())
+        .with_skills_prompt_mode(root_config.skills.prompt_injection_mode);
         tool_arcs.push(Arc::new(delegate_tool));
-        Some(parent_tools)
+        Some(Arc::clone(&parent_tools))
     };
+
+    // Always add spawn_agent tool — allows ad-hoc agent creation even without pre-configured agents.
+    let spawn_tool = spawn_agent::SpawnAgentTool::new(
+        Arc::clone(&shared_agents),
+        delegate_fallback_credential.clone(),
+        security.clone(),
+        provider_runtime_options.clone(),
+    )
+    .with_parent_tools(Arc::clone(&parent_tools))
+    .with_multimodal_config(root_config.multimodal.clone())
+    .with_delegate_config(root_config.delegate.clone())
+    .with_workspace_dir(workspace_dir.to_path_buf())
+    .with_skills_prompt_mode(root_config.skills.prompt_injection_mode)
+    .with_defaults(
+        root_config.default_provider.clone().unwrap_or_default(),
+        root_config.default_model.clone().unwrap_or_default(),
+    );
+    tool_arcs.push(Arc::new(spawn_tool.with_memory(memory.clone())));
 
     // Add swarm tool when swarms are configured
     if !root_config.swarms.is_empty() {

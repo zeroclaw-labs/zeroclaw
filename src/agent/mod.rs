@@ -15,6 +15,7 @@ pub mod personality;
 pub mod prompt;
 pub mod thinking;
 pub mod tool_execution;
+pub mod workspace_agents;
 
 #[cfg(test)]
 mod tests;
