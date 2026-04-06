@@ -128,7 +128,7 @@ impl WorkspaceAgentManager {
     /// On `Create`/`Modify` events for `config.toml` or `.md` files the
     /// affected agent is reloaded.  On `Remove` events the agent is removed
     /// from the registry (only if it was workspace-loaded, never config-defined).
-    pub fn startwatcher_handle(&mut self) -> Result<()> {
+    pub fn start_watcher(&mut self) -> Result<()> {
         let agents_dir = self.workspace_dir.join("agents");
         if !agents_dir.is_dir() {
             std::fs::create_dir_all(&agents_dir)
