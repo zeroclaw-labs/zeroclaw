@@ -6391,6 +6391,7 @@ impl Default for ChannelsConfig {
             session_ttl_hours: 0,
             debounce_ms: 0,
             reply_precheck: false,
+            max_concurrent_per_channel: default_max_concurrent_per_channel(),
         }
     }
 }
@@ -11596,6 +11597,7 @@ auto_save = true
                 session_ttl_hours: 0,
                 debounce_ms: 0,
                 reply_precheck: false,
+                max_concurrent_per_channel: default_max_concurrent_per_channel(),
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -12637,6 +12639,7 @@ allowed_users = ["@ops:matrix.org"]
             session_ttl_hours: 0,
             debounce_ms: 0,
             reply_precheck: false,
+            max_concurrent_per_channel: 4,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -13012,6 +13015,7 @@ channel_ids = ["C123", "D456"]
             session_ttl_hours: 0,
             debounce_ms: 0,
             reply_precheck: false,
+            max_concurrent_per_channel: 4,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
