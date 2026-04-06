@@ -10394,6 +10394,35 @@ impl Config {
                 }
             }
         }
+        // Channel tokens: allow credentials to be supplied via environment
+        // variables so they don't need to be hardcoded in config.toml.
+        if let Some(ref mut sl) = self.channels_config.slack {
+            if let Ok(bot_token) = std::env::var("SLACK_BOT_TOKEN") {
+                if !bot_token.is_empty() {
+                    sl.bot_token = bot_token;
+                }
+            }
+            if let Ok(app_token) = std::env::var("SLACK_APP_TOKEN") {
+                if !app_token.is_empty() {
+                    sl.app_token = Some(app_token);
+                }
+            }
+        }
+        if let Some(ref mut dc) = self.channels_config.discord {
+            if let Ok(bot_token) = std::env::var("DISCORD_BOT_TOKEN") {
+                if !bot_token.is_empty() {
+                    dc.bot_token = bot_token;
+                }
+            }
+        }
+        if let Some(ref mut tg) = self.channels_config.telegram {
+            if let Ok(bot_token) = std::env::var("TELEGRAM_BOT_TOKEN") {
+                if !bot_token.is_empty() {
+                    tg.bot_token = bot_token;
+                }
+            }
+        }
+
         // Proxy enabled flag: ZEROCLAW_PROXY_ENABLED
         let explicit_proxy_enabled = std::env::var("ZEROCLAW_PROXY_ENABLED")
             .ok()
