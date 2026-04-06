@@ -377,6 +377,18 @@ pub struct AppState {
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
 }
 
+impl AppState {
+    /// Return the current model from the live config, falling back to the
+    /// startup-time snapshot when the config has no `default_model` set.
+    pub fn active_model(&self) -> String {
+        self.config
+            .lock()
+            .default_model
+            .clone()
+            .unwrap_or_else(|| self.model.clone())
+    }
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 pub async fn run_gateway(
@@ -1289,7 +1301,7 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
         let config_guard = state.config.lock();
         crate::channels::build_system_prompt(
             &config_guard.workspace_dir,
-            &state.model,
+            &state.active_model(),
             &[], // tools - empty for simple chat
             &[], // skills
             Some(&config_guard.identity),
@@ -1307,7 +1319,7 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
 
     state
         .provider
-        .chat_with_history(&prepared.messages, &state.model, state.temperature)
+        .chat_with_history(&prepared.messages, &state.active_model(), state.temperature)
         .await
 }
 
@@ -1440,7 +1452,7 @@ async fn handle_webhook(
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-    let model_label = state.model.clone();
+    let model_label = state.active_model();
     let started_at = Instant::now();
 
     state
@@ -1484,7 +1496,7 @@ async fn handle_webhook(
                     cost_usd: None,
                 });
 
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let body = serde_json::json!({"response": response, "model": state.active_model()});
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
