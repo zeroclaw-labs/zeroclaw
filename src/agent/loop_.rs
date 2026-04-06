@@ -4044,6 +4044,38 @@ pub async fn run(
                 }
             }
         }
+
+        // Autonomous skill improvement: update metadata for skills used during this execution.
+        #[cfg(feature = "skill-creation")]
+        if config.skills.skill_improvement.enabled {
+            let skill_slugs = crate::skills::improver::extract_skill_slugs_from_history(&history);
+            if !skill_slugs.is_empty() {
+                let mut improver = crate::skills::improver::SkillImprover::new(
+                    config.workspace_dir.clone(),
+                    config.skills.skill_improvement.clone(),
+                );
+                for slug in &skill_slugs {
+                    if !improver.should_improve_skill(slug) {
+                        tracing::debug!(slug = %slug, "Skill improvement skipped (cooldown or disabled)");
+                        continue;
+                    }
+                    let toml_path = config.workspace_dir.join("skills").join(slug).join("SKILL.toml");
+                    match std::fs::read_to_string(&toml_path) {
+                        Ok(current_content) => {
+                            match improver.improve_skill(slug, &current_content, "Successful tool execution").await {
+                                Ok(Some(s)) => tracing::info!(slug = %s, "Auto-improved skill after successful use"),
+                                Ok(None) => tracing::debug!(slug = %slug, "Skill improvement returned None"),
+                                Err(e) => tracing::warn!(slug = %slug, "Skill improvement failed: {e}"),
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(slug = %slug, "Could not read skill TOML for improvement: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
@@ -4771,6 +4803,10 @@ pub async fn process_message(
     if config.autonomy.level != AutonomyLevel::Full {
         excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
     }
+
+    // TODO: Add post-execution skill creation and skill improvement hooks here
+    // (matching the single-shot `run` path) once `agent_turn` returns the final
+    // history so we can extract tool calls and skill slugs.
 
     agent_turn(
         provider.as_ref(),
