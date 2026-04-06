@@ -1445,7 +1445,18 @@ async fn get_or_create_provider(
 ) -> anyhow::Result<Arc<dyn Provider>> {
     let cache_key = provider_cache_key(provider_name, route_api_key);
 
-    if let Some(existing) = ctx
+    // For Qwen OAuth providers, check whether the cached token has expired.
+    // If stale, evict the cached entry so a fresh provider is created below
+    // (which triggers token refresh via `resolve_qwen_oauth_context`).
+    let qwen_stale =
+        providers::is_qwen_oauth_alias(provider_name) && providers::is_qwen_oauth_token_stale();
+
+    if qwen_stale {
+        ctx.provider_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&cache_key);
+    } else if let Some(existing) = ctx
         .provider_cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1457,8 +1468,9 @@ async fn get_or_create_provider(
 
     // Only return the pre-built default provider when there is no
     // route-specific credential override — otherwise the default was
-    // created with the global key and would be wrong.
-    if route_api_key.is_none() && provider_name == ctx.default_provider.as_str() {
+    // created with the global key and would be wrong.  Also skip when
+    // the OAuth token is stale so we recreate with refreshed credentials.
+    if !qwen_stale && route_api_key.is_none() && provider_name == ctx.default_provider.as_str() {
         return Ok(Arc::clone(&ctx.provider));
     }
 

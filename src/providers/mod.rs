@@ -152,6 +152,17 @@ pub(crate) fn is_qwen_oauth_alias(name: &str) -> bool {
     matches!(name, "qwen-code" | "qwen-oauth" | "qwen_oauth")
 }
 
+/// Returns `true` when the cached Qwen OAuth token is expired (or missing)
+/// and the provider should be recreated so that
+/// [`resolve_qwen_oauth_context`] can refresh it.
+pub(crate) fn is_qwen_oauth_token_stale() -> bool {
+    match read_qwen_oauth_cached_credentials() {
+        Some(creds) => qwen_oauth_token_expired(&creds),
+        // No cached credentials — provider creation will attempt a refresh.
+        None => true,
+    }
+}
+
 pub(crate) fn is_bailian_alias(name: &str) -> bool {
     matches!(name, "bailian" | "aliyun-bailian" | "aliyun")
 }
