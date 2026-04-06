@@ -372,6 +372,10 @@ impl Tool for SpawnAgentTool {
                     "minLength": 1,
                     "description": "The task to execute"
                 },
+                "provider": {
+                    "type": "string",
+                    "description": "Provider override (e.g. 'openai', 'anthropic', 'ollama'). Falls back to default_provider."
+                },
                 "model": {
                     "type": "string",
                     "description": "Model override (e.g. 'claude-sonnet-4-20250514'). Falls back to default_model."
@@ -453,6 +457,12 @@ impl Tool for SpawnAgentTool {
         };
 
         // Parse optional parameters
+        let provider = args
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let model = args
             .get("model")
             .and_then(|v| v.as_str())
@@ -485,7 +495,7 @@ impl Tool for SpawnAgentTool {
 
         // Build the DelegateAgentConfig
         let agent_config = DelegateAgentConfig {
-            provider: self.default_provider.clone(),
+            provider: provider.unwrap_or_else(|| self.default_provider.clone()),
             model: model.unwrap_or_else(|| self.default_model.clone()),
             system_prompt: Some(system_prompt),
             api_key: self.fallback_credential.clone(),
