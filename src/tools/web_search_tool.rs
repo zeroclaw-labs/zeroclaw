@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Web search tool for searching the internet.
@@ -249,7 +249,10 @@ impl WebSearchTool {
                 Ok(())
             }
             Ok(res) => {
-                anyhow::bail!("SearXNG instance warm-up failed with status: {}", res.status())
+                anyhow::bail!(
+                    "SearXNG instance warm-up failed with status: {}",
+                    res.status()
+                )
             }
             Err(e) => {
                 anyhow::bail!("SearXNG instance warm-up failed: {e}")
@@ -443,11 +446,10 @@ impl WebSearchTool {
                     if response.status().is_success() {
                         let json: serde_json::Value = response.json().await?;
                         return self.parse_searxng_results(&json, query);
-                    } else {
-                        let status = response.status();
-                        let text = response.text().await.unwrap_or_default();
-                        last_error = Some(anyhow::anyhow!("SearXNG error {}: {}", status, text));
                     }
+                    let status = response.status();
+                    let text = response.text().await.unwrap_or_default();
+                    last_error = Some(anyhow::anyhow!("SearXNG error {}: {}", status, text));
                 }
                 Err(e) => {
                     last_error = Some(anyhow::anyhow!("SearXNG request failed: {}", e));
