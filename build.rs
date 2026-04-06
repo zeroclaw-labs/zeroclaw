@@ -85,6 +85,14 @@ fn main() {
 
     ensure_dist_dir(dist_dir);
     ensure_dashboard_assets(dist_dir);
+
+    // Warn loudly if the dashboard will be unavailable at runtime.
+    if !dist_dir.join("index.html").exists() {
+        eprintln!(
+            "cargo:warning=web/dist/index.html not found — the web dashboard will be unavailable. \
+             Run: cd web && npm ci && npm run build"
+        );
+    }
 }
 
 fn web_build_required(web_dir: &Path, dist_dir: &Path) -> bool {
