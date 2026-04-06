@@ -277,6 +277,8 @@ Delegate sub-agent configurations. Each key under `[agents]` defines a named sub
 | `timeout_secs` | `120` | Timeout in seconds for non-agentic provider calls (1–3600) |
 | `agentic_timeout_secs` | `300` | Timeout in seconds for agentic sub-agent loops (1–3600) |
 | `skills_directory` | unset | Optional skills directory path (workspace-relative) for scoped skill loading |
+| `max_context_tokens` | unset | Cap on the total tokens sent in the sub-agent context window; truncates oldest messages when exceeded |
+| `max_tool_result_chars` | unset | Maximum characters retained from each tool result; longer outputs are truncated with a summary marker |
 
 Notes:
 
