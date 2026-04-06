@@ -47,6 +47,7 @@ pub struct Agent {
     tool_dispatcher: Box<dyn ToolDispatcher>,
     memory_loader: Box<dyn MemoryLoader>,
     config: crate::config::AgentConfig,
+    provider_name: String,
     model_name: String,
     temperature: f64,
     workspace_dir: std::path::PathBuf,
@@ -82,6 +83,7 @@ pub struct AgentBuilder {
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
     memory_loader: Option<Box<dyn MemoryLoader>>,
     config: Option<crate::config::AgentConfig>,
+    provider_name: Option<String>,
     model_name: Option<String>,
     temperature: Option<f64>,
     workspace_dir: Option<std::path::PathBuf>,
@@ -112,6 +114,7 @@ impl AgentBuilder {
             tool_dispatcher: None,
             memory_loader: None,
             config: None,
+            provider_name: None,
             model_name: None,
             temperature: None,
             workspace_dir: None,
@@ -169,6 +172,11 @@ impl AgentBuilder {
 
     pub fn config(mut self, config: crate::config::AgentConfig) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    pub fn provider_name(mut self, provider_name: String) -> Self {
+        self.provider_name = Some(provider_name);
         self
     }
 
@@ -301,6 +309,7 @@ impl AgentBuilder {
                 .memory_loader
                 .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
             config: self.config.unwrap_or_default(),
+            provider_name: self.provider_name.unwrap_or_else(|| "unknown".into()),
             model_name: self
                 .model_name
                 .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into()),
@@ -540,6 +549,7 @@ impl Agent {
             )))
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(config.agent.clone())
+            .provider_name(provider_name.to_string())
             .model_name(model_name)
             .temperature(config.default_temperature)
             .workspace_dir(config.workspace_dir.clone())
@@ -841,6 +851,15 @@ impl Agent {
                 Err(err) => return Err(err),
             };
 
+            // Record cost via task-local tracker (no-op when not scoped)
+            let _ = response.usage.as_ref().and_then(|usage| {
+                super::cost::record_tool_loop_cost_usage(
+                    &self.provider_name,
+                    &effective_model,
+                    usage,
+                )
+            });
+
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
             if calls.is_empty() {
                 let final_text = if text.is_empty() {
@@ -1106,6 +1125,15 @@ impl Agent {
                     Err(err) => return Err(err),
                 }
             };
+
+            // Record cost via task-local tracker (no-op when not scoped)
+            let _ = response.usage.as_ref().and_then(|usage| {
+                super::cost::record_tool_loop_cost_usage(
+                    &self.provider_name,
+                    &effective_model,
+                    usage,
+                )
+            });
 
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
             if calls.is_empty() {

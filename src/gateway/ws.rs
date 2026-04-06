@@ -421,6 +421,19 @@ async fn process_chat_message(
         let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
     }
 
+    // Set up cost tracking context so LLM costs are recorded.
+    let config_snapshot = state.config.lock().clone();
+    let cost_tracking_context = crate::cost::CostTracker::get_or_init_global(
+        config_snapshot.cost.clone(),
+        &config_snapshot.workspace_dir,
+    )
+    .map(|tracker| {
+        crate::agent::loop_::ToolLoopCostTrackingContext::new(
+            tracker,
+            std::sync::Arc::new(config_snapshot.cost.prices.clone()),
+        )
+    });
+
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
 
@@ -430,7 +443,10 @@ async fn process_chat_message(
     // instead — `turn_streamed` writes to the channel and we drain it
     // from the other branch.
     let content_owned = content.to_string();
-    let turn_fut = async { agent.turn_streamed(&content_owned, event_tx).await };
+    let turn_fut = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
+        .scope(cost_tracking_context, async {
+            agent.turn_streamed(&content_owned, event_tx).await
+        });
 
     // Drive both futures concurrently: the agent turn produces events
     // and we relay them over WebSocket.

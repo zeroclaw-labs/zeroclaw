@@ -3861,6 +3861,16 @@ pub async fn run(
         }
     });
 
+    // ── Cost tracking ────────────────────────────────────────────
+    let cost_tracking_context =
+        crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.workspace_dir)
+            .map(|tracker| {
+                ToolLoopCostTrackingContext::new(
+                    tracker,
+                    std::sync::Arc::new(config.cost.prices.clone()),
+                )
+            });
+
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
 
@@ -3955,33 +3965,37 @@ pub async fn run(
         #[allow(unused_assignments)]
         let mut response = String::new();
         loop {
-            match run_tool_call_loop(
-                provider.as_ref(),
-                &mut history,
-                &tools_registry,
-                observer.as_ref(),
-                &provider_name,
-                &model_name,
-                effective_temperature,
-                false,
-                approval_manager.as_ref(),
-                channel_name,
-                None,
-                &config.multimodal,
-                config.agent.max_tool_iterations,
-                None,
-                None,
-                None,
-                &excluded_tools,
-                &config.agent.tool_call_dedup_exempt,
-                activated_handle.as_ref(),
-                Some(model_switch_callback.clone()),
-                &config.pacing,
-                config.agent.max_tool_result_chars,
-                config.agent.max_context_tokens,
-                None, // shared_budget
-            )
-            .await
+            match TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(
+                    cost_tracking_context.clone(),
+                    run_tool_call_loop(
+                        provider.as_ref(),
+                        &mut history,
+                        &tools_registry,
+                        observer.as_ref(),
+                        &provider_name,
+                        &model_name,
+                        effective_temperature,
+                        false,
+                        approval_manager.as_ref(),
+                        channel_name,
+                        None,
+                        &config.multimodal,
+                        config.agent.max_tool_iterations,
+                        None,
+                        None,
+                        None,
+                        &excluded_tools,
+                        &config.agent.tool_call_dedup_exempt,
+                        activated_handle.as_ref(),
+                        Some(model_switch_callback.clone()),
+                        &config.pacing,
+                        config.agent.max_tool_result_chars,
+                        config.agent.max_context_tokens,
+                        None, // shared_budget
+                    ),
+                )
+                .await
             {
                 Ok(resp) => {
                     response = resp;
@@ -4261,33 +4275,37 @@ pub async fn run(
             });
 
             let response = loop {
-                match run_tool_call_loop(
-                    provider.as_ref(),
-                    &mut history,
-                    &tools_registry,
-                    observer.as_ref(),
-                    &provider_name,
-                    &model_name,
-                    turn_temperature,
-                    true,
-                    approval_manager.as_ref(),
-                    channel_name,
-                    None,
-                    &config.multimodal,
-                    config.agent.max_tool_iterations,
-                    Some(cancel_token.clone()),
-                    Some(delta_tx.clone()),
-                    None,
-                    &excluded_tools,
-                    &config.agent.tool_call_dedup_exempt,
-                    activated_handle.as_ref(),
-                    Some(model_switch_callback.clone()),
-                    &config.pacing,
-                    config.agent.max_tool_result_chars,
-                    config.agent.max_context_tokens,
-                    None, // shared_budget
-                )
-                .await
+                match TOOL_LOOP_COST_TRACKING_CONTEXT
+                    .scope(
+                        cost_tracking_context.clone(),
+                        run_tool_call_loop(
+                            provider.as_ref(),
+                            &mut history,
+                            &tools_registry,
+                            observer.as_ref(),
+                            &provider_name,
+                            &model_name,
+                            turn_temperature,
+                            true,
+                            approval_manager.as_ref(),
+                            channel_name,
+                            None,
+                            &config.multimodal,
+                            config.agent.max_tool_iterations,
+                            Some(cancel_token.clone()),
+                            Some(delta_tx.clone()),
+                            None,
+                            &excluded_tools,
+                            &config.agent.tool_call_dedup_exempt,
+                            activated_handle.as_ref(),
+                            Some(model_switch_callback.clone()),
+                            &config.pacing,
+                            config.agent.max_tool_result_chars,
+                            config.agent.max_context_tokens,
+                            None, // shared_budget
+                        ),
+                    )
+                    .await
                 {
                     Ok(resp) => break resp,
                     Err(e) => {
