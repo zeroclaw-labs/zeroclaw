@@ -1594,7 +1594,21 @@ pub async fn handle_api_projects_create(
     }
     let id = uuid::Uuid::new_v4().to_string();
     match backend.create(&id, &name, body.project_workspace_dir.as_deref()) {
-        Ok(project) => (StatusCode::CREATED, Json(serde_json::json!(project))).into_response(),
+        Ok(project) => {
+            // Add project directory to allowed_roots (deduplicated, persisted)
+            if let Some(ref dir) = body.project_workspace_dir {
+                let mut config = state.config.lock().clone();
+                if !config.autonomy.allowed_roots.contains(dir) {
+                    config.autonomy.allowed_roots.push(dir.clone());
+                    if let Err(e) = config.save().await {
+                        tracing::error!("Failed to persist allowed_roots: {e}");
+                    } else {
+                        *state.config.lock() = config;
+                    }
+                }
+            }
+            (StatusCode::CREATED, Json(serde_json::json!(project))).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to create project: {e}")})),
@@ -1606,7 +1620,6 @@ pub async fn handle_api_projects_create(
 #[derive(serde::Deserialize)]
 pub struct PatchProjectBody {
     pub name: Option<String>,
-    pub project_workspace_dir: Option<serde_json::Value>,
 }
 
 /// PATCH /api/projects/{id} — rename or update project_workspace_dir
@@ -1639,26 +1652,6 @@ pub async fn handle_api_projects_patch(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Failed to rename project: {e}")})),
-            )
-                .into_response();
-        }
-    }
-    if let Some(wd_value) = body.project_workspace_dir {
-        let wd: Option<String> = match wd_value {
-            serde_json::Value::Null => None,
-            serde_json::Value::String(s) => Some(s),
-            _ => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "project_workspace_dir must be a string or null"})),
-                )
-                    .into_response();
-            }
-        };
-        if let Err(e) = backend.set_project_workspace_dir(&id, wd.as_deref()) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to update project_workspace_dir: {e}")})),
             )
                 .into_response();
         }
