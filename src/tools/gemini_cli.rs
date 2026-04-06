@@ -92,8 +92,15 @@ impl Tool for GeminiCliTool {
         // could bypass the workspace containment check via symlinks or
         // specially-crafted path components).
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
-            let wd_path = std::path::PathBuf::from(wd);
             let workspace = &self.security.workspace_dir;
+            let wd_path = {
+                let raw = std::path::PathBuf::from(wd);
+                if raw.is_absolute() {
+                    raw
+                } else {
+                    workspace.join(raw)
+                }
+            };
             let canonical_wd = match wd_path.canonicalize() {
                 Ok(p) => p,
                 Err(_) => {
