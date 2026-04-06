@@ -126,11 +126,20 @@ impl LandlockSandbox {
 
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
 impl Sandbox for LandlockSandbox {
-    fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
-        // Apply Landlock restrictions before executing the command
-        // Note: This affects the current process, not the child process
-        // Child processes inherit the Landlock restrictions
-        self.apply_restrictions()
+    fn wrap_command(&self, cmd: &mut std::process::Command) -> std::io::Result<()> {
+        // Apply Landlock restrictions in the child process before exec()
+        // This ensures the parent process is not affected by the sandbox
+        use std::os::unix::process::CommandExt;
+
+        // Clone workspace_dir for the closure
+        let workspace_dir = self.workspace_dir.clone();
+        cmd.pre_exec(move || {
+            let sandbox = LandlockSandbox {
+                workspace_dir: workspace_dir.clone(),
+            };
+            sandbox.apply_restrictions()
+        });
+        Ok(())
     }
 
     fn is_available(&self) -> bool {

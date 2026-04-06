@@ -144,24 +144,43 @@ impl SkillCreator {
         toml.push_str("author = \"zeroclaw-auto\"\n");
         toml.push_str("tags = [\"auto-generated\"]\n");
 
+        // Track unique tools to avoid duplicates in the generated skill
+        let mut seen_tools = std::collections::HashSet::new();
+
         for call in tool_calls {
+            // Skip duplicate tool entries
+            if !seen_tools.insert(call.name.clone()) {
+                continue;
+            }
+
             toml.push('\n');
             toml.push_str("[[tools]]\n");
             let _ = writeln!(toml, "name = {}", toml_escape(&call.name));
             let _ = writeln!(
                 toml,
                 "description = {}",
-                toml_escape(&format!("Tool used in task: {}", call.name))
+                toml_escape(&format!("Execute {} tool", call.name))
             );
-            toml.push_str("kind = \"shell\"\n");
+            // Use the actual tool name as kind instead of hardcoded "shell"
+            let tool_kind = if call.name.contains("shell") {
+                "shell"
+            } else {
+                &call.name
+            };
+            let _ = writeln!(toml, "kind = {}", toml_escape(tool_kind));
 
-            // Extract the command from args if available, otherwise use the tool name.
-            let command = call
-                .args
-                .get("command")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(&call.name);
-            let _ = writeln!(toml, "command = {}", toml_escape(command));
+            // Only add command field for shell-like tools
+            if tool_kind == "shell" {
+                if let Some(cmd) = call.args.get("command").and_then(serde_json::Value::as_str) {
+                    let _ = writeln!(toml, "command = {}", toml_escape(cmd));
+                }
+            }
+
+            // Add args as parameters if present
+            if !call.args.is_null() && !call.args.as_object().map(|o| o.is_empty()).unwrap_or(true)
+            {
+                let _ = writeln!(toml, "args = {}", toml_escape(&call.args.to_string()));
+            }
         }
 
         toml
