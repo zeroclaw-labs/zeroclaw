@@ -3,10 +3,20 @@ import { Send, Bot, User, AlertCircle, Copy, Check } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { WsMessage } from '@/types/api';
-import { WebSocketClient } from '@/lib/ws';
+import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
+import { getSessionMessages } from '@/lib/api';
+import ToolCallCard from '@/components/ToolCallCard';
+import type { ToolCallInfo } from '@/components/ToolCallCard';
+import {
+  loadChatHistory,
+  mapServerMessagesToPersisted,
+  persistedToUiMessages,
+  saveChatHistory,
+  uiMessagesToPersisted,
+} from '@/lib/chatHistoryStorage';
 
 interface ChatMessage {
   id: string;
@@ -14,14 +24,22 @@ interface ChatMessage {
   content: string;
   thinking?: string;
   markdown?: boolean;
+  toolCall?: ToolCallInfo;
   timestamp: Date;
 }
 
 const DRAFT_KEY = 'agent-chat';
 
 export default function AgentChat() {
+  const sessionIdRef = useRef(getOrCreateSessionId());
   const { draft, saveDraft, clearDraft } = useDraft(DRAFT_KEY);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>(() => {
+    // Synchronously hydrate from localStorage so messages survive tab switches
+    // without a flash of empty state. Server hydration may override later.
+    const persisted = loadChatHistory(sessionIdRef.current);
+    return persisted.length > 0 ? persistedToUiMessages(persisted) : [];
+  });
+  const [historyReady, setHistoryReady] = useState(false);
   const [input, setInput] = useState(draft);
   const [typing, setTyping] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -42,6 +60,50 @@ export default function AgentChat() {
   useEffect(() => {
     saveDraft(input);
   }, [input, saveDraft]);
+
+  // Hydrate chat from server (preferred) or localStorage fallback
+  useEffect(() => {
+    const sid = sessionIdRef.current;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const res = await getSessionMessages(sid);
+        if (cancelled) return;
+        if (res.session_persistence && res.messages.length > 0) {
+          setMessages((prev) =>
+            prev.length > 0 ? prev : persistedToUiMessages(mapServerMessagesToPersisted(res.messages)),
+          );
+        } else if (!res.session_persistence) {
+          setMessages((prev) => {
+            if (prev.length > 0) return prev;
+            const ls = loadChatHistory(sid);
+            return ls.length ? persistedToUiMessages(ls) : prev;
+          });
+        }
+      } catch {
+        if (!cancelled) {
+          setMessages((prev) => {
+            if (prev.length > 0) return prev;
+            const ls = loadChatHistory(sid);
+            return ls.length ? persistedToUiMessages(ls) : prev;
+          });
+        }
+      } finally {
+        if (!cancelled) setHistoryReady(true);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Mirror transcript to localStorage (bounded); server remains source of truth when persistence is on
+  useEffect(() => {
+    if (!historyReady) return;
+    saveChatHistory(sessionIdRef.current, uiMessagesToPersisted(messages));
+  }, [messages, historyReady]);
 
   useEffect(() => {
     const ws = new WebSocketClient();
@@ -64,6 +126,10 @@ export default function AgentChat() {
 
     ws.onMessage = (msg: WsMessage) => {
       switch (msg.type) {
+        case 'session_start':
+        case 'connected':
+          break;
+
         case 'thinking':
           setTyping(true);
           pendingThinkingRef.current += msg.content ?? '';
@@ -112,29 +178,79 @@ export default function AgentChat() {
           break;
         }
 
-        case 'tool_call':
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: generateUUID(),
-              role: 'agent',
-              content: `${t('agent.tool_call_prefix')} ${msg.name ?? 'unknown'}(${JSON.stringify(msg.args ?? {})})`,
-              timestamp: new Date(),
-            },
-          ]);
-          break;
+        case 'tool_call': {
+          const toolName = msg.name ?? 'unknown';
+          const toolArgs = msg.args;
+          setMessages((prev) => {
+            // Dedup: backend streaming may re-send tool_call events before execution.
+            // Skip if an unresolved card with the same name+args already exists.
+            const argsKey = JSON.stringify(toolArgs ?? {});
+            const isDuplicate = prev.some(
+              (m) => m.toolCall
+                && m.toolCall.output === undefined
+                && m.toolCall.name === toolName
+                && JSON.stringify(m.toolCall.args ?? {}) === argsKey,
+            );
+            if (isDuplicate) return prev;
 
-        case 'tool_result':
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: generateUUID(),
-              role: 'agent',
-              content: `${t('agent.tool_result_prefix')} ${msg.output ?? ''}`,
-              timestamp: new Date(),
-            },
-          ]);
+            return [
+              ...prev,
+              {
+                id: generateUUID(),
+                role: 'agent' as const,
+                content: `${t('agent.tool_call_prefix')} ${toolName}(${argsKey})`,
+                toolCall: { name: toolName, args: toolArgs },
+                timestamp: new Date(),
+              },
+            ];
+          });
           break;
+        }
+
+        case 'tool_result': {
+          setMessages((prev) => {
+            // Forward scan: find the FIRST unresolved toolCall (order-guaranteed by backend)
+            const idx = prev.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
+            if (idx !== -1) {
+              const updated = [...prev];
+              const existing = prev[idx]!;
+              updated[idx] = {
+                ...existing,
+                toolCall: { ...existing.toolCall!, output: msg.output ?? '' },
+              };
+              return updated;
+            }
+            // Fallback: no unresolved call found — append standalone card
+            return [
+              ...prev,
+              {
+                id: generateUUID(),
+                role: 'agent' as const,
+                content: `${t('agent.tool_result_prefix')} ${msg.output ?? ''}`,
+                toolCall: { name: msg.name ?? 'unknown', output: msg.output ?? '' },
+                timestamp: new Date(),
+              },
+            ];
+          });
+          break;
+        }
+
+        case 'cron_result': {
+          const cronOutput = msg.output ?? '';
+          if (cronOutput) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: generateUUID(),
+                role: 'agent' as const,
+                content: cronOutput,
+                markdown: true,
+                timestamp: new Date(msg.timestamp ?? Date.now()),
+              },
+            ]);
+          }
+          break;
+        }
 
         case 'error':
           setMessages((prev) => [
@@ -311,7 +427,9 @@ export default function AgentChat() {
                     <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-lg" style={{ color: 'var(--pc-text-muted)', background: 'var(--pc-bg-surface)' }}>{msg.thinking}</pre>
                   </details>
                 )}
-                {msg.markdown ? (
+                {msg.toolCall ? (
+                  <ToolCallCard toolCall={msg.toolCall} />
+                ) : msg.markdown ? (
                   <div className="text-sm break-words leading-relaxed chat-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown></div>
                 ) : (
                   <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{msg.content}</p>

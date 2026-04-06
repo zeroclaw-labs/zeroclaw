@@ -22,6 +22,89 @@ For resilient fallback chains (`reliability.fallback_providers`), each fallback
 provider resolves credentials independently. The primary provider's explicit
 credential is not reused for fallback providers.
 
+## Fallback Provider Chains
+
+ZeroClaw supports automatic failover to alternative providers when the primary encounters:
+
+- Timeout or connection errors
+- Service unavailability (503)
+- Rate limits (429), after exhausting API key rotation
+- Model not found errors (with per-model fallback configured)
+
+Configure fallback chains in `config.toml`:
+
+```toml
+[reliability]
+fallback_providers = ["anthropic", "groq", "openrouter"]
+provider_retries = 2
+provider_backoff_ms = 500
+```
+
+Behavior:
+
+1. Try primary provider (with `provider_retries` and exponential backoff)
+2. On transient failure, move to first fallback provider
+3. Repeat for each fallback in order
+4. On permanent errors (400, 401, 403), skip to fallback immediately
+
+Each fallback provider:
+- Resolves credentials independently
+- Can be from a different API family (OpenAI-compatible → Anthropic → local Ollama)
+- Reuses the same requested model if available, or triggers model fallback if configured
+
+Example: Multi-cloud high availability
+
+```toml
+default_provider = "openai"
+default_model = "gpt-4o"
+
+[reliability]
+fallback_providers = ["anthropic", "ollama"]
+
+[reliability.model_fallbacks]
+"gpt-4o" = ["gpt-4-turbo"]
+"claude-opus-4-20250514" = ["claude-sonnet-4-20250514"]
+```
+
+When OpenAI times out:
+1. Retry 2x with backoff
+2. Fall back to Anthropic, attempt `gpt-4o` (Anthropic will select equivalent)
+3. If Anthropic fails, fall back to local Ollama
+4. If Ollama doesn't have the model, use model fallback (Sonnet)
+
+### API Key Rotation on Rate Limits
+
+When a provider returns 429 (rate limit), ZeroClaw:
+
+1. Rotates to the next API key in `reliability.api_keys` (on the same provider/model)
+2. If all keys exhausted, proceeds to `fallback_providers`
+
+Configure additional keys:
+
+```toml
+api_key = "sk-primary"  # Primary key (always tried first)
+
+[reliability]
+api_keys = ["sk-backup-1", "sk-backup-2"]  # Fallback keys for rate-limit rotation
+```
+
+### Model Fallbacks
+
+When a specific model is unavailable or rate-limited, configure per-model fallbacks:
+
+```toml
+[reliability.model_fallbacks]
+"gpt-4o" = ["gpt-4-turbo", "gpt-3.5-turbo"]
+"claude-opus-4-20250514" = ["claude-sonnet-4-20250514"]
+```
+
+Fallback is triggered when:
+- Model is not found in the provider's available models
+- Provider returns an error mentioning the model (e.g., "model not found")
+- Model is rate-limited and API key rotation is exhausted
+
+For detailed setup guidance, see [Multi-Model Setup and Fallback Chains](/docs/getting-started/multi-model-setup.md).
+
 ## Provider Catalog
 
 | Canonical ID | Aliases | Local | Provider-specific env var(s) |

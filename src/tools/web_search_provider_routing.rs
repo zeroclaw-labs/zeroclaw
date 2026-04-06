@@ -3,6 +3,7 @@ pub enum WebSearchProviderRoute {
     DuckDuckGo,
     Brave,
     SearXNG,
+    Tavily,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +16,7 @@ pub struct WebSearchProviderResolution {
 pub const DEFAULT_WEB_SEARCH_PROVIDER: &str = "duckduckgo";
 const BRAVE_PROVIDER: &str = "brave";
 const SEARXNG_PROVIDER: &str = "searxng";
+const TAVILY_PROVIDER: &str = "tavily";
 
 pub fn resolve_web_search_provider(raw_provider: &str) -> WebSearchProviderResolution {
     let normalized = raw_provider.trim().to_ascii_lowercase();
@@ -36,6 +38,13 @@ pub fn resolve_web_search_provider(raw_provider: &str) -> WebSearchProviderResol
             canonical_provider: SEARXNG_PROVIDER,
             used_fallback: false,
         },
+        "tavily" | "tavily-search" | "tavily_search" => WebSearchProviderResolution {
+            route: WebSearchProviderRoute::Tavily,
+            canonical_provider: TAVILY_PROVIDER,
+            used_fallback: false,
+        },
+        // Warns for unknown providers, falls back to default.
+        // Known non-default providers: Brave, SearXNG, Tavily.
         _ => WebSearchProviderResolution {
             route: WebSearchProviderRoute::DuckDuckGo,
             canonical_provider: DEFAULT_WEB_SEARCH_PROVIDER,
@@ -87,5 +96,10 @@ mod tests {
         assert_eq!(resolved.route, WebSearchProviderRoute::DuckDuckGo);
         assert_eq!(resolved.canonical_provider, DEFAULT_WEB_SEARCH_PROVIDER);
         assert!(resolved.used_fallback);
+
+        let resolved2 = resolve_web_search_provider("searxng-plus");
+        assert_eq!(resolved2.route, WebSearchProviderRoute::DuckDuckGo);
+        assert_eq!(resolved2.canonical_provider, DEFAULT_WEB_SEARCH_PROVIDER);
+        assert!(resolved2.used_fallback);
     }
 }

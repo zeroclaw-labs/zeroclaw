@@ -62,7 +62,7 @@ async fn provider_vision_support() -> Result<()> {
         eprintln!("Creating minimal 1x1 PNG...");
 
         // Create minimal PNG if missing
-        use base64::{engine::general_purpose, Engine as _};
+        use base64::{Engine as _, engine::general_purpose};
         let png_data = general_purpose::STANDARD.decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
         )?;
@@ -156,6 +156,7 @@ async fn openai_codex_second_vision_support() -> Result<()> {
         provider_max_tokens: None,
         extra_headers: std::collections::HashMap::new(),
         api_path: None,
+        merge_system_into_user: false,
     };
 
     let provider = zeroclaw::providers::create_provider_with_options("openai-codex", None, &opts)?;
@@ -189,7 +190,7 @@ async fn openai_codex_second_vision_support() -> Result<()> {
         eprintln!("Creating minimal 1x1 PNG...");
 
         // Create minimal PNG if missing
-        use base64::{engine::general_purpose, Engine as _};
+        use base64::{Engine as _, engine::general_purpose};
         let png_data = general_purpose::STANDARD.decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
         )?;

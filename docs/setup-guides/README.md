@@ -8,6 +8,7 @@ For first-time setup and quick orientation.
 2. One-click setup and dual bootstrap mode: [one-click-bootstrap.md](one-click-bootstrap.md)
 3. Update or uninstall on macOS: [macos-update-uninstall.md](macos-update-uninstall.md)
 4. Find commands by tasks: [../reference/cli/commands-reference.md](../reference/cli/commands-reference.md)
+5. Register MCP servers: [mcp-setup.md](mcp-setup.md)
 
 ## Choose Your Path
 

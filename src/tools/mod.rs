@@ -111,6 +111,7 @@ pub mod web_fetch;
 mod web_search_provider_routing;
 pub mod web_search_tool;
 pub mod workspace_tool;
+pub mod wrappers;
 
 pub use ask_user::AskUserTool;
 pub use backup_tool::BackupTool;
@@ -210,11 +211,12 @@ pub use weather_tool::WeatherTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 pub use workspace_tool::WorkspaceTool;
+pub use wrappers::{PathGuardedTool, RateLimitedTool};
 
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
-use crate::security::{create_sandbox, SecurityPolicy};
+use crate::security::{SecurityPolicy, create_sandbox};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -291,7 +293,10 @@ pub fn default_tools_with_runtime(
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(ShellTool::new(security.clone(), runtime)),
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(ShellTool::new(security.clone(), runtime), security.clone()),
+            security.clone(),
+        )),
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security.clone())),
         Box::new(FileEditTool::new(security.clone())),
@@ -405,10 +410,14 @@ pub fn all_tools_with_runtime(
     let has_shell_access = runtime.has_shell_access();
     let sandbox = create_sandbox(&root_config.security);
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(
-            ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
-                .with_timeout_secs(root_config.shell_tool.timeout_secs),
-        ),
+        Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(
+                ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
+                    .with_timeout_secs(root_config.shell_tool.timeout_secs),
+                security.clone(),
+            ),
+            security.clone(),
+        )),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
@@ -424,7 +433,7 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryExportTool::new(memory.clone())),
-        Arc::new(MemoryPurgeTool::new(memory, security.clone())),
+        Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
@@ -467,21 +476,8 @@ pub fn all_tools_with_runtime(
             .default_model
             .clone()
             .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
-        let llm_task_runtime_options = crate::providers::ProviderRuntimeOptions {
-            auth_profile_override: None,
-            provider_api_url: root_config.api_url.clone(),
-            zeroclaw_dir: root_config
-                .config_path
-                .parent()
-                .map(std::path::PathBuf::from),
-            secrets_encrypt: root_config.secrets.encrypt,
-            reasoning_enabled: root_config.runtime.reasoning_enabled,
-            reasoning_effort: root_config.runtime.reasoning_effort.clone(),
-            provider_timeout_secs: Some(root_config.provider_timeout_secs),
-            extra_headers: root_config.extra_headers.clone(),
-            api_path: root_config.api_path.clone(),
-            provider_max_tokens: root_config.provider_max_tokens,
-        };
+        let llm_task_runtime_options =
+            crate::providers::provider_runtime_options_from_config(root_config);
         tool_arcs.push(Arc::new(LlmTaskTool::new(
             security.clone(),
             llm_task_provider,
@@ -907,21 +903,8 @@ pub fn all_tools_with_runtime(
         let trimmed_value = value.trim();
         (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
     });
-    let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
-        provider_api_url: root_config.api_url.clone(),
-        zeroclaw_dir: root_config
-            .config_path
-            .parent()
-            .map(std::path::PathBuf::from),
-        secrets_encrypt: root_config.secrets.encrypt,
-        reasoning_enabled: root_config.runtime.reasoning_enabled,
-        reasoning_effort: root_config.runtime.reasoning_effort.clone(),
-        provider_timeout_secs: Some(root_config.provider_timeout_secs),
-        provider_max_tokens: root_config.provider_max_tokens,
-        extra_headers: root_config.extra_headers.clone(),
-        api_path: root_config.api_path.clone(),
-    };
+    let provider_runtime_options =
+        crate::providers::provider_runtime_options_from_config(root_config);
 
     let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
         None
@@ -940,7 +923,8 @@ pub fn all_tools_with_runtime(
         .with_parent_tools(Arc::clone(&parent_tools))
         .with_multimodal_config(root_config.multimodal.clone())
         .with_delegate_config(root_config.delegate.clone())
-        .with_workspace_dir(workspace_dir.to_path_buf());
+        .with_workspace_dir(workspace_dir.to_path_buf())
+        .with_memory(memory.clone());
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };
@@ -1290,6 +1274,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
 

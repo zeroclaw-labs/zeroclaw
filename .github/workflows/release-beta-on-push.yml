@@ -218,7 +218,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          toolchain: 1.92.0
+          toolchain: 1.93.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         if: runner.os != 'Windows'
@@ -251,6 +251,8 @@ jobs:
       - name: Check binary size
         shell: bash
         run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
+        env:
+          BINARY_SIZE_HARD_LIMIT: "52428800"  # 50MB — release builds include all optional features
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -281,7 +283,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          toolchain: 1.92.0
+          toolchain: 1.93.0
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
@@ -330,6 +332,9 @@ jobs:
     name: Publish Beta Release
     needs: [version, release-notes, build, build-desktop]
     runs-on: ubuntu-latest
+    environment:
+      name: github-releases
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ needs.version.outputs.tag }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -342,6 +347,31 @@ jobs:
         with:
           name: desktop-macos
           path: artifacts/desktop-macos
+
+      - name: Verify required release assets
+        shell: bash
+        run: |
+          required_assets=(
+            "zeroclaw-x86_64-unknown-linux-gnu.tar.gz"
+            "zeroclaw-aarch64-unknown-linux-gnu.tar.gz"
+            "zeroclaw-armv7-unknown-linux-gnueabihf.tar.gz"
+            "zeroclaw-aarch64-apple-darwin.tar.gz"
+            "zeroclaw-aarch64-linux-android.tar.gz"
+            "zeroclaw-x86_64-pc-windows-msvc.zip"
+            "ZeroClaw.dmg"
+          )
+          missing=0
+          for asset in "${required_assets[@]}"; do
+            if ! find artifacts -type f -name "$asset" -print -quit | grep -q .; then
+              echo "::error::Missing required release asset: ${asset}"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Collected files:"
+            find artifacts -type f | sort
+            exit 1
+          fi
 
       - name: Generate checksums
         run: |
@@ -393,6 +423,9 @@ jobs:
     needs: [version, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment:
+      name: docker
+      url: https://github.com/${{ github.repository }}/pkgs/container/zeroclaw
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -459,4 +492,12 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:beta-debian
           platforms: linux/amd64,linux/arm64
 
-  # Tweet removed — only stable releases should tweet (see tweet-release.yml).
+  # ── Post-publish: sync marketplace templates (Coolify, Dokploy, EasyPanel) ──
+  marketplace:
+    name: Sync Marketplace Templates
+    needs: [version, docker]
+    if: ${{ !cancelled() && needs.docker.result == 'success' }}
+    uses: ./.github/workflows/sync-marketplace-templates.yml
+    with:
+      release_tag: ${{ needs.version.outputs.tag }}
+    secrets: inherit

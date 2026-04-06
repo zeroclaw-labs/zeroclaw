@@ -5,14 +5,14 @@
 //! - `GET  /api/canvas`     — list all active canvases
 //! - `WS   /ws/canvas/:id`  — real-time canvas updates via WebSocket
 
-use super::api::require_auth;
 use super::AppState;
+use super::api::require_auth;
 use axum::{
     extract::{
-        ws::{Message, WebSocket},
         Path, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
     },
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -194,6 +194,20 @@ pub async fn handle_ws_canvas(
                 .into_response();
         }
     }
+
+    // Echo Sec-WebSocket-Protocol if the client requests our sub-protocol
+    // (browsers reject the upgrade if a requested protocol isn't echoed back).
+    const WS_CANVAS_PROTOCOL: &str = "zeroclaw.v1";
+    let ws = if headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |protos| {
+            protos.split(',').any(|p| p.trim() == WS_CANVAS_PROTOCOL)
+        }) {
+        ws.protocols([WS_CANVAS_PROTOCOL])
+    } else {
+        ws
+    };
 
     ws.on_upgrade(move |socket| handle_canvas_socket(socket, state, id))
         .into_response()

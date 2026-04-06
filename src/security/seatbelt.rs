@@ -189,11 +189,12 @@ fn generate_policy(workspace: &Path) -> String {
     (remote unix-socket (path-literal "/var/run/mDNSResponder")))
 (allow system-socket)
 
-;; Allow localhost connections only (for local dev servers)
+;; Allow localhost connections only (for local dev servers).
+;; Note: macOS sandbox-exec only accepts "localhost:*" or "*:port" in
+;; (remote ip ...) filters — raw IP addresses cause the entire policy
+;; to fail to parse.
 (allow network-outbound
     (remote ip "localhost:*"))
-(allow network-outbound
-    (remote ip "127.0.0.1:*"))
 
 ;; ── Mach / IPC ─────────────────────────────────────────────
 ;; Allow basic mach services needed for process execution
@@ -261,7 +262,7 @@ mod tests {
         let workspace = PathBuf::from("/tmp/workspace");
         let policy = generate_policy(&workspace);
         assert!(policy.contains("localhost"));
-        assert!(policy.contains("127.0.0.1"));
+        assert!(!policy.contains("127.0.0.1"));
         assert!(!policy.contains("(allow network*)"));
     }
 

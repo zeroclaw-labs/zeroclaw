@@ -98,8 +98,6 @@ The installer builds ZeroClaw, configures your provider and API key,
 starts the gateway service, and opens the dashboard — all in one step.
 
 Options:
-  --guided                   Run interactive guided installer (default on Linux TTY)
-  --no-guided                Disable guided installer
   --docker                   Run install in Docker-compatible mode
   --install-system-deps      Install build dependencies (Linux/macOS)
   --install-rust             Install Rust via rustup if missing
@@ -109,6 +107,7 @@ Options:
   --api-key <key>            API key (skips interactive prompt)
   --provider <id>            Provider (default: openrouter)
   --model <id>               Model (optional)
+  --cargo-features <list>    Extra cargo features (comma/space separated)
   --skip-onboard             Skip provider/API key configuration
   --skip-build               Skip build step
   --skip-install             Skip cargo install step
@@ -138,6 +137,7 @@ Environment:
   ZEROCLAW_API_KEY           Used when --api-key is not provided
   ZEROCLAW_PROVIDER          Used when --provider is not provided (default: openrouter)
   ZEROCLAW_MODEL             Used when --model is not provided
+  ZEROCLAW_CARGO_FEATURES    Extra cargo features for source builds (comma/space separated)
   ZEROCLAW_BOOTSTRAP_MIN_RAM_MB   Minimum RAM threshold for source build preflight (default: 2048)
   ZEROCLAW_BOOTSTRAP_MIN_DISK_MB  Minimum free disk threshold for source build preflight (default: 6144)
   ZEROCLAW_DISABLE_ALPINE_AUTO_DEPS
@@ -147,6 +147,37 @@ USAGE
 
 have_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+append_cargo_feature() {
+  local feature="${1:-}"
+  [[ -n "$feature" ]] || return 0
+  case ",${CARGO_FEATURES_CSV:-}," in
+    *,"$feature",*) return 0 ;;
+  esac
+  if [[ -n "${CARGO_FEATURES_CSV:-}" ]]; then
+    CARGO_FEATURES_CSV+=",${feature}"
+  else
+    CARGO_FEATURES_CSV="$feature"
+  fi
+}
+
+append_cargo_features_from_input() {
+  local raw="${1:-}" token
+  raw="${raw//,/ }"
+  for token in $raw; do
+    append_cargo_feature "$token"
+  done
+}
+
+refresh_cargo_feature_args() {
+  CARGO_FEATURE_ARGS=()
+  if [[ "${CARGO_NO_DEFAULT_FEATURES:-false}" == true ]]; then
+    CARGO_FEATURE_ARGS+=(--no-default-features)
+  fi
+  if [[ -n "${CARGO_FEATURES_CSV:-}" ]]; then
+    CARGO_FEATURE_ARGS+=(--features "$CARGO_FEATURES_CSV")
+  fi
 }
 
 get_total_memory_mb() {
@@ -486,78 +517,6 @@ find_missing_alpine_prereqs() {
   done
 }
 
-bool_to_word() {
-  if [[ "$1" == true ]]; then
-    echo "yes"
-  else
-    echo "no"
-  fi
-}
-
-guided_open_input() {
-  # Use stdin directly when it is an interactive terminal (e.g. SSH into LXC).
-  # Subshell probing of /dev/stdin fails in some constrained containers even
-  # when FD 0 is perfectly usable, so skip the probe and trust -t 0.
-  if [[ -t 0 ]]; then
-    GUIDED_FD=0
-    return 0
-  fi
-
-  # Non-interactive stdin: try to open /dev/tty as an explicit fd.
-  exec {GUIDED_FD}</dev/tty 2>/dev/null || return 1
-}
-
-guided_read() {
-  local __target_var="$1"
-  local __prompt="$2"
-  local __silent="${3:-false}"
-  local __value=""
-
-  [[ -n "${GUIDED_FD:-}" ]] || guided_open_input || return 1
-
-  if [[ "$__silent" == true ]]; then
-    read -r -s -u "$GUIDED_FD" -p "$__prompt" __value || return 1
-    echo
-  else
-    read -r -u "$GUIDED_FD" -p "$__prompt" __value || return 1
-  fi
-
-  printf -v "$__target_var" '%s' "$__value"
-  return 0
-}
-
-prompt_yes_no() {
-  local question="$1"
-  local default_answer="$2"
-  local prompt=""
-  local answer=""
-
-  if [[ "$default_answer" == "yes" ]]; then
-    prompt="[Y/n]"
-  else
-    prompt="[y/N]"
-  fi
-
-  while true; do
-    if ! guided_read answer "$question $prompt "; then
-      error "guided installer input was interrupted."
-      exit 1
-    fi
-    answer="${answer:-$default_answer}"
-    case "$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')" in
-      y|yes)
-        return 0
-        ;;
-      n|no)
-        return 1
-        ;;
-      *)
-        echo "Please answer yes or no."
-        ;;
-    esac
-  done
-}
-
 install_system_deps() {
   step_dot "Installing system dependencies"
 
@@ -672,157 +631,6 @@ install_rust_toolchain() {
   fi
 }
 
-prompt_provider() {
-  local provider_input=""
-  echo
-  echo -e "  ${BOLD}Select your AI provider${RESET}"
-  echo -e "  ${DIM}(press Enter for default: ${PROVIDER})${RESET}"
-  echo
-  echo -e "  ${BOLD_BLUE}1)${RESET} OpenRouter ${DIM}(recommended — multi-model gateway)${RESET}"
-  echo -e "  ${BOLD_BLUE}2)${RESET} Anthropic ${DIM}(Claude)${RESET}"
-  echo -e "  ${BOLD_BLUE}3)${RESET} OpenAI ${DIM}(GPT)${RESET}"
-  echo -e "  ${BOLD_BLUE}4)${RESET} Gemini ${DIM}(Google)${RESET}"
-  echo -e "  ${BOLD_BLUE}5)${RESET} Ollama ${DIM}(local, no API key needed)${RESET}"
-  echo -e "  ${BOLD_BLUE}6)${RESET} Groq ${DIM}(fast inference)${RESET}"
-  echo -e "  ${BOLD_BLUE}7)${RESET} Venice ${DIM}(privacy-focused)${RESET}"
-  echo -e "  ${BOLD_BLUE}8)${RESET} Other ${DIM}(enter provider ID manually)${RESET}"
-  echo
-
-  if ! guided_read provider_input "  Provider [1]: "; then
-    error "input was interrupted."
-    exit 1
-  fi
-
-  case "${provider_input:-1}" in
-    1|"") PROVIDER="openrouter" ;;
-    2) PROVIDER="anthropic" ;;
-    3) PROVIDER="openai" ;;
-    4) PROVIDER="gemini" ;;
-    5) PROVIDER="ollama" ;;
-    6) PROVIDER="groq" ;;
-    7) PROVIDER="venice" ;;
-    8)
-      if ! guided_read provider_input "  Provider ID: "; then
-        error "input was interrupted."
-        exit 1
-      fi
-      if [[ -n "$provider_input" ]]; then
-        PROVIDER="$provider_input"
-      fi
-      ;;
-    *) PROVIDER="openrouter" ;;
-  esac
-}
-
-prompt_api_key() {
-  local api_key_input=""
-
-  if [[ "$PROVIDER" == "ollama" ]]; then
-    step_ok "Ollama selected — no API key required"
-    return 0
-  fi
-
-  echo
-  if [[ -n "$API_KEY" ]]; then
-    step_ok "API key provided via environment/flag"
-    return 0
-  fi
-
-  echo -e "  ${BOLD}Enter your ${PROVIDER} API key${RESET}"
-  echo -e "  ${DIM}(input is hidden; leave empty to configure later)${RESET}"
-  echo
-
-  if ! guided_read api_key_input "  API key: " true; then
-    echo
-    error "input was interrupted."
-    exit 1
-  fi
-  echo
-
-  if [[ -n "$api_key_input" ]]; then
-    API_KEY="$api_key_input"
-    step_ok "API key set"
-  else
-    warn "No API key entered — you can configure it later with zeroclaw onboard"
-    SKIP_ONBOARD=true
-  fi
-}
-
-prompt_model() {
-  local model_input=""
-
-  echo -e "  ${DIM}Model (press Enter for provider default):${RESET}"
-  if ! guided_read model_input "  Model [default]: "; then
-    error "input was interrupted."
-    exit 1
-  fi
-
-  if [[ -n "$model_input" ]]; then
-    MODEL="$model_input"
-  fi
-}
-
-run_guided_installer() {
-  local os_name="$1"
-
-  if ! guided_open_input >/dev/null; then
-    error "guided installer requires an interactive terminal."
-    error "Run from a terminal, or pass --no-guided with explicit flags."
-    exit 1
-  fi
-
-  echo
-  echo -e "  ${BOLD_BLUE}${CRAB} ZeroClaw Guided Installer${RESET}"
-  echo -e "  ${DIM}Answer a few questions, then the installer will handle everything.${RESET}"
-  echo
-
-  # --- System dependencies ---
-  if [[ "$os_name" == "Linux" ]]; then
-    if prompt_yes_no "Install Linux build dependencies (toolchain/pkg-config/git/curl)?" "yes"; then
-      INSTALL_SYSTEM_DEPS=true
-    fi
-  else
-    if prompt_yes_no "Install system dependencies for $os_name?" "no"; then
-      INSTALL_SYSTEM_DEPS=true
-    fi
-  fi
-
-  # --- Rust toolchain ---
-  if have_cmd cargo && have_cmd rustc; then
-    step_ok "Detected Rust toolchain: $(rustc --version)"
-  else
-    if prompt_yes_no "Rust toolchain not found. Install Rust via rustup now?" "yes"; then
-      INSTALL_RUST=true
-    fi
-  fi
-
-  # --- Provider + API key (inline onboarding) ---
-  prompt_provider
-  prompt_api_key
-  prompt_model
-
-  # --- Install plan summary ---
-  echo
-  echo -e "${BOLD}Install plan${RESET}"
-  step_dot "OS: $(echo "$os_name" | tr '[:upper:]' '[:lower:]')"
-  step_dot "Install system deps: $(bool_to_word "$INSTALL_SYSTEM_DEPS")"
-  step_dot "Install Rust: $(bool_to_word "$INSTALL_RUST")"
-  step_dot "Provider: ${PROVIDER}"
-  if [[ -n "$MODEL" ]]; then
-    step_dot "Model: ${MODEL}"
-  fi
-  if [[ -n "$API_KEY" ]]; then
-    step_ok "API key: configured"
-  else
-    step_dot "API key: not set (configure later)"
-  fi
-
-  echo
-  if ! prompt_yes_no "Proceed with this install plan?" "yes"; then
-    info "Installation canceled by user."
-    exit 0
-  fi
-}
 
 ensure_default_config_and_workspace() {
   # Creates a minimal config.toml and workspace scaffold files when the
@@ -844,7 +652,7 @@ ensure_default_config_and_workspace() {
     step_dot "Creating default config.toml"
     cat > "$config_path" <<TOML
 # ZeroClaw configuration — generated by install.sh
-# Edit this file or run 'zeroclaw onboard' to reconfigure.
+# Edit this file or run 'zeroclaw onboard --tui' to reconfigure.
 
 default_provider = "${provider}"
 workspace_dir = "${workspace_dir}"
@@ -958,12 +766,32 @@ You are **${agent_name}**. Built in Rust. 3MB binary. Zero bloat.
   unset -f _write_if_missing
 }
 
+_is_wsl() {
+  # Detect Windows Subsystem for Linux (WSL)
+  # WSL typically has microsoft-standard or microsoft in the kernel release
+  if [[ -f /proc/version ]] && grep -qi 'microsoft' /proc/version; then
+    return 0
+  fi
+  # WSL2 sets WSL_DISTRO_NAME or WSL_INTEROP environment variables
+  if [[ -n "${WSL_DISTRO_NAME:-}" || -n "${WSL_INTEROP:-}" ]]; then
+    return 0
+  fi
+  return 1
+}
+
 resolve_container_cli() {
   local requested_cli
   requested_cli="${ZEROCLAW_CONTAINER_CLI:-docker}"
 
   if have_cmd "$requested_cli"; then
     CONTAINER_CLI="$requested_cli"
+    return 0
+  fi
+
+  # WSL: try docker.exe (Docker Desktop for Windows) if docker is not found
+  if [[ "$requested_cli" == "docker" ]] && _is_wsl && have_cmd docker.exe; then
+    info "Detected WSL environment with Docker Desktop"
+    CONTAINER_CLI="docker.exe"
     return 0
   fi
 
@@ -1077,7 +905,7 @@ run_docker_bootstrap() {
       "$docker_image" \
       "${onboard_cmd[@]}" || true
   else
-    info "Docker image ready. Run zeroclaw onboard inside the container to configure."
+    info "Docker image ready. Run zeroclaw onboard --tui inside the container to configure."
   fi
 
   # Ensure config.toml and workspace scaffold exist on the host even when
@@ -1092,9 +920,6 @@ SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd || pwd)"
 ROOT_DIR="$SCRIPT_DIR"
 REPO_URL="https://github.com/zeroclaw-labs/zeroclaw.git"
-ORIGINAL_ARG_COUNT=$#
-GUIDED_MODE="auto"
-
 DOCKER_MODE=false
 INSTALL_SYSTEM_DEPS=false
 INSTALL_RUST=false
@@ -1109,15 +934,15 @@ CONTAINER_CLI="${ZEROCLAW_CONTAINER_CLI:-docker}"
 API_KEY="${ZEROCLAW_API_KEY:-}"
 PROVIDER="${ZEROCLAW_PROVIDER:-openrouter}"
 MODEL="${ZEROCLAW_MODEL:-}"
+CARGO_FEATURES_INPUT="${ZEROCLAW_CARGO_FEATURES:-}"
+CARGO_NO_DEFAULT_FEATURES=false
+CARGO_FEATURES_CSV=""
+CARGO_FEATURE_ARGS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --guided)
-      GUIDED_MODE="on"
-      shift
-      ;;
-    --no-guided)
-      GUIDED_MODE="off"
+    --guided|--no-guided)
+      warn "--guided / --no-guided are deprecated; the TUI wizard runs automatically after install."
       shift
       ;;
     --docker)
@@ -1172,6 +997,14 @@ while [[ $# -gt 0 ]]; do
       }
       shift 2
       ;;
+    --cargo-features)
+      CARGO_FEATURES_INPUT="${2:-}"
+      [[ -n "$CARGO_FEATURES_INPUT" ]] || {
+        error "--cargo-features requires a value"
+        exit 1
+      }
+      shift 2
+      ;;
     --build-first)
       SKIP_BUILD=false
       shift
@@ -1197,26 +1030,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+append_cargo_features_from_input "$CARGO_FEATURES_INPUT"
+refresh_cargo_feature_args
+
 OS_NAME="$(uname -s)"
 DEVICE_CLASS="$(detect_device_class)"
 step_dot "Device: $OS_NAME/$(uname -m) ($DEVICE_CLASS)"
-
-if [[ "$GUIDED_MODE" == "auto" ]]; then
-  if [[ "$OS_NAME" == "Linux" && "$ORIGINAL_ARG_COUNT" -eq 0 && -t 0 && -t 1 ]]; then
-    GUIDED_MODE="on"
-  else
-    GUIDED_MODE="off"
-  fi
-fi
-
-if [[ "$DOCKER_MODE" == true && "$GUIDED_MODE" == "on" ]]; then
-  warn "--guided is ignored with --docker."
-  GUIDED_MODE="off"
-fi
-
-if [[ "$GUIDED_MODE" == "on" ]]; then
-  run_guided_installer "$OS_NAME"
-fi
 
 if [[ "$DOCKER_MODE" == true ]]; then
   if [[ "$INSTALL_SYSTEM_DEPS" == true ]]; then
@@ -1465,17 +1284,22 @@ if [[ "$SKIP_BUILD" == false ]]; then
 
   # Determine cargo feature flags — disable prometheus on 32-bit targets
   # (prometheus crate requires AtomicU64, unavailable on armv7l/armv6l)
-  CARGO_FEATURE_FLAGS=""
   _build_arch="$(uname -m)"
   case "$_build_arch" in
     armv7l|armv6l|armhf)
       step_dot "32-bit ARM detected ($_build_arch) — disabling prometheus (requires 64-bit atomics)"
-      CARGO_FEATURE_FLAGS="--no-default-features --features channel-nostr,skill-creation"
+      CARGO_NO_DEFAULT_FEATURES=true
+      append_cargo_feature "channel-nostr"
+      append_cargo_feature "skill-creation"
       ;;
   esac
+  refresh_cargo_feature_args
+  if [[ ${#CARGO_FEATURE_ARGS[@]} -gt 0 ]]; then
+    step_dot "Cargo feature flags: ${CARGO_FEATURE_ARGS[*]}"
+  fi
 
   step_dot "Building release binary"
-  cargo build --release --locked $CARGO_FEATURE_FLAGS
+  cargo build --release --locked "${CARGO_FEATURE_ARGS[@]}"
   step_ok "Release binary built"
 else
   step_dot "Skipping build"
@@ -1494,7 +1318,7 @@ if [[ "$SKIP_INSTALL" == false ]]; then
     fi
   fi
 
-  cargo install --path "$WORK_DIR" --force --locked $CARGO_FEATURE_FLAGS
+  cargo install --path "$WORK_DIR" --force --locked "${CARGO_FEATURE_ARGS[@]}"
   step_ok "ZeroClaw installed"
 
   # Sync binary to ~/.local/bin so PATH lookups find the fresh version
@@ -1597,9 +1421,10 @@ fi
 echo
 echo -e "${BOLD_BLUE}[3/3]${RESET} ${BOLD}Finalizing setup${RESET}"
 
-# --- Inline onboarding (provider + API key configuration) ---
+# --- Onboarding via TUI wizard ---
 if [[ "$SKIP_ONBOARD" == false && -n "$ZEROCLAW_BIN" ]]; then
   if [[ -n "$API_KEY" ]]; then
+    # Non-interactive: apply provider/key directly
     step_dot "Configuring provider: ${PROVIDER}"
     ONBOARD_CMD=("$ZEROCLAW_BIN" onboard --api-key "$API_KEY" --provider "$PROVIDER")
     if [[ -n "$MODEL" ]]; then
@@ -1608,37 +1433,19 @@ if [[ "$SKIP_ONBOARD" == false && -n "$ZEROCLAW_BIN" ]]; then
     if "${ONBOARD_CMD[@]}" 2>/dev/null; then
       step_ok "Provider configured"
     else
-      step_fail "Provider configuration failed — run zeroclaw onboard to retry"
+      step_fail "Provider configuration failed — run zeroclaw onboard --tui to retry"
     fi
-  elif [[ "$PROVIDER" == "ollama" ]]; then
-    step_dot "Configuring Ollama (no API key needed)"
-    if "$ZEROCLAW_BIN" onboard --provider ollama 2>/dev/null; then
-      step_ok "Ollama configured"
-    else
-      step_fail "Ollama configuration failed — run zeroclaw onboard to retry"
-    fi
+  elif [[ -t 1 ]] && [[ -t 0 || -e /dev/tty ]]; then
+    # Interactive terminal: launch TUI onboarding wizard.
+    # The TUI binary handles /dev/tty reopening internally when stdin is a pipe.
+    echo
+    step_dot "Launching TUI onboarding wizard"
+    "$ZEROCLAW_BIN" onboard --tui || warn "TUI setup exited — run zeroclaw onboard --tui to retry"
   else
-    # No API key and not ollama — prompt inline if interactive, skip otherwise
-    if [[ -t 0 && -t 1 ]]; then
-      prompt_provider
-      prompt_api_key
-      if [[ -n "$API_KEY" ]]; then
-        ONBOARD_CMD=("$ZEROCLAW_BIN" onboard --api-key "$API_KEY" --provider "$PROVIDER")
-        if [[ -n "$MODEL" ]]; then
-          ONBOARD_CMD+=(--model "$MODEL")
-        fi
-        if "${ONBOARD_CMD[@]}" 2>/dev/null; then
-          step_ok "Provider configured"
-        else
-          step_fail "Provider configuration failed — run zeroclaw onboard to retry"
-        fi
-      fi
-    else
-      step_dot "No API key provided — run zeroclaw onboard to configure"
-    fi
+    step_dot "No API key provided — run zeroclaw onboard --tui to configure"
   fi
 elif [[ "$SKIP_ONBOARD" == true ]]; then
-  step_dot "Skipping configuration (run zeroclaw onboard later)"
+  step_dot "Skipping configuration (run zeroclaw onboard --tui later)"
 elif [[ -z "$ZEROCLAW_BIN" ]]; then
   warn "ZeroClaw binary not found — cannot configure provider"
 fi

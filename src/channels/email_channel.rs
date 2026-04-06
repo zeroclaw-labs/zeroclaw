@@ -8,13 +8,14 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::unnecessary_map_or)]
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
+use async_imap::Session;
 use async_imap::extensions::idle::IdleResponse;
 use async_imap::types::Fetch;
-use async_imap::Session;
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
-use lettre::message::SinglePart;
+use lettre::message::header::ContentType;
+use lettre::message::{Attachment, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use mail_parser::{MessageParser, MimeHeaders};
@@ -26,10 +27,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::{sleep, timeout};
-use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -70,6 +71,10 @@ pub struct EmailConfig {
     /// Default subject line for outgoing emails (default: "ZeroClaw Message")
     #[serde(default = "default_subject")]
     pub default_subject: String,
+    /// Maximum total attachment size in bytes (default: 25 MB).
+    /// Attachments exceeding this limit are dropped with a warning.
+    #[serde(default = "default_max_attachment_bytes")]
+    pub max_attachment_bytes: usize,
 }
 
 impl crate::config::traits::ChannelConfig for EmailConfig {
@@ -99,6 +104,9 @@ fn default_true() -> bool {
 fn default_subject() -> String {
     "ZeroClaw Message".into()
 }
+fn default_max_attachment_bytes() -> usize {
+    25 * 1024 * 1024
+}
 
 impl Default for EmailConfig {
     fn default() -> Self {
@@ -115,6 +123,7 @@ impl Default for EmailConfig {
             idle_timeout_secs: default_idle_timeout(),
             allowed_senders: Vec::new(),
             default_subject: default_subject(),
+            max_attachment_bytes: default_max_attachment_bytes(),
         }
     }
 }
@@ -210,6 +219,55 @@ impl EmailChannel {
             }
         }
         "(no readable content)".to_string()
+    }
+
+    /// Extract binary attachments from a parsed email as MediaAttachment entries.
+    fn extract_attachments(
+        &self,
+        parsed: &mail_parser::Message,
+    ) -> Vec<super::media_pipeline::MediaAttachment> {
+        let mut attachments = Vec::new();
+        let mut total_size = 0;
+
+        for part in parsed.attachments() {
+            let part: &mail_parser::MessagePart = part;
+            let ct = MimeHeaders::content_type(part);
+            let mime_str =
+                ct.map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("octet-stream")));
+
+            // Skip text parts — already handled by extract_text()
+            if let Some(ref m) = mime_str {
+                if m.starts_with("text/") {
+                    continue;
+                }
+            }
+
+            let data = part.contents().to_vec();
+            if data.is_empty() {
+                continue;
+            }
+
+            // Check size limit
+            total_size += data.len();
+            if total_size > self.config.max_attachment_bytes {
+                warn!(
+                    "Attachment size limit exceeded ({} bytes), dropping remaining attachments",
+                    self.config.max_attachment_bytes
+                );
+                break;
+            }
+
+            let file_name = MimeHeaders::attachment_name(part)
+                .unwrap_or("attachment")
+                .to_string();
+
+            attachments.push(super::media_pipeline::MediaAttachment {
+                file_name,
+                data,
+                mime_type: mime_str,
+            });
+        }
+        attachments
     }
 
     /// Connect to IMAP server with TLS and authenticate
@@ -315,12 +373,15 @@ impl EmailChannel {
                                     .unwrap_or(0)
                             });
 
+                        let attachments = self.extract_attachments(&parsed);
+
                         results.push(ParsedEmail {
                             _uid: uid,
                             msg_id,
                             sender,
                             content,
                             timestamp: ts,
+                            attachments,
                         });
                     }
                 }
@@ -479,7 +540,7 @@ impl EmailChannel {
                 timestamp: email.timestamp,
                 thread_ts: None,
                 interruption_scope_id: None,
-                attachments: vec![],
+                attachments: email.attachments,
             };
 
             if tx.send(msg).await.is_err() {
@@ -515,6 +576,7 @@ struct ParsedEmail {
     sender: String,
     content: String,
     timestamp: u64,
+    attachments: Vec<super::media_pipeline::MediaAttachment>,
 }
 
 /// Result from waiting on IDLE
@@ -545,15 +607,46 @@ impl Channel for EmailChannel {
             (default_subject, message.content.as_str())
         };
 
-        let email = Message::builder()
-            .from(self.config.from_address.parse()?)
-            .to(message.recipient.parse()?)
-            .subject(subject)
-            .singlepart(SinglePart::plain(body.to_string()))?;
+        let email = if message.attachments.is_empty() {
+            // Existing plain-text path
+            Message::builder()
+                .from(self.config.from_address.parse()?)
+                .to(message.recipient.parse()?)
+                .subject(subject)
+                .singlepart(SinglePart::plain(body.to_string()))?
+        } else {
+            // Multipart with attachments
+            let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(body.to_string()));
+
+            for att in &message.attachments {
+                let content_type = att
+                    .mime_type
+                    .as_deref()
+                    .and_then(|m| ContentType::parse(m).ok())
+                    .unwrap_or_else(|| {
+                        ContentType::parse("application/octet-stream").expect("hardcoded MIME type")
+                    });
+
+                let attachment =
+                    Attachment::new(att.file_name.clone()).body(att.data.clone(), content_type);
+
+                multipart = multipart.singlepart(attachment);
+            }
+
+            Message::builder()
+                .from(self.config.from_address.parse()?)
+                .to(message.recipient.parse()?)
+                .subject(subject)
+                .multipart(multipart)?
+        };
 
         let transport = self.create_smtp_transport()?;
         transport.send(&email)?;
-        info!("Email sent to {}", message.recipient);
+        info!(
+            "Email sent to {} ({} attachments)",
+            message.recipient,
+            message.attachments.len()
+        );
         Ok(())
     }
 
@@ -682,6 +775,7 @@ mod tests {
             idle_timeout_secs: 1200,
             allowed_senders: vec!["allowed@example.com".to_string()],
             default_subject: "Custom Subject".to_string(),
+            max_attachment_bytes: default_max_attachment_bytes(),
         };
         assert_eq!(config.imap_host, "imap.example.com");
         assert_eq!(config.imap_folder, "Archive");
@@ -704,6 +798,7 @@ mod tests {
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
             default_subject: "Test Subject".to_string(),
+            max_attachment_bytes: default_max_attachment_bytes(),
         };
         let cloned = config.clone();
         assert_eq!(cloned.imap_host, config.imap_host);
@@ -951,6 +1046,7 @@ mod tests {
             idle_timeout_secs: 1740,
             allowed_senders: vec!["allowed@example.com".to_string()],
             default_subject: "Serialization Test".to_string(),
+            max_attachment_bytes: default_max_attachment_bytes(),
         };
 
         let json = serde_json::to_string(&config).unwrap();

@@ -17,6 +17,7 @@ import Canvas from './pages/Canvas';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
 import { setLocale, type Locale } from './lib/i18n';
+import { loadLocale, saveLocale } from './contexts/ThemeContext';
 import { basePath } from './lib/basePath';
 import { getAdminPairCode } from './lib/api';
 
@@ -187,12 +188,14 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 
 function AppContent() {
   const { isAuthenticated, requiresPairing, loading, pair, logout } = useAuth();
-  const [locale, setLocaleState] = useState('en');
+  const [locale, setLocaleState] = useState(loadLocale());
   const draftStore = useDraftStore();
+  setLocale(locale as Locale);
 
   const setAppLocale = (newLocale: string) => {
     setLocaleState(newLocale);
     setLocale(newLocale as Locale);
+    saveLocale(newLocale);
   };
 
   // Listen for 401 events to force logout

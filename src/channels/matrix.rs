@@ -1,30 +1,30 @@
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use matrix_sdk::{
+    Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
     authentication::matrix::MatrixSession,
     config::SyncSettings,
     ruma::{
+        OwnedEventId, OwnedRoomId, OwnedUserId,
         api::client::receipt::create_receipt,
         events::reaction::ReactionEventContent,
         events::receipt::ReceiptThread,
         events::relation::{Annotation, Thread},
+        events::room::MediaSource,
         events::room::member::StrippedRoomMemberEvent,
         events::room::message::{
             MessageType, OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata,
             RoomMessageEventContent,
         },
-        events::room::MediaSource,
-        OwnedEventId, OwnedRoomId, OwnedUserId,
     },
-    Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
 };
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, OnceCell, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{Mutex, OnceCell, RwLock, mpsc};
 
 /// Matrix channel for Matrix Client-Server API.
 /// Uses matrix-sdk for reliable sync and encrypted-room decryption.
@@ -44,6 +44,7 @@ pub struct MatrixChannel {
     reaction_events: Arc<RwLock<HashMap<String, String>>>,
     voice_mode: Arc<AtomicBool>,
     otk_conflict_detected: Arc<AtomicBool>,
+    recovery_key: Option<String>,
     transcription: Option<crate::config::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
     stream_mode: crate::config::StreamMode,
@@ -156,6 +157,7 @@ impl MatrixChannel {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -175,6 +177,7 @@ impl MatrixChannel {
             vec![],
             owner_hint,
             device_id_hint,
+            None,
             None,
         )
     }
@@ -197,6 +200,7 @@ impl MatrixChannel {
             owner_hint,
             device_id_hint,
             zeroclaw_dir,
+            None,
         )
     }
 
@@ -209,6 +213,7 @@ impl MatrixChannel {
         owner_hint: Option<String>,
         device_id_hint: Option<String>,
         zeroclaw_dir: Option<PathBuf>,
+        recovery_key: Option<String>,
     ) -> Self {
         let homeserver = homeserver.trim_end_matches('/').to_string();
         let access_token = access_token.trim().to_string();
@@ -239,6 +244,7 @@ impl MatrixChannel {
             reaction_events: Arc::new(RwLock::new(HashMap::new())),
             voice_mode: Arc::new(AtomicBool::new(false)),
             otk_conflict_detected: Arc::new(AtomicBool::new(false)),
+            recovery_key,
             transcription: None,
             transcription_manager: None,
             stream_mode: crate::config::StreamMode::Off,
@@ -603,6 +609,25 @@ impl MatrixChannel {
                 client.restore_session(session).await?;
                 tracing::debug!("Matrix session restored for device");
 
+                // Attempt E2EE key recovery if a recovery key is configured
+                if let Some(ref key) = self.recovery_key {
+                    match client.encryption().recovery().recover(key).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                "Matrix E2EE recovery successful — room keys and cross-signing secrets restored from server backup."
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "Matrix E2EE recovery failed: {error}. \
+                                 The recovery key may be incorrect, or server-side key backup may not be configured. \
+                                 The bot will still work in unencrypted rooms. \
+                                 See docs/security/matrix-e2ee-guide.md section 4I."
+                            );
+                        }
+                    }
+                }
+
                 Ok::<MatrixSdkClient, anyhow::Error>(client)
             })
             .await?;
@@ -751,11 +776,18 @@ impl MatrixChannel {
             tracing::info!("Matrix room-key backup is enabled for this device.");
         } else {
             let _ = client.encryption().backups().disable().await;
-            tracing::warn!(
-                "Matrix room-key backup is not enabled for this device. \
-                 Key backup warnings may appear until recovery is configured. \
-                 See docs/security/matrix-e2ee-guide.md section 4D."
-            );
+            if self.recovery_key.is_some() {
+                tracing::info!(
+                    "Matrix room-key backup is not active on this device, but a recovery key is configured. \
+                     Room keys will be restored from server backup on startup."
+                );
+            } else {
+                tracing::warn!(
+                    "Matrix room-key backup is not enabled for this device. \
+                     To automatically restore room keys after a device reset, set recovery_key in your Matrix config. \
+                     See docs/security/matrix-e2ee-guide.md section 4I."
+                );
+            }
         }
     }
 }
@@ -917,11 +949,19 @@ impl Channel for MatrixChannel {
 
         let _ = client.sync_once(SyncSettings::new()).await;
 
-        tracing::info!(
-            "Matrix channel listening on room {} (configured as {})...",
-            target_room_id,
-            self.room_id
-        );
+        if self.allowed_rooms.is_empty() {
+            tracing::info!(
+                "Matrix channel listening on room {} (configured as {})...",
+                target_room_id,
+                self.room_id
+            );
+        } else {
+            tracing::info!(
+                "Matrix channel listening on {} allowed room(s) (primary: {})...",
+                self.allowed_rooms.len(),
+                self.room_id
+            );
+        }
 
         let recent_event_cache = Arc::new(Mutex::new((
             std::collections::VecDeque::new(),
@@ -952,15 +992,19 @@ impl Channel for MatrixChannel {
             let transcription_mgr = transcription_mgr_for_handler.clone();
 
             async move {
-                if !MatrixChannel::room_matches_target(
-                    target_room.as_str(),
-                    room.room_id().as_str(),
-                ) {
-                    return;
-                }
-
-                // Room allowlist: skip messages from rooms not in the configured list
-                if !MatrixChannel::is_room_allowed_static(&allowed_rooms, room.room_id().as_ref()) {
+                // Room filtering: use allowed_rooms if set, otherwise fall back to single room_id
+                if allowed_rooms.is_empty() {
+                    if !MatrixChannel::room_matches_target(
+                        target_room.as_str(),
+                        room.room_id().as_str(),
+                    ) {
+                        tracing::debug!(
+                            "Matrix: ignoring message from room {} (not the configured room_id)",
+                            room.room_id()
+                        );
+                        return;
+                    }
+                } else if !MatrixChannel::is_room_allowed_static(&allowed_rooms, room.room_id().as_ref()) {
                     tracing::debug!(
                         "Matrix: ignoring message from room {} (not in allowed_rooms)",
                         room.room_id()
@@ -968,12 +1012,20 @@ impl Channel for MatrixChannel {
                     return;
                 }
 
+                tracing::debug!(
+                    "Matrix: received message in room {} from {}",
+                    room.room_id(),
+                    event.sender
+                );
+
                 if event.sender == my_user_id {
+                    tracing::debug!("Matrix: ignoring own message");
                     return;
                 }
 
                 let sender = event.sender.to_string();
                 if !MatrixChannel::is_sender_allowed(&allowed_users, &sender) {
+                    tracing::debug!("Matrix: ignoring message from non-allowed user {sender}");
                     return;
                 }
 
@@ -1051,7 +1103,7 @@ impl Channel for MatrixChannel {
 
                 // Voice transcription: if this was an audio message, transcribe it
                 let body = if body.starts_with("[audio:") {
-                    if let (Some(path_start), Some(ref manager)) = (body.find("saved to "), &transcription_mgr) {
+                    if let (Some(path_start), Some(manager)) = (body.find("saved to "), &transcription_mgr) {
                         let audio_path = body[path_start + 9..].to_string();
                         let file_name = audio_path
                             .rsplit('/')
@@ -1874,10 +1926,12 @@ mod tests {
         assert_eq!(value["msgtype"], "m.text");
         assert_eq!(value["body"], "**hello**");
         assert_eq!(value["format"], "org.matrix.custom.html");
-        assert!(value["formatted_body"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("<strong>hello</strong>"));
+        assert!(
+            value["formatted_body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("<strong>hello</strong>")
+        );
     }
 
     #[test]
@@ -2122,9 +2176,10 @@ mod tests {
         );
 
         let err = ch.resolve_room_id().await.unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("must start with '!' (room ID) or '#' (room alias)"));
+        assert!(
+            err.to_string()
+                .contains("must start with '!' (room ID) or '#' (room alias)")
+        );
     }
 
     #[tokio::test]
@@ -2179,6 +2234,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(ch.is_room_allowed("!allowed:matrix.org"));
         assert!(!ch.is_room_allowed("!forbidden:matrix.org"));
@@ -2195,6 +2251,7 @@ mod tests {
                 "#ops:matrix.org".to_string(),
                 "!direct:matrix.org".to_string(),
             ],
+            None,
             None,
             None,
             None,
@@ -2215,6 +2272,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(ch.is_room_allowed("!room:matrix.org"));
         assert!(ch.is_room_allowed("!ROOM:MATRIX.ORG"));
@@ -2228,6 +2286,7 @@ mod tests {
             "!r:m".to_string(),
             vec![],
             vec!["  !room:matrix.org  ".to_string(), "   ".to_string()],
+            None,
             None,
             None,
             None,

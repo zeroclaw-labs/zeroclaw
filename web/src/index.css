@@ -673,3 +673,45 @@ code, kbd, pre {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* ── Tool call cards (AgentChat) ── */
+.tool-card {
+  border-left: 3px solid var(--pc-accent);
+  background: var(--pc-bg-surface);
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.5rem;
+}
+
+.tool-card__header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.tool-card details summary {
+  cursor: pointer;
+  user-select: none;
+  font-size: 0.75rem;
+  color: var(--pc-text-muted);
+  margin-top: 0.25rem;
+}
+
+.tool-card pre {
+  font-size: 0.75rem;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 12rem;
+  overflow-y: auto;
+  margin-top: 0.25rem;
+  padding: 0.5rem;
+  border-radius: 0.375rem;
+  background: var(--pc-bg-code);
+}
+
+.tool-card__inline {
+  font-size: 0.75rem;
+  color: var(--pc-text-muted);
+  margin-top: 0.25rem;
+}
