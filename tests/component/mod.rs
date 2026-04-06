@@ -1,3 +1,4 @@
+mod agent_prompt_gate;
 mod config_persistence;
 mod config_schema;
 mod dockerignore_test;

@@ -21,6 +21,10 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': '日志',
     'nav.doctor': '诊断',
     'nav.canvas': '画布',
+    'nav.nodes': '节点',
+    'nav.general': '通用',
+    'nav.permissions': '权限',
+    'nav.about': '关于',
 
     // Dashboard
     'dashboard.title': '仪表盘',
@@ -449,6 +453,23 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.logs': 'Logs',
     'nav.doctor': 'Doctor',
     'nav.canvas': 'Canvas',
+    'nav.nodes': 'Nodes',
+    'nav.general': 'General',
+    'nav.permissions': 'Permissions',
+    'nav.about': 'About',
+
+    // Nodes
+    'nodes.title': 'Connected Nodes',
+    'nodes.empty': 'No nodes connected',
+
+    // General (desktop)
+    'general.title': 'General',
+
+    // Permissions (desktop)
+    'permissions.title': 'Permissions',
+
+    // About (desktop)
+    'about.title': 'About',
 
     // Dashboard
     'dashboard.title': 'Dashboard',

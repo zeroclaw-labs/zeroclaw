@@ -139,6 +139,42 @@ export function getHealth(): Promise<HealthSnapshot> {
 }
 
 // ---------------------------------------------------------------------------
+// Nodes
+// ---------------------------------------------------------------------------
+
+import type { NodeSummary, DeviceInfo } from '../types/api';
+
+export function getNodes(): Promise<NodeSummary[]> {
+  return apiFetch<NodeSummary[] | { nodes: NodeSummary[] }>('/api/nodes').then((data) =>
+    unwrapField(data, 'nodes'),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Devices (paired)
+// ---------------------------------------------------------------------------
+
+export function getDevices(): Promise<DeviceInfo[]> {
+  return apiFetch<DeviceInfo[] | { devices: DeviceInfo[] }>('/api/devices').then((data) =>
+    unwrapField(data, 'devices'),
+  );
+}
+
+export function revokeDevice(id: string): Promise<void> {
+  return apiFetch<void>(`/api/devices/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+export function rotateDeviceToken(id: string): Promise<{ pairing_code: string }> {
+  return apiFetch<{ pairing_code: string }>(`/api/devices/${encodeURIComponent(id)}/token/rotate`, {
+    method: 'POST',
+  });
+}
+
+export function initiatePairing(): Promise<{ pairing_code: string }> {
+  return apiFetch<{ pairing_code: string }>('/api/pairing/initiate', { method: 'POST' });
+}
+
+// ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 

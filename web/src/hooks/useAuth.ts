@@ -14,6 +14,7 @@ import {
   isAuthenticated as checkAuth,
 } from '../lib/auth';
 import { pair as apiPair, getPublicHealth } from '../lib/api';
+import { isTauri } from '../lib/tauri';
 
 // ---------------------------------------------------------------------------
 // Context shape
@@ -50,10 +51,42 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [requiresPairing, setRequiresPairing] = useState<boolean>(true);
   const [loading, setLoading] = useState<boolean>(!checkAuth());
 
-  // On mount: check if server requires pairing at all
+  // On mount: check if server requires pairing at all.
+  // In Tauri, the Rust backend auto-pairs and injects the token into
+  // localStorage.  We poll for up to 5 seconds before falling through.
   useEffect(() => {
     if (checkAuth()) return; // already have a token, no need to check
     let cancelled = false;
+
+    // In Tauri desktop, skip pairing entirely — the backend handles auth.
+    // Poll localStorage for the auto-injected token.
+    if (isTauri()) {
+      let attempts = 0;
+      const poll = setInterval(() => {
+        attempts += 1;
+        const t = readToken();
+        if (t) {
+          clearInterval(poll);
+          setTokenState(t);
+          setAuthenticated(true);
+          setRequiresPairing(false);
+          setLoading(false);
+          return;
+        }
+        if (attempts >= 10) {
+          // After ~5 s, fall through — try without auth (pairing may be disabled).
+          clearInterval(poll);
+          setRequiresPairing(false);
+          setAuthenticated(true);
+          setLoading(false);
+        }
+      }, 500);
+      return () => {
+        cancelled = true;
+        clearInterval(poll);
+      };
+    }
+
     getPublicHealth()
       .then((health) => {
         if (cancelled) return;

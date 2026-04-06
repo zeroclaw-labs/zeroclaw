@@ -158,6 +158,64 @@ export interface WsMessage {
   success?: boolean;
 }
 
+// ── Nodes & Devices ────────────────────────────────────────────────────────
+
+export interface NodeSummary {
+  node_id: string;
+  capabilities: NodeCapabilityInfo[];
+  device_type: string | null;
+  status: string;
+  last_seen: string;
+}
+
+export interface NodeCapabilityInfo {
+  name: string;
+  description: string;
+  parameters: any;
+}
+
+export interface DeviceInfo {
+  id: string;
+  name: string | null;
+  device_type: string | null;
+  paired_at: string;
+  last_seen: string;
+  ip_address: string | null;
+}
+
+export interface ExecApprovalSettings {
+  target: 'gateway' | 'node';
+  security_mode: string;
+  ask_mode: string;
+  ask_fallback: string;
+  auto_allow_skill_clis: boolean;
+}
+
+// ── Desktop Settings (Tauri-only) ──────────────────────────────────────────
+
+export interface DesktopSettings {
+  launch_at_login: boolean;
+  show_dock_icon: boolean;
+  play_tray_animations: boolean;
+  allow_canvas: boolean;
+  allow_camera: boolean;
+  enable_peekaboo_bridge: boolean;
+}
+
+export interface GatewayInfo {
+  active: boolean;
+  version: string | null;
+  port: number;
+  pid: number | null;
+  health_status: string;
+}
+
+export interface PermissionStatus {
+  name: string;
+  label: string;
+  status: 'granted' | 'denied' | 'not_determined';
+}
+
 /** Row from GET /api/sessions/{id}/messages */
 export interface SessionMessageRow {
   role: string;

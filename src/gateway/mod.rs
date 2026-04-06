@@ -803,8 +803,11 @@ pub async fn run_gateway(
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Node registry for dynamic node discovery
-    let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
+    // Node registry for dynamic node discovery (with SQLite persistence)
+    let node_registry = Arc::new(nodes::NodeRegistry::new_with_persistence(
+        config.nodes.max_nodes,
+        &config.workspace_dir,
+    ));
 
     // Device registry and pairing store (only when pairing is required)
     let device_registry = if config.gateway.require_pairing {
@@ -937,6 +940,7 @@ pub async fn run_gateway(
         .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
+        .route("/api/nodes", get(nodes::handle_list_nodes))
         .route("/api/health", get(api::handle_api_health))
         .route("/api/sessions", get(api::handle_api_sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))

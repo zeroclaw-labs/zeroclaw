@@ -217,6 +217,24 @@ impl PairingStore {
     }
 }
 
+/// Auto-detect device type from User-Agent header when not provided explicitly.
+fn detect_device_type_from_ua(headers: &HeaderMap) -> Option<String> {
+    let ua = headers.get("user-agent")?.to_str().ok()?;
+    if ua.contains("Android") {
+        Some("android".into())
+    } else if ua.contains("iPhone") || ua.contains("iPad") {
+        Some("ios".into())
+    } else if ua.contains("Macintosh") || ua.contains("Mac OS") {
+        Some("macos".into())
+    } else if ua.contains("Windows") {
+        Some("windows".into())
+    } else if ua.contains("Linux") {
+        Some("linux".into())
+    } else {
+        None
+    }
+}
+
 fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
@@ -265,7 +283,10 @@ pub async fn submit_pairing_enhanced(
 ) -> impl IntoResponse {
     let code = body["code"].as_str().unwrap_or("");
     let device_name = body["device_name"].as_str().map(String::from);
-    let device_type = body["device_type"].as_str().map(String::from);
+    let device_type = body["device_type"]
+        .as_str()
+        .map(String::from)
+        .or_else(|| detect_device_type_from_ua(&headers));
 
     let client_id = headers
         .get("X-Forwarded-For")

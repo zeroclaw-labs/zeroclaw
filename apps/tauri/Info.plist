@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSCameraUsageDescription</key>
+    <string>ZeroClaw needs camera access for photo capture automation.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>ZeroClaw needs microphone access for voice commands and audio recording.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>ZeroClaw needs speech recognition for voice transcription.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>ZeroClaw needs Automation permission to control other applications via AppleScript.</string>
+</dict>
+</plist>

@@ -3,6 +3,9 @@
 pub mod commands;
 pub mod gateway_client;
 pub mod health;
+pub mod local_node;
+#[cfg(target_os = "macos")]
+pub mod macos;
 pub mod state;
 pub mod tray;
 
@@ -99,6 +102,26 @@ pub fn run() {
             commands::pairing::initiate_pairing,
             commands::pairing::get_devices,
             commands::agent::send_message,
+            // Permissions
+            commands::permissions::get_permissions_status,
+            commands::permissions::request_permission,
+            commands::permissions::open_privacy_settings,
+            // Automation
+            commands::automation::applescript::run_applescript_action,
+            commands::automation::applescript::run_applescript_raw,
+            commands::automation::screen::capture_screen,
+            commands::automation::camera::capture_photo,
+            commands::automation::microphone::record_audio,
+            commands::automation::notifications::send_desktop_notification,
+            commands::automation::accessibility::inspect_ui_element,
+            commands::automation::accessibility::click_ui_element,
+            commands::automation::accessibility::type_into_element,
+            // Desktop settings
+            commands::settings::get_desktop_settings,
+            commands::settings::set_desktop_setting,
+            commands::settings::toggle_gateway,
+            commands::settings::get_gateway_info,
+            commands::settings::set_launch_at_login,
         ])
         .setup(move |app| {
             // Set macOS dock icon (needed for dev builds without .app bundle).
@@ -109,18 +132,27 @@ pub fn run() {
             let _ = tray::setup_tray(app);
 
             // Auto-pair with gateway and inject token into the WebView.
+            // Retries up to 10 times (5s total) to wait for gateway readiness.
             let app_handle = app.handle().clone();
             let pair_state = shared.clone();
             tauri::async_runtime::spawn(async move {
-                if let Some(token) = auto_pair(&pair_state).await {
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        inject_token_into_webview(&window, &token);
+                for _ in 0..10 {
+                    if let Some(token) = auto_pair(&pair_state).await {
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            inject_token_into_webview(&window, &token);
+                        }
+                        return;
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
+                // If pairing not required, no token is needed — frontend handles this.
             });
 
             // Start background health polling.
             health::spawn_health_poller(app.handle().clone(), shared.clone());
+
+            // Register as a local node with the gateway for desktop automation.
+            local_node::spawn_local_node(shared.clone());
 
             Ok(())
         })

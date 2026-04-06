@@ -12,10 +12,15 @@ import {
   Activity,
   Stethoscope,
   Monitor,
+  Network,
+  SlidersHorizontal,
+  Shield,
+  Info,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
+import { isTauri } from '../../lib/tauri';
 
-const navItems = [
+const baseNavItems = [
   { to: '/', icon: LayoutDashboard, labelKey: 'nav.dashboard' },
   { to: '/agent', icon: MessageSquare, labelKey: 'nav.agent' },
   { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
@@ -26,8 +31,19 @@ const navItems = [
   { to: '/cost', icon: DollarSign, labelKey: 'nav.cost' },
   { to: '/logs', icon: Activity, labelKey: 'nav.logs' },
   { to: '/doctor', icon: Stethoscope, labelKey: 'nav.doctor' },
+  { to: '/nodes', icon: Network, labelKey: 'nav.nodes' },
   { to: '/canvas', icon: Monitor, labelKey: 'nav.canvas' },
 ];
+
+const desktopNavItems = [
+  { to: '/general', icon: SlidersHorizontal, labelKey: 'nav.general' },
+  { to: '/permissions', icon: Shield, labelKey: 'nav.permissions' },
+  { to: '/about', icon: Info, labelKey: 'nav.about' },
+];
+
+const navItems = isTauri()
+  ? [...baseNavItems, ...desktopNavItems]
+  : baseNavItems;
 
 interface SidebarProps {
   open: boolean;

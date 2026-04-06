@@ -1,5 +1,5 @@
 import { Routes, Route, Navigate } from 'react-router-dom';
-import { useState, useEffect, createContext, useContext, Component, type ReactNode, type ErrorInfo } from 'react';
+import { useState, useEffect, lazy, Suspense, createContext, useContext, Component, type ReactNode, type ErrorInfo } from 'react';
 import { ThemeProvider } from './contexts/ThemeContext';
 import Layout from './components/layout/Layout';
 import Dashboard from './pages/Dashboard';
@@ -14,12 +14,19 @@ import Logs from './pages/Logs';
 import Doctor from './pages/Doctor';
 import Pairing from './pages/Pairing';
 import Canvas from './pages/Canvas';
+import Nodes from './pages/Nodes';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
 import { setLocale, type Locale } from './lib/i18n';
 import { loadLocale, saveLocale } from './contexts/ThemeContext';
 import { basePath } from './lib/basePath';
 import { getAdminPairCode } from './lib/api';
+import { isTauri } from './lib/tauri';
+
+// Desktop-only pages (lazy loaded).
+const General = lazy(() => import('./pages/General'));
+const Permissions = lazy(() => import('./pages/Permissions'));
+const About = lazy(() => import('./pages/About'));
 
 // Locale context
 interface LocaleContextType {
@@ -239,6 +246,14 @@ function AppContent() {
             <Route path="/doctor" element={<Doctor />} />
             <Route path="/pairing" element={<Pairing />} />
             <Route path="/canvas" element={<Canvas />} />
+            <Route path="/nodes" element={<Nodes />} />
+            {isTauri() && (
+              <>
+                <Route path="/general" element={<Suspense fallback={null}><General /></Suspense>} />
+                <Route path="/permissions" element={<Suspense fallback={null}><Permissions /></Suspense>} />
+                <Route path="/about" element={<Suspense fallback={null}><About /></Suspense>} />
+              </>
+            )}
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>

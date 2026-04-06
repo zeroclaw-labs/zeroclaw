@@ -215,6 +215,7 @@ mod tests {
 
         registry.register(NodeInfo {
             node_id: "test-node".to_string(),
+            device_type: None,
             capabilities: vec![NodeCapability {
                 name: "echo".to_string(),
                 description: "Echo back".to_string(),
