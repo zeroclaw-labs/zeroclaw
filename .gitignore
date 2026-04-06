@@ -47,6 +47,9 @@ credentials.json
 # Coverage artifacts
 lcov.info
 
+# Tauri generated schema files
+apps/tauri/gen/schemas/
+
 # IDE's stuff
 .idea
 
