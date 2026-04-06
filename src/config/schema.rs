@@ -11565,6 +11565,7 @@ auto_save = true
                 mattermost: None,
                 webhook: None,
                 imessage: None,
+                gchat: None,
                 matrix: None,
                 signal: None,
                 whatsapp: None,
@@ -12592,6 +12593,7 @@ allowed_users = ["@ops:matrix.org"]
             imessage: Some(IMessageConfig {
                 allowed_contacts: vec!["+1".into()],
             }),
+            gchat: None,
             matrix: Some(MatrixConfig {
                 homeserver: "https://m.org".into(),
                 access_token: "tok".into(),
@@ -12962,6 +12964,7 @@ channel_ids = ["C123", "D456"]
             mattermost: None,
             webhook: None,
             imessage: None,
+            gchat: None,
             matrix: None,
             signal: None,
             whatsapp: Some(WhatsAppConfig {
