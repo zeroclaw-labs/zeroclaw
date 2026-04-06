@@ -160,8 +160,11 @@ interrupt_on_new_message = false  # 可选: 取消同一发送者同一聊天中
 
 Telegram 注意事项：
 
+- `stream_mode = "partial"` 发送一条可编辑的草稿消息，随着 LLM 流式输出逐 token 更新，最后以完整文本定稿。工具调用期间显示进度（如"🤔 Thinking..."、"🔧 Running shell..."）。
+- `draft_update_interval_ms` 控制部分模式下的编辑节流（默认：1000ms）。
 - `interrupt_on_new_message = true` 会在对话历史中保留被中断的用户轮次，然后在最新消息上重新开始生成。
 - 中断范围是严格的：同一聊天中的同一发送者。来自不同聊天的消息独立处理。
+- **语音模式**：当用户在启用 `[transcription]` 的情况下发送语音消息时，代理会转录（STT）并回复文本，同时发送 TTS 语音回复（需要启用 `[tts]`）。语音模式在收到语音消息时按聊天激活，当用户发送文本时停用。短于 40 个字符的回复不会被合成。
 
 ### 4.2 Discord
 

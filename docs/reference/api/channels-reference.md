@@ -160,8 +160,11 @@ interrupt_on_new_message = false  # optional: cancel in-flight same-sender same-
 
 Telegram notes:
 
+- `stream_mode = "partial"` sends an editable draft message that updates token-by-token as the LLM streams its response, then finalizes with the complete text. Tool-call progress (e.g. "🤔 Thinking...", "🔧 Running shell...") is shown during tool execution.
+- `draft_update_interval_ms` controls edit throttling in partial mode (default: 1000ms).
 - `interrupt_on_new_message = true` preserves interrupted user turns in conversation history, then restarts generation on the newest message.
 - Interruption scope is strict: same sender in the same chat. Messages from different chats are processed independently.
+- **Voice mode**: When a user sends a voice note with `[transcription]` enabled, the agent transcribes it (STT), responds with text, and also sends a TTS voice note reply (requires `[tts]` enabled). Voice mode activates per-chat on incoming voice notes and deactivates when the user sends text. Responses shorter than 40 characters are not synthesized.
 
 ### 4.2 Discord
 
