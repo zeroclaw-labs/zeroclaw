@@ -11565,6 +11565,7 @@ auto_save = true
                 mattermost: None,
                 webhook: None,
                 imessage: None,
+                gchat: None,
                 matrix: None,
                 signal: None,
                 whatsapp: None,
@@ -12608,6 +12609,7 @@ allowed_users = ["@ops:matrix.org"]
             }),
             signal: None,
             whatsapp: None,
+            gchat: None,
             linq: None,
             wati: None,
             nextcloud_talk: None,
@@ -12962,6 +12964,7 @@ channel_ids = ["C123", "D456"]
             mattermost: None,
             webhook: None,
             imessage: None,
+            gchat: None,
             matrix: None,
             signal: None,
             whatsapp: Some(WhatsAppConfig {
