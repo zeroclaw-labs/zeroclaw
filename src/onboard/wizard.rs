@@ -399,13 +399,13 @@ fn apply_provider_update(
 
 /// Non-interactive setup: generates a sensible default config instantly.
 /// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite|lucid`.
-fn backend_key_from_choice(choice: usize) -> &'static str {
+pub fn backend_key_from_choice(choice: usize) -> &'static str {
     selectable_memory_backends()
         .get(choice)
         .map_or(default_memory_backend_key(), |backend| backend.key)
 }
 
-fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
+pub fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
     let profile = memory_backend_profile(backend);
 
     MemoryConfig {
@@ -885,7 +885,7 @@ fn default_model_for_provider(provider: &str) -> String {
     }
 }
 
-fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
+pub fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
     match canonical_provider_name(provider_name) {
         "openrouter" => vec![
             (
@@ -1325,7 +1325,7 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
     }
 }
 
-fn supports_live_model_fetch(provider_name: &str) -> bool {
+pub fn supports_live_model_fetch(provider_name: &str) -> bool {
     if provider_name.trim().starts_with("custom:") {
         return true;
     }
@@ -1677,7 +1677,7 @@ fn resolve_live_models_endpoint(
     models_endpoint_for_provider(provider_name).map(str::to_string)
 }
 
-async fn fetch_live_models_for_provider(
+pub async fn fetch_live_models_for_provider(
     provider_name: &str,
     api_key: &str,
     provider_api_url: Option<&str>,
@@ -1767,9 +1767,9 @@ struct ModelCacheState {
 }
 
 #[derive(Debug, Clone)]
-struct CachedModels {
-    models: Vec<String>,
-    age_secs: u64,
+pub struct CachedModels {
+    pub models: Vec<String>,
+    pub age_secs: u64,
 }
 
 fn model_cache_path(workspace_dir: &Path) -> PathBuf {
@@ -1817,7 +1817,7 @@ async fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -
     Ok(())
 }
 
-async fn cache_live_models_for_provider(
+pub async fn cache_live_models_for_provider(
     workspace_dir: &Path,
     provider_name: &str,
     models: &[String],
@@ -1879,7 +1879,7 @@ async fn load_cached_models_for_provider_internal(
     }))
 }
 
-async fn load_cached_models_for_provider(
+pub async fn load_cached_models_for_provider(
     workspace_dir: &Path,
     provider_name: &str,
     ttl_secs: u64,
@@ -5680,7 +5680,7 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
 // ── Step 6: Scaffold workspace files ─────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-async fn scaffold_workspace(
+pub async fn scaffold_workspace(
     workspace_dir: &Path,
     ctx: &ProjectContext,
     memory_backend: &str,

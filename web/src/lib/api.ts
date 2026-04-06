@@ -15,6 +15,7 @@ import type {
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
 import { apiOrigin, basePath } from './basePath';
+import { isTauri } from './tauri';
 
 // ---------------------------------------------------------------------------
 // Base fetch wrapper
@@ -24,6 +25,52 @@ export class UnauthorizedError extends Error {
   constructor() {
     super('Unauthorized');
     this.name = 'UnauthorizedError';
+  }
+}
+
+// Guard to prevent concurrent auto-repair attempts.
+let autoRepairInFlight = false;
+
+/**
+ * Attempt to auto-re-pair with the gateway on localhost / in the desktop app.
+ * Returns true if a fresh token was obtained and stored.
+ */
+async function tryAutoRepair(): Promise<boolean> {
+  if (autoRepairInFlight) return false;
+  autoRepairInFlight = true;
+  try {
+    // Desktop app: the Tauri health poller handles re-pairing and injects the
+    // token into localStorage. Check if it already refreshed.
+    if (isTauri()) {
+      const existing = getToken();
+      if (existing) return true;
+      // Give the Tauri health poller a moment to inject a fresh token.
+      await new Promise((r) => setTimeout(r, 2000));
+      return getToken() !== null;
+    }
+
+    // Web: only works on localhost where the admin endpoint is reachable.
+    const origin = apiOrigin || window.location.origin;
+    const codeResp = await fetch(`${origin}/admin/paircode/new`, { method: 'POST' });
+    if (!codeResp.ok) return false;
+    const { pairing_code } = (await codeResp.json()) as { pairing_code?: string };
+    if (!pairing_code) return false;
+
+    const pairResp = await fetch(`${origin}${basePath}/pair`, {
+      method: 'POST',
+      headers: { 'X-Pairing-Code': pairing_code },
+    });
+    if (!pairResp.ok) return false;
+    const { token: newToken } = (await pairResp.json()) as { token?: string };
+    if (!newToken) return false;
+
+    setToken(newToken);
+    window.dispatchEvent(new Event('zeroclaw-token-refreshed'));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    autoRepairInFlight = false;
   }
 }
 
@@ -38,6 +85,10 @@ export async function apiFetch<T = unknown>(
     headers.set('Authorization', `Bearer ${token}`);
   }
 
+  // Prevent stale cached responses — always fetch fresh data from the server
+  headers.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+  headers.set('Pragma', 'no-cache');
+
   if (
     options.body &&
     typeof options.body === 'string' &&
@@ -49,6 +100,25 @@ export async function apiFetch<T = unknown>(
   const response = await fetch(`${apiOrigin}${basePath}${path}`, { ...options, headers });
 
   if (response.status === 401) {
+    // Attempt auto-re-pair on localhost / desktop before forcing logout.
+    // The admin endpoint is only reachable from localhost, so this is safe.
+    const repaired = await tryAutoRepair();
+    if (repaired) {
+      // Retry the original request with the fresh token.
+      const retryHeaders = new Headers(options.headers);
+      retryHeaders.set('Authorization', `Bearer ${getToken()}`);
+      retryHeaders.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+      retryHeaders.set('Pragma', 'no-cache');
+      if (options.body && typeof options.body === 'string' && !retryHeaders.has('Content-Type')) {
+        retryHeaders.set('Content-Type', 'application/json');
+      }
+      const retry = await fetch(`${apiOrigin}${basePath}${path}`, { ...options, headers: retryHeaders });
+      if (retry.ok) {
+        if (retry.status === 204) return undefined as unknown as T;
+        return retry.json() as Promise<T>;
+      }
+    }
+
     clearToken();
     window.dispatchEvent(new Event('zeroclaw-unauthorized'));
     throw new UnauthorizedError();

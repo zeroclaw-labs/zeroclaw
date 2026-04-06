@@ -957,6 +957,15 @@ async fn main() -> Result<()> {
         // TUI onboarding mode (ratatui-based)
         if use_tui {
             Box::pin(tui::run_tui_onboarding()).await?;
+            // Load saved config to show pairing info (same as CLI wizard path)
+            let config = Box::pin(Config::load_or_init()).await?;
+            if config.gateway.require_pairing {
+                println!();
+                println!("  Pairing is enabled. A one-time pairing code will be");
+                println!("  displayed when the gateway starts.");
+                println!("  Dashboard: http://127.0.0.1:{}", config.gateway.port);
+                println!();
+            }
             return Ok(());
         }
 

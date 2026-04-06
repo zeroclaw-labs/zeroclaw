@@ -15,6 +15,7 @@ pub mod api_plugins;
 pub mod api_webauthn;
 pub mod auth_rate_limit;
 pub mod canvas;
+pub mod config_watcher;
 pub mod nodes;
 pub mod session_queue;
 pub mod sse;
@@ -881,6 +882,11 @@ pub async fn run_gateway(
             None
         },
     };
+
+    // ── Config file watcher ──────────────────────────────────────────
+    // Polls config.toml mtime so external edits (CLI, TUI, editor) are
+    // picked up by the running gateway and broadcast to dashboard clients.
+    config_watcher::spawn_config_watcher(state.clone(), config.config_path.clone());
 
     // Config PUT needs larger body limit (1MB)
     let config_put_router = Router::new()

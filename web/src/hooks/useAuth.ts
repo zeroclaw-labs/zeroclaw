@@ -86,6 +86,20 @@ export function AuthProvider({ children }: AuthProviderProps) {
     return () => window.removeEventListener('storage', handler);
   }, []);
 
+  // Desktop app: recover from 401 when the health poller auto-re-pairs
+  // and injects a fresh token into localStorage.
+  useEffect(() => {
+    const handler = () => {
+      const t = readToken();
+      if (t) {
+        setTokenState(t);
+        setAuthenticated(true);
+      }
+    };
+    window.addEventListener('zeroclaw-token-refreshed', handler);
+    return () => window.removeEventListener('zeroclaw-token-refreshed', handler);
+  }, []);
+
   const pair = useCallback(async (code: string): Promise<void> => {
     const { token: newToken } = await apiPair(code);
     writeToken(newToken);

@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react';
 import {
   Settings,
   Save,
@@ -8,6 +9,7 @@ import {
   SlidersHorizontal,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
+import { useSSE } from '@/hooks/useSSE';
 import { useConfigState } from './config/useConfigState';
 import ConfigFormView from './config/ConfigFormView';
 import ConfigTomlEditor from './config/ConfigTomlEditor';
@@ -19,6 +21,7 @@ export default function Config() {
     mode,
     loading,
     saving,
+    dirty,
     error,
     success,
     parseError,
@@ -26,7 +29,18 @@ export default function Config() {
     switchMode,
     updateRawToml,
     save,
+    reload,
   } = useConfigState();
+
+  // Auto-reload when backend broadcasts a config_updated event (unless user has unsaved edits)
+  const { events } = useSSE({ filterTypes: ['config_updated'], autoConnect: true });
+  const prevEventsLen = useRef(events.length);
+  useEffect(() => {
+    if (events.length > prevEventsLen.current && !dirty && !saving) {
+      reload();
+    }
+    prevEventsLen.current = events.length;
+  }, [events.length, dirty, saving, reload]);
 
   if (loading) {
     return (

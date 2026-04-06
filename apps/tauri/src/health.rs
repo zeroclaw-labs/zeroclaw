@@ -4,9 +4,30 @@ use crate::gateway_client::GatewayClient;
 use crate::state::SharedState;
 use crate::tray::icon;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Inject a bearer token into the WebView's localStorage so the React app
+/// can authenticate without showing the pairing dialog.
+///
+/// Uses Tauri's `WebviewWindow::eval` — the standard Tauri API for running
+/// scripts in the WebView context. The token is escaped to prevent injection.
+fn inject_token<R: Runtime>(app: &AppHandle<R>, token: &str) {
+    if let Some(window) = app.get_webview_window("main") {
+        let escaped = token
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r");
+        // Tauri's eval() is the documented API for WebView scripting.
+        let script = format!("localStorage.setItem('zeroclaw_token', '{escaped}')");
+        let _ = window.eval(&script);
+        // Notify the React app that a fresh token is available so it can
+        // recover from an unauthorized state without a full page reload.
+        let _ = window.eval("window.dispatchEvent(new Event('zeroclaw-token-refreshed'))");
+    }
+}
 
 /// Spawn a background task that polls gateway health and updates state + tray.
 pub fn spawn_health_poller<R: Runtime>(app: AppHandle<R>, state: SharedState) {
@@ -19,6 +40,27 @@ pub fn spawn_health_poller<R: Runtime>(app: AppHandle<R>, state: SharedState) {
 
             let client = GatewayClient::new(&url, token.as_deref());
             let healthy = client.get_health().await.unwrap_or(false);
+
+            // If the gateway is up but our token is stale, auto-re-pair.
+            if healthy {
+                let needs_repair = if let Some(ref tok) = token {
+                    let authed = GatewayClient::new(&url, Some(tok));
+                    !authed.validate_token().await.unwrap_or(false)
+                } else {
+                    client.requires_pairing().await.unwrap_or(false)
+                };
+
+                if needs_repair {
+                    let fresh = GatewayClient::new(&url, None);
+                    if let Ok(new_token) = fresh.auto_pair().await {
+                        {
+                            let mut s = state.write().await;
+                            s.token = Some(new_token.clone());
+                        }
+                        inject_token(&app, &new_token);
+                    }
+                }
+            }
 
             let (connected, agent_status) = {
                 let mut s = state.write().await;

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Cpu,
   Clock,
@@ -790,13 +790,23 @@ export default function Dashboard() {
   const [showAllChannels, setShowAllChannels] = useState(false);
   const [activeTab, setActiveTab] = useState<TabId>('overview');
 
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   useEffect(() => {
-    Promise.all([getStatus(), getCost()])
-      .then(([s, c]) => {
-        setStatus(s);
-        setCost(c);
-      })
-      .catch((err) => setError(err.message));
+    const refresh = () => {
+      Promise.all([getStatus(), getCost()])
+        .then(([s, c]) => {
+          setStatus(s);
+          setCost(c);
+        })
+        .catch((err) => setError(err.message));
+    };
+
+    refresh();
+    intervalRef.current = setInterval(refresh, 15_000);
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
   }, []);
 
   if (error) {

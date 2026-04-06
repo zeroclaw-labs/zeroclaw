@@ -209,6 +209,14 @@ pub async fn handle_api_config_put(
     // Update in-memory config
     *state.config.lock() = new_config;
 
+    // Broadcast config_updated event so dashboard auto-refreshes
+    let event = serde_json::json!({
+        "type": "config_updated",
+        "source": "api",
+    });
+    state.event_buffer.push(event.clone());
+    let _ = state.event_tx.send(event);
+
     Json(serde_json::json!({"status": "ok"})).into_response()
 }
 
