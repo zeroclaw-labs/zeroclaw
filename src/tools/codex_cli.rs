@@ -152,7 +152,7 @@ impl Tool for CodexCliTool {
             "codex"
         };
         let mut cmd = Command::new(codex_bin);
-        cmd.arg("exec").arg(prompt);
+        cmd.arg("exec").arg("--skip-git-repo-check").arg(prompt);
 
         // Environment: clear everything, pass only safe vars + configured passthrough.
         cmd.env_clear();

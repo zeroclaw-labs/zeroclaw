@@ -28,6 +28,7 @@ pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
 pub mod codex_cli;
+pub mod codex_runner;
 pub mod composio;
 pub mod content_search;
 pub mod cron_add;
@@ -126,6 +127,7 @@ pub use claude_code_runner::ClaudeCodeRunnerTool;
 pub use cloud_ops::CloudOpsTool;
 pub use cloud_patterns::CloudPatternsTool;
 pub use codex_cli::CodexCliTool;
+pub use codex_runner::CodexRunnerTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -711,6 +713,14 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(CodexCliTool::new(
             security.clone(),
             root_config.codex_cli.clone(),
+        )));
+    }
+
+    // Codex task runner with SSH handoff
+    if root_config.codex_runner.enabled {
+        tool_arcs.push(Arc::new(CodexRunnerTool::new(
+            security.clone(),
+            root_config.codex_runner.clone(),
         )));
     }
 

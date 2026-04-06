@@ -417,6 +417,10 @@ pub struct Config {
     #[serde(default)]
     pub codex_cli: CodexCliConfig,
 
+    /// Codex task runner with SSH session handoff (`[codex_runner]`).
+    #[serde(default)]
+    pub codex_runner: CodexRunnerConfig,
+
     /// Gemini CLI tool configuration (`[gemini_cli]`).
     #[serde(default)]
     pub gemini_cli: GeminiCliConfig,
@@ -3652,6 +3656,52 @@ impl Default for ClaudeCodeRunnerConfig {
             ssh_host: None,
             tmux_prefix: default_claude_code_runner_tmux_prefix(),
             session_ttl: default_claude_code_runner_session_ttl(),
+        }
+    }
+}
+
+// ── Codex Runner ────────────────────────────────────────────────
+
+/// Codex task runner configuration (`[codex_runner]` section).
+///
+/// Spawns Codex in a tmux session so work can continue after the initial tool
+/// call returns. The session can be attached locally or over SSH, and Codex's
+/// persisted session files can later be resumed from within the tmux session.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CodexRunnerConfig {
+    /// Enable the `codex_runner` tool
+    #[serde(default)]
+    pub enabled: bool,
+    /// SSH host for session handoff links (e.g. "myhost.example.com")
+    #[serde(default)]
+    pub ssh_host: Option<String>,
+    /// Prefix for tmux session names (default: "zc-codex-")
+    #[serde(default = "default_codex_runner_tmux_prefix")]
+    pub tmux_prefix: String,
+    /// Session time-to-live in seconds before auto-cleanup (default: 3600)
+    #[serde(default = "default_codex_runner_session_ttl")]
+    pub session_ttl: u64,
+    /// Extra env vars passed to the codex subprocess (e.g. OPENAI_API_KEY)
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+}
+
+fn default_codex_runner_tmux_prefix() -> String {
+    "zc-codex-".into()
+}
+
+fn default_codex_runner_session_ttl() -> u64 {
+    3600
+}
+
+impl Default for CodexRunnerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ssh_host: None,
+            tmux_prefix: default_codex_runner_tmux_prefix(),
+            session_ttl: default_codex_runner_session_ttl(),
+            env_passthrough: Vec::new(),
         }
     }
 }
@@ -8445,6 +8495,7 @@ impl Default for Config {
             claude_code: ClaudeCodeConfig::default(),
             claude_code_runner: ClaudeCodeRunnerConfig::default(),
             codex_cli: CodexCliConfig::default(),
+            codex_runner: CodexRunnerConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
@@ -11621,6 +11672,7 @@ auto_save = true
             claude_code: ClaudeCodeConfig::default(),
             claude_code_runner: ClaudeCodeRunnerConfig::default(),
             codex_cli: CodexCliConfig::default(),
+            codex_runner: CodexRunnerConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
@@ -12151,6 +12203,7 @@ default_temperature = 0.7
             claude_code: ClaudeCodeConfig::default(),
             claude_code_runner: ClaudeCodeRunnerConfig::default(),
             codex_cli: CodexCliConfig::default(),
+            codex_runner: CodexRunnerConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),

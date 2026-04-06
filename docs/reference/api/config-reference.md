@@ -359,6 +359,72 @@ Notes:
 - Typical flow: call `connect`, complete browser OAuth, then run `execute` for the desired tool action.
 - If Composio returns a missing connected-account reference error, call `list_accounts` (optionally with `app`) and pass the returned `connected_account_id` to `execute`.
 
+## External Coding Harness Tools
+
+ZeroClaw can delegate coding work to external agent CLIs. There are two integration styles:
+
+- inline subprocess tools such as `codex_cli`, which block until the CLI returns
+- runner tools such as `codex_runner`, which start the harness in `tmux` and return an attach command immediately
+
+These tools are disabled by default.
+
+### `[codex_cli]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable the `codex_cli` tool |
+| `timeout_secs` | `600` | Maximum runtime for a single inline `codex exec` call |
+| `max_output_bytes` | `2097152` | Maximum captured stdout size before truncation |
+| `env_passthrough` | `[]` | Extra environment variables passed to the Codex subprocess |
+
+Notes:
+
+- `codex_cli` runs `codex exec --skip-git-repo-check`.
+- Authentication uses the local Codex CLI login/session by default.
+- Add `OPENAI_API_KEY` to `env_passthrough` only when you intentionally want ZeroClaw to forward that credential into the subprocess.
+- `working_directory` is selected per tool call and must stay inside the ZeroClaw workspace boundary.
+
+Example:
+
+```toml
+[codex_cli]
+enabled = true
+timeout_secs = 900
+max_output_bytes = 2097152
+env_passthrough = ["OPENAI_API_KEY"]
+```
+
+### `[codex_runner]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable the `codex_runner` tool |
+| `ssh_host` | unset | Host used when returning an SSH attach command |
+| `tmux_prefix` | `zc-codex-` | Prefix for spawned tmux session names |
+| `session_ttl` | `3600` | Auto-cleanup TTL for spawned tmux sessions |
+| `env_passthrough` | `[]` | Extra environment variables passed to the Codex subprocess |
+
+Notes:
+
+- `codex_runner` starts `codex exec --skip-git-repo-check --json` inside a detached `tmux` session.
+- The tool returns a short runner session ID plus either:
+  - `ssh -t <host> tmux attach-session -t <session>`
+  - `tmux attach-session -t <session>`
+- Codex persists its own session files by default, so once attached you can continue or resume work from inside the harness.
+- Raw JSONL event output is written to a workspace-local log file named `.codex-runner-<id>.jsonl`.
+- `tmux` must be installed on the host where ZeroClaw runs.
+
+Example:
+
+```toml
+[codex_runner]
+enabled = true
+ssh_host = "devbox.example.com"
+tmux_prefix = "zc-codex-"
+session_ttl = 7200
+env_passthrough = ["OPENAI_API_KEY"]
+```
+
 ## `[cost]`
 
 | Key | Default | Purpose |
