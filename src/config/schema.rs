@@ -16162,4 +16162,52 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert_eq!(config.enforcement.mode, "warn");
         assert_eq!(config.enforcement.reserve_percent, 10);
     }
+
+    #[tokio::test]
+    async fn web_search_config_toml_roundtrip() {
+        let wsc = WebSearchConfig {
+            enabled: true,
+            provider: "searxng".into(),
+            brave_api_key: Some("brave-key".into()),
+            searxng_instance_url: Some("https://searx.example.com".into()),
+            searxng_auth_token: Some("auth-tok".into()),
+            searxng_language: "ja-JP".into(),
+            searxng_engines: "google,bing".into(),
+            searxng_safesearch: 1,
+            searxng_max_retries: 5,
+            max_results: 10,
+            timeout_secs: 30,
+        };
+        let toml_str = toml::to_string(&wsc).unwrap();
+        let parsed: WebSearchConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.provider, "searxng");
+        assert_eq!(parsed.searxng_safesearch, 1);
+        assert_eq!(parsed.searxng_max_retries, 5);
+        assert_eq!(parsed.searxng_language, "ja-JP");
+        assert_eq!(parsed.searxng_engines, "google,bing");
+    }
+
+    #[test]
+    async fn test_searxng_safesearch_validation() {
+        // Valid values
+        for v in 0..=2 {
+            let toml_str = format!("searxng_safesearch = {v}");
+            let parsed: std::result::Result<WebSearchConfigFieldsOnly, _> =
+                toml::from_str(&toml_str);
+            assert!(parsed.is_ok());
+        }
+
+        // Invalid value
+        let toml_str = "searxng_safesearch = 3";
+        let parsed: std::result::Result<WebSearchConfigFieldsOnly, toml::de::Error> =
+            toml::from_str(toml_str);
+        assert!(parsed.is_err());
+        assert!(parsed.unwrap_err().to_string().contains("is invalid"));
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct WebSearchConfigFieldsOnly {
+        #[serde(deserialize_with = "deserialize_searxng_safesearch")]
+        searxng_safesearch: u8,
+    }
 }

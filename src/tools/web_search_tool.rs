@@ -3,6 +3,7 @@ use super::web_search_provider_routing::{WebSearchProviderRoute, resolve_web_sea
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -71,7 +72,8 @@ impl WebSearchTool {
     ///
     /// `config_path` is the path to `config.toml` so the tool can re-read the
     /// Brave API key at execution time. `secrets_encrypt` controls whether the
-    /// key is decrypted via `SecretStore`.
+    /// re-reads `config.toml` at execution time for safe secret resolution and instance rotation.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_config(
         provider: String,
         brave_api_key: Option<String>,
@@ -417,7 +419,7 @@ impl WebSearchTool {
         );
 
         if !engines.is_empty() {
-            search_url.push_str(&format!("&engines={}", engines));
+            let _ = write!(search_url, "&engines={}", engines);
         }
 
         let mut backoff = Duration::from_millis(500);
