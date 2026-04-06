@@ -435,27 +435,36 @@ fn validate_target_url(
         anyhow::bail!("Host '{host}' is in {tool_name}.blocked_domains");
     }
 
-    let private_host_allowed =
-        is_private_or_local_host(&host) && host_matches_allowlist(&host, allowed_private_hosts);
+    // Check if host is explicitly allowed as a private host (regardless of whether
+    // it looks like a private IP/domain - user has explicitly approved it)
+    let host_in_allowed_private_list = host_matches_allowlist(&host, allowed_private_hosts);
 
-    if is_private_or_local_host(&host) && !private_host_allowed {
+    // Check if host is a private/local host by its nature (IP or .local domain)
+    let is_private = is_private_or_local_host(&host);
+
+    // If host is inherently private but not in the allowlist, block it
+    if is_private && !host_in_allowed_private_list {
         anyhow::bail!(
             "Blocked local/private host: {host}. \
              To allow this host, add it to {tool_name}.allowed_private_hosts in config.toml"
         );
     }
 
-    if private_host_allowed {
+    // Log when we allow a host via the private hosts list
+    if host_in_allowed_private_list {
         tracing::warn!(
             "{tool_name}: allowing private/local host '{host}' via allowed_private_hosts"
         );
     }
 
-    if !private_host_allowed && !host_matches_allowlist(&host, allowed_domains) {
+    // If not in private allowlist, check against allowed_domains
+    if !host_in_allowed_private_list && !host_matches_allowlist(&host, allowed_domains) {
         anyhow::bail!("Host '{host}' is not in {tool_name}.allowed_domains");
     }
 
-    if !private_host_allowed {
+    // Skip DNS resolution check if host is explicitly in allowed_private_hosts.
+    // This allows domain names that resolve to private IPs when explicitly approved.
+    if !host_in_allowed_private_list {
         validate_resolved_host_is_public(&host)?;
     }
 
@@ -1504,5 +1513,37 @@ mod tests {
     fn allowed_private_host_with_port() {
         let tool = test_tool_with_private_hosts(vec!["*"], vec![], vec!["192.168.1.5"]);
         assert!(tool.validate_url("https://192.168.1.5:8080/api").is_ok());
+    }
+
+    #[test]
+    fn allowed_private_host_domain_bypasses_dns_resolution_check() {
+        // When a domain name is in allowed_private_hosts, it should be allowed
+        // even if it resolves to a private IP address. This is the fix for issue #5122.
+        let tool = test_tool_with_private_hosts(
+            vec!["*"],
+            vec![],
+            vec!["example.localdomain", "home.local:8123"],
+        );
+        // Domain names in allowed_private_hosts should be allowed without DNS resolution check
+        assert!(tool.validate_url("https://example.localdomain/api").is_ok());
+        assert!(
+            tool.validate_url("https://example.localdomain:8123/endpoint")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn domain_not_in_allowed_private_hosts_still_requires_public_dns() {
+        // Domain names NOT in allowed_private_hosts should still require
+        // DNS resolution to public IPs (test uses mock that rejects all)
+        let tool = test_tool_with_private_hosts(vec!["*"], vec![], vec!["allowed.local"]);
+        // This domain is not in the allowlist, so it goes through DNS resolution check
+        // which in tests rejects all lookups
+        let err = tool
+            .validate_url("https://unallowed.localdomain/api")
+            .unwrap_err()
+            .to_string();
+        // In test mode, validate_resolved_host_is_public rejects all lookups
+        assert!(err.contains("private") || err.contains("public"));
     }
 }
