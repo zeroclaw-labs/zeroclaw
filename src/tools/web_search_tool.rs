@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Web search tool for searching the internet.
 /// Supports multiple providers: DuckDuckGo (free), Brave (requires API key),
@@ -14,6 +16,9 @@ use std::time::Duration;
 /// is missing or still encrypted, the tool re-reads `config.toml`, decrypts the
 /// `[web_search] brave_api_key` field, and uses the result. This ensures that
 /// keys set or rotated after boot, and encrypted keys, are correctly picked up.
+static SEARXNG_HEALTH_CACHE: OnceLock<AtomicI64> = OnceLock::new();
+const SEARXNG_HEALTH_TTL_SECS: i64 = 300; // 5 minutes
+
 pub struct WebSearchTool {
     /// Provider selector as configured by user. Routed via provider aliases at runtime.
     provider: String,
@@ -213,6 +218,45 @@ impl WebSearchTool {
         self.searxng_max_retries.unwrap_or(3)
     }
 
+    /// Perform a quick health check ("warm-up") of the SearXNG instance before use.
+    /// Results are cached for `SEARXNG_HEALTH_TTL_SECS`.
+    async fn check_searxng_health_proactive(&self, instance_url: &str) -> anyhow::Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let cache = SEARXNG_HEALTH_CACHE.get_or_init(|| AtomicI64::new(0));
+        let last_check = cache.load(Ordering::Relaxed);
+
+        if now - last_check < SEARXNG_HEALTH_TTL_SECS {
+            return Ok(());
+        }
+
+        tracing::debug!("Performing proactive SearXNG health check (warm-up)...");
+
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5)) // Fast timeout for warm-up
+            .user_agent("ZeroClaw/1.0");
+        builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_search");
+        let client = builder.build()?;
+
+        let response = client.get(instance_url.trim_end_matches('/')).send().await;
+
+        match response {
+            Ok(res) if res.status().is_success() => {
+                cache.store(now, Ordering::Relaxed);
+                Ok(())
+            }
+            Ok(res) => {
+                anyhow::bail!("SearXNG instance warm-up failed with status: {}", res.status())
+            }
+            Err(e) => {
+                anyhow::bail!("SearXNG instance warm-up failed: {e}")
+            }
+        }
+    }
+
     async fn search_duckduckgo(&self, query: &str) -> anyhow::Result<String> {
         let encoded_query = urlencoding::encode(query);
         let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
@@ -348,6 +392,13 @@ impl WebSearchTool {
 
     async fn search_searxng(&self, query: &str) -> anyhow::Result<String> {
         let instance_url = self.resolve_searxng_instance_url()?;
+
+        // Perform proactive health check (warm-up) before real search
+        if let Err(e) = self.check_searxng_health_proactive(&instance_url).await {
+            tracing::warn!("SearXNG warm-up warning: {e}");
+            // We continue anyway and and and let the retries handle it, but and and and we've logged it.
+        }
+
         let auth_token = self.resolve_searxng_auth_token()?;
         let language = self.resolve_searxng_language();
         let engines = self.resolve_searxng_engines();
