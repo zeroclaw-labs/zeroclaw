@@ -37,8 +37,20 @@ enum CopilotTransportApi {
     OpenAiResponses,
 }
 
-fn resolve_copilot_transport_api(model_id: &str) -> CopilotTransportApi {
-    if model_id.trim().to_ascii_lowercase().contains("claude") {
+fn resolve_copilot_transport_api(
+    original_model: &str,
+    normalized_model: &str,
+) -> CopilotTransportApi {
+    let orig = original_model.trim();
+    if let Some((provider, _)) = orig.split_once('/') {
+        if provider.eq_ignore_ascii_case("anthropic") {
+            return CopilotTransportApi::AnthropicMessages;
+        }
+    }
+
+    let orig_lc = orig.to_ascii_lowercase();
+    let norm_lc = normalized_model.trim().to_ascii_lowercase();
+    if orig_lc.contains("anthropic") || norm_lc.contains("claude") {
         CopilotTransportApi::AnthropicMessages
     } else {
         CopilotTransportApi::OpenAiResponses
@@ -46,12 +58,7 @@ fn resolve_copilot_transport_api(model_id: &str) -> CopilotTransportApi {
 }
 
 fn normalize_model_id(model_id: &str) -> String {
-    model_id
-        .rsplit('/')
-        .next()
-        .unwrap_or(model_id)
-        .trim()
-        .to_string()
+    model_id.rsplit('/').next().unwrap().trim().to_string()
 }
 
 // ── Token types ──────────────────────────────────────────────────
@@ -919,7 +926,7 @@ impl CopilotProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         let normalized_model = normalize_model_id(model);
 
-        match resolve_copilot_transport_api(&normalized_model) {
+        match resolve_copilot_transport_api(model, &normalized_model) {
             CopilotTransportApi::OpenAiResponses => {
                 self.send_openai_chat_request(
                     Self::convert_messages(messages),
@@ -1289,15 +1296,15 @@ mod tests {
     #[test]
     fn resolves_transport_api_from_model_id() {
         assert_eq!(
-            resolve_copilot_transport_api("claude-sonnet-4.6"),
+            resolve_copilot_transport_api("claude-sonnet-4.6", "claude-sonnet-4.6"),
             CopilotTransportApi::AnthropicMessages
         );
         assert_eq!(
-            resolve_copilot_transport_api("gpt-4o"),
+            resolve_copilot_transport_api("gpt-4o", "gpt-4o"),
             CopilotTransportApi::OpenAiResponses
         );
         assert_eq!(
-            resolve_copilot_transport_api("github-copilot/claude-sonnet-4.6"),
+            resolve_copilot_transport_api("github-copilot/claude-sonnet-4.6", "claude-sonnet-4.6"),
             CopilotTransportApi::AnthropicMessages
         );
     }
@@ -1377,5 +1384,24 @@ mod tests {
 
         let result = CopilotProvider::to_api_content("assistant", "sure").unwrap();
         assert!(matches!(result, ApiContent::Text(ref s) if s == "sure"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_user_content_data_url() {
+        let content = "Here is an image [IMAGE:data:image/png;base64,AA==]";
+        let messages = vec![ChatMessage::user(content)];
+        let (_system, native_messages) =
+            CopilotProvider::convert_messages_for_anthropic(&messages).await;
+        assert_eq!(native_messages.len(), 1);
+        let first = &native_messages[0];
+        assert_eq!(first.role, "user");
+        let contains_image = first
+            .content
+            .iter()
+            .any(|c| matches!(c, CopilotAnthropicContentOut::Image { .. }));
+        assert!(
+            contains_image,
+            "expected an Image block in anthropic_user_content"
+        );
     }
 }

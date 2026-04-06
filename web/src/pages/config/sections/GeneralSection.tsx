@@ -203,7 +203,7 @@ export default function GeneralSection({ config, onUpdate }: Props) {
 
   return (
     <SectionCard
-      icon={<Zap className="h-5 w-5" />}
+      icon={<Zap className='h-5 w-5' />}
       title={t('config.section.general')}
       defaultOpen
     >

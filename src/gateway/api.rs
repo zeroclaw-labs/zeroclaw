@@ -156,15 +156,12 @@ fn channel_health_summary(
     match component.map(|c| c.status.as_str()) {
         Some("error") => ("error".to_string(), "down".to_string()),
         Some("ok") => ("active".to_string(), "healthy".to_string()),
-        Some(_) => ("active".to_string(), "degraded".to_string()),
-        None => ("active".to_string(), "degraded".to_string()),
+        Some(_) | None => ("active".to_string(), "degraded".to_string()),
     }
 }
 
 fn channel_health_key(name: &str) -> String {
-    name.to_ascii_lowercase()
-        .replace(' ', "_")
-        .replace('-', "_")
+    name.to_ascii_lowercase().replace([' ', '-'], "_")
 }
 
 fn build_channel_details(
