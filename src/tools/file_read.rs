@@ -54,34 +54,6 @@ impl Tool for FileReadTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
 
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
-        // Security check: validate path is within workspace
-        if !self.security.is_path_allowed(path) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Path not allowed by security policy: {path}")),
-            });
-        }
-
-        // Record action BEFORE canonicalization so that every non-trivially-rejected
-        // request consumes rate limit budget. This prevents attackers from probing
-        // path existence (via canonicalize errors) without rate limit cost.
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
-
         let full_path = self.security.resolve_tool_path(path);
 
         // Resolve path before reading to block symlink escapes.
@@ -237,6 +209,7 @@ fn try_extract_pdf_text(_bytes: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::tools::{PathGuardedTool, RateLimitedTool};
 
     fn test_security(workspace: std::path::PathBuf) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -257,6 +230,15 @@ mod tests {
             max_actions_per_hour,
             ..SecurityPolicy::default()
         })
+    }
+
+    fn wrapped_file_read(
+        security: Arc<SecurityPolicy>,
+    ) -> RateLimitedTool<PathGuardedTool<FileReadTool>> {
+        RateLimitedTool::new(
+            PathGuardedTool::new(FileReadTool::new(security.clone()), security.clone()),
+            security,
+        )
     }
 
     #[test]
@@ -326,23 +308,23 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = wrapped_file_read(test_security(dir.clone()));
         let result = tool
             .execute(json!({"path": "../../../etc/passwd"}))
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(result.error.as_ref().unwrap().contains("blocked"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_read_blocks_absolute_path() {
-        let tool = FileReadTool::new(test_security(std::env::temp_dir()));
+        let tool = wrapped_file_read(test_security(std::env::temp_dir()));
         let result = tool.execute(json!({"path": "/etc/passwd"})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(result.error.as_ref().unwrap().contains("blocked"));
     }
 
     #[tokio::test]
@@ -354,7 +336,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileReadTool::new(test_security_with(
+        let tool = wrapped_file_read(test_security_with(
             dir.clone(),
             AutonomyLevel::Supervised,
             0,
@@ -509,7 +491,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         // Allow only 2 actions total
-        let tool = FileReadTool::new(test_security_with(
+        let tool = wrapped_file_read(test_security_with(
             dir.clone(),
             AutonomyLevel::Supervised,
             2,
@@ -1034,13 +1016,13 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileReadTool::new(test_security(dir.clone()));
+        let tool = wrapped_file_read(test_security(dir.clone()));
         let result = tool
             .execute(json!({"path": "test\0evil.txt"}))
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(result.error.as_ref().unwrap().contains("blocked"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
