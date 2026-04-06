@@ -217,22 +217,29 @@ impl MattermostChannel {
         const PONG_TIMEOUT: Duration = Duration::from_secs(15);
 
         loop {
-            // 1. Login to get session token
-            let token = match self.login_for_token().await {
-                Ok(token) => {
-                    tracing::info!("Mattermost: login successful");
-                    token
-                }
-                Err(e) => {
-                    let wait = compute_mm_backoff(reconnect_attempt);
-                    tracing::warn!(
-                        "Mattermost: login failed: {e}; retrying in {:.1}s (attempt #{})",
-                        wait.as_secs_f64(),
-                        reconnect_attempt + 1,
-                    );
-                    reconnect_attempt = reconnect_attempt.saturating_add(1);
-                    tokio::time::sleep(wait).await;
-                    continue;
+            // 1. Acquire bearer token. Static `bot_token` takes priority; otherwise
+            // re-login each reconnect cycle so an expired session token doesn't
+            // wedge the loop. Bypasses the `effective_token()` cache because
+            // session tokens may be invalidated by the server on reconnect.
+            let token = if let Some(ref t) = self.bot_token {
+                t.clone()
+            } else {
+                match self.login_for_token().await {
+                    Ok(token) => {
+                        tracing::info!("Mattermost: login successful");
+                        token
+                    }
+                    Err(e) => {
+                        let wait = compute_mm_backoff(reconnect_attempt);
+                        tracing::warn!(
+                            "Mattermost: login failed: {e}; retrying in {:.1}s (attempt #{})",
+                            wait.as_secs_f64(),
+                            reconnect_attempt + 1,
+                        );
+                        reconnect_attempt = reconnect_attempt.saturating_add(1);
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
                 }
             };
 
@@ -792,17 +799,14 @@ impl Channel for MattermostChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        // Validate that we have at least one auth method.
+        // Validate that we have at least one auth method. Both polling and
+        // websocket modes accept either a static `bot_token` or login
+        // credentials (`bot_id` + `bot_password`).
         if self.bot_token.is_none() && (self.bot_id.is_none() || self.bot_password.is_none()) {
             bail!("Mattermost requires either bot_token or both bot_id and bot_password");
         }
         match self.listen_mode {
-            ListenMode::WebSocket => {
-                if self.bot_id.is_none() || self.bot_password.is_none() {
-                    bail!("Mattermost WebSocket mode requires both bot_id and bot_password");
-                }
-                self.listen_ws(tx).await
-            }
+            ListenMode::WebSocket => self.listen_ws(tx).await,
             ListenMode::Polling => self.listen_polling(tx).await,
         }
     }
