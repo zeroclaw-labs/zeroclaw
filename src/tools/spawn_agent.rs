@@ -268,23 +268,23 @@ impl SpawnAgentTool {
                 &agent_config.provider,
                 &agent_config.model,
                 temperature,
-                true,  // silent
-                None,  // approval
+                true, // silent
+                None, // approval
                 "spawn_agent",
-                None,  // channel_reply_target
+                None, // channel_reply_target
                 &self.multimodal_config,
                 agent_config.max_iterations,
-                None,  // cancellation_token
-                None,  // on_delta
-                None,  // hooks
-                &[],   // excluded_tools
-                &[],   // dedup_exempt_tools
-                None,  // activated_tools
-                None,  // model_switch_callback
+                None, // cancellation_token
+                None, // on_delta
+                None, // hooks
+                &[],  // excluded_tools
+                &[],  // dedup_exempt_tools
+                None, // activated_tools
+                None, // model_switch_callback
                 &crate::config::PacingConfig::default(),
-                0,     // max_tool_result_chars
-                0,     // context_token_budget
-                None,  // shared_budget
+                0,    // max_tool_result_chars
+                0,    // context_token_budget
+                None, // shared_budget
             ),
         )
         .await;
@@ -298,9 +298,9 @@ impl SpawnAgentTool {
                 }
             }
             Ok(Err(e)) => Err(e),
-            Err(_) => anyhow::bail!(
-                "Spawned agent '{name}' timed out after {agentic_timeout_secs}s"
-            ),
+            Err(_) => {
+                anyhow::bail!("Spawned agent '{name}' timed out after {agentic_timeout_secs}s")
+            }
         }
     }
 
@@ -486,10 +486,7 @@ impl Tool for SpawnAgentTool {
             .map(str::trim)
             .unwrap_or("");
 
-        let mode = args
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("sync");
+        let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("sync");
 
         let save = args.get("save").and_then(|v| v.as_bool()).unwrap_or(false);
 

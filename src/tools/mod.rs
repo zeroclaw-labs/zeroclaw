@@ -97,11 +97,11 @@ pub mod shell;
 pub mod skill_http;
 pub mod skill_tool;
 pub mod sop_advance;
-pub mod spawn_agent;
 pub mod sop_approve;
 pub mod sop_execute;
 pub mod sop_list;
 pub mod sop_status;
+pub mod spawn_agent;
 pub mod swarm;
 pub mod text_browser;
 pub mod tool_search;
@@ -198,11 +198,11 @@ pub use skill_http::SkillHttpTool;
 pub use skill_tool::SkillShellTool;
 pub use sop_advance::SopAdvanceTool;
 pub use sop_approve::SopApproveTool;
-#[allow(unused_imports)]
-pub use spawn_agent::SpawnAgentTool;
 pub use sop_execute::SopExecuteTool;
 pub use sop_list::SopListTool;
 pub use sop_status::SopStatusTool;
+#[allow(unused_imports)]
+pub use spawn_agent::SpawnAgentTool;
 pub use swarm::SwarmTool;
 pub use text_browser::TextBrowserTool;
 pub use tool_search::ToolSearchTool;
@@ -915,13 +915,12 @@ pub fn all_tools_with_runtime(
         .iter()
         .map(|(name, cfg)| (name.clone(), cfg.clone()))
         .collect();
-    let mut workspace_agent_manager =
-        crate::agent::workspace_agents::WorkspaceAgentManager::new(
-            workspace_dir.to_path_buf(),
-            delegate_agents,
-            root_config.default_provider.clone().unwrap_or_default(),
-            root_config.default_model.clone().unwrap_or_default(),
-        );
+    let mut workspace_agent_manager = crate::agent::workspace_agents::WorkspaceAgentManager::new(
+        workspace_dir.to_path_buf(),
+        delegate_agents,
+        root_config.default_provider.clone().unwrap_or_default(),
+        root_config.default_model.clone().unwrap_or_default(),
+    );
     // Start file watcher for hot-reload of workspace agent definitions.
     if let Err(e) = workspace_agent_manager.start_watcher() {
         tracing::warn!("workspace agent file watcher failed to start: {e}");

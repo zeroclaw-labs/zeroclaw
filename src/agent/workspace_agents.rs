@@ -32,7 +32,7 @@ pub struct WorkspaceAgentManager {
     /// Names of agents defined in the static TOML config (protected from overwrite).
     config_agent_names: HashSet<String>,
     /// File watcher handle (kept alive so watcher doesn't drop).
-    _watcher: Option<RecommendedWatcher>,
+    watcher_handle: Option<RecommendedWatcher>,
 }
 
 impl WorkspaceAgentManager {
@@ -119,7 +119,7 @@ impl WorkspaceAgentManager {
             default_provider,
             default_model,
             config_agent_names,
-            _watcher: None,
+            watcher_handle: None,
         }
     }
 
@@ -128,7 +128,7 @@ impl WorkspaceAgentManager {
     /// On `Create`/`Modify` events for `config.toml` or `.md` files the
     /// affected agent is reloaded.  On `Remove` events the agent is removed
     /// from the registry (only if it was workspace-loaded, never config-defined).
-    pub fn start_watcher(&mut self) -> Result<()> {
+    pub fn startwatcher_handle(&mut self) -> Result<()> {
         let agents_dir = self.workspace_dir.join("agents");
         if !agents_dir.is_dir() {
             std::fs::create_dir_all(&agents_dir)
@@ -161,7 +161,7 @@ impl WorkspaceAgentManager {
         // Guard against missing Tokio runtime (e.g. in non-async tests).
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             warn!("no Tokio runtime available — workspace agent watcher disabled");
-            self._watcher = Some(watcher);
+            self.watcher_handle = Some(watcher);
             return Ok(());
         };
         handle.spawn(async move {
@@ -180,11 +180,11 @@ impl WorkspaceAgentManager {
                 match event.kind {
                     EventKind::Create(_) | EventKind::Modify(_) => {
                         for path in &event.paths {
-                            let agent_name =
-                                match extract_agent_name_from_path(path, &agents_root) {
-                                    Some(n) => n,
-                                    None => continue,
-                                };
+                            let agent_name = match extract_agent_name_from_path(path, &agents_root)
+                            {
+                                Some(n) => n,
+                                None => continue,
+                            };
                             if agent_name == "common" {
                                 // Common dir changed — reload all workspace agents.
                                 debug!("common directory changed, reloading all workspace agents");
@@ -217,9 +217,7 @@ impl WorkspaceAgentManager {
                             ) {
                                 Ok(delegate) => {
                                     info!(agent = %agent_name, "reloaded workspace agent");
-                                    agents_clone
-                                        .write()
-                                        .insert(agent_name, delegate);
+                                    agents_clone.write().insert(agent_name, delegate);
                                 }
                                 Err(e) => {
                                     warn!(
@@ -233,11 +231,11 @@ impl WorkspaceAgentManager {
                     }
                     EventKind::Remove(_) => {
                         for path in &event.paths {
-                            let agent_name =
-                                match extract_agent_name_from_path(path, &agents_root) {
-                                    Some(n) => n,
-                                    None => continue,
-                                };
+                            let agent_name = match extract_agent_name_from_path(path, &agents_root)
+                            {
+                                Some(n) => n,
+                                None => continue,
+                            };
                             if config_names.contains(&agent_name) {
                                 continue;
                             }
@@ -253,7 +251,7 @@ impl WorkspaceAgentManager {
             }
         });
 
-        self._watcher = Some(watcher);
+        self.watcher_handle = Some(watcher);
         info!(
             path = %agents_dir.display(),
             "workspace agent file watcher started"
@@ -515,7 +513,12 @@ mod tests {
     fn loads_workspace_agents_on_new() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
-        write_agent(base, "researcher", "agentic = true\n", Some("You are a researcher."));
+        write_agent(
+            base,
+            "researcher",
+            "agentic = true\n",
+            Some("You are a researcher."),
+        );
 
         let mgr = WorkspaceAgentManager::new(
             base.to_path_buf(),
