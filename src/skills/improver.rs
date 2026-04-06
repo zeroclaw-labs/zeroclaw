@@ -31,12 +31,40 @@ impl SkillImprover {
         if !self.config.enabled {
             return false;
         }
+        // Check in-memory cooldown first (fast path).
         if let Some(last) = self.cooldowns.get(slug) {
             let elapsed = Instant::now().saturating_duration_since(*last);
-            elapsed.as_secs() >= self.config.cooldown_secs
-        } else {
-            true
+            if elapsed.as_secs() < self.config.cooldown_secs {
+                return false;
+            }
         }
+        // Check on-disk cooldown (durable across restarts).
+        if self.is_on_disk_cooldown(slug) {
+            return false;
+        }
+        true
+    }
+
+    /// Check if the skill's SKILL.toml `updated_at` field is within the cooldown window.
+    fn is_on_disk_cooldown(&self, slug: &str) -> bool {
+        let toml_path = self
+            .workspace_dir
+            .join("skills")
+            .join(slug)
+            .join("SKILL.toml");
+        if let Ok(content) = std::fs::read_to_string(&toml_path) {
+            if let Ok(parsed) = content.parse::<toml::Table>() {
+                if let Some(skill) = parsed.get("skill").and_then(|v| v.as_table()) {
+                    if let Some(updated_at) = skill.get("updated_at").and_then(|v| v.as_str()) {
+                        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(updated_at) {
+                            let elapsed = chrono::Utc::now().signed_duration_since(ts);
+                            return elapsed.num_seconds() < self.config.cooldown_secs as i64;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Improve an existing skill file atomically.
@@ -120,6 +148,39 @@ impl SkillImprover {
     fn skills_dir(&self) -> PathBuf {
         self.workspace_dir.join("skills")
     }
+}
+
+/// Extract unique skill slugs from conversation history by finding
+/// successful skill-tool invocations (tool names containing a dot).
+///
+/// Scans all messages for `<tool_result name="slug.tool">` patterns and
+/// returns the unique slug portions (the part before the first dot).
+pub fn extract_skill_slugs_from_history(
+    history: &[crate::providers::traits::ChatMessage],
+) -> Vec<String> {
+    let mut slugs = std::collections::HashSet::new();
+    for msg in history {
+        let content = &msg.content;
+        let marker = "<tool_result name=\"";
+        let mut pos = 0;
+        while pos < content.len() {
+            if let Some(start) = content[pos..].find(marker) {
+                let abs = pos + start + marker.len();
+                if let Some(end) = content[abs..].find('"') {
+                    let name = &content[abs..abs + end];
+                    if let Some(dot_pos) = name.find('.') {
+                        slugs.insert(name[..dot_pos].to_string());
+                    }
+                    pos = abs + end + 1;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    slugs.into_iter().collect()
 }
 
 /// Validate skill content: must be non-empty, valid UTF-8 (already a &str),
