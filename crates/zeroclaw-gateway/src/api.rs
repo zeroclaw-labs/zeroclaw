@@ -11,6 +11,7 @@ use axum::{
 use serde::Deserialize;
 
 const MASKED_SECRET: &str = "***MASKED***";
+const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
 
 // ── Bearer token auth extractor ─────────────────────────────────
 
@@ -655,7 +656,10 @@ pub async fn handle_api_memory_list(
         let since = params.since.as_deref();
         let until = params.until.as_deref();
         match state.mem.recall(query, 50, None, since, until).await {
-            Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
+            Ok(entries) => {
+                Json(serde_json::json!({"entries": sanitize_memory_entries_for_api(entries)}))
+                    .into_response()
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Memory recall failed: {e}")})),
@@ -672,7 +676,10 @@ pub async fn handle_api_memory_list(
         });
 
         match state.mem.list(category.as_ref(), None).await {
-            Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
+            Ok(entries) => {
+                Json(serde_json::json!({"entries": sanitize_memory_entries_for_api(entries)}))
+                    .into_response()
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Memory list failed: {e}")})),
@@ -680,6 +687,17 @@ pub async fn handle_api_memory_list(
                 .into_response(),
         }
     }
+}
+
+fn sanitize_memory_entries_for_api(entries: Vec<crate::memory::MemoryEntry>) -> Vec<crate::memory::MemoryEntry> {
+    entries
+        .into_iter()
+        .map(|mut entry| {
+            entry.content =
+                crate::util::truncate_with_ellipsis(&entry.content, MEMORY_API_CONTENT_MAX_CHARS);
+            entry
+        })
+        .collect()
 }
 
 /// POST /api/memory — store a memory entry
@@ -1561,7 +1579,7 @@ mod tests {
     use super::*;
     use crate::{AppState, GatewayRateLimiter, IdempotencyStore, nodes};
     use async_trait::async_trait;
-    use axum::response::IntoResponse;
+    use axum::{http::HeaderMap, response::IntoResponse};
     use http_body_util::BodyExt;
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -1617,6 +1635,62 @@ mod tests {
 
         async fn count(&self) -> anyhow::Result<usize> {
             Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    struct StaticMemory {
+        entries: Vec<MemoryEntry>,
+    }
+
+    #[async_trait]
+    impl Memory for StaticMemory {
+        fn name(&self) -> &str {
+            "static"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(self.entries.clone())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(self.entries.clone())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(self.entries.len())
         }
 
         async fn health_check(&self) -> bool {
@@ -1688,6 +1762,21 @@ mod tests {
             .expect("response body")
             .to_bytes();
         serde_json::from_slice(&body).expect("valid json response")
+    }
+
+    fn memory_entry_with_content(content: String) -> MemoryEntry {
+        MemoryEntry {
+            id: "entry-1".into(),
+            key: "huge-memory".into(),
+            content,
+            category: MemoryCategory::Conversation,
+            timestamp: "2026-04-06T00:00:00Z".into(),
+            session_id: None,
+            score: None,
+            namespace: "default".into(),
+            importance: Some(0.5),
+            superseded_by: None,
+        }
     }
 
     #[test]
@@ -2335,5 +2424,42 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn handle_api_memory_list_truncates_oversized_content() {
+        let mut cfg = crate::config::Config::default();
+        cfg.gateway.require_pairing = false;
+        let huge = "x".repeat(MEMORY_API_CONTENT_MAX_CHARS + 128);
+        let state = AppState {
+            mem: Arc::new(StaticMemory {
+                entries: vec![memory_entry_with_content(huge.clone())],
+            }),
+            ..test_state(cfg)
+        };
+
+        let response = handle_api_memory_list(
+            State(state),
+            HeaderMap::new(),
+            Query(MemoryQuery {
+                query: None,
+                category: None,
+                since: None,
+                until: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        let content = json["entries"][0]["content"]
+            .as_str()
+            .expect("string content");
+
+        assert_eq!(content.chars().count(), MEMORY_API_CONTENT_MAX_CHARS + 3);
+        assert!(content.ends_with("..."));
+        assert_eq!(json["entries"][0]["key"], "huge-memory");
+        assert_eq!(json["entries"][0]["category"], "conversation");
+        assert_ne!(content, huge);
     }
 }

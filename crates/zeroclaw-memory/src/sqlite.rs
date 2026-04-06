@@ -233,6 +233,11 @@ impl SqliteMemory {
             conn.execute_batch("ALTER TABLE memories ADD COLUMN superseded_by TEXT;")?;
         }
 
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_memories_active_updated_at
+             ON memories(superseded_by, updated_at DESC);",
+        )?;
+
         Ok(())
     }
 
@@ -1297,6 +1302,27 @@ mod tests {
 
         let daily = mem.list(Some(&MemoryCategory::Daily), None).await.unwrap();
         assert_eq!(daily.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_creates_recent_list_index() {
+        let (_tmp, mem) = temp_sqlite();
+        let conn = mem.conn.lock();
+        let mut stmt = conn
+            .prepare("PRAGMA index_list(memories)")
+            .expect("prepare pragma index_list");
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query index list")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect index names");
+
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "idx_memories_active_updated_at"),
+            "expected idx_memories_active_updated_at in {names:?}"
+        );
     }
 
     #[tokio::test]
