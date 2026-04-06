@@ -3,7 +3,6 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
-use std::path::Path;
 use std::sync::Arc;
 
 /// Maximum file size we will read and base64-encode (5 MB).
@@ -156,20 +155,9 @@ impl Tool for ImageInfoTool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        let path = Path::new(path_str);
+        let full_path = self.security.resolve_tool_path(path_str);
 
-        // Restrict reads to workspace directory to prevent arbitrary file exfiltration
-        if !self.security.is_path_allowed(path_str) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Path not allowed: {path_str} (must be within workspace)"
-                )),
-            });
-        }
-
-        if !path.exists() {
+        if !full_path.exists() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -177,7 +165,7 @@ impl Tool for ImageInfoTool {
             });
         }
 
-        let metadata = tokio::fs::metadata(path)
+        let metadata = tokio::fs::metadata(&full_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read file metadata: {e}"))?;
 
@@ -193,7 +181,7 @@ impl Tool for ImageInfoTool {
             });
         }
 
-        let bytes = tokio::fs::read(path)
+        let bytes = tokio::fs::read(&full_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read image file: {e}"))?;
 
@@ -232,6 +220,7 @@ impl Tool for ImageInfoTool {
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::tools::PathGuardedTool;
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -241,6 +230,10 @@ mod tests {
             forbidden_paths: vec![],
             ..SecurityPolicy::default()
         })
+    }
+
+    fn wrapped_image_info(security: Arc<SecurityPolicy>) -> PathGuardedTool<ImageInfoTool> {
+        PathGuardedTool::new(ImageInfoTool::new(security.clone()), security)
     }
 
     #[test]
@@ -489,5 +482,15 @@ mod tests {
         assert!(result.output.contains("data:image/png;base64,"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // ── PathGuardedTool integration ─────────────────────────────
+
+    #[tokio::test]
+    async fn image_info_blocked_path_returns_error() {
+        let tool = wrapped_image_info(test_security());
+        let result = tool.execute(json!({"path": "/etc/shadow"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_ref().unwrap().contains("blocked"));
     }
 }

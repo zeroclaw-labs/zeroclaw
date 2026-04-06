@@ -731,11 +731,17 @@ pub fn all_tools_with_runtime(
     }
 
     // PDF extraction (feature-gated at compile time via rag-pdf)
-    tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
+    tool_arcs.push(Arc::new(RateLimitedTool::new(
+        PathGuardedTool::new(PdfReadTool::new(security.clone()), security.clone()),
+        security.clone(),
+    )));
 
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
-    tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
+    tool_arcs.push(Arc::new(PathGuardedTool::new(
+        ImageInfoTool::new(security.clone()),
+        security.clone(),
+    )));
 
     // Session-to-session messaging tools (always available when sessions dir exists)
     if let Ok(session_store) = crate::channels::session_store::SessionStore::new(workspace_dir) {
