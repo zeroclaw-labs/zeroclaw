@@ -794,6 +794,52 @@ pub async fn handle_api_health(
     Json(serde_json::json!({"health": snapshot})).into_response()
 }
 
+/// GET /api/channels — detailed channel information
+pub async fn handle_api_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let health = crate::health::snapshot();
+
+    let channels: Vec<serde_json::Value> = config
+        .channels_config
+        .channels()
+        .into_iter()
+        .map(|(channel, enabled)| {
+            let name = channel.name();
+            let channel_type = channel.desc();
+
+            // Determine health status from health snapshot
+            let health_status = health
+                .components
+                .get(name)
+                .map(|comp| match comp.status.to_lowercase().as_str() {
+                    "ok" | "healthy" => "healthy",
+                    "warn" | "warning" | "degraded" => "degraded",
+                    _ => "down",
+                })
+                .unwrap_or_else(|| if enabled { "healthy" } else { "down" });
+
+            serde_json::json!({
+                "name": name,
+                "type": channel_type,
+                "enabled": enabled,
+                "status": if enabled { "active" } else { "inactive" },
+                "message_count": 0, // TODO: Track message counts per channel
+                "last_message_at": serde_json::Value::Null, // TODO: Track last message time per channel
+                "health": health_status,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({"channels": channels})).into_response()
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn is_masked_secret(value: &str) -> bool {
@@ -2258,5 +2304,38 @@ mod tests {
 
         let config = state.config.lock().clone();
         assert!(crate::cron::list_jobs(&config).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn channels_api_returns_channel_list() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = crate::config::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..crate::config::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let state = test_state(config);
+
+        let response = handle_api_channels(State(state), HeaderMap::new())
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert!(json["channels"].is_array());
+
+        // Should have at least the CLI channel
+        let channels = json["channels"].as_array().unwrap();
+        assert!(!channels.is_empty());
+
+        // Each channel should have required fields
+        for channel in channels {
+            assert!(channel["name"].is_string());
+            assert!(channel["type"].is_string());
+            assert!(channel["enabled"].is_boolean());
+            assert!(channel["status"].is_string());
+            assert!(channel["health"].is_string());
+        }
     }
 }
