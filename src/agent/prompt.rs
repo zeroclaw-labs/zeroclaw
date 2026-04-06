@@ -12,6 +12,7 @@ use std::path::Path;
 
 pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
+    pub project_dir: Option<&'a Path>,
     pub model_name: &'a str,
     pub tools: &'a [Box<dyn Tool>],
     pub skills: &'a [Skill],
@@ -53,6 +54,7 @@ impl SystemPromptBuilder {
                 Box::new(SafetySection),
                 Box::new(SkillsSection),
                 Box::new(WorkspaceSection),
+                Box::new(ProjectSection),
                 Box::new(RuntimeSection),
                 Box::new(ChannelMediaSection),
             ],
@@ -84,6 +86,7 @@ pub struct ToolsSection;
 pub struct SafetySection;
 pub struct SkillsSection;
 pub struct WorkspaceSection;
+pub struct ProjectSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
 pub struct ChannelMediaSection;
@@ -234,10 +237,36 @@ impl PromptSection for WorkspaceSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        let ws = ctx.workspace_dir;
+        let scratch = ws.join(".austenite");
         Ok(format!(
-            "## Workspace\n\nWorking directory: `{}`",
-            ctx.workspace_dir.display()
+            "## Workspace\n\n\
+             Working directory: `{}`\n\n\
+             **Scratch directory**: `{}`\n\
+             Save all intermediate/working files (scripts, temp data, logs) in the scratch directory, \
+             not in the workspace root. Create the directory if it does not exist. \
+             Only final deliverables should be saved to the location the user specifies.",
+            ws.display(),
+            scratch.display(),
         ))
+    }
+}
+
+impl PromptSection for ProjectSection {
+    fn name(&self) -> &str {
+        "project"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        match ctx.project_dir {
+            Some(dir) => Ok(format!(
+                "## Project\n\n\
+                 Project directory: `{}`\n\
+                 File paths and shell commands operate relative to this directory.\n",
+                dir.display(),
+            )),
+            None => Ok(String::new()),
+        }
     }
 }
 
@@ -350,6 +379,7 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: &workspace,
+            project_dir: None,
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -381,6 +411,7 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            project_dir: None,
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -419,6 +450,7 @@ mod tests {
 
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            project_dir: None,
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
@@ -461,6 +493,7 @@ mod tests {
 
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp/workspace"),
+            project_dir: None,
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
@@ -489,6 +522,7 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            project_dir: None,
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -530,6 +564,7 @@ mod tests {
         }];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp/workspace"),
+            project_dir: None,
             model_name: "test-model",
             tools: &tools,
             skills: &skills,
@@ -564,6 +599,7 @@ mod tests {
             .to_string();
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            project_dir: None,
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -599,6 +635,7 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            project_dir: None,
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -626,6 +663,7 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            project_dir: None,
             model_name: "test-model",
             tools: &tools,
             skills: &[],
@@ -661,6 +699,7 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
+            project_dir: None,
             model_name: "test-model",
             tools: &tools,
             skills: &[],
