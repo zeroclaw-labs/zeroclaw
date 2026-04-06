@@ -5149,6 +5149,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let security = Arc::new(SecurityPolicy::from_config(
         &config.autonomy,
         &config.workspace_dir,
+        None,
     ));
     let model = resolved_default_model(&config);
     let temperature = config.default_temperature;

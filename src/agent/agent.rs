@@ -373,6 +373,7 @@ impl Agent {
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
+            None,
         ));
 
         let memory: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
@@ -1158,14 +1159,16 @@ impl Agent {
                 reasoning_content: response.reasoning_content.clone(),
             });
 
-            // Notify about each tool call
-            for call in &calls {
-                let _ = event_tx
-                    .send(TurnEvent::ToolCall {
-                        name: call.name.clone(),
-                        args: call.arguments.clone(),
-                    })
-                    .await;
+            // Notify about each tool call (skip if already emitted during streaming)
+            if !got_stream {
+                for call in &calls {
+                    let _ = event_tx
+                        .send(TurnEvent::ToolCall {
+                            name: call.name.clone(),
+                            args: call.arguments.clone(),
+                        })
+                        .await;
+                }
             }
 
             let results = self.execute_tools(&calls).await;

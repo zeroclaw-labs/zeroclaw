@@ -174,6 +174,7 @@ impl Default for PerSenderTracker {
 pub struct SecurityPolicy {
     pub autonomy: AutonomyLevel,
     pub workspace_dir: PathBuf,
+    pub project_dir: Option<PathBuf>,
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
@@ -307,6 +308,7 @@ impl Default for SecurityPolicy {
         Self {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: PathBuf::from("."),
+            project_dir: None,
             workspace_only: true,
             allowed_commands: default_allowed_commands(),
             forbidden_paths: default_forbidden_paths(),
@@ -1409,6 +1411,13 @@ impl SecurityPolicy {
             return true;
         }
 
+        if let Some(ref project) = self.project_dir {
+            let project_root = project.canonicalize().unwrap_or_else(|_| project.clone());
+            if resolved.starts_with(&project_root) {
+                return true;
+            }
+        }
+
         // Check extra allowed roots (e.g. shared skills directories) before
         // forbidden checks so explicit allowlists can coexist with broad
         // default forbidden roots such as `/home` and `/tmp`.
@@ -1546,19 +1555,21 @@ impl SecurityPolicy {
     pub fn resolve_tool_path(&self, path: &str) -> PathBuf {
         let expanded = expand_user_path(path);
         if expanded.is_absolute() {
-            expanded
-        } else if let Some(workspace_hint) = rootless_path(&self.workspace_dir) {
+            return expanded;
+        }
+        let base = self.project_dir.as_deref().unwrap_or(&self.workspace_dir);
+        if let Some(workspace_hint) = rootless_path(base) {
             if let Ok(stripped) = expanded.strip_prefix(&workspace_hint) {
                 if stripped.as_os_str().is_empty() {
-                    self.workspace_dir.clone()
+                    base.to_path_buf()
                 } else {
-                    self.workspace_dir.join(stripped)
+                    base.join(stripped)
                 }
             } else {
-                self.workspace_dir.join(expanded)
+                base.join(expanded)
             }
         } else {
-            self.workspace_dir.join(expanded)
+            base.join(expanded)
         }
     }
 
@@ -1581,10 +1592,12 @@ impl SecurityPolicy {
     pub fn from_config(
         autonomy_config: &crate::config::AutonomyConfig,
         workspace_dir: &Path,
+        project_dir: Option<&Path>,
     ) -> Self {
         Self {
             autonomy: autonomy_config.level,
             workspace_dir: workspace_dir.to_path_buf(),
+            project_dir: project_dir.map(|p| p.to_path_buf()),
             workspace_only: autonomy_config.workspace_only,
             allowed_commands: autonomy_config.allowed_commands.clone(),
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
@@ -2188,7 +2201,7 @@ mod tests {
             ..crate::config::AutonomyConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test-workspace");
-        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace, None);
 
         assert_eq!(policy.autonomy, AutonomyLevel::Full);
         assert!(!policy.workspace_only);
@@ -2209,7 +2222,7 @@ mod tests {
             ..crate::config::AutonomyConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test-workspace");
-        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace, None);
 
         let expected_home_root = if let Some(home) = std::env::var_os("HOME") {
             PathBuf::from(home).join("Desktop")
@@ -2849,7 +2862,7 @@ mod tests {
             ..crate::config::AutonomyConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test");
-        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace, None);
         assert!(!policy.is_rate_limited());
     }
 

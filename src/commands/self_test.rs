@@ -166,6 +166,7 @@ fn check_tool_registry(config: &crate::config::Config) -> CheckResult {
     let security = std::sync::Arc::new(crate::security::SecurityPolicy::from_config(
         &config.autonomy,
         &config.workspace_dir,
+        None,
     ));
     let tools = crate::tools::default_tools(security);
     if tools.is_empty() {
@@ -190,7 +191,7 @@ fn check_channel_config(config: &crate::config::Config) -> CheckResult {
 
 fn check_security_policy(config: &crate::config::Config) -> CheckResult {
     let _policy =
-        crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir, None);
     CheckResult::pass(
         "security",
         format!("autonomy level: {:?}", config.autonomy.level),

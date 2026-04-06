@@ -159,9 +159,11 @@ impl Tool for ShellTool {
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
+        let cwd = self.security.project_dir.as_deref()
+            .unwrap_or(&self.security.workspace_dir);
         let mut cmd = match self
             .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
+            .build_shell_command(command, cwd)
         {
             Ok(cmd) => cmd,
             Err(e) => {
