@@ -1,5 +1,5 @@
 // Skill self-improvement: atomically updates existing skill documents
-// after the agent uses them successfully.
+// after the agent uses them, triggered on failures to fix issues via LLM.
 //
 // Gated behind `#[cfg(feature = "skill-creation")]` at the module level
 // in `src/skills/mod.rs`.
@@ -78,10 +78,6 @@ impl SkillImprover {
         improved_content: &str,
         improvement_reason: &str,
     ) -> Result<Option<String>> {
-        if !self.should_improve_skill(slug) {
-            return Ok(None);
-        }
-
         // Validate the improved content before writing.
         validate_skill_content(improved_content)?;
 
@@ -145,42 +141,164 @@ impl SkillImprover {
         Ok(Some(slug.to_string()))
     }
 
+    /// Generate improved skill content using an LLM based on the execution failure.
+    pub async fn generate_improved_content(
+        &self,
+        slug: &str,
+        current_content: &str,
+        failure_context: &str,
+        provider: &dyn crate::providers::traits::Provider,
+        model: &str,
+    ) -> Result<String> {
+        let prompt = format!(
+            "You are a skill improvement assistant. A skill named '{}' failed during execution.\n\n\
+             Current skill content:\n```\n{}\n```\n\n\
+             Failure context:\n{}\n\n\
+             Rewrite the skill content to fix the issue. Output ONLY the improved skill file content, nothing else.",
+            slug, current_content, failure_context
+        );
+
+        provider
+            .simple_chat(&prompt, model, 0.3)
+            .await
+            .with_context(|| format!("LLM call failed while improving skill '{slug}'"))
+    }
+
     fn skills_dir(&self) -> PathBuf {
         self.workspace_dir.join("skills")
     }
 }
 
-/// Extract unique skill slugs from conversation history by finding
-/// successful skill-tool invocations (tool names containing a dot).
+/// Check whether tool-result content looks like a failure.
+fn looks_like_failure(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    lower.contains("error")
+        || lower.contains("failed")
+        || lower.contains("panic")
+        || lower.contains("exception")
+        || lower.contains("not found")
+        || lower.starts_with("exit code")
+}
+
+/// Extract skill tool executions from conversation history.
+/// Returns `(skill_slug, succeeded)` pairs for each skill-tool invocation found.
 ///
-/// Scans all messages for `<tool_result name="slug.tool">` patterns and
-/// returns the unique slug portions (the part before the first dot).
-pub fn extract_skill_slugs_from_history(
+/// Handles two formats:
+/// - XML: `<tool_result name="slug.tool">...content...</tool_result>`
+/// - Native: tool-role messages preceded by assistant messages containing
+///   tool calls with dotted names (e.g. `"name": "slug.tool"`)
+pub fn extract_skill_executions_from_history(
     history: &[crate::providers::traits::ChatMessage],
-) -> Vec<String> {
-    let mut slugs = std::collections::HashSet::new();
-    for msg in history {
+) -> Vec<(String, bool)> {
+    let mut results: Vec<(String, bool)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for (i, msg) in history.iter().enumerate() {
         let content = &msg.content;
-        let marker = "<tool_result name=\"";
-        let mut pos = 0;
-        while pos < content.len() {
-            if let Some(start) = content[pos..].find(marker) {
-                let abs = pos + start + marker.len();
-                if let Some(end) = content[abs..].find('"') {
-                    let name = &content[abs..abs + end];
-                    if let Some(dot_pos) = name.find('.') {
-                        slugs.insert(name[..dot_pos].to_string());
+
+        // Format 1: XML tool_result tags in any message.
+        {
+            let open_marker = "<tool_result name=\"";
+            let close_marker = "</tool_result>";
+            let mut pos = 0;
+            while pos < content.len() {
+                if let Some(start) = content[pos..].find(open_marker) {
+                    let abs = pos + start + open_marker.len();
+                    if let Some(end) = content[abs..].find('"') {
+                        let name = &content[abs..abs + end];
+                        if let Some(dot_pos) = name.find('.') {
+                            let slug = name[..dot_pos].to_string();
+                            // Extract the content between the tag opening and closing.
+                            let after_tag = abs + end + 1;
+                            // Skip the closing `>` of the opening tag.
+                            let body_start =
+                                content[after_tag..].find('>').map(|p| after_tag + p + 1);
+                            let body_end = content[after_tag..].find(close_marker);
+                            let body = match (body_start, body_end) {
+                                (Some(s), Some(e)) if s <= after_tag + e => {
+                                    &content[s..after_tag + e]
+                                }
+                                _ => "",
+                            };
+                            let succeeded = !looks_like_failure(body);
+                            let key = (slug.clone(), succeeded);
+                            if seen.insert(key) {
+                                results.push((slug, succeeded));
+                            }
+                            pos = after_tag + end + 1;
+                        } else {
+                            pos = abs + end + 1;
+                        }
+                    } else {
+                        break;
                     }
-                    pos = abs + end + 1;
                 } else {
                     break;
                 }
-            } else {
-                break;
+            }
+        }
+
+        // Format 2: Native tool-call messages (role "tool" preceded by assistant
+        // with a dotted tool name in JSON).
+        if msg.role == "tool" && i > 0 {
+            let prev = &history[i - 1];
+            if prev.role == "assistant" {
+                // Look for dotted tool names in the assistant content (JSON tool_call).
+                // Pattern: `"name": "slug.tool"` or `"name":"slug.tool"`
+                let prev_content = &prev.content;
+                let name_marker = "\"name\"";
+                let mut pos = 0;
+                while pos < prev_content.len() {
+                    if let Some(start) = prev_content[pos..].find(name_marker) {
+                        let after = pos + start + name_marker.len();
+                        // Skip whitespace and colon.
+                        let rest = prev_content[after..].trim_start();
+                        if let Some(rest) = rest.strip_prefix(':') {
+                            let rest = rest.trim_start();
+                            if let Some(rest) = rest.strip_prefix('"') {
+                                if let Some(end) = rest.find('"') {
+                                    let name = &rest[..end];
+                                    if let Some(dot_pos) = name.find('.') {
+                                        let slug = name[..dot_pos].to_string();
+                                        let succeeded = !looks_like_failure(content);
+                                        let key = (slug.clone(), succeeded);
+                                        if seen.insert(key) {
+                                            results.push((slug, succeeded));
+                                        }
+                                    }
+                                    pos = after + end + 1;
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                pos = after + 1;
+                            }
+                        } else {
+                            pos = after + 1;
+                        }
+                    } else {
+                        break;
+                    }
+                }
             }
         }
     }
-    slugs.into_iter().collect()
+
+    results
+}
+
+/// Backwards-compatible wrapper: returns unique skill slugs from history.
+///
+/// Delegates to [`extract_skill_executions_from_history`] and returns only
+/// the unique slug strings (discarding success/failure info).
+pub fn extract_skill_slugs_from_history(
+    history: &[crate::providers::traits::ChatMessage],
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    extract_skill_executions_from_history(history)
+        .into_iter()
+        .filter_map(|(slug, _)| if seen.insert(slug.clone()) { Some(slug) } else { None })
+        .collect()
 }
 
 /// Validate skill content: must be non-empty, valid UTF-8 (already a &str),
@@ -221,13 +339,14 @@ fn append_improvement_metadata(content: &str, timestamp: &str, reason: &str) -> 
         None => (content, ""),
     };
 
-    // Check if updated_at already exists; if so, replace it.
-    let skill_section = if skill_section.contains("updated_at") {
+    // Strip any existing updated_at / improvement_reason to avoid duplicate keys.
+    let skill_section = {
         let mut lines: Vec<&str> = skill_section.lines().collect();
-        lines.retain(|line| !line.trim_start().starts_with("updated_at"));
+        lines.retain(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("updated_at") && !trimmed.starts_with("improvement_reason")
+        });
         lines.join("\n") + "\n"
-    } else {
-        skill_section.to_string()
     };
 
     let escaped_reason = reason.replace('"', "\\\"").replace('\n', " ");
@@ -432,7 +551,10 @@ version = "0.1.0"
     }
 
     #[tokio::test]
-    async fn improve_skill_cooldown_returns_none() {
+    async fn improve_skill_writes_when_cooldown_not_checked_by_caller() {
+        // After removing the internal cooldown check, improve_skill always
+        // writes when given valid content — the caller is responsible for
+        // gating via should_improve_skill().
         let dir = tempfile::tempdir().unwrap();
         let skill_dir = dir.path().join("skills").join("test-skill");
         tokio::fs::create_dir_all(&skill_dir).await.unwrap();
@@ -450,7 +572,8 @@ version = "0.1.0"
                 cooldown_secs: 9999,
             },
         );
-        // Record a recent cooldown.
+        // Even with a recent cooldown recorded, improve_skill proceeds
+        // (caller should have checked should_improve_skill beforehand).
         improver
             .cooldowns
             .insert("test-skill".to_string(), Instant::now());
@@ -463,7 +586,7 @@ version = "0.1.0"
             )
             .await
             .unwrap();
-        assert!(result.is_none());
+        assert_eq!(result, Some("test-skill".to_string()));
     }
 
     // ── Metadata appending ──────────────────────────────────
