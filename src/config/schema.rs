@@ -12620,8 +12620,6 @@ allowed_users = ["@ops:matrix.org"]
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
-            reply_precheck: false,
-            max_concurrent_per_channel: 4,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
