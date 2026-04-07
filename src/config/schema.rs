@@ -9015,11 +9015,26 @@ impl Config {
                 // serialization round-trip.  This is computed once and cached.
                 static KNOWN_KEYS: OnceLock<Vec<String>> = OnceLock::new();
                 let known = KNOWN_KEYS.get_or_init(|| {
-                    toml::to_string(&Config::default())
+                    let mut keys = toml::to_string(&Config::default())
                         .ok()
                         .and_then(|s| s.parse::<toml::Table>().ok())
-                        .map(|t| t.keys().cloned().collect())
-                        .unwrap_or_default()
+                        .map(|t| t.keys().cloned().collect::<Vec<String>>())
+                        .unwrap_or_default();
+                    // Add optional top-level fields that are valid config keys but
+                    // get omitted from TOML serialization when they are None.
+                    // This prevents spurious "Unknown config key ignored" warnings.
+                    for key in [
+                        "api_key",
+                        "api_url",
+                        "api_path",
+                        "default_provider",
+                        "default_model",
+                    ] {
+                        if !keys.contains(&key.to_string()) {
+                            keys.push(key.to_string());
+                        }
+                    }
+                    keys
                 });
                 for key in raw.keys() {
                     if !known.contains(key) {
@@ -16119,5 +16134,93 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let config = CostConfig::default();
         assert_eq!(config.enforcement.mode, "warn");
         assert_eq!(config.enforcement.reserve_percent, 10);
+    }
+
+    // ── Known keys detection ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn known_keys_includes_optional_fields() {
+        let mut keys = toml::to_string(&Config::default())
+            .ok()
+            .and_then(|s| s.parse::<toml::Table>().ok())
+            .map(|t| t.keys().cloned().collect::<Vec<String>>())
+            .unwrap_or_default();
+        for key in [
+            "api_key",
+            "api_url",
+            "api_path",
+            "default_provider",
+            "default_model",
+        ] {
+            if !keys.contains(&key.to_string()) {
+                keys.push(key.to_string());
+            }
+        }
+        assert!(keys.contains(&"api_key".to_string()));
+        assert!(keys.contains(&"api_url".to_string()));
+        assert!(keys.contains(&"api_path".to_string()));
+        assert!(keys.contains(&"default_provider".to_string()));
+        assert!(keys.contains(&"default_model".to_string()));
+    }
+
+    #[tokio::test]
+    async fn api_key_does_not_trigger_unknown_key_warning() {
+        let raw_toml = r#"
+api_key = "sk-test"
+default_provider = "anthropic"
+"#;
+        let raw: toml::Table = raw_toml.parse().unwrap();
+        let mut known = toml::to_string(&Config::default())
+            .ok()
+            .and_then(|s| s.parse::<toml::Table>().ok())
+            .map(|t| t.keys().cloned().collect::<Vec<String>>())
+            .unwrap_or_default();
+        for key in [
+            "api_key",
+            "api_url",
+            "api_path",
+            "default_provider",
+            "default_model",
+        ] {
+            if !known.contains(&key.to_string()) {
+                known.push(key.to_string());
+            }
+        }
+        let unknown_keys: Vec<&String> = raw.keys().filter(|k| !known.contains(*k)).collect();
+        assert!(
+            unknown_keys.is_empty(),
+            "api_key should not trigger unknown key warning, but found: {:?}",
+            unknown_keys
+        );
+    }
+
+    #[tokio::test]
+    async fn truly_unknown_key_triggers_warning() {
+        let raw_toml = r#"
+api_key = "sk-test"
+foo_bar = 123
+"#;
+        let raw: toml::Table = raw_toml.parse().unwrap();
+        let mut known = toml::to_string(&Config::default())
+            .ok()
+            .and_then(|s| s.parse::<toml::Table>().ok())
+            .map(|t| t.keys().cloned().collect::<Vec<String>>())
+            .unwrap_or_default();
+        for key in [
+            "api_key",
+            "api_url",
+            "api_path",
+            "default_provider",
+            "default_model",
+        ] {
+            if !known.contains(&key.to_string()) {
+                known.push(key.to_string());
+            }
+        }
+        let unknown_keys: Vec<&String> = raw.keys().filter(|k| !known.contains(*k)).collect();
+        assert!(
+            unknown_keys.contains(&&"foo_bar".to_string()),
+            "foo_bar should be detected as unknown key"
+        );
     }
 }
