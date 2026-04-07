@@ -214,7 +214,16 @@ mod tests {
             "--env=MY_VAR=TEST_VALUE".to_string(),
             "--hostname=testbox".to_string(),
         ];
-        let sandbox = FirejailSandbox::new(custom_args.clone()).unwrap_or_default();
+
+        // Skip test if firejail is not installed
+        let sandbox = match FirejailSandbox::new(custom_args.clone()) {
+            Ok(s) => s,
+            Err(_) => {
+                println!("Skipping test: firejail not installed");
+                return;
+            }
+        };
+
         let mut cmd = Command::new("echo");
         cmd.arg("test");
         sandbox.wrap_command(&mut cmd).unwrap();
