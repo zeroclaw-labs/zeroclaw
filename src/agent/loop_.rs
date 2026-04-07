@@ -4886,6 +4886,39 @@ mod tests {
         assert!(result.ends_with("yz"));
     }
 
+    // ── truncate_tool_message tests ─────────────────────────────
+
+    #[test]
+    fn truncate_tool_message_preserves_json_structure() {
+        use crate::agent::history::truncate_tool_message;
+        let big_content = "x".repeat(5000);
+        let msg = serde_json::json!({
+            "tool_call_id": "call_abc123",
+            "content": big_content,
+        })
+        .to_string();
+        let result = truncate_tool_message(&msg, 2000);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["tool_call_id"], "call_abc123");
+        assert!(parsed["content"].as_str().unwrap().contains("[... "));
+    }
+
+    #[test]
+    fn truncate_tool_message_plain_text_fallback() {
+        use crate::agent::history::truncate_tool_message;
+        let plain = "a".repeat(5000);
+        let result = truncate_tool_message(&plain, 2000);
+        assert!(result.contains("[... "));
+        assert!(result.len() < 5000);
+    }
+
+    #[test]
+    fn truncate_tool_message_short_passthrough() {
+        use crate::agent::history::truncate_tool_message;
+        let msg = r#"{"tool_call_id":"call_1","content":"ok"}"#;
+        assert_eq!(truncate_tool_message(msg, 2000), msg);
+    }
+
     // ── fast_trim_tool_results tests ────────────────────────────
 
     #[test]

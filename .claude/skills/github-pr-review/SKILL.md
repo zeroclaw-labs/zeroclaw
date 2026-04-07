@@ -79,7 +79,7 @@ Every PR decision is governed by these — see `AGENTS.md` for full rationale:
 | Suggest documentation improvements | Act. Comment only, don't push. |
 | Skip draft PRs | Act. |
 | Skip high-risk path (non-docs) PRs | Act. |
-| Mark PR as ready to merge | Act. Apply `agent-approved` label. |
+| Mark PR as ready to merge | Act. Apply `agent-approved` label. **Only when there are zero findings of any severity — no `[blocking]`, no `[suggestion]`, no `[question]`.** Any outstanding feedback means "Needs author action", not approved. |
 | Push code to contributor branch | Never. |
 | Merge to master | Never. Human only. |
 | Close duplicate PRs autonomously | Never. Flag for maintainer. |
