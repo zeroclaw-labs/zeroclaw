@@ -812,8 +812,12 @@ impl SlackChannel {
         respond_to_broadcasts: bool,
         bot_user_id: &str,
     ) -> Option<String> {
-        let normalized =
-            Self::normalize_incoming_text(text, require_mention, respond_to_broadcasts, bot_user_id)?;
+        let normalized = Self::normalize_incoming_text(
+            text,
+            require_mention,
+            respond_to_broadcasts,
+            bot_user_id,
+        )?;
         if normalized.is_empty() {
             return None;
         }
@@ -4103,7 +4107,11 @@ mod tests {
     #[test]
     fn slack_group_reply_policy_applies_sender_overrides() {
         let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()])
-            .with_group_reply_policy(true, true, vec![" U111 ".into(), "U111".into(), "U222".into()]);
+            .with_group_reply_policy(
+                true,
+                true,
+                vec![" U111 ".into(), "U111".into(), "U222".into()],
+            );
 
         assert!(ch.mention_only);
         assert_eq!(
@@ -4286,7 +4294,8 @@ mod tests {
     fn normalize_incoming_content_requires_mention_when_enabled() {
         assert!(SlackChannel::normalize_incoming_content("hello", true, true, "U_BOT").is_none());
         assert_eq!(
-            SlackChannel::normalize_incoming_content("<@U_BOT> run", true, true, "U_BOT").as_deref(),
+            SlackChannel::normalize_incoming_content("<@U_BOT> run", true, true, "U_BOT")
+                .as_deref(),
             Some("@you run")
         );
     }
@@ -4294,7 +4303,8 @@ mod tests {
     #[test]
     fn normalize_incoming_content_without_mention_mode_keeps_message() {
         assert_eq!(
-            SlackChannel::normalize_incoming_content("  hello world  ", false, true, "U_BOT").as_deref(),
+            SlackChannel::normalize_incoming_content("  hello world  ", false, true, "U_BOT")
+                .as_deref(),
             Some("hello world")
         );
     }
