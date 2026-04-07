@@ -3781,7 +3781,18 @@ pub async fn run(
     if !config.agents.is_empty() {
         tool_descs.push((
             "delegate",
-            "Delegate a sub-task to a specialized agent. Use when: task needs different model/capability, or to parallelize work.",
+            "Delegate a sub-task to a specialized agent from your team (see AGENTS.md for roster). \
+             Use when: task needs a specialist, different model/capability, or to parallelize work. \
+             Supports background (async) and parallel execution. Refer to AGENTS.md for who to pick.",
+        ));
+    }
+    if !config.swarms.is_empty() {
+        tool_descs.push((
+            "swarm",
+            "Orchestrate a swarm of agents for collaborative tasks. Strategies: \
+             'auto' (AI picks the best agent), 'game_team' (design→dev→art pipeline), \
+             'game_full' (intel→design→dev→art→qa full pipeline). \
+             Use when: task spans multiple roles, or you're unsure which specialist to pick.",
         ));
     }
     if config.peripherals.enabled && !config.peripherals.boards.is_empty() {

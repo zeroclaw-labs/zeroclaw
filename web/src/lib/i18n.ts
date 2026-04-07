@@ -43,7 +43,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.send': '发送',
     'agent.placeholder': '输入消息...',
     'agent.start_conversation': '发送消息开始对话',
-    'agent.type_message': '输入消息...',
+    'agent.type_message': '输入消息（Ctrl+Enter 发送）...',
     'agent.connecting': '连接中...',
     'agent.connected': '已连接',
     'agent.disconnected': '已断开',

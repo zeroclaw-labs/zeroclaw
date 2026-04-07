@@ -14,6 +14,8 @@ import Logs from './pages/Logs';
 import Doctor from './pages/Doctor';
 import Pairing from './pages/Pairing';
 import Canvas from './pages/Canvas';
+import Agents from './pages/Agents';
+import AgentDetail from './pages/AgentDetail';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
 import { setLocale, type Locale } from './lib/i18n';
@@ -29,7 +31,7 @@ interface LocaleContextType {
 
 export const LocaleContext = createContext<LocaleContextType>({
   locale: 'en',
-  setAppLocale: () => {},
+  setAppLocale: () => { },
 });
 
 export const useLocaleContext = () => useContext(LocaleContext);
@@ -239,6 +241,8 @@ function AppContent() {
             <Route path="/doctor" element={<Doctor />} />
             <Route path="/pairing" element={<Pairing />} />
             <Route path="/canvas" element={<Canvas />} />
+            <Route path="/agents" element={<Agents />} />
+            <Route path="/agents/:id" element={<AgentDetail />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>

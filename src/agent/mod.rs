@@ -13,6 +13,7 @@ pub mod loop_detector;
 pub mod memory_loader;
 pub mod personality;
 pub mod prompt;
+pub mod registry;
 pub mod thinking;
 pub mod tool_execution;
 

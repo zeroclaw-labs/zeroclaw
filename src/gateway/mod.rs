@@ -22,6 +22,7 @@ pub mod static_files;
 pub mod tls;
 pub mod ws;
 
+use crate::agent::registry::AgentRegistry;
 use crate::channels::{
     Channel, GmailPushChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel,
     WhatsAppChannel, session_backend::SessionBackend, session_sqlite::SqliteSessionBackend,
@@ -51,6 +52,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
@@ -372,6 +374,8 @@ pub struct AppState {
     pub pending_pairings: Option<Arc<api_pairing::PairingStore>>,
     /// Shared canvas store for Live Canvas (A2UI) system
     pub canvas_store: CanvasStore,
+    /// Multi-agent registry
+    pub agent_registry: Arc<RwLock<AgentRegistry>>,
     /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
     #[cfg(feature = "webauthn")]
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
@@ -833,6 +837,13 @@ pub async fn run_gateway(
         None
     };
 
+    // ── Agent registry ────────────────────────────────────
+    let mut agent_registry = AgentRegistry::new(std::path::Path::new(&config.workspace_dir));
+    if let Err(e) = agent_registry.load_all() {
+        tracing::warn!("Failed to load agent registry: {e}");
+    }
+    let agent_registry = Arc::new(RwLock::new(agent_registry));
+
     let state = AppState {
         config: config_state,
         provider,
@@ -867,6 +878,7 @@ pub async fn run_gateway(
         pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
         canvas_store,
+        agent_registry,
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(crate::security::SecretStore::new(
@@ -977,6 +989,22 @@ pub async fn run_gateway(
         .route(
             "/api/canvas/{id}/history",
             get(canvas::handle_canvas_history),
+        )
+        // ── Multi-Agent API routes ──
+        .route("/api/agents", get(api::handle_api_agents_list).post(api::handle_api_agent_create))
+        .route(
+            "/api/agents/{id}",
+            get(api::handle_api_agent_get)
+                .put(api::handle_api_agent_update)
+                .delete(api::handle_api_agent_delete),
+        )
+        .route("/api/agents/{id}/identity", put(api::handle_api_agent_identity_update))
+        .route("/api/agents/{id}/status", put(api::handle_api_agent_status_update))
+        .route("/api/agents/{id}/message", post(api::handle_api_agent_message))
+        .route("/api/agents/{id}/skills", get(api::handle_api_agent_skills_list))
+        .route(
+            "/api/agents/{id}/skills/{skill}",
+            get(api::handle_api_agent_skill_get).put(api::handle_api_agent_skill_put),
         );
 
     // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
@@ -2360,6 +2388,9 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            agent_registry: Arc::new(RwLock::new(AgentRegistry::new(std::path::Path::new(
+                "/tmp/zeroclaw-test",
+            )))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2431,6 +2462,9 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            agent_registry: Arc::new(RwLock::new(AgentRegistry::new(std::path::Path::new(
+                "/tmp/zeroclaw-test",
+            )))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2826,6 +2860,9 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            agent_registry: Arc::new(RwLock::new(AgentRegistry::new(std::path::Path::new(
+                "/tmp/zeroclaw-test",
+            )))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2905,6 +2942,9 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            agent_registry: Arc::new(RwLock::new(AgentRegistry::new(std::path::Path::new(
+                "/tmp/zeroclaw-test",
+            )))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2996,6 +3036,9 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            agent_registry: Arc::new(RwLock::new(AgentRegistry::new(std::path::Path::new(
+                "/tmp/zeroclaw-test",
+            )))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3059,6 +3102,9 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            agent_registry: Arc::new(RwLock::new(AgentRegistry::new(std::path::Path::new(
+                "/tmp/zeroclaw-test",
+            )))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3127,6 +3173,9 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            agent_registry: Arc::new(RwLock::new(AgentRegistry::new(std::path::Path::new(
+                "/tmp/zeroclaw-test",
+            )))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3200,6 +3249,9 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            agent_registry: Arc::new(RwLock::new(AgentRegistry::new(std::path::Path::new(
+                "/tmp/zeroclaw-test",
+            )))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3270,6 +3322,9 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            agent_registry: Arc::new(RwLock::new(AgentRegistry::new(std::path::Path::new(
+                "/tmp/zeroclaw-test",
+            )))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };

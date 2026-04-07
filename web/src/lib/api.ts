@@ -341,3 +341,93 @@ export function getCliTools(): Promise<CliTool[]> {
     unwrapField(data, 'cli_tools'),
   );
 }
+
+// ---------------------------------------------------------------------------
+// Agents (multi-agent registry)
+// ---------------------------------------------------------------------------
+
+export interface AgentDef {
+  id: string;
+  display_name: string;
+  avatar: string;
+  role: string;
+  focus: string[];
+  allowed_tools: string[];
+  memory_namespace: string;
+  project_dir: string | null;
+  status: { state: 'idle' } | { state: 'working'; task: string } | { state: 'error'; message: string };
+  last_activity_ms: number;
+  // Detail-only fields (returned by GET /api/agents/:id)
+  identity?: string;
+  soul?: string;
+  skills?: string[];
+}
+
+export function getAgents(): Promise<AgentDef[]> {
+  return apiFetch<{ agents: AgentDef[] }>('/api/agents').then((d) => d.agents);
+}
+
+export function getAgent(id: string): Promise<AgentDef> {
+  return apiFetch<AgentDef>(`/api/agents/${encodeURIComponent(id)}`);
+}
+
+export function createAgent(body: Partial<AgentDef>): Promise<AgentDef> {
+  return apiFetch<AgentDef>('/api/agents', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function updateAgent(id: string, body: Partial<AgentDef>): Promise<AgentDef> {
+  return apiFetch<AgentDef>(`/api/agents/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+}
+
+export function deleteAgent(id: string): Promise<void> {
+  return apiFetch(`/api/agents/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+export function updateAgentIdentity(id: string, identity?: string, soul?: string): Promise<void> {
+  return apiFetch(`/api/agents/${encodeURIComponent(id)}/identity`, {
+    method: 'PUT',
+    body: JSON.stringify({ identity, soul }),
+  });
+}
+
+export function getAgentSkills(id: string): Promise<string[]> {
+  return apiFetch<{ skills: string[] }>(`/api/agents/${encodeURIComponent(id)}/skills`).then(
+    (d) => d.skills,
+  );
+}
+
+export function getAgentSkill(id: string, skill: string): Promise<string> {
+  return apiFetch<{ content: string }>(
+    `/api/agents/${encodeURIComponent(id)}/skills/${encodeURIComponent(skill)}`,
+  ).then((d) => d.content);
+}
+
+export function putAgentSkill(id: string, skill: string, content: string): Promise<void> {
+  return apiFetch(
+    `/api/agents/${encodeURIComponent(id)}/skills/${encodeURIComponent(skill)}`,
+    { method: 'PUT', body: JSON.stringify({ content }) },
+  );
+}
+
+export interface AgentMessageResponse {
+  agent_id: string;
+  reply: string;
+  session_id: string;
+}
+
+export function postAgentMessage(
+  id: string,
+  message: string,
+  session_id?: string,
+): Promise<AgentMessageResponse> {
+  return apiFetch(`/api/agents/${encodeURIComponent(id)}/message`, {
+    method: 'POST',
+    body: JSON.stringify({ message, session_id }),
+  });
+}

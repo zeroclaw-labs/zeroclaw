@@ -15,8 +15,15 @@
   "files.autoSave": "afterDelay",
   "files.autoSaveDelay": 1000,
   "rust-analyzer.check.command": "clippy",
-  "rust-analyzer.check.extraArgs": ["--all-targets", "--", "-D", "warnings"],
+  "rust-analyzer.check.extraArgs": [
+    "--all-targets",
+    "--",
+    "-D",
+    "warnings"
+  ],
   "window.title": "${activeRepositoryBranchName}",
-  "coverage-gutters.coverageFileNames": ["lcov.info"],
+  "coverage-gutters.coverageFileNames": [
+    "lcov.info"
+  ],
   "git.postCommitCommand": "push"
 }

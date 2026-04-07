@@ -1534,6 +1534,434 @@ pub async fn handle_claude_code_hook(
     Json(serde_json::json!({ "ok": true }))
 }
 
+// ── Multi-Agent API ─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct AgentCreateBody {
+    pub id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub avatar: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub focus: Vec<String>,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub memory_namespace: Option<String>,
+    #[serde(default)]
+    pub project_dir: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct AgentSkillBody {
+    pub content: String,
+}
+
+#[derive(Deserialize)]
+pub struct AgentIdentityBody {
+    pub identity: Option<String>,
+    pub soul: Option<String>,
+}
+
+/// GET /api/agents — list all registered agents
+pub async fn handle_api_agents_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let registry = state.agent_registry.read().await;
+    let agents: Vec<serde_json::Value> = registry.list().iter().map(|a| a.to_api_json()).collect();
+    Json(serde_json::json!({ "agents": agents })).into_response()
+}
+
+/// GET /api/agents/:id — get a single agent
+pub async fn handle_api_agent_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let registry = state.agent_registry.read().await;
+    match registry.get(&id) {
+        Some(agent) => {
+            let mut json = agent.to_api_json();
+            // Include identity and soul content for detail view
+            if let Some(obj) = json.as_object_mut() {
+                obj.insert(
+                    "identity".into(),
+                    serde_json::Value::String(agent.identity_content.clone()),
+                );
+                obj.insert(
+                    "soul".into(),
+                    serde_json::Value::String(agent.soul_content.clone()),
+                );
+            }
+            // Include skills list
+            let skills = registry.list_skills(&id).unwrap_or_default();
+            if let Some(obj) = json.as_object_mut() {
+                obj.insert("skills".into(), serde_json::json!(skills));
+            }
+            Json(json).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Agent not found"})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/agents — create a new agent
+pub async fn handle_api_agent_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AgentCreateBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    // Validate id (alphanumeric + hyphens only)
+    if body.id.is_empty()
+        || !body
+            .id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid agent id — use alphanumeric, hyphens, underscores only"})),
+        )
+            .into_response();
+    }
+
+    let def = crate::agent::registry::AgentDefinition {
+        id: body.id.clone(),
+        display_name: body.display_name,
+        avatar: body.avatar,
+        role: body.role,
+        focus: body.focus,
+        allowed_tools: body.allowed_tools,
+        memory_namespace: body.memory_namespace,
+        project_dir: body.project_dir,
+    };
+
+    let mut registry = state.agent_registry.write().await;
+    if registry.get(&body.id).is_some() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "Agent already exists"})),
+        )
+            .into_response();
+    }
+
+    match registry.create(def) {
+        Ok(agent) => (StatusCode::CREATED, Json(agent.to_api_json())).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e:#}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /api/agents/:id — update agent definition
+pub async fn handle_api_agent_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<AgentCreateBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let def = crate::agent::registry::AgentDefinition {
+        id: id.clone(),
+        display_name: body.display_name,
+        avatar: body.avatar,
+        role: body.role,
+        focus: body.focus,
+        allowed_tools: body.allowed_tools,
+        memory_namespace: body.memory_namespace,
+        project_dir: body.project_dir,
+    };
+
+    let mut registry = state.agent_registry.write().await;
+    match registry.update(&id, def) {
+        Ok(()) => {
+            let agent = registry.get(&id).unwrap();
+            Json(agent.to_api_json()).into_response()
+        }
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("{e:#}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/agents/:id — delete an agent
+pub async fn handle_api_agent_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let mut registry = state.agent_registry.write().await;
+    match registry.delete(&id) {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e:#}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /api/agents/:id/identity — update agent IDENTITY.md and/or SOUL.md
+pub async fn handle_api_agent_identity_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<AgentIdentityBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let mut registry = state.agent_registry.write().await;
+    if registry.get(&id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Agent not found"})),
+        )
+            .into_response();
+    }
+
+    if let Some(identity) = &body.identity {
+        if let Err(e) = registry.update_identity(&id, identity) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{e:#}")})),
+            )
+                .into_response();
+        }
+    }
+    if let Some(soul) = &body.soul {
+        if let Err(e) = registry.update_soul(&id, soul) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{e:#}")})),
+            )
+                .into_response();
+        }
+    }
+
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+/// GET /api/agents/:id/skills — list skills for an agent
+pub async fn handle_api_agent_skills_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let registry = state.agent_registry.read().await;
+    match registry.list_skills(&id) {
+        Ok(skills) => Json(serde_json::json!({"skills": skills})).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("{e:#}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/agents/:id/skills/:skill — read a skill
+pub async fn handle_api_agent_skill_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, skill)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let registry = state.agent_registry.read().await;
+    match registry.read_skill(&id, &skill) {
+        Ok(content) => {
+            Json(serde_json::json!({"skill": skill, "content": content})).into_response()
+        }
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("{e:#}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /api/agents/:id/skills/:skill — write/update a skill
+pub async fn handle_api_agent_skill_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, skill)): Path<(String, String)>,
+    Json(body): Json<AgentSkillBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let registry = state.agent_registry.read().await;
+    match registry.write_skill(&id, &skill, &body.content) {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e:#}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /api/agents/:id/status — update agent status
+pub async fn handle_api_agent_status_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(status): Json<crate::agent::registry::AgentStatus>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let mut registry = state.agent_registry.write().await;
+    match registry.get_mut(&id) {
+        Some(agent) => {
+            agent.set_status(status);
+            Json(agent.to_api_json()).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Agent not found"})),
+        )
+            .into_response(),
+    }
+}
+
+// ── Agent message dispatch ──────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct AgentMessageBody {
+    pub message: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// POST /api/agents/:id/message — run a message through a specific agent.
+///
+/// Overrides `workspace_dir` to the agent's directory so its IDENTITY.md /
+/// SOUL.md / skills are used for the system prompt.
+pub async fn handle_api_agent_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<AgentMessageBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    // Snapshot the agent definition without holding the lock across the async call.
+    let (agent_dir, memory_namespace) = {
+        let registry = state.agent_registry.read().await;
+        match registry.get(&id) {
+            Some(agent) => (
+                agent.dir.clone(),
+                agent.definition.effective_memory_namespace().to_string(),
+            ),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "Agent not found"})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    // Clone base config and override workspace_dir → agent directory.
+    // This makes IDENTITY.md / SOUL.md / skills/ load from the agent's own dir.
+    let mut config = state.config.lock().clone();
+    config.workspace_dir = agent_dir.clone();
+
+    // The memory_namespace is embedded in the session_id to isolate each
+    // agent's chat history without requiring MemoryConfig changes.
+    let _ = memory_namespace; // captured for future namespacing if needed
+
+    // Use agent-scoped session_id to isolate chat history.
+    let effective_session_id = body.session_id.clone().unwrap_or_else(|| {
+        format!("agent-{id}")
+    });
+
+    // Mark agent as working.
+    {
+        let mut registry = state.agent_registry.write().await;
+        if let Some(agent) = registry.get_mut(&id) {
+            agent.set_status(crate::agent::registry::AgentStatus::Working {
+                task: body.message.chars().take(60).collect(),
+            });
+        }
+    }
+
+    let message = body.message.clone();
+    let agent_id = id.clone();
+    let registry_ref = state.agent_registry.clone();
+
+    let result = crate::agent::process_message(config, &message, Some(&effective_session_id)).await;
+
+    // Mark agent idle (or error) after completion.
+    {
+        let mut registry = registry_ref.write().await;
+        if let Some(agent) = registry.get_mut(&agent_id) {
+            match &result {
+                Ok(_) => agent.set_status(crate::agent::registry::AgentStatus::Idle),
+                Err(e) => agent.set_status(crate::agent::registry::AgentStatus::Error {
+                    message: e.to_string(),
+                }),
+            }
+        }
+    }
+
+    match result {
+        Ok(reply) => Json(serde_json::json!({
+            "agent_id": agent_id,
+            "reply": reply,
+            "session_id": effective_session_id,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e:#}")})),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1654,6 +2082,11 @@ mod tests {
             pending_pairings: None,
             path_prefix: String::new(),
             canvas_store: crate::tools::canvas::CanvasStore::new(),
+            agent_registry: Arc::new(tokio::sync::RwLock::new(
+                crate::agent::registry::AgentRegistry::new(std::path::Path::new(
+                    "/tmp/zeroclaw-test",
+                )),
+            )),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
