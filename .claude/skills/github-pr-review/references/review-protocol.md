@@ -1,4 +1,4 @@
-# PR Review Protocol — Full Reference
+  # PR Review Protocol — Full Reference
 
 This is the detailed, phase-by-phase review protocol. The SKILL.md provides the quick reference; this document is the authoritative procedure.
 
@@ -220,6 +220,7 @@ Before marking ready, re-read the PR page for:
 Use one of three outcomes per `reviewer-playbook.md` §3.4. Every verdict comment must open with the **PR comprehension summary** from §1.2 (what, why, blast radius) and include the **security/performance assessment** from §3.4.
 
 **Ready to merge:**
+- **Gate:** Only use this verdict when there are **zero** `[blocking]` findings AND **zero** `[suggestion]` findings. If there are any suggestions — even non-blocking ones — use "Needs author action" instead. The `agent-approved` label means "nothing left to do, just merge." Any outstanding feedback, however minor, means the PR is not ready.
 - Leave a comment that:
   - Thanks the contributor.
   - Opens with the comprehension summary (what this PR does and why).
@@ -231,11 +232,12 @@ Use one of three outcomes per `reviewer-playbook.md` §3.4. Every verdict commen
 - **Do NOT merge. Do NOT rebase and merge. A human maintainer will do this.**
 
 **Needs author action:**
+- **Gate:** Use this verdict when there are ANY findings — `[blocking]`, `[suggestion]`, or `[question]`. Even a single suggestion means the PR is not ready for blind merge.
 - Leave a comment that:
   - Thanks the contributor.
   - Opens with the comprehension summary.
   - Notes what is already good (avoid demoralizing contributors).
-  - Lists blocking issues in priority order, each with a severity tag (`[blocking]` or `[suggestion]`).
+  - Lists all issues in priority order, each with a severity tag (`[blocking]` or `[suggestion]`).
   - States clearly what must change before re-review.
 - Do not apply `agent-approved`.
 
