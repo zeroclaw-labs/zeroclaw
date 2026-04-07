@@ -615,8 +615,13 @@ fn validate_resolved_host_is_public(host: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-fn validate_resolved_host_is_public(_host: &str) -> anyhow::Result<()> {
+fn validate_resolved_host_is_public(host: &str) -> anyhow::Result<()> {
     // DNS checks are covered by validate_resolved_ips_are_public unit tests.
+    // For testing the code path that requires DNS resolution, reject .localdomain
+    // to simulate a domain that would resolve to a private IP.
+    if host.ends_with(".localdomain") {
+        anyhow::bail!("Blocked host '{host}' resolved to non-global address");
+    }
     Ok(())
 }
 
