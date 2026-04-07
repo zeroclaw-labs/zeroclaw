@@ -90,10 +90,7 @@ impl Tool for CalendarListEventsTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let days_ahead = args
-            .get("days_ahead")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(7);
+        let days_ahead = args.get("days_ahead").and_then(|v| v.as_u64()).unwrap_or(7);
         let max_results = args
             .get("max_results")
             .and_then(|v| v.as_u64())
@@ -330,10 +327,16 @@ impl Tool for CalendarCreateEventTool {
                 let (start_json, end_json) = if all_day {
                     let sd = &start_time[..10.min(start_time.len())];
                     let ed = end_time.map(|t| &t[..10.min(t.len())]).unwrap_or(sd);
-                    (json!({"date": sd, "timeZone": timezone}), json!({"date": ed, "timeZone": timezone}))
+                    (
+                        json!({"date": sd, "timeZone": timezone}),
+                        json!({"date": ed, "timeZone": timezone}),
+                    )
                 } else {
                     let end = end_time.unwrap_or(&default_end);
-                    (json!({"dateTime": start_time, "timeZone": timezone}), json!({"dateTime": end, "timeZone": timezone}))
+                    (
+                        json!({"dateTime": start_time, "timeZone": timezone}),
+                        json!({"dateTime": end, "timeZone": timezone}),
+                    )
                 };
 
                 let mut body = json!({
@@ -345,18 +348,34 @@ impl Tool for CalendarCreateEventTool {
                         "overrides": [{"method": "popup", "minutes": reminder_minutes}]
                     }
                 });
-                if let Some(loc) = location { body["location"] = json!(loc); }
-                if let Some(desc) = description { body["description"] = json!(desc); }
+                if let Some(loc) = location {
+                    body["location"] = json!(loc);
+                }
+                if let Some(desc) = description {
+                    body["description"] = json!(desc);
+                }
 
-                let resp = client.post(&url).bearer_auth(access_token).json(&body).send().await?;
+                let resp = client
+                    .post(&url)
+                    .bearer_auth(access_token)
+                    .json(&body)
+                    .send()
+                    .await?;
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let err = resp.text().await.unwrap_or_default();
-                    return Ok(ToolResult { success: false, output: String::new(), error: Some(format!("Google Calendar create error {status}: {err}")) });
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Google Calendar create error {status}: {err}")),
+                    });
                 }
                 let result: serde_json::Value = resp.json().await?;
                 let event_id = result.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                let html_link = result.get("htmlLink").and_then(|v| v.as_str()).unwrap_or("");
+                let html_link = result
+                    .get("htmlLink")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 Ok(ToolResult {
                     success: true,
                     output: format!("Event created.\nTitle: {title}\nStart: {start_time}\nID: {event_id}\nLink: {html_link}"),
@@ -374,15 +393,27 @@ impl Tool for CalendarCreateEventTool {
                     "isReminderOn": true,
                     "reminderMinutesBeforeStart": reminder_minutes
                 });
-                if let Some(loc) = location { body["location"] = json!({"displayName": loc}); }
-                if let Some(desc) = description { body["body"] = json!({"contentType": "Text", "content": desc}); }
+                if let Some(loc) = location {
+                    body["location"] = json!({"displayName": loc});
+                }
+                if let Some(desc) = description {
+                    body["body"] = json!({"contentType": "Text", "content": desc});
+                }
 
-                let resp = client.post("https://graph.microsoft.com/v1.0/me/events")
-                    .bearer_auth(access_token).json(&body).send().await?;
+                let resp = client
+                    .post("https://graph.microsoft.com/v1.0/me/events")
+                    .bearer_auth(access_token)
+                    .json(&body)
+                    .send()
+                    .await?;
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let err = resp.text().await.unwrap_or_default();
-                    return Ok(ToolResult { success: false, output: String::new(), error: Some(format!("Outlook create error {status}: {err}")) });
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Outlook create error {status}: {err}")),
+                    });
                 }
                 let result: serde_json::Value = resp.json().await?;
                 let event_id = result.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -474,12 +505,31 @@ fn format_google_events(data: &serde_json::Value) -> String {
     };
     let mut out = format!("Found {} upcoming event(s):\n\n", items.len());
     for (i, ev) in items.iter().enumerate() {
-        let title = ev.get("summary").and_then(|v| v.as_str()).unwrap_or("(No title)");
-        let start = ev.get("start").and_then(|s| s.get("dateTime").or_else(|| s.get("date")).and_then(|v| v.as_str())).unwrap_or("?");
-        let end = ev.get("end").and_then(|s| s.get("dateTime").or_else(|| s.get("date")).and_then(|v| v.as_str())).unwrap_or("?");
+        let title = ev
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(No title)");
+        let start = ev
+            .get("start")
+            .and_then(|s| {
+                s.get("dateTime")
+                    .or_else(|| s.get("date"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("?");
+        let end = ev
+            .get("end")
+            .and_then(|s| {
+                s.get("dateTime")
+                    .or_else(|| s.get("date"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("?");
         let loc = ev.get("location").and_then(|v| v.as_str()).unwrap_or("");
         out.push_str(&format!("{}. {} ({}~{})", i + 1, title, start, end));
-        if !loc.is_empty() { out.push_str(&format!(" @ {loc}")); }
+        if !loc.is_empty() {
+            out.push_str(&format!(" @ {loc}"));
+        }
         out.push('\n');
     }
     out
@@ -492,12 +542,26 @@ fn format_outlook_events(data: &serde_json::Value) -> String {
     };
     let mut out = format!("Found {} upcoming event(s):\n\n", items.len());
     for (i, ev) in items.iter().enumerate() {
-        let title = ev.get("subject").and_then(|v| v.as_str()).unwrap_or("(No title)");
-        let start = ev.pointer("/start/dateTime").and_then(|v| v.as_str()).unwrap_or("?");
-        let end = ev.pointer("/end/dateTime").and_then(|v| v.as_str()).unwrap_or("?");
-        let loc = ev.pointer("/location/displayName").and_then(|v| v.as_str()).unwrap_or("");
+        let title = ev
+            .get("subject")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(No title)");
+        let start = ev
+            .pointer("/start/dateTime")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let end = ev
+            .pointer("/end/dateTime")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let loc = ev
+            .pointer("/location/displayName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         out.push_str(&format!("{}. {} ({}~{})", i + 1, title, start, end));
-        if !loc.is_empty() { out.push_str(&format!(" @ {loc}")); }
+        if !loc.is_empty() {
+            out.push_str(&format!(" @ {loc}"));
+        }
         out.push('\n');
     }
     out
@@ -510,12 +574,26 @@ fn format_kakao_events(data: &serde_json::Value) -> String {
     };
     let mut out = format!("톡캘린더: {} 건의 일정\n\n", events.len());
     for (i, ev) in events.iter().enumerate() {
-        let title = ev.get("title").and_then(|v| v.as_str()).unwrap_or("(제목 없음)");
-        let start = ev.pointer("/time/start_at").and_then(|v| v.as_str()).unwrap_or("?");
-        let end = ev.pointer("/time/end_at").and_then(|v| v.as_str()).unwrap_or("?");
-        let loc = ev.pointer("/location/name").and_then(|v| v.as_str()).unwrap_or("");
+        let title = ev
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(제목 없음)");
+        let start = ev
+            .pointer("/time/start_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let end = ev
+            .pointer("/time/end_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let loc = ev
+            .pointer("/location/name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         out.push_str(&format!("{}. {} ({}~{})", i + 1, title, start, end));
-        if !loc.is_empty() { out.push_str(&format!(" @ {loc}")); }
+        if !loc.is_empty() {
+            out.push_str(&format!(" @ {loc}"));
+        }
         out.push('\n');
     }
     out
@@ -570,7 +648,10 @@ mod tests {
 
     #[test]
     fn format_google_events_empty() {
-        assert_eq!(format_google_events(&json!({"items": []})), "No upcoming events found.");
+        assert_eq!(
+            format_google_events(&json!({"items": []})),
+            "No upcoming events found."
+        );
     }
 
     #[test]
@@ -583,7 +664,10 @@ mod tests {
 
     #[test]
     fn format_outlook_events_empty() {
-        assert_eq!(format_outlook_events(&json!({"value": []})), "No upcoming events found.");
+        assert_eq!(
+            format_outlook_events(&json!({"value": []})),
+            "No upcoming events found."
+        );
     }
 
     #[test]
@@ -614,15 +698,20 @@ mod tests {
     #[tokio::test]
     async fn calendar_create_missing_title_fails() {
         let tool = CalendarCreateEventTool::new(CalendarProvider::Google {
-            access_token: "t".into(), calendar_id: "primary".into(),
+            access_token: "t".into(),
+            calendar_id: "primary".into(),
         });
-        assert!(tool.execute(json!({"start_time": "2026-03-30T10:00:00+09:00"})).await.is_err());
+        assert!(tool
+            .execute(json!({"start_time": "2026-03-30T10:00:00+09:00"}))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
     async fn calendar_create_missing_start_fails() {
         let tool = CalendarCreateEventTool::new(CalendarProvider::Kakao {
-            access_token: "t".into(), calendar_id: None,
+            access_token: "t".into(),
+            calendar_id: None,
         });
         assert!(tool.execute(json!({"title": "Test"})).await.is_err());
     }

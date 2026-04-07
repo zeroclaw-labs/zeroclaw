@@ -623,9 +623,7 @@ impl AuthStore {
             )
             .unwrap_or_default();
         if !table_sql.contains("device_id") {
-            let _ = conn.execute_batch(
-                "ALTER TABLE channel_links ADD COLUMN device_id TEXT;",
-            );
+            let _ = conn.execute_batch("ALTER TABLE channel_links ADD COLUMN device_id TEXT;");
         }
         if !table_sql.contains("autonomy_mode") {
             let _ = conn.execute_batch(
@@ -681,7 +679,8 @@ impl AuthStore {
                 Ok(ChannelLink {
                     user_id: row.get(0)?,
                     device_id: row.get(1)?,
-                    autonomy_mode: row.get::<_, String>(2)
+                    autonomy_mode: row
+                        .get::<_, String>(2)
                         .unwrap_or_else(|_| "read_only".into()),
                     user: User {
                         id: row.get(3)?,

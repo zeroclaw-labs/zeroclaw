@@ -733,7 +733,9 @@ impl Channel for KakaoTalkChannel {
         match result {
             Ok(resp) => {
                 if resp.status().as_u16() == 401 {
-                    tracing::warn!("KakaoTalk health_check: 401 Unauthorized — admin key may be invalid");
+                    tracing::warn!(
+                        "KakaoTalk health_check: 401 Unauthorized — admin key may be invalid"
+                    );
                     return false;
                 }
                 resp.status().is_success()

@@ -226,7 +226,10 @@ impl Tool for CredentialRecallTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("list");
         let site = args.get("site").and_then(|v| v.as_str()).unwrap_or("");
         let label = args.get("label").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -326,14 +329,18 @@ impl Tool for CredentialRecallTool {
 
                 Ok(ToolResult {
                     success: true,
-                    output: format!("Deleted {removed} credential(s) for site={site}, label={label}"),
+                    output: format!(
+                        "Deleted {removed} credential(s) for site={site}, label={label}"
+                    ),
                     error: None,
                 })
             }
             _ => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Unknown action: {action}. Use 'list', 'get', or 'delete'.")),
+                error: Some(format!(
+                    "Unknown action: {action}. Use 'list', 'get', or 'delete'."
+                )),
             }),
         }
     }

@@ -314,10 +314,7 @@ const MAX_CONVERSATION_CONTEXT_BYTES: usize = 15_000;
 
 fn build_recent_conversation_context(history: &[ChatMessage]) -> String {
     // Collect non-system turns (skip the system prompt at index 0)
-    let turns: Vec<&ChatMessage> = history
-        .iter()
-        .filter(|m| m.role != "system")
-        .collect();
+    let turns: Vec<&ChatMessage> = history.iter().filter(|m| m.role != "system").collect();
 
     if turns.is_empty() {
         return String::new();

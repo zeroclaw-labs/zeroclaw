@@ -98,7 +98,7 @@ fn weblink(label: impl Into<String>, url: impl Into<String>) -> ReplyButton {
 // ── Callback data prefixes ──────────────────────────────────────────
 // Compact tokens that fit in Telegram's 64-byte callback_data limit.
 
-pub const CB_DEVICE_SELECT: &str = "moa:dev:";    // moa:dev:1, moa:dev:2
+pub const CB_DEVICE_SELECT: &str = "moa:dev:"; // moa:dev:1, moa:dev:2
 pub const CB_MODE_FULL: &str = "moa:mode:full";
 pub const CB_MODE_READONLY: &str = "moa:mode:ro";
 pub const CB_UNLINK: &str = "moa:unlink";
@@ -174,9 +174,7 @@ impl ResponseCollector {
 
         // Append a settings button to every AI response so users can always
         // access mode/device controls without knowing slash commands.
-        ChannelReply::with_buttons(full_response, vec![
-            postback("⚙️ 설정", CB_SETTINGS),
-        ])
+        ChannelReply::with_buttons(full_response, vec![postback("⚙️ 설정", CB_SETTINGS)])
     }
 }
 
@@ -205,11 +203,15 @@ pub async fn route_channel_message(
     };
 
     if !device_router.is_device_online(&device_id) {
-        let device_name = auth_store
-            .list_devices(&link.user_id)
-            .ok()
-            .and_then(|ds| ds.into_iter().find(|d| d.device_id == device_id).map(|d| d.device_name));
-        return RouteResult::DeviceOffline { device_id, device_name };
+        let device_name = auth_store.list_devices(&link.user_id).ok().and_then(|ds| {
+            ds.into_iter()
+                .find(|d| d.device_id == device_id)
+                .map(|d| d.device_name)
+        });
+        return RouteResult::DeviceOffline {
+            device_id,
+            device_name,
+        };
     }
 
     let msg_id = Uuid::new_v4().to_string();
@@ -230,15 +232,23 @@ pub async fn route_channel_message(
     };
 
     let (resp_tx, resp_rx) = mpsc::channel::<RoutedMessage>(64);
-    REMOTE_RESPONSE_CHANNELS.lock().insert(msg_id.clone(), resp_tx);
+    REMOTE_RESPONSE_CHANNELS
+        .lock()
+        .insert(msg_id.clone(), resp_tx);
 
     if let Err(err) = device_router.send_to_device(&device_id, routed).await {
         tracing::warn!(device_id, "Channel → device send failed: {err}");
         REMOTE_RESPONSE_CHANNELS.lock().remove(&msg_id);
-        return RouteResult::DeviceOffline { device_id, device_name: None };
+        return RouteResult::DeviceOffline {
+            device_id,
+            device_name: None,
+        };
     }
 
-    RouteResult::Delivered { msg_id, response_rx: resp_rx }
+    RouteResult::Delivered {
+        msg_id,
+        response_rx: resp_rx,
+    }
 }
 
 // ── Button-Based Command Handling ───────────────────────────────────
@@ -257,10 +267,7 @@ pub fn handle_channel_command(
     let trimmed = message.trim();
 
     // ── Settings menu ──
-    if trimmed == CB_SETTINGS
-        || trimmed == "/설정"
-        || trimmed.eq_ignore_ascii_case("/settings")
-    {
+    if trimmed == CB_SETTINGS || trimmed == "/설정" || trimmed.eq_ignore_ascii_case("/settings") {
         return Some(settings_menu(auth_store, channel, platform_uid));
     }
 
@@ -269,7 +276,12 @@ pub fn handle_channel_command(
         || trimmed == "/디바이스"
         || trimmed.eq_ignore_ascii_case("/device")
     {
-        return Some(device_list_reply(auth_store, device_router, channel, platform_uid));
+        return Some(device_list_reply(
+            auth_store,
+            device_router,
+            channel,
+            platform_uid,
+        ));
     }
 
     // ── Device selection by callback: moa:dev:1 ──
@@ -292,7 +304,8 @@ pub fn handle_channel_command(
             ],
         ));
     }
-    if trimmed == CB_MODE_READONLY || trimmed == "/모드 읽기전용" || trimmed == "/모드 안전" {
+    if trimmed == CB_MODE_READONLY || trimmed == "/모드 읽기전용" || trimmed == "/모드 안전"
+    {
         let _ = auth_store.set_channel_autonomy_mode(channel, platform_uid, "read_only");
         return Some(ChannelReply::with_buttons(
             "🔒 안전 모드로 전환되었습니다.\n\n대화 내용은 계속 기억에 저장됩니다.\n검색, 기억 조회가 가능하며, 파일 수정과 명령 실행은 제한됩니다.",
@@ -328,11 +341,7 @@ pub fn handle_channel_command(
 }
 
 /// Build the settings menu with buttons.
-fn settings_menu(
-    auth_store: &AuthStore,
-    channel: &str,
-    platform_uid: &str,
-) -> ChannelReply {
+fn settings_menu(auth_store: &AuthStore, channel: &str, platform_uid: &str) -> ChannelReply {
     let current_mode = auth_store
         .find_channel_link_full(channel, platform_uid)
         .ok()
@@ -375,10 +384,17 @@ fn device_list_reply(
     channel: &str,
     platform_uid: &str,
 ) -> ChannelReply {
-    let link = match auth_store.find_channel_link_full(channel, platform_uid).ok().flatten() {
-        Some(l) => l,
-        None => return ChannelReply::text("MoA 계정이 연결되어 있지 않습니다.\n아무 메시지를 보내면 연결 안내가 표시됩니다."),
-    };
+    let link =
+        match auth_store
+            .find_channel_link_full(channel, platform_uid)
+            .ok()
+            .flatten()
+        {
+            Some(l) => l,
+            None => return ChannelReply::text(
+                "MoA 계정이 연결되어 있지 않습니다.\n아무 메시지를 보내면 연결 안내가 표시됩니다.",
+            ),
+        };
     let devices = match auth_store.list_devices(&link.user_id).ok() {
         Some(d) => d,
         None => return ChannelReply::text("디바이스 목록을 확인할 수 없습니다."),
@@ -388,7 +404,10 @@ fn device_list_reply(
     }
     if devices.len() == 1 {
         return ChannelReply::with_buttons(
-            format!("현재 연결된 디바이스: {}\n디바이스가 1대뿐이므로 변경할 수 없습니다.", devices[0].device_name),
+            format!(
+                "현재 연결된 디바이스: {}\n디바이스가 1대뿐이므로 변경할 수 없습니다.",
+                devices[0].device_name
+            ),
             vec![postback("⚙️ 설정으로 돌아가기", CB_SETTINGS)],
         );
     }
@@ -396,9 +415,23 @@ fn device_list_reply(
     let mut text = "📱 디바이스를 선택하세요\n".to_string();
     let mut buttons = Vec::new();
     for (i, d) in devices.iter().enumerate() {
-        let online = if device_router.is_device_online(&d.device_id) { "🟢" } else { "⚪" };
-        let current = if link.device_id.as_deref() == Some(&d.device_id) { " ✓" } else { "" };
-        text.push_str(&format!("\n{} {} {}{}", i + 1, online, d.device_name, current));
+        let online = if device_router.is_device_online(&d.device_id) {
+            "🟢"
+        } else {
+            "⚪"
+        };
+        let current = if link.device_id.as_deref() == Some(&d.device_id) {
+            " ✓"
+        } else {
+            ""
+        };
+        text.push_str(&format!(
+            "\n{} {} {}{}",
+            i + 1,
+            online,
+            d.device_name,
+            current
+        ));
         buttons.push(postback(
             format!("{} {}", online, d.device_name),
             format!("{}{}", CB_DEVICE_SELECT, i + 1),
@@ -418,7 +451,11 @@ fn select_device(
         Ok(n) => n,
         Err(_) => return ChannelReply::text("올바른 번호를 입력해 주세요."),
     };
-    let link = match auth_store.find_channel_link_full(channel, platform_uid).ok().flatten() {
+    let link = match auth_store
+        .find_channel_link_full(channel, platform_uid)
+        .ok()
+        .flatten()
+    {
         Some(l) => l,
         None => return ChannelReply::text("연결 정보를 찾을 수 없습니다."),
     };
@@ -432,7 +469,10 @@ fn select_device(
     let target = &devices[num - 1];
     let _ = auth_store.update_channel_device(channel, platform_uid, &target.device_id);
     ChannelReply::with_buttons(
-        format!("✅ '{}'(으)로 연결되었습니다.\n이제 메시지를 보내면 이 디바이스의 MoA가 답변합니다.", target.device_name),
+        format!(
+            "✅ '{}'(으)로 연결되었습니다.\n이제 메시지를 보내면 이 디바이스의 MoA가 답변합니다.",
+            target.device_name
+        ),
         vec![postback("⚙️ 설정", CB_SETTINGS)],
     )
 }
@@ -440,11 +480,7 @@ fn select_device(
 // ── Onboarding Messages ─────────────────────────────────────────────
 
 /// Generate the onboarding auth URL.
-pub fn build_onboarding_url(
-    gateway_url: &str,
-    channel: &str,
-    platform_uid: &str,
-) -> String {
+pub fn build_onboarding_url(gateway_url: &str, channel: &str, platform_uid: &str) -> String {
     let encoded_uid = urlencoding::encode(platform_uid);
     format!("{gateway_url}/auth?channel_link={channel}&platform_uid={encoded_uid}")
 }
@@ -464,10 +500,15 @@ pub fn device_selection_reply(
     devices: &[crate::auth::store::Device],
     device_router: &DeviceRouter,
 ) -> ChannelReply {
-    let mut text = "MoA 앱이 여러 디바이스에 설치되어 있습니다.\n어떤 디바이스와 대화할까요?\n".to_string();
+    let mut text =
+        "MoA 앱이 여러 디바이스에 설치되어 있습니다.\n어떤 디바이스와 대화할까요?\n".to_string();
     let mut buttons = Vec::new();
     for (i, d) in devices.iter().enumerate() {
-        let online = if device_router.is_device_online(&d.device_id) { "🟢" } else { "⚪" };
+        let online = if device_router.is_device_online(&d.device_id) {
+            "🟢"
+        } else {
+            "⚪"
+        };
         text.push_str(&format!("\n{} {} — {}", i + 1, d.device_name, online));
         buttons.push(postback(
             format!("{} {}", online, d.device_name),
@@ -490,8 +531,11 @@ pub fn device_offline_reply(device_name: Option<&str>) -> ChannelReply {
                  MoA 앱이 실행 중인지 확인해 주세요."
             .into(),
     };
-    ChannelReply::with_buttons(text, vec![
-        postback("📱 다른 디바이스 선택", CB_DEVICE_LIST),
-        postback("⚙️ 설정", CB_SETTINGS),
-    ])
+    ChannelReply::with_buttons(
+        text,
+        vec![
+            postback("📱 다른 디바이스 선택", CB_DEVICE_LIST),
+            postback("⚙️ 설정", CB_SETTINGS),
+        ],
+    )
 }

@@ -3545,9 +3545,12 @@ mod tests {
         // Manually insert a dummy handle
         {
             let mut guard = ch.typing_handles.lock();
-            guard.insert("123".to_string(), tokio::spawn(async {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }));
+            guard.insert(
+                "123".to_string(),
+                tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }),
+            );
         }
 
         // stop_typing should abort and clear
@@ -3564,9 +3567,12 @@ mod tests {
         // Insert a dummy handle first
         {
             let mut guard = ch.typing_handles.lock();
-            guard.insert("123".to_string(), tokio::spawn(async {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }));
+            guard.insert(
+                "123".to_string(),
+                tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }),
+            );
         }
 
         // start_typing should abort the old handle and set a new one

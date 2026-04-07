@@ -299,17 +299,23 @@ fn detect_attachment_regions(content: &str) -> Vec<AttachmentRegion> {
         }
 
         // ── Search results (3+ consecutive URL lines) ──
-        if line.starts_with("http://") || line.starts_with("https://")
-            || line.contains("](http") || line.contains("출처:") || line.contains("Source:")
+        if line.starts_with("http://")
+            || line.starts_with("https://")
+            || line.contains("](http")
+            || line.contains("출처:")
+            || line.contains("Source:")
         {
             let block_start = line_starts[i];
             let mut j = i + 1;
             let mut url_count = 1;
             while j < lines.len() {
                 let l = lines[j].trim();
-                if l.contains("http://") || l.contains("https://")
-                    || l.contains("출처:") || l.contains("Source:")
-                    || l.starts_with("- ") || l.starts_with("* ")
+                if l.contains("http://")
+                    || l.contains("https://")
+                    || l.contains("출처:")
+                    || l.contains("Source:")
+                    || l.starts_with("- ")
+                    || l.starts_with("* ")
                 {
                     url_count += 1;
                     j += 1;
@@ -352,8 +358,11 @@ fn detect_attachment_regions(content: &str) -> Vec<AttachmentRegion> {
                     } else {
                         break;
                     }
-                } else if l.starts_with('}') || l.starts_with(']') || l.starts_with('|')
-                    || l.starts_with('"') || l.starts_with('{')
+                } else if l.starts_with('}')
+                    || l.starts_with(']')
+                    || l.starts_with('|')
+                    || l.starts_with('"')
+                    || l.starts_with('{')
                 {
                     j += 1;
                 } else {
@@ -378,8 +387,11 @@ fn detect_attachment_regions(content: &str) -> Vec<AttachmentRegion> {
         }
 
         // ── Document markers (explicit file references) ──
-        if line.contains("[Document:") || line.contains("[PDF:") || line.contains("[IMAGE:")
-            || line.contains("[HWPX:") || line.contains("[DOCX:")
+        if line.contains("[Document:")
+            || line.contains("[PDF:")
+            || line.contains("[IMAGE:")
+            || line.contains("[HWPX:")
+            || line.contains("[DOCX:")
         {
             let block_start = line_starts[i];
             // Scan forward to find the end of the document content
@@ -420,7 +432,11 @@ fn build_attachment_memo(text: &str, kind: &AttachmentKind) -> String {
         .lines()
         .find(|l| l.trim().len() > 3)
         .map(|l| {
-            let t = l.trim().trim_start_matches('#').trim_start_matches('>').trim();
+            let t = l
+                .trim()
+                .trim_start_matches('#')
+                .trim_start_matches('>')
+                .trim();
             if t.chars().count() > 80 {
                 format!("{}...", t.chars().take(77).collect::<String>())
             } else {
@@ -435,9 +451,27 @@ fn build_attachment_memo(text: &str, kind: &AttachmentKind) -> String {
         .filter(|w| {
             let clean = w.trim_matches(|c: char| !c.is_alphanumeric());
             clean.chars().count() > 3
-                && !matches!(clean, "the" | "and" | "for" | "that" | "this" | "with"
-                    | "from" | "have" | "been" | "were" | "are" | "있는" | "하는"
-                    | "것이" | "에서" | "으로" | "대한" | "통해")
+                && !matches!(
+                    clean,
+                    "the"
+                        | "and"
+                        | "for"
+                        | "that"
+                        | "this"
+                        | "with"
+                        | "from"
+                        | "have"
+                        | "been"
+                        | "were"
+                        | "are"
+                        | "있는"
+                        | "하는"
+                        | "것이"
+                        | "에서"
+                        | "으로"
+                        | "대한"
+                        | "통해"
+                )
         })
         .take(8)
         .collect();
@@ -445,7 +479,9 @@ fn build_attachment_memo(text: &str, kind: &AttachmentKind) -> String {
     // Extract first ~summary_budget chars as summary
     let summary: String = text
         .lines()
-        .filter(|l| !l.trim().is_empty() && !l.trim().starts_with("```") && !l.trim().starts_with(">"))
+        .filter(|l| {
+            !l.trim().is_empty() && !l.trim().starts_with("```") && !l.trim().starts_with(">")
+        })
         .take(5)
         .flat_map(|l| l.chars().chain(std::iter::once(' ')))
         .take(summary_budget)
@@ -587,7 +623,10 @@ mod tests {
 
     #[test]
     fn memo_substitute_long_blockquote_compressed() {
-        let lines = (0..100).map(|i| format!("> 인용문 라인 {i}")).collect::<Vec<_>>().join("\n");
+        let lines = (0..100)
+            .map(|i| format!("> 인용문 라인 {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let msg = format!("다음은 인용문입니다:\n{lines}\n위 내용을 요약하면");
         let result = memo_substitute_attachments(&msg);
         assert!(result.is_some());

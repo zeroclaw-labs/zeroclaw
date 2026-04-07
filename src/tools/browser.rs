@@ -936,7 +936,10 @@ impl BrowserTool {
 
         // Fallback: try to parse as generic JSON
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&resp_text) {
-            let success = json.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+            let success = json
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let data = json.get("data").cloned().unwrap_or(Value::Null);
             let error = json.get("error").and_then(|v| v.as_str()).map(String::from);
 
@@ -995,7 +998,11 @@ impl BrowserTool {
 
         tracing::info!("Starting Playwright browser daemon on port {port}");
 
-        let headless_flag = if self.playwright_headless { "--headless" } else { "--headed" };
+        let headless_flag = if self.playwright_headless {
+            "--headless"
+        } else {
+            "--headed"
+        };
         let _child = std::process::Command::new(&self.playwright_command)
             .arg(&daemon_script)
             .arg("--port")

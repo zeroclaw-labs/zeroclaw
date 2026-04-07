@@ -40,7 +40,9 @@ mod history;
 mod parsing;
 mod promotion;
 
-use context::{build_context, build_cross_session_context, build_hardware_context, AceContextResult};
+use context::{
+    build_context, build_cross_session_context, build_hardware_context, AceContextResult,
+};
 use detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
 use execution::{
     execute_tools_parallel, execute_tools_sequential, should_execute_tools_in_parallel,
@@ -2756,8 +2758,18 @@ pub async fn run(
 
         // ACE Layer 2: Unified context — profile + RAG memory + ontology + cross-search + Layer 3 budget guard
         let ace_budget = config.agent.session.ace_total_budget_chars;
-        let AceContextResult { context: mem_context, trimmed_memories_notice: trimmed_notice } =
-            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score, None, ontology_repo.as_ref(), ace_budget).await;
+        let AceContextResult {
+            context: mem_context,
+            trimmed_memories_notice: trimmed_notice,
+        } = build_context(
+            mem.as_ref(),
+            &msg,
+            config.memory.min_relevance_score,
+            None,
+            ontology_repo.as_ref(),
+            ace_budget,
+        )
+        .await;
 
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
@@ -3003,7 +3015,10 @@ pub async fn run(
             }
 
             // Inject memory + ontology + hardware RAG context into user message
-            let AceContextResult { context: mem_context, .. } = build_context(
+            let AceContextResult {
+                context: mem_context,
+                ..
+            } = build_context(
                 mem.as_ref(),
                 &user_input,
                 config.memory.min_relevance_score,
@@ -3179,7 +3194,8 @@ pub async fn run(
             // Instead of fixed message count, we measure the total chars in history
             // and compact when it exceeds the ACE budget. This preserves more recent
             // context while still preventing unbounded growth.
-            let total_history_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
+            let total_history_chars: usize =
+                history.iter().map(|m| m.content.chars().count()).sum();
             let ace_budget = config.agent.session.ace_total_budget_chars;
 
             if total_history_chars > ace_budget {
@@ -3471,7 +3487,10 @@ pub async fn process_message_with_session(
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
 
     let ontology_repo = crate::ontology::OntologyRepo::open(&config.workspace_dir).ok();
-    let AceContextResult { context: mem_context, .. } = build_context(
+    let AceContextResult {
+        context: mem_context,
+        ..
+    } = build_context(
         mem.as_ref(),
         message,
         config.memory.min_relevance_score,
@@ -3583,8 +3602,7 @@ pub async fn process_message_with_session(
             // Without this, ontology objects are never created from gateway chat,
             // and cross-search (Phase 3-4) has no data to work with.
             if config.memory.auto_save {
-                let ontology_repo =
-                    crate::ontology::OntologyRepo::open(&config.workspace_dir).ok();
+                let ontology_repo = crate::ontology::OntologyRepo::open(&config.workspace_dir).ok();
                 promote_turn(
                     &mem,
                     ontology_repo.as_ref(),
@@ -5712,7 +5730,8 @@ Tail"#;
         .await
         .unwrap();
 
-        let AceContextResult { context, .. } = build_context(&mem, "status updates", 0.0, None, None, 2_000_000).await;
+        let AceContextResult { context, .. } =
+            build_context(&mem, "status updates", 0.0, None, None, 2_000_000).await;
         assert!(context.contains("user_msg_real"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));

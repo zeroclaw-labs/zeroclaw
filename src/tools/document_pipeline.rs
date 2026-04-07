@@ -443,11 +443,13 @@ impl DocumentPipelineTool {
                 match ext {
                     "docx" => {
                         let text = super::docx_read::extract_docx_text_from_path(path)?;
-                        let html = format!("<div class=\"docx-content\">{}</div>",
+                        let html = format!(
+                            "<div class=\"docx-content\">{}</div>",
                             text.lines()
                                 .map(|l| format!("<p>{}</p>", html_escape(l)))
                                 .collect::<Vec<_>>()
-                                .join("\n"));
+                                .join("\n")
+                        );
                         return Ok(DocumentOutput {
                             markdown: text.clone(),
                             html,
@@ -469,11 +471,13 @@ impl DocumentPipelineTool {
                     }
                     "pptx" => {
                         let text = super::pptx_read::extract_pptx_text_from_path(path)?;
-                        let html = format!("<div class=\"pptx-content\">{}</div>",
+                        let html = format!(
+                            "<div class=\"pptx-content\">{}</div>",
                             text.lines()
                                 .map(|l| format!("<p>{}</p>", html_escape(l)))
                                 .collect::<Vec<_>>()
-                                .join("\n"));
+                                .join("\n")
+                        );
                         return Ok(DocumentOutput {
                             markdown: text,
                             html,
@@ -848,7 +852,8 @@ impl Tool for DocumentPipelineTool {
                 };
 
                 // Auto-save to long-term memory for future recall
-                let file_name = path.file_name()
+                let file_name = path
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("unknown");
                 let memory_note = format!(
@@ -858,7 +863,8 @@ impl Tool for DocumentPipelineTool {
                 );
 
                 let markdown_content = if output.markdown.len() > 50000 {
-                    let end = output.markdown
+                    let end = output
+                        .markdown
                         .char_indices()
                         .take_while(|(i, _)| *i < 50000)
                         .last()
