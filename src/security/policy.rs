@@ -1221,8 +1221,11 @@ impl SecurityPolicy {
                 return false;
             }
 
-            // Validate arguments for the command
-            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+            // Validate arguments for the command.
+            // Pass args without lowercasing — is_args_safe must do its own
+            // case-folding where needed. Lowercasing here caused git -C
+            // (change directory) to collide with -c (config injection).
+            let args: Vec<String> = words.map(|w| w.to_string()).collect();
             if !self.is_args_safe(base_cmd, &args) {
                 return false;
             }
@@ -1241,17 +1244,23 @@ impl SecurityPolicy {
         match base.as_str() {
             "find" => {
                 // find -exec and find -ok allow arbitrary command execution
-                !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
+                !args.iter().any(|arg| {
+                    let lower = arg.to_ascii_lowercase();
+                    lower == "-exec" || lower == "-ok"
+                })
             }
             "git" => {
-                // git config, alias, and -c can be used to set dangerous options
-                // (e.g. git config core.editor "rm -rf /")
+                // git config, alias, and -c (lowercase only) can be used to set
+                // dangerous options (e.g. git config core.editor "rm -rf /").
+                // Use case-sensitive comparison: -C (uppercase) is the safe
+                // "change directory" flag and must not be conflated with -c.
                 !args.iter().any(|arg| {
-                    arg == "config"
-                        || arg.starts_with("config.")
-                        || arg == "alias"
-                        || arg.starts_with("alias.")
-                        || arg == "-c"
+                    let lower = arg.to_ascii_lowercase();
+                    lower == "config"
+                        || lower.starts_with("config.")
+                        || lower == "alias"
+                        || lower.starts_with("alias.")
+                        || arg == "-c"  // case-sensitive: -C is safe, -c is not
                 })
             }
             _ => true,
