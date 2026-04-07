@@ -33,7 +33,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ── Docs base URL ───────────────────────────────────────────────────
 
-const DOCS_BASE: &str = "https://www.zeroclawlabs.ai/docs";
+const DOCS_BASE: &str = "https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/README.md";
 
 // ── Screens ─────────────────────────────────────────────────────────
 
@@ -1646,7 +1646,7 @@ fn render_security(frame: &mut Frame, area: Rect) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            format!("Must read: {DOCS_BASE}/gateway/security"),
+            format!("Must read: {DOCS_BASE}"),
             theme::dim_style(),
         )),
     ];
@@ -2241,7 +2241,7 @@ fn render_how_channels_work(frame: &mut Frame, area: Rect) {
             theme::body_style(),
         )),
         Line::from(Span::styled(
-            format!("  Docs: {DOCS_BASE}/channels/pairing"),
+            format!("  Docs: {DOCS_BASE}"),
             theme::dim_style(),
         )),
         Line::from(""),
@@ -2371,7 +2371,7 @@ fn render_web_search_info(frame: &mut Frame, area: Rect) {
                 )),
                 Line::from(Span::styled("  key-free.", theme::body_style())),
                 Line::from(Span::styled(
-                    format!("  Docs: {DOCS_BASE}/tools/web"),
+                    format!("  Docs: {DOCS_BASE}"),
                     theme::dim_style(),
                 )),
                 Line::from(""),
@@ -2548,7 +2548,7 @@ fn render_hooks_info(frame: &mut Frame, area: Rect) {
                 Line::from(Span::styled("  /reset.", theme::body_style())),
                 Line::from(""),
                 Line::from(Span::styled(
-                    format!("  Learn more: {DOCS_BASE}/automation/hooks"),
+                    format!("  Learn more: {DOCS_BASE}"),
                     theme::dim_style(),
                 )),
                 Line::from(""),
@@ -2668,14 +2668,7 @@ fn render_health_check(frame: &mut Frame, area: Rect, _app: &App) {
             lines: vec![
                 Line::from(""),
                 Line::from(Span::styled("  Docs:", theme::dim_style())),
-                Line::from(Span::styled(
-                    format!("  {DOCS_BASE}/gateway/health"),
-                    theme::dim_style(),
-                )),
-                Line::from(Span::styled(
-                    format!("  {DOCS_BASE}/gateway/troubleshooting"),
-                    theme::dim_style(),
-                )),
+                Line::from(Span::styled(format!("  {DOCS_BASE}"), theme::dim_style())),
                 Line::from(""),
             ],
         },
@@ -2795,7 +2788,7 @@ fn render_control_ui(frame: &mut Frame, area: Rect, app: &App) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        format!("  Docs: {DOCS_BASE}/web/control-ui"),
+        format!("  Docs: {DOCS_BASE}"),
         theme::dim_style(),
     )));
     lines.push(Line::from(""));
@@ -2843,7 +2836,7 @@ fn render_workspace_backup(frame: &mut Frame, area: Rect) {
                     theme::body_style(),
                 )),
                 Line::from(Span::styled(
-                    format!("  Docs: {DOCS_BASE}/concepts/agent-workspace"),
+                    format!("  Docs: {DOCS_BASE}"),
                     theme::dim_style(),
                 )),
                 Line::from(""),
@@ -2876,10 +2869,7 @@ fn render_final_security(frame: &mut Frame, area: Rect) {
                     "  Running agents on your computer is risky \u{2014} harden your setup:",
                     theme::body_style(),
                 )),
-                Line::from(Span::styled(
-                    format!("  {DOCS_BASE}/security"),
-                    theme::dim_style(),
-                )),
+                Line::from(Span::styled(format!("  {DOCS_BASE}"), theme::dim_style())),
                 Line::from(""),
             ],
         },
@@ -2931,7 +2921,7 @@ fn render_web_search_confirm(frame: &mut Frame, area: Rect, app: &App) {
                     ),
                 ]),
                 Line::from(Span::styled(
-                    format!("  Docs: {DOCS_BASE}/tools/web"),
+                    format!("  Docs: {DOCS_BASE}"),
                     theme::dim_style(),
                 )),
                 Line::from(""),
@@ -2961,7 +2951,7 @@ fn render_what_now(frame: &mut Frame, area: Rect) {
             lines: vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  What now: https://zeroclawlabs.ai/showcase",
+                    "  What now: https://github.com/zeroclaw-labs/zeroclaw",
                     theme::body_style(),
                 )),
                 Line::from(Span::styled(
@@ -3723,5 +3713,23 @@ mod tests {
             let _: Config = toml::from_str(&toml_str)
                 .unwrap_or_else(|e| panic!("failed to deserialize config for {channel_name}: {e}"));
         }
+    }
+
+    #[test]
+    fn docs_base_points_to_github() {
+        assert!(
+            DOCS_BASE.contains("github.com/zeroclaw-labs/zeroclaw"),
+            "DOCS_BASE should point to GitHub repo, got: {}",
+            DOCS_BASE
+        );
+    }
+
+    #[test]
+    fn all_doc_references_use_base_only() {
+        let base = DOCS_BASE;
+        assert!(
+            base.contains("docs/README.md") || base.contains("/docs"),
+            "DOCS_BASE should reference docs folder"
+        );
     }
 }

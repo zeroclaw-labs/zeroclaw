@@ -1208,7 +1208,7 @@ if [[ "$DOCKER_MODE" == true ]]; then
   echo -e "  ${DIM}zeroclaw agent -m \"Hello, ZeroClaw!\"${RESET}"
   echo -e "  ${DIM}zeroclaw gateway${RESET}"
   echo
-  echo -e "${BOLD}Docs:${RESET} ${BLUE}https://www.zeroclawlabs.ai/docs${RESET}"
+  echo -e "${BOLD}Docs:${RESET} ${BLUE}https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/README.md${RESET}"
   exit 0
 fi
 
@@ -1566,5 +1566,5 @@ if [[ "$DEVICE_CLASS" == "desktop" ]]; then
   fi
 fi
 echo
-echo -e "${BOLD}Docs:${RESET} ${BLUE}https://www.zeroclawlabs.ai/docs${RESET}"
+echo -e "${BOLD}Docs:${RESET} ${BLUE}https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/README.md${RESET}"
 echo
