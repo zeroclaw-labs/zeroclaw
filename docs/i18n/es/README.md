@@ -65,7 +65,7 @@ ZeroClaw es un asistente personal de IA que ejecutas en tus propios dispositivos
 Si quieres un asistente personal, de un solo usuario, que se sienta local, rápido y siempre activo, esto es lo que buscas.
 
 <p align="center">
-  <a href="https://zeroclawlabs.ai">Sitio web</a> ·
+  <a href="https://www.zeroclawlabs.ai">Sitio web</a> ·
   <a href="docs/README.md">Documentación</a> ·
   <a href="docs/architecture.md">Arquitectura</a> ·
   <a href="#inicio-rápido">Primeros pasos</a> ·
@@ -655,7 +655,7 @@ Usa estos recursos cuando hayas pasado el flujo de onboarding y quieras la refer
 
 ZeroClaw fue construido para el cangrejo suave 🦀, un asistente de IA rápido y eficiente. Construido por Argenis De La Rosa y la comunidad.
 
-- [zeroclawlabs.ai](https://zeroclawlabs.ai)
+- [zeroclawlabs.ai](https://www.zeroclawlabs.ai)
 - [@zeroclawlabs](https://x.com/zeroclawlabs)
 
 ## Apoya a ZeroClaw
