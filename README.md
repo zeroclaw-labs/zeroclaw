@@ -97,6 +97,18 @@ Runtime: Rust stable toolchain. Single binary, no runtime dependencies.
 brew install zeroclaw
 ```
 
+### Cargo binstall
+
+```bash
+cargo binstall zeroclaw
+```
+
+### Nix
+
+```bash
+nix run github:zeroclaw-labs/zeroclaw
+```
+
 ### One-click bootstrap
 
 ```bash
