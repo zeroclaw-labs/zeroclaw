@@ -2009,6 +2009,74 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AssistantChannelOutcome {
+    Reply(String),
+    NoReply { reason: Option<String> },
+}
+
+impl AssistantChannelOutcome {
+    fn history_marker(&self) -> String {
+        match self {
+            Self::Reply(text) => text.clone(),
+            Self::NoReply {
+                reason: Some(reason),
+            } if !reason.trim().is_empty() => {
+                format!("[No reply sent: {}]", reason.trim())
+            }
+            Self::NoReply { .. } => "[No reply sent]".to_string(),
+        }
+    }
+}
+
+async fn classify_channel_reply_intent(
+    provider: &dyn Provider,
+    system_prompt: &str,
+    history: &[ChatMessage],
+    model: &str,
+    temperature: f64,
+) -> anyhow::Result<AssistantChannelOutcome> {
+    let mut convo = String::from(
+        "Decide whether the assistant should send any visible reply to the latest inbound \
+         channel message.\n\nReturn exactly one of:\n- `REPLY`\n- `NO_REPLY: <short reason>`\n\n\
+         Rules:\n- Follow the workspace and channel instructions in the system prompt.\n- If the \
+         latest message is not clearly addressed to the assistant, prefer `NO_REPLY`.\n- In DMs \
+         or direct conversations, prefer `REPLY` unless the instructions explicitly say \
+         otherwise.\n- Do not answer the user. Only classify.\n\nConversation:\n",
+    );
+
+    for msg in history.iter().filter(|m| m.role != "system") {
+        let role = match msg.role.as_str() {
+            "assistant" => "assistant",
+            _ => "user",
+        };
+        let _ = writeln!(convo, "[{role}] {}", msg.content);
+    }
+
+    let response = provider
+        .chat_with_system(Some(system_prompt), &convo, model, temperature)
+        .await?;
+    let trimmed = response.trim();
+    if trimmed.is_empty() {
+        return Ok(AssistantChannelOutcome::NoReply { reason: None });
+    }
+    if trimmed.eq_ignore_ascii_case("REPLY") {
+        return Ok(AssistantChannelOutcome::Reply(String::new()));
+    }
+
+    if let Some(reason) = trimmed.strip_prefix("NO_REPLY:") {
+        let reason = reason.trim();
+        return Ok(AssistantChannelOutcome::NoReply {
+            reason: (!reason.is_empty()).then(|| reason.to_string()),
+        });
+    }
+    if trimmed.eq_ignore_ascii_case("NO_REPLY") {
+        return Ok(AssistantChannelOutcome::NoReply { reason: None });
+    }
+
+    Ok(AssistantChannelOutcome::Reply(String::new()))
+}
+
 fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
@@ -2707,6 +2775,49 @@ async fn process_channel_message(
             }
             _ => {}
         }
+    }
+
+    // ── Reply-intent precheck ────────────────────────────────────────
+    let reply_intent = classify_channel_reply_intent(
+        active_provider.as_ref(),
+        history[0].content.as_str(),
+        &history,
+        route.model.as_str(),
+        runtime_defaults.temperature,
+    )
+    .await
+    .unwrap_or(AssistantChannelOutcome::Reply(String::new()));
+
+    if let AssistantChannelOutcome::NoReply { reason } = reply_intent {
+        let history_response = AssistantChannelOutcome::NoReply {
+            reason: reason.clone(),
+        }
+        .history_marker();
+        append_sender_turn(
+            ctx.as_ref(),
+            &history_key,
+            ChatMessage::assistant(&history_response),
+        );
+        runtime_trace::record_event(
+            "channel_message_no_reply",
+            Some(msg.channel.as_str()),
+            Some(route.provider.as_str()),
+            Some(route.model.as_str()),
+            None,
+            Some(true),
+            reason.as_deref(),
+            serde_json::json!({
+                "sender": msg.sender,
+                "elapsed_ms": started_at.elapsed().as_millis(),
+                "phase": "precheck",
+            }),
+        );
+        println!(
+            "  🤖 No reply ({}ms): {}",
+            started_at.elapsed().as_millis(),
+            reason.as_deref().unwrap_or("no reason provided")
+        );
+        return;
     }
 
     let use_draft_streaming = target_channel
@@ -4987,18 +5098,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
-    let provider_runtime_options = providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
-        provider_api_url: config.api_url.clone(),
-        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
-        secrets_encrypt: config.secrets.encrypt,
-        reasoning_enabled: config.runtime.reasoning_enabled,
-        reasoning_effort: config.runtime.reasoning_effort.clone(),
-        provider_timeout_secs: Some(config.provider_timeout_secs),
-        extra_headers: config.extra_headers.clone(),
-        api_path: config.api_path.clone(),
-        provider_max_tokens: config.provider_max_tokens,
-    };
+    let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
             &provider_name,
@@ -6278,7 +6378,7 @@ mod tests {
         }
     }
 
-    /// A provider that always returns an empty reply, used to test the
+    /// A provider that always returns `NO_REPLY`, used to test the
     /// no-reply precheck path (typing indicator should not fire).
     struct NoReplyProvider;
 
@@ -6291,7 +6391,7 @@ mod tests {
             _model: &str,
             _temperature: f64,
         ) -> anyhow::Result<String> {
-            Ok(String::new())
+            Ok("NO_REPLY: not addressed to agent".to_string())
         }
     }
 
@@ -8005,8 +8105,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let elapsed = started.elapsed();
 
         assert!(
-            elapsed < Duration::from_millis(430),
-            "expected parallel dispatch (<430ms), got {:?}",
+            elapsed < Duration::from_millis(700),
+            "expected parallel dispatch with precheck (<700ms), got {:?}",
             elapsed
         );
 

@@ -79,6 +79,7 @@ Last refreshed: **February 18, 2026**.
 - [setup-guides/README.md](setup-guides/README.md)
 - [macos-update-uninstall.md](setup-guides/macos-update-uninstall.md)
 - [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)
+- [mcp-setup.md](setup-guides/mcp-setup.md)
 
 ### 2) Command/Config References & Integrations
 
