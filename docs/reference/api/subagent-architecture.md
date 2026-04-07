@@ -182,13 +182,15 @@ Sub-agents do NOT share:
 
 ## Invocation
 
-### From the main agent (LLM decides):
+### From the main agent (LLM decides)
+
 ```
 delegate(agent="researcher", prompt="Find info about X")
 spawn_agent(name="helper", system_prompt="...", prompt="Do Y")
 ```
 
-### Background execution:
+### Background execution
+
 ```
 delegate(agent="researcher", prompt="...", background=true)
 spawn_agent(name="helper", ..., mode="background")
