@@ -6139,10 +6139,7 @@ mod tests {
         // The alignment pass should also drop a1 so the first remaining is u2.
         let dropped = proactive_trim_turns(&mut turns, 20);
         assert!(dropped >= 2, "should drop u1 and a1");
-        assert_eq!(
-            turns[0].role, "user",
-            "first turn must be user after trim"
-        );
+        assert_eq!(turns[0].role, "user", "first turn must be user after trim");
         assert_eq!(turns[0].content, "u2");
     }
 
@@ -6158,10 +6155,7 @@ mod tests {
         ];
         let dropped = proactive_trim_turns(&mut turns, 20);
         assert!(dropped >= 3, "should drop u1, a1 and t1");
-        assert_eq!(
-            turns[0].role, "user",
-            "first turn must be user after trim"
-        );
+        assert_eq!(turns[0].role, "user", "first turn must be user after trim");
         assert_eq!(turns[0].content, "u2");
     }
 
