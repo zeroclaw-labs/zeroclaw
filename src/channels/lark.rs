@@ -1269,7 +1269,7 @@ impl LarkChannel {
         {
             let text = String::from_utf8_lossy(&bytes);
             let truncated = if text.len() > 50_000 {
-                let end = text.floor_char_boundary(50_000);
+                let end = crate::util::floor_char_boundary(text.as_ref(), 50_000);
                 format!("{}...\n[truncated]", &text[..end])
             } else {
                 text.into_owned()

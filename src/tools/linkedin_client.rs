@@ -1072,7 +1072,7 @@ impl ImageGenerator {
     pub fn generate_fallback_card(title: &str, accent_color: &str) -> String {
         // Truncate title to ~80 chars for clean display (UTF-8 safe)
         let display_title = if title.len() > 80 {
-            let end = title.floor_char_boundary(77);
+            let end = crate::util::floor_char_boundary(title, 77);
             format!("{}...", &title[..end])
         } else {
             title.to_string()

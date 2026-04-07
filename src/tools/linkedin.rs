@@ -234,7 +234,7 @@ impl Tool for LinkedInTool {
                         .and_then(|v| v.as_str())
                         .map(String::from)
                         .unwrap_or_else(|| {
-                            let end = text.floor_char_boundary(200);
+                            let end = crate::util::floor_char_boundary(&text, 200);
                             let display = if text.len() > 200 { &text[..end] } else { &text };
                             format!(
                                 "Professional, modern illustration for a LinkedIn post about: {display}"

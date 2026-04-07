@@ -14,6 +14,20 @@ const SERIAL_ALLOWED_PATH_PREFIXES: &[&str] = &[
     "COM",               // Windows
 ];
 
+/// Largest byte index `<= i` on a UTF-8 character boundary.
+///
+/// MSRV-compatible alternative to [`str::floor_char_boundary`] (stable in Rust 1.91).
+pub fn floor_char_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut pos = i;
+    while pos > 0 && !s.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
+}
+
 /// Returns true if the path is an allowed serial device (USB CDC, FTDI, etc.).
 /// Rejects arbitrary paths like /etc/passwd or /dev/sda.
 pub fn is_serial_path_allowed(path: &str) -> bool {
@@ -73,6 +87,19 @@ pub enum MaybeSet<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floor_char_boundary_mid_utf8() {
+        let text = "abc😀def";
+        // Byte offset 5 is inside the 4-byte emoji, so floor to char start at 3.
+        assert_eq!(floor_char_boundary(text, 5), 3);
+    }
+
+    #[test]
+    fn floor_char_boundary_past_len() {
+        let text = "hi";
+        assert_eq!(floor_char_boundary(text, usize::MAX), text.len());
+    }
 
     #[test]
     fn test_truncate_ascii_no_truncation() {

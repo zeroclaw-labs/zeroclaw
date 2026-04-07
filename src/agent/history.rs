@@ -8,19 +8,6 @@ use std::path::Path;
 /// used when callers omit the parameter.
 pub(crate) const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 
-/// Find the largest byte index `<= i` that is a valid char boundary.
-/// MSRV-compatible replacement for `str::floor_char_boundary` (stable in 1.91).
-pub(crate) fn floor_char_boundary(s: &str, i: usize) -> usize {
-    if i >= s.len() {
-        return s.len();
-    }
-    let mut pos = i;
-    while pos > 0 && !s.is_char_boundary(pos) {
-        pos -= 1;
-    }
-    pos
-}
-
 /// Truncate a tool result to `max_chars`, keeping head (2/3) + tail (1/3)
 /// with a marker in the middle. Returns input unchanged if within limit or
 /// `max_chars == 0` (disabled).
@@ -30,7 +17,7 @@ pub(crate) fn truncate_tool_result(output: &str, max_chars: usize) -> String {
     }
     let head_len = max_chars * 2 / 3;
     let tail_len = max_chars.saturating_sub(head_len);
-    let head_end = floor_char_boundary(output, head_len);
+    let head_end = crate::util::floor_char_boundary(output, head_len);
     // ceil_char_boundary: find smallest byte index >= i on a char boundary
     let tail_start_raw = output.len().saturating_sub(tail_len);
     let tail_start = if tail_start_raw >= output.len() {
@@ -44,7 +31,7 @@ pub(crate) fn truncate_tool_result(output: &str, max_chars: usize) -> String {
     };
     // Guard against overlap when max_chars is very small
     if head_end >= tail_start {
-        return output[..floor_char_boundary(output, max_chars)].to_string();
+        return output[..crate::util::floor_char_boundary(output, max_chars)].to_string();
     }
     let truncated_chars = tail_start - head_end;
     format!(

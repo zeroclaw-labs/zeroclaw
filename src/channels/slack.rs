@@ -3233,7 +3233,8 @@ fn split_text_into_chunks(text: &str, max_bytes: usize, max_chunks: usize) -> Ve
                 chunks.push(remaining.to_string());
             } else {
                 // Truncate with indicator.
-                let avail = remaining.floor_char_boundary(
+                let avail = crate::util::floor_char_boundary(
+                    remaining,
                     max_bytes.saturating_sub(SLACK_TRUNCATION_INDICATOR.len()),
                 );
                 let break_at = remaining[..avail]
@@ -3249,7 +3250,7 @@ fn split_text_into_chunks(text: &str, max_bytes: usize, max_chunks: usize) -> Ve
         }
 
         // Normal chunk: find a good break point.
-        let limit = remaining.floor_char_boundary(max_bytes);
+        let limit = crate::util::floor_char_boundary(remaining, max_bytes);
         let break_at = remaining[..limit]
             .rfind('\n')
             .map(|i| i + 1)
