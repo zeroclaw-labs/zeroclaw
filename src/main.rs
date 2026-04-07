@@ -279,7 +279,7 @@ Examples:
 Start the long-running autonomous daemon.
 
 Launches the full ZeroClaw runtime: gateway server, all configured \
-channels (Telegram, Discord, Slack, etc.), heartbeat monitor, and \
+channels (Telegram, Slack, CLI), heartbeat monitor, and \
 the cron scheduler. This is the recommended way to run ZeroClaw in \
 production or as an always-on assistant.
 
@@ -386,13 +386,12 @@ Examples:
     /// List supported AI providers
     Providers,
 
-    /// Manage channels (telegram, discord, slack)
+    /// Manage channels (telegram, slack, cli)
     #[command(long_about = "\
 Manage communication channels.
 
 Add, remove, list, send, and health-check channels that connect ZeroClaw \
-to messaging platforms. Supported channel types: telegram, discord, \
-slack, whatsapp, matrix, imessage, email.
+to messaging platforms. Supported channel types: telegram, slack, cli.
 
 Examples:
   zeroclaw channel list
@@ -1033,18 +1032,10 @@ async fn main() -> Result<()> {
         }
 
         Commands::Acp {
-            max_sessions,
-            session_timeout,
+            max_sessions: _,
+            session_timeout: _,
         } => {
-            let mut acp_config = channels::acp_server::AcpServerConfig::default();
-            if let Some(max) = max_sessions {
-                acp_config.max_sessions = max;
-            }
-            if let Some(timeout) = session_timeout {
-                acp_config.session_timeout_secs = timeout;
-            }
-            let server = channels::acp_server::AcpServer::new(config, acp_config);
-            server.run().await
+            anyhow::bail!("ACP server has been removed in this version");
         }
 
         Commands::Gateway { gateway_command } => {

@@ -40,13 +40,13 @@ fn channel_message_sender_field_holds_platform_user_id() {
 
 #[test]
 fn channel_message_reply_target_distinct_from_sender() {
-    // Simulates Discord: reply_target should be channel_id, not sender user_id
+    // Simulates Slack: reply_target should be channel_id, not sender user_id
     let msg = ChannelMessage {
         id: "msg_1".into(),
-        sender: "user_987654".into(),       // Discord user ID
-        reply_target: "channel_123".into(), // Discord channel ID for replies
+        sender: "user_987654".into(),       // Slack user ID
+        reply_target: "channel_123".into(), // Slack channel ID for replies
         content: "test message".into(),
-        channel: "discord".into(),
+        channel: "slack".into(),
         timestamp: 1700000000,
         thread_ts: None,
         interruption_scope_id: None,
@@ -55,14 +55,14 @@ fn channel_message_reply_target_distinct_from_sender() {
 
     assert_ne!(
         msg.sender, msg.reply_target,
-        "sender and reply_target should be distinct for Discord"
+        "sender and reply_target should be distinct for Slack"
     );
     assert_eq!(msg.reply_target, "channel_123");
 }
 
 #[test]
 fn channel_message_fields_not_swapped() {
-    // Guards against #496 (Telegram) and #483 (Discord) field swap bugs
+    // Guards against #496 (Telegram) field swap bugs
     let msg = ChannelMessage {
         id: "msg_42".into(),
         sender: "sender_value".into(),
@@ -139,17 +139,17 @@ fn send_message_with_subject_sets_all_fields() {
 fn send_message_recipient_carries_platform_target() {
     // Verifies that SendMessage::recipient is used as the platform delivery target
     // For Telegram: this should be the chat_id
-    // For Discord: this should be the channel_id
+    // For Slack: this should be the channel_id
     let telegram_msg = SendMessage::new("response", "123456789");
     assert_eq!(
         telegram_msg.recipient, "123456789",
         "Telegram SendMessage recipient should be chat_id"
     );
 
-    let discord_msg = SendMessage::new("response", "channel_987654");
+    let slack_msg = SendMessage::new("response", "C987654");
     assert_eq!(
-        discord_msg.recipient, "channel_987654",
-        "Discord SendMessage recipient should be channel_id"
+        slack_msg.recipient, "C987654",
+        "Slack SendMessage recipient should be channel_id"
     );
 }
 

@@ -7,7 +7,6 @@
 //! for each provider's API specification. Validates ChatMessage, ChatResponse,
 //! ToolCall, and AuthStyle serialization contracts.
 
-use zeroclaw::providers::compatible::AuthStyle;
 use zeroclaw::providers::traits::{ChatMessage, ChatResponse, ToolCall};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,75 +218,6 @@ fn chat_response_multiple_tool_calls() {
     assert_eq!(resp.tool_calls.len(), 2);
     // Each tool call should have a distinct id
     assert_ne!(resp.tool_calls[0].id, resp.tool_calls[1].id);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// AuthStyle variants
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn auth_style_bearer_is_constructible() {
-    let style = AuthStyle::Bearer;
-    assert!(matches!(style, AuthStyle::Bearer));
-}
-
-#[test]
-fn auth_style_xapikey_is_constructible() {
-    let style = AuthStyle::XApiKey;
-    assert!(matches!(style, AuthStyle::XApiKey));
-}
-
-#[test]
-fn auth_style_custom_header() {
-    let style = AuthStyle::Custom("X-Custom-Auth".into());
-    if let AuthStyle::Custom(header) = style {
-        assert_eq!(header, "X-Custom-Auth");
-    } else {
-        panic!("expected AuthStyle::Custom");
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Provider naming consistency
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn provider_construction_with_different_names() {
-    use zeroclaw::providers::compatible::OpenAiCompatibleProvider;
-
-    // Construction with various names should succeed
-    let _p1 = OpenAiCompatibleProvider::new(
-        "DeepSeek",
-        "https://api.deepseek.com",
-        Some("test-key"),
-        AuthStyle::Bearer,
-    );
-    let _p2 =
-        OpenAiCompatibleProvider::new("deepseek", "https://api.test.com", None, AuthStyle::Bearer);
-}
-
-#[test]
-fn provider_construction_with_different_auth_styles() {
-    use zeroclaw::providers::compatible::OpenAiCompatibleProvider;
-
-    let _bearer = OpenAiCompatibleProvider::new(
-        "Test",
-        "https://api.test.com",
-        Some("key"),
-        AuthStyle::Bearer,
-    );
-    let _xapi = OpenAiCompatibleProvider::new(
-        "Test",
-        "https://api.test.com",
-        Some("key"),
-        AuthStyle::XApiKey,
-    );
-    let _custom = OpenAiCompatibleProvider::new(
-        "Test",
-        "https://api.test.com",
-        Some("key"),
-        AuthStyle::Custom("X-My-Auth".into()),
-    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

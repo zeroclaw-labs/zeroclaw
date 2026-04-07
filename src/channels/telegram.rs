@@ -4905,41 +4905,6 @@ mod tests {
         );
     }
 
-    // ── Groq provider rejects photo with vision error ────────────────
-
-    /// Verify that the Groq provider (OpenAI-compatible) does not support
-    /// vision, so the existing `count_image_markers > 0 && !supports_vision()`
-    /// guard in `agent/loop_.rs` will reject photo messages.
-    #[test]
-    fn groq_provider_rejects_photo_with_vision_error() {
-        use crate::providers::Provider;
-        use crate::providers::compatible::{AuthStyle, OpenAiCompatibleProvider};
-
-        let groq = OpenAiCompatibleProvider::new(
-            "Groq",
-            "https://api.groq.com/openai",
-            Some("fake_key"),
-            AuthStyle::Bearer,
-        );
-
-        // Groq must not support vision.
-        assert!(
-            !groq.supports_vision(),
-            "Groq provider must not support vision"
-        );
-
-        // Build a message with an [IMAGE:] marker (as photo attachment would).
-        let messages = vec![crate::providers::ChatMessage::user(
-            "[IMAGE:/tmp/photo.jpg]\n\nDescribe this image".to_string(),
-        )];
-        let marker_count = crate::multimodal::count_image_markers(&messages);
-        assert_eq!(marker_count, 1, "must detect image marker in photo content");
-
-        // The combination of marker_count > 0 && !supports_vision() means
-        // the agent loop will return ProviderCapabilityError before calling
-        // the provider, and the channel will send "⚠️ Error: ..." to the user.
-    }
-
     #[test]
     fn ack_reactions_defaults_to_true() {
         let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);

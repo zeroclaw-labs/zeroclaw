@@ -302,6 +302,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));

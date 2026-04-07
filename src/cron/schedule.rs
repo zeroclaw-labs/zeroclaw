@@ -163,7 +163,6 @@ fn normalize_weekday_field(field: &str) -> Result<String> {
     Ok(result_parts.join(","))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,7 +204,7 @@ mod tests {
         let cron_both = CronExprSchedule::from_str(&both).unwrap();
         // April 2026: 1st is Wednesday. 7th is Tuesday.
         let april1 = Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).unwrap();
-        let next = cron_both.after(&april1).next().unwrap();
+        let _next = cron_both.after(&april1).next().unwrap();
         // If OR: next should be April 7 (Tuesday). Wait, April 1 is Wednesday.
         // If April 1 08:00 is INCLUDED, it should be April 1 08:00? No, 'after' is exclusive.
         let march31 = Utc.with_ymd_and_hms(2026, 3, 31, 0, 0, 0).unwrap();

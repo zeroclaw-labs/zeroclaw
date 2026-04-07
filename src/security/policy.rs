@@ -2966,7 +2966,10 @@ mod tests {
         // A command with a comment line followed by an allowed command
         let command = "# some comment\nls";
 
-        assert!(p.is_command_allowed(command), "Command with comment should be allowed");
+        assert!(
+            p.is_command_allowed(command),
+            "Command with comment should be allowed"
+        );
     }
 
     #[test]
@@ -2979,7 +2982,10 @@ mod tests {
         };
 
         let command = "# comment 1\n# comment 2\nls";
-        assert!(p.is_command_allowed(command), "Command with multiple comments should be allowed");
+        assert!(
+            p.is_command_allowed(command),
+            "Command with multiple comments should be allowed"
+        );
     }
 
     #[test]
@@ -2992,7 +2998,10 @@ mod tests {
         };
 
         let command = "# just a comment";
-        assert!(p.is_command_allowed(command), "Only comment should be allowed");
+        assert!(
+            p.is_command_allowed(command),
+            "Only comment should be allowed"
+        );
     }
 
     #[test]

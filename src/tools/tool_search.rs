@@ -224,7 +224,10 @@ impl ToolSearchTool {
             .iter()
             .enumerate()
             .filter_map(|(i, haystack)| {
-                let hits = terms.iter().filter(|t| haystack.contains(t.as_str())).count();
+                let hits = terms
+                    .iter()
+                    .filter(|t| haystack.contains(t.as_str()))
+                    .count();
                 if hits > 0 { Some((i, hits)) } else { None }
             })
             .collect();
@@ -394,7 +397,10 @@ mod tests {
     #[tokio::test]
     async fn keyword_search_finds_builtin_match() {
         let tool = ToolSearchTool::builtin_only(vec![
-            make_builtin_spec("git_operations", "Git status, diff, commit, branch operations"),
+            make_builtin_spec(
+                "git_operations",
+                "Git status, diff, commit, branch operations",
+            ),
             make_builtin_spec("shell", "Execute terminal commands"),
             make_builtin_spec("weather", "Get current weather and forecast"),
         ]);
@@ -409,9 +415,10 @@ mod tests {
 
     #[tokio::test]
     async fn select_finds_builtin_tool() {
-        let tool = ToolSearchTool::builtin_only(vec![
-            make_builtin_spec("http_request", "Make HTTP requests"),
-        ]);
+        let tool = ToolSearchTool::builtin_only(vec![make_builtin_spec(
+            "http_request",
+            "Make HTTP requests",
+        )]);
         let result = tool
             .execute(serde_json::json!({"query": "select:http_request"}))
             .await
@@ -427,7 +434,10 @@ mod tests {
         let tool = ToolSearchTool::new(
             make_deferred_set(vec![make_stub("mcp__read_file", "Read file via MCP")]).await,
             Arc::clone(&activated),
-            vec![make_builtin_spec("file_read", "Read file contents with line numbers")],
+            vec![make_builtin_spec(
+                "file_read",
+                "Read file contents with line numbers",
+            )],
         );
         let result = tool
             .execute(serde_json::json!({"query": "read file", "max_results": 10}))
@@ -546,9 +556,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_registered_noop_when_present() {
-        let mut tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(ToolSearchTool::builtin_only(vec![])),
-        ];
+        let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(ToolSearchTool::builtin_only(vec![]))];
         ensure_registered(&mut tools);
         assert_eq!(tools.len(), 1);
     }

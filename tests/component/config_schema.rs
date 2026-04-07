@@ -6,6 +6,38 @@
 use zeroclaw::config::{AutonomyConfig, ChannelsConfig, Config, GatewayConfig, SecurityConfig};
 
 // ─────────────────────────────────────────────────────────────────────────────
+// FR-014: Removed channel config keys are silently ignored
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn config_removed_channel_discord_ignored() {
+    let toml_str = r#"
+default_temperature = 0.7
+
+[channels_config.discord]
+bot_token = "test_token"
+"#;
+    let parsed: Config =
+        toml::from_str(toml_str).expect("removed channel 'discord' should be silently ignored");
+    assert!(parsed.channels_config.telegram.is_none());
+    assert!(parsed.channels_config.slack.is_none());
+}
+
+#[test]
+fn config_removed_channel_matrix_ignored() {
+    let toml_str = r#"
+[channels_config.matrix]
+homeserver = "https://matrix.example.com"
+access_token = "syt_test"
+room_id = "!abc:example.com"
+allowed_users = ["*"]
+"#;
+    let parsed: Config =
+        toml::from_str(toml_str).expect("removed channel 'matrix' should be silently ignored");
+    assert!(parsed.channels_config.telegram.is_none());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Invalid value fail-fast
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -385,13 +417,12 @@ default_temperature = 0.7
 bot_token = "test_token"
 allowed_users = ["zeroclaw_user"]
 
-[channels_config.discord]
-bot_token = "test_token"
+[channels_config.slack]
+bot_token = "xoxb-test"
 "#;
     let parsed: Config = toml::from_str(toml_str).expect("multi-channel config should parse");
     assert!(parsed.channels_config.telegram.is_some());
-    assert!(parsed.channels_config.discord.is_some());
-    assert!(parsed.channels_config.slack.is_none());
+    assert!(parsed.channels_config.slack.is_some());
 }
 
 #[test]
@@ -414,12 +445,7 @@ fn config_channels_default_cli_enabled() {
 fn config_channels_all_optional_channels_none_by_default() {
     let channels = ChannelsConfig::default();
     assert!(channels.telegram.is_none());
-    assert!(channels.discord.is_none());
     assert!(channels.slack.is_none());
-    assert!(channels.matrix.is_none());
-    assert!(channels.lark.is_none());
-    assert!(channels.feishu.is_none());
-    assert!(channels.webhook.is_none());
 }
 
 #[test]
@@ -441,19 +467,18 @@ fn config_channels_without_cli_field() {
     let toml_str = r#"
 default_temperature = 0.7
 
-[channels_config.matrix]
-homeserver = "https://matrix.example.com"
-access_token = "syt_test_token"
-room_id = "!abc123:example.com"
-allowed_users = ["@user:example.com"]
+[channels_config.telegram]
+bot_token = "test_token"
+allowed_users = ["zeroclaw_user"]
 "#;
-    let parsed: Config = toml::from_str(toml_str)
-        .expect("channels_config with only a Matrix section (no explicit cli field) should parse");
+    let parsed: Config = toml::from_str(toml_str).expect(
+        "channels_config with only a Telegram section (no explicit cli field) should parse",
+    );
     assert!(
         parsed.channels_config.cli,
         "cli should default to true when omitted"
     );
-    assert!(parsed.channels_config.matrix.is_some());
+    assert!(parsed.channels_config.telegram.is_some());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -461,62 +486,24 @@ allowed_users = ["@user:example.com"]
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn config_toplevel_cli_section_with_whatsapp_parses() {
-    // Exact config from issue #3456
+fn config_toplevel_cli_section_with_telegram_parses() {
     let toml_str = r#"
 [cli]
 
-[channels_config.whatsapp]
-session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
-allowed_numbers = ["*"]
+[channels_config.telegram]
+bot_token = "test_token"
+allowed_users = ["*"]
 "#;
     let parsed: Config = toml::from_str(toml_str)
-        .expect("top-level [cli] section with [channels_config.whatsapp] should parse");
-    assert!(parsed.channels_config.whatsapp.is_some());
-    let wa = parsed.channels_config.whatsapp.unwrap();
-    assert_eq!(
-        wa.session_path.as_deref(),
-        Some("~/.zeroclaw/state/whatsapp-web/session.db")
-    );
-    assert_eq!(wa.allowed_numbers, vec!["*".to_string()]);
-}
-
-#[test]
-fn config_only_whatsapp_channel_parses() {
-    let toml_str = r#"
-[channels_config.whatsapp]
-session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
-allowed_numbers = ["*"]
-"#;
-    let parsed: Config =
-        toml::from_str(toml_str).expect("config with only whatsapp channel should parse");
-    assert!(parsed.channels_config.whatsapp.is_some());
-    assert!(
-        parsed.channels_config.cli,
-        "cli should default to true when omitted"
-    );
-}
-
-#[test]
-fn config_channels_explicit_cli_true_with_whatsapp() {
-    let toml_str = r#"
-[channels_config]
-cli = true
-
-[channels_config.whatsapp]
-session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
-allowed_numbers = ["*"]
-"#;
-    let parsed: Config = toml::from_str(toml_str)
-        .expect("explicit channels_config.cli=true with whatsapp should parse");
-    assert!(parsed.channels_config.cli);
-    assert!(parsed.channels_config.whatsapp.is_some());
+        .expect("top-level [cli] section with [channels_config.telegram] should parse");
+    assert!(parsed.channels_config.telegram.is_some());
 }
 
 #[test]
 fn config_empty_parses_with_all_defaults() {
     let parsed: Config = toml::from_str("").expect("empty config should parse with all defaults");
     assert!(parsed.channels_config.cli);
-    assert!(parsed.channels_config.whatsapp.is_none());
+    assert!(parsed.channels_config.telegram.is_none());
+    assert!(parsed.channels_config.slack.is_none());
     assert!((parsed.default_temperature - 0.7).abs() < f64::EPSILON);
 }

@@ -132,18 +132,6 @@ Changes deferred from the project-cleanup pass. Each entry includes rationale an
 
 **Scope:** Rename module (`src/sop/` → `src/runbooks/`), update config keys (`[sop]` → `[runbooks]`), CLI subcommand (`zeroclaw sop` → `zeroclaw runbook`), all internal types (`Sop*` → `Runbook*`), docs (`docs/sop/` → matching new structure), and references in CLAUDE.md.
 
-### Consolidate i18n docs into `docs/i18n/<locale>/`
-
-**Why:** Vietnamese translations currently exist in three places: `docs/i18n/vi/` (canonical per CLAUDE.md), `docs/vi/` (stale duplicate with 17 files diverged), and `docs/*.vi.md` (5 scattered suffix files). Other locales (zh-CN, ja, ru, fr) have SUMMARY + README files scattered in `docs/` root.
-
-**Plan:**
-- Keep `docs/i18n/vi/` as canonical; delete `docs/vi/` (stale duplicate)
-- Move `docs/*.vi.md` files into `docs/i18n/vi/` at matching paths
-- Move `docs/SUMMARY.*.md` and `docs/README.*.md` into `docs/i18n/<locale>/`
-- Create `docs/i18n/{zh-CN,ja,ru,fr}/` directories with their README + SUMMARY
-- Root `README.*.md` files stay (GitHub convention)
-- Update `docs/i18n/vi/` internal structure to mirror the new English docs layout after the English restructure lands
-
 ### TODO: Fuzz testing — upgrade stubs to real coverage
 
 **Current state:** 5 fuzz targets exist in `fuzz/fuzz_targets/`, but only `fuzz_command_validation` tests real ZeroClaw code. The other 4 (`fuzz_config_parse`, `fuzz_tool_params`, `fuzz_webhook_payload`, `fuzz_provider_response`) just fuzz `serde_json::from_str::<Value>` or `toml::from_str::<Value>` — they test third-party crate internals, not ZeroClaw logic.

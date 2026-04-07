@@ -992,69 +992,9 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     if let Some(telegram) = masked.channels_config.telegram.as_mut() {
         mask_required_secret(&mut telegram.bot_token);
     }
-    if let Some(discord) = masked.channels_config.discord.as_mut() {
-        mask_required_secret(&mut discord.bot_token);
-    }
     if let Some(slack) = masked.channels_config.slack.as_mut() {
         mask_required_secret(&mut slack.bot_token);
         mask_optional_secret(&mut slack.app_token);
-    }
-    if let Some(mattermost) = masked.channels_config.mattermost.as_mut() {
-        mask_required_secret(&mut mattermost.bot_token);
-    }
-    if let Some(webhook) = masked.channels_config.webhook.as_mut() {
-        mask_optional_secret(&mut webhook.secret);
-    }
-    if let Some(matrix) = masked.channels_config.matrix.as_mut() {
-        mask_required_secret(&mut matrix.access_token);
-    }
-    if let Some(whatsapp) = masked.channels_config.whatsapp.as_mut() {
-        mask_optional_secret(&mut whatsapp.access_token);
-        mask_optional_secret(&mut whatsapp.app_secret);
-        mask_optional_secret(&mut whatsapp.verify_token);
-    }
-    if let Some(linq) = masked.channels_config.linq.as_mut() {
-        mask_required_secret(&mut linq.api_token);
-        mask_optional_secret(&mut linq.signing_secret);
-    }
-    if let Some(nextcloud) = masked.channels_config.nextcloud_talk.as_mut() {
-        mask_required_secret(&mut nextcloud.app_token);
-        mask_optional_secret(&mut nextcloud.webhook_secret);
-    }
-    if let Some(wati) = masked.channels_config.wati.as_mut() {
-        mask_required_secret(&mut wati.api_token);
-    }
-    if let Some(irc) = masked.channels_config.irc.as_mut() {
-        mask_optional_secret(&mut irc.server_password);
-        mask_optional_secret(&mut irc.nickserv_password);
-        mask_optional_secret(&mut irc.sasl_password);
-    }
-    if let Some(lark) = masked.channels_config.lark.as_mut() {
-        mask_required_secret(&mut lark.app_secret);
-        mask_optional_secret(&mut lark.encrypt_key);
-        mask_optional_secret(&mut lark.verification_token);
-    }
-    if let Some(feishu) = masked.channels_config.feishu.as_mut() {
-        mask_required_secret(&mut feishu.app_secret);
-        mask_optional_secret(&mut feishu.encrypt_key);
-        mask_optional_secret(&mut feishu.verification_token);
-    }
-    if let Some(dingtalk) = masked.channels_config.dingtalk.as_mut() {
-        mask_required_secret(&mut dingtalk.client_secret);
-    }
-    if let Some(qq) = masked.channels_config.qq.as_mut() {
-        mask_required_secret(&mut qq.app_secret);
-    }
-    #[cfg(feature = "channel-nostr")]
-    if let Some(nostr) = masked.channels_config.nostr.as_mut() {
-        mask_required_secret(&mut nostr.private_key);
-    }
-    if let Some(clawdtalk) = masked.channels_config.clawdtalk.as_mut() {
-        mask_required_secret(&mut clawdtalk.api_key);
-        mask_optional_secret(&mut clawdtalk.webhook_secret);
-    }
-    if let Some(email) = masked.channels_config.email.as_mut() {
-        mask_required_secret(&mut email.password);
     }
     mask_optional_secret(&mut masked.transcription.api_key);
     masked
@@ -1118,131 +1058,11 @@ fn restore_masked_sensitive_fields(
         restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.discord.as_mut(),
-        current.channels_config.discord.as_ref(),
-    ) {
-        restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.slack.as_mut(),
         current.channels_config.slack.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
         restore_optional_secret(&mut incoming_ch.app_token, &current_ch.app_token);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.mattermost.as_mut(),
-        current.channels_config.mattermost.as_ref(),
-    ) {
-        restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.webhook.as_mut(),
-        current.channels_config.webhook.as_ref(),
-    ) {
-        restore_optional_secret(&mut incoming_ch.secret, &current_ch.secret);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.matrix.as_mut(),
-        current.channels_config.matrix.as_ref(),
-    ) {
-        restore_required_secret(&mut incoming_ch.access_token, &current_ch.access_token);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.whatsapp.as_mut(),
-        current.channels_config.whatsapp.as_ref(),
-    ) {
-        restore_optional_secret(&mut incoming_ch.access_token, &current_ch.access_token);
-        restore_optional_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
-        restore_optional_secret(&mut incoming_ch.verify_token, &current_ch.verify_token);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.linq.as_mut(),
-        current.channels_config.linq.as_ref(),
-    ) {
-        restore_required_secret(&mut incoming_ch.api_token, &current_ch.api_token);
-        restore_optional_secret(&mut incoming_ch.signing_secret, &current_ch.signing_secret);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.nextcloud_talk.as_mut(),
-        current.channels_config.nextcloud_talk.as_ref(),
-    ) {
-        restore_required_secret(&mut incoming_ch.app_token, &current_ch.app_token);
-        restore_optional_secret(&mut incoming_ch.webhook_secret, &current_ch.webhook_secret);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.wati.as_mut(),
-        current.channels_config.wati.as_ref(),
-    ) {
-        restore_required_secret(&mut incoming_ch.api_token, &current_ch.api_token);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.irc.as_mut(),
-        current.channels_config.irc.as_ref(),
-    ) {
-        restore_optional_secret(
-            &mut incoming_ch.server_password,
-            &current_ch.server_password,
-        );
-        restore_optional_secret(
-            &mut incoming_ch.nickserv_password,
-            &current_ch.nickserv_password,
-        );
-        restore_optional_secret(&mut incoming_ch.sasl_password, &current_ch.sasl_password);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.lark.as_mut(),
-        current.channels_config.lark.as_ref(),
-    ) {
-        restore_required_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
-        restore_optional_secret(&mut incoming_ch.encrypt_key, &current_ch.encrypt_key);
-        restore_optional_secret(
-            &mut incoming_ch.verification_token,
-            &current_ch.verification_token,
-        );
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.feishu.as_mut(),
-        current.channels_config.feishu.as_ref(),
-    ) {
-        restore_required_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
-        restore_optional_secret(&mut incoming_ch.encrypt_key, &current_ch.encrypt_key);
-        restore_optional_secret(
-            &mut incoming_ch.verification_token,
-            &current_ch.verification_token,
-        );
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.dingtalk.as_mut(),
-        current.channels_config.dingtalk.as_ref(),
-    ) {
-        restore_required_secret(&mut incoming_ch.client_secret, &current_ch.client_secret);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.qq.as_mut(),
-        current.channels_config.qq.as_ref(),
-    ) {
-        restore_required_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
-    }
-    #[cfg(feature = "channel-nostr")]
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.nostr.as_mut(),
-        current.channels_config.nostr.as_ref(),
-    ) {
-        restore_required_secret(&mut incoming_ch.private_key, &current_ch.private_key);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.clawdtalk.as_mut(),
-        current.channels_config.clawdtalk.as_ref(),
-    ) {
-        restore_required_secret(&mut incoming_ch.api_key, &current_ch.api_key);
-        restore_optional_secret(&mut incoming_ch.webhook_secret, &current_ch.webhook_secret);
-    }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.email.as_mut(),
-        current.channels_config.email.as_ref(),
-    ) {
-        restore_required_secret(&mut incoming_ch.password, &current_ch.password);
     }
     restore_optional_secret(
         &mut incoming.transcription.api_key,
@@ -1624,14 +1444,6 @@ mod tests {
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(crate::gateway::auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
-            whatsapp: None,
-            whatsapp_app_secret: None,
-            linq: None,
-            linq_signing_secret: None,
-            nextcloud_talk: None,
-            nextcloud_talk_webhook_secret: None,
-            wati: None,
-            gmail_push: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
@@ -1671,37 +1483,6 @@ mod tests {
             token: "cf-token".to_string(),
         });
         cfg.memory.qdrant.api_key = Some("qdrant-key".to_string());
-        cfg.channels_config.wati = Some(crate::config::schema::WatiConfig {
-            api_token: "wati-token".to_string(),
-            api_url: "https://live-mt-server.wati.io".to_string(),
-            tenant_id: None,
-            allowed_numbers: vec![],
-            proxy_url: None,
-        });
-        cfg.channels_config.feishu = Some(crate::config::schema::FeishuConfig {
-            app_id: "cli_aabbcc".to_string(),
-            app_secret: "feishu-secret".to_string(),
-            encrypt_key: Some("feishu-encrypt".to_string()),
-            verification_token: Some("feishu-verify".to_string()),
-            allowed_users: vec!["*".to_string()],
-            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
-            port: None,
-            proxy_url: None,
-        });
-        cfg.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
-            imap_host: "imap.example.com".to_string(),
-            imap_port: 993,
-            imap_folder: "INBOX".to_string(),
-            smtp_host: "smtp.example.com".to_string(),
-            smtp_port: 465,
-            smtp_tls: true,
-            username: "agent@example.com".to_string(),
-            password: "email-password-secret".to_string(),
-            from_address: "agent@example.com".to_string(),
-            idle_timeout_secs: 1740,
-            allowed_senders: vec!["*".to_string()],
-            default_subject: "ZeroClaw Message".to_string(),
-        });
         cfg.model_routes = vec![crate::config::schema::ModelRouteConfig {
             hint: "reasoning".to_string(),
             provider: "openrouter".to_string(),
@@ -1734,39 +1515,7 @@ mod tests {
             parsed.tunnel.cloudflare.as_ref().map(|v| v.token.as_str()),
             Some(MASKED_SECRET)
         );
-        assert_eq!(
-            parsed
-                .channels_config
-                .wati
-                .as_ref()
-                .map(|v| v.api_token.as_str()),
-            Some(MASKED_SECRET)
-        );
         assert_eq!(parsed.memory.qdrant.api_key.as_deref(), Some(MASKED_SECRET));
-        assert_eq!(
-            parsed
-                .channels_config
-                .feishu
-                .as_ref()
-                .map(|v| v.app_secret.as_str()),
-            Some(MASKED_SECRET)
-        );
-        assert_eq!(
-            parsed
-                .channels_config
-                .feishu
-                .as_ref()
-                .and_then(|v| v.encrypt_key.as_deref()),
-            Some(MASKED_SECRET)
-        );
-        assert_eq!(
-            parsed
-                .channels_config
-                .feishu
-                .as_ref()
-                .and_then(|v| v.verification_token.as_deref()),
-            Some(MASKED_SECRET)
-        );
         assert_eq!(
             parsed
                 .model_routes
@@ -1779,14 +1528,6 @@ mod tests {
                 .embedding_routes
                 .first()
                 .and_then(|v| v.api_key.as_deref()),
-            Some(MASKED_SECRET)
-        );
-        assert_eq!(
-            parsed
-                .channels_config
-                .email
-                .as_ref()
-                .map(|v| v.password.as_str()),
             Some(MASKED_SECRET)
         );
     }
@@ -1807,37 +1548,6 @@ mod tests {
             domain: None,
         });
         current.memory.qdrant.api_key = Some("qdrant-real".to_string());
-        current.channels_config.wati = Some(crate::config::schema::WatiConfig {
-            api_token: "wati-real".to_string(),
-            api_url: "https://live-mt-server.wati.io".to_string(),
-            tenant_id: None,
-            allowed_numbers: vec![],
-            proxy_url: None,
-        });
-        current.channels_config.feishu = Some(crate::config::schema::FeishuConfig {
-            app_id: "cli_current".to_string(),
-            app_secret: "feishu-secret-real".to_string(),
-            encrypt_key: Some("feishu-encrypt-real".to_string()),
-            verification_token: Some("feishu-verify-real".to_string()),
-            allowed_users: vec!["*".to_string()],
-            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
-            port: None,
-            proxy_url: None,
-        });
-        current.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
-            imap_host: "imap.example.com".to_string(),
-            imap_port: 993,
-            imap_folder: "INBOX".to_string(),
-            smtp_host: "smtp.example.com".to_string(),
-            smtp_port: 465,
-            smtp_tls: true,
-            username: "agent@example.com".to_string(),
-            password: "email-password-real".to_string(),
-            from_address: "agent@example.com".to_string(),
-            idle_timeout_secs: 1740,
-            allowed_senders: vec!["*".to_string()],
-            default_subject: "ZeroClaw Message".to_string(),
-        });
         current.model_routes = vec![
             crate::config::schema::ModelRouteConfig {
                 hint: "reasoning".to_string(),
@@ -1881,17 +1591,6 @@ mod tests {
             ngrok.auth_token = MASKED_SECRET.to_string();
         }
         incoming.memory.qdrant.api_key = Some(MASKED_SECRET.to_string());
-        if let Some(wati) = incoming.channels_config.wati.as_mut() {
-            wati.api_token = MASKED_SECRET.to_string();
-        }
-        if let Some(feishu) = incoming.channels_config.feishu.as_mut() {
-            feishu.app_secret = MASKED_SECRET.to_string();
-            feishu.encrypt_key = Some(MASKED_SECRET.to_string());
-            feishu.verification_token = Some("feishu-verify-new".to_string());
-        }
-        if let Some(email) = incoming.channels_config.email.as_mut() {
-            email.password = MASKED_SECRET.to_string();
-        }
         incoming.model_routes[1].api_key = Some("route-model-key-2-new".to_string());
         incoming.embedding_routes[1].api_key = Some("route-embed-key-2-new".to_string());
 
@@ -1930,38 +1629,6 @@ mod tests {
             Some("qdrant-real")
         );
         assert_eq!(
-            hydrated
-                .channels_config
-                .wati
-                .as_ref()
-                .map(|v| v.api_token.as_str()),
-            Some("wati-real")
-        );
-        assert_eq!(
-            hydrated
-                .channels_config
-                .feishu
-                .as_ref()
-                .map(|v| v.app_secret.as_str()),
-            Some("feishu-secret-real")
-        );
-        assert_eq!(
-            hydrated
-                .channels_config
-                .feishu
-                .as_ref()
-                .and_then(|v| v.encrypt_key.as_deref()),
-            Some("feishu-encrypt-real")
-        );
-        assert_eq!(
-            hydrated
-                .channels_config
-                .feishu
-                .as_ref()
-                .and_then(|v| v.verification_token.as_deref()),
-            Some("feishu-verify-new")
-        );
-        assert_eq!(
             hydrated.model_routes[0].api_key.as_deref(),
             Some("route-model-key-1")
         );
@@ -1976,14 +1643,6 @@ mod tests {
         assert_eq!(
             hydrated.embedding_routes[1].api_key.as_deref(),
             Some("route-embed-key-2-new")
-        );
-        assert_eq!(
-            hydrated
-                .channels_config
-                .email
-                .as_ref()
-                .map(|v| v.password.as_str()),
-            Some("email-password-real")
         );
     }
 

@@ -138,7 +138,6 @@ pub use delegate::DelegateTool;
 // Re-exported for downstream consumers of background delegation results.
 #[allow(unused_imports)]
 pub use delegate::{BackgroundDelegateResult, BackgroundTaskStatus};
-pub use discord_search::DiscordSearchTool;
 pub use escalate::EscalateToHumanTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
@@ -447,18 +446,6 @@ pub fn all_tools_with_runtime(
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
     ];
-
-    // Register discord_search if discord_history channel is configured
-    if root_config.channels_config.discord_history.is_some() {
-        match crate::memory::SqliteMemory::new_named(workspace_dir, "discord") {
-            Ok(discord_mem) => {
-                tool_arcs.push(Arc::new(DiscordSearchTool::new(Arc::new(discord_mem))));
-            }
-            Err(e) => {
-                tracing::warn!("discord_search: failed to open discord.db: {e}");
-            }
-        }
-    }
 
     // LLM task tool — always registered when a provider is configured
     {
@@ -1345,5 +1332,4 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
     }
-
 }

@@ -1,11 +1,4 @@
-#[cfg(feature = "channel-matrix")]
-use crate::channels::MatrixChannel;
-#[cfg(feature = "whatsapp-web")]
-use crate::channels::WhatsAppWebChannel;
-use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, QQChannel, SendMessage, SignalChannel,
-    SlackChannel, TelegramChannel,
-};
+use crate::channels::{Channel, SendMessage, SlackChannel, TelegramChannel};
 use crate::config::Config;
 use crate::config::schema::{CronJobDecl, CronScheduleDecl};
 use crate::cron::{
@@ -410,15 +403,6 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
     }
 }
 
-fn resolve_matrix_delivery_room(configured_room_id: &str, target: &str) -> String {
-    let target = target.trim();
-    if target.is_empty() {
-        configured_room_id.trim().to_string()
-    } else {
-        target.to_string()
-    }
-}
-
 async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
@@ -494,23 +478,6 @@ pub(crate) async fn deliver_announcement(
                 .send(&SendMessage::new(safe_output.as_str(), target))
                 .await?;
         }
-        "discord" => {
-            let dc = config
-                .channels_config
-                .discord
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("discord channel not configured"))?;
-            let channel = DiscordChannel::new(
-                dc.bot_token.clone(),
-                dc.guild_id.clone(),
-                dc.allowed_users.clone(),
-                dc.listen_to_bots,
-                dc.mention_only,
-            );
-            channel
-                .send(&SendMessage::new(safe_output.as_str(), target))
-                .await?;
-        }
         "slack" => {
             let sl = config
                 .channels_config
@@ -525,116 +492,6 @@ pub(crate) async fn deliver_announcement(
                 sl.allowed_users.clone(),
             )
             .with_workspace_dir(config.workspace_dir.clone());
-            channel
-                .send(&SendMessage::new(safe_output.as_str(), target))
-                .await?;
-        }
-        "mattermost" => {
-            let mm = config
-                .channels_config
-                .mattermost
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("mattermost channel not configured"))?;
-            let channel = MattermostChannel::new(
-                mm.url.clone(),
-                mm.bot_token.clone(),
-                mm.channel_id.clone(),
-                mm.allowed_users.clone(),
-                mm.thread_replies.unwrap_or(true),
-                mm.mention_only.unwrap_or(false),
-            );
-            channel
-                .send(&SendMessage::new(safe_output.as_str(), target))
-                .await?;
-        }
-        "signal" => {
-            let sg = config
-                .channels_config
-                .signal
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("signal channel not configured"))?;
-            let channel = SignalChannel::new(
-                sg.http_url.clone(),
-                sg.account.clone(),
-                sg.group_id.clone(),
-                sg.allowed_from.clone(),
-                sg.ignore_attachments,
-                sg.ignore_stories,
-            );
-            channel
-                .send(&SendMessage::new(safe_output.as_str(), target))
-                .await?;
-        }
-        "matrix" => {
-            #[cfg(feature = "channel-matrix")]
-            {
-                let mx = config
-                    .channels_config
-                    .matrix
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("matrix channel not configured"))?;
-                let room_id = resolve_matrix_delivery_room(&mx.room_id, target);
-                let channel = MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
-                    mx.homeserver.clone(),
-                    mx.access_token.clone(),
-                    room_id,
-                    mx.allowed_users.clone(),
-                    mx.user_id.clone(),
-                    mx.device_id.clone(),
-                    config.config_path.parent().map(|path| path.to_path_buf()),
-                );
-                channel
-                    .send(&SendMessage::new(safe_output.as_str(), target))
-                    .await?;
-            }
-            #[cfg(not(feature = "channel-matrix"))]
-            {
-                anyhow::bail!("matrix delivery channel requires `channel-matrix` feature");
-            }
-        }
-        "whatsapp" | "whatsapp-web" | "whatsapp_web" => {
-            #[cfg(feature = "whatsapp-web")]
-            {
-                let wa = config
-                    .channels_config
-                    .whatsapp
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("whatsapp channel not configured"))?;
-                if !wa.is_web_config() {
-                    anyhow::bail!(
-                        "whatsapp cron delivery requires Web mode (session_path must be set)"
-                    );
-                }
-                let channel = WhatsAppWebChannel::new(
-                    wa.session_path.clone().unwrap_or_default(),
-                    wa.pair_phone.clone(),
-                    wa.pair_code.clone(),
-                    wa.allowed_numbers.clone(),
-                    wa.mode.clone(),
-                    wa.dm_policy.clone(),
-                    wa.group_policy.clone(),
-                    wa.self_chat_mode,
-                );
-                channel
-                    .send(&SendMessage::new(safe_output.as_str(), target))
-                    .await?;
-            }
-            #[cfg(not(feature = "whatsapp-web"))]
-            {
-                anyhow::bail!("whatsapp delivery channel requires `whatsapp-web` feature");
-            }
-        }
-        "qq" => {
-            let qq = config
-                .channels_config
-                .qq
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("qq channel not configured"))?;
-            let channel = QQChannel::new(
-                qq.app_id.clone(),
-                qq.app_secret.clone(),
-                qq.allowed_users.clone(),
-            );
             channel
                 .send(&SendMessage::new(safe_output.as_str(), target))
                 .await?;
@@ -1322,63 +1179,6 @@ mod tests {
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
-    }
-
-    #[test]
-    fn resolve_matrix_delivery_room_prefers_target_when_present() {
-        assert_eq!(
-            resolve_matrix_delivery_room("!default:matrix.org", "  !ops:matrix.org  "),
-            "!ops:matrix.org"
-        );
-    }
-
-    #[test]
-    fn resolve_matrix_delivery_room_falls_back_to_configured_room() {
-        assert_eq!(
-            resolve_matrix_delivery_room("  !default:matrix.org  ", "   "),
-            "!default:matrix.org"
-        );
-    }
-
-    #[cfg(feature = "channel-matrix")]
-    #[tokio::test]
-    async fn deliver_if_configured_matrix_missing_config() {
-        let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
-        let mut job = test_job("echo ok");
-        job.delivery = DeliveryConfig {
-            mode: "announce".into(),
-            channel: Some("matrix".into()),
-            to: Some("!ops:matrix.org".into()),
-            best_effort: false,
-        };
-
-        let err = deliver_if_configured(&config, &job, "hello")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("matrix channel not configured"));
-    }
-
-    #[cfg(not(feature = "channel-matrix"))]
-    #[tokio::test]
-    async fn deliver_if_configured_matrix_feature_disabled() {
-        let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
-        let mut job = test_job("echo ok");
-        job.delivery = DeliveryConfig {
-            mode: "announce".into(),
-            channel: Some("matrix".into()),
-            to: Some("!ops:matrix.org".into()),
-            best_effort: false,
-        };
-
-        let err = deliver_if_configured(&config, &job, "hello")
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("matrix delivery channel requires `channel-matrix` feature")
-        );
     }
 
     #[test]

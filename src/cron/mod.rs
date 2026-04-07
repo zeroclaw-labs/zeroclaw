@@ -588,6 +588,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
 
@@ -612,16 +613,7 @@ mod tests {
         let config = test_config(&tmp);
         let job = make_job(&config, "*/5 * * * *", None, "echo test");
 
-        run_update(
-            &config,
-            &job.id,
-            Some("0 9 * * *"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        run_update(&config, &job.id, Some("0 9 * * *"), None, None, None, None).unwrap();
 
         let updated = get_job(&config, &job.id).unwrap();
         assert_eq!(updated.expression, "0 9 * * *");
@@ -633,16 +625,7 @@ mod tests {
         let config = test_config(&tmp);
         let job = make_job(&config, "*/5 * * * *", None, "echo test");
 
-        run_update(
-            &config,
-            &job.id,
-            None,
-            None,
-            None,
-            None,
-            Some("new-name"),
-        )
-        .unwrap();
+        run_update(&config, &job.id, None, None, None, None, Some("new-name")).unwrap();
 
         let updated = get_job(&config, &job.id).unwrap();
         assert_eq!(updated.name.as_deref(), Some("new-name"));
@@ -686,16 +669,7 @@ mod tests {
             "echo test",
         );
 
-        run_update(
-            &config,
-            &job.id,
-            Some("0 9 * * *"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        run_update(&config, &job.id, Some("0 9 * * *"), None, None, None, None).unwrap();
 
         let updated = get_job(&config, &job.id).unwrap();
         assert_eq!(
@@ -1085,6 +1059,7 @@ mod tests {
                 expression: None,
                 tz: None,
                 command: None,
+                prompt: None,
                 name: None,
                 allowed_tools: vec!["shell".into()],
             },

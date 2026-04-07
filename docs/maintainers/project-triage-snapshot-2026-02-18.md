@@ -72,7 +72,6 @@ Implication for docs:
 
 1. **Keep docs IA stable and obvious**
    - Maintain `docs/SUMMARY.md` + collection indexes as canonical nav.
-   - Keep localized hubs aligned with the same top-level doc map.
 
 2. **Protect operator discoverability**
    - Keep `operations-runbook` + `troubleshooting` linked in top-level README/hubs.

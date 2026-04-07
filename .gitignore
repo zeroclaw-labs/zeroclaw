@@ -36,6 +36,9 @@ credentials.json
 
 # Skill eval workspaces (test outputs, transcripts, grading)
 .claude/skills/*-workspace/
+.claude/skills/speckit-*/
+.specify/
+specs/
 
 # Claude Code agent worktrees (temporary isolated workspaces)
 .claude/worktrees/
