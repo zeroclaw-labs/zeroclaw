@@ -49,6 +49,8 @@ pub struct SpawnAgentTool {
     default_provider: String,
     /// Default model name.
     default_model: String,
+    /// Optional concurrency semaphore shared with DelegateTool.
+    subagent_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl SpawnAgentTool {
@@ -71,6 +73,7 @@ impl SpawnAgentTool {
             memory: None,
             default_provider: "anthropic".into(),
             default_model: "claude-sonnet-4-20250514".into(),
+            subagent_semaphore: None,
         }
     }
 
@@ -101,6 +104,11 @@ impl SpawnAgentTool {
 
     pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    pub fn with_subagent_semaphore(mut self, sem: Arc<tokio::sync::Semaphore>) -> Self {
+        self.subagent_semaphore = Some(sem);
         self
     }
 
@@ -531,6 +539,16 @@ impl Tool for SpawnAgentTool {
             "Spawning ad-hoc agent"
         );
 
+        // Acquire concurrency permit if semaphore is configured.
+        let _permit = match &self.subagent_semaphore {
+            Some(sem) => Some(
+                sem.acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("subagent semaphore closed"))?,
+            ),
+            None => None,
+        };
+
         // Build full prompt with optional context
         let full_prompt = if context.is_empty() {
             prompt.clone()
@@ -637,6 +655,7 @@ impl SpawnAgentTool {
                 memory,
                 default_provider,
                 default_model,
+                subagent_semaphore: None,
             };
 
             let outcome = inner

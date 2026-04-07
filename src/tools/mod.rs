@@ -929,11 +929,21 @@ pub fn all_tools_with_runtime(
     // Keep the manager alive for the process lifetime (owns the file watcher).
     std::mem::forget(workspace_agent_manager);
 
+    // Build optional concurrency semaphore for sub-agent execution.
+    // 0 = unlimited (default), N = at most N sub-agents running concurrently.
+    let subagent_semaphore = if root_config.delegate.max_concurrent_subagents > 0 {
+        Some(Arc::new(tokio::sync::Semaphore::new(
+            root_config.delegate.max_concurrent_subagents,
+        )))
+    } else {
+        None
+    };
+
     let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
     let delegate_handle: Option<DelegateParentToolsHandle> = if shared_agents.read().is_empty() {
         None
     } else {
-        let delegate_tool = DelegateTool::new_with_options(
+        let mut delegate_tool = DelegateTool::new_with_options(
             HashMap::new(), // empty — using shared_agents instead
             delegate_fallback_credential.clone(),
             security.clone(),
@@ -946,12 +956,15 @@ pub fn all_tools_with_runtime(
         .with_workspace_dir(workspace_dir.to_path_buf())
         .with_memory(memory.clone())
         .with_skills_prompt_mode(root_config.skills.prompt_injection_mode);
+        if let Some(ref sem) = subagent_semaphore {
+            delegate_tool = delegate_tool.with_subagent_semaphore(Arc::clone(sem));
+        }
         tool_arcs.push(Arc::new(delegate_tool));
         Some(Arc::clone(&parent_tools))
     };
 
     // Always add spawn_agent tool — allows ad-hoc agent creation even without pre-configured agents.
-    let spawn_tool = spawn_agent::SpawnAgentTool::new(
+    let mut spawn_tool = spawn_agent::SpawnAgentTool::new(
         Arc::clone(&shared_agents),
         delegate_fallback_credential.clone(),
         security.clone(),
@@ -966,6 +979,9 @@ pub fn all_tools_with_runtime(
         root_config.default_provider.clone().unwrap_or_default(),
         root_config.default_model.clone().unwrap_or_default(),
     );
+    if let Some(ref sem) = subagent_semaphore {
+        spawn_tool = spawn_tool.with_subagent_semaphore(Arc::clone(sem));
+    }
     tool_arcs.push(Arc::new(spawn_tool.with_memory(memory.clone())));
 
     // Add swarm tool when swarms are configured
@@ -1314,8 +1330,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
-            max_context_tokens: None,
-            max_tool_result_chars: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
 

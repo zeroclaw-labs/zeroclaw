@@ -76,6 +76,9 @@ pub struct DelegateTool {
     /// Skills prompt injection mode inherited from root config.
     /// Fixes #5155: sub-agents now respect the global `skills.prompt_injection_mode`.
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    /// Optional concurrency semaphore shared with SpawnAgentTool.
+    /// When set, limits how many sub-agents run simultaneously.
+    subagent_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl DelegateTool {
@@ -111,6 +114,7 @@ impl DelegateTool {
             cancellation_token: CancellationToken::new(),
             memory: None,
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            subagent_semaphore: None,
         }
     }
 
@@ -152,6 +156,7 @@ impl DelegateTool {
             cancellation_token: CancellationToken::new(),
             memory: None,
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            subagent_semaphore: None,
         }
     }
 
@@ -219,6 +224,12 @@ impl DelegateTool {
         agents: Arc<RwLock<HashMap<String, DelegateAgentConfig>>>,
     ) -> Self {
         self.agents = agents;
+        self
+    }
+
+    /// Attach a shared concurrency semaphore for sub-agent execution.
+    pub fn with_subagent_semaphore(mut self, sem: Arc<tokio::sync::Semaphore>) -> Self {
+        self.subagent_semaphore = Some(sem);
         self
     }
 
@@ -407,6 +418,16 @@ impl DelegateTool {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .unwrap_or("");
+
+        // Acquire concurrency permit if semaphore is configured.
+        let _permit = match &self.subagent_semaphore {
+            Some(sem) => Some(
+                sem.acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("subagent semaphore closed"))?,
+            ),
+            None => None,
+        };
 
         // Look up agent config
         let agent_config = match self.agents.read().get(agent_name).cloned() {
@@ -676,6 +697,7 @@ impl DelegateTool {
                 cancellation_token: child_token.clone(),
                 memory: None,
                 skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+                subagent_semaphore: None,
             };
 
             let args_inner = json!({
@@ -835,6 +857,7 @@ impl DelegateTool {
                     cancellation_token,
                     memory: None,
                     skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+                    subagent_semaphore: None,
                 };
                 let result = Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)).await;
                 (agent_name, result)
@@ -1313,8 +1336,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
-            max_context_tokens: None,
-            max_tool_result_chars: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         agents.insert(
@@ -1333,8 +1356,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
-            max_context_tokens: None,
-            max_tool_result_chars: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         agents
@@ -1492,8 +1515,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
-        max_context_tokens: None,
-        max_tool_result_chars: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
         }
     }
 
@@ -1610,8 +1633,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
-            max_context_tokens: None,
-            max_tool_result_chars: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1726,8 +1749,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
-            max_context_tokens: None,
-            max_tool_result_chars: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1769,8 +1792,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
-            max_context_tokens: None,
-            max_tool_result_chars: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -2060,8 +2083,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
-        max_context_tokens: None,
-        max_tool_result_chars: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2116,8 +2139,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
-        max_context_tokens: None,
-        max_tool_result_chars: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
         };
 
         struct MockShellTool;
@@ -2189,8 +2212,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
-        max_context_tokens: None,
-        max_tool_result_chars: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2220,8 +2243,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
-        max_context_tokens: None,
-        max_tool_result_chars: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2256,8 +2279,8 @@ mod tests {
             agentic_timeout_secs: Some(600),
             skills_directory: None,
             memory_namespace: None,
-        max_context_tokens: None,
-        max_tool_result_chars: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2314,8 +2337,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
-            max_context_tokens: None,
-            max_tool_result_chars: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2344,8 +2367,8 @@ mod tests {
                 agentic_timeout_secs: Some(0),
                 skills_directory: None,
                 memory_namespace: None,
-            max_context_tokens: None,
-            max_tool_result_chars: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2374,8 +2397,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
-            max_context_tokens: None,
-            max_tool_result_chars: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2404,8 +2427,8 @@ mod tests {
                 agentic_timeout_secs: Some(5000),
                 skills_directory: None,
                 memory_namespace: None,
-            max_context_tokens: None,
-            max_tool_result_chars: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2434,8 +2457,8 @@ mod tests {
                 agentic_timeout_secs: Some(3600),
                 skills_directory: None,
                 memory_namespace: None,
-            max_context_tokens: None,
-            max_tool_result_chars: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2460,8 +2483,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
-            max_context_tokens: None,
-            max_tool_result_chars: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2495,8 +2518,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: Some("skills/code-review".to_string()),
             memory_namespace: None,
-        max_context_tokens: None,
-        max_tool_result_chars: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2544,8 +2567,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
-        max_context_tokens: None,
-        max_tool_result_chars: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];

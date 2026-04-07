@@ -539,6 +539,11 @@ pub struct DelegateToolConfig {
     /// Default: 300 seconds.
     #[serde(default = "default_delegate_agentic_timeout_secs")]
     pub agentic_timeout_secs: u64,
+    /// Maximum number of sub-agents (delegate + spawn) that can run concurrently.
+    /// Prevents slot saturation on LLM backends with limited capacity (e.g. llama.cpp).
+    /// `0` means unlimited (default).
+    #[serde(default)]
+    pub max_concurrent_subagents: usize,
 }
 
 impl Default for DelegateToolConfig {
@@ -546,6 +551,7 @@ impl Default for DelegateToolConfig {
         Self {
             timeout_secs: DEFAULT_DELEGATE_TIMEOUT_SECS,
             agentic_timeout_secs: DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
+            max_concurrent_subagents: 0,
         }
     }
 }
@@ -12313,8 +12319,8 @@ default_temperature = 0.7
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
-            max_context_tokens: None,
-            max_tool_result_chars: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
 
