@@ -2,8 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { X, Settings, Sun, Moon, Monitor, Laptop, Check, Type, CaseSensitive, Palette } from 'lucide-react';
 import { useTheme } from '@/hooks/useTheme';
 import { t } from '@/lib/i18n';
-import type { AccentColor, UiFont, MonoFont, ThemeMode } from '@/contexts/ThemeContextDef';
-import { uiFontStacks, monoFontStacks } from '@/contexts/ThemeContextDef';
+import type { AccentColor, UiFont, MonoFont, ThemeMode } from '@/contexts/ThemeContext';
+import { uiFontStacks, monoFontStacks } from '@/contexts/ThemeContext';
 import { colorThemes } from '@/contexts/colorThemes';
 
 const themeOptions: { value: ThemeMode; icon: typeof Sun; labelKey: string }[] = [
