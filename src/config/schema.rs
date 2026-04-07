@@ -674,8 +674,12 @@ pub fn validate_temperature(value: f64) -> std::result::Result<f64, String> {
         Ok(value)
     } else {
         Err(format!(
-            "temperature {value} is out of range (expected {}..={})",
+            "temperature {value} is out of valid range (expected {}..={}). \
+             The temperature parameter controls randomness in model outputs: \
+             lower values (close to 0) make output more deterministic, \
+             higher values (up to {}) make output more random and creative.",
             TEMPERATURE_RANGE.start(),
+            TEMPERATURE_RANGE.end(),
             TEMPERATURE_RANGE.end()
         ))
     }
