@@ -248,6 +248,13 @@ impl OpenAiCompatibleProvider {
         self
     }
 
+    /// Merge all system messages into the first user message before sending.
+    /// Unlike `new_merge_system_into_user`, this preserves native tool calling.
+    pub fn with_merge_system_into_user(mut self) -> Self {
+        self.merge_system_into_user = true;
+        self
+    }
+
     /// Override the HTTP request timeout for LLM API calls.
     pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = timeout_secs;
@@ -959,6 +966,10 @@ fn extract_sse_text_delta(choice: &StreamChoice) -> Option<String> {
         }
     }
 
+    None
+}
+
+fn extract_sse_reasoning_delta(choice: &StreamChoice) -> Option<String> {
     choice
         .delta
         .reasoning_content
@@ -1159,6 +1170,16 @@ fn sse_bytes_to_events(
 
                         let mut should_emit_tool_calls = false;
                         for choice in &chunk.choices {
+                            if let Some(reasoning_delta) = extract_sse_reasoning_delta(choice) {
+                                let reasoning_chunk = StreamChunk::reasoning(reasoning_delta);
+                                if tx
+                                    .send(Ok(StreamEvent::TextDelta(reasoning_chunk)))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
                             if let Some(text_delta) = extract_sse_text_delta(choice) {
                                 let mut text_chunk = StreamChunk::delta(text_delta);
                                 if count_tokens {
