@@ -170,7 +170,7 @@ impl SlackChannel {
             allowed_users,
             thread_replies: true,
             mention_only: false,
-            respond_to_broadcasts: true,
+            respond_to_broadcasts: false,
             group_reply_allowed_sender_ids: Vec::new(),
             user_display_name_cache: Mutex::new(HashMap::new()),
             workspace_dir: None,
