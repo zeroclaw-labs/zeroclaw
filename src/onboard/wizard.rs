@@ -3645,7 +3645,7 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                 ChannelMenuChoice::InboxApi => format!(
                     "InboxAPI   {}",
                     if config.inboxapi.is_some() {
-                        "✅ connected"
+                        "✅ configured"
                     } else {
                         "— agent-native email (no SMTP needed)"
                     }

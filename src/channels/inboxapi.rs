@@ -123,15 +123,22 @@ pub struct InboxApiChannel {
     client: reqwest::Client,
     seen_messages: Arc<Mutex<HashSet<String>>>,
     tokens: Arc<RwLock<Option<TokenState>>>,
-    /// ISO 8601 timestamp cursor for incremental polling via `search_emails`.
+    /// RFC3339/ISO-8601 timestamp cursor for incremental polling via `search_emails`.
     last_poll_time: Arc<Mutex<Option<String>>>,
 }
 
 impl InboxApiChannel {
     pub fn new(config: InboxApiConfig) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|e| {
+                warn!("Failed to build reqwest client with timeout: {e}; using default client");
+                reqwest::Client::new()
+            });
         Self {
             config,
-            client: reqwest::Client::new(),
+            client,
             seen_messages: Arc::new(Mutex::new(HashSet::new())),
             tokens: Arc::new(RwLock::new(None)),
             last_poll_time: Arc::new(Mutex::new(None)),
@@ -183,7 +190,9 @@ impl InboxApiChannel {
         let mut req = self
             .client
             .post(&self.config.endpoint)
-            .header("Accept", "application/json, text/event-stream")
+            // Prefer a single JSON response; streaming SSE responses can hang if the server
+            // keeps the connection open.
+            .header("Accept", "application/json")
             .json(&payload);
         if let Some(token) = auth_token {
             req = req.bearer_auth(token);
@@ -228,6 +237,32 @@ impl InboxApiChannel {
         }
         // Fallback: treat as plain JSON
         Ok(serde_json::from_str(body)?)
+    }
+
+    /// Parse an email timestamp from InboxAPI fields into a canonical UTC time.
+    fn parse_email_received_at(email: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>> {
+        fn parse_any(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .or_else(|_| chrono::DateTime::parse_from_rfc2822(s))
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        }
+
+        email
+            .get("received_at")
+            .and_then(|v| v.as_str())
+            .and_then(parse_any)
+            .or_else(|| {
+                email
+                    .get("date")
+                    .and_then(|v| v.as_str())
+                    .and_then(parse_any)
+            })
+    }
+
+    /// Format a UTC timestamp for use as an incremental polling cursor.
+    fn format_cursor(ts: chrono::DateTime<chrono::Utc>) -> String {
+        ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     }
 
     /// Extract text content from an MCP tool result envelope.
@@ -312,19 +347,54 @@ impl InboxApiChannel {
 
     /// Persist credentials to disk with 0600 permissions.
     fn save_credentials(&self, creds: &Credentials) -> Result<()> {
+        use std::io::Write;
+
         let path = self.credentials_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(creds)?;
-        std::fs::write(&path, &json)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("credentials path has no parent: {}", path.display()))?;
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| anyhow!("credentials path has no file name: {}", path.display()))?;
+        let temp_path = parent.join(format!(
+            ".{}.tmp.{}.{}",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
 
-        // Set file permissions to 0600 (owner read/write only)
         #[cfg(unix)]
+        let mut temp_file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp_path)?
+        };
+
+        #[cfg(not(unix))]
+        let mut temp_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+
+        temp_file.write_all(json.as_bytes())?;
+        temp_file.sync_all()?;
+        drop(temp_file);
+
+        #[cfg(windows)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            let _ = std::fs::remove_file(&path);
         }
+
+        std::fs::rename(&temp_path, &path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&temp_path);
+        })?;
 
         debug!("Credentials saved to {}", path.display());
         Ok(())
@@ -446,6 +516,12 @@ impl InboxApiChannel {
 
     /// Ensure we have valid tokens, creating an account if needed.
     async fn ensure_authenticated(&self) -> Result<()> {
+        if self.config.account_name.trim().is_empty() {
+            return Err(anyhow!(
+                "InboxAPI account_name must be set to a non-empty, non-whitespace value"
+            ));
+        }
+
         // 1. Try loading existing credentials
         if let Some(creds) = self.load_credentials() {
             let ts = self.apply_credentials(&creds);
@@ -520,6 +596,11 @@ impl InboxApiChannel {
     /// Retries with a random suffix if the configured name is already taken.
     async fn create_account(&self) -> Result<()> {
         let base_name = &self.config.account_name;
+        if base_name.trim().is_empty() {
+            return Err(anyhow!(
+                "InboxAPI account_name must be set to a non-empty, non-whitespace value before creating an account"
+            ));
+        }
         info!("Creating InboxAPI account for '{}'...", base_name);
 
         // Try with configured name first; on collision, retry with suffix
@@ -681,7 +762,7 @@ impl InboxApiChannel {
                 .unwrap_or_default()
         );
 
-        let mut latest_received_at: Option<String> = None;
+        let mut latest_received_at: Option<chrono::DateTime<chrono::Utc>> = None;
 
         for email in email_array {
             let msg_id = email["id"]
@@ -725,9 +806,8 @@ impl InboxApiChannel {
             // Always set thread_ts to the email's own ID so replies use send_reply
             let thread_ts = Some(msg_id.clone());
 
-            let timestamp = email["received_at"]
-                .as_str()
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            let received_at = Self::parse_email_received_at(email);
+            let timestamp = received_at
                 .map(|dt| dt.timestamp() as u64)
                 .unwrap_or_else(|| {
                     SystemTime::now()
@@ -736,18 +816,10 @@ impl InboxApiChannel {
                         .unwrap_or(0)
                 });
 
-            // Track latest timestamp for the since cursor
-            let received_at_str = email["date"]
-                .as_str()
-                .or_else(|| email["received_at"].as_str())
-                .map(|s| s.to_string());
-            if let Some(ref ts) = received_at_str {
-                match (&latest_received_at, ts.as_str()) {
-                    (None, _) => latest_received_at = Some(ts.clone()),
-                    (Some(prev), cur) if cur > prev.as_str() => {
-                        latest_received_at = Some(ts.clone());
-                    }
-                    _ => {}
+            // Track latest timestamp for the since cursor (compare by actual time, store canonical RFC3339)
+            if let Some(dt) = received_at {
+                if latest_received_at.map_or(true, |prev| dt > prev) {
+                    latest_received_at = Some(dt);
                 }
             }
 
@@ -770,7 +842,7 @@ impl InboxApiChannel {
 
         // Advance the since cursor for next poll
         if let Some(ts) = latest_received_at {
-            *self.last_poll_time.lock().await = Some(ts);
+            *self.last_poll_time.lock().await = Some(Self::format_cursor(ts));
         }
 
         Ok(())
@@ -1355,38 +1427,33 @@ mod tests {
     #[test]
     fn latest_received_at_tracks_max_timestamp() {
         let emails = vec![
-            serde_json::json!({"date": "2026-03-14T10:00:00Z"}),
-            serde_json::json!({"date": "2026-03-14T12:00:00Z"}),
-            serde_json::json!({"date": "2026-03-14T11:00:00Z"}),
+            serde_json::json!({"received_at": "2026-03-14T10:00:00Z"}),
+            serde_json::json!({"received_at": "2026-03-14T12:00:00Z"}),
+            serde_json::json!({"received_at": "2026-03-14T11:00:00Z"}),
         ];
 
-        let mut latest_received_at: Option<String> = None;
+        let mut latest_received_at: Option<chrono::DateTime<chrono::Utc>> = None;
         for email in &emails {
-            let received_at_str = email["date"]
-                .as_str()
-                .or_else(|| email["received_at"].as_str())
-                .map(|s| s.to_string());
-            if let Some(ref ts) = received_at_str {
-                match (&latest_received_at, ts.as_str()) {
-                    (None, _) => latest_received_at = Some(ts.clone()),
-                    (Some(prev), cur) if cur > prev.as_str() => {
-                        latest_received_at = Some(ts.clone());
-                    }
-                    _ => {}
+            if let Some(dt) = InboxApiChannel::parse_email_received_at(email) {
+                if latest_received_at.map_or(true, |prev| dt > prev) {
+                    latest_received_at = Some(dt);
                 }
             }
         }
 
-        assert_eq!(latest_received_at.as_deref(), Some("2026-03-14T12:00:00Z"));
+        assert_eq!(
+            latest_received_at
+                .map(InboxApiChannel::format_cursor)
+                .as_deref(),
+            Some("2026-03-14T12:00:00Z")
+        );
     }
 
     #[test]
     fn latest_received_at_falls_back_to_received_at() {
-        let email = serde_json::json!({"received_at": "2026-03-14T09:00:00Z"});
-        let ts = email["date"]
-            .as_str()
-            .or_else(|| email["received_at"].as_str())
-            .map(|s| s.to_string());
+        let email = serde_json::json!({"date": "Sat, 14 Mar 2026 09:00:00 +0000"});
+        let ts =
+            InboxApiChannel::parse_email_received_at(&email).map(InboxApiChannel::format_cursor);
         assert_eq!(ts.as_deref(), Some("2026-03-14T09:00:00Z"));
     }
 }
