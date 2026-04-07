@@ -331,6 +331,7 @@ Notes:
 | `open_skills_enabled` | `false` | Opt-in loading/sync of community `open-skills` repository |
 | `open_skills_dir` | unset | Optional local path for `open-skills` (defaults to `$HOME/open-skills` when enabled) |
 | `prompt_injection_mode` | `full` | Skill prompt verbosity: `full` (inline instructions/tools) or `compact` (name/description/location only) |
+| `whitelist` | `[]` | Skill name allowlist. Empty loads all skills (default). Non-empty loads only the named skills. Useful to reduce system prompt size on low-context models. |
 
 Notes:
 
@@ -583,6 +584,7 @@ Use route hints so integrations can keep stable names while model IDs evolve.
 | `provider` | _required_ | Provider to route to (must match a known provider name) |
 | `model` | _required_ | Model to use with that provider |
 | `api_key` | unset | Optional API key override for this route's provider |
+| `context_window` | unset | Optional context window size override for this route (tokens). Useful to cap context on backends with limited VRAM. |
 
 ### `[[embedding_routes]]`
 
@@ -671,6 +673,8 @@ Top-level channel options are configured under `channels_config`.
 | Key | Default | Purpose |
 |---|---|---|
 | `message_timeout_secs` | `300` | Base timeout in seconds for channel message processing; runtime scales this with tool-loop depth (up to 4x, overridable via `[pacing].message_timeout_scale_max`) |
+| `reply_precheck` | `false` | Run an LLM reply-intent precheck before responding in group conversations. When `true`, the agent makes a lightweight classification call to decide whether the latest group message warrants a reply. DMs always bypass this. |
+| `max_concurrent_per_channel` | `4` | Maximum concurrent LLM requests per channel. Lower values prevent saturating backends with limited slots (e.g. llama.cpp `--parallel 3`). |
 
 Examples:
 

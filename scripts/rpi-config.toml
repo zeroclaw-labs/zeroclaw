@@ -360,6 +360,7 @@ open_skills_enabled = false
 trusted_skill_roots = []
 allow_scripts = false
 prompt_injection_mode = "full"
+whitelist = []
 
 [query_classification]
 enabled = false
@@ -382,6 +383,8 @@ max_steps_per_cycle = 3
 [channels_config]
 cli = true
 message_timeout_secs = 300
+reply_precheck = false
+max_concurrent_per_channel = 4
 
 [channels_config.webhook]
 port = 8080
