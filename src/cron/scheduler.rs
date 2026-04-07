@@ -1,3 +1,5 @@
+#[cfg(feature = "channel-lark")]
+use crate::channels::LarkChannel;
 #[cfg(feature = "channel-matrix")]
 use crate::channels::MatrixChannel;
 #[cfg(feature = "whatsapp-web")]
@@ -657,6 +659,42 @@ pub(crate) async fn deliver_announcement(
             channel
                 .send(&SendMessage::new(safe_output.as_str(), target))
                 .await?;
+        }
+        "lark" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                let lark = config
+                    .channels_config
+                    .lark
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
+                let channel = LarkChannel::from_lark_config(lark);
+                channel
+                    .send(&SendMessage::new(safe_output.as_str(), target))
+                    .await?;
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            {
+                anyhow::bail!("lark delivery channel requires `channel-lark` feature");
+            }
+        }
+        "feishu" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                let feishu = config
+                    .channels_config
+                    .feishu
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("feishu channel not configured"))?;
+                let channel = LarkChannel::from_feishu_config(feishu);
+                channel
+                    .send(&SendMessage::new(safe_output.as_str(), target))
+                    .await?;
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            {
+                anyhow::bail!("feishu delivery channel requires `channel-lark` feature");
+            }
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
