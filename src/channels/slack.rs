@@ -794,9 +794,16 @@ impl SlackChannel {
             return None;
         }
 
+        // Normalize broadcast mentions so the model understands them.
+        // <!here> and <!channel> are Slack's wire format; replace with readable
+        // equivalents so the model knows this is a channel-wide broadcast.
+        let text = text
+            .replace("<!here>", "@here")
+            .replace("<!channel>", "@channel");
+
         // Always strip bot mentions so the model sees clean text,
         // even in threads where the mention wasn't required.
-        Some(Self::strip_bot_mentions(text, bot_user_id))
+        Some(Self::strip_bot_mentions(&text, bot_user_id))
     }
 
     fn normalize_incoming_content(
