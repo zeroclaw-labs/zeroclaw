@@ -1,0 +1,13 @@
+id = "design"
+display_name = "策划师"
+avatar = "design"
+role = "游戏系统设计、数值策划、玩法设计、关卡设计"
+focus = ["系统设计", "数值策划", "玩法创新", "用户体验"]
+allowed_tools = [
+  "shell",
+  "file_read",
+  "file_write",
+  "memory_store",
+  "memory_query",
+]
+memory_namespace = "design"

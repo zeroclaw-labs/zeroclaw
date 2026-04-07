@@ -1,0 +1,15 @@
+id = "dev"
+display_name = "开发者"
+avatar = "dev"
+role = "微信小游戏开发、Canvas渲染、游戏逻辑实现、性能优化"
+focus = ["小游戏开发", "Canvas/WebGL", "性能优化", "代码质量"]
+allowed_tools = [
+  "shell",
+  "file_read",
+  "file_write",
+  "file_edit",
+  "memory_store",
+  "memory_query",
+  "browser",
+]
+memory_namespace = "dev"

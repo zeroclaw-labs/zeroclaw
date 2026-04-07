@@ -1,0 +1,14 @@
+id = "qa"
+display_name = "测试员"
+avatar = "qa"
+role = "自动化测试、质量保证、Bug追踪、兼容性测试"
+focus = ["自动化测试", "Bug追踪", "性能测试", "兼容性"]
+allowed_tools = [
+  "shell",
+  "file_read",
+  "file_write",
+  "memory_store",
+  "memory_query",
+  "browser",
+]
+memory_namespace = "qa"

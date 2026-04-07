@@ -1,0 +1,15 @@
+id = "intel"
+display_name = "情报员"
+avatar = "intel"
+role = "竞品分析、市场调研、行业趋势、玩家反馈收集"
+focus = ["竞品分析", "市场调研", "行业趋势", "玩家洞察"]
+allowed_tools = [
+  "shell",
+  "web_fetch",
+  "file_read",
+  "file_write",
+  "memory_store",
+  "memory_query",
+  "browser",
+]
+memory_namespace = "intel"

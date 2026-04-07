@@ -1,0 +1,15 @@
+id = "art"
+display_name = "美术设计师"
+avatar = "design"
+role = "游戏视觉设计、UI/UX、美术方向、HUD设计、视觉反馈"
+focus = ["美术方向", "UI/UX设计", "HUD设计", "视觉反馈", "配色方案"]
+allowed_tools = [
+  "file_read",
+  "file_write",
+  "web_search_tool",
+  "web_fetch",
+  "memory_store",
+  "memory_query",
+  "browser",
+]
+memory_namespace = "art"

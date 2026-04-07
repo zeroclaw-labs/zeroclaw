@@ -1,0 +1,151 @@
+# BEGIN repo-agent-team
+
+[agents.design]
+provider = "minimax-cn"
+model = "MiniMax-Text-01"
+system_prompt = """你是微信小游戏策划专家。负责 GDD 撰写、系统设计、数值策划、里程碑规划、社交玩法设计。
+不写代码，不做美术决策。输出格式：结构化 Markdown。
+委派实现任务给 dev，视觉任务给 art。"""
+agentic = true
+allowed_tools = [
+  "file_read",
+  "file_write",
+  "web_search_tool",
+  "web_fetch",
+  "memory_store",
+  "memory_query",
+  "content_search",
+  "glob_search",
+  "delegate",
+]
+memory_namespace = "design"
+max_iterations = 15
+agentic_timeout_secs = 300
+skills_directory = "agents/design/skills"
+
+[agents.dev]
+provider = "minimax-cn"
+model = "MiniMax-Text-01"
+system_prompt = """你是微信小游戏开发专家。使用 wx.createCanvas/wx.createImage 等微信 API 实现游戏。
+禁止使用 DOM API（document、window、HTMLElement）。只用 wx.* API。
+性能目标：60fps 中端安卓，主包≤4MB。"""
+agentic = true
+allowed_tools = [
+  "file_read",
+  "file_write",
+  "file_edit",
+  "shell",
+  "glob_search",
+  "content_search",
+  "web_search_tool",
+  "memory_store",
+  "memory_query",
+]
+memory_namespace = "dev"
+max_iterations = 20
+agentic_timeout_secs = 600
+skills_directory = "agents/dev/skills"
+
+[agents.art]
+provider = "minimax-cn"
+model = "MiniMax-Text-01"
+system_prompt = """你是游戏视觉设计专家。负责 UI/UX、HUD 设计、美术方向、配色方案、视觉反馈（game juice）。
+不实现游戏逻辑，不改平衡数值。竖屏优先，触控友好。"""
+agentic = true
+allowed_tools = [
+  "file_read",
+  "file_write",
+  "web_search_tool",
+  "web_fetch",
+  "memory_store",
+  "memory_query",
+  "browser",
+]
+memory_namespace = "art"
+max_iterations = 15
+agentic_timeout_secs = 300
+skills_directory = "agents/art/skills"
+
+[agents.intel]
+provider = "minimax-cn"
+model = "MiniMax-Text-01"
+system_prompt = """你是游戏行业情报分析师。负责竞品分析、市场调研、行业趋势跟踪、玩家反馈收集。
+输出结构化调研报告。"""
+agentic = true
+allowed_tools = [
+  "web_search_tool",
+  "web_fetch",
+  "file_read",
+  "file_write",
+  "memory_store",
+  "memory_query",
+  "browser",
+]
+memory_namespace = "intel"
+max_iterations = 15
+agentic_timeout_secs = 300
+
+[agents.ops]
+provider = "minimax-cn"
+model = "MiniMax-Text-01"
+system_prompt = """你是游戏运营专家。负责用户增长策略、活动策划、数据分析、渠道运营。"""
+agentic = true
+allowed_tools = [
+  "web_search_tool",
+  "web_fetch",
+  "file_read",
+  "file_write",
+  "memory_store",
+  "memory_query",
+]
+memory_namespace = "ops"
+max_iterations = 15
+agentic_timeout_secs = 300
+
+[agents.qa]
+provider = "minimax-cn"
+model = "MiniMax-Text-01"
+system_prompt = """你是游戏 QA 测试专家。负责自动化测试、Bug 追踪、性能测试、兼容性测试。"""
+agentic = true
+allowed_tools = [
+  "shell",
+  "file_read",
+  "file_write",
+  "memory_store",
+  "memory_query",
+  "browser",
+  "glob_search",
+  "content_search",
+]
+memory_namespace = "qa"
+max_iterations = 15
+agentic_timeout_secs = 300
+skills_directory = "agents/qa/skills"
+
+[swarms.game_team]
+agents = ["design", "dev", "art"]
+strategy = "sequential"
+description = "微信小游戏核心开发团队：策划产出 GDD → 开发实现功能 → 美术完成视觉设计"
+timeout_secs = 1800
+
+[swarms.game_full]
+agents = ["intel", "design", "dev", "art", "qa"]
+strategy = "sequential"
+description = "微信小游戏完整团队：情报→策划→开发→美术→测试"
+timeout_secs = 3600
+
+[swarms.auto]
+agents = ["design", "dev", "art", "intel", "ops", "qa"]
+strategy = "router"
+router_prompt = """根据任务内容选择最合适的专家。各专家职责：
+- design: 游戏策划、GDD文档、系统设计、数值策划、功能定义
+- dev: 微信小游戏开发、代码实现、Canvas/WebGL、性能优化
+- art: 美术设计、UI/UX、HUD设计、配色方案、视觉反馈
+- intel: 竞品分析、市场调研、行业趋势
+- ops: 用户增长、活动策划、数据分析、渠道运营
+- qa: 自动化测试、Bug追踪、性能测试、兼容性测试
+只回复一个最合适的专家名字。"""
+description = "AI 智能分配：根据任务内容自动选择最合适的专家"
+timeout_secs = 900
+
+# END repo-agent-team
