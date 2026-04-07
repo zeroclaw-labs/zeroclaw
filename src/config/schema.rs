@@ -12713,6 +12713,20 @@ allowed_users = ["@ops:matrix.org"]
     }
 
     #[test]
+    async fn slack_config_respond_to_broadcasts_defaults_false() {
+        let json = r#"{"bot_token":"xoxb-tok"}"#;
+        let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.respond_to_broadcasts);
+    }
+
+    #[test]
+    async fn slack_config_respond_to_broadcasts_can_be_enabled() {
+        let json = r#"{"bot_token":"xoxb-tok","respond_to_broadcasts":true}"#;
+        let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.respond_to_broadcasts);
+    }
+
+    #[test]
     async fn discord_config_default_interrupt_on_new_message_is_false() {
         let json = r#"{"bot_token":"tok"}"#;
         let parsed: DiscordConfig = serde_json::from_str(json).unwrap();

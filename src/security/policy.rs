@@ -1260,7 +1260,7 @@ impl SecurityPolicy {
                         || lower.starts_with("config.")
                         || lower == "alias"
                         || lower.starts_with("alias.")
-                        || arg == "-c"  // case-sensitive: -C is safe, -c is not
+                        || arg == "-c" // case-sensitive: -C is safe, -c is not
                 })
             }
             _ => true,
