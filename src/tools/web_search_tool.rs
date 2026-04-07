@@ -247,8 +247,7 @@ impl WebSearchTool {
             .connect_timeout(Duration::from_secs(15))
             .user_agent(self.user_agent.as_str())
             .redirect(reqwest::redirect::Policy::limited(10));
-        let builder =
-            crate::config::apply_runtime_proxy_to_builder(builder, service_key);
+        let builder = crate::config::apply_runtime_proxy_to_builder(builder, service_key);
         Ok(builder.build()?)
     }
 
@@ -853,10 +852,7 @@ impl WebSearchTool {
                 "Google",
                 format!("https://www.google.com/search?q={encoded}&hl=ko"),
             ),
-            (
-                "DuckDuckGo",
-                format!("https://duckduckgo.com/?q={encoded}"),
-            ),
+            ("DuckDuckGo", format!("https://duckduckgo.com/?q={encoded}")),
         ];
 
         let daemon_url = format!("http://127.0.0.1:{}/command", daemon_port);
@@ -881,7 +877,8 @@ impl WebSearchTool {
                 Ok(r) => {
                     let text = r.text().await.unwrap_or_default();
                     if let Ok(j) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let Some(tid) = j.get("data")
+                        if let Some(tid) = j
+                            .get("data")
                             .and_then(|d| d.get("tab_id"))
                             .and_then(|t| t.as_i64())
                             .or_else(|| j.get("tab_id").and_then(|t| t.as_i64()))
@@ -966,12 +963,10 @@ impl WebSearchTool {
     ) -> anyhow::Result<String> {
         let encoded = urlencoding::encode(query).to_string().replace("%20", "+");
         let search_url = match engine {
-            "naver" => format!(
-                "https://search.naver.com/search.naver?where=nexearch&query={encoded}"
-            ),
-            "google" => format!(
-                "https://www.google.com/search?q={encoded}&hl=ko"
-            ),
+            "naver" => {
+                format!("https://search.naver.com/search.naver?where=nexearch&query={encoded}")
+            }
+            "google" => format!("https://www.google.com/search?q={encoded}&hl=ko"),
             _ => format!("https://duckduckgo.com/?q={encoded}"),
         };
 
@@ -1009,7 +1004,10 @@ impl WebSearchTool {
         let page_text = extract_daemon_text(&resp_text);
 
         if page_text.trim().is_empty() {
-            return Ok(format!("No results found for: {} (via {} browser)", query, engine));
+            return Ok(format!(
+                "No results found for: {} (via {} browser)",
+                query, engine
+            ));
         }
 
         let max_chars = 4000;
@@ -1133,7 +1131,11 @@ fn extract_daemon_text(resp_text: &str) -> String {
         if let Some(s) = j.get("output").and_then(|o| o.as_str()) {
             return s.to_string();
         }
-        if let Some(s) = j.get("data").and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
+        if let Some(s) = j
+            .get("data")
+            .and_then(|d| d.get("text"))
+            .and_then(|t| t.as_str())
+        {
             return s.to_string();
         }
     }

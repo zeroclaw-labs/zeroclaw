@@ -1507,7 +1507,6 @@ pub struct AgentSessionConfig {
     pub cross_session_turn_max_chars: usize,
 
     // ── ACE (Adaptive Context Engine) settings ──
-
     /// Layer 0: Number of most-recent turns to always preserve verbatim.
     /// These turns are never compressed or removed. Default: 10.
     #[serde(default = "default_ace_layer0_immediate_turns")]
@@ -1587,15 +1586,15 @@ fn default_ace_shortterm_window_secs() -> i64 {
 
 fn default_ace_rag_max_chars() -> usize {
     1_200_000 // 컨텍스트 윈도우 100만 토큰의 약 60% (한국어 기준 ~120만자)
-    // 실제 RAG 검색 결과는 관련 대화만 선별하므로 이 한계에 도달할 일은 거의 없음.
-    // Layer 1 첨부메모가 이미 대용량 콘텐츠를 압축하므로 안전.
+              // 실제 RAG 검색 결과는 관련 대화만 선별하므로 이 한계에 도달할 일은 거의 없음.
+              // Layer 1 첨부메모가 이미 대용량 콘텐츠를 압축하므로 안전.
 }
 
 fn default_ace_total_budget_chars() -> usize {
     2_000_000 // 컨텍스트 윈도우 100만 토큰 전체 (한영 혼합 평균 ~200만자)
-    // 실제 사용량은 Layer 0(~20K) + Layer 2 RAG(관련 대화만) ≈ 총 ~80K~150K자가 일반적.
-    // 최대치를 넓게 잡아도 Layer 0~2의 효율적 관리로 불필요한 낭비 없음.
-    // 소형 모델(128K 윈도우)에서는 config에서 축소 가능.
+              // 실제 사용량은 Layer 0(~20K) + Layer 2 RAG(관련 대화만) ≈ 총 ~80K~150K자가 일반적.
+              // 최대치를 넓게 잡아도 Layer 0~2의 효율적 관리로 불필요한 낭비 없음.
+              // 소형 모델(128K 윈도우)에서는 config에서 축소 가능.
 }
 
 fn default_loop_detection_no_progress_threshold() -> usize {
@@ -2261,7 +2260,11 @@ impl ApiKeyInventory {
         // LLM providers
         out.push_str("### LLM Providers\n");
         for (name, available) in &self.providers {
-            let status = if *available { "configured" } else { "not configured" };
+            let status = if *available {
+                "configured"
+            } else {
+                "not configured"
+            };
             let icon = if *available { "[O]" } else { "[X]" };
             let _ = writeln!(out, "- {icon} **{name}**: {status}");
         }
@@ -2270,7 +2273,11 @@ impl ApiKeyInventory {
         // Tools
         out.push_str("### Tool API Keys\n");
         for (name, available) in &self.tools {
-            let status = if *available { "configured" } else { "not configured" };
+            let status = if *available {
+                "configured"
+            } else {
+                "not configured"
+            };
             let icon = if *available { "[O]" } else { "[X]" };
             let _ = writeln!(out, "- {icon} **{name}**: {status}");
         }
@@ -2359,9 +2366,7 @@ pub fn build_api_key_inventory(config: &Config) -> ApiKeyInventory {
         || std::env::var("EXA_API_KEY")
             .ok()
             .is_some_and(|v| !v.trim().is_empty());
-    inventory
-        .tools
-        .push(("exa_search".to_string(), has_exa));
+    inventory.tools.push(("exa_search".to_string(), has_exa));
 
     // Jina Search
     let has_jina = config
@@ -2372,9 +2377,7 @@ pub fn build_api_key_inventory(config: &Config) -> ApiKeyInventory {
         || std::env::var("JINA_API_KEY")
             .ok()
             .is_some_and(|v| !v.trim().is_empty());
-    inventory
-        .tools
-        .push(("jina_search".to_string(), has_jina));
+    inventory.tools.push(("jina_search".to_string(), has_jina));
 
     // Composio
     let has_composio = config.composio.enabled
@@ -2383,9 +2386,7 @@ pub fn build_api_key_inventory(config: &Config) -> ApiKeyInventory {
             .api_key
             .as_ref()
             .is_some_and(|k| !k.trim().is_empty());
-    inventory
-        .tools
-        .push(("composio".to_string(), has_composio));
+    inventory.tools.push(("composio".to_string(), has_composio));
 
     // Web search (Perplexity as web_search provider)
     let has_web_search_perplexity = config
@@ -3323,8 +3324,13 @@ fn default_web_search_exa_search_type() -> String {
 const BROWSER_OPEN_ALLOWED_VALUES: &[&str] = &[
     "disable", "brave", "chrome", "firefox", "edge", "msedge", "default",
 ];
-const BROWSER_BACKEND_ALLOWED_VALUES: &[&str] =
-    &["agent_browser", "rust_native", "playwright", "computer_use", "auto"];
+const BROWSER_BACKEND_ALLOWED_VALUES: &[&str] = &[
+    "agent_browser",
+    "rust_native",
+    "playwright",
+    "computer_use",
+    "auto",
+];
 const BROWSER_AUTO_BACKEND_ALLOWED_VALUES: &[&str] =
     &["agent_browser", "rust_native", "playwright", "computer_use"];
 const WEB_SEARCH_PROVIDER_ALLOWED_VALUES: &[&str] = &[
@@ -16599,10 +16605,7 @@ reserve_percent = 15
         // Default config has no API keys configured
         assert!(inventory.providers.iter().all(|(_, v)| !v));
         assert!(inventory.tools.iter().all(|(_, v)| !v));
-        assert_eq!(
-            inventory.access_mode,
-            Some(ProviderAccessMode::Platform)
-        );
+        assert_eq!(inventory.access_mode, Some(ProviderAccessMode::Platform));
     }
 
     #[test]

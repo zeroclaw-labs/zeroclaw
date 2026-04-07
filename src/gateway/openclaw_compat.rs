@@ -600,24 +600,36 @@ pub async fn handle_api_chat(
                 }
             } else if is_context_error {
                 "메시지가 너무 깁니다. 더 짧은 메시지로 다시 시도하거나, \
-                 설정에서 더 큰 컨텍스트 윈도우를 지원하는 모델로 변경해주세요.".to_string()
-            } else if sanitized.contains("rate limit") || sanitized.contains("429") || sanitized.contains("Too Many") {
+                 설정에서 더 큰 컨텍스트 윈도우를 지원하는 모델로 변경해주세요."
+                    .to_string()
+            } else if sanitized.contains("rate limit")
+                || sanitized.contains("429")
+                || sanitized.contains("Too Many")
+            {
                 format!(
                     "⏳ {} API 요청 한도에 도달했습니다.\n\
                      잠시 후 다시 시도해주세요. (보통 1-2분 후 자동 해제됩니다)",
                     provider_label
                 )
-            } else if sanitized.contains("overloaded") || sanitized.contains("503") || sanitized.contains("capacity") {
+            } else if sanitized.contains("overloaded")
+                || sanitized.contains("503")
+                || sanitized.contains("capacity")
+            {
                 format!(
                     "🔄 {} 서버가 일시적으로 과부하 상태입니다.\n\
                      잠시 후 다시 시도하거나, 설정에서 다른 모델로 변경해주세요.",
                     provider_label
                 )
             } else if sanitized.contains("timeout") || sanitized.contains("timed out") {
-                "⏱️ 응답 시간이 초과되었습니다. 네트워크 연결을 확인하고 다시 시도해주세요.".to_string()
-            } else if sanitized.contains("connection") || sanitized.contains("network") || sanitized.contains("DNS") {
+                "⏱️ 응답 시간이 초과되었습니다. 네트워크 연결을 확인하고 다시 시도해주세요."
+                    .to_string()
+            } else if sanitized.contains("connection")
+                || sanitized.contains("network")
+                || sanitized.contains("DNS")
+            {
                 "🌐 네트워크 연결에 문제가 있습니다.\n\
-                 인터넷 연결을 확인하고 다시 시도해주세요.".to_string()
+                 인터넷 연결을 확인하고 다시 시도해주세요."
+                    .to_string()
             } else if sanitized.contains("invalid_api_key") || sanitized.contains("API key") {
                 format!(
                     "🔑 {} API 키가 올바르지 않습니다.\n\

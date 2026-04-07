@@ -9,7 +9,10 @@
     "shell:allow-open",
     "shell:allow-execute",
     "shell:allow-spawn",
+    "dialog:default",
     "dialog:allow-open",
-    "dialog:allow-save"
+    "dialog:allow-save",
+    "dialog:allow-message",
+    "dialog:allow-ask"
   ]
 }

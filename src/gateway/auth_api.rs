@@ -669,7 +669,7 @@ pub async fn handle_auth_kakao_callback(
 
         match auth_store.register(&auto_username, &auto_password) {
             Ok(uid) => {
-                let _ = auth_store.link_channel("kakao", &kakao_id, &uid);
+                let _ = auth_store.link_channel("kakao", &kakao_id, &uid, None);
                 (uid, auto_username)
             }
             Err(e) => {

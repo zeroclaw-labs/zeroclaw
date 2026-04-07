@@ -26,6 +26,7 @@ pub mod channel_ack_config;
 pub mod cli_discovery;
 pub mod composio;
 pub mod content_search;
+pub mod credential_vault;
 pub mod cron_add;
 pub mod cron_list;
 pub mod cron_remove;
@@ -63,6 +64,7 @@ pub mod memory_store;
 pub mod model_routing_config;
 pub mod openclaw_migration;
 pub mod pdf_read;
+pub mod perplexity_search;
 pub mod pptx_read;
 pub mod process;
 pub mod proxy_config;
@@ -81,10 +83,8 @@ pub mod traits;
 pub mod url_validation;
 pub mod wasm_module;
 pub mod wasm_tool;
-pub mod credential_vault;
 pub mod web_access_config;
 pub mod web_fetch;
-pub mod perplexity_search;
 pub mod web_search_config;
 pub mod web_search_tool;
 pub mod workspace_folder;
@@ -141,6 +141,7 @@ pub use memory_store::MemoryStoreTool;
 pub use model_routing_config::ModelRoutingConfigTool;
 pub use openclaw_migration::OpenClawMigrationTool;
 pub use pdf_read::PdfReadTool;
+pub use perplexity_search::PerplexitySearchTool;
 pub use pptx_read::PptxReadTool;
 pub use process::ProcessTool;
 pub use proxy_config::ProxyConfigTool;
@@ -159,7 +160,6 @@ pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 pub use wasm_module::WasmModuleTool;
-pub use perplexity_search::PerplexitySearchTool;
 pub use web_access_config::WebAccessConfigTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_config::WebSearchConfigTool;
@@ -866,46 +866,46 @@ pub fn all_tools_with_runtime(
             .unwrap_or_else(|| "default_user".to_string());
 
         match OntologyRepo::open(workspace_dir) {
-        Ok(mut onto_repo) => {
-            // Wire sync engine into OntologyRepo so every CUD operation
-            // automatically records a delta for cross-device replication.
-            // occurred_at is the primary temporal anchor for sync ordering.
-            if let Some(ref se) = sync_engine {
-                onto_repo.set_sync(Arc::clone(se));
+            Ok(mut onto_repo) => {
+                // Wire sync engine into OntologyRepo so every CUD operation
+                // automatically records a delta for cross-device replication.
+                // occurred_at is the primary temporal anchor for sync ordering.
+                if let Some(ref se) = sync_engine {
+                    onto_repo.set_sync(Arc::clone(se));
+                }
+                let onto_repo = Arc::new(onto_repo);
+                let rule_engine = Arc::new(RuleEngine::new(Arc::clone(&onto_repo)));
+                let ctx_builder = Arc::new(ContextBuilder::new(Arc::clone(&onto_repo)));
+
+                // Give the dispatcher access to the current tool set for routing.
+                let home_timezone = root_config.sync.home_timezone.clone();
+                let dispatcher = Arc::new(ActionDispatcher::new(
+                    Arc::clone(&onto_repo),
+                    rule_engine,
+                    tool_arcs.clone(),
+                    home_timezone,
+                ));
+
+                tool_arcs.push(Arc::new(OntologyGetContextTool::new(
+                    ctx_builder,
+                    owner_user_id.clone(),
+                )));
+                tool_arcs.push(Arc::new(OntologySearchObjectsTool::new(
+                    Arc::clone(&onto_repo),
+                    owner_user_id.clone(),
+                )));
+                tool_arcs.push(Arc::new(OntologyExecuteActionTool::new(
+                    dispatcher,
+                    owner_user_id,
+                )));
             }
-            let onto_repo = Arc::new(onto_repo);
-            let rule_engine = Arc::new(RuleEngine::new(Arc::clone(&onto_repo)));
-            let ctx_builder = Arc::new(ContextBuilder::new(Arc::clone(&onto_repo)));
-
-            // Give the dispatcher access to the current tool set for routing.
-            let home_timezone = root_config.sync.home_timezone.clone();
-            let dispatcher = Arc::new(ActionDispatcher::new(
-                Arc::clone(&onto_repo),
-                rule_engine,
-                tool_arcs.clone(),
-                home_timezone,
-            ));
-
-            tool_arcs.push(Arc::new(OntologyGetContextTool::new(
-                ctx_builder,
-                owner_user_id.clone(),
-            )));
-            tool_arcs.push(Arc::new(OntologySearchObjectsTool::new(
-                Arc::clone(&onto_repo),
-                owner_user_id.clone(),
-            )));
-            tool_arcs.push(Arc::new(OntologyExecuteActionTool::new(
-                dispatcher,
-                owner_user_id,
-            )));
-        }
-        Err(e) => {
-            tracing::warn!(
-                workspace = %workspace_dir.display(),
-                error = %e,
-                "ontology: failed to open repo; ontology tools disabled"
-            );
-        }
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_dir.display(),
+                    error = %e,
+                    "ontology: failed to open repo; ontology tools disabled"
+                );
+            }
         }
     }
 

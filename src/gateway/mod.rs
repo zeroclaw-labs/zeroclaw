@@ -9,6 +9,7 @@
 
 pub mod api;
 pub mod auth_api;
+pub mod channel_router;
 pub mod llm_proxy;
 mod openai_compat;
 mod openclaw_compat;
@@ -1136,6 +1137,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .route("/qq", post(handle_qq_webhook))
+        .route("/kakao", post(handle_kakao_webhook))
         // ── OpenClaw migration: tools-enabled chat endpoint (extended timeout) ──
         .merge(chat_routes)
         // ── OpenAI-compatible endpoints (extended timeout) ──
@@ -1236,9 +1238,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/node-control", post(handle_node_control))
         // ── LLM proxy (hybrid architecture: keys stay on server) ──
         // Needs extended body limit — conversation history can exceed 64KB.
-        .nest("/api/llm", Router::new()
-            .route("/proxy", post(llm_proxy::handle_llm_proxy))
-            .layer(RequestBodyLimitLayer::new(CHAT_MAX_BODY_SIZE))
+        .nest(
+            "/api/llm",
+            Router::new()
+                .route("/proxy", post(llm_proxy::handle_llm_proxy))
+                .layer(RequestBodyLimitLayer::new(CHAT_MAX_BODY_SIZE)),
         )
         // ── Document processing ──
         .route(
@@ -1637,169 +1641,20 @@ fn try_consume_pairing_code(
     ))
 }
 
-/// Try to relay a channel message to the user's local device for processing.
-///
-/// **Channel-to-Device Relay Architecture**:
-/// Instead of processing channel messages entirely on Railway, this function
-/// attempts to route them to the user's local MoA device. This ensures:
-///   - Local tool API keys are used (web search, browser, Composio, etc.)
-///   - Local settings/config are applied
-///   - LLM calls go through Railway's /api/llm/proxy if device has no LLM key
-///
-/// The user is identified via ChannelPairingStore: (channel, platform_uid) → user_id.
-/// If the user is not paired or their device is offline, returns None and the
-/// caller falls back to Railway processing.
-///
-/// Returns `Some(response_text)` if device handled the message, `None` otherwise.
-pub(super) async fn try_relay_channel_to_device(
-    state: &AppState,
-    channel_name: &str,
-    sender_platform_uid: &str,
-    content: &str,
-    session_id: &str,
-) -> Option<String> {
-    // 1. Look up MoA user_id from channel pairing
-    let channel_pairing = state.channel_pairing.as_ref()?;
-    let user_id = channel_pairing.lookup_user_id(channel_name, sender_platform_uid)?;
-
-    // 2. Check if user's device is online
-    let device_router = state.device_router.as_ref()?;
-    let auth_store = state.auth_store.as_ref()?;
-
-    let devices = auth_store.list_devices(&user_id).ok()?;
-    let online_device = devices
-        .iter()
-        .find(|d| device_router.is_device_online(&d.device_id))?;
-
-    let device_id = online_device.device_id.clone();
-    let device_name = online_device.device_name.clone();
-
-    // 3. Determine proxy URL for LLM calls
-    let proxy_url = if let Ok(domain) = std::env::var("RAILWAY_PUBLIC_DOMAIN") {
-        format!("https://{}/api/llm/proxy", domain.trim_end_matches('/'))
-    } else {
-        let config_guard = state.config.lock();
-        let host = &config_guard.gateway.host;
-        let port = config_guard.gateway.port;
-        format!("http://{}:{}/api/llm/proxy", host, port)
-    };
-
-    // 4. Issue a short-lived proxy token (15 min)
-    let proxy_token = auth_store
-        .create_session_with_ttl(
-            &user_id,
-            Some(&device_id),
-            Some(&device_name),
-            15 * 60, // 15 minutes
-        )
-        .ok()?;
-
-    let provider_name = {
-        let config_guard = state.config.lock();
-        config_guard
-            .default_provider
-            .clone()
-            .unwrap_or_else(|| "gemini".to_string())
-    };
-
-    tracing::info!(
-        channel = channel_name,
-        sender = sender_platform_uid,
-        user_id = user_id.as_str(),
-        device_id = device_id.as_str(),
-        "Channel relay: routing message to user's local device"
-    );
-
-    // 5. Send channel_relay message to device
-    let msg_id = uuid::Uuid::new_v4().to_string();
-    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<remote::RoutedMessage>(64);
-
-    {
-        remote::REMOTE_RESPONSE_CHANNELS
-            .lock()
-            .insert(msg_id.clone(), resp_tx);
-    }
-
-    let routed_msg = remote::RoutedMessage {
-        id: msg_id.clone(),
-        direction: "to_device".to_string(),
-        content: serde_json::json!({
-            "content": content,
-            "channel": channel_name,
-            "session_id": session_id,
-            "provider": provider_name,
-            "proxy_token": proxy_token,
-            "proxy_url": proxy_url,
-        })
-        .to_string(),
-        msg_type: "channel_relay".to_string(),
-    };
-
-    if device_router
-        .send_to_device(&device_id, routed_msg)
-        .await
-        .is_err()
-    {
-        remote::REMOTE_RESPONSE_CHANNELS.lock().remove(&msg_id);
-        tracing::warn!(
-            device_id = device_id.as_str(),
-            "Channel relay: failed to send to device"
-        );
-        return None;
-    }
-
-    // 6. Wait for device response (up to 120 seconds for agent processing)
-    let mut response_text = String::new();
-    let mut got_response = false;
-
-    loop {
-        match tokio::time::timeout(tokio::time::Duration::from_secs(120), resp_rx.recv()).await {
-            Ok(Some(resp)) => {
-                got_response = true;
-                match resp.msg_type.as_str() {
-                    "done" => {
-                        response_text = resp.content;
-                        break;
-                    }
-                    "chunk" => {
-                        response_text.push_str(&resp.content);
-                    }
-                    "error" => {
-                        tracing::warn!(
-                            device_id = device_id.as_str(),
-                            error = resp.content.as_str(),
-                            "Channel relay: device returned error"
-                        );
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            Ok(None) => break,
-            Err(_) => {
-                tracing::warn!(
-                    device_id = device_id.as_str(),
-                    "Channel relay: device timed out (120s)"
-                );
-                break;
-            }
-        }
-    }
-
-    remote::REMOTE_RESPONSE_CHANNELS.lock().remove(&msg_id);
-
-    if got_response && !response_text.is_empty() {
-        Some(response_text)
-    } else {
-        None
-    }
-}
-
 /// Process a channel message with device-first relay.
 ///
-/// Tries to route the message to the user's local device first.
-/// Falls back to Railway processing if device is offline or not paired.
-/// This is the primary entry point for all channel webhook handlers.
+/// Routes the message to the user's specific MoA device via the common
+/// channel routing framework.  Each user's memories and tools stay on
+/// their local device — Railway only relays messages.
+///
+/// Flow:
+/// 1. Check for channel commands (/디바이스, /모드, /도움말, etc.)
+/// 2. Check for pairing code (one-click channel linking)
+/// 3. Look up channel_link → (user_id, device_id, autonomy_mode)
+/// 4. Route to device via DeviceRouter
+/// 5. Collect response and return
+///
+/// If the user isn't linked yet, returns an onboarding message with auth URL.
 pub(super) async fn process_channel_message(
     state: &AppState,
     channel_name: &str,
@@ -1807,30 +1662,159 @@ pub(super) async fn process_channel_message(
     content: &str,
     session_id: Option<&str>,
 ) -> anyhow::Result<String> {
-    // ── Step 0: Check for pairing code ──
-    // If the user sends a message that looks like a pairing code (4-64 char
-    // alphanumeric/dash, including UUID tokens), try to consume it and pair.
-    // This enables one-click channel pairing: user sends the code in the
-    // channel chat, and we automatically link their channel identity to
-    // their MoA account.
+    let reply = process_channel_message_rich(
+        state,
+        channel_name,
+        sender_platform_uid,
+        content,
+        session_id,
+    )
+    .await?;
+    Ok(reply.as_plain_text())
+}
+
+/// Same as `process_channel_message` but returns a structured `ChannelReply`
+/// with buttons.  Channel-specific webhook handlers (KakaoTalk, Telegram)
+/// can render these buttons in their native format (quickReplies, inline_keyboard).
+pub(super) async fn process_channel_message_rich(
+    state: &AppState,
+    channel_name: &str,
+    sender_platform_uid: &str,
+    content: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<channel_router::ChannelReply> {
+    let auth_store = match state.auth_store.as_ref() {
+        Some(s) => s,
+        None => {
+            let text = run_gateway_chat_with_tools(state, content, session_id).await?;
+            return Ok(channel_router::ChannelReply::text(text));
+        }
+    };
+    let device_router = match state.device_router.as_ref() {
+        Some(r) => r,
+        None => {
+            let text = run_gateway_chat_with_tools(state, content, session_id).await?;
+            return Ok(channel_router::ChannelReply::text(text));
+        }
+    };
+
+    // Ensure channel_links table exists (idempotent)
+    let _ = auth_store.ensure_channel_links_table();
+
+    // ── Step 0: Handle button callbacks and commands ──
+    if let Some(reply) = channel_router::handle_channel_command(
+        auth_store,
+        device_router,
+        channel_name,
+        sender_platform_uid,
+        content,
+    ) {
+        return Ok(reply);
+    }
+
+    // ── Step 1: Check for pairing code ──
     if let Some(pairing_response) =
         try_consume_pairing_code(state, channel_name, sender_platform_uid, content)
     {
-        return Ok(pairing_response);
+        return Ok(channel_router::ChannelReply::text(pairing_response));
     }
 
-    let sid = session_id.unwrap_or("");
+    // ── Step 2: Route to device via channel router ──
+    let result = channel_router::route_channel_message(
+        auth_store,
+        device_router,
+        channel_name,
+        sender_platform_uid,
+        content,
+    )
+    .await;
 
-    // Step 1: Try device relay (preserves local tool keys)
-    let device_response =
-        try_relay_channel_to_device(state, channel_name, sender_platform_uid, content, sid).await;
+    match result {
+        channel_router::RouteResult::Delivered {
+            msg_id,
+            response_rx,
+        } => {
+            let collector = channel_router::ResponseCollector {
+                rx: response_rx,
+                msg_id,
+            };
+            Ok(collector.collect(std::time::Duration::from_secs(120)).await)
+        }
 
-    if let Some(response) = device_response {
-        return Ok(response);
+        channel_router::RouteResult::NotLinked => {
+            let gateway_url = resolve_public_gateway_url(state);
+            let auth_url = channel_router::build_onboarding_url(
+                &gateway_url,
+                channel_name,
+                sender_platform_uid,
+            );
+            Ok(channel_router::onboarding_reply(&auth_url))
+        }
+
+        channel_router::RouteResult::NoDeviceSelected { link } => {
+            match auth_store.list_devices(&link.user_id) {
+                Ok(devices) if devices.len() == 1 => {
+                    // Single device — auto-select and retry
+                    let _ = auth_store.update_channel_device(
+                        channel_name,
+                        sender_platform_uid,
+                        &devices[0].device_id,
+                    );
+                    let retry = channel_router::route_channel_message(
+                        auth_store,
+                        device_router,
+                        channel_name,
+                        sender_platform_uid,
+                        content,
+                    )
+                    .await;
+                    match retry {
+                        channel_router::RouteResult::Delivered {
+                            msg_id,
+                            response_rx,
+                        } => {
+                            let collector = channel_router::ResponseCollector {
+                                rx: response_rx,
+                                msg_id,
+                            };
+                            Ok(collector.collect(std::time::Duration::from_secs(120)).await)
+                        }
+                        channel_router::RouteResult::DeviceOffline { device_name, .. } => {
+                            Ok(channel_router::device_offline_reply(device_name.as_deref()))
+                        }
+                        _ => Ok(channel_router::ChannelReply::text(
+                            "디바이스에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+                        )),
+                    }
+                }
+                Ok(devices) if devices.is_empty() => Ok(channel_router::ChannelReply::text(
+                    "MoA 앱이 설치된 디바이스가 없습니다. 먼저 MoA 앱을 설치해 주세요.",
+                )),
+                Ok(devices) => Ok(channel_router::device_selection_reply(
+                    &devices,
+                    device_router,
+                )),
+                Err(_) => Ok(channel_router::ChannelReply::text(
+                    "디바이스 목록을 확인할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+                )),
+            }
+        }
+
+        channel_router::RouteResult::DeviceOffline { device_name, .. } => {
+            Ok(channel_router::device_offline_reply(device_name.as_deref()))
+        }
     }
+}
 
-    // Step 2: Fallback to Railway processing
-    run_gateway_chat_with_tools(state, content, session_id).await
+/// Resolve the public URL for this gateway (for generating auth links).
+fn resolve_public_gateway_url(state: &AppState) -> String {
+    if let Ok(domain) = std::env::var("RAILWAY_PUBLIC_DOMAIN") {
+        return format!("https://{}", domain.trim_end_matches('/'));
+    }
+    let config = state.config.lock();
+    let host = &config.gateway.host;
+    let port = config.gateway.port;
+    format!("http://{}:{}", host, port)
 }
 
 /// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
@@ -3625,6 +3609,105 @@ async fn handle_qq_webhook(
     }
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+// ── KakaoTalk Webhook (Chatbot Skill API) ───────────────────────────
+
+/// POST /kakao — KakaoTalk Chatbot Skill webhook.
+///
+/// Receives messages from KakaoTalk channel and routes them to the user's
+/// MoA device via the common channel routing framework.  Returns Kakao Skill
+/// JSON with `quickReplies` for native button rendering.
+async fn handle_kakao_webhook(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("KakaoTalk webhook: invalid JSON: {e}");
+            return kakao_skill_json("요청을 처리할 수 없습니다.", &[]);
+        }
+    };
+
+    // Kakao Chatbot Skill format: { "userRequest": { "user": { "id": "..." }, "utterance": "..." } }
+    let user_id = payload
+        .pointer("/userRequest/user/id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    let utterance = payload
+        .pointer("/userRequest/utterance")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+
+    if utterance.is_empty() {
+        return kakao_skill_json("메시지를 입력해주세요.", &[]);
+    }
+
+    tracing::info!(
+        channel = "kakao",
+        user_id,
+        utterance_len = utterance.len(),
+        "KakaoTalk webhook received"
+    );
+
+    // Route through the common channel routing framework
+    match process_channel_message_rich(&state, "kakao", user_id, utterance, None).await {
+        Ok(reply) => kakao_skill_json(&reply.text, &reply.buttons),
+        Err(e) => {
+            tracing::error!("KakaoTalk processing failed: {e:#}");
+            kakao_skill_json(
+                "메시지를 처리하는 중 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+                &[],
+            )
+        }
+    }
+}
+
+/// Render a ChannelReply as Kakao Chatbot Skill JSON with quickReplies.
+fn kakao_skill_json(
+    text: &str,
+    buttons: &[channel_router::ReplyButton],
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut quick_replies = Vec::new();
+
+    for btn in buttons {
+        match &btn.action {
+            channel_router::ButtonAction::PostBack(data) => {
+                quick_replies.push(serde_json::json!({
+                    "label": btn.label,
+                    "action": "message",
+                    "messageText": data,
+                }));
+            }
+            channel_router::ButtonAction::WebLink(url) => {
+                quick_replies.push(serde_json::json!({
+                    "label": btn.label,
+                    "action": "webLink",
+                    "webLinkUrl": url,
+                }));
+            }
+        }
+    }
+
+    let mut template = serde_json::json!({
+        "outputs": [{
+            "simpleText": {
+                "text": text
+            }
+        }]
+    });
+
+    if !quick_replies.is_empty() {
+        template["quickReplies"] = serde_json::Value::Array(quick_replies);
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "version": "2.0",
+            "template": template
+        })),
+    )
 }
 
 #[cfg(test)]

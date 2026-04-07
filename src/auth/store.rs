@@ -607,29 +607,96 @@ impl AuthStore {
                 channel TEXT NOT NULL,
                 platform_uid TEXT NOT NULL,
                 user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                device_id TEXT,
+                autonomy_mode TEXT NOT NULL DEFAULT 'read_only',
                 linked_at INTEGER NOT NULL,
                 PRIMARY KEY (channel, platform_uid)
             );
             CREATE INDEX IF NOT EXISTS idx_channel_links_user ON channel_links(user_id);",
         )?;
+        // Migration: add device_id column if missing (existing installs)
+        let table_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='channel_links'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+        if !table_sql.contains("device_id") {
+            let _ = conn.execute_batch("ALTER TABLE channel_links ADD COLUMN device_id TEXT;");
+        }
+        if !table_sql.contains("autonomy_mode") {
+            let _ = conn.execute_batch(
+                "ALTER TABLE channel_links ADD COLUMN autonomy_mode TEXT NOT NULL DEFAULT 'read_only';",
+            );
+        }
         Ok(())
     }
 
-    /// Link a messaging channel identity to an authenticated MoA user.
-    pub fn link_channel(&self, channel: &str, platform_uid: &str, user_id: &str) -> Result<()> {
+    /// Link a messaging channel identity to an authenticated MoA user and device.
+    pub fn link_channel(
+        &self,
+        channel: &str,
+        platform_uid: &str,
+        user_id: &str,
+        device_id: Option<&str>,
+    ) -> Result<()> {
         let conn = self.conn.lock();
         let now = epoch_secs();
         conn.execute(
-            "INSERT OR REPLACE INTO channel_links (channel, platform_uid, user_id, linked_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![channel, platform_uid, user_id, now as i64],
+            "INSERT INTO channel_links (channel, platform_uid, user_id, device_id, autonomy_mode, linked_at)
+             VALUES (?1, ?2, ?3, ?4, 'read_only', ?5)
+             ON CONFLICT(channel, platform_uid) DO UPDATE SET
+                user_id = excluded.user_id,
+                device_id = excluded.device_id,
+                linked_at = excluded.linked_at",
+            rusqlite::params![channel, platform_uid, user_id, device_id, now as i64],
         )?;
         tracing::info!(
             channel = channel,
             platform_uid = platform_uid,
+            device_id = device_id,
             "Channel identity linked"
         );
         Ok(())
+    }
+
+    /// Full channel link lookup — returns user, device_id, and autonomy mode.
+    pub fn find_channel_link_full(
+        &self,
+        channel: &str,
+        platform_uid: &str,
+    ) -> Result<Option<ChannelLink>> {
+        let conn = self.conn.lock();
+        let row = conn.query_row(
+            "SELECT cl.user_id, cl.device_id, cl.autonomy_mode,
+                    u.id, u.username, u.email, u.created_at
+             FROM channel_links cl
+             JOIN users u ON cl.user_id = u.id
+             WHERE cl.channel = ?1 AND cl.platform_uid = ?2",
+            rusqlite::params![channel, platform_uid],
+            |row| {
+                Ok(ChannelLink {
+                    user_id: row.get(0)?,
+                    device_id: row.get(1)?,
+                    autonomy_mode: row
+                        .get::<_, String>(2)
+                        .unwrap_or_else(|_| "read_only".into()),
+                    user: User {
+                        id: row.get(3)?,
+                        username: row.get(4)?,
+                        email: row.get(5)?,
+                        created_at: row.get(6)?,
+                    },
+                })
+            },
+        );
+
+        match row {
+            Ok(link) => Ok(Some(link)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Check if a channel identity is linked to any MoA user.
@@ -676,6 +743,55 @@ impl AuthStore {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Update the target device for an existing channel link.
+    pub fn update_channel_device(
+        &self,
+        channel: &str,
+        platform_uid: &str,
+        device_id: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE channel_links SET device_id = ?3 WHERE channel = ?1 AND platform_uid = ?2",
+            rusqlite::params![channel, platform_uid, device_id],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Toggle autonomy mode for a channel link (read_only / full).
+    pub fn set_channel_autonomy_mode(
+        &self,
+        channel: &str,
+        platform_uid: &str,
+        mode: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE channel_links SET autonomy_mode = ?3 WHERE channel = ?1 AND platform_uid = ?2",
+            rusqlite::params![channel, platform_uid, mode],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Remove channel link (unlink).
+    pub fn unlink_channel(&self, channel: &str, platform_uid: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let deleted = conn.execute(
+            "DELETE FROM channel_links WHERE channel = ?1 AND platform_uid = ?2",
+            rusqlite::params![channel, platform_uid],
+        )?;
+        Ok(deleted > 0)
+    }
+}
+
+/// Full channel link record — user identity + target device + autonomy mode.
+#[derive(Debug, Clone)]
+pub struct ChannelLink {
+    pub user_id: String,
+    pub device_id: Option<String>,
+    pub autonomy_mode: String,
+    pub user: User,
 }
 
 // ── Cryptographic Helpers ───────────────────────────────────────────

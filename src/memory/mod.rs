@@ -3,6 +3,7 @@ pub mod chunker;
 pub mod cli;
 pub mod cortex;
 pub mod embeddings;
+pub mod hot_cache;
 pub mod hybrid;
 pub mod hygiene;
 pub mod lucid;
@@ -18,7 +19,6 @@ pub mod sync;
 pub mod synced;
 pub mod traits;
 pub mod vector;
-pub mod hot_cache;
 
 #[allow(unused_imports)]
 pub use backend::{

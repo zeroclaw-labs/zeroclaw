@@ -86,15 +86,15 @@ pub(super) async fn build_context(
     let mut ontology_cross_keywords = Vec::new();
     if let Some(repo) = ontology {
         let owner = session_id.unwrap_or("cli_interactive");
-        if let Ok(objects) =
-            repo.search_objects(owner, None, user_msg, MAX_ONTOLOGY_ENTRIES)
-        {
+        if let Ok(objects) = repo.search_objects(owner, None, user_msg, MAX_ONTOLOGY_ENTRIES) {
             if !objects.is_empty() {
                 let start = context.len();
                 context.push_str("[Ontology context]\n");
                 for obj in &objects {
                     let title = obj.title.as_deref().unwrap_or("(untitled)");
-                    let props = if obj.properties.is_null() || obj.properties.as_object().is_some_and(|m| m.is_empty()) {
+                    let props = if obj.properties.is_null()
+                        || obj.properties.as_object().is_some_and(|m| m.is_empty())
+                    {
                         String::new()
                     } else {
                         obj.properties.to_string()
@@ -107,7 +107,10 @@ pub(super) async fn build_context(
                     if let Some(t) = obj.title.as_deref() {
                         ontology_cross_keywords.push(t.to_string());
                     }
-                    extract_cross_search_keywords_from_json(&obj.properties, &mut ontology_cross_keywords);
+                    extract_cross_search_keywords_from_json(
+                        &obj.properties,
+                        &mut ontology_cross_keywords,
+                    );
                 }
                 context.push('\n');
                 section_boundaries.push((start, SectionPriority::Ontology));
@@ -123,7 +126,10 @@ pub(super) async fn build_context(
                 .collect::<Vec<_>>()
                 .join(" ");
 
-            if let Ok(enriched) = mem.recall(&cross_query, MAX_CROSS_SEARCH_ENTRIES, session_id).await {
+            if let Ok(enriched) = mem
+                .recall(&cross_query, MAX_CROSS_SEARCH_ENTRIES, session_id)
+                .await
+            {
                 let new_entries: Vec<_> = enriched
                     .iter()
                     .filter(|e| {
@@ -171,7 +177,9 @@ pub(super) async fn build_context(
                     context.push_str("[Cross-referenced relationships (from memory context)]\n");
                     for obj in &new_objects {
                         let title = obj.title.as_deref().unwrap_or("(untitled)");
-                        let props = if obj.properties.is_null() || obj.properties.as_object().is_some_and(|m| m.is_empty()) {
+                        let props = if obj.properties.is_null()
+                            || obj.properties.as_object().is_some_and(|m| m.is_empty())
+                        {
                             String::new()
                         } else {
                             obj.properties.to_string()
@@ -229,11 +237,7 @@ pub(super) async fn build_context(
                 // Remove the section
                 if let Some(end) = section_text.find("\n\n") {
                     let end_pos = pos + end + 2;
-                    new_context = format!(
-                        "{}{}",
-                        &new_context[..pos],
-                        &new_context[end_pos..]
-                    );
+                    new_context = format!("{}{}", &new_context[..pos], &new_context[end_pos..]);
                 }
             }
         }
@@ -296,9 +300,17 @@ fn extract_cross_search_keywords_from_json(props: &serde_json::Value, keywords: 
     if let Some(obj) = props.as_object() {
         for (key, value) in obj {
             // Focus on identity/temporal/spatial fields
-            if matches!(key.as_str(),
-                "name" | "location" | "time" | "date" | "counterpart"
-                | "channel" | "category" | "topic" | "subject"
+            if matches!(
+                key.as_str(),
+                "name"
+                    | "location"
+                    | "time"
+                    | "date"
+                    | "counterpart"
+                    | "channel"
+                    | "category"
+                    | "topic"
+                    | "subject"
             ) {
                 if let Some(s) = value.as_str() {
                     if !s.is_empty() && s.len() < 100 {
@@ -394,7 +406,8 @@ pub(super) fn build_cross_session_context(
         return String::new();
     }
 
-    const HEADER: &str = "[Recent conversation history — verbatim, continue this conversation naturally]\n";
+    const HEADER: &str =
+        "[Recent conversation history — verbatim, continue this conversation naturally]\n";
 
     // ── 3-tier progressive compression thresholds ──
     // Tier 1: 0~999 chars     → verbatim (normal conversation)
@@ -415,7 +428,11 @@ pub(super) fn build_cross_session_context(
     let mut total = HEADER.len();
 
     for turn in turns.iter().take(take_count) {
-        let label = if turn.role == "user" { "User" } else { "Assistant" };
+        let label = if turn.role == "user" {
+            "User"
+        } else {
+            "Assistant"
+        };
         let content = &turn.content;
         let char_count = content.chars().count();
 
@@ -535,9 +552,14 @@ fn generate_turn_memo(content: &str, char_count: usize) -> String {
         .collect();
     for line in last_lines.iter().rev() {
         let trimmed = line.trim();
-        if trimmed.contains('?') || trimmed.contains("할까") || trimmed.contains("드릴까")
-            || trimmed.contains("하시겠") || trimmed.contains("해줘") || trimmed.contains("알려")
-            || trimmed.contains("확인") || trimmed.contains("제안")
+        if trimmed.contains('?')
+            || trimmed.contains("할까")
+            || trimmed.contains("드릴까")
+            || trimmed.contains("하시겠")
+            || trimmed.contains("해줘")
+            || trimmed.contains("알려")
+            || trimmed.contains("확인")
+            || trimmed.contains("제안")
         {
             let question: String = trimmed.chars().take(chars_per_section).collect();
             memo_parts.push(format!("▸ 질문/요청: {question}"));
@@ -632,11 +654,20 @@ fn summarize_section(section: &str, budget: usize) -> String {
             .filter(|l| {
                 let t = l.trim();
                 t.len() > 10
-                    && (t.contains("결과") || t.contains("결론") || t.contains("요약")
-                        || t.contains("중요") || t.contains("핵심") || t.contains("따라서")
-                        || t.contains("때문") || t.contains("위해") || t.contains("Result")
-                        || t.contains("Summary") || t.contains("because") || t.contains("therefore")
-                        || t.starts_with("- ") || t.starts_with("* "))
+                    && (t.contains("결과")
+                        || t.contains("결론")
+                        || t.contains("요약")
+                        || t.contains("중요")
+                        || t.contains("핵심")
+                        || t.contains("따라서")
+                        || t.contains("때문")
+                        || t.contains("위해")
+                        || t.contains("Result")
+                        || t.contains("Summary")
+                        || t.contains("because")
+                        || t.contains("therefore")
+                        || t.starts_with("- ")
+                        || t.starts_with("* "))
             })
             .collect();
 
@@ -802,9 +833,18 @@ mod tests {
     #[test]
     fn build_cross_session_skips_current() {
         let turns = vec![
-            ChatMessage { role: "user".into(), content: "hello".into() },
-            ChatMessage { role: "assistant".into(), content: "hi there".into() },
-            ChatMessage { role: "user".into(), content: "current msg".into() },
+            ChatMessage {
+                role: "user".into(),
+                content: "hello".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "hi there".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "current msg".into(),
+            },
         ];
         let ctx = build_cross_session_context(&turns, 1, 16000, 600);
         assert!(ctx.contains("User: hello"));
@@ -841,8 +881,14 @@ mod tests {
     #[test]
     fn build_cross_session_short_turns_verbatim() {
         let turns = vec![
-            ChatMessage { role: "user".into(), content: "안녕하세요 변호사님".into() },
-            ChatMessage { role: "assistant".into(), content: "네, 변호사님! 무엇을 도와드릴까요?".into() },
+            ChatMessage {
+                role: "user".into(),
+                content: "안녕하세요 변호사님".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "네, 변호사님! 무엇을 도와드릴까요?".into(),
+            },
         ];
         let ctx = build_cross_session_context(&turns, 0, 16000, 2000);
         assert!(ctx.contains("User: 안녕하세요 변호사님"));
@@ -853,7 +899,10 @@ mod tests {
     fn build_cross_session_tier2_medium_turn_partial_compress() {
         // 1000~1499 chars: keep 70%, compress tail 30%
         let content = "가".repeat(1200);
-        let turns = vec![ChatMessage { role: "assistant".into(), content }];
+        let turns = vec![ChatMessage {
+            role: "assistant".into(),
+            content,
+        }];
         let ctx = build_cross_session_context(&turns, 0, 32000, 2000);
         // Should contain the 축약 marker
         assert!(ctx.contains("축약"));
@@ -865,7 +914,10 @@ mod tests {
     fn build_cross_session_tier3_long_turn_half_compress() {
         // 1500~1999 chars: keep 50%, compress tail 50%
         let content = "나".repeat(1700);
-        let turns = vec![ChatMessage { role: "assistant".into(), content }];
+        let turns = vec![ChatMessage {
+            role: "assistant".into(),
+            content,
+        }];
         let ctx = build_cross_session_context(&turns, 0, 32000, 2000);
         assert!(ctx.contains("축약"));
         // Should be significantly shorter than verbatim
@@ -876,7 +928,10 @@ mod tests {
     fn build_cross_session_under_1000_verbatim() {
         // Under 1000 chars: fully verbatim
         let content = "다".repeat(999);
-        let turns = vec![ChatMessage { role: "user".into(), content: content.clone() }];
+        let turns = vec![ChatMessage {
+            role: "user".into(),
+            content: content.clone(),
+        }];
         let ctx = build_cross_session_context(&turns, 0, 32000, 2000);
         assert!(!ctx.contains("축약"));
         assert!(!ctx.contains("MEMO"));

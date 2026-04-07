@@ -80,11 +80,7 @@ impl PerplexitySearchTool {
         Self {
             security,
             api_keys,
-            api_url: config
-                .api_url
-                .trim()
-                .trim_end_matches('/')
-                .to_string(),
+            api_url: config.api_url.trim().trim_end_matches('/').to_string(),
             max_results: config.max_results.clamp(1, 20),
             timeout_secs: config.timeout_secs.max(1),
             region: config.region.clone(),
@@ -178,11 +174,7 @@ impl PerplexitySearchTool {
             if status.as_u16() == 404 || status.as_u16() == 405 {
                 return self.search_via_sonar(query, &api_key, num_results).await;
             }
-            anyhow::bail!(
-                "Perplexity Search API error ({}): {}",
-                status.as_u16(),
-                raw
-            );
+            anyhow::bail!("Perplexity Search API error ({}): {}", status.as_u16(), raw);
         }
 
         let parsed: serde_json::Value = serde_json::from_str(&raw)
@@ -325,8 +317,7 @@ impl PerplexitySearchTool {
         let link_regex = Regex::new(
             r#"<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#,
         )?;
-        let snippet_regex =
-            Regex::new(r#"<a class="result__snippet[^"]*"[^>]*>([\s\S]*?)</a>"#)?;
+        let snippet_regex = Regex::new(r#"<a class="result__snippet[^"]*"[^>]*>([\s\S]*?)</a>"#)?;
 
         let link_matches: Vec<_> = link_regex
             .captures_iter(html)
@@ -391,9 +382,7 @@ impl PerplexitySearchTool {
         query: &str,
         parsed: &serde_json::Value,
     ) -> anyhow::Result<String> {
-        let results = parsed
-            .get("results")
-            .and_then(serde_json::Value::as_array);
+        let results = parsed.get("results").and_then(serde_json::Value::as_array);
 
         let results = match results {
             Some(arr) if !arr.is_empty() => arr,
@@ -418,18 +407,13 @@ impl PerplexitySearchTool {
             lines.push(format!("\n[{}] {}", i + 1, title));
             lines.push(format!("    URL: {}", url));
 
-            if let Some(snippets) = result
-                .get("snippets")
-                .and_then(serde_json::Value::as_array)
-            {
+            if let Some(snippets) = result.get("snippets").and_then(serde_json::Value::as_array) {
                 for snippet in snippets {
                     if let Some(text) = snippet.as_str() {
                         lines.push(format!("    {}", text));
                     }
                 }
-            } else if let Some(snippet) = result
-                .get("snippet")
-                .and_then(serde_json::Value::as_str)
+            } else if let Some(snippet) = result.get("snippet").and_then(serde_json::Value::as_str)
             {
                 lines.push(format!("    {}", snippet));
             }

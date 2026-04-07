@@ -393,8 +393,8 @@ mod tests {
             timestamp: "2026-02-16T00:00:00Z".into(),
             session_id: Some("session-abc".into()),
             score: Some(0.98),
-        recall_count: 0,
-        last_recalled: None,
+            recall_count: 0,
+            last_recalled: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();

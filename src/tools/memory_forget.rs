@@ -83,9 +83,7 @@ impl Tool for MemoryForgetTool {
                     Ok(_) => {
                         return Ok(ToolResult {
                             success: true,
-                            output: format!(
-                                "'{pat}' 패턴과 일치하는 기억이 없습니다."
-                            ),
+                            output: format!("'{pat}' 패턴과 일치하는 기억이 없습니다."),
                             error: None,
                         });
                     }

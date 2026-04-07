@@ -2414,20 +2414,19 @@ pub fn run() {
                 api.prevent_close();
 
                 let win = window.clone();
-                tauri::async_runtime::spawn(async move {
-                    use tauri::dialog::{MessageDialogBuilder, MessageDialogKind, MessageDialogButtons};
+                std::thread::spawn(move || {
+                    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
                     // Ask user: quit completely or run in background?
-                    let answer = MessageDialogBuilder::new(
-                        "MoA 종료",
-                        "MoA를 어떻게 종료할까요?\n\n\
+                    let answer = win.dialog()
+                        .message("MoA를 어떻게 종료할까요?\n\n\
                          [예] 완전 종료 — MoA와 백그라운드 서비스를 모두 종료합니다.\n\
                          [아니오] 백그라운드 유지 — 창만 닫고 AI 서비스는 계속 실행합니다.\n\
-                                 (채널 메시지 수신, cron 작업 계속 실행)",
-                    )
-                    .kind(MessageDialogKind::Info)
-                    .buttons(MessageDialogButtons::YesNo)
-                    .blocking_show();
+                                 (채널 메시지 수신, cron 작업 계속 실행)")
+                        .title("MoA 종료")
+                        .kind(MessageDialogKind::Info)
+                        .buttons(MessageDialogButtons::YesNo)
+                        .blocking_show();
 
                     if answer {
                         // YES = 완전 종료: kill zeroclaw + close app

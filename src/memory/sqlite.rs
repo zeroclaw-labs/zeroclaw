@@ -671,8 +671,8 @@ impl Memory for SqliteMemory {
                             timestamp: row.get(4)?,
                             session_id: row.get(5)?,
                             score: Some(1.0),
-                        recall_count: 0,
-                        last_recalled: None,
+                            recall_count: 0,
+                            last_recalled: None,
                         })
                     })?;
                     for row in rows {
@@ -750,8 +750,8 @@ impl Memory for SqliteMemory {
                     timestamp: row.get(4)?,
                     session_id: row.get(5)?,
                     score: None,
-                recall_count: 0,
-                last_recalled: None,
+                    recall_count: 0,
+                    last_recalled: None,
                 })
             };
 

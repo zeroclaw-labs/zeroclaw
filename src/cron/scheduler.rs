@@ -179,10 +179,9 @@ async fn run_agent_job(
     // Economy tier: use Gemini Flash Lite for cron jobs when no explicit model is set.
     // Cost-effective for routine tasks (weather alerts, schedule reminders).
     let model_override = job.model.clone().or_else(|| {
-        let (_, economy_model) =
-            crate::billing::llm_router::default_model_for_task(
-                crate::billing::llm_router::TaskCategory::CronRoutine,
-            );
+        let (_, economy_model) = crate::billing::llm_router::default_model_for_task(
+            crate::billing::llm_router::TaskCategory::CronRoutine,
+        );
         Some(economy_model.to_string())
     });
 

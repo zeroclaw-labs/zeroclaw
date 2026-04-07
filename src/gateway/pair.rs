@@ -131,7 +131,8 @@ pub async fn handle_auto_pair_login(
     let uid = pairing_token.platform_uid.clone();
 
     // Link channel identity to user account
-    if let Err(e) = auth_store.link_channel(&channel, &uid, &user.id) {
+    // device_id will be selected later (in channel chat) if user has multiple devices.
+    if let Err(e) = auth_store.link_channel(&channel, &uid, &user.id, None) {
         tracing::warn!("Failed to link channel: {e}");
     }
 
@@ -230,7 +231,7 @@ pub async fn handle_pair_signup_submit(
                 let channel = &pairing_token.channel;
                 let uid = &pairing_token.platform_uid;
 
-                if let Err(e) = auth_store.link_channel(channel, uid, &user_id) {
+                if let Err(e) = auth_store.link_channel(channel, uid, &user_id, None) {
                     tracing::warn!("Failed to link channel after signup: {e}");
                 }
 

@@ -263,7 +263,21 @@ async fn handle_connection(
                 send_response(&outbound_tx, &msg_id, &response_text).await;
             }
 
+            // ── remote_read_only: web chat read-only relay ──
+            "remote_read_only" => {
+                let response_text = process_on_local_gateway_with_read_only(
+                    &http_client,
+                    local_gateway_url,
+                    content_str,
+                    token,
+                )
+                .await;
+                send_response(&outbound_tx, &msg_id, &response_text).await;
+            }
+
             // ── channel_relay: channel message (KakaoTalk, WhatsApp, etc.) ──
+            // Conversations through channels are processed by the local agent
+            // loop, which stores them in long-term memory — same as app chat.
             "channel_relay" => {
                 let content: serde_json::Value =
                     serde_json::from_str(content_str).unwrap_or_default();
@@ -272,18 +286,39 @@ async fn handle_connection(
                 let proxy_url = content["proxy_url"].as_str();
                 let provider = content["provider"].as_str();
                 let session_id = content["session_id"].as_str();
+                let autonomy_mode = content["autonomy_mode"].as_str().unwrap_or("read_only");
 
-                let response_text = process_on_local_gateway_with_session(
-                    &http_client,
-                    local_gateway_url,
-                    user_content,
-                    proxy_url,
-                    proxy_token,
-                    provider,
-                    session_id,
-                    token,
-                )
-                .await;
+                // Channel autonomy: "read_only" → pass remote_read_only=true
+                // so agent restricts file write/shell but still stores memories.
+                // "full" → no restriction (user explicitly opted in).
+                let read_only = autonomy_mode != "full";
+
+                let response_text = if read_only {
+                    process_on_local_gateway_with_channel_context(
+                        &http_client,
+                        local_gateway_url,
+                        user_content,
+                        proxy_url,
+                        proxy_token,
+                        provider,
+                        session_id,
+                        token,
+                        true, // remote_read_only
+                    )
+                    .await
+                } else {
+                    process_on_local_gateway_with_session(
+                        &http_client,
+                        local_gateway_url,
+                        user_content,
+                        proxy_url,
+                        proxy_token,
+                        provider,
+                        session_id,
+                        token,
+                    )
+                    .await
+                };
 
                 send_response(&outbound_tx, &msg_id, &response_text).await;
             }
@@ -448,6 +483,104 @@ async fn process_on_local_gateway_with_session(
         }
         Err(e) => {
             tracing::error!(error = %e, "Failed to reach local gateway");
+            format!("Could not reach local MoA gateway: {}", e)
+        }
+    }
+}
+
+/// Process a read-only remote message on the local gateway.
+///
+/// Sets `remote_read_only: true` which restricts file write/shell but
+/// **still allows memory_store and memory_recall** so conversations are
+/// recorded in long-term memory.
+async fn process_on_local_gateway_with_read_only(
+    client: &reqwest::Client,
+    gateway_url: &str,
+    content: &str,
+    auth_token: &str,
+) -> String {
+    process_on_local_gateway_with_channel_context(
+        client,
+        gateway_url,
+        content,
+        None,
+        None,
+        None,
+        None,
+        auth_token,
+        true,
+    )
+    .await
+}
+
+/// Process a channel message with explicit remote_read_only flag.
+///
+/// When `remote_read_only` is true, the local gateway restricts dangerous
+/// tools (file_write, shell) but allows memory operations so all channel
+/// conversations are stored in the user's local long-term memory.
+async fn process_on_local_gateway_with_channel_context(
+    client: &reqwest::Client,
+    gateway_url: &str,
+    content: &str,
+    proxy_url: Option<&str>,
+    proxy_token: Option<&str>,
+    provider: Option<&str>,
+    session_id: Option<&str>,
+    auth_token: &str,
+    remote_read_only: bool,
+) -> String {
+    let mut body = serde_json::json!({
+        "message": content,
+    });
+
+    if remote_read_only {
+        body["remote_read_only"] = serde_json::Value::Bool(true);
+    }
+    if let Some(proxy_url) = proxy_url {
+        body["proxy_url"] = serde_json::Value::String(proxy_url.to_string());
+    }
+    if let Some(proxy_token) = proxy_token {
+        body["proxy_token"] = serde_json::Value::String(proxy_token.to_string());
+    }
+    if let Some(provider) = provider {
+        body["provider"] = serde_json::Value::String(provider.to_string());
+    }
+    if let Some(session_id) = session_id {
+        body["session_id"] = serde_json::Value::String(session_id.to_string());
+    }
+
+    let url = format!("{}/api/chat", gateway_url);
+    let result = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&body)
+        .send()
+        .await;
+
+    match result {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => json["response"]
+                        .as_str()
+                        .unwrap_or("Processing complete.")
+                        .to_string(),
+                    Err(_) => "Response received but could not parse.".to_string(),
+                }
+            } else {
+                let status = resp.status();
+                let error_text = resp.text().await.unwrap_or_default();
+                tracing::warn!(
+                    status = %status,
+                    error = error_text.as_str(),
+                    "Local gateway returned error for channel message"
+                );
+                format!("Local processing error ({}): {}", status, error_text)
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to reach local gateway for channel message");
             format!("Could not reach local MoA gateway: {}", e)
         }
     }
