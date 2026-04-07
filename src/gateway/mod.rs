@@ -756,6 +756,9 @@ pub async fn run_gateway(
     } else if pairing.require_pairing() {
         println!("  🔒 Pairing: ACTIVE (bearer token required)");
         println!("     To pair a new device: zeroclaw gateway get-paircode --new");
+        println!(
+            "     Or generate a code via: curl -s -X POST http://{display_addr}{pfx}/admin/paircode/new"
+        );
         println!();
     } else {
         println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
