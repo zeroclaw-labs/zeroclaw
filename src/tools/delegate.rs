@@ -1309,7 +1309,7 @@ impl Observer for SubagentObserver {
                 tracing::info!(
                     agent = %self.agent_name,
                     tool = %tool,
-                    duration_ms = duration.as_millis() as u64,
+                    duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                     success = success,
                     "◀ [subagent] tool done"
                 );
@@ -1336,13 +1336,13 @@ impl Observer for SubagentObserver {
                 if *success {
                     tracing::info!(
                         agent = %self.agent_name,
-                        duration_ms = duration.as_millis() as u64,
+                        duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                         "✓ [subagent] LLM response"
                     );
                 } else {
                     tracing::warn!(
                         agent = %self.agent_name,
-                        duration_ms = duration.as_millis() as u64,
+                        duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                         error = ?error_message,
                         "✗ [subagent] LLM error"
                     );
