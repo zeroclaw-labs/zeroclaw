@@ -516,6 +516,12 @@ pub struct ModelProviderConfig {
     /// may exceed a model's actual limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// When true, all system messages are collected and prepended to the first
+    /// user message instead of being sent with `role: system`. Native tool
+    /// calling is preserved. Useful for local model servers (e.g. llama.cpp)
+    /// whose chat template rejects system messages at non-first positions.
+    #[serde(default)]
+    pub merge_system_into_user: bool,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
@@ -10992,8 +10998,22 @@ async fn sync_directory(path: &Path) -> Result<()> {
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)
             .with_context(|| format!("Failed to open directory for fsync: {}", path.display()))?;
-        dir.sync_all()
-            .with_context(|| format!("Failed to fsync directory metadata: {}", path.display()))?;
+        // FlushFileBuffers on directory handles returns ERROR_ACCESS_DENIED on
+        // Windows (OS Error 5). This is expected — NTFS does not support
+        // flushing directory metadata the same way Unix does. The individual
+        // files have already been synced, so it is safe to ignore this error.
+        if let Err(e) = dir.sync_all() {
+            if e.raw_os_error() == Some(5) {
+                tracing::trace!(
+                    "Ignoring expected ACCESS_DENIED when fsyncing directory on Windows: {}",
+                    path.display()
+                );
+            } else {
+                return Err(e).with_context(|| {
+                    format!("Failed to fsync directory metadata: {}", path.display())
+                });
+            }
+        }
         Ok(())
     }
 
@@ -13678,6 +13698,7 @@ requires_openai_auth = true
                     azure_openai_api_version: None,
                     api_path: None,
                     max_tokens: None,
+                    ..Default::default()
                 },
             )]),
             ..Config::default()
@@ -13711,6 +13732,7 @@ requires_openai_auth = true
                     azure_openai_api_version: None,
                     api_path: None,
                     max_tokens: None,
+                    ..Default::default()
                 },
             )]),
             api_key: None,
@@ -13821,6 +13843,7 @@ requires_openai_auth = true
                     azure_openai_api_version: None,
                     api_path: None,
                     max_tokens: None,
+                    ..Default::default()
                 },
             )]),
             ..Config::default()
