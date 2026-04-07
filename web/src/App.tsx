@@ -17,7 +17,7 @@ import Canvas from './pages/Canvas';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
 import { setLocale, type Locale } from './lib/i18n';
-import { loadLocale, saveLocale } from './contexts/localeStorage';
+import { loadLocale, saveLocale } from './contexts/ThemeContext';
 import { basePath } from './lib/basePath';
 import { getAdminPairCode } from './lib/api';
 
