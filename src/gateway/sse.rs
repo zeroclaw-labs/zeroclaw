@@ -4,6 +4,7 @@
 
 use super::AppState;
 use axum::{
+    Json,
     extract::State,
     http::{HeaderMap, StatusCode, header},
     response::{
@@ -11,9 +12,40 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
+use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::sync::{Arc, Mutex};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+
+/// Thread-safe ring buffer that retains recent events for history replay.
+pub struct EventBuffer {
+    inner: Mutex<VecDeque<serde_json::Value>>,
+    capacity: usize,
+}
+
+impl EventBuffer {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity,
+        }
+    }
+
+    /// Push an event into the buffer, evicting the oldest if at capacity.
+    pub fn push(&self, event: serde_json::Value) {
+        let mut buf = self.inner.lock().unwrap();
+        if buf.len() == self.capacity {
+            buf.pop_front();
+        }
+        buf.push_back(event);
+    }
+
+    /// Return a snapshot of all buffered events (oldest first).
+    pub fn snapshot(&self) -> Vec<serde_json::Value> {
+        self.inner.lock().unwrap().iter().cloned().collect()
+    }
+}
 
 /// GET /api/events — SSE event stream
 pub async fn handle_sse_events(
@@ -57,18 +89,32 @@ pub async fn handle_sse_events(
         .into_response()
 }
 
+/// GET /api/events/history — return buffered recent events as JSON.
+pub async fn handle_events_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = super::api::require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let events = state.event_buffer.snapshot();
+    Json(serde_json::json!({ "events": events })).into_response()
+}
+
 /// Broadcast observer that forwards events to the SSE broadcast channel.
 pub struct BroadcastObserver {
     inner: Box<dyn crate::observability::Observer>,
     tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    buffer: Arc<EventBuffer>,
 }
 
 impl BroadcastObserver {
     pub fn new(
         inner: Box<dyn crate::observability::Observer>,
         tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+        buffer: Arc<EventBuffer>,
     ) -> Self {
-        Self { inner, tx }
+        Self { inner, tx, buffer }
     }
 
     pub fn inner(&self) -> &dyn crate::observability::Observer {
@@ -141,6 +187,7 @@ impl crate::observability::Observer for BroadcastObserver {
             _ => return, // Skip events we don't broadcast
         };
 
+        self.buffer.push(json.clone());
         let _ = self.tx.send(json);
     }
 
