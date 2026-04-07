@@ -9005,14 +9005,20 @@ impl Config {
             // This replaces the previous serde_ignored-based approach which
             // had false-positive issues with #[serde(default)] nested structs.
             if let Ok(raw) = contents.parse::<toml::Table>() {
-                // Build the set of known top-level keys from a default Config
-                // serialization round-trip.  This is computed once and cached.
+                // Build the set of known top-level keys from the JSON schema.
+                // The previous approach serialized Config::default() to TOML,
+                // which silently omitted Option fields defaulting to None
+                // (e.g. api_key, api_url) causing false-positive warnings.
                 static KNOWN_KEYS: OnceLock<Vec<String>> = OnceLock::new();
                 let known = KNOWN_KEYS.get_or_init(|| {
-                    toml::to_string(&Config::default())
+                    let schema = schemars::schema_for!(Config);
+                    serde_json::to_value(&schema)
                         .ok()
-                        .and_then(|s| s.parse::<toml::Table>().ok())
-                        .map(|t| t.keys().cloned().collect())
+                        .and_then(|v| {
+                            v.get("properties")?
+                                .as_object()
+                                .map(|props| props.keys().cloned().collect())
+                        })
                         .unwrap_or_default()
                 });
                 for key in raw.keys() {
