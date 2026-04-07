@@ -1171,22 +1171,8 @@ impl Channel for WhatsAppWebChannel {
                                             return;
                                         }
                                         // self_chat_mode=true: always process, skip further policy checks.
-                                        //
-                                        // When the chat JID is LID-based, replies
-                                        // won't be delivered. Convert to a phone
-                                        // JID so the reply shows up in the self-chat.
-                                        if info.source.chat.is_lid() {
-                                            let phone_digits = normalized
-                                                .as_ref()
-                                                .map(|n| n.chars().filter(|c| c.is_ascii_digit()).collect::<String>())
-                                                .filter(|d| !d.is_empty());
-                                            if let Some(digits) = phone_digits {
-                                                reply_target = format!("{digits}@s.whatsapp.net");
-                                                tracing::debug!(
-                                                    "WhatsApp Web: self-chat LID→phone reply target: {reply_target}"
-                                                );
-                                            }
-                                        }
+                                        // LID→phone reply-target conversion is handled by the
+                                        // general fixup below (after all policy checks).
                                     } else if is_group {
                                         match wa_group_policy {
                                             crate::config::WhatsAppChatPolicy::Ignore => {
@@ -1230,6 +1216,30 @@ impl Channel for WhatsAppWebChannel {
                                                 }
                                             }
                                         }
+                                    }
+                                }
+
+                                // ── General LID reply-target fixup ──
+                                // LID JIDs (e.g. 159193097105449@lid) are internal
+                                // identifiers that cannot receive messages.  When
+                                // the chat JID is LID-based and we have a resolved
+                                // phone number from the allowlist, convert the
+                                // reply target so the response is deliverable.
+                                // This covers self-chat, DMs, and any future case
+                                // where WhatsApp routes via LID.
+                                if reply_target.ends_with("@lid") {
+                                    if let Some(ref n) = normalized {
+                                        let digits: String = n.chars().filter(|c| c.is_ascii_digit()).collect();
+                                        if !digits.is_empty() {
+                                            tracing::debug!(
+                                                "WhatsApp Web: LID→phone reply target fixup: {reply_target} → {digits}@s.whatsapp.net"
+                                            );
+                                            reply_target = format!("{digits}@s.whatsapp.net");
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            "WhatsApp Web: reply target is LID ({reply_target}) but no phone number resolved; response may not be delivered"
+                                        );
                                     }
                                 }
 
