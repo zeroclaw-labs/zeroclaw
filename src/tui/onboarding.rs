@@ -31,9 +31,24 @@ use super::widgets::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// ── Docs base URL ───────────────────────────────────────────────────
+// ── Docs URLs ──────────────────────────────────────────────────────
+//
+// The website (zeroclawlabs.ai/docs) is an SPA that doesn't serve these
+// sub-paths.  Point users to the in-repo docs on GitHub instead.
+// See: https://github.com/zeroclaw-labs/zeroclaw/issues/5413
 
-const DOCS_BASE: &str = "https://www.zeroclawlabs.ai/docs";
+const DOCS_SECURITY: &str =
+    "https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/security/README.md";
+const DOCS_CHANNELS: &str = "https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/reference/api/channels-reference.md";
+const DOCS_BROWSER: &str =
+    "https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/browser-setup.md";
+const DOCS_HOOKS: &str = "https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/reference/sop";
+const DOCS_GATEWAY_OPS: &str =
+    "https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/ops/operations-runbook.md";
+const DOCS_TROUBLESHOOTING: &str =
+    "https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/ops/troubleshooting.md";
+const DOCS_SETUP: &str = "https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/setup-guides";
+const DOCS_HUB: &str = "https://github.com/zeroclaw-labs/zeroclaw/blob/master/docs/README.md";
 
 // ── Screens ─────────────────────────────────────────────────────────
 
@@ -1646,7 +1661,7 @@ fn render_security(frame: &mut Frame, area: Rect) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            format!("Must read: {DOCS_BASE}/gateway/security"),
+            format!("Must read: {DOCS_SECURITY}"),
             theme::dim_style(),
         )),
     ];
@@ -2241,7 +2256,7 @@ fn render_how_channels_work(frame: &mut Frame, area: Rect) {
             theme::body_style(),
         )),
         Line::from(Span::styled(
-            format!("  Docs: {DOCS_BASE}/channels/pairing"),
+            format!("  Docs: {DOCS_CHANNELS}"),
             theme::dim_style(),
         )),
         Line::from(""),
@@ -2371,7 +2386,7 @@ fn render_web_search_info(frame: &mut Frame, area: Rect) {
                 )),
                 Line::from(Span::styled("  key-free.", theme::body_style())),
                 Line::from(Span::styled(
-                    format!("  Docs: {DOCS_BASE}/tools/web"),
+                    format!("  Docs: {DOCS_BROWSER}"),
                     theme::dim_style(),
                 )),
                 Line::from(""),
@@ -2548,7 +2563,7 @@ fn render_hooks_info(frame: &mut Frame, area: Rect) {
                 Line::from(Span::styled("  /reset.", theme::body_style())),
                 Line::from(""),
                 Line::from(Span::styled(
-                    format!("  Learn more: {DOCS_BASE}/automation/hooks"),
+                    format!("  Learn more: {DOCS_HOOKS}"),
                     theme::dim_style(),
                 )),
                 Line::from(""),
@@ -2669,11 +2684,11 @@ fn render_health_check(frame: &mut Frame, area: Rect, _app: &App) {
                 Line::from(""),
                 Line::from(Span::styled("  Docs:", theme::dim_style())),
                 Line::from(Span::styled(
-                    format!("  {DOCS_BASE}/gateway/health"),
+                    format!("  {DOCS_GATEWAY_OPS}"),
                     theme::dim_style(),
                 )),
                 Line::from(Span::styled(
-                    format!("  {DOCS_BASE}/gateway/troubleshooting"),
+                    format!("  {DOCS_TROUBLESHOOTING}"),
                     theme::dim_style(),
                 )),
                 Line::from(""),
@@ -2795,7 +2810,7 @@ fn render_control_ui(frame: &mut Frame, area: Rect, app: &App) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        format!("  Docs: {DOCS_BASE}/web/control-ui"),
+        format!("  Docs: {DOCS_SETUP}"),
         theme::dim_style(),
     )));
     lines.push(Line::from(""));
@@ -2843,7 +2858,7 @@ fn render_workspace_backup(frame: &mut Frame, area: Rect) {
                     theme::body_style(),
                 )),
                 Line::from(Span::styled(
-                    format!("  Docs: {DOCS_BASE}/concepts/agent-workspace"),
+                    format!("  Docs: {DOCS_HUB}"),
                     theme::dim_style(),
                 )),
                 Line::from(""),
@@ -2877,7 +2892,7 @@ fn render_final_security(frame: &mut Frame, area: Rect) {
                     theme::body_style(),
                 )),
                 Line::from(Span::styled(
-                    format!("  {DOCS_BASE}/security"),
+                    format!("  {DOCS_SECURITY}"),
                     theme::dim_style(),
                 )),
                 Line::from(""),
@@ -2931,7 +2946,7 @@ fn render_web_search_confirm(frame: &mut Frame, area: Rect, app: &App) {
                     ),
                 ]),
                 Line::from(Span::styled(
-                    format!("  Docs: {DOCS_BASE}/tools/web"),
+                    format!("  Docs: {DOCS_BROWSER}"),
                     theme::dim_style(),
                 )),
                 Line::from(""),
