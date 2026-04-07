@@ -516,6 +516,12 @@ pub struct ModelProviderConfig {
     /// may exceed a model's actual limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// When true, all system messages are collected and prepended to the first
+    /// user message instead of being sent with `role: system`. Native tool
+    /// calling is preserved. Useful for local model servers (e.g. llama.cpp)
+    /// whose chat template rejects system messages at non-first positions.
+    #[serde(default)]
+    pub merge_system_into_user: bool,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
@@ -13615,6 +13621,7 @@ requires_openai_auth = true
                     azure_openai_api_version: None,
                     api_path: None,
                     max_tokens: None,
+                    ..Default::default()
                 },
             )]),
             ..Config::default()
@@ -13648,6 +13655,7 @@ requires_openai_auth = true
                     azure_openai_api_version: None,
                     api_path: None,
                     max_tokens: None,
+                    ..Default::default()
                 },
             )]),
             api_key: None,
@@ -13758,6 +13766,7 @@ requires_openai_auth = true
                     azure_openai_api_version: None,
                     api_path: None,
                     max_tokens: None,
+                    ..Default::default()
                 },
             )]),
             ..Config::default()
