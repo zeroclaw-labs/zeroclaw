@@ -3521,6 +3521,12 @@ mod tests {
 
     #[test]
     fn listed_providers_and_aliases_are_constructible() {
+        let _lock = env_lock();
+        let _endpoint_guard = EnvGuard::set(
+            "ZEROCLAW_PROVIDER_ENDPOINT",
+            Some("https://managed.example.com"),
+        );
+
         for provider in list_providers() {
             assert!(
                 create_provider(provider.name, Some("provider-test-credential")).is_ok(),
