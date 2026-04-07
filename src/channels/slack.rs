@@ -5066,7 +5066,11 @@ mod tests {
         // Regression: byte index 3000 inside '═' (bytes 2999..3002) caused panic.
         let line = "按当前汇率 **100日元 ≈ 4.83人民币**（2026年3月近似值）换算：════\n";
         let text = line.repeat(200);
-        let chunks = split_text_into_chunks(&text, SLACK_BLOCK_TEXT_MAX_CHARS, SLACK_MAX_BLOCKS_PER_MESSAGE);
+        let chunks = split_text_into_chunks(
+            &text,
+            SLACK_BLOCK_TEXT_MAX_CHARS,
+            SLACK_MAX_BLOCKS_PER_MESSAGE,
+        );
         for chunk in &chunks {
             assert!(chunk.len() <= SLACK_BLOCK_TEXT_MAX_CHARS);
         }
