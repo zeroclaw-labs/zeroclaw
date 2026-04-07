@@ -709,6 +709,9 @@ pub struct ProviderRuntimeOptions {
     /// Maximum output tokens for LLM provider API requests.
     /// `None` uses the provider's built-in default.
     pub provider_max_tokens: Option<u32>,
+    /// When true, system messages are merged into the first user message before
+    /// sending. Propagated from `ModelProviderConfig::merge_system_into_user`.
+    pub merge_system_into_user: bool,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -724,6 +727,7 @@ impl Default for ProviderRuntimeOptions {
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
             provider_max_tokens: None,
+            merge_system_into_user: false,
         }
     }
 }
@@ -731,6 +735,27 @@ impl Default for ProviderRuntimeOptions {
 pub fn provider_runtime_options_from_config(
     config: &crate::config::Config,
 ) -> ProviderRuntimeOptions {
+    // Resolve merge_system_into_user from the active model provider profile by
+    // matching api_url — apply_named_model_provider_profile() has already run
+    // and rewritten default_provider, but model_providers retains all profiles.
+    let merge_system_into_user = config
+        .api_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .and_then(|active_url| {
+            config.model_providers.values().find(|p| {
+                p.base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|u| !u.is_empty())
+                    .map(|u| u.trim_end_matches('/'))
+                    == Some(active_url.trim_end_matches('/'))
+            })
+        })
+        .map(|p| p.merge_system_into_user)
+        .unwrap_or(false);
+
     ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
@@ -742,6 +767,7 @@ pub fn provider_runtime_options_from_config(
         extra_headers: config.extra_headers.clone(),
         api_path: config.api_path.clone(),
         provider_max_tokens: config.provider_max_tokens,
+        merge_system_into_user,
     }
 }
 
@@ -1437,13 +1463,19 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("llama.cpp");
-            Ok(compat(OpenAiCompatibleProvider::new_with_vision(
+            let provider = OpenAiCompatibleProvider::new_with_vision(
                 "llama.cpp",
                 base_url,
                 Some(llama_cpp_key),
                 AuthStyle::Bearer,
                 true,
-            )))
+            );
+            let provider = if options.merge_system_into_user {
+                provider.with_merge_system_into_user()
+            } else {
+                provider
+            };
+            Ok(compat(provider))
         }
         "sglang" => {
             let base_url = api_url
@@ -1666,13 +1698,19 @@ fn create_provider_with_url_and_options(
                 "Custom provider",
                 "custom:https://your-api.com",
             )?;
-            Ok(compat(OpenAiCompatibleProvider::new_with_vision(
+            let provider = OpenAiCompatibleProvider::new_with_vision(
                 "Custom",
                 &base_url,
                 key,
                 AuthStyle::Bearer,
                 true,
-            )))
+            );
+            let provider = if options.merge_system_into_user {
+                provider.with_merge_system_into_user()
+            } else {
+                provider
+            };
+            Ok(compat(provider))
         }
 
         // ── Anthropic-compatible custom endpoints ───────────
