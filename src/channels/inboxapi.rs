@@ -2,7 +2,7 @@
 #![allow(clippy::doc_link_with_quotes)]
 #![allow(clippy::cast_sign_loss)]
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use sha1::{Digest, Sha1};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
@@ -759,6 +759,8 @@ impl InboxApiChannel {
                 channel: "inboxapi".to_string(),
                 timestamp,
                 thread_ts,
+                interruption_scope_id: None,
+                attachments: vec![],
             };
 
             if tx.send(msg).await.is_err() {
@@ -1063,6 +1065,8 @@ mod tests {
             recipient: "user@example.com".into(),
             subject: Some("Test Subject".into()),
             thread_ts: Some("msg-123".into()),
+            cancellation_token: None,
+            attachments: vec![],
         };
 
         let mut args = serde_json::json!({
@@ -1108,6 +1112,8 @@ mod tests {
             channel: "inboxapi".to_string(),
             timestamp: 0,
             thread_ts: thread_ts.clone(),
+            interruption_scope_id: None,
+            attachments: vec![],
         };
 
         assert_eq!(msg.id, "msg-abc");
