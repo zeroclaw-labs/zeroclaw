@@ -486,7 +486,8 @@ mod tests {
         );
 
         let tools = parsed.get("tools").and_then(toml::Value::as_array).unwrap();
-        assert_eq!(tools.len(), 2);
+        // Duplicate tool names are deduplicated, so only 1 tool entry.
+        assert_eq!(tools.len(), 1);
         assert_eq!(
             tools[0].get("command").and_then(toml::Value::as_str),
             Some("cargo build")
@@ -520,11 +521,13 @@ mod tests {
         let toml_str = SkillCreator::generate_skill_toml("memory-op", "Store to memory", &calls);
         let parsed: toml::Value = toml::from_str(&toml_str).expect("TOML should be valid");
         let tools = parsed.get("tools").and_then(toml::Value::as_array).unwrap();
-        // When no "command" arg exists, falls back to tool name.
+        // Non-shell tools don't have a command field; kind is set to the tool name.
         assert_eq!(
-            tools[0].get("command").and_then(toml::Value::as_str),
+            tools[0].get("kind").and_then(toml::Value::as_str),
             Some("memory_store")
         );
+        // Command field should not be present for non-shell tools.
+        assert!(tools[0].get("command").is_none());
     }
 
     // ── TOML description extraction ──────────────────────────────
