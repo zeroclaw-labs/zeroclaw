@@ -4182,6 +4182,9 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                         .unwrap_or(false),
                     thread_replies: existing_sl.and_then(|s| s.thread_replies),
                     mention_only: existing_sl.map(|s| s.mention_only).unwrap_or(false),
+                    respond_to_broadcasts: existing_sl
+                        .map(|s| s.respond_to_broadcasts)
+                        .unwrap_or(false),
                     use_markdown_blocks: existing_sl
                         .map(|s| s.use_markdown_blocks)
                         .unwrap_or(false),

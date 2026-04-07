@@ -6558,6 +6558,11 @@ pub struct SlackConfig {
     /// Direct messages remain allowed.
     #[serde(default)]
     pub mention_only: bool,
+    /// When false (default), ignore Slack broadcast mentions (`@here`, `@channel`)
+    /// even if they appear in an otherwise-eligible message.
+    /// Set to true to allow broadcasts to trigger the bot.
+    #[serde(default)]
+    pub respond_to_broadcasts: bool,
     /// Use the newer Slack `markdown` block type (12 000 char limit, richer formatting).
     /// Defaults to false (uses universally supported `section` blocks with `mrkdwn`).
     /// Enable this only if your Slack workspace supports the `markdown` block type.
@@ -12705,6 +12710,20 @@ allowed_users = ["@ops:matrix.org"]
         assert_eq!(parsed.thread_replies, Some(false));
         assert!(!parsed.interrupt_on_new_message);
         assert!(!parsed.mention_only);
+    }
+
+    #[test]
+    async fn slack_config_respond_to_broadcasts_defaults_false() {
+        let json = r#"{"bot_token":"xoxb-tok"}"#;
+        let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.respond_to_broadcasts);
+    }
+
+    #[test]
+    async fn slack_config_respond_to_broadcasts_can_be_enabled() {
+        let json = r#"{"bot_token":"xoxb-tok","respond_to_broadcasts":true}"#;
+        let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.respond_to_broadcasts);
     }
 
     #[test]
