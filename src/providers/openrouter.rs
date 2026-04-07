@@ -10,7 +10,11 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 pub struct OpenRouterProvider {
+    provider_name: &'static str,
+    client_scope: &'static str,
     credential: Option<String>,
+    endpoint: String,
+    account_id: Option<String>,
     timeout_secs: u64,
     max_tokens: Option<u32>,
 }
@@ -24,7 +28,14 @@ struct ChatRequest {
     messages: Vec<Message>,
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<RequestMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RequestMetadata {
+    account_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,6 +87,8 @@ struct NativeChatRequest {
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<RequestMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
 }
@@ -158,7 +171,29 @@ struct NativeResponseMessage {
 impl OpenRouterProvider {
     pub fn new(credential: Option<&str>, timeout_secs: Option<u64>) -> Self {
         Self {
+            provider_name: "OpenRouter",
+            client_scope: "provider.openrouter",
             credential: credential.map(ToString::to_string),
+            endpoint: "https://openrouter.ai".to_string(),
+            account_id: None,
+            timeout_secs: timeout_secs
+                .filter(|secs| *secs > 0)
+                .unwrap_or(DEFAULT_OPENROUTER_TIMEOUT_SECS),
+            max_tokens: None,
+        }
+    }
+
+    pub fn managed(
+        credential: Option<&str>,
+        endpoint: impl Into<String>,
+        timeout_secs: Option<u64>,
+    ) -> Self {
+        Self {
+            provider_name: "Managed",
+            client_scope: "provider.managed",
+            credential: credential.map(ToString::to_string),
+            endpoint: endpoint.into(),
+            account_id: None,
             timeout_secs: timeout_secs
                 .filter(|secs| *secs > 0)
                 .unwrap_or(DEFAULT_OPENROUTER_TIMEOUT_SECS),
@@ -176,6 +211,37 @@ impl OpenRouterProvider {
     pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
         self
+    }
+
+    pub fn with_account_id(mut self, account_id: Option<String>) -> Self {
+        self.account_id = account_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self
+    }
+
+    fn request_metadata(&self) -> Option<RequestMetadata> {
+        self.account_id.as_ref().map(|account_id| RequestMetadata {
+            account_id: account_id.clone(),
+        })
+    }
+
+    fn api_url(&self, path: &str) -> String {
+        format!("{}/{}", self.endpoint.trim_end_matches('/'), path)
+    }
+
+    fn require_credential(&self) -> anyhow::Result<&str> {
+        self.credential.as_deref().ok_or_else(|| {
+            if self.provider_name == "OpenRouter" {
+                anyhow::anyhow!(
+                    "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."
+                )
+            } else {
+                anyhow::anyhow!(
+                    "Managed provider API key not set. Set ZEROCLAW_API_KEY, API_KEY, or config.api_key."
+                )
+            }
+        })
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -355,7 +421,7 @@ impl OpenRouterProvider {
 
     fn http_client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts(
-            "provider.openrouter",
+            self.client_scope,
             self.timeout_secs,
             OPENROUTER_CONNECT_TIMEOUT_SECS,
         )
@@ -377,7 +443,7 @@ impl Provider for OpenRouterProvider {
         // This prevents the first real chat request from timing out on cold start.
         if let Some(credential) = self.credential.as_ref() {
             self.http_client()
-                .get("https://openrouter.ai/api/v1/auth/key")
+                .get(self.api_url("api/v1/auth/key"))
                 .header("Authorization", format!("Bearer {credential}"))
                 .send()
                 .await?
@@ -393,8 +459,7 @@ impl Provider for OpenRouterProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."))?;
+        let credential = self.require_credential()?;
 
         let mut messages = Vec::new();
 
@@ -414,12 +479,13 @@ impl Provider for OpenRouterProvider {
             model: model.to_string(),
             messages,
             temperature,
+            metadata: self.request_metadata(),
             max_tokens: self.max_tokens,
         };
 
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(self.api_url("api/v1/chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -428,19 +494,22 @@ impl Provider for OpenRouterProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(super::api_error("OpenRouter", response).await);
+            return Err(super::api_error(self.provider_name, response).await);
         }
 
-        let body = Self::read_response_body("OpenRouter", response).await?;
-        let chat_response =
-            Self::parse_response_body::<ApiChatResponse>("OpenRouter", &body, "chat-completions")?;
+        let body = Self::read_response_body(self.provider_name, response).await?;
+        let chat_response = Self::parse_response_body::<ApiChatResponse>(
+            self.provider_name,
+            &body,
+            "chat-completions",
+        )?;
 
         chat_response
             .choices
             .into_iter()
             .next()
             .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))
+            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.provider_name))
     }
 
     async fn chat_with_history(
@@ -449,8 +518,7 @@ impl Provider for OpenRouterProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."))?;
+        let credential = self.require_credential()?;
 
         let api_messages: Vec<Message> = messages
             .iter()
@@ -464,12 +532,13 @@ impl Provider for OpenRouterProvider {
             model: model.to_string(),
             messages: api_messages,
             temperature,
+            metadata: self.request_metadata(),
             max_tokens: self.max_tokens,
         };
 
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(self.api_url("api/v1/chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -478,19 +547,22 @@ impl Provider for OpenRouterProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(super::api_error("OpenRouter", response).await);
+            return Err(super::api_error(self.provider_name, response).await);
         }
 
-        let body = Self::read_response_body("OpenRouter", response).await?;
-        let chat_response =
-            Self::parse_response_body::<ApiChatResponse>("OpenRouter", &body, "chat-completions")?;
+        let body = Self::read_response_body(self.provider_name, response).await?;
+        let chat_response = Self::parse_response_body::<ApiChatResponse>(
+            self.provider_name,
+            &body,
+            "chat-completions",
+        )?;
 
         chat_response
             .choices
             .into_iter()
             .next()
             .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))
+            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.provider_name))
     }
 
     async fn chat(
@@ -499,11 +571,7 @@ impl Provider for OpenRouterProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-            "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."
-        )
-        })?;
+        let credential = self.require_credential()?;
 
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
@@ -512,12 +580,13 @@ impl Provider for OpenRouterProvider {
             temperature,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
+            metadata: self.request_metadata(),
             max_tokens: self.max_tokens,
         };
 
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(self.api_url("api/v1/chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -526,12 +595,15 @@ impl Provider for OpenRouterProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(super::api_error("OpenRouter", response).await);
+            return Err(super::api_error(self.provider_name, response).await);
         }
 
-        let body = Self::read_response_body("OpenRouter", response).await?;
-        let native_response =
-            Self::parse_response_body::<NativeChatResponse>("OpenRouter", &body, "native chat")?;
+        let body = Self::read_response_body(self.provider_name, response).await?;
+        let native_response = Self::parse_response_body::<NativeChatResponse>(
+            self.provider_name,
+            &body,
+            "native chat",
+        )?;
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
@@ -542,7 +614,7 @@ impl Provider for OpenRouterProvider {
             .into_iter()
             .next()
             .map(|c| c.message)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
+            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.provider_name))?;
         let mut result = Self::parse_native_response(message);
         result.usage = usage;
         Ok(result)
@@ -559,11 +631,7 @@ impl Provider for OpenRouterProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."
-            )
-        })?;
+        let credential = self.require_credential()?;
 
         // Convert tool JSON values to NativeToolSpec
         let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
@@ -603,12 +671,13 @@ impl Provider for OpenRouterProvider {
             temperature,
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
+            metadata: self.request_metadata(),
             max_tokens: self.max_tokens,
         };
 
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(self.api_url("api/v1/chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -617,12 +686,15 @@ impl Provider for OpenRouterProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(super::api_error("OpenRouter", response).await);
+            return Err(super::api_error(self.provider_name, response).await);
         }
 
-        let body = Self::read_response_body("OpenRouter", response).await?;
-        let native_response =
-            Self::parse_response_body::<NativeChatResponse>("OpenRouter", &body, "native chat")?;
+        let body = Self::read_response_body(self.provider_name, response).await?;
+        let native_response = Self::parse_response_body::<NativeChatResponse>(
+            self.provider_name,
+            &body,
+            "native chat",
+        )?;
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
@@ -633,7 +705,7 @@ impl Provider for OpenRouterProvider {
             .into_iter()
             .next()
             .map(|c| c.message)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
+            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.provider_name))?;
         let mut result = Self::parse_native_response(message);
         result.usage = usage;
         Ok(result)
@@ -676,6 +748,21 @@ mod tests {
     fn creates_without_key() {
         let provider = OpenRouterProvider::new(None, None);
         assert!(provider.credential.is_none());
+    }
+
+    #[test]
+    fn managed_provider_uses_custom_endpoint() {
+        let provider = OpenRouterProvider::managed(
+            Some("managed-test-credential"),
+            "https://managed.example.com/",
+            None,
+        );
+        assert_eq!(provider.provider_name, "Managed");
+        assert_eq!(provider.endpoint, "https://managed.example.com/");
+        assert_eq!(
+            provider.api_url("api/v1/chat/completions"),
+            "https://managed.example.com/api/v1/chat/completions"
+        );
     }
 
     #[test]
@@ -745,6 +832,7 @@ mod tests {
                 },
             ],
             temperature: 0.5,
+            metadata: None,
             max_tokens: None,
         };
 
@@ -779,6 +867,7 @@ mod tests {
                 })
                 .collect(),
             temperature: 0.0,
+            metadata: None,
             max_tokens: None,
         };
 
@@ -863,6 +952,49 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
+    }
+
+    #[test]
+    fn chat_request_serializes_account_id_metadata() {
+        let request = ChatRequest {
+            model: "anthropic/claude-sonnet-4".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: MessageContent::Text("hello".into()),
+            }],
+            temperature: 0.2,
+            metadata: Some(RequestMetadata {
+                account_id: "acc-123".into(),
+            }),
+            max_tokens: None,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"metadata\":{\"account_id\":\"acc-123\"}"));
+    }
+
+    #[test]
+    fn native_chat_request_serializes_account_id_metadata() {
+        let request = NativeChatRequest {
+            model: "anthropic/claude-sonnet-4".into(),
+            messages: vec![NativeMessage {
+                role: "user".into(),
+                content: Some(MessageContent::Text("hello".into())),
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: None,
+            }],
+            temperature: 0.2,
+            tools: None,
+            tool_choice: None,
+            metadata: Some(RequestMetadata {
+                account_id: "acc-123".into(),
+            }),
+            max_tokens: None,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"metadata\":{\"account_id\":\"acc-123\"}"));
     }
 
     #[test]

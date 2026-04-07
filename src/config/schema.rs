@@ -21,6 +21,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "provider.glm",
     "provider.ollama",
     "provider.openai",
+    "provider.managed",
     "provider.openrouter",
     "channel.dingtalk",
     "channel.discord",

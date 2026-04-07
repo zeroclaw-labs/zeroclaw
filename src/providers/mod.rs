@@ -912,6 +912,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
     let provider_env_candidates: Vec<&str> = match name {
         "anthropic" => vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
         "openrouter" => vec!["OPENROUTER_API_KEY"],
+        "managed" => vec![],
         "openai" => vec!["OPENAI_API_KEY"],
         "ollama" => vec!["OLLAMA_API_KEY"],
         "venice" => vec!["VENICE_API_KEY"],
@@ -1182,6 +1183,21 @@ fn create_provider_with_url_and_options(
             openrouter::OpenRouterProvider::new(key, options.provider_timeout_secs)
                 .with_max_tokens(options.provider_max_tokens),
         )),
+        "managed" => {
+            let endpoint = read_non_empty_env("ZEROCLAW_PROVIDER_ENDPOINT").ok_or_else(|| {
+                anyhow::anyhow!("ZEROCLAW_PROVIDER_ENDPOINT is required for provider \"managed\".")
+            })?;
+            let account_id = read_non_empty_env("ZEROCLAW_ACCOUNT_ID");
+            Ok(Box::new(
+                openrouter::OpenRouterProvider::managed(
+                    key,
+                    endpoint,
+                    options.provider_timeout_secs,
+                )
+                .with_account_id(account_id)
+                .with_max_tokens(options.provider_max_tokens),
+            ))
+        }
         "anthropic" => {
             let mut p = anthropic::AnthropicProvider::new(key);
             if let Some(mt) = options.provider_max_tokens {
@@ -1958,6 +1974,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "managed",
+            display_name: "Managed",
+            aliases: &[],
+            local: false,
+        },
+        ProviderInfo {
             name: "anthropic",
             display_name: "Anthropic",
             aliases: &[],
@@ -2675,6 +2697,33 @@ mod tests {
     fn factory_openrouter() {
         assert!(create_provider("openrouter", Some("provider-test-credential")).is_ok());
         assert!(create_provider("openrouter", None).is_ok());
+    }
+
+    #[test]
+    fn factory_managed_requires_endpoint_env() {
+        let _lock = env_lock();
+        let _endpoint_guard = EnvGuard::set("ZEROCLAW_PROVIDER_ENDPOINT", None);
+
+        let err = create_provider("managed", Some("provider-test-credential"))
+            .err()
+            .expect("managed provider should require ZEROCLAW_PROVIDER_ENDPOINT");
+
+        assert!(
+            err.to_string()
+                .contains("ZEROCLAW_PROVIDER_ENDPOINT is required")
+        );
+    }
+
+    #[test]
+    fn factory_managed_uses_endpoint_env() {
+        let _lock = env_lock();
+        let _endpoint_guard = EnvGuard::set(
+            "ZEROCLAW_PROVIDER_ENDPOINT",
+            Some("https://managed.example.com"),
+        );
+        let _account_guard = EnvGuard::set("ZEROCLAW_ACCOUNT_ID", Some("acc-123"));
+
+        assert!(create_provider("managed", Some("provider-test-credential")).is_ok());
     }
 
     #[test]
