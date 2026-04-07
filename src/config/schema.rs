@@ -72,18 +72,24 @@ pub struct Config {
     #[serde(skip)]
     pub config_path: PathBuf,
     /// API key for the selected provider. Overridden by `ZEROCLAW_API_KEY` or `API_KEY` env vars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_url: Option<String>,
     /// Custom API path suffix for OpenAI-compatible / custom providers
     /// (e.g. "/v2/generate" instead of the default "/v1/chat/completions").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_path: Option<String>,
     /// Default provider ID or alias (e.g. `"openrouter"`, `"ollama"`, `"anthropic"`). Default: `"openrouter"`.
-    #[serde(alias = "model_provider")]
+    #[serde(
+        default,
+        alias = "model_provider",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub default_provider: Option<String>,
     /// Default model routed through the selected provider (e.g. `"anthropic/claude-sonnet-4-6"`).
-    #[serde(alias = "model")]
+    #[serde(default, alias = "model", skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     /// Optional named provider profiles keyed by id (Codex app-server compatible layout).
     #[serde(default)]
@@ -9015,11 +9021,25 @@ impl Config {
                 // serialization round-trip.  This is computed once and cached.
                 static KNOWN_KEYS: OnceLock<Vec<String>> = OnceLock::new();
                 let known = KNOWN_KEYS.get_or_init(|| {
-                    toml::to_string(&Config::default())
+                    let mut keys: Vec<String> = toml::to_string(&Config::default())
                         .ok()
                         .and_then(|s| s.parse::<toml::Table>().ok())
                         .map(|t| t.keys().cloned().collect())
-                        .unwrap_or_default()
+                        .unwrap_or_default();
+                    // Add top-level Option fields that may be omitted during TOML serialization
+                    // when their value is None (TOML does not support null values).
+                    for key in [
+                        "api_key",
+                        "api_url",
+                        "default_provider",
+                        "default_model",
+                        "api_path",
+                    ] {
+                        if !keys.iter().any(|k| k == key) {
+                            keys.push(key.to_string());
+                        }
+                    }
+                    keys
                 });
                 for key in raw.keys() {
                     if !known.contains(key) {
