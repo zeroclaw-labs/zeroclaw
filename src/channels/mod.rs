@@ -670,9 +670,15 @@ fn build_channel_system_prompt(
     }
 
     if !reply_target.is_empty() {
+        let is_slack_dm = channel_name == "slack" && reply_target.starts_with('D');
+        let dm_note = if is_slack_dm {
+            " This is a private 1:1 DM conversation — always reply."
+        } else {
+            ""
+        };
         let context = format!(
             "\n\nChannel context: You are currently responding on channel={channel_name}, \
-             reply_target={reply_target}. When scheduling delayed messages or reminders \
+             reply_target={reply_target}.{dm_note} When scheduling delayed messages or reminders \
              via cron_add for this conversation, use delivery={{\"mode\":\"announce\",\
              \"channel\":\"{channel_name}\",\"to\":\"{reply_target}\"}} so the message \
              reaches the user."
@@ -11723,5 +11729,33 @@ This is an example JSON object for profile settings."#;
     fn default_keep_tool_context_turns_is_two() {
         let config = crate::config::schema::AgentConfig::default();
         assert_eq!(config.keep_tool_context_turns, 2);
+    }
+
+    #[test]
+    fn build_channel_system_prompt_slack_dm_adds_dm_note() {
+        let prompt = build_channel_system_prompt("base", "slack", "D07ABC123");
+        assert!(
+            prompt.contains("private 1:1 DM conversation"),
+            "Slack DM reply_target should inject DM note: {prompt}"
+        );
+    }
+
+    #[test]
+    fn build_channel_system_prompt_slack_channel_no_dm_note() {
+        let prompt = build_channel_system_prompt("base", "slack", "C07ABC123");
+        assert!(
+            !prompt.contains("private 1:1 DM"),
+            "Slack public channel should not have DM note: {prompt}"
+        );
+    }
+
+    #[test]
+    fn build_channel_system_prompt_non_slack_dm_prefix_no_dm_note() {
+        // Only Slack uses 'D' prefix convention; other channels should not get the note
+        let prompt = build_channel_system_prompt("base", "discord", "D07ABC123");
+        assert!(
+            !prompt.contains("private 1:1 DM"),
+            "Non-Slack channel should not get DM note even with D-prefix: {prompt}"
+        );
     }
 }
