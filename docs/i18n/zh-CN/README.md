@@ -65,7 +65,7 @@ ZeroClaw 是一个运行在你自己设备上的个人AI助手。它在你已经
 如果你想要一个本地化、快速、始终在线的个人单用户助手，这就是它。
 
 <p align="center">
-  <a href="https://zeroclawlabs.ai">官网</a> ·
+  <a href="https://www.zeroclawlabs.ai">官网</a> ·
   <a href="docs/README.md">文档</a> ·
   <a href="docs/architecture.md">架构</a> ·
   <a href="#快速开始简版">入门指南</a> ·
@@ -655,7 +655,7 @@ curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 
 ZeroClaw 为 smooth crab 🦀 而构建，一个快速高效的 AI 助手。由 Argenis De La Rosa 和社区共同构建。
 
-- [zeroclawlabs.ai](https://zeroclawlabs.ai)
+- [zeroclawlabs.ai](https://www.zeroclawlabs.ai)
 - [@zeroclawlabs](https://x.com/zeroclawlabs)
 
 ## 支持 ZeroClaw
