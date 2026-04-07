@@ -6,7 +6,7 @@ use crate::security::traits::Sandbox;
 use std::process::Command;
 
 /// Firejail sandbox backend for Linux
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FirejailSandbox {
     /// Custom firejail arguments (e.g., --env=KEY=VALUE)
     extra_args: Vec<String>,
@@ -42,14 +42,6 @@ impl FirejailSandbox {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
-    }
-}
-
-impl Default for FirejailSandbox {
-    fn default() -> Self {
-        Self {
-            extra_args: Vec::new(),
-        }
     }
 }
 
