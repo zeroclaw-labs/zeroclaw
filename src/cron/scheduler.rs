@@ -279,27 +279,9 @@ async fn run_agent_job(
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
 
-    // Recall relevant memories so cron jobs have context awareness.
-    let memory_context = match crate::memory::create_memory(
-        &config.memory,
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-    ) {
-        Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
-            Ok(entries) if !entries.is_empty() => {
-                let ctx: String = entries
-                    .iter()
-                    .map(|e| format!("- {}: {}", e.key, e.content))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!("[Memory context]\n{ctx}\n\n")
-            }
-            _ => String::new(),
-        },
-        Err(_) => String::new(),
-    };
-
-    let prefixed_prompt = format!("{memory_context}[cron:{} {name}] {prompt}", job.id);
+    // Scheduled tasks should only execute the instruction given in the prompt.
+    // Do not include chat memory to prevent context spillage.
+    let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
     let run_result = match job.session_target {
