@@ -141,8 +141,13 @@ pub(crate) fn align_to_user_boundary(
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
 ///
-/// After the bulk drain, extends the removal to the next `user` message so that
-/// providers requiring `system* -> user` ordering are satisfied.
+/// After the bulk drain, delegates to [`align_to_user_boundary`] so that the
+/// first non-system message has role `user` (required by providers like Zhipu GLM).
+///
+/// Note: this function does not have a `keep_recent` guard, so if no `user`
+/// message exists after the drain point the alignment pass may remove all
+/// remaining non-system messages. This is acceptable because a conversation
+/// with zero user messages is inherently degenerate.
 pub(crate) fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
@@ -157,11 +162,9 @@ pub(crate) fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
 
     let start = if has_system { 1 } else { 0 };
     let to_remove = non_system_count - max_history;
-    let mut drain_end = start + to_remove;
-    while drain_end < history.len() && history[drain_end].role != "user" {
-        drain_end += 1;
-    }
-    history.drain(start..drain_end);
+    history.drain(start..start + to_remove);
+    let mut extra = 0usize;
+    align_to_user_boundary(history, 0, &mut extra);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

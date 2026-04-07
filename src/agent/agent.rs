@@ -559,6 +559,11 @@ impl Agent {
             .build()
     }
 
+    /// Trims history for `ConversationMessage` (which wraps `ChatMessage` in an
+    /// enum). Mirrors the user-boundary alignment logic from
+    /// [`crate::agent::history::align_to_user_boundary`] but operates on
+    /// `ConversationMessage` directly because the shared helper is typed for
+    /// `ChatMessage` and cannot be reused here without a type-level refactor.
     fn trim_history(&mut self) {
         let max = self.config.max_history_messages;
         if self.history.len() <= max {
@@ -1470,12 +1475,10 @@ mod tests {
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "done");
-        assert!(
-            agent
-                .history()
-                .iter()
-                .any(|msg| matches!(msg, ConversationMessage::ToolResults(_)))
-        );
+        assert!(agent
+            .history()
+            .iter()
+            .any(|msg| matches!(msg, ConversationMessage::ToolResults(_))));
     }
 
     #[tokio::test]
@@ -1534,7 +1537,7 @@ mod tests {
 
     #[tokio::test]
     async fn from_config_passes_extra_headers_to_custom_provider() {
-        use axum::{Json, Router, http::HeaderMap, routing::post};
+        use axum::{http::HeaderMap, routing::post, Json, Router};
         use tempfile::TempDir;
         use tokio::net::TcpListener;
 
@@ -1896,6 +1899,52 @@ mod tests {
         assert!(
             has_tool_result,
             "Should have emitted a ToolResult event for 'echo'"
+        );
+    }
+
+    #[test]
+    fn trim_history_aligns_to_user_boundary_for_conversation_messages() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        agent.config.max_history_messages = 3;
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::system("sys")),
+            ConversationMessage::Chat(ChatMessage::user("u1")),
+            ConversationMessage::Chat(ChatMessage::assistant("a1")),
+            ConversationMessage::Chat(ChatMessage::tool("t1")),
+            ConversationMessage::Chat(ChatMessage::user("u2")),
+            ConversationMessage::Chat(ChatMessage::assistant("a2")),
+        ];
+
+        agent.trim_history();
+
+        assert!(
+            matches!(&agent.history[0], ConversationMessage::Chat(m) if m.role == "system"),
+            "first message should be system"
+        );
+        assert!(
+            matches!(&agent.history[1], ConversationMessage::Chat(m) if m.role == "user" && m.content == "u2"),
+            "first non-system message should be user after boundary alignment"
         );
     }
 }
