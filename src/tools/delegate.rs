@@ -1313,6 +1313,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
             },
         );
         agents.insert(
@@ -1331,6 +1333,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
             },
         );
         agents
@@ -1488,6 +1492,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+        max_context_tokens: None,
+        max_tool_result_chars: None,
         }
     }
 
@@ -1604,6 +1610,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1718,6 +1726,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1759,6 +1769,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -2048,6 +2060,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+        max_context_tokens: None,
+        max_tool_result_chars: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2102,6 +2116,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+        max_context_tokens: None,
+        max_tool_result_chars: None,
         };
 
         struct MockShellTool;
@@ -2173,6 +2189,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+        max_context_tokens: None,
+        max_tool_result_chars: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2202,6 +2220,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+        max_context_tokens: None,
+        max_tool_result_chars: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2236,6 +2256,8 @@ mod tests {
             agentic_timeout_secs: Some(600),
             skills_directory: None,
             memory_namespace: None,
+        max_context_tokens: None,
+        max_tool_result_chars: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2292,6 +2314,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2320,6 +2344,8 @@ mod tests {
                 agentic_timeout_secs: Some(0),
                 skills_directory: None,
                 memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2348,6 +2374,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2376,6 +2404,8 @@ mod tests {
                 agentic_timeout_secs: Some(5000),
                 skills_directory: None,
                 memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2404,6 +2434,8 @@ mod tests {
                 agentic_timeout_secs: Some(3600),
                 skills_directory: None,
                 memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2428,6 +2460,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2461,6 +2495,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: Some("skills/code-review".to_string()),
             memory_namespace: None,
+        max_context_tokens: None,
+        max_tool_result_chars: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2508,6 +2544,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+        max_context_tokens: None,
+        max_tool_result_chars: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];

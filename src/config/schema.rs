@@ -12313,6 +12313,8 @@ default_temperature = 0.7
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
             },
         );
 
