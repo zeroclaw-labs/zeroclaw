@@ -72,8 +72,10 @@ pub struct Config {
     #[serde(skip)]
     pub config_path: PathBuf,
     /// API key for the selected provider. Overridden by `ZEROCLAW_API_KEY` or `API_KEY` env vars.
+    #[serde(default)]
     pub api_key: Option<String>,
     /// Base URL override for provider API (e.g. "http://10.0.0.1:11434" for remote Ollama)
+    #[serde(default)]
     pub api_url: Option<String>,
     /// Custom API path suffix for OpenAI-compatible / custom providers
     /// (e.g. "/v2/generate" instead of the default "/v1/chat/completions").
