@@ -727,6 +727,9 @@ struct ResponsesInput {
     content: ResponsesInputContent,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
+    /// Required for tool role messages in OpenAI Responses API
+    #[serde(rename = "call_id", skip_serializing_if = "Option::is_none")]
+    call_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -749,6 +752,7 @@ impl ResponsesInput {
             role: "user".to_string(),
             content: ResponsesInputContent::Text(content),
             kind: None,
+            call_id: None,
         }
     }
 
@@ -760,6 +764,21 @@ impl ResponsesInput {
                 text: content,
             }]),
             kind: Some("message".to_string()),
+            call_id: None,
+        }
+    }
+
+    /// Create a tool result input for OpenAI Responses API.
+    /// Requires call_id to associate the result with the tool call.
+    fn tool_result(content: String, call_id: String) -> Self {
+        Self {
+            role: "tool".to_string(),
+            content: ResponsesInputContent::Parts(vec![ResponsesInputPart {
+                kind: "output_text".to_string(),
+                text: content,
+            }]),
+            kind: Some("message".to_string()),
+            call_id: Some(call_id),
         }
     }
 }
@@ -1279,7 +1298,29 @@ fn build_responses_prompt(messages: &[ChatMessage]) -> (Option<String>, Vec<Resp
         let input_item = match message.role.as_str() {
             // llama.cpp Responses parser expects assistant history items in
             // "output_message" shape (`type=message`, `output_text` parts).
-            "assistant" | "tool" => ResponsesInput::assistant_output_text(message.content.clone()),
+            "assistant" => ResponsesInput::assistant_output_text(message.content.clone()),
+            // Tool results require call_id in OpenAI Responses API.
+            // Extract it from the message content JSON.
+            "tool" => {
+                let call_id = serde_json::from_str::<serde_json::Value>(&message.content)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("tool_call_id")
+                            .or_else(|| v.get("call_id"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToString::to_string)
+                    })
+                    .unwrap_or_default();
+                let content = serde_json::from_str::<serde_json::Value>(&message.content)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToString::to_string)
+                    })
+                    .unwrap_or_else(|| message.content.clone());
+                ResponsesInput::tool_result(content, call_id)
+            }
             _ => ResponsesInput::user_text(message.content.clone()),
         };
         input.push(input_item);
@@ -2795,8 +2836,9 @@ mod tests {
         assert_eq!(
             serialized[2],
             serde_json::json!({
-                "role": "assistant",
+                "role": "tool",
                 "type": "message",
+                "call_id": "",
                 "content": [{
                     "type": "output_text",
                     "text": "{\"result\":\"ok\"}"
