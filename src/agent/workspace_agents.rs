@@ -560,8 +560,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
-            max_context_tokens: None,
-            max_tool_result_chars: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
 
@@ -670,8 +670,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
-            max_context_tokens: None,
-            max_tool_result_chars: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
 
