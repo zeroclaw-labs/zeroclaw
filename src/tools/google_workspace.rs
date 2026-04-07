@@ -78,6 +78,8 @@ impl GoogleWorkspaceTool {
     }
 
     /// Build the positional `gws` arguments: `[service, resource, (sub_resource,)? method]`.
+    /// Only Gmail uses 4-segment commands with sub_resource (e.g., `gws gmail users messages list`).
+    /// Other services (Drive, Calendar, etc.) use 3-segment commands without sub_resource.
     fn positional_cmd_args(
         service: &str,
         resource: &str,
@@ -85,8 +87,12 @@ impl GoogleWorkspaceTool {
         method: &str,
     ) -> Vec<String> {
         let mut args = vec![service.to_string(), resource.to_string()];
-        if let Some(sub) = sub_resource {
-            args.push(sub.to_string());
+        // Only Gmail supports 4-segment commands with sub_resource.
+        // Other services (Drive, Calendar, etc.) should use 3-segment commands.
+        if service == "gmail" {
+            if let Some(sub) = sub_resource {
+                args.push(sub.to_string());
+            }
         }
         args.push(method.to_string());
         args
