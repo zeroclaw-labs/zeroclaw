@@ -4601,7 +4601,7 @@ fn collect_configured_channels(
                     sl.allowed_users.clone(),
                 )
                 .with_thread_replies(sl.thread_replies.unwrap_or(true))
-                .with_group_reply_policy(sl.mention_only, Vec::new())
+                .with_group_reply_policy(sl.mention_only, sl.respond_to_broadcasts, Vec::new())
                 .with_workspace_dir(config.workspace_dir.clone())
                 .with_markdown_blocks(sl.use_markdown_blocks)
                 .with_proxy_url(sl.proxy_url.clone())

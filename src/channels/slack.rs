@@ -28,6 +28,7 @@ pub struct SlackChannel {
     allowed_users: Vec<String>,
     thread_replies: bool,
     mention_only: bool,
+    respond_to_broadcasts: bool,
     group_reply_allowed_sender_ids: Vec<String>,
     user_display_name_cache: Mutex<HashMap<String, CachedSlackDisplayName>>,
     workspace_dir: Option<PathBuf>,
@@ -169,6 +170,7 @@ impl SlackChannel {
             allowed_users,
             thread_replies: true,
             mention_only: false,
+            respond_to_broadcasts: true,
             group_reply_allowed_sender_ids: Vec::new(),
             user_display_name_cache: Mutex::new(HashMap::new()),
             workspace_dir: None,
@@ -189,9 +191,11 @@ impl SlackChannel {
     pub fn with_group_reply_policy(
         mut self,
         mention_only: bool,
+        respond_to_broadcasts: bool,
         allowed_sender_ids: Vec<String>,
     ) -> Self {
         self.mention_only = mention_only;
+        self.respond_to_broadcasts = respond_to_broadcasts;
         self.group_reply_allowed_sender_ids =
             Self::normalize_group_reply_allowed_sender_ids(allowed_sender_ids);
         self
@@ -759,17 +763,34 @@ impl SlackChannel {
         if bot_user_id.is_empty() {
             return text.trim().to_string();
         }
-        text.replace(&format!("<@{bot_user_id}>"), " ")
+        // Replace the bot's own mention with "@you" so the model knows it was
+        // directly addressed. Stripping to empty caused the model to silently
+        // decline @mentions because it saw no addressee in the message text.
+        text.replace(&format!("<@{bot_user_id}>"), "@you")
             .trim()
             .to_string()
+    }
+
+    fn contains_broadcast_mention(text: &str) -> bool {
+        text.contains("<!here>") || text.contains("<!channel>")
     }
 
     fn normalize_incoming_text(
         text: &str,
         require_mention: bool,
+        respond_to_broadcasts: bool,
         bot_user_id: &str,
     ) -> Option<String> {
-        if require_mention && !Self::contains_bot_mention(text, bot_user_id) {
+        let has_broadcast = Self::contains_broadcast_mention(text);
+        // A broadcast mention satisfies the mention requirement only when
+        // respond_to_broadcasts is enabled; otherwise drop it entirely.
+        if has_broadcast && !respond_to_broadcasts {
+            return None;
+        }
+        if require_mention
+            && !Self::contains_bot_mention(text, bot_user_id)
+            && !(respond_to_broadcasts && has_broadcast)
+        {
             return None;
         }
 
@@ -781,9 +802,11 @@ impl SlackChannel {
     fn normalize_incoming_content(
         text: &str,
         require_mention: bool,
+        respond_to_broadcasts: bool,
         bot_user_id: &str,
     ) -> Option<String> {
-        let normalized = Self::normalize_incoming_text(text, require_mention, bot_user_id)?;
+        let normalized =
+            Self::normalize_incoming_text(text, require_mention, respond_to_broadcasts, bot_user_id)?;
         if normalized.is_empty() {
             return None;
         }
@@ -822,7 +845,12 @@ impl SlackChannel {
             .get("text")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
-        let normalized_text = Self::normalize_incoming_text(text, require_mention, bot_user_id)?;
+        let normalized_text = Self::normalize_incoming_text(
+            text,
+            require_mention,
+            self.respond_to_broadcasts,
+            bot_user_id,
+        )?;
         let attachment_blocks = self.render_file_attachments(message).await;
         let permalink_blocks = self.resolve_permalink_blocks(&normalized_text).await;
         let mut blocks = attachment_blocks;
@@ -4068,7 +4096,7 @@ mod tests {
     #[test]
     fn slack_group_reply_policy_applies_sender_overrides() {
         let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()])
-            .with_group_reply_policy(true, vec![" U111 ".into(), "U111".into(), "U222".into()]);
+            .with_group_reply_policy(true, true, vec![" U111 ".into(), "U111".into(), "U222".into()]);
 
         assert!(ch.mention_only);
         assert_eq!(
@@ -4249,17 +4277,17 @@ mod tests {
 
     #[test]
     fn normalize_incoming_content_requires_mention_when_enabled() {
-        assert!(SlackChannel::normalize_incoming_content("hello", true, "U_BOT").is_none());
+        assert!(SlackChannel::normalize_incoming_content("hello", true, true, "U_BOT").is_none());
         assert_eq!(
-            SlackChannel::normalize_incoming_content("<@U_BOT> run", true, "U_BOT").as_deref(),
-            Some("run")
+            SlackChannel::normalize_incoming_content("<@U_BOT> run", true, true, "U_BOT").as_deref(),
+            Some("@you run")
         );
     }
 
     #[test]
     fn normalize_incoming_content_without_mention_mode_keeps_message() {
         assert_eq!(
-            SlackChannel::normalize_incoming_content("  hello world  ", false, "U_BOT").as_deref(),
+            SlackChannel::normalize_incoming_content("  hello world  ", false, true, "U_BOT").as_deref(),
             Some("hello world")
         );
     }

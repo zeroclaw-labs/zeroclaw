@@ -6558,6 +6558,11 @@ pub struct SlackConfig {
     /// Direct messages remain allowed.
     #[serde(default)]
     pub mention_only: bool,
+    /// When false (default), ignore Slack broadcast mentions (`@here`, `@channel`)
+    /// even if they appear in an otherwise-eligible message.
+    /// Set to true to allow broadcasts to trigger the bot.
+    #[serde(default)]
+    pub respond_to_broadcasts: bool,
     /// Use the newer Slack `markdown` block type (12 000 char limit, richer formatting).
     /// Defaults to false (uses universally supported `section` blocks with `mrkdwn`).
     /// Enable this only if your Slack workspace supports the `markdown` block type.
