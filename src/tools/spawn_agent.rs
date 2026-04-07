@@ -259,7 +259,7 @@ impl SpawnAgentTool {
         }
         history.push(ChatMessage::user(full_prompt.to_string()));
 
-        let noop_observer = NoopObserver;
+        let noop_observer = SubagentObserver { agent_name: name.to_string() };
         let temperature = agent_config.temperature.unwrap_or(0.7);
 
         let agentic_timeout_secs = agent_config
@@ -747,15 +747,63 @@ impl Tool for ToolArcRef {
     }
 }
 
-struct NoopObserver;
+/// Observer that logs sub-agent events via tracing so they appear in journalctl.
+struct SubagentObserver {
+    agent_name: String,
+}
 
-impl Observer for NoopObserver {
-    fn record_event(&self, _event: &ObserverEvent) {}
+impl Observer for SubagentObserver {
+    fn record_event(&self, event: &ObserverEvent) {
+        match event {
+            ObserverEvent::ToolCallStart { tool, .. } => {
+                tracing::info!(agent = %self.agent_name, tool = %tool, "▶ [subagent] tool start");
+            }
+            ObserverEvent::ToolCall {
+                tool,
+                duration,
+                success,
+            } => {
+                tracing::info!(
+                    agent = %self.agent_name,
+                    tool = %tool,
+                    duration_ms = duration.as_millis() as u64,
+                    success = success,
+                    "◀ [subagent] tool done"
+                );
+            }
+            ObserverEvent::LlmRequest { provider, model, messages_count } => {
+                tracing::info!(
+                    agent = %self.agent_name,
+                    provider = %provider,
+                    model = %model,
+                    messages = messages_count,
+                    "🔄 [subagent] LLM request"
+                );
+            }
+            ObserverEvent::LlmResponse { duration, success, error_message, .. } => {
+                if *success {
+                    tracing::info!(
+                        agent = %self.agent_name,
+                        duration_ms = duration.as_millis() as u64,
+                        "✓ [subagent] LLM response"
+                    );
+                } else {
+                    tracing::warn!(
+                        agent = %self.agent_name,
+                        duration_ms = duration.as_millis() as u64,
+                        error = ?error_message,
+                        "✗ [subagent] LLM error"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
 
     fn record_metric(&self, _metric: &ObserverMetric) {}
 
     fn name(&self) -> &str {
-        "noop"
+        "subagent-tracing"
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
