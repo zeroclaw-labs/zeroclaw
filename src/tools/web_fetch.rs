@@ -620,7 +620,7 @@ fn validate_resolved_host_is_public(host: &str) -> anyhow::Result<()> {
     // For testing the code path that requires DNS resolution, reject .localdomain
     // to simulate a domain that would resolve to a private IP.
     if host.ends_with(".localdomain") {
-        anyhow::bail!("Blocked host '{host}' resolved to non-global address");
+        anyhow::bail!("Blocked host '{host}' resolved to non-global (private) address");
     }
     Ok(())
 }
