@@ -1260,6 +1260,75 @@ fn write_zeroclaw_config(
     Ok(config_path.to_string_lossy().to_string())
 }
 
+/// Save a channel configuration block to config.toml.
+///
+/// Merges the channel settings into the existing `[channels.<name>]` section
+/// so the user doesn't have to manually edit the TOML file.
+#[tauri::command]
+fn save_channel_config(
+    channel_name: String,
+    config_values: std::collections::HashMap<String, String>,
+) -> Result<String, String> {
+    let home = dirs_next::home_dir().ok_or("Cannot find home directory")?;
+    let config_path = home.join(".zeroclaw").join("config.toml");
+
+    let existing = if config_path.exists() {
+        std::fs::read_to_string(&config_path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let mut table: toml::Table = existing
+        .parse()
+        .unwrap_or_else(|_| toml::Table::new());
+
+    // Get or create [channels.<channel_name>]
+    let channels = table
+        .entry("channels".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let channels_table = channels
+        .as_table_mut()
+        .ok_or("channels is not a table")?;
+    let channel = channels_table
+        .entry(channel_name.clone())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let channel_table = channel
+        .as_table_mut()
+        .ok_or("channel section is not a table")?;
+
+    // Merge values
+    for (key, value) in &config_values {
+        if value.starts_with('[') && value.ends_with(']') {
+            // Parse as array of strings: ["a", "b"]
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(value) {
+                let toml_arr: Vec<toml::Value> = arr
+                    .into_iter()
+                    .map(toml::Value::String)
+                    .collect();
+                channel_table.insert(key.clone(), toml::Value::Array(toml_arr));
+                continue;
+            }
+        }
+        channel_table.insert(key.clone(), toml::Value::String(value.clone()));
+    }
+
+    // Write back
+    let output = toml::to_string_pretty(&table)
+        .map_err(|e| format!("Failed to serialize config: {e}"))?;
+    std::fs::write(&config_path, &output)
+        .map_err(|e| format!("Failed to write config.toml: {e}"))?;
+
+    // Set file permissions to 0600
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    tracing::info!(channel = channel_name.as_str(), "Channel config saved");
+    Ok(format!("채널 설정이 저장되었습니다: {channel_name}"))
+}
+
 /// Check if ZeroClaw config.toml exists (setup already done).
 #[tauri::command]
 fn is_zeroclaw_configured() -> bool {
@@ -2303,6 +2372,7 @@ pub fn run() {
             on_app_resume,
             is_gateway_running,
             write_zeroclaw_config,
+            save_channel_config,
             is_zeroclaw_configured,
             browse_and_extract,
             web_search,

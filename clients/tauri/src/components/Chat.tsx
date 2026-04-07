@@ -273,10 +273,18 @@ export function Chat({
 
   // ── STT: start listening (internal helper) ──
   const startListening = useCallback((lang: string) => {
+    // Never start STT while TTS is still playing
+    if (isSpeakingRef.current) return;
+
     const recognition = createSpeechRecognition(lang);
     if (!recognition) return;
     let finalTranscript = "";
     recognition.onresult = (event: { results: SpeechRecognitionResultList }) => {
+      // ── Echo suppression: ignore all STT input while TTS is speaking ──
+      // Without this, the speaker output feeds back into the microphone,
+      // gets transcribed, and auto-sent as a new question → infinite loop.
+      if (isSpeakingRef.current) return;
+
       let interim = "";
       finalTranscript = "";
       for (let i = 0; i < event.results.length; i++) {
@@ -293,7 +301,7 @@ export function Chat({
       setVoiceMode(false);
     };
     recognition.onend = () => {
-      // Don't restart STT while TTS is playing (echo suppression)
+      // Don't restart or auto-send while TTS is playing (echo suppression)
       if (isSpeakingRef.current) {
         setListening(false);
         return;
@@ -339,14 +347,25 @@ export function Chat({
     if (messages.length > prevMsgCountRef.current) {
       const last = messages[messages.length - 1];
       if (last && last.role === "assistant") {
-        // Mute STT during TTS to prevent echo (speaker → mic → STT loop)
+        // ── Echo suppression: fully stop STT before TTS starts ──
+        // 1. Set speaking flag FIRST (blocks onresult from processing)
         isSpeakingRef.current = true;
+        // 2. Stop recognition (async — onresult/onend may still fire)
         recognitionRef.current?.stop();
+        recognitionRef.current = null;
         setListening(false);
-        speakText(last.content, chatLangRef.current, () => {
-          isSpeakingRef.current = false;
-          if (voiceModeRef.current) startListening(chatLangRef.current);
-        }, ttsSettingsRef.current);
+        // 3. Clear any partially-recognized text that might be echo
+        setInput("");
+        // 4. Small delay to ensure STT is fully stopped before TTS audio plays
+        setTimeout(() => {
+          speakText(last.content, chatLangRef.current, () => {
+            isSpeakingRef.current = false;
+            // Resume listening after TTS finishes
+            if (voiceModeRef.current) {
+              setTimeout(() => startListening(chatLangRef.current), 200);
+            }
+          }, ttsSettingsRef.current);
+        }, 100);
       }
     }
     prevMsgCountRef.current = messages.length;

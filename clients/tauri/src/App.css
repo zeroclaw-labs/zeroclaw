@@ -706,6 +706,84 @@ html, body {
   line-height: 1.7;
 }
 
+/* ── Channel Guide form (inline token input) ── */
+.channel-guide-form {
+  margin-top: 16px;
+  padding: 16px;
+  background: #1a1d27;
+  border-radius: 8px;
+  border: 1px solid var(--color-border);
+}
+
+.channel-guide-field {
+  margin-bottom: 12px;
+}
+
+.channel-guide-label {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  margin-bottom: 4px;
+}
+
+.channel-guide-required {
+  color: #f87171;
+}
+
+.channel-guide-input {
+  width: 100%;
+  padding: 10px 12px;
+  font-size: 14px;
+  font-family: var(--font-mono);
+  background: #0f1117;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  color: var(--color-text);
+  outline: none;
+  box-sizing: border-box;
+}
+
+.channel-guide-input:focus {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+}
+
+.channel-guide-input::placeholder {
+  color: var(--color-text-muted);
+  opacity: 0.5;
+}
+
+.channel-guide-save-btn {
+  width: 100%;
+  padding: 10px;
+  margin-top: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: white;
+  background: var(--color-accent);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.channel-guide-save-btn:hover {
+  opacity: 0.85;
+}
+
+.channel-guide-save-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.channel-guide-save-result {
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  text-align: center;
+}
+
 .sidebar-empty {
   text-align: center;
   padding: 32px 16px;

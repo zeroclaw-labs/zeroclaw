@@ -190,6 +190,19 @@ export async function writeMoAConfig(
   }) as Promise<string>;
 }
 
+/** Save channel configuration (e.g., Telegram bot token) to config.toml. */
+export async function saveChannelConfig(
+  channelName: string,
+  configValues: Record<string, string>,
+): Promise<string | null> {
+  const invoke = await getInvoke();
+  if (!invoke) return null;
+  return invoke("save_channel_config", {
+    channel_name: channelName,
+    config_values: configValues,
+  }) as Promise<string>;
+}
+
 /** Check if MoA config.toml already exists. */
 export async function isMoAConfigured(): Promise<boolean | null> {
   const invoke = await getInvoke();
