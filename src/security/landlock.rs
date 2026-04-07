@@ -133,12 +133,17 @@ impl Sandbox for LandlockSandbox {
 
         // Clone workspace_dir for the closure
         let workspace_dir = self.workspace_dir.clone();
-        cmd.pre_exec(move || {
-            let sandbox = LandlockSandbox {
-                workspace_dir: workspace_dir.clone(),
-            };
-            sandbox.apply_restrictions()
-        });
+        // SAFETY: pre_exec is unsafe because the code runs in a forked process
+        // before exec(). We only call apply_restrictions which is signal-safe
+        // and doesn't allocate memory or use non-async-signal-safe operations.
+        unsafe {
+            cmd.pre_exec(move || {
+                let sandbox = LandlockSandbox {
+                    workspace_dir: workspace_dir.clone(),
+                };
+                sandbox.apply_restrictions()
+            });
+        }
         Ok(())
     }
 
