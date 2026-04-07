@@ -2082,6 +2082,18 @@ impl Provider for OpenAiCompatibleProvider {
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
 
+            if status == reqwest::StatusCode::BAD_REQUEST {
+                let roles: Vec<&str> = effective_messages.iter().map(|m| m.role.as_str()).collect();
+                tracing::debug!(
+                    provider = %self.name,
+                    model,
+                    message_count = effective_messages.len(),
+                    ?roles,
+                    has_tools = native_request.tools.as_ref().is_some_and(|t| !t.is_empty()),
+                    "400 Bad Request — message role sequence for diagnosis"
+                );
+            }
+
             if Self::is_native_tool_schema_unsupported(status, &sanitized) {
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
@@ -2180,6 +2192,7 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         let tools = Self::convert_tool_specs(request.tools);
+        let tool_stream = self.tool_stream_for_tools(has_tools);
         let payload = if has_tools {
             serde_json::to_value(NativeChatRequest {
                 model: model.to_string(),
@@ -2189,7 +2202,7 @@ impl Provider for OpenAiCompatibleProvider {
                 ),
                 temperature,
                 reasoning_effort: self.reasoning_effort.clone(),
-                tool_stream: if options.enabled { Some(true) } else { None },
+                tool_stream,
                 stream: Some(options.enabled),
                 tools: tools.clone(),
                 tool_choice: tools.as_ref().map(|_| "auto".to_string()),
@@ -2213,7 +2226,7 @@ impl Provider for OpenAiCompatibleProvider {
                 messages,
                 temperature,
                 reasoning_effort: self.reasoning_effort.clone(),
-                tool_stream: if options.enabled { Some(true) } else { None },
+                tool_stream: None,
                 stream: Some(options.enabled),
                 tools: None,
                 tool_choice: None,
@@ -2232,6 +2245,9 @@ impl Provider for OpenAiCompatibleProvider {
         let client = self.http_client();
         let auth_header = self.auth_header.clone();
         let count_tokens = options.count_tokens;
+        let provider_name = self.name.clone();
+        let model_name = model.to_string();
+        let roles: Vec<String> = effective_messages.iter().map(|m| m.role.clone()).collect();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
@@ -2255,6 +2271,18 @@ impl Provider for OpenAiCompatibleProvider {
                     Ok(text) => text,
                     Err(_) => format!("HTTP error: {}", status),
                 };
+
+                if status == reqwest::StatusCode::BAD_REQUEST {
+                    tracing::debug!(
+                        provider = %provider_name,
+                        model = %model_name,
+                        message_count = roles.len(),
+                        ?roles,
+                        has_tools,
+                        "stream 400 Bad Request — message role sequence for diagnosis"
+                    );
+                }
+
                 let _ = tx
                     .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
                     .await;

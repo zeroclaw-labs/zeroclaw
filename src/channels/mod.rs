@@ -1169,6 +1169,10 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 /// count stays within [`PROACTIVE_CONTEXT_BUDGET_CHARS`].  Drops the oldest
 /// turns first, but always preserves the most recent turn (the current user
 /// message).  Returns the number of turns dropped.
+///
+/// After the bulk drain, ensures the first remaining message has role `user`
+/// so providers that require `system → user` ordering (e.g. Zhipu GLM) are
+/// satisfied.
 fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
     let total_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
     if total_chars <= budget || turns.len() <= 1 {
@@ -1187,6 +1191,22 @@ fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
     if drop_count > 0 {
         turns.drain(..drop_count);
     }
+
+    // After trimming, the first remaining turn may be an assistant message
+    // (e.g. if we dropped an odd number of user/assistant pairs). Drop
+    // leading non-user turns so the caller can prepend a system message
+    // without violating the `system → user` constraint that some providers
+    // (Zhipu GLM, etc.) enforce.
+    let skip = turns
+        .iter()
+        .take(turns.len().saturating_sub(1))
+        .take_while(|t| t.role != "user")
+        .count();
+    if skip > 0 {
+        turns.drain(..skip);
+        drop_count += skip;
+    }
+
     drop_count
 }
 
@@ -1216,6 +1236,12 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
     turns.push(turn);
     while turns.len() > max_history {
+        turns.remove(0);
+    }
+    // After length-based truncation the first turn may be `assistant` or
+    // `tool`.  Align to a `user` boundary so downstream system-prompt
+    // prepend doesn't violate provider ordering constraints (Zhipu GLM).
+    while turns.len() > 1 && turns.first().is_some_and(|t| t.role != "user") {
         turns.remove(0);
     }
 }
@@ -6098,6 +6124,45 @@ mod tests {
         let dropped = proactive_trim_turns(&mut turns, 100);
         assert_eq!(dropped, 0, "single turn must never be dropped");
         assert_eq!(turns.len(), 1);
+    }
+
+    #[test]
+    fn proactive_trim_aligns_to_user_boundary() {
+        let mut turns = vec![
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("a1".repeat(500)),
+            ChatMessage::user("u2"),
+            ChatMessage::assistant("a2"),
+            ChatMessage::user("u3"),
+        ];
+        // Budget smaller than a1 forces dropping u1, leaving assistant first.
+        // The alignment pass should also drop a1 so the first remaining is u2.
+        let dropped = proactive_trim_turns(&mut turns, 20);
+        assert!(dropped >= 2, "should drop u1 and a1");
+        assert_eq!(
+            turns[0].role, "user",
+            "first turn must be user after trim"
+        );
+        assert_eq!(turns[0].content, "u2");
+    }
+
+    #[test]
+    fn proactive_trim_aligns_past_multiple_non_user() {
+        let mut turns = vec![
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("a1".repeat(500)),
+            ChatMessage::tool("t1"),
+            ChatMessage::user("u2"),
+            ChatMessage::assistant("a2"),
+            ChatMessage::user("u3"),
+        ];
+        let dropped = proactive_trim_turns(&mut turns, 20);
+        assert!(dropped >= 3, "should drop u1, a1 and t1");
+        assert_eq!(
+            turns[0].role, "user",
+            "first turn must be user after trim"
+        );
+        assert_eq!(turns[0].content, "u2");
     }
 
     #[test]
