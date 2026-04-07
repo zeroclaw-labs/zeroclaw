@@ -4110,13 +4110,13 @@ pub async fn run(
                                 .await
                             {
                                 Ok(Some(s)) => {
-                                    tracing::info!(slug = %s, "Auto-improved skill after failure")
+                                    tracing::info!(slug = %s, "Auto-improved skill after failure");
                                 }
                                 Ok(None) => {
-                                    tracing::debug!(slug = %slug, "Skill improvement skipped")
+                                    tracing::debug!(slug = %slug, "Skill improvement skipped");
                                 }
                                 Err(e) => {
-                                    tracing::warn!(slug = %slug, "Skill improvement write failed: {e}")
+                                    tracing::warn!(slug = %slug, "Skill improvement write failed: {e}");
                                 }
                             }
                         }
