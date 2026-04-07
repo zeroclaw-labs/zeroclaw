@@ -119,6 +119,7 @@ Last refreshed: **February 18, 2026**.
 - [adding-boards-and-tools.md](contributing/adding-boards-and-tools.md)
 - [nucleo-setup.md](hardware/nucleo-setup.md)
 - [arduino-uno-q-setup.md](hardware/arduino-uno-q-setup.md)
+- [raspberry-pi-setup.md](hardware/raspberry-pi-setup.md)
 - [datasheets/nucleo-f401re.md](hardware/datasheets/nucleo-f401re.md)
 - [datasheets/arduino-uno.md](hardware/datasheets/arduino-uno.md)
 - [datasheets/esp32.md](hardware/datasheets/esp32.md)
