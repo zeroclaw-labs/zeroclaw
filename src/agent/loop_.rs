@@ -4044,6 +4044,90 @@ pub async fn run(
                 }
             }
         }
+
+        // Autonomous skill improvement: when a skill tool fails, ask the LLM to improve it.
+        #[cfg(feature = "skill-creation")]
+        if config.skills.skill_improvement.enabled {
+            // extract_skill_executions_from_history returns Vec<(slug, succeeded)>
+            let executions =
+                crate::skills::improver::extract_skill_executions_from_history(&history);
+            let failed_skills: Vec<&str> = executions
+                .iter()
+                .filter(|(_, succeeded)| !succeeded)
+                .map(|(slug, _)| slug.as_str())
+                .collect();
+
+            if !failed_skills.is_empty() {
+                let mut improver = crate::skills::improver::SkillImprover::new(
+                    config.workspace_dir.clone(),
+                    config.skills.skill_improvement.clone(),
+                );
+
+                for slug in failed_skills {
+                    let toml_path = config
+                        .workspace_dir
+                        .join("skills")
+                        .join(slug)
+                        .join("SKILL.toml");
+                    let current_content = match std::fs::read_to_string(&toml_path) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::debug!(slug = %slug, "Could not read skill TOML: {e}");
+                            continue;
+                        }
+                    };
+
+                    // Build failure context from the last few history messages
+                    let failure_context: String = history
+                        .iter()
+                        .rev()
+                        .take(6)
+                        .rev()
+                        .map(|m| {
+                            format!("[{}]: {}", m.role, &m.content[..m.content.len().min(500)])
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    // Ask LLM to generate improved content
+                    match improver
+                        .generate_improved_content(
+                            slug,
+                            &current_content,
+                            &failure_context,
+                            provider.as_ref(),
+                            &model_name,
+                        )
+                        .await
+                    {
+                        Ok(improved) => {
+                            match improver
+                                .improve_skill(
+                                    slug,
+                                    &improved,
+                                    "Auto-fix after skill execution failure",
+                                )
+                                .await
+                            {
+                                Ok(Some(s)) => {
+                                    tracing::info!(slug = %s, "Auto-improved skill after failure");
+                                }
+                                Ok(None) => {
+                                    tracing::debug!(slug = %slug, "Skill improvement skipped");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(slug = %slug, "Skill improvement write failed: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(slug = %slug, "LLM skill improvement generation failed: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
@@ -4771,6 +4855,10 @@ pub async fn process_message(
     if config.autonomy.level != AutonomyLevel::Full {
         excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
     }
+
+    // TODO: Add post-execution skill creation and skill improvement hooks here
+    // (matching the single-shot `run` path) once `agent_turn` returns the final
+    // history so we can extract tool calls and skill slugs.
 
     agent_turn(
         provider.as_ref(),
