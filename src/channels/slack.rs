@@ -53,6 +53,9 @@ pub struct SlackChannel {
     lazy_draft_ts: tokio::sync::Mutex<HashMap<String, String>>,
     /// Emoji reaction name (without colons) that cancels an in-flight request.
     cancel_reaction: Option<String>,
+    /// When true, messages with `<!here>` or `<!channel>` broadcast mentions bypass
+    /// the `mention_only` filter even when the bot is not directly @-mentioned.
+    respond_to_broadcasts: bool,
 }
 
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
@@ -182,6 +185,7 @@ impl SlackChannel {
             last_draft_edit: Mutex::new(HashMap::new()),
             lazy_draft_ts: tokio::sync::Mutex::new(HashMap::new()),
             cancel_reaction: None,
+            respond_to_broadcasts: false,
         }
     }
 
@@ -253,6 +257,12 @@ impl SlackChannel {
     /// Set the emoji reaction name that cancels an in-flight request.
     pub fn with_cancel_reaction(mut self, reaction: Option<String>) -> Self {
         self.cancel_reaction = reaction;
+        self
+    }
+
+    /// Configure whether `@here` / `@channel` broadcast mentions bypass `mention_only`.
+    pub fn with_respond_to_broadcasts(mut self, enabled: bool) -> Self {
+        self.respond_to_broadcasts = enabled;
         self
     }
 
@@ -746,6 +756,12 @@ impl SlackChannel {
 
     fn is_group_channel_id(channel_id: &str) -> bool {
         matches!(channel_id.chars().next(), Some('C' | 'G'))
+    }
+
+    /// Returns `true` when the message text contains a Slack broadcast mention
+    /// (`<!here>` or `<!channel>`).
+    fn contains_broadcast_mention(text: &str) -> bool {
+        text.contains("<!here>") || text.contains("<!channel>")
     }
 
     fn contains_bot_mention(text: &str, bot_user_id: &str) -> bool {
@@ -2805,10 +2821,18 @@ impl SlackChannel {
                 let is_thread_reply = event.get("thread_ts").and_then(|v| v.as_str()).is_some();
                 let allow_sender_without_mention =
                     is_group_message && self.is_group_sender_trigger_enabled(user);
+                let message_text = event
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let allow_broadcast = self.respond_to_broadcasts
+                    && is_group_message
+                    && Self::contains_broadcast_mention(message_text);
                 let require_mention = self.mention_only
                     && is_group_message
                     && !allow_sender_without_mention
-                    && !is_thread_reply;
+                    && !is_thread_reply
+                    && !allow_broadcast;
 
                 let Some(normalized_text) = self
                     .build_incoming_content(event, require_mention, bot_user_id)
@@ -3808,10 +3832,16 @@ impl Channel for SlackChannel {
                             msg.get("thread_ts").and_then(|v| v.as_str()).is_some();
                         let allow_sender_without_mention =
                             is_group_message && self.is_group_sender_trigger_enabled(user);
+                        let message_text =
+                            msg.get("text").and_then(|v| v.as_str()).unwrap_or_default();
+                        let allow_broadcast = self.respond_to_broadcasts
+                            && is_group_message
+                            && Self::contains_broadcast_mention(message_text);
                         let require_mention = self.mention_only
                             && is_group_message
                             && !allow_sender_without_mention
-                            && !is_thread_reply;
+                            && !is_thread_reply
+                            && !allow_broadcast;
                         let Some(normalized_text) = self
                             .build_incoming_content(msg, require_mention, &bot_user_id)
                             .await
@@ -5056,5 +5086,30 @@ mod tests {
             assert_eq!(map.get("C123"), Some(&"1741234567.000100".to_string()),);
             assert_eq!(map.get("C999"), None);
         }
+    }
+
+    #[test]
+    fn contains_broadcast_mention_detects_here_and_channel() {
+        assert!(SlackChannel::contains_broadcast_mention("<!here> everyone"));
+        assert!(SlackChannel::contains_broadcast_mention("Hey <!channel>!"));
+        assert!(SlackChannel::contains_broadcast_mention(
+            "prefix <!here> suffix"
+        ));
+        assert!(!SlackChannel::contains_broadcast_mention(
+            "just a normal message"
+        ));
+        assert!(!SlackChannel::contains_broadcast_mention(
+            "<@U1234567> hello"
+        ));
+    }
+
+    #[test]
+    fn with_respond_to_broadcasts_sets_flag() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![])
+            .with_respond_to_broadcasts(true);
+        assert!(ch.respond_to_broadcasts);
+
+        let ch2 = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
+        assert!(!ch2.respond_to_broadcasts);
     }
 }

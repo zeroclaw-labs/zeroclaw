@@ -6578,6 +6578,12 @@ pub struct SlackConfig {
     /// Leave unset to disable reaction-based cancellation.
     #[serde(default)]
     pub cancel_reaction: Option<String>,
+    /// When true, messages containing `@here` or `@channel` broadcast mentions
+    /// (`<!here>` / `<!channel>` in Slack wire format) are treated as implicit
+    /// bot mentions even when `mention_only = true`.
+    /// Defaults to `false` — broadcasts are ignored like any other un-mentioned message.
+    #[serde(default)]
+    pub respond_to_broadcasts: bool,
 }
 
 fn default_slack_draft_update_interval_ms() -> u64 {
@@ -12705,6 +12711,20 @@ allowed_users = ["@ops:matrix.org"]
         assert_eq!(parsed.thread_replies, Some(false));
         assert!(!parsed.interrupt_on_new_message);
         assert!(!parsed.mention_only);
+    }
+
+    #[test]
+    async fn slack_config_respond_to_broadcasts_defaults_false() {
+        let json = r#"{"bot_token":"xoxb-tok"}"#;
+        let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.respond_to_broadcasts);
+    }
+
+    #[test]
+    async fn slack_config_respond_to_broadcasts_can_be_enabled() {
+        let json = r#"{"bot_token":"xoxb-tok","respond_to_broadcasts":true}"#;
+        let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.respond_to_broadcasts);
     }
 
     #[test]

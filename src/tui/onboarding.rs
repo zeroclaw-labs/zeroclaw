@@ -767,6 +767,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     stream_drafts: false,
                     draft_update_interval_ms: 1200,
                     cancel_reaction: None,
+                    respond_to_broadcasts: false,
                 });
             }
         }

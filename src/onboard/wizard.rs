@@ -4191,6 +4191,9 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                         .map(|s| s.draft_update_interval_ms)
                         .unwrap_or(1200),
                     cancel_reaction: existing_sl.and_then(|s| s.cancel_reaction.clone()),
+                    respond_to_broadcasts: existing_sl
+                        .map(|s| s.respond_to_broadcasts)
+                        .unwrap_or(false),
                 });
             }
             ChannelMenuChoice::IMessage => {
