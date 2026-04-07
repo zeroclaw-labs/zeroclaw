@@ -2961,7 +2961,7 @@ fn render_what_now(frame: &mut Frame, area: Rect) {
             lines: vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  What now: https://zeroclawlabs.ai/showcase",
+                    "  What now: https://www.zeroclawlabs.ai/showcase",
                     theme::body_style(),
                 )),
                 Line::from(Span::styled(
