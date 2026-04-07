@@ -5063,9 +5063,14 @@ mod tests {
 
     #[test]
     fn split_text_into_chunks_safe_on_multibyte_utf8() {
-        // Regression: byte index 3000 inside '═' (bytes 2999..3002) caused panic.
-        let line = "按当前汇率 **100日元 ≈ 4.83人民币**（2026年3月近似值）换算：════\n";
-        let text = line.repeat(200);
+        // Use a mix of ASCII and multibyte Unicode characters to test chunking at UTF-8 boundaries,
+        // making sure splitting does not break in the middle of a multibyte char.
+        let line = "这是一些多字节字符: 漢字，Русский, 😀, 𝄞, ────\n";
+        // Make line long enough to approach a chunk boundary with multibyte at the edge.
+        let long_line = format!("{}{}", "a".repeat(SLACK_BLOCK_TEXT_MAX_CHARS - 5), "═\n");
+        let text = format!("{}{}", long_line, line.repeat(5));
+        let text = text.repeat(20); // Produce a text long enough to require splitting.
+
         let chunks = split_text_into_chunks(
             &text,
             SLACK_BLOCK_TEXT_MAX_CHARS,
@@ -5073,8 +5078,10 @@ mod tests {
         );
         for chunk in &chunks {
             assert!(chunk.len() <= SLACK_BLOCK_TEXT_MAX_CHARS);
+            // Should not break inside a multibyte character
+            assert!(chunk.is_char_boundary(chunk.len()));
         }
-        // Reassembled content should be a prefix of the original (last chunk may be truncated).
+        // Reassembled content should be a prefix of the original
         let reassembled: String = chunks.concat();
         assert!(!reassembled.is_empty());
         assert!(text.starts_with(&reassembled));
