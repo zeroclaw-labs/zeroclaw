@@ -1189,7 +1189,9 @@ impl DelegateTool {
         }
         history.push(ChatMessage::user(full_prompt.to_string()));
 
-        let noop_observer = SubagentObserver { agent_name: agent_name.to_string() };
+        let noop_observer = SubagentObserver {
+            agent_name: agent_name.to_string(),
+        };
 
         let agentic_timeout_secs = agent_config
             .agentic_timeout_secs
@@ -1299,7 +1301,11 @@ impl Observer for SubagentObserver {
             ObserverEvent::ToolCallStart { tool, .. } => {
                 tracing::info!(agent = %self.agent_name, tool = %tool, "▶ [subagent] tool start");
             }
-            ObserverEvent::ToolCall { tool, duration, success } => {
+            ObserverEvent::ToolCall {
+                tool,
+                duration,
+                success,
+            } => {
                 tracing::info!(
                     agent = %self.agent_name,
                     tool = %tool,
@@ -1308,7 +1314,11 @@ impl Observer for SubagentObserver {
                     "◀ [subagent] tool done"
                 );
             }
-            ObserverEvent::LlmRequest { provider, model, messages_count } => {
+            ObserverEvent::LlmRequest {
+                provider,
+                model,
+                messages_count,
+            } => {
                 tracing::info!(
                     agent = %self.agent_name,
                     provider = %provider,
@@ -1317,7 +1327,12 @@ impl Observer for SubagentObserver {
                     "🔄 [subagent] LLM request"
                 );
             }
-            ObserverEvent::LlmResponse { duration, success, error_message, .. } => {
+            ObserverEvent::LlmResponse {
+                duration,
+                success,
+                error_message,
+                ..
+            } => {
                 if *success {
                     tracing::info!(
                         agent = %self.agent_name,

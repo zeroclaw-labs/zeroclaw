@@ -259,7 +259,9 @@ impl SpawnAgentTool {
         }
         history.push(ChatMessage::user(full_prompt.to_string()));
 
-        let noop_observer = SubagentObserver { agent_name: name.to_string() };
+        let noop_observer = SubagentObserver {
+            agent_name: name.to_string(),
+        };
         let temperature = agent_config.temperature.unwrap_or(0.7);
 
         let agentic_timeout_secs = agent_config
@@ -771,7 +773,11 @@ impl Observer for SubagentObserver {
                     "◀ [subagent] tool done"
                 );
             }
-            ObserverEvent::LlmRequest { provider, model, messages_count } => {
+            ObserverEvent::LlmRequest {
+                provider,
+                model,
+                messages_count,
+            } => {
                 tracing::info!(
                     agent = %self.agent_name,
                     provider = %provider,
@@ -780,7 +786,12 @@ impl Observer for SubagentObserver {
                     "🔄 [subagent] LLM request"
                 );
             }
-            ObserverEvent::LlmResponse { duration, success, error_message, .. } => {
+            ObserverEvent::LlmResponse {
+                duration,
+                success,
+                error_message,
+                ..
+            } => {
                 if *success {
                     tracing::info!(
                         agent = %self.agent_name,
