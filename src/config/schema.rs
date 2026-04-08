@@ -10959,6 +10959,7 @@ async fn sync_directory(path: &Path) -> Result<()> {
 
     #[cfg(windows)]
     {
+        use std::io::ErrorKind;
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
         let dir = std::fs::OpenOptions::new()
@@ -10971,7 +10972,11 @@ async fn sync_directory(path: &Path) -> Result<()> {
         // flushing directory metadata the same way Unix does. The individual
         // files have already been synced, so it is safe to ignore this error.
         if let Err(e) = dir.sync_all() {
-            if e.raw_os_error() == Some(5) {
+            // Check both raw OS error code and ErrorKind to handle all
+            // permission denied scenarios on Windows
+            let is_access_denied =
+                e.raw_os_error() == Some(5) || e.kind() == ErrorKind::PermissionDenied;
+            if is_access_denied {
                 tracing::trace!(
                     "Ignoring expected ACCESS_DENIED when fsyncing directory on Windows: {}",
                     path.display()
