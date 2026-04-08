@@ -1,5 +1,6 @@
 [workspace]
 members = [".", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri"]
+exclude = ["fuzz"]
 resolver = "2"
 
 [package]
