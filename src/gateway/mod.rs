@@ -7,6 +7,7 @@
 //! - Request timeouts (300s global, matching chat endpoint timeout)
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod admin_api;
 pub mod api;
 pub mod auth_api;
 pub mod channel_router;
@@ -1233,6 +1234,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 .put(api::handle_api_admin_pricing_upsert)
                 .delete(api::handle_api_admin_pricing_delete),
         )
+        // ── Admin Dashboard ──
+        .nest("/api/admin/dashboard", admin_api::admin_router())
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
         .route("/api/node-control", post(handle_node_control))
@@ -1277,6 +1280,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/auth/register", post(auth_api::handle_auth_register))
         .route("/api/auth/login", post(auth_api::handle_auth_login))
         .route("/api/auth/logout", post(auth_api::handle_auth_logout))
+        .route(
+            "/api/auth/set-password",
+            post(auth_api::handle_auth_set_password),
+        )
+        .route("/api/user/profile", get(auth_api::handle_user_profile))
+        .route(
+            "/api/user/channels",
+            get(auth_api::handle_user_channels),
+        )
         .route("/api/auth/devices", get(auth_api::handle_auth_devices_list))
         .route(
             "/api/auth/devices",

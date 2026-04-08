@@ -35,11 +35,22 @@ pub struct SyncCoordinator {
     order_buffer: Mutex<OrderBuffer>,
     /// Batch size for sync responses.
     batch_size: usize,
+    /// Optional ontology repo for cross-device knowledge graph sync.
+    ontology: Option<crate::ontology::OntologyRepo>,
 }
 
 impl SyncCoordinator {
     /// Create a new coordinator for the given synced memory.
     pub fn new(memory: Arc<SyncedMemory>, batch_size: usize) -> Self {
+        Self::with_ontology(memory, batch_size, None)
+    }
+
+    /// Create coordinator with optional ontology repo for cross-device sync.
+    pub fn with_ontology(
+        memory: Arc<SyncedMemory>,
+        batch_size: usize,
+        ontology: Option<crate::ontology::OntologyRepo>,
+    ) -> Self {
         let mut order_buffer = OrderBuffer::new();
         order_buffer.init_from_version_vector(&memory.version());
 
@@ -47,6 +58,7 @@ impl SyncCoordinator {
             memory,
             order_buffer: Mutex::new(order_buffer),
             batch_size,
+            ontology,
         }
     }
 
@@ -239,7 +251,10 @@ impl SyncCoordinator {
             return Vec::new();
         }
 
-        let applied = self.memory.apply_remote_deltas(ready_deltas).await;
+        let applied = self
+            .memory
+            .apply_remote_deltas(ready_deltas, self.ontology.as_ref())
+            .await;
 
         // Send ack
         let last_seq = self.version().get(from_device_id);
@@ -441,7 +456,10 @@ impl SyncCoordinator {
         match self.memory.decrypt_payload(&payload) {
             Ok(deltas) => {
                 let count = deltas.len();
-                let applied = self.memory.apply_remote_deltas(deltas).await;
+                let applied = self
+                    .memory
+                    .apply_remote_deltas(deltas, self.ontology.as_ref())
+                    .await;
                 tracing::info!(
                     from = %from_device_id,
                     entity_id,
@@ -512,6 +530,21 @@ impl SyncCoordinator {
     /// Periodic maintenance: prune old journal entries.
     pub fn prune_journal(&self) {
         self.memory.prune_journal();
+    }
+
+    /// Spawn a background maintenance loop that periodically prunes the
+    /// sync journal (every 6 hours) to prevent unbounded SQLite growth.
+    pub fn spawn_maintenance_loop(coordinator: Arc<parking_lot::Mutex<Self>>) {
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            interval.tick().await; // skip first immediate tick
+            loop {
+                interval.tick().await;
+                coordinator.lock().prune_journal();
+                tracing::info!("Sync: periodic journal prune completed");
+            }
+        });
     }
 }
 

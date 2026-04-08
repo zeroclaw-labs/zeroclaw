@@ -295,7 +295,9 @@ pub struct RemoteLoginRequest {
     pub username: String,
     pub password: String,
     pub device_id: String,
-    pub pairing_code: String,
+    /// Optional — only required if the user has set a pairing code on the device.
+    #[serde(default)]
+    pub pairing_code: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -404,30 +406,48 @@ pub async fn handle_remote_login(
         }
     };
 
-    // 3. Verify device pairing code
-    match auth_store.verify_device_pairing_code(&body.device_id, &body.pairing_code) {
-        Ok(true) => {} // Pairing code valid
-        Ok(false) => {
-            device_router.record_login_failure(&client_key);
+    // 3. Verify device pairing code (only if the user has set one)
+    let has_pairing_code = auth_store
+        .device_has_pairing_code(&body.device_id)
+        .unwrap_or(false);
+
+    if has_pairing_code {
+        let code = body.pairing_code.as_deref().unwrap_or("");
+        if code.is_empty() {
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
-                    "error": "Invalid device pairing code"
+                    "error": "이 디바이스에는 페어링 코드가 설정되어 있습니다. 코드를 입력해 주세요.",
+                    "requires_pairing_code": true
                 })),
             )
                 .into_response();
         }
-        Err(e) => {
-            tracing::error!("Failed to verify pairing code: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "Failed to verify pairing code"
-                })),
-            )
-                .into_response();
+        match auth_store.verify_device_pairing_code(&body.device_id, code) {
+            Ok(true) => {} // Valid
+            Ok(false) => {
+                device_router.record_login_failure(&client_key);
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": "페어링 코드가 올바르지 않습니다."
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                tracing::error!("Failed to verify pairing code: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "페어링 코드 확인 중 문제가 발생했습니다."
+                    })),
+                )
+                    .into_response();
+            }
         }
     }
+    // If no pairing code is set → skip verification (email auth is still enforced)
 
     // 4. Check if email verification is required
     if let Some(ref email_svc) = state.email_verify_service {
@@ -796,6 +816,9 @@ async fn handle_remote_socket(
         }
     });
 
+    // Track message IDs from this session for cleanup on disconnect
+    let mut session_msg_ids: Vec<String> = Vec::new();
+
     // Main loop: handle both inbound messages and outbound sends
     loop {
         tokio::select! {
@@ -848,6 +871,7 @@ async fn handle_remote_socket(
                 REMOTE_RESPONSE_CHANNELS
                     .lock()
                     .insert(msg_id.clone(), response_tx.clone());
+                session_msg_ids.push(msg_id.clone());
 
                 // Route to device
                 if let Err(e) = device_router.send_to_device(&device_id, routed_msg).await {
@@ -877,9 +901,14 @@ async fn handle_remote_socket(
         }
     }
 
-    // Cleanup
+    // Cleanup: remove orphaned response channels from this session
     response_relay.abort();
-    REMOTE_RESPONSE_CHANNELS.lock().retain(|_, _| true); // Cleanup handled by Drop
+    {
+        let mut channels = REMOTE_RESPONSE_CHANNELS.lock();
+        for id in &session_msg_ids {
+            channels.remove(id);
+        }
+    }
 
     tracing::info!(
         device_id = %device_id,

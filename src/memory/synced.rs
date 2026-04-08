@@ -9,6 +9,7 @@
 
 use crate::memory::sync::{DeltaEntry, DeltaOperation, SyncEngine, SyncPayload, VersionVector};
 use crate::memory::traits::{Memory, MemoryCategory, MemoryEntry};
+use crate::ontology::OntologyRepo;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -39,10 +40,17 @@ impl SyncedMemory {
     }
 
     /// Apply delta operations received from a remote device to the local
-    /// memory backend.  Returns the number of operations successfully applied.
+    /// memory backend and ontology repo.  Returns the number of operations
+    /// successfully applied.
     ///
     /// This is the inbound path: peer sends deltas → we apply them locally.
-    pub async fn apply_remote_deltas(&self, deltas: Vec<DeltaEntry>) -> usize {
+    /// If `ontology` is provided, ontology deltas (object upsert, link create,
+    /// action log) are also applied — enabling cross-device knowledge graph sync.
+    pub async fn apply_remote_deltas(
+        &self,
+        deltas: Vec<DeltaEntry>,
+        ontology: Option<&OntologyRepo>,
+    ) -> usize {
         // Let the sync engine filter duplicates / already-seen entries.
         let ops = {
             let mut engine = self.sync.lock();
@@ -74,15 +82,60 @@ impl SyncedMemory {
                         tracing::warn!(key, "Failed to apply remote forget delta: {e}");
                     }
                 },
-                // Ontology deltas are applied by the ontology layer, not the
-                // memory layer. They are carried in the journal for cross-device
-                // transport but processed separately.
-                DeltaOperation::OntologyObjectUpsert { .. }
-                | DeltaOperation::OntologyLinkCreate { .. }
-                | DeltaOperation::OntologyActionLog { .. } => {
-                    tracing::debug!(
-                        "Skipping ontology delta in memory apply (handled by ontology layer)"
-                    );
+                // ── Ontology sync: apply object/link/action deltas ──
+                DeltaOperation::OntologyObjectUpsert {
+                    type_name,
+                    title,
+                    properties_json,
+                    owner_user_id,
+                    ..
+                } => {
+                    if let Some(repo) = ontology {
+                        let props: serde_json::Value =
+                            serde_json::from_str(properties_json).unwrap_or_default();
+                        let title_str = title.as_deref().unwrap_or("(untitled)");
+                        match repo.ensure_object(
+                            type_name,
+                            title_str,
+                            &props,
+                            owner_user_id,
+                        ) {
+                            Ok(_) => {
+                                tracing::debug!(type_name, "Applied remote ontology object");
+                                applied += 1;
+                            }
+                            Err(e) => tracing::warn!("Failed to apply ontology object: {e}"),
+                        }
+                    }
+                }
+                DeltaOperation::OntologyLinkCreate {
+                    link_type_name,
+                    from_object_id,
+                    to_object_id,
+                    properties_json,
+                } => {
+                    if let Some(repo) = ontology {
+                        let props = properties_json
+                            .as_ref()
+                            .and_then(|s| serde_json::from_str(s).ok());
+                        match repo.create_link(
+                            link_type_name,
+                            *from_object_id,
+                            *to_object_id,
+                            props.as_ref(),
+                        ) {
+                            Ok(_) => {
+                                tracing::debug!(link_type_name, "Applied remote ontology link");
+                                applied += 1;
+                            }
+                            Err(e) => tracing::warn!("Failed to apply ontology link: {e}"),
+                        }
+                    }
+                }
+                DeltaOperation::OntologyActionLog { .. } => {
+                    // Action logs are read-only replications — we don't replay
+                    // actions on remote devices, just acknowledge them.
+                    tracing::debug!("Received remote ontology action log (read-only)");
                 }
             }
         }
@@ -191,8 +244,12 @@ impl SyncedMemory {
     }
 
     /// Import entries received during Layer 3 full sync.
-    pub async fn import_full_sync_entries(&self, entries: Vec<DeltaEntry>) -> usize {
-        self.apply_remote_deltas(entries).await
+    pub async fn import_full_sync_entries(
+        &self,
+        entries: Vec<DeltaEntry>,
+        ontology: Option<&OntologyRepo>,
+    ) -> usize {
+        self.apply_remote_deltas(entries, ontology).await
     }
 }
 
@@ -385,7 +442,7 @@ mod tests {
             timestamp: 9999,
         }];
 
-        let applied = synced.apply_remote_deltas(remote_deltas).await;
+        let applied = synced.apply_remote_deltas(remote_deltas, None).await;
         assert_eq!(applied, 1);
 
         let entry = mem.get("remote_key").await.unwrap();
@@ -416,7 +473,7 @@ mod tests {
             timestamp: 9999,
         }];
 
-        let applied = synced.apply_remote_deltas(remote_deltas).await;
+        let applied = synced.apply_remote_deltas(remote_deltas, None).await;
         assert_eq!(applied, 1);
 
         assert!(mem.get("to_delete").await.unwrap().is_none());
@@ -442,10 +499,10 @@ mod tests {
             timestamp: 9999,
         };
 
-        let applied1 = synced.apply_remote_deltas(vec![delta.clone()]).await;
+        let applied1 = synced.apply_remote_deltas(vec![delta.clone()], None).await;
         assert_eq!(applied1, 1);
 
-        let applied2 = synced.apply_remote_deltas(vec![delta]).await;
+        let applied2 = synced.apply_remote_deltas(vec![delta], None).await;
         assert_eq!(applied2, 0); // duplicate — already seen
     }
 
@@ -482,7 +539,7 @@ mod tests {
         let deltas = synced_a.decrypt_payload(&payload).unwrap();
         // For this test, B needs same key — simulate shared key by using A's engine
         // In production, all devices share the same .sync_key file
-        let applied = synced_b.apply_remote_deltas(deltas).await;
+        let applied = synced_b.apply_remote_deltas(deltas, None).await;
         assert_eq!(applied, 1);
 
         // Device B now has the data

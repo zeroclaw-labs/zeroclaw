@@ -254,6 +254,21 @@ export default function ChatPage() {
   const handleSend = () => {
     const trimmed = input.trim();
     if (!trimmed || !wsRef.current?.connected) return;
+
+    // Warn if selected device is offline
+    if (selectedDeviceId && devices.length > 0) {
+      const targetDevice = devices.find((d) => d.device_id === selectedDeviceId);
+      if (targetDevice && !targetDevice.is_online) {
+        setMessages((prev) => [...prev, {
+          id: makeMessageId(),
+          role: 'assistant',
+          content: `'${targetDevice.device_name}' 디바이스에 연결할 수 없습니다.\n\nMoA 앱이 실행 중인지 확인해 주세요.\n다른 디바이스를 선택하거나, 디바이스를 켠 후 다시 시도해 주세요.`,
+          timestamp: new Date(),
+        }]);
+        return;
+      }
+    }
+
     const detected = detectLang(trimmed);
     if (detected !== chatLang) setChatLang(detected);
     setMessages((prev) => [...prev, { id: makeMessageId(), role: 'user', content: trimmed, timestamp: new Date() }]);
@@ -264,7 +279,7 @@ export default function ChatPage() {
       setTyping(true);
       pendingContentRef.current = '';
     } catch {
-      setError('Failed to send message. Please try again.');
+      setError('메시지를 보내지 못했습니다. 다시 시도해 주세요.');
     }
     setInput('');
     inputRef.current?.focus();
