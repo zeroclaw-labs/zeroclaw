@@ -2312,7 +2312,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_error_for_log_scrubs_secret_prefixes() {
+    fn sanitize_error_for_log_scrubs_prefixes() {
         let sanitized = MatrixChannel::sanitize_error_for_log(&"auth failed: sk-proj-abc123xyz");
         assert!(!sanitized.contains("sk-proj-abc123xyz"));
         assert!(sanitized.contains("[REDACTED]"));

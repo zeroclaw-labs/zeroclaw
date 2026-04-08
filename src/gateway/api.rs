@@ -1753,6 +1753,7 @@ mod tests {
         });
         cfg.memory.qdrant.api_key = Some("qdrant-key".to_string());
         cfg.channels_config.wati = Some(crate::config::schema::WatiConfig {
+            enabled: true,
             api_token: "wati-token".to_string(),
             api_url: "https://live-mt-server.wati.io".to_string(),
             tenant_id: None,
@@ -1760,6 +1761,7 @@ mod tests {
             proxy_url: None,
         });
         cfg.channels_config.feishu = Some(crate::config::schema::FeishuConfig {
+            enabled: true,
             app_id: "cli_aabbcc".to_string(),
             app_secret: "feishu-secret".to_string(),
             encrypt_key: Some("feishu-encrypt".to_string()),
@@ -1890,6 +1892,7 @@ mod tests {
         });
         current.memory.qdrant.api_key = Some("qdrant-real".to_string());
         current.channels_config.wati = Some(crate::config::schema::WatiConfig {
+            enabled: true,
             api_token: "wati-real".to_string(),
             api_url: "https://live-mt-server.wati.io".to_string(),
             tenant_id: None,
@@ -1897,6 +1900,7 @@ mod tests {
             proxy_url: None,
         });
         current.channels_config.feishu = Some(crate::config::schema::FeishuConfig {
+            enabled: true,
             app_id: "cli_current".to_string(),
             app_secret: "feishu-secret-real".to_string(),
             encrypt_key: Some("feishu-encrypt-real".to_string()),

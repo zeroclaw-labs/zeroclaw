@@ -1,10 +1,10 @@
 [workspace]
-members = [".", "crates/robot-kit", "crates/aardvark-sys", "apps/tauri"]
+members = [".", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri"]
 resolver = "2"
 
 [package]
 name = "zeroclawlabs"
-version = "0.6.8"
+version = "0.6.9"
 edition = "2024"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
@@ -34,6 +34,8 @@ name = "zeroclaw"
 path = "src/lib.rs"
 
 [dependencies]
+# Internal proc macros
+zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.1.0" }
 # CLI - minimal and fast
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
@@ -240,7 +242,7 @@ landlock = { version = "0.4", optional = true }
 libc = "0.2"
 
 [features]
-default = ["observability-prometheus", "skill-creation"]
+default = ["observability-prometheus", "skill-creation", "channel-lark"]
 channel-nostr = ["dep:nostr-sdk"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]

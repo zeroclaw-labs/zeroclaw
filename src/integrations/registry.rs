@@ -834,6 +834,7 @@ mod tests {
     fn telegram_active_when_configured() {
         let mut config = Config::default();
         config.channels_config.telegram = Some(TelegramConfig {
+            enabled: true,
             bot_token: "123:ABC".into(),
             allowed_users: vec!["user".into()],
             stream_mode: StreamMode::default(),
@@ -863,6 +864,7 @@ mod tests {
     fn imessage_active_when_configured() {
         let mut config = Config::default();
         config.channels_config.imessage = Some(IMessageConfig {
+            enabled: true,
             allowed_contacts: vec!["*".into()],
         });
         let entries = all_integrations();
@@ -885,6 +887,7 @@ mod tests {
     fn matrix_active_when_configured() {
         let mut config = Config::default();
         config.channels_config.matrix = Some(MatrixConfig {
+            enabled: true,
             homeserver: "https://m.org".into(),
             access_token: "tok".into(),
             user_id: None,
