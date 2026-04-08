@@ -2077,6 +2077,28 @@ async fn classify_channel_reply_intent(
     Ok(AssistantChannelOutcome::Reply(String::new()))
 }
 
+/// Strip `<think>...</think>` blocks from streaming draft text so reasoning
+/// tokens are never shown to the user in partial updates.
+fn strip_think_tags_inline(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        if let Some(start) = rest.find("<think>") {
+            result.push_str(&rest[..start]);
+            if let Some(end) = rest[start..].find("</think>") {
+                rest = &rest[start + end + "</think>".len()..];
+            } else {
+                // Unclosed tag: drop the tail to avoid leaking partial reasoning.
+                break;
+            }
+        } else {
+            result.push_str(rest);
+            break;
+        }
+    }
+    result.trim().to_string()
+}
+
 fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
@@ -2881,8 +2903,9 @@ async fn process_channel_message(
                             accumulated.clear();
                         }
                         DraftEvent::Progress(text) => {
+                            let visible = strip_think_tags_inline(&text);
                             if let Err(e) = channel
-                                .update_draft_progress(&reply_target, &draft_id, &text)
+                                .update_draft_progress(&reply_target, &draft_id, &visible)
                                 .await
                             {
                                 tracing::debug!("Draft progress update failed: {e}");
@@ -2890,8 +2913,9 @@ async fn process_channel_message(
                         }
                         DraftEvent::Content(text) => {
                             accumulated.push_str(&text);
+                            let visible = strip_think_tags_inline(&accumulated);
                             if let Err(e) = channel
-                                .update_draft(&reply_target, &draft_id, &accumulated)
+                                .update_draft(&reply_target, &draft_id, &visible)
                                 .await
                             {
                                 tracing::debug!("Draft update failed: {e}");
@@ -11643,6 +11667,38 @@ This is an example JSON object for profile settings."#;
         let result = sanitize_channel_response(clean_text, &tools);
 
         assert_eq!(result, clean_text);
+    }
+
+    // ── Tests for strip_think_tags_inline (streaming draft sanitization) ──
+
+    #[test]
+    fn strip_think_tags_inline_removes_single_block() {
+        assert_eq!(strip_think_tags_inline("<think>reasoning</think>Hello"), "Hello");
+    }
+
+    #[test]
+    fn strip_think_tags_inline_removes_multiple_blocks() {
+        assert_eq!(strip_think_tags_inline("<think>a</think>X<think>b</think>Y"), "XY");
+    }
+
+    #[test]
+    fn strip_think_tags_inline_handles_unclosed_block() {
+        assert_eq!(strip_think_tags_inline("visible<think>hidden tail"), "visible");
+    }
+
+    #[test]
+    fn strip_think_tags_inline_preserves_text_without_tags() {
+        assert_eq!(strip_think_tags_inline("plain text"), "plain text");
+    }
+
+    #[test]
+    fn strip_think_tags_inline_handles_empty_string() {
+        assert_eq!(strip_think_tags_inline(""), "");
+    }
+
+    #[test]
+    fn strip_think_tags_inline_strips_surrounding_whitespace() {
+        assert_eq!(strip_think_tags_inline("<think>hidden</think>  Answer  "), "Answer");
     }
 
     // ── Tests for #4827: tool context preservation ──────────────
