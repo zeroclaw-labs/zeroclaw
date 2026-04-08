@@ -1,10 +1,11 @@
 //! LLM presentation layer for tool output.
 //!
 //! Sits between tool execution and LLM-facing result formatting.
-//! Applies three transformations:
+//! Applies four transformations:
 //! 1. Strip ANSI escape codes (prevents garbage tokens)
-//! 2. Overflow handling (truncate + save to file + exploration hints)
-//! 3. Metadata footer (exit code or ok/err + duration)
+//! 2. Flatten JSON responses to pipe-delimited plain text (Gemma 4 compat)
+//! 3. Overflow handling (truncate + save to file + exploration hints)
+//! 4. Metadata footer (exit code or ok/err + duration)
 
 use std::fs;
 use std::path::PathBuf;
@@ -89,12 +90,101 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
+/// Maximum nesting depth for JSON flattening. Deeper values are stringified.
+const FLATTEN_MAX_DEPTH: usize = 2;
+
+/// Flatten a JSON object/array to pipe-delimited `key=value` plain text.
+///
+/// Returns the input unchanged if it doesn't parse as JSON.
+/// Objects become `key=value | key=value`. Nested objects use dot notation
+/// up to `FLATTEN_MAX_DEPTH`. Arrays of objects become one line per element.
+///
+/// CRITICAL: output must never contain `{`, `}`, or `"` — these collide with
+/// Gemma 4's native `response:name{key:value}` and `<|"|>` token syntax.
+pub fn flatten_json_output(output: &str) -> String {
+    let trimmed = output.trim();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return output.to_string();
+    };
+
+    match &value {
+        serde_json::Value::Object(map) if map.is_empty() => "(empty)".to_string(),
+        serde_json::Value::Object(map) => flatten_object(map, "", 0),
+        serde_json::Value::Array(arr) if arr.is_empty() => "(empty list)".to_string(),
+        serde_json::Value::Array(arr) => {
+            arr.iter()
+                .enumerate()
+                .map(|(i, v)| match v {
+                    serde_json::Value::Object(map) => {
+                        format!("[{i}] {}", flatten_object(map, "", 0))
+                    }
+                    other => format!("[{i}] {}", format_value(other)),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        other => format_value(other),
+    }
+}
+
+fn flatten_object(
+    map: &serde_json::Map<String, serde_json::Value>,
+    prefix: &str,
+    depth: usize,
+) -> String {
+    let mut parts = Vec::new();
+    for (key, value) in map {
+        let full_key = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match value {
+            serde_json::Value::Object(inner) if depth < FLATTEN_MAX_DEPTH => {
+                parts.push(flatten_object(inner, &full_key, depth + 1));
+            }
+            other => {
+                parts.push(format!("{full_key}={}", format_value(other)));
+            }
+        }
+    }
+    parts.join(" | ")
+}
+
+/// Format a JSON value as Gemma 4-safe plain text.
+///
+/// CRITICAL: output must never contain `{`, `}`, `:` as structural
+/// separators, or `"` around values — these collide with Gemma 4's
+/// native `response:name{key:value}` and `<|"|>` token syntax.
+fn format_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(format_value).collect();
+            format!("[{}]", items.join(", "))
+        }
+        serde_json::Value::Object(map) => {
+            // Beyond max depth — flatten to key=value pairs inline
+            // Do NOT use v.to_string() which produces JSON with {, }, :, "
+            let pairs: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{k}={}", format_value(v)))
+                .collect();
+            format!("({})", pairs.join(", "))
+        }
+    }
+}
+
 /// Process tool output for LLM consumption.
 ///
-/// Applies three transformations in order:
+/// Applies four transformations in order:
 /// 1. Strip ANSI escape codes (prevents garbage tokens)
-/// 2. Overflow handling (truncate + save to file + exploration hints)
-/// 3. Metadata footer (exit code or ok/err + duration)
+/// 2. Flatten JSON responses to pipe-delimited plain text (Gemma 4 compat)
+/// 3. Overflow handling (truncate + save to file + exploration hints)
+/// 4. Metadata footer (exit code or ok/err + duration)
 pub fn present_for_llm(
     output: &str,
     tool_name: &str,
@@ -109,10 +199,15 @@ pub fn present_for_llm(
         result = strip_ansi(&result);
     }
 
-    // Step 2: Overflow handling
+    // Step 2: Flatten JSON responses to pipe-delimited plain text
+    if config.flatten_json_responses {
+        result = flatten_json_output(&result);
+    }
+
+    // Step 3: Overflow handling
     result = handle_overflow(&result, config);
 
-    // Step 3: Metadata footer
+    // Step 4: Metadata footer
     if config.show_metadata {
         let dur = format_duration(duration);
         let status = if SHELL_LIKE_TOOLS.contains(&tool_name) {
@@ -324,5 +419,139 @@ mod tests {
         assert!(!result.contains("\x1b")); // no raw escapes
         assert!(result.contains("truncated")); // overflow triggered
         assert!(result.contains("[exit:0 | 10ms]")); // metadata
+    }
+
+    // ── JSON flattening tests ──
+
+    #[test]
+    fn flatten_json_simple_object() {
+        let input = r#"{"name": "speakr-daily-summary", "schedule": "0 12 * * *", "enabled": true}"#;
+        let result = flatten_json_output(input);
+        assert!(result.contains("name=speakr-daily-summary"));
+        assert!(result.contains("schedule=0 12 * * *"));
+        assert!(result.contains("enabled=true"));
+        assert!(result.contains(" | "));
+    }
+
+    #[test]
+    fn flatten_json_nested_object() {
+        let input = r#"{"job": {"id": "abc-123", "status": "ok"}, "count": 3}"#;
+        let result = flatten_json_output(input);
+        assert!(result.contains("job.id=abc-123"));
+        assert!(result.contains("job.status=ok"));
+        assert!(result.contains("count=3"));
+    }
+
+    #[test]
+    fn flatten_json_array_of_objects() {
+        let input = r#"[{"name": "job1", "status": "ok"}, {"name": "job2", "status": "err"}]"#;
+        let result = flatten_json_output(input);
+        assert!(result.contains("[0] name=job1 | status=ok"));
+        assert!(result.contains("[1] name=job2 | status=err"));
+    }
+
+    #[test]
+    fn flatten_json_not_json_passthrough() {
+        let input = "This is plain text output, not JSON.";
+        let result = flatten_json_output(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn flatten_json_empty_object() {
+        let input = "{}";
+        let result = flatten_json_output(input);
+        assert_eq!(result, "(empty)");
+    }
+
+    #[test]
+    fn flatten_json_null_values() {
+        let input = r#"{"name": "test", "value": null}"#;
+        let result = flatten_json_output(input);
+        assert!(result.contains("name=test"));
+        assert!(result.contains("value=null"));
+    }
+
+    #[test]
+    fn flatten_json_deeply_nested_uses_parens() {
+        // 3 levels of nesting: depth 0 -> a, depth 1 -> b, depth 2 -> c is object
+        // At depth 2, c exceeds FLATTEN_MAX_DEPTH so format_value produces parens
+        let input = r#"{"a": {"b": {"c": {"d": "deep"}}}}"#;
+        let result = flatten_json_output(input);
+        assert!(result.contains("a.b.c=(d=deep)"));
+        assert!(!result.contains('{'));
+        assert!(!result.contains('}'));
+        assert!(!result.contains('"'));
+    }
+
+    #[test]
+    fn flatten_json_output_never_contains_json_syntax() {
+        let inputs = vec![
+            r#"{"simple": "value"}"#,
+            r#"{"nested": {"deep": {"deeper": "val"}}}"#,
+            r#"[{"a": 1}, {"b": {"c": 2}}]"#,
+            r#"{"arr": [1, 2, 3], "obj": {"k": "v"}}"#,
+        ];
+        for input in inputs {
+            let result = flatten_json_output(input);
+            assert!(!result.contains('{'), "contains {{ for: {input}\ngot: {result}");
+            assert!(!result.contains('}'), "contains }} for: {input}\ngot: {result}");
+            assert!(!result.contains('"'), "contains \" for: {input}\ngot: {result}");
+        }
+    }
+
+    #[test]
+    fn present_for_llm_flattens_json_when_enabled() {
+        let config = PresentationConfig {
+            flatten_json_responses: true,
+            ..Default::default()
+        };
+        let json_input = r#"{"status": "ok", "count": 5}"#;
+        let result = present_for_llm(json_input, "cron_list", true, Duration::from_millis(10), &config);
+        assert!(result.contains("status=ok"));
+        assert!(result.contains("count=5"));
+        assert!(!result.contains(r#""status""#));
+    }
+
+    #[test]
+    fn present_for_llm_skips_flatten_when_disabled() {
+        let config = PresentationConfig::default();
+        let json_input = r#"{"status": "ok", "count": 5}"#;
+        let result = present_for_llm(json_input, "cron_list", true, Duration::from_millis(10), &config);
+        assert!(result.contains(r#""status""#));
+    }
+
+    #[test]
+    fn flatten_realistic_cron_list_output() {
+        let input = r#"[
+  {
+    "id": "d4e5f6",
+    "name": "speakr-daily-summary",
+    "schedule": {"type": "cron", "expr": "0 12,17 * * 1-5", "tz": "America/Vancouver"},
+    "job_type": "agent",
+    "enabled": true,
+    "next_run": "2026-04-08T19:00:00Z"
+  },
+  {
+    "id": "a1b2c3",
+    "name": "morning-project-status",
+    "schedule": {"type": "cron", "expr": "0 8 * * 1-5", "tz": "America/Vancouver"},
+    "job_type": "agent",
+    "enabled": true,
+    "next_run": "2026-04-09T15:00:00Z"
+  }
+]"#;
+        let result = flatten_json_output(input);
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("[0]"));
+        assert!(lines[0].contains("name=speakr-daily-summary"));
+        assert!(lines[0].contains("schedule.expr=0 12,17 * * 1-5"));
+        assert!(lines[0].contains("enabled=true"));
+        assert!(lines[1].contains("[1]"));
+        assert!(lines[1].contains("name=morning-project-status"));
+        assert!(!result.contains('"'), "output contains quotes: {result}");
+        assert!(!result.contains('{'), "output contains open brace: {result}");
+        assert!(!result.contains('}'), "output contains close brace: {result}");
     }
 }
