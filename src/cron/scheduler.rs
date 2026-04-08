@@ -281,6 +281,8 @@ async fn run_agent_job(
     let prompt = job.prompt.clone().unwrap_or_default();
 
     // Recall relevant memories so cron jobs have context awareness.
+    // Exclude `Conversation` memories to prevent chat context from
+    // leaking into scheduled executions (see #5415).
     let memory_context = match crate::memory::create_memory(
         &config.memory,
         &config.workspace_dir,
@@ -290,10 +292,20 @@ async fn run_agent_job(
             Ok(entries) if !entries.is_empty() => {
                 let ctx: String = entries
                     .iter()
+                    .filter(|e| {
+                        !matches!(
+                            e.category,
+                            crate::memory::traits::MemoryCategory::Conversation
+                        )
+                    })
                     .map(|e| format!("- {}: {}", e.key, e.content))
                     .collect::<Vec<_>>()
                     .join("\n");
-                format!("[Memory context]\n{ctx}\n\n")
+                if ctx.is_empty() {
+                    String::new()
+                } else {
+                    format!("[Memory context]\n{ctx}\n\n")
+                }
             }
             _ => String::new(),
         },
@@ -403,26 +415,25 @@ fn is_one_shot_auto_delete(job: &CronJob) -> bool {
     job.delete_after_run && matches!(job.schedule, Schedule::At { .. })
 }
 
-fn warn_if_high_frequency_agent_job(job: &CronJob) {
+fn is_high_frequency_agent_job(job: &CronJob) -> bool {
     if !matches!(job.job_type, JobType::Agent) {
-        return;
+        return false;
     }
-    let too_frequent = match &job.schedule {
+    match &job.schedule {
         Schedule::Every { every_ms } => *every_ms < 5 * 60 * 1000,
         Schedule::Cron { .. } => {
             let now = Utc::now();
-            match (
-                next_run_for_schedule(&job.schedule, now),
-                next_run_for_schedule(&job.schedule, now + chrono::Duration::seconds(1)),
-            ) {
-                (Ok(a), Ok(b)) => (b - a).num_minutes() < 5,
-                _ => false,
-            }
+            next_run_for_schedule(&job.schedule, now)
+                .and_then(|a| next_run_for_schedule(&job.schedule, a).map(|b| (a, b)))
+                .map(|(a, b)| (b - a).num_minutes() < 5)
+                .unwrap_or(false)
         }
         Schedule::At { .. } => false,
-    };
+    }
+}
 
-    if too_frequent {
+fn warn_if_high_frequency_agent_job(job: &CronJob) {
+    if is_high_frequency_agent_job(job) {
         tracing::warn!(
             "Cron agent job '{}' is scheduled more frequently than every 5 minutes",
             job.id
@@ -832,6 +843,72 @@ mod tests {
 
     fn unique_component(prefix: &str) -> String {
         format!("{prefix}-{}", uuid::Uuid::new_v4())
+    }
+
+    fn agent_job_with_schedule(schedule: crate::cron::Schedule) -> CronJob {
+        CronJob {
+            job_type: JobType::Agent,
+            schedule,
+            ..test_job("echo test")
+        }
+    }
+
+    #[test]
+    fn high_frequency_daily_cron_is_not_flagged() {
+        // `0 6 * * *` fires once per day — must never warn regardless of when the check runs
+        let job = agent_job_with_schedule(crate::cron::Schedule::Cron {
+            expr: "0 6 * * *".into(),
+            tz: Some("America/Chicago".into()),
+        });
+        assert!(!is_high_frequency_agent_job(&job));
+    }
+
+    #[test]
+    fn high_frequency_every_4min_cron_is_flagged() {
+        let job = agent_job_with_schedule(crate::cron::Schedule::Cron {
+            expr: "*/4 * * * *".into(),
+            tz: None,
+        });
+        assert!(is_high_frequency_agent_job(&job));
+    }
+
+    #[test]
+    fn high_frequency_every_5min_cron_is_not_flagged() {
+        // Exactly 5 minutes is acceptable (threshold is strictly less than 5)
+        let job = agent_job_with_schedule(crate::cron::Schedule::Cron {
+            expr: "*/5 * * * *".into(),
+            tz: None,
+        });
+        assert!(!is_high_frequency_agent_job(&job));
+    }
+
+    #[test]
+    fn high_frequency_every_interval_below_threshold_is_flagged() {
+        let job = agent_job_with_schedule(crate::cron::Schedule::Every {
+            every_ms: 4 * 60 * 1000, // 4 minutes
+        });
+        assert!(is_high_frequency_agent_job(&job));
+    }
+
+    #[test]
+    fn high_frequency_every_interval_at_threshold_is_not_flagged() {
+        let job = agent_job_with_schedule(crate::cron::Schedule::Every {
+            every_ms: 5 * 60 * 1000, // exactly 5 minutes
+        });
+        assert!(!is_high_frequency_agent_job(&job));
+    }
+
+    #[test]
+    fn high_frequency_shell_job_is_never_flagged() {
+        // Shell jobs are exempt regardless of frequency
+        let job = CronJob {
+            job_type: JobType::Shell,
+            schedule: crate::cron::Schedule::Every {
+                every_ms: 60 * 1000, // 1 minute
+            },
+            ..test_job("echo test")
+        };
+        assert!(!is_high_frequency_agent_job(&job));
     }
 
     #[tokio::test]

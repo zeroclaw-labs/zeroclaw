@@ -5354,14 +5354,32 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     LarkReceiveMode::Webhook
                 };
 
-                let verification_token = if receive_mode == LarkReceiveMode::Webhook {
-                    let token: String = Input::new()
-                        .with_prompt("  Verification Token (optional, for Webhook mode)")
+                let existing_lk = config.lark.as_ref();
+
+                let encrypt_key = {
+                    let existing_ek = existing_lk.and_then(|l| l.encrypt_key.clone());
+                    let prompt_default = existing_ek.clone().unwrap_or_default();
+                    let ek: String = Input::new()
+                        .with_prompt("  Encrypt Key (optional, from Event Subscriptions page)")
+                        .default(prompt_default)
                         .allow_empty(true)
                         .interact_text()?;
-                    if token.is_empty() { None } else { Some(token) }
-                } else {
-                    None
+                    let ek = ek.trim().to_string();
+                    if ek.is_empty() { existing_ek } else { Some(ek) }
+                };
+
+                let verification_token = {
+                    let existing_vt = existing_lk.and_then(|l| l.verification_token.clone());
+                    let prompt_default = existing_vt.clone().unwrap_or_default();
+                    let vt: String = Input::new()
+                        .with_prompt(
+                            "  Verification Token (optional, from Event Subscriptions page)",
+                        )
+                        .default(prompt_default)
+                        .allow_empty(true)
+                        .interact_text()?;
+                    let vt = vt.trim().to_string();
+                    if vt.is_empty() { existing_vt } else { Some(vt) }
                 };
 
                 if receive_mode == LarkReceiveMode::Webhook && verification_token.is_none() {
@@ -5399,12 +5417,11 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     );
                 }
 
-                let existing_lk = config.lark.as_ref();
                 config.lark = Some(LarkConfig {
                     app_id,
                     app_secret,
                     verification_token,
-                    encrypt_key: existing_lk.and_then(|l| l.encrypt_key.clone()),
+                    encrypt_key,
                     allowed_users,
                     mention_only: existing_lk.map(|l| l.mention_only).unwrap_or(false),
                     use_feishu: is_feishu,

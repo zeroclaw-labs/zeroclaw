@@ -434,15 +434,27 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             let task_prompt = format!("[Heartbeat Task | {}] {}", task.priority, task.text);
 
             // Recall relevant memories so heartbeat tasks have context awareness.
+            // Exclude `Conversation` memories to prevent chat context from
+            // leaking into scheduled executions (see #5415).
             let memory_context = if let Some(ref mem) = heartbeat_memory {
                 match mem.recall(&task.text, 5, None, None, None).await {
                     Ok(entries) if !entries.is_empty() => {
                         let ctx: String = entries
                             .iter()
+                            .filter(|e| {
+                                !matches!(
+                                    e.category,
+                                    crate::memory::traits::MemoryCategory::Conversation
+                                )
+                            })
                             .map(|e| format!("- {}: {}", e.key, e.content))
                             .collect::<Vec<_>>()
                             .join("\n");
-                        Some(format!("[Memory context]\n{ctx}\n"))
+                        if ctx.is_empty() {
+                            None
+                        } else {
+                            Some(format!("[Memory context]\n{ctx}\n"))
+                        }
                     }
                     _ => None,
                 }
