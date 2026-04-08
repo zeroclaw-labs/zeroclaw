@@ -68,7 +68,7 @@
       "minSdkVersion": 24
     },
     "iOS": {
-      "developmentTeam": "",
+      "developmentTeam": "SIMULATOR",
       "minimumSystemVersion": "13.0"
     }
   },

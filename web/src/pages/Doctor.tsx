@@ -208,7 +208,7 @@ export default function Doctor() {
           <Stethoscope className="h-12 w-12 text-gray-600 mb-4" />
           <p className="text-lg font-medium">System Diagnostics</p>
           <p className="text-sm mt-1">
-            Click "Run Diagnostics" to check your ZeroClaw installation.
+            Click "Run Diagnostics" to check your MoA installation.
           </p>
         </div>
       )}

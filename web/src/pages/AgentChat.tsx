@@ -1118,7 +1118,7 @@ export default function AgentChat() {
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-gray-500">
             <Bot className="h-12 w-12 mb-3 text-gray-600" />
-            <p className="text-lg font-medium">ZeroClaw Agent</p>
+            <p className="text-lg font-medium">MoA Agent</p>
             <p className="text-sm mt-1">Send a message to start the conversation</p>
           </div>
         )}

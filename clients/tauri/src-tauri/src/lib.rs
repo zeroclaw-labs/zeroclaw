@@ -2531,11 +2531,13 @@ pub fn run() {
                                 .status();
                         }
                         // Close window and exit app
-                        let _ = win.destroy();
+                        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+                        { let _ = win.destroy(); }
                         std::process::exit(0);
                     } else {
                         // NO = 백그라운드 유지: hide window, keep zeroclaw running
-                        let _ = win.hide();
+                        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+                        { let _ = win.hide(); }
                     }
                 });
             }

@@ -385,11 +385,11 @@ function App() {
         // If greeting fails, show a placeholder welcome message
         const fallbackText = isFirstLogin
           ? (locale === "ko"
-            ? "안녕하세요. 저는 MoA입니다. 현재 서버 연결을 확인 중입니다. 잠시 후 다시 시도해주세요."
-            : "Hello. I'm MoA. The server connection is being established. Please try again shortly.")
+            ? "안녕하세요. 저는 MoA입니다.\n\n로컬 컴퓨터에 MoA 앱이 설치되어 있지 않아 서버에 연결할 수 없습니다.\n\n아래 링크에서 MoA 앱을 설치해주세요.\n🔗 https://mymoa.app"
+            : "Hello. I'm MoA.\n\nCannot connect to the server because MoA is not installed on your local computer.\n\nPlease install MoA from the link below.\n🔗 https://mymoa.app")
           : (locale === "ko"
-            ? "안녕하세요. 현재 서버 연결을 확인 중입니다."
-            : "Hello. Checking server connection...");
+            ? "서버에 연결할 수 없습니다. 로컬 컴퓨터에 MoA 앱을 설치해주세요.\n🔗 https://mymoa.app"
+            : "Cannot connect to server. Please install MoA on your local computer.\n🔗 https://mymoa.app");
         const fallbackMsg = createMessage("assistant", fallbackText);
 
         setChats((prev) =>

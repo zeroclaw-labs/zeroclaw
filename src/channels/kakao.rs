@@ -18,11 +18,13 @@ const KAKAO_MAX_TEXT_LEN: usize = 1000;
 /// KakaoTalk REST API base URL.
 const KAKAO_API_BASE: &str = "https://kapi.kakao.com";
 
-/// KakaoTalk Channel API base URL for sending messages.
-const KAKAO_CHANNEL_API: &str = "https://kapi.kakao.com/v1/api/talk/channels/message";
+/// KakaoTalk friends message API — send template messages to channel friends.
+/// Requires admin key (KakaoAK) and `talk_message` consent from receiver.
+const KAKAO_FRIENDS_MESSAGE_API: &str =
+    "https://kapi.kakao.com/v1/api/talk/friends/message/default/send";
 
-/// Alimtalk API base URL (Kakao notification templates).
-const KAKAO_ALIMTALK_API: &str = "https://kapi.kakao.com/v2/api/talk/memo/default/send";
+/// KakaoTalk memo API — send template messages to the token owner (나에게 보내기).
+const KAKAO_MEMO_API: &str = "https://kapi.kakao.com/v2/api/talk/memo/default/send";
 
 /// KakaoTalk channel — connects via webhook HTTP receiver for incoming messages,
 /// sends replies through Kakao REST API with support for rich message types.
@@ -144,11 +146,15 @@ impl KakaoTalkChannel {
         Ok(self.admin_key.clone())
     }
 
-    /// Send a text message to a specific user via KakaoTalk Channel API.
+    /// Send a text message to a specific user via KakaoTalk friends message API.
+    ///
+    /// Uses `application/x-www-form-urlencoded` content type as required by
+    /// the Kakao REST API. `receiver_uuids` and `template_object` are
+    /// JSON-serialized strings within the form body.
     async fn send_text_message(&self, user_id: &str, text: &str) -> anyhow::Result<()> {
         let token = self.get_access_token().await?;
 
-        let template = serde_json::json!({
+        let template_object = serde_json::json!({
             "object_type": "text",
             "text": text,
             "link": {
@@ -157,16 +163,16 @@ impl KakaoTalkChannel {
             }
         });
 
-        let body = serde_json::json!({
-            "receiver_uuids": [user_id],
-            "template_object": template
-        });
+        let receiver_uuids = serde_json::json!([user_id]);
 
         let resp = self
             .client
-            .post(KAKAO_CHANNEL_API)
+            .post(KAKAO_FRIENDS_MESSAGE_API)
             .header("Authorization", format!("KakaoAK {token}"))
-            .json(&body)
+            .form(&[
+                ("receiver_uuids", receiver_uuids.to_string()),
+                ("template_object", template_object.to_string()),
+            ])
             .send()
             .await?;
 
@@ -179,8 +185,13 @@ impl KakaoTalkChannel {
         Ok(())
     }
 
-    /// Send an Alimtalk template message (for business notifications).
-    async fn send_alimtalk(
+    /// Send a custom template message to channel friends via Kakao friends message API.
+    ///
+    /// This uses a registered custom template with `template_id` and fills in
+    /// the template arguments. Requires the template to be registered in
+    /// Kakao Developers console under 메시지 템플릿.
+    #[allow(dead_code)]
+    async fn send_template_message(
         &self,
         user_id: &str,
         template_id: &str,
@@ -188,34 +199,25 @@ impl KakaoTalkChannel {
     ) -> anyhow::Result<()> {
         let token = self.get_access_token().await?;
 
-        let args: Vec<serde_json::Value> = template_args
-            .iter()
-            .map(|(k, v)| {
-                serde_json::json!({
-                    "key": k,
-                    "value": v
-                })
-            })
-            .collect();
-
-        let body = serde_json::json!({
-            "template_id": template_id,
-            "receiver_uuids": [user_id],
-            "template_args": args
-        });
+        let receiver_uuids = serde_json::json!([user_id]);
+        let template_args_json = serde_json::to_string(template_args)?;
 
         let resp = self
             .client
-            .post(KAKAO_ALIMTALK_API)
+            .post("https://kapi.kakao.com/v1/api/talk/friends/message/send")
             .header("Authorization", format!("KakaoAK {token}"))
-            .json(&body)
+            .form(&[
+                ("receiver_uuids", receiver_uuids.to_string()),
+                ("template_id", template_id.to_string()),
+                ("template_args", template_args_json),
+            ])
             .send()
             .await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("KakaoTalk Alimtalk send failed ({status}): {err}");
+            anyhow::bail!("KakaoTalk template send failed ({status}): {err}");
         }
 
         Ok(())
@@ -440,8 +442,13 @@ fn kakao_skill_response(text: &str) -> Json<serde_json::Value> {
 }
 
 /// Webhook handler: POST /kakao/webhook
-/// Returns Kakao Chatbot Skill JSON response format for Skill API requests,
-/// and plain StatusCode for direct callback format.
+///
+/// Kakao Open Builder Skill API requires a JSON response within **5 seconds**.
+/// If the response is missing, malformed, or late, the platform shows its own
+/// default error: "죄송합니다. 메시지 처리중 오류가 발생했습니다."
+///
+/// Therefore every code path — including error/auth failures — must return a
+/// valid Skill JSON body. Never return a bare `StatusCode`.
 async fn handle_webhook(
     State(state): State<WebhookState>,
     headers: axum::http::HeaderMap,
@@ -458,7 +465,10 @@ async fn handle_webhook(
 
         if !verify_webhook_signature(secret, &body, signature) {
             tracing::warn!("KakaoTalk: webhook signature verification failed");
-            return StatusCode::UNAUTHORIZED.into_response();
+            return kakao_skill_response(
+                "인증에 실패했습니다. 관리자에게 문의해주세요.\n\nWebhook authentication failed.",
+            )
+            .into_response();
         }
     }
 
@@ -466,7 +476,10 @@ async fn handle_webhook(
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("KakaoTalk: invalid webhook payload: {e}");
-            return StatusCode::BAD_REQUEST.into_response();
+            return kakao_skill_response(
+                "요청을 처리할 수 없습니다.\n\nInvalid request payload.",
+            )
+            .into_response();
         }
     };
 
@@ -498,7 +511,9 @@ async fn handle_webhook(
                     });
                     // Fall through to process message normally
                 } else {
-                    // Create token and show one-click connect button
+                    // Create token and show one-click connect button via basicCard.
+                    // NOTE: quickReplies only support "message" and "block" actions —
+                    // web links require a basicCard with a webLink button.
                     if let Some(ref gw_url) = state.gateway_url {
                         let token = store.create_token("kakao", user_id);
                         let auto_url =
@@ -507,25 +522,26 @@ async fn handle_webhook(
                             "version": "2.0",
                             "template": {
                                 "outputs": [{
-                                    "simpleText": {
-                                        "text": "MoA에 연결하려면 아래 버튼을 눌러주세요.\n\nTap the button below to connect to MoA."
+                                    "basicCard": {
+                                        "title": "MoA 연결",
+                                        "description": "아래 버튼을 눌러 MoA에 연결해주세요.\n\nTap the button below to connect to MoA.",
+                                        "buttons": [{
+                                            "action": "webLink",
+                                            "label": "연결하기 / Connect",
+                                            "webLinkUrl": auto_url
+                                        }]
                                     }
-                                }],
-                                "quickReplies": [{
-                                    "messageText": "연결하기",
-                                    "action": "webLink",
-                                    "label": "🔗 연결하기 / Connect",
-                                    "webLinkUrl": auto_url
                                 }]
                             }
-                        })).into_response();
+                        }))
+                        .into_response();
                     }
 
-                    tracing::warn!("KakaoTalk: ignoring message from unauthorized user: {user_id}");
+                    tracing::warn!("KakaoTalk: unauthorized user (no gateway URL for pairing): {user_id}");
                     return kakao_skill_response("접근이 허용되지 않은 사용자입니다.\n\nAccess denied. Please contact the operator.").into_response();
                 }
             } else {
-                tracing::warn!("KakaoTalk: ignoring message from unauthorized user: {user_id}");
+                tracing::warn!("KakaoTalk: unauthorized user (no pairing store): {user_id}");
                 return kakao_skill_response("접근이 허용되지 않은 사용자입니다.\n\nAccess denied. Please contact the operator.").into_response();
             }
         }
@@ -566,10 +582,11 @@ async fn handle_webhook(
                 silent: false,
             };
 
-            if state.tx.send(channel_msg).await.is_err() {
-                tracing::warn!("KakaoTalk: message channel closed");
+            // Use try_send to avoid blocking — Kakao requires response within 5s.
+            if let Err(e) = state.tx.try_send(channel_msg) {
+                tracing::warn!("KakaoTalk: failed to enqueue command: {e}");
                 return kakao_skill_response(
-                    "시스템 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
+                    "시스템이 바쁩니다. 잠시 후 다시 시도해주세요.\n\nSystem is busy. Please try again shortly.",
                 )
                 .into_response();
             }
@@ -607,16 +624,22 @@ async fn handle_webhook(
             silent: false,
         };
 
-        if state.tx.send(channel_msg).await.is_err() {
-            tracing::warn!("KakaoTalk: message channel closed");
-            return kakao_skill_response("시스템 오류가 발생했습니다.").into_response();
+        // Use try_send to avoid blocking — Kakao requires response within 5s.
+        if let Err(e) = state.tx.try_send(channel_msg) {
+            tracing::warn!("KakaoTalk: failed to enqueue message: {e}");
+            return kakao_skill_response(
+                "시스템이 바쁩니다. 잠시 후 다시 시도해주세요.\n\nSystem is busy. Please try again shortly.",
+            )
+            .into_response();
         }
 
         return kakao_skill_response("요청을 처리 중입니다. 잠시만 기다려주세요...")
             .into_response();
     }
 
-    // Also handle direct message callback format (plain StatusCode response)
+    // Direct message callback format (non-Skill API).
+    // Still return Skill JSON as a safe default since Kakao Open Builder
+    // may route both formats to the same endpoint.
     if let Some(content) = payload.get("content") {
         let user_id = payload
             .get("user_id")
@@ -640,16 +663,18 @@ async fn handle_webhook(
                     });
                     // Fall through to process message
                 } else {
-                    return StatusCode::FORBIDDEN.into_response();
+                    return kakao_skill_response("접근이 허용되지 않은 사용자입니다.")
+                        .into_response();
                 }
             } else {
-                return StatusCode::FORBIDDEN.into_response();
+                return kakao_skill_response("접근이 허용되지 않은 사용자입니다.")
+                    .into_response();
             }
         }
 
         let text = content.as_str().unwrap_or("").trim();
         if text.is_empty() {
-            return StatusCode::OK.into_response();
+            return kakao_skill_response("메시지를 입력해주세요.").into_response();
         }
 
         let channel_msg = ChannelMessage {
@@ -663,14 +688,19 @@ async fn handle_webhook(
             silent: false,
         };
 
-        if state.tx.send(channel_msg).await.is_err() {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        if let Err(e) = state.tx.try_send(channel_msg) {
+            tracing::warn!("KakaoTalk: failed to enqueue direct message: {e}");
+            return kakao_skill_response("시스템이 바쁩니다. 잠시 후 다시 시도해주세요.")
+                .into_response();
         }
 
-        return StatusCode::OK.into_response();
+        return kakao_skill_response("요청을 처리 중입니다.").into_response();
     }
 
-    StatusCode::OK.into_response()
+    // Unknown payload format — still return valid Skill JSON so Kakao
+    // does not show its default platform error.
+    tracing::debug!("KakaoTalk: received unrecognized webhook payload format");
+    kakao_skill_response("알 수 없는 요청입니다.").into_response()
 }
 
 /// Health check endpoint: GET /kakao/health

@@ -60,7 +60,7 @@ export default function Sidebar({ isOpen, onClose }: SidebarProps) {
           <div className="flex items-center gap-2">
             <img
               src={`${import.meta.env.BASE_URL}MoA_icon_128px.png`}
-              alt="ZeroClaw"
+              alt="MoA"
               className="h-8 w-8 rounded-lg object-cover"
             />
             <span className="text-lg font-semibold text-white tracking-wide">
