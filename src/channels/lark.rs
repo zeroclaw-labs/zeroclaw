@@ -1028,7 +1028,8 @@ impl LarkChannel {
                             .as_secs(),
                         thread_ts: None,
                         interruption_scope_id: None,
-                    attachments: vec![],
+                        attachments: vec![],
+                        is_dm: true,
                     };
 
                     tracing::debug!("Lark WS: message in {}", lark_msg.chat_id);
@@ -1556,6 +1557,7 @@ impl LarkChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            is_dm: true,
         }]
     }
 
@@ -1772,6 +1774,7 @@ impl LarkChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            is_dm: true,
         });
 
         messages

@@ -281,6 +281,11 @@ impl SignalChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            is_dm: data_msg
+                .group_info
+                .as_ref()
+                .and_then(|g| g.group_id.as_deref())
+                .is_none(),
         })
     }
 }

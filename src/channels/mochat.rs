@@ -200,6 +200,7 @@ impl Channel for MochatChannel {
                                 thread_ts: None,
                                 interruption_scope_id: None,
                                 attachments: vec![],
+                                is_dm: true,
                             };
 
                             if tx.send(channel_msg).await.is_err() {

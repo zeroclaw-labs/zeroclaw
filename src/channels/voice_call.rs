@@ -390,6 +390,7 @@ impl VoiceCallChannel {
             thread_ts: Some(call_id.to_string()),
             interruption_scope_id: Some(call_id.to_string()),
             attachments: vec![],
+            is_dm: true,
         };
         tx.send(msg)
             .await

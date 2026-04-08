@@ -578,6 +578,7 @@ impl Channel for IrcChannel {
                         thread_ts: None,
                         interruption_scope_id: None,
                         attachments: vec![],
+                        is_dm: !is_channel,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
