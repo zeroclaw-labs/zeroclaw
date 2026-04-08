@@ -578,7 +578,24 @@ impl Agent {
         }
 
         if other_messages.len() > max {
-            let drop_count = other_messages.len() - max;
+            let mut drop_count = other_messages.len() - max;
+
+            // Avoid creating orphan ToolResults: if the first message remaining
+            // after the drop is a ToolResults, its paired AssistantToolCalls was
+            // dropped, so the ToolResults must be dropped too. Otherwise the
+            // history would start with a tool_result block whose tool_use_id
+            // has no matching tool_use, causing providers (e.g. Anthropic) to
+            // reject the request with "messages.0.content.0: unexpected
+            // tool_use_id found in tool_result blocks".
+            while drop_count < other_messages.len()
+                && matches!(
+                    &other_messages[drop_count],
+                    ConversationMessage::ToolResults(_)
+                )
+            {
+                drop_count += 1;
+            }
+
             other_messages.drain(0..drop_count);
         }
 
@@ -1887,5 +1904,106 @@ mod tests {
             has_tool_result,
             "Should have emitted a ToolResult event for 'echo'"
         );
+    }
+
+    /// Reproduction test for the orphan-tool_results trim bug.
+    ///
+    /// `trim_history` previously dropped the oldest N entries blindly. When
+    /// the boundary fell in the middle of an `AssistantToolCalls` /
+    /// `ToolResults` pair, the call side was dropped while the result side
+    /// remained — leaving an orphan `ToolResults` at the head of the
+    /// history. The next provider request then started with a `tool_result`
+    /// block that had no matching `tool_use`, which Anthropic rejects with:
+    ///
+    ///   `messages.0.content.0: unexpected tool_use_id found in tool_result blocks`
+    ///
+    /// To reliably reproduce the bug we need the drop boundary to fall in
+    /// the middle of a pair. Five entries (`AC1, TR1, AC2, TR2, AC3`) with
+    /// `max = 4` makes `drop_count = 1`, which removes `AC1` and leaves
+    /// `TR1` as an orphan at the head.
+    #[test]
+    fn trim_history_does_not_leave_orphan_tool_results() {
+        use crate::providers::{ToolCall, ToolResultMessage};
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let mut agent_config = crate::config::AgentConfig::default();
+        // Force trimming with the boundary landing inside a pair:
+        // 5 entries (AC, TR, AC, TR, AC) > 4 → drop_count = 1 → AC1 dropped,
+        // TR1 left as an orphan unless the trim guards against it.
+        agent_config.max_history_messages = 4;
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(agent_config)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        // Build the history: AC1, TR1, AC2, TR2, AC3 (no trailing TR3).
+        for i in 1..=3 {
+            agent.history.push(ConversationMessage::AssistantToolCalls {
+                text: Some(format!("Calling tool {i}")),
+                tool_calls: vec![ToolCall {
+                    id: format!("tc{i}"),
+                    name: format!("tool{i}"),
+                    arguments: "{}".into(),
+                }],
+                reasoning_content: None,
+            });
+            // Skip the trailing ToolResults for the last AssistantToolCalls
+            // so the entry count is 5, not 6, and the drop boundary lands
+            // mid-pair.
+            if i < 3 {
+                agent
+                    .history
+                    .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        tool_call_id: format!("tc{i}"),
+                        content: format!("result{i}"),
+                    }]));
+            }
+        }
+
+        assert_eq!(agent.history.len(), 5);
+        agent.trim_history();
+
+        // After trimming, the surviving history must not start with a
+        // ToolResults entry (that would be an orphan whose AssistantToolCalls
+        // partner was dropped).
+        if let Some(first) = agent.history.first() {
+            assert!(
+                !matches!(first, ConversationMessage::ToolResults(_)),
+                "trim_history left an orphan ToolResults at the head of the \
+                 history; this would cause Anthropic to reject the next \
+                 request with 'unexpected tool_use_id found in tool_result \
+                 blocks'"
+            );
+        }
+
+        // Every ToolResults entry must be immediately preceded by an
+        // AssistantToolCalls entry.
+        for window in agent.history.windows(2) {
+            if matches!(&window[1], ConversationMessage::ToolResults(_)) {
+                assert!(
+                    matches!(&window[0], ConversationMessage::AssistantToolCalls { .. }),
+                    "ToolResults entry is not preceded by an AssistantToolCalls \
+                     entry — pair was split during trim"
+                );
+            }
+        }
     }
 }
