@@ -6,6 +6,7 @@ import Link from 'next/link';
 import { isAuthenticated, setToken } from '@/lib/auth';
 import {
   authLogin,
+  authRegister,
   remoteLogin,
   verifyRemoteEmail,
   getRemoteDevices,
@@ -15,6 +16,7 @@ import {
 
 type AuthStep =
   | 'login'
+  | 'signup'
   | 'device-select'
   | 'pairing-code'
   | 'email-verify';
@@ -44,9 +46,11 @@ function AuthPageInner() {
 
   const [step, setStep] = useState<AuthStep>('login');
 
-  // Login fields
+  // Login/Signup fields
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [signupEmail, setSignupEmail] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [successMessage, setSuccessMessage] = useState('');
@@ -128,20 +132,53 @@ function AuthPageInner() {
       }
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : 'Login failed';
-      // Show app guide modal for user-not-found / auth failures
-      if (
-        errMsg.toLowerCase().includes('not found') ||
-        errMsg.toLowerCase().includes('invalid') ||
-        errMsg.toLowerCase().includes('unauthorized') ||
-        errMsg.toLowerCase().includes('failed')
-      ) {
-        setShowAppGuideModal(true);
+      const lower = errMsg.toLowerCase();
+      if (lower.includes('not found') || lower.includes('no user')) {
+        setError('등록되지 않은 아이디입니다. 아래에서 회원가입해 주세요.');
+      } else if (lower.includes('invalid') || lower.includes('password') || lower.includes('unauthorized')) {
+        setError('비밀번호가 올바르지 않습니다. 다시 확인해 주세요.');
+      } else {
+        setError(errMsg);
       }
-      setError(errMsg);
     } finally {
       setLoading(false);
     }
   }, [username, password, router, redirectTo]);
+
+  const handleSignup = useCallback(async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+    setSuccessMessage('');
+
+    if (password !== confirmPassword) {
+      setError('비밀번호가 일치하지 않습니다.');
+      setLoading(false);
+      return;
+    }
+    if (password.length < 4) {
+      setError('비밀번호는 4자 이상이어야 합니다.');
+      setLoading(false);
+      return;
+    }
+
+    try {
+      await authRegister(username, password, signupEmail || undefined);
+      setSuccessMessage('회원가입이 완료되었습니다! 로그인해 주세요.');
+      setStep('login');
+      setConfirmPassword('');
+      setSignupEmail('');
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : 'Registration failed';
+      if (errMsg.toLowerCase().includes('already') || errMsg.toLowerCase().includes('taken')) {
+        setError('이미 사용 중인 아이디입니다. 다른 아이디를 입력해 주세요.');
+      } else {
+        setError(errMsg);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, [username, password, confirmPassword, signupEmail]);
 
   const handleDeviceSelect = useCallback(() => {
     if (!selectedDeviceId) {
@@ -275,7 +312,8 @@ function AuthPageInner() {
           </Link>
           <h1 className="text-2xl font-bold text-dark-50">MoA</h1>
           <p className="text-dark-400 text-sm mt-1">
-            {step === 'login' && 'Sign in to your account'}
+            {step === 'login' && 'MoA 로그인'}
+            {step === 'signup' && 'MoA 회원가입'}
             {step === 'device-select' && 'Select your device'}
             {step === 'pairing-code' && `Enter pairing code for ${selectedDeviceName || 'device'}`}
             {step === 'email-verify' && 'Enter email verification code'}
@@ -295,7 +333,7 @@ function AuthPageInner() {
         )}
 
         {/* Back button for multi-step */}
-        {step !== 'login' && (
+        {step !== 'login' && step !== 'signup' && (
           <button
             type="button"
             onClick={handleBack}
@@ -341,8 +379,19 @@ function AuthPageInner() {
               disabled={loading}
               className="w-full py-3 bg-primary-500 hover:bg-primary-600 disabled:bg-dark-700 disabled:text-dark-500 text-white rounded-lg font-medium transition-colors"
             >
-              {loading ? 'Logging in...' : 'Log In'}
+              {loading ? '로그인 중...' : '로그인'}
             </button>
+
+            <p className="text-center text-sm text-dark-400 mt-4">
+              계정이 없으신가요?{' '}
+              <button
+                type="button"
+                onClick={() => { setStep('signup'); setError(''); setSuccessMessage(''); }}
+                className="text-primary-400 hover:text-primary-300 font-medium"
+              >
+                회원가입
+              </button>
+            </p>
 
             {KAKAO_REST_KEY && (
               <>
@@ -362,6 +411,77 @@ function AuthPageInner() {
                 </button>
               </>
             )}
+          </form>
+        )}
+
+        {/* Step: Signup */}
+        {step === 'signup' && (
+          <form onSubmit={handleSignup} className="space-y-4">
+            <div>
+              <label htmlFor="signup-username" className="block text-sm font-medium text-dark-300 mb-1">아이디</label>
+              <input
+                id="signup-username"
+                type="text"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                className="w-full px-4 py-3 bg-dark-800 border border-dark-700 rounded-lg text-dark-100 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500/30 transition-all"
+                placeholder="사용할 아이디를 입력하세요"
+                autoFocus
+                required
+              />
+            </div>
+            <div>
+              <label htmlFor="signup-email" className="block text-sm font-medium text-dark-300 mb-1">이메일 (선택)</label>
+              <input
+                id="signup-email"
+                type="email"
+                value={signupEmail}
+                onChange={(e) => setSignupEmail(e.target.value)}
+                className="w-full px-4 py-3 bg-dark-800 border border-dark-700 rounded-lg text-dark-100 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500/30 transition-all"
+                placeholder="example@email.com"
+              />
+            </div>
+            <div>
+              <label htmlFor="signup-password" className="block text-sm font-medium text-dark-300 mb-1">비밀번호</label>
+              <input
+                id="signup-password"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="w-full px-4 py-3 bg-dark-800 border border-dark-700 rounded-lg text-dark-100 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500/30 transition-all"
+                placeholder="4자 이상"
+                required
+              />
+            </div>
+            <div>
+              <label htmlFor="signup-confirm" className="block text-sm font-medium text-dark-300 mb-1">비밀번호 확인</label>
+              <input
+                id="signup-confirm"
+                type="password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                className="w-full px-4 py-3 bg-dark-800 border border-dark-700 rounded-lg text-dark-100 focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500/30 transition-all"
+                placeholder="비밀번호를 다시 입력하세요"
+                required
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={loading}
+              className="w-full py-3 bg-primary-500 hover:bg-primary-600 disabled:bg-dark-700 disabled:text-dark-500 text-white rounded-lg font-medium transition-colors"
+            >
+              {loading ? '가입 중...' : '회원가입'}
+            </button>
+            <p className="text-center text-sm text-dark-400 mt-4">
+              이미 계정이 있으신가요?{' '}
+              <button
+                type="button"
+                onClick={() => { setStep('login'); setError(''); setSuccessMessage(''); }}
+                className="text-primary-400 hover:text-primary-300 font-medium"
+              >
+                로그인
+              </button>
+            </p>
           </form>
         )}
 
