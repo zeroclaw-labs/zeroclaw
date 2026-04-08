@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
-import { LogOut, Menu, Settings, ChevronDown } from 'lucide-react';
+import { LogOut, Settings, ChevronDown, PanelLeftClose, PanelLeftOpen, Menu } from 'lucide-react';
 import { t, SUPPORTED_LOCALES } from '@/lib/i18n';
 import { useLocaleContext } from '@/App';
 import { useAuth } from '@/hooks/useAuth';
@@ -21,9 +21,11 @@ const routeTitles: Record<string, string> = {
 
 interface HeaderProps {
   onMenuToggle: () => void;
+  onCollapseToggle: () => void;
+  collapsed: boolean;
 }
 
-export default function Header({ onMenuToggle }: HeaderProps) {
+export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: HeaderProps) {
   const location = useLocation();
   const { logout } = useAuth();
   const { locale, setAppLocale } = useLocaleContext();
@@ -61,6 +63,19 @@ export default function Header({ onMenuToggle }: HeaderProps) {
             aria-label="Open menu"
           >
             <Menu className="h-5 w-5" />
+          </button>
+
+          {/* Collapse toggle — visible only on desktop */}
+          <button
+            type="button"
+            onClick={onCollapseToggle}
+            className="hidden md:flex p-1.5 -ml-1.5 rounded-lg transition-colors duration-200"
+            style={{ color: 'var(--pc-text-muted)' }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--pc-text-primary)'; e.currentTarget.style.background = 'var(--pc-hover)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; e.currentTarget.style.background = 'transparent'; }}
+            aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            {collapsed ? <PanelLeftOpen className="h-5 w-5" /> : <PanelLeftClose className="h-5 w-5" />}
           </button>
 
           {/* Page title */}

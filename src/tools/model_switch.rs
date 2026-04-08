@@ -122,24 +122,32 @@ impl ModelSwitchTool {
             }
         };
 
-        // Validate the provider exists
-        let known_providers = providers::list_providers();
-        let provider_valid = known_providers.iter().any(|p| {
-            p.name.eq_ignore_ascii_case(provider)
-                || p.aliases.iter().any(|a| a.eq_ignore_ascii_case(provider))
-        });
+        // Validate the provider exists.
+        // Custom URL-based providers (e.g. "custom:https://api.nvidia.com/v1")
+        // and Anthropic-compatible custom endpoints bypass the known-provider
+        // check because they are not in the static provider list.
+        let is_custom_provider =
+            provider.starts_with("custom:") || provider.starts_with("anthropic-custom:");
 
-        if !provider_valid {
-            return Ok(ToolResult {
-                success: false,
-                output: serde_json::to_string_pretty(&json!({
-                    "available_providers": known_providers.iter().map(|p| p.name).collect::<Vec<_>>()
-                }))?,
-                error: Some(format!(
-                    "Unknown provider: {}. Use 'list_providers' to see available options.",
-                    provider
-                )),
+        if !is_custom_provider {
+            let known_providers = providers::list_providers();
+            let provider_valid = known_providers.iter().any(|p| {
+                p.name.eq_ignore_ascii_case(provider)
+                    || p.aliases.iter().any(|a| a.eq_ignore_ascii_case(provider))
             });
+
+            if !provider_valid {
+                return Ok(ToolResult {
+                    success: false,
+                    output: serde_json::to_string_pretty(&json!({
+                        "available_providers": known_providers.iter().map(|p| p.name).collect::<Vec<_>>()
+                    }))?,
+                    error: Some(format!(
+                        "Unknown provider: {}. Use 'list_providers' to see available options, or use 'custom:<url>' for custom endpoints.",
+                        provider
+                    )),
+                });
+            }
         }
 
         // Set the global model switch request
