@@ -614,6 +614,24 @@ fn looks_like_deferred_action_without_tool_call(text: &str) -> bool {
         && CJK_DEFERRED_ACTION_VERB_REGEX.is_match(trimmed)
 }
 
+/// Format reasoning content for user-visible display.
+///
+/// Wraps reasoning text in a blockquote that works across Signal, Telegram,
+/// Discord, and CLI. Uses `> ` prefix for each line with a "Reasoning:" header.
+fn format_reasoning_for_display(reasoning: &str) -> String {
+    let trimmed = reasoning.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut output = String::from("Reasoning:\n");
+    for line in trimmed.lines() {
+        output.push_str("> ");
+        output.push_str(line);
+        output.push('\n');
+    }
+    output
+}
+
 fn merge_continuation_text(existing: &str, next: &str) -> String {
     if next.is_empty() {
         return existing.to_string();
@@ -1594,6 +1612,7 @@ pub async fn run_tool_call_loop(
             assistant_history_content,
             native_tool_calls,
             parse_issue_detected,
+            reasoning_content,
         ) = match chat_result {
             Ok(resp) => {
                 let mut response_text = resp.text_or_empty().to_string();
@@ -1887,6 +1906,7 @@ pub async fn run_tool_call_loop(
                     assistant_history_content,
                     native_calls,
                     parse_issue.is_some(),
+                    reasoning_content,
                 )
             }
             Err(e) => {
@@ -1921,6 +1941,27 @@ pub async fn run_tool_call_loop(
             response_text.clone()
         } else {
             parsed_text
+        };
+
+        // Prepend reasoning content if configured to show it.
+        let display_text = {
+            let show = TOOL_LOOP_PRESENTATION_CONFIG
+                .try_with(|c| c.show_reasoning)
+                .unwrap_or(false);
+            if show {
+                if let Some(ref reasoning) = reasoning_content {
+                    let formatted = format_reasoning_for_display(reasoning);
+                    if !formatted.is_empty() {
+                        format!("{formatted}\n{display_text}")
+                    } else {
+                        display_text
+                    }
+                } else {
+                    display_text
+                }
+            } else {
+                display_text
+            }
         };
 
         // ── Progress: LLM responded ─────────────────────────────
