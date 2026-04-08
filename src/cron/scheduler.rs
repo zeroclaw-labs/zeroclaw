@@ -280,6 +280,8 @@ async fn run_agent_job(
     let prompt = job.prompt.clone().unwrap_or_default();
 
     // Recall relevant memories so cron jobs have context awareness.
+    // Exclude `Conversation` memories to prevent chat context from
+    // leaking into scheduled executions (see #5415).
     let memory_context = match crate::memory::create_memory(
         &config.memory,
         &config.workspace_dir,
@@ -289,10 +291,20 @@ async fn run_agent_job(
             Ok(entries) if !entries.is_empty() => {
                 let ctx: String = entries
                     .iter()
+                    .filter(|e| {
+                        !matches!(
+                            e.category,
+                            crate::memory::traits::MemoryCategory::Conversation
+                        )
+                    })
                     .map(|e| format!("- {}: {}", e.key, e.content))
                     .collect::<Vec<_>>()
                     .join("\n");
-                format!("[Memory context]\n{ctx}\n\n")
+                if ctx.is_empty() {
+                    String::new()
+                } else {
+                    format!("[Memory context]\n{ctx}\n\n")
+                }
             }
             _ => String::new(),
         },
