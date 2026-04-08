@@ -796,6 +796,9 @@ async fn handle_remote_socket(
         }
     });
 
+    // Track message IDs from this session for cleanup on disconnect
+    let mut session_msg_ids: Vec<String> = Vec::new();
+
     // Main loop: handle both inbound messages and outbound sends
     loop {
         tokio::select! {
@@ -848,6 +851,7 @@ async fn handle_remote_socket(
                 REMOTE_RESPONSE_CHANNELS
                     .lock()
                     .insert(msg_id.clone(), response_tx.clone());
+                session_msg_ids.push(msg_id.clone());
 
                 // Route to device
                 if let Err(e) = device_router.send_to_device(&device_id, routed_msg).await {
@@ -877,9 +881,14 @@ async fn handle_remote_socket(
         }
     }
 
-    // Cleanup
+    // Cleanup: remove orphaned response channels from this session
     response_relay.abort();
-    REMOTE_RESPONSE_CHANNELS.lock().retain(|_, _| true); // Cleanup handled by Drop
+    {
+        let mut channels = REMOTE_RESPONSE_CHANNELS.lock();
+        for id in &session_msg_ids {
+            channels.remove(id);
+        }
+    }
 
     tracing::info!(
         device_id = %device_id,

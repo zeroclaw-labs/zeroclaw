@@ -324,7 +324,18 @@ async fn handle_connection(
             }
 
             _ => {
-                tracing::debug!(msg_type = msg_type, "Device-link: unknown message type");
+                tracing::warn!(msg_type = msg_type, "Device-link: unknown message type");
+                // Send error response so the web user isn't left waiting forever
+                if !msg_id.is_empty() {
+                    let error_response = serde_json::json!({
+                        "type": "remote_error",
+                        "id": msg_id,
+                        "content": format!("이 디바이스에서 지원하지 않는 요청입니다 ({}). MoA 앱을 업데이트해 주세요.", msg_type),
+                    });
+                    let _ = outbound_tx
+                        .send(Message::Text(error_response.to_string().into()))
+                        .await;
+                }
             }
         }
     }
