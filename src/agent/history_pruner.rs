@@ -1,6 +1,7 @@
 use crate::providers::traits::ChatMessage;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use zeroclaw_macros::Configurable;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -18,7 +19,8 @@ fn default_collapse() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[prefix = "agent.history-pruning"]
 pub struct HistoryPrunerConfig {
     /// Enable history pruning. Default: false.
     #[serde(default)]

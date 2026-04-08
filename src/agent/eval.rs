@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use schemars::JsonSchema;
+use zeroclaw_macros::Configurable;
 
 // ── Complexity estimation ───────────────────────────────────────
 
@@ -73,7 +74,8 @@ pub fn estimate_complexity(message: &str) -> ComplexityTier {
 /// When the rule-based classifier in `QueryClassificationConfig` produces no
 /// match, the eval layer can fall back to `estimate_complexity` and map the
 /// resulting tier to a routing hint.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[prefix = "agent.auto-classify"]
 pub struct AutoClassifyConfig {
     /// Hint to use for `Simple` complexity tier (e.g. `"fast"`).
     #[serde(default)]
@@ -118,7 +120,8 @@ impl AutoClassifyConfig {
 // ── Post-response eval ──────────────────────────────────────────
 
 /// Configuration for the post-response quality evaluator.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[prefix = "agent.eval"]
 pub struct EvalConfig {
     /// Enable the eval quality gate.
     #[serde(default)]
