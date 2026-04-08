@@ -98,11 +98,18 @@ fn base64url_no_pad(data: &[u8]) -> String {
 }
 
 /// Apply auth to a request builder (usable from spawned tasks without `&self`).
+///
+/// When `credential` is `None` (e.g. local LLM servers that require no API key),
+/// the request is returned unchanged -- no auth header is added.
 fn apply_auth_to_request(
     req: reqwest::RequestBuilder,
     style: &AuthStyle,
-    credential: &str,
+    credential: Option<&str>,
 ) -> reqwest::RequestBuilder {
+    let credential = match credential {
+        Some(c) => c,
+        None => return req,
+    };
     match style {
         AuthStyle::Bearer => req.header("Authorization", format!("Bearer {credential}")),
         AuthStyle::XApiKey => req.header("x-api-key", credential),
@@ -1352,22 +1359,14 @@ impl OpenAiCompatibleProvider {
     fn apply_auth_header(
         &self,
         req: reqwest::RequestBuilder,
-        credential: &str,
+        credential: Option<&str>,
     ) -> reqwest::RequestBuilder {
-        match &self.auth_header {
-            AuthStyle::Bearer => req.header("Authorization", format!("Bearer {credential}")),
-            AuthStyle::XApiKey => req.header("x-api-key", credential),
-            AuthStyle::Custom(header) => req.header(header, credential),
-            AuthStyle::ZhipuJwt => match zhipu_jwt_bearer(credential) {
-                Ok(val) => req.header("Authorization", val),
-                Err(_) => req.header("Authorization", format!("Bearer {credential}")),
-            },
-        }
+        apply_auth_to_request(req, &self.auth_header, credential)
     }
 
     async fn chat_via_responses(
         &self,
-        credential: &str,
+        credential: Option<&str>,
         messages: &[ChatMessage],
         model: &str,
     ) -> anyhow::Result<String> {
@@ -1653,12 +1652,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = self.credential.as_deref();
 
         let mut messages = Vec::new();
 
@@ -1785,12 +1779,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = self.credential.as_deref();
 
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(messages)
@@ -1898,12 +1887,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = self.credential.as_deref();
 
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(messages)
@@ -2014,12 +1998,7 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `zeroclaw onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
+        let credential = self.credential.as_deref();
 
         let tools = Self::convert_tool_specs(request.tools);
         let effective_messages = if self.merge_system_into_user {
@@ -2158,19 +2137,7 @@ impl Provider for OpenAiCompatibleProvider {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
 
-        let credential = match self.credential.as_ref() {
-            Some(value) => value.clone(),
-            None => {
-                let provider_name = self.name.clone();
-                return stream::once(async move {
-                    Err(StreamError::Provider(format!(
-                        "{} API key not set",
-                        provider_name
-                    )))
-                })
-                .boxed();
-            }
-        };
+        let credential = self.credential.clone();
 
         let has_tools = request.tools.is_some_and(|tools| !tools.is_empty());
         let effective_messages = if self.merge_system_into_user {
@@ -2238,7 +2205,7 @@ impl Provider for OpenAiCompatibleProvider {
         tokio::spawn(async move {
             let mut req_builder = client.post(&url).json(&payload);
 
-            req_builder = apply_auth_to_request(req_builder, &auth_header, &credential);
+            req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
 
             let response = match req_builder.send().await {
@@ -2283,19 +2250,7 @@ impl Provider for OpenAiCompatibleProvider {
         temperature: f64,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let credential = match self.credential.as_ref() {
-            Some(value) => value.clone(),
-            None => {
-                let provider_name = self.name.clone();
-                return stream::once(async move {
-                    Err(StreamError::Provider(format!(
-                        "{} API key not set",
-                        provider_name
-                    )))
-                })
-                .boxed();
-            }
-        };
+        let credential = self.credential.clone();
 
         let mut messages = Vec::new();
         if let Some(sys) = system_prompt {
@@ -2333,7 +2288,7 @@ impl Provider for OpenAiCompatibleProvider {
             let mut req_builder = client.post(&url).json(&request);
 
             // Apply auth header
-            req_builder = apply_auth_to_request(req_builder, &auth_header, &credential);
+            req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
 
             // Set accept header for streaming
             req_builder = req_builder.header("Accept", "text/event-stream");
@@ -2383,19 +2338,7 @@ impl Provider for OpenAiCompatibleProvider {
         temperature: f64,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let credential = match self.credential.as_ref() {
-            Some(value) => value.clone(),
-            None => {
-                let provider_name = self.name.clone();
-                return stream::once(async move {
-                    Err(StreamError::Provider(format!(
-                        "{} API key not set",
-                        provider_name
-                    )))
-                })
-                .boxed();
-            }
-        };
+        let credential = self.credential.clone();
 
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(messages)
@@ -2434,7 +2377,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         tokio::spawn(async move {
             let mut req_builder = client.post(&url).json(&request);
-            req_builder = apply_auth_to_request(req_builder, &auth_header, &credential);
+            req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
 
             let response = match req_builder.send().await {
@@ -2472,16 +2415,14 @@ impl Provider for OpenAiCompatibleProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        if let Some(credential) = self.credential.as_ref() {
-            // Hit the chat completions URL with a GET to establish the connection pool.
-            // The server will likely return 405 Method Not Allowed, which is fine -
-            // the goal is TLS handshake and HTTP/2 negotiation.
-            let url = self.chat_completions_url();
-            let _ = self
-                .apply_auth_header(self.http_client().get(&url), credential)
-                .send()
-                .await?;
-        }
+        // Hit the chat completions URL with a GET to establish the connection pool.
+        // The server will likely return 405 Method Not Allowed, which is fine -
+        // the goal is TLS handshake and HTTP/2 negotiation.
+        let url = self.chat_completions_url();
+        let _ = self
+            .apply_auth_header(self.http_client().get(&url), self.credential.as_deref())
+            .send()
+            .await?;
         Ok(())
     }
 }
@@ -2519,17 +2460,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_fails_without_key() {
-        let p = make_provider("Venice", "https://api.venice.ai", None);
-        let result = p
-            .chat_with_system(None, "hello", "llama-3.3-70b", 0.7)
-            .await;
+    async fn chat_without_key_attempts_request() {
+        let p = make_provider("Local", "http://127.0.0.1:1", None);
+        let result = p.chat_with_system(None, "hello", "default", 0.7).await;
         assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Venice API key not set")
+            !err_msg.contains("API key not set"),
+            "should not get credential error, got: {err_msg}"
         );
     }
 
@@ -2701,24 +2639,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_compatible_providers_fail_without_key() {
+    async fn all_compatible_providers_attempt_request_without_key() {
         let providers = vec![
-            make_provider("Venice", "https://api.venice.ai", None),
-            make_provider("Moonshot", "https://api.moonshot.cn", None),
-            make_provider("GLM", "https://open.bigmodel.cn", None),
-            make_provider("MiniMax", "https://api.minimaxi.com/v1", None),
-            make_provider("Groq", "https://api.groq.com/openai", None),
-            make_provider("Mistral", "https://api.mistral.ai", None),
-            make_provider("xAI", "https://api.x.ai", None),
-            make_provider("Astrai", "https://as-trai.com/v1", None),
+            make_provider("Venice", "http://127.0.0.1:1", None),
+            make_provider("Moonshot", "http://127.0.0.1:1", None),
+            make_provider("GLM", "http://127.0.0.1:1", None),
+            make_provider("MiniMax", "http://127.0.0.1:1", None),
+            make_provider("Groq", "http://127.0.0.1:1", None),
+            make_provider("Mistral", "http://127.0.0.1:1", None),
+            make_provider("xAI", "http://127.0.0.1:1", None),
+            make_provider("Astrai", "http://127.0.0.1:1", None),
         ];
 
         for p in providers {
             let result = p.chat_with_system(None, "test", "model", 0.7).await;
-            assert!(result.is_err(), "{} should fail without key", p.name);
+            assert!(result.is_err(), "{} should fail (unreachable host)", p.name);
+            let err_msg = result.unwrap_err().to_string();
             assert!(
-                result.unwrap_err().to_string().contains("API key not set"),
-                "{} error should mention key",
+                !err_msg.contains("API key not set"),
+                "{} should get transport error, not credential error, got: {err_msg}",
                 p.name
             );
         }
@@ -2816,7 +2755,11 @@ mod tests {
     async fn chat_via_responses_requires_non_system_message() {
         let provider = make_provider("custom", "https://api.example.com", Some("test-key"));
         let err = provider
-            .chat_via_responses("test-key", &[ChatMessage::system("policy")], "gpt-test")
+            .chat_via_responses(
+                Some("test-key"),
+                &[ChatMessage::system("policy")],
+                "gpt-test",
+            )
             .await
             .expect_err("system-only fallback payload should fail");
 
@@ -3231,10 +3174,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warmup_without_key_is_noop() {
-        let provider = make_provider("test", "https://example.com", None);
+    async fn warmup_without_key_attempts_connection() {
+        let provider = make_provider("test", "http://127.0.0.1:1", None);
         let result = provider.warmup().await;
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("API key not set"),
+            "should not get credential error, got: {err_msg}"
+        );
     }
 
     // ══════════════════════════════════════════════════════════
@@ -3571,8 +3519,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_with_tools_fails_without_key() {
-        let p = make_provider("TestProvider", "https://example.com", None);
+    async fn chat_with_tools_without_key_attempts_request() {
+        let p = make_provider("TestProvider", "http://127.0.0.1:1", None);
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "hello".to_string(),
@@ -3588,11 +3536,10 @@ mod tests {
 
         let result = p.chat_with_tools(&messages, &tools, "model", 0.7).await;
         assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("TestProvider API key not set")
+            !err_msg.contains("API key not set"),
+            "should not get credential error, got: {err_msg}"
         );
     }
 

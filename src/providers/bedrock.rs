@@ -611,11 +611,18 @@ impl BedrockProvider {
                             content: blocks,
                         });
                     } else {
+                        // Guard: never send an empty text block to Bedrock.
+                        // This can happen when a daemon restart interrupts a
+                        // streaming response, leaving a partially-persisted
+                        // assistant message with empty content.
+                        let text = if msg.content.trim().is_empty() {
+                            "(empty response)".to_string()
+                        } else {
+                            msg.content.clone()
+                        };
                         converse_messages.push(ConverseMessage {
                             role: "assistant".to_string(),
-                            content: vec![ContentBlock::Text(TextBlock {
-                                text: msg.content.clone(),
-                            })],
+                            content: vec![ContentBlock::Text(TextBlock { text })],
                         });
                     }
                 }
@@ -681,6 +688,27 @@ impl BedrockProvider {
             Some(system_blocks)
         };
         (system, converse_messages)
+    }
+
+    /// Remove empty text ContentBlocks from converse messages.
+    ///
+    /// Bedrock rejects requests where a ContentBlock has a blank `text` field
+    /// with: "The text field in the ContentBlock object is blank". This can
+    /// occur when a daemon restart interrupts a streaming response, leaving a
+    /// partially-persisted message with empty content, or when bot/attachment-
+    /// only messages produce empty text blocks.
+    fn sanitize_empty_content_blocks(messages: &mut [ConverseMessage]) {
+        for msg in messages.iter_mut() {
+            msg.content.retain(|block| match block {
+                ContentBlock::Text(tb) => !tb.text.trim().is_empty(),
+                _ => true,
+            });
+            if msg.content.is_empty() {
+                msg.content.push(ContentBlock::Text(TextBlock {
+                    text: "(empty)".to_string(),
+                }));
+            }
+        }
     }
 
     /// Try to extract a tool_call_id from partially-valid JSON content.
@@ -801,9 +829,12 @@ impl BedrockProvider {
         }
 
         if blocks.is_empty() {
-            blocks.push(ContentBlock::Text(TextBlock {
-                text: content.to_string(),
-            }));
+            let fallback = if content.trim().is_empty() {
+                "(empty)".to_string()
+            } else {
+                content.to_string()
+            };
+            blocks.push(ContentBlock::Text(TextBlock { text: fallback }));
         }
 
         blocks
@@ -1097,12 +1128,15 @@ impl Provider for BedrockProvider {
             blocks
         });
 
+        let mut messages = vec![ConverseMessage {
+            role: "user".to_string(),
+            content: Self::parse_user_content_blocks(message),
+        }];
+        Self::sanitize_empty_content_blocks(&mut messages);
+
         let request = ConverseRequest {
             system,
-            messages: vec![ConverseMessage {
-                role: "user".to_string(),
-                content: Self::parse_user_content_blocks(message),
-            }],
+            messages,
             inference_config: Some(InferenceConfig {
                 max_tokens: self.max_tokens,
                 temperature,
@@ -1126,6 +1160,9 @@ impl Provider for BedrockProvider {
         let auth = self.resolve_auth().await?;
 
         let (system_blocks, mut converse_messages) = Self::convert_messages(request.messages);
+
+        // Strip empty text ContentBlocks that would cause Bedrock 400 errors.
+        Self::sanitize_empty_content_blocks(&mut converse_messages);
 
         // Apply cachePoint to system if large.
         let system = system_blocks.map(|mut blocks| {
@@ -1819,6 +1856,59 @@ mod tests {
             assert_eq!(wrapper.tool_result.tool_use_id, "x");
         } else {
             panic!("Expected ToolResult");
+        }
+    }
+
+    #[test]
+    fn sanitize_removes_empty_text_blocks() {
+        let mut messages = vec![ConverseMessage {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::Text(TextBlock {
+                text: String::new(),
+            })],
+        }];
+        BedrockProvider::sanitize_empty_content_blocks(&mut messages);
+        assert_eq!(messages.len(), 1);
+        if let ContentBlock::Text(ref tb) = messages[0].content[0] {
+            assert_eq!(tb.text, "(empty)");
+        } else {
+            panic!("Expected Text block with placeholder");
+        }
+    }
+
+    #[test]
+    fn sanitize_preserves_non_empty_text_blocks() {
+        let mut messages = vec![ConverseMessage {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text(TextBlock {
+                text: "Hello".to_string(),
+            })],
+        }];
+        BedrockProvider::sanitize_empty_content_blocks(&mut messages);
+        if let ContentBlock::Text(ref tb) = messages[0].content[0] {
+            assert_eq!(tb.text, "Hello");
+        } else {
+            panic!("Expected preserved Text block");
+        }
+    }
+
+    #[test]
+    fn convert_messages_empty_assistant_gets_placeholder() {
+        let messages = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: String::new(),
+            },
+            ChatMessage::user("Continue"),
+        ];
+        let (_, converse) = BedrockProvider::convert_messages(&messages);
+        let assistant_msg = &converse[1];
+        assert_eq!(assistant_msg.role, "assistant");
+        if let ContentBlock::Text(ref tb) = assistant_msg.content[0] {
+            assert!(!tb.text.is_empty(), "Assistant text should not be empty");
+        } else {
+            panic!("Expected Text block for assistant message");
         }
     }
 }

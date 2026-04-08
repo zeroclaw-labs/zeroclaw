@@ -3415,6 +3415,19 @@ async fn process_channel_message(
                     "  ❌ LLM error after {}ms: {e}",
                     started_at.elapsed().as_millis()
                 );
+
+                // Evict cached provider on auth errors so the next request
+                // re-creates it with fresh OAuth credentials (#5219).
+                if providers::reliable::is_auth_error(&e) {
+                    let cache_key = provider_cache_key(&route.provider, route.api_key.as_deref());
+                    let mut cache = ctx.provider_cache.lock().unwrap_or_else(|p| p.into_inner());
+                    if cache.remove(&cache_key).is_some() {
+                        tracing::info!(
+                            provider = %route.provider,
+                            "Evicted cached provider after auth error; next request will re-create with fresh credentials"
+                        );
+                    }
+                }
                 let safe_error = providers::sanitize_api_error(&e.to_string());
                 runtime_trace::record_event(
                     "channel_message_error",

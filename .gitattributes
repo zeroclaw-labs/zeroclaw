@@ -21,6 +21,10 @@
 *.bash text eol=lf linguist-language=Shell
 *.ps1 text eol=crlf linguist-language=PowerShell
 
+# Vendored / non-primary language directories (excluded from GitHub language stats)
+web/** linguist-vendored
+marketplace/** linguist-vendored
+
 # Documentation
 *.txt text eol=lf
 LICENSE* text eol=lf

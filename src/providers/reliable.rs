@@ -138,6 +138,34 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
             || msg_lower.contains("invalid"))
 }
 
+/// Check if an error indicates an authentication/authorization failure.
+/// Used by channels to evict cached providers whose OAuth tokens may have
+/// expired so the next request triggers a fresh credential resolution (#5219).
+pub fn is_auth_error(err: &anyhow::Error) -> bool {
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
+        if let Some(status) = reqwest_err.status() {
+            let code = status.as_u16();
+            return code == 401 || code == 403;
+        }
+    }
+
+    let msg_lower = err.to_string().to_lowercase();
+    let hints = [
+        "401 unauthorized",
+        "403 forbidden",
+        "invalid api key",
+        "incorrect api key",
+        "authentication failed",
+        "auth failed",
+        "unauthorized",
+        "invalid token",
+        "token expired",
+        "access_token",
+    ];
+
+    hints.iter().any(|hint| msg_lower.contains(hint))
+}
+
 /// Check if an error is a tool schema validation failure (e.g. Groq returning
 /// "tool call validation failed: attempted to call tool '...' which was not in request").
 /// These errors should NOT be classified as non-retryable because the provider's
@@ -1483,6 +1511,19 @@ mod tests {
         assert!(!is_non_retryable(&anyhow::anyhow!(
             "OpenAI Codex stream error: Your input exceeds the context window of this model."
         )));
+    }
+
+    #[test]
+    fn auth_error_detects_common_patterns() {
+        assert!(is_auth_error(&anyhow::anyhow!("401 Unauthorized")));
+        assert!(is_auth_error(&anyhow::anyhow!("403 Forbidden")));
+        assert!(is_auth_error(&anyhow::anyhow!("invalid api key")));
+        assert!(is_auth_error(&anyhow::anyhow!("authentication failed")));
+        assert!(is_auth_error(&anyhow::anyhow!("token expired")));
+        assert!(!is_auth_error(&anyhow::anyhow!("400 Bad Request")));
+        assert!(!is_auth_error(&anyhow::anyhow!("429 Too Many Requests")));
+        assert!(!is_auth_error(&anyhow::anyhow!("timeout")));
+        assert!(!is_auth_error(&anyhow::anyhow!("connection reset")));
     }
 
     #[tokio::test]

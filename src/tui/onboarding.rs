@@ -567,6 +567,22 @@ impl App {
     }
 }
 
+fn provider_supports_keyless_local_usage(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        "ollama" | "llamacpp" | "sglang" | "vllm" | "osaurus"
+    )
+}
+
+fn provider_uses_oauth_without_api_key(provider_id: &str) -> bool {
+    matches!(provider_id, "openai-codex")
+}
+
+fn provider_skips_api_key_input(provider_id: &str) -> bool {
+    provider_supports_keyless_local_usage(provider_id)
+        || provider_uses_oauth_without_api_key(provider_id)
+}
+
 // ── Public entry point ──────────────────────────────────────────────
 
 pub async fn run_tui_onboarding() -> Result<()> {
@@ -1154,7 +1170,14 @@ fn handle_input(app: &mut App, key: KeyCode) {
                 nav_down(&mut app.provider_idx, max);
                 scroll_into_view(&mut app.provider_scroll, app.provider_idx, 16);
             }
-            KeyCode::Enter => app.screen = Screen::ApiKeyInput,
+            KeyCode::Enter => {
+                if provider_skips_api_key_input(app.selected_provider_id()) {
+                    app.api_key_input.clear();
+                    app.screen = Screen::ProviderNotes;
+                } else {
+                    app.screen = Screen::ApiKeyInput;
+                }
+            }
             KeyCode::Esc => app.screen = Screen::ProviderTier,
             _ => {}
         },
@@ -1164,7 +1187,7 @@ fn handle_input(app: &mut App, key: KeyCode) {
             KeyCode::Backspace => {
                 app.api_key_input.pop();
             }
-            KeyCode::Enter if !app.api_key_input.is_empty() => {
+            KeyCode::Enter => {
                 app.screen = Screen::ProviderNotes;
             }
             KeyCode::Esc => {
@@ -1990,9 +2013,30 @@ fn render_api_key(frame: &mut Frame, area: Rect, app: &App) {
         },
         layout[1],
     );
+    let provider_id = app.selected_provider_id();
+    let prompt = if provider_uses_oauth_without_api_key(provider_id) {
+        format!(
+            "{} uses OAuth (no API key). Press Enter to continue.",
+            app.selected_provider()
+        )
+    } else if provider_supports_keyless_local_usage(provider_id) {
+        format!(
+            "{} is local-first (no API key required). Press Enter to continue.",
+            app.selected_provider()
+        )
+    } else if provider_id == "bedrock" {
+        "Bedrock uses AWS credentials (AK/SK), not a single API key. Press Enter to continue."
+            .to_string()
+    } else {
+        format!(
+            "Enter {} API key (or press Enter to skip)",
+            app.selected_provider()
+        )
+    };
+
     frame.render_widget(
         InputPrompt {
-            label: &format!("Enter {} API key", app.selected_provider()),
+            label: &prompt,
             input: &app.api_key_input,
             masked: true,
         },
@@ -2020,10 +2064,23 @@ fn render_provider_notes(frame: &mut Frame, area: Rect, app: &App) {
         },
         layout[1],
     );
+    let provider_id = app.selected_provider_id();
+    let api_key_status = if !app.api_key_input.is_empty() {
+        "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022} (set)".to_string()
+    } else if provider_uses_oauth_without_api_key(provider_id) {
+        "OAuth login required (no API key)".to_string()
+    } else if provider_supports_keyless_local_usage(provider_id) {
+        "not required (local provider)".to_string()
+    } else if provider_id == "bedrock" {
+        "use AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY".to_string()
+    } else {
+        "not set (optional for now)".to_string()
+    };
+
     frame.render_widget(
         ConfirmedLine {
             label: "API key",
-            value: "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022} (set)",
+            value: &api_key_status,
         },
         layout[2],
     );
@@ -3666,6 +3723,38 @@ mod tests {
         );
         assert!(config.hooks.enabled);
         assert_eq!(config.gateway.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn provider_select_skips_api_key_for_openai_codex() {
+        let mut app = test_app();
+        app.screen = Screen::ProviderSelect;
+        app.provider_tier_idx = 0;
+        app.provider_idx = 4; // OpenAI Codex
+
+        handle_input(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::ProviderNotes);
+    }
+
+    #[test]
+    fn provider_select_skips_api_key_for_ollama_local() {
+        let mut app = test_app();
+        app.screen = Screen::ProviderSelect;
+        app.provider_tier_idx = 4;
+        app.provider_idx = 0; // Ollama
+
+        handle_input(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::ProviderNotes);
+    }
+
+    #[test]
+    fn api_key_screen_allows_empty_enter_to_continue() {
+        let mut app = test_app();
+        app.screen = Screen::ApiKeyInput;
+        app.api_key_input.clear();
+
+        handle_input(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::ProviderNotes);
     }
 
     // ── TOML round-trip: verify serialization ───────────────────────
