@@ -712,6 +712,9 @@ pub struct ProviderRuntimeOptions {
     /// When true, system messages are merged into the first user message before
     /// sending. Propagated from `ModelProviderConfig::merge_system_into_user`.
     pub merge_system_into_user: bool,
+    /// When true, tools are sent via the provider's native API parameter
+    /// (e.g. Ollama's `/api/chat` `tools` field) instead of prompt-guided XML.
+    pub native_tools: bool,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -728,6 +731,7 @@ impl Default for ProviderRuntimeOptions {
             api_path: None,
             provider_max_tokens: None,
             merge_system_into_user: false,
+            native_tools: false,
         }
     }
 }
@@ -756,6 +760,26 @@ pub fn provider_runtime_options_from_config(
         .map(|p| p.merge_system_into_user)
         .unwrap_or(false);
 
+    // Resolve native_tools from the active model provider profile, same lookup
+    // strategy as merge_system_into_user above.
+    let native_tools = config
+        .api_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .and_then(|active_url| {
+            config.model_providers.values().find(|p| {
+                p.base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|u| !u.is_empty())
+                    .map(|u| u.trim_end_matches('/'))
+                    == Some(active_url.trim_end_matches('/'))
+            })
+        })
+        .map(|p| p.native_tools)
+        .unwrap_or(false);
+
     ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: config.api_url.clone(),
@@ -768,6 +792,7 @@ pub fn provider_runtime_options_from_config(
         api_path: config.api_path.clone(),
         provider_max_tokens: config.provider_max_tokens,
         merge_system_into_user,
+        native_tools,
     }
 }
 
@@ -1202,11 +1227,17 @@ fn create_provider_with_url_and_options(
 
             let api_url = env_url.as_deref().or(api_url);
 
-            Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
-                api_url,
-                key,
-                options.reasoning_enabled,
-            )))
+            // Allow enabling native tool calling via config or env var.
+            let native_tools = options.native_tools
+                || std::env::var("OLLAMA_NATIVE_TOOLS")
+                    .ok()
+                    .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                    .unwrap_or(false);
+
+            Ok(Box::new(
+                ollama::OllamaProvider::new_with_reasoning(api_url, key, options.reasoning_enabled)
+                    .with_native_tools(native_tools),
+            ))
         }
         "gemini" | "google" | "google-gemini" => {
             let state_dir = options.zeroclaw_dir.clone().unwrap_or_else(|| {

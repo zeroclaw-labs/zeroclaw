@@ -11,6 +11,11 @@ pub struct OllamaProvider {
     base_url: String,
     api_key: Option<String>,
     reasoning_enabled: Option<bool>,
+    /// When `true`, the provider sends tool definitions via the native
+    /// `/api/chat` `tools` parameter instead of injecting XML instructions
+    /// into the system prompt. Many modern Ollama models (qwen3.5, llama3.3,
+    /// mistral, etc.) support this. Defaults to `false` for backward compat.
+    native_tools: bool,
 }
 
 // ─── Request Structures ───────────────────────────────────────────────────────
@@ -144,7 +149,16 @@ impl OllamaProvider {
             base_url: Self::normalize_base_url(base_url.unwrap_or("http://localhost:11434")),
             api_key,
             reasoning_enabled,
+            native_tools: false,
         }
+    }
+
+    /// Enable or disable native tool calling via the `/api/chat` `tools`
+    /// parameter. When enabled, tool definitions are sent natively instead of
+    /// being injected as XML instructions in the system prompt.
+    pub fn with_native_tools(mut self, enabled: bool) -> Self {
+        self.native_tools = enabled;
+        self
     }
 
     fn is_local_endpoint(&self) -> bool {
@@ -631,7 +645,7 @@ impl OllamaProvider {
 impl Provider for OllamaProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
-            native_tool_calling: false,
+            native_tool_calling: self.native_tools,
             vision: true,
             prompt_caching: false,
         }
@@ -825,13 +839,7 @@ impl Provider for OllamaProvider {
     }
 
     fn supports_native_tools(&self) -> bool {
-        // Default to prompt-guided tool calling (XML instructions in system prompt)
-        // because many Ollama-served models do not support Ollama's native
-        // /api/chat tool-calling parameter. Models that lack support silently
-        // ignore the tools array and emit tool-call JSON as plain text, which the
-        // agent loop cannot parse without the XML protocol instructions.
-        // See: https://github.com/zeroclaw-labs/zeroclaw/issues/3999
-        false
+        self.native_tools
     }
 
     async fn chat(
@@ -1230,7 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_disable_native_tools_and_enable_vision() {
+    fn capabilities_default_disables_native_tools_and_enables_vision() {
         let provider = OllamaProvider::new(None, None);
         let caps = <OllamaProvider as Provider>::capabilities(&provider);
         assert!(
@@ -1238,6 +1246,17 @@ mod tests {
             "Ollama should default to prompt-guided tool calling"
         );
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn capabilities_with_native_tools_enabled() {
+        let provider = OllamaProvider::new(None, None).with_native_tools(true);
+        let caps = <OllamaProvider as Provider>::capabilities(&provider);
+        assert!(
+            caps.native_tool_calling,
+            "Ollama with native_tools=true should report native tool calling"
+        );
+        assert!(provider.supports_native_tools());
     }
 
     #[test]

@@ -591,6 +591,13 @@ pub struct ModelProviderConfig {
     /// whose chat template rejects system messages at non-first positions.
     #[serde(default)]
     pub merge_system_into_user: bool,
+    /// When true, tools are sent via the provider's native API parameter
+    /// instead of being injected as XML instructions in the system prompt.
+    /// Useful for Ollama models that support native tool calling (e.g.
+    /// qwen3.5, llama3.3, mistral). Can also be set via env var
+    /// `OLLAMA_NATIVE_TOOLS=true`. Default: false.
+    #[serde(default)]
+    pub native_tools: bool,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
