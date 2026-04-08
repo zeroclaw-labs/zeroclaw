@@ -28,7 +28,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: signal-cli-daemon
-          image: registry.gitlab.com/packaging/signal-cli/signal-cli-native:v0-13-24-2
+          image: registry.gitlab.com/packaging/signal-cli/signal-cli-native:v0-14-1-2
           imagePullPolicy: IfNotPresent
           command:
             - sh
