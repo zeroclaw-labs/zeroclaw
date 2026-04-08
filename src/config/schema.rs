@@ -829,6 +829,12 @@ pub struct PresentationConfig {
     /// Directory for overflow file storage. Default: "/tmp/cmd-output".
     #[serde(default = "default_overflow_dir")]
     pub overflow_dir: String,
+
+    /// Convert JSON tool responses to pipe-delimited plain text before sending
+    /// to the LLM. Prevents collision with Gemma 4's native tool response
+    /// syntax (`{`, `}`, `:`, `"`). Default: false.
+    #[serde(default)]
+    pub flatten_json_responses: bool,
 }
 
 impl Default for PresentationConfig {
@@ -839,6 +845,7 @@ impl Default for PresentationConfig {
             strip_ansi: default_true(),
             show_metadata: default_true(),
             overflow_dir: default_overflow_dir(),
+            flatten_json_responses: false,
         }
     }
 }
