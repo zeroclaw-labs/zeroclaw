@@ -71,6 +71,9 @@ pub struct Agent {
     /// When MCP deferred loading is enabled, tools are activated via `tool_search`
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// Hook runner for tool-call auditing and lifecycle side effects.
+    /// See issue #5462.
+    hook_runner: Option<Arc<crate::hooks::HookRunner>>,
 }
 
 pub struct AgentBuilder {
@@ -99,6 +102,7 @@ pub struct AgentBuilder {
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    hook_runner: Option<Arc<crate::hooks::HookRunner>>,
 }
 
 impl AgentBuilder {
@@ -129,6 +133,7 @@ impl AgentBuilder {
             security_summary: None,
             autonomy_level: None,
             activated_tools: None,
+            hook_runner: None,
         }
     }
 
@@ -269,6 +274,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn hook_runner(mut self, runner: Option<Arc<crate::hooks::HookRunner>>) -> Self {
+        self.hook_runner = runner;
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -325,6 +335,7 @@ impl AgentBuilder {
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
+            hook_runner: self.hook_runner,
         })
     }
 }
@@ -556,14 +567,30 @@ impl Agent {
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(config.autonomy.level)
             .activated_tools(activated_tools)
+            .hook_runner(if config.hooks.enabled {
+                let mut runner = crate::hooks::HookRunner::new();
+                if config.hooks.builtin.command_logger {
+                    runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+                }
+                if config.hooks.builtin.webhook_audit.enabled {
+                    runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
+                        config.hooks.builtin.webhook_audit.clone(),
+                    )));
+                }
+                Some(Arc::new(runner))
+            } else {
+                None
+            })
             .build()
     }
 
     /// Trims history for `ConversationMessage` (which wraps `ChatMessage` in an
-    /// enum). Mirrors the user-boundary alignment logic from
-    /// [`crate::agent::history::align_to_user_boundary`] but operates on
-    /// `ConversationMessage` directly because the shared helper is typed for
-    /// `ChatMessage` and cannot be reused here without a type-level refactor.
+    /// enum). After the bulk drop, skips leading orphan [`ToolResults`] when
+    /// the cut splits an `AssistantToolCalls` / `ToolResults` pair, then aligns
+    /// the first retained message to a user [`Chat`] turn (same intent as
+    /// [`crate::agent::history::align_to_user_boundary`] on `ChatMessage`
+    /// history). The shared helper is typed for `ChatMessage` only, so this
+    /// stays on `ConversationMessage` without a type-level refactor.
     fn trim_history(&mut self) {
         let max = self.config.max_history_messages;
         if self.history.len() <= max {
@@ -583,18 +610,40 @@ impl Agent {
         }
 
         if other_messages.len() > max {
-            let mut drain_end = other_messages.len() - max;
-            while drain_end < other_messages.len() {
+            let mut drop_count = other_messages.len() - max;
+
+            // Avoid creating orphan ToolResults: if the first message remaining
+            // after the drop is a ToolResults, its paired AssistantToolCalls was
+            // dropped, so the ToolResults must be dropped too. Otherwise the
+            // history would start with a tool_result block whose tool_use_id
+            // has no matching tool_use, causing providers (e.g. Anthropic) to
+            // reject the request with "messages.0.content.0: unexpected
+            // tool_use_id found in tool_result blocks".
+            while drop_count < other_messages.len()
+                && matches!(
+                    &other_messages[drop_count],
+                    ConversationMessage::ToolResults(_)
+                )
+            {
+                drop_count += 1;
+            }
+
+            // Align so the first retained non-system message is a user `Chat`
+            // (see [`crate::agent::history::align_to_user_boundary`] on
+            // `ChatMessage` history). Extends the left drain past assistant /
+            // tool roles until a user turn is at the boundary.
+            while drop_count < other_messages.len() {
                 let is_user = matches!(
-                    &other_messages[drain_end],
+                    &other_messages[drop_count],
                     ConversationMessage::Chat(chat) if chat.role == "user"
                 );
                 if is_user {
                     break;
                 }
-                drain_end += 1;
+                drop_count += 1;
             }
-            other_messages.drain(0..drain_end);
+
+            other_messages.drain(0..drop_count);
         }
 
         self.history = system_messages;
@@ -621,67 +670,110 @@ impl Agent {
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
         let start = Instant::now();
 
-        // First try to find tool in static registry, then in activated MCP tools.
-        let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
-            match tool.execute(call.arguments.clone()).await {
-                Ok(r) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
-                        success: r.success,
-                    });
-                    if r.success {
-                        r.output
-                    } else {
-                        format!("Error: {}", r.error.unwrap_or(r.output))
-                    }
+        // ── Hook: before_tool_call (modifying) ──────────────────
+        // Mirrors the hook pipeline in run_tool_call_loop (loop_.rs) so that
+        // library-integrated runs honour the same hook chain.  See #5462.
+        let mut tool_name = call.name.clone();
+        let mut tool_args = call.arguments.clone();
+        if let Some(ref hooks) = self.hook_runner {
+            match hooks
+                .run_before_tool_call(tool_name.clone(), tool_args.clone())
+                .await
+            {
+                crate::hooks::HookResult::Continue((n, a)) => {
+                    tool_name = n;
+                    tool_args = a;
                 }
-                Err(e) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
+                crate::hooks::HookResult::Cancel(reason) => {
+                    tracing::info!(
+                        tool = %call.name, %reason,
+                        "tool call cancelled by hook"
+                    );
+                    return ToolExecutionResult {
+                        name: call.name.clone(),
+                        output: format!("Cancelled by hook: {reason}"),
                         success: false,
-                    });
-                    format!("Error executing {}: {e}", call.name)
+                        tool_call_id: call.tool_call_id.clone(),
+                    };
                 }
             }
-        } else if let Some(activated_arc) = self.activated_tools.as_ref() {
-            // Try to find in activated MCP tools.
-            let activated_opt = activated_arc.lock().unwrap().get_resolved(&call.name);
-            if let Some(tool) = activated_opt {
-                match tool.execute(call.arguments.clone()).await {
+        }
+
+        // First try to find tool in static registry, then in activated MCP tools.
+        let (result, success) =
+            if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
+                match tool.execute(tool_args.clone()).await {
                     Ok(r) => {
                         self.observer.record_event(&ObserverEvent::ToolCall {
-                            tool: call.name.clone(),
+                            tool: tool_name.clone(),
                             duration: start.elapsed(),
                             success: r.success,
                         });
                         if r.success {
-                            r.output
+                            (r.output, true)
                         } else {
-                            format!("Error: {}", r.error.unwrap_or(r.output))
+                            (format!("Error: {}", r.error.unwrap_or(r.output)), false)
                         }
                     }
                     Err(e) => {
                         self.observer.record_event(&ObserverEvent::ToolCall {
-                            tool: call.name.clone(),
+                            tool: tool_name.clone(),
                             duration: start.elapsed(),
                             success: false,
                         });
-                        format!("Error executing {}: {e}", call.name)
+                        (format!("Error executing {}: {e}", tool_name), false)
                     }
                 }
+            } else if let Some(activated_arc) = self.activated_tools.as_ref() {
+                let activated_opt = activated_arc.lock().unwrap().get_resolved(&tool_name);
+                if let Some(tool) = activated_opt {
+                    match tool.execute(tool_args.clone()).await {
+                        Ok(r) => {
+                            self.observer.record_event(&ObserverEvent::ToolCall {
+                                tool: tool_name.clone(),
+                                duration: start.elapsed(),
+                                success: r.success,
+                            });
+                            if r.success {
+                                (r.output, true)
+                            } else {
+                                (format!("Error: {}", r.error.unwrap_or(r.output)), false)
+                            }
+                        }
+                        Err(e) => {
+                            self.observer.record_event(&ObserverEvent::ToolCall {
+                                tool: tool_name.clone(),
+                                duration: start.elapsed(),
+                                success: false,
+                            });
+                            (format!("Error executing {}: {e}", tool_name), false)
+                        }
+                    }
+                } else {
+                    (format!("Unknown tool: {}", tool_name), false)
+                }
             } else {
-                format!("Unknown tool: {}", call.name)
-            }
-        } else {
-            format!("Unknown tool: {}", call.name)
-        };
+                (format!("Unknown tool: {}", tool_name), false)
+            };
+
+        let duration = start.elapsed();
+
+        // ── Hook: after_tool_call (void) ─────────────────────────
+        if let Some(ref hooks) = self.hook_runner {
+            let tool_result_obj = crate::tools::ToolResult {
+                success,
+                output: result.clone(),
+                error: None,
+            };
+            hooks
+                .fire_after_tool_call(&tool_name, &tool_result_obj, duration)
+                .await;
+        }
 
         ToolExecutionResult {
-            name: call.name.clone(),
+            name: tool_name,
             output: result,
-            success: true,
+            success,
             tool_call_id: call.tool_call_id.clone(),
         }
     }
@@ -1948,5 +2040,106 @@ mod tests {
             matches!(&agent.history[1], ConversationMessage::Chat(m) if m.role == "user" && m.content == "u2"),
             "first non-system message should be user after boundary alignment"
         );
+    }
+
+    /// Reproduction test for the orphan-tool_results trim bug.
+    ///
+    /// `trim_history` previously dropped the oldest N entries blindly. When
+    /// the boundary fell in the middle of an `AssistantToolCalls` /
+    /// `ToolResults` pair, the call side was dropped while the result side
+    /// remained — leaving an orphan `ToolResults` at the head of the
+    /// history. The next provider request then started with a `tool_result`
+    /// block that had no matching `tool_use`, which Anthropic rejects with:
+    ///
+    ///   `messages.0.content.0: unexpected tool_use_id found in tool_result blocks`
+    ///
+    /// To reliably reproduce the bug we need the drop boundary to fall in
+    /// the middle of a pair. Five entries (`AC1, TR1, AC2, TR2, AC3`) with
+    /// `max = 4` makes `drop_count = 1`, which removes `AC1` and leaves
+    /// `TR1` as an orphan at the head.
+    #[test]
+    fn trim_history_does_not_leave_orphan_tool_results() {
+        use crate::providers::{ToolCall, ToolResultMessage};
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let mut agent_config = crate::config::AgentConfig::default();
+        // Force trimming with the boundary landing inside a pair:
+        // 5 entries (AC, TR, AC, TR, AC) > 4 → drop_count = 1 → AC1 dropped,
+        // TR1 left as an orphan unless the trim guards against it.
+        agent_config.max_history_messages = 4;
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(agent_config)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        // Build the history: AC1, TR1, AC2, TR2, AC3 (no trailing TR3).
+        for i in 1..=3 {
+            agent.history.push(ConversationMessage::AssistantToolCalls {
+                text: Some(format!("Calling tool {i}")),
+                tool_calls: vec![ToolCall {
+                    id: format!("tc{i}"),
+                    name: format!("tool{i}"),
+                    arguments: "{}".into(),
+                }],
+                reasoning_content: None,
+            });
+            // Skip the trailing ToolResults for the last AssistantToolCalls
+            // so the entry count is 5, not 6, and the drop boundary lands
+            // mid-pair.
+            if i < 3 {
+                agent
+                    .history
+                    .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        tool_call_id: format!("tc{i}"),
+                        content: format!("result{i}"),
+                    }]));
+            }
+        }
+
+        assert_eq!(agent.history.len(), 5);
+        agent.trim_history();
+
+        // After trimming, the surviving history must not start with a
+        // ToolResults entry (that would be an orphan whose AssistantToolCalls
+        // partner was dropped).
+        if let Some(first) = agent.history.first() {
+            assert!(
+                !matches!(first, ConversationMessage::ToolResults(_)),
+                "trim_history left an orphan ToolResults at the head of the \
+                 history; this would cause Anthropic to reject the next \
+                 request with 'unexpected tool_use_id found in tool_result \
+                 blocks'"
+            );
+        }
+
+        // Every ToolResults entry must be immediately preceded by an
+        // AssistantToolCalls entry.
+        for window in agent.history.windows(2) {
+            if matches!(&window[1], ConversationMessage::ToolResults(_)) {
+                assert!(
+                    matches!(&window[0], ConversationMessage::AssistantToolCalls { .. }),
+                    "ToolResults entry is not preceded by an AssistantToolCalls \
+                     entry — pair was split during trim"
+                );
+            }
+        }
     }
 }
