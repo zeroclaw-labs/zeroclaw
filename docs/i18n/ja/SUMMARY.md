@@ -30,6 +30,7 @@
 
 - [setup-guides/README.md](setup-guides/README.md)
 - [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)
+- [mcp-setup.md](setup-guides/mcp-setup.md)
 
 ### 2) コマンド・設定リファレンスと統合
 

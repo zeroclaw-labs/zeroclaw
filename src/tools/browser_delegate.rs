@@ -18,9 +18,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
+use zeroclaw_macros::Configurable;
 
 /// Configuration for browser delegation (`[browser_delegate]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[prefix = "browser-delegate"]
 pub struct BrowserDelegateConfig {
     /// Enable browser delegation tool.
     #[serde(default)]

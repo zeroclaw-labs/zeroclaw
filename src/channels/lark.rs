@@ -2980,6 +2980,7 @@ mod tests {
     fn lark_config_serde() {
         use crate::config::schema::{LarkConfig, LarkReceiveMode};
         let lc = LarkConfig {
+            enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
@@ -3003,6 +3004,7 @@ mod tests {
     fn lark_config_toml_roundtrip() {
         use crate::config::schema::{LarkConfig, LarkReceiveMode};
         let lc = LarkConfig {
+            enabled: true,
             app_id: "app".into(),
             app_secret: "secret".into(),
             encrypt_key: None,
@@ -3038,6 +3040,7 @@ mod tests {
         use crate::config::schema::{LarkConfig, LarkReceiveMode};
 
         let cfg = LarkConfig {
+            enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
@@ -3063,6 +3066,7 @@ mod tests {
         use crate::config::schema::{LarkConfig, LarkReceiveMode};
 
         let cfg = LarkConfig {
+            enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
@@ -3087,6 +3091,7 @@ mod tests {
         use crate::config::schema::{FeishuConfig, LarkReceiveMode};
 
         let cfg = FeishuConfig {
+            enabled: true,
             app_id: "cli_feishu_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,
@@ -3286,6 +3291,7 @@ mod tests {
         );
 
         let feishu_cfg = crate::config::schema::FeishuConfig {
+            enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
             encrypt_key: None,

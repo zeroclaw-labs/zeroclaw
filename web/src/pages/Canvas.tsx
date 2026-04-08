@@ -259,7 +259,7 @@ export default function Canvas() {
           {currentFrame ? (
             <iframe
               ref={iframeRef}
-              sandbox="allow-scripts"
+              sandbox="allow-scripts allow-same-origin"
               className="w-full h-full border-0"
               title={`Canvas: ${canvasId}`}
               style={{ background: 'var(--pc-bg-base)' }}
