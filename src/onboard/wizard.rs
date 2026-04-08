@@ -1,7 +1,7 @@
 use crate::cli_input::Input;
 use crate::config::schema::{
-    DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, NextcloudTalkConfig, QQConfig,
-    SignalConfig, StreamMode, WhatsAppConfig,
+    DingTalkConfig, IrcConfig, LarkReceiveMode, LineConfig, LinqConfig, NextcloudTalkConfig,
+    QQConfig, SignalConfig, StreamMode, WhatsAppConfig,
 };
 #[cfg(feature = "channel-nostr")]
 use crate::config::schema::{NostrConfig, default_nostr_relays};
@@ -3557,6 +3557,7 @@ enum ChannelMenuChoice {
     Matrix,
     Signal,
     WhatsApp,
+    Line,
     Linq,
     Irc,
     Webhook,
@@ -3578,6 +3579,7 @@ const CHANNEL_MENU_CHOICES: &[ChannelMenuChoice] = &[
     ChannelMenuChoice::Matrix,
     ChannelMenuChoice::Signal,
     ChannelMenuChoice::WhatsApp,
+    ChannelMenuChoice::Line,
     ChannelMenuChoice::Linq,
     ChannelMenuChoice::Irc,
     ChannelMenuChoice::Webhook,
@@ -3662,6 +3664,14 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                         "✅ connected"
                     } else {
                         "— Business Cloud API"
+                    }
+                ),
+                ChannelMenuChoice::Line => format!(
+                    "LINE       {}",
+                    if config.line.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— LINE Messaging API"
                     }
                 ),
                 ChannelMenuChoice::Linq => format!(
@@ -5499,6 +5509,154 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     style("✅").green().bold(),
                     style(relays.len()).cyan()
                 );
+            }
+            ChannelMenuChoice::Line => {
+                // ── LINE ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("LINE Setup").white().bold(),
+                    style("— LINE Messaging API").dim()
+                );
+                print_bullet("1. Go to https://developers.line.biz and sign in");
+                print_bullet("2. Create a provider → Create a Messaging API channel");
+                print_bullet(
+                    "3. Go to \"Messaging API\" tab → issue a Long-lived Channel access token",
+                );
+                print_bullet("4. Copy the Channel secret from \"Basic settings\" tab");
+                print_bullet("5. Set the Webhook URL to https://<your-host>:<port>/line/webhook");
+                print_bullet("6. Enable \"Use webhook\" and \"Allow bot to join group chats\"");
+                println!();
+
+                let has_existing_ln = config.line.is_some();
+
+                let token_prompt = if has_existing_ln {
+                    "  Channel access token (Enter to keep existing)"
+                } else {
+                    "  Channel access token (long-lived, from Messaging API tab)"
+                };
+                let token_input: String = Input::new()
+                    .with_prompt(token_prompt)
+                    .allow_empty(has_existing_ln)
+                    .interact_text()?;
+                let channel_access_token = if token_input.trim().is_empty() && has_existing_ln {
+                    config.line.as_ref().unwrap().channel_access_token.clone()
+                } else {
+                    token_input
+                };
+
+                if channel_access_token.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                let secret_prompt = if has_existing_ln {
+                    "  Channel secret (Enter to keep existing)"
+                } else {
+                    "  Channel secret (from Basic settings tab)"
+                };
+                let secret_input: String = Input::new()
+                    .with_prompt(secret_prompt)
+                    .allow_empty(has_existing_ln)
+                    .interact_text()?;
+                let channel_secret = if secret_input.trim().is_empty() && has_existing_ln {
+                    config.line.as_ref().unwrap().channel_secret.clone()
+                } else {
+                    secret_input
+                };
+
+                if channel_secret.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                // Test connection via GET /v2/bot/info
+                print!("  {} Testing connection... ", style("⏳").dim());
+                let token_clone = channel_access_token.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let resp = client
+                        .get("https://api.line.me/v2/bot/info")
+                        .bearer_auth(&token_clone)
+                        .send()?;
+                    let ok = resp.status().is_success();
+                    let data: serde_json::Value = resp.json().unwrap_or_default();
+                    let display_name = data
+                        .get("displayName")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    Ok::<_, reqwest::Error>((ok, display_name))
+                })
+                .join();
+                match thread_result {
+                    Ok(Ok((true, display_name))) => {
+                        println!(
+                            "\r  {} Connected as {display_name}        ",
+                            style("✅").green().bold()
+                        );
+                    }
+                    _ => {
+                        println!(
+                            "\r  {} Connection failed — check your Channel access token",
+                            style("❌").red().bold()
+                        );
+                        continue;
+                    }
+                }
+
+                let port_default = config
+                    .line
+                    .as_ref()
+                    .map(|ln| ln.webhook_port.to_string())
+                    .unwrap_or_else(|| "8443".to_string());
+                let port_str: String = Input::new()
+                    .with_prompt("  Webhook port (default 8443)")
+                    .default(port_default)
+                    .interact_text()?;
+                let webhook_port: u16 = port_str.trim().parse().unwrap_or(8443);
+
+                let users_default = config
+                    .line
+                    .as_ref()
+                    .map(|ln| ln.allowed_users.join(", "))
+                    .unwrap_or_default();
+                let users_str: String = Input::new()
+                    .with_prompt("  Allowed LINE user IDs (comma-separated, '*' for all)")
+                    .default(users_default)
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let allowed_users: Vec<String> = if users_str.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    users_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+
+                if allowed_users.is_empty() {
+                    println!(
+                        "  {} No users allowlisted — LINE inbound messages will be denied until you add a LINE user ID or '*'.",
+                        style("⚠").yellow().bold()
+                    );
+                }
+
+                println!(
+                    "  {} Remember to set Webhook URL in LINE Developers Console:",
+                    style("ℹ").cyan().bold()
+                );
+                println!("      https://<your-host>:{webhook_port}/line/webhook");
+
+                config.line = Some(LineConfig {
+                    channel_access_token,
+                    channel_secret,
+                    allowed_users,
+                    webhook_port,
+                    proxy_url: config.line.as_ref().and_then(|ln| ln.proxy_url.clone()),
+                });
             }
             ChannelMenuChoice::Done => break,
         }

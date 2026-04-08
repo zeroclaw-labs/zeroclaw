@@ -28,6 +28,7 @@ pub mod imessage;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
 pub mod lark;
+pub mod line;
 pub mod link_enricher;
 pub mod linq;
 #[cfg(feature = "channel-matrix")]
@@ -77,6 +78,7 @@ pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 #[cfg(feature = "channel-lark")]
 pub use lark::LarkChannel;
+pub use line::LineChannel;
 pub use linq::LinqChannel;
 #[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixChannel;
@@ -4518,6 +4520,21 @@ fn collect_configured_channels(
 ) -> Vec<ConfiguredChannel> {
     let _ = matrix_skip_context;
     let mut channels = Vec::new();
+
+    if let Some(ref ln) = config.channels_config.line {
+        channels.push(ConfiguredChannel {
+            display_name: "LINE",
+            channel: Arc::new(
+                LineChannel::new(
+                    ln.channel_access_token.clone(),
+                    ln.channel_secret.clone(),
+                    ln.allowed_users.clone(),
+                    ln.webhook_port,
+                )
+                .with_proxy_url(ln.proxy_url.clone()),
+            ),
+        });
+    }
 
     if let Some(ref tg) = config.channels_config.telegram {
         let ack = tg

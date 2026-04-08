@@ -6104,6 +6104,8 @@ pub struct ChannelsConfig {
     /// Enable the CLI interactive channel. Default: `true`.
     #[serde(default = "default_true")]
     pub cli: bool,
+    /// LINE Messaging API channel configuration.
+    pub line: Option<LineConfig>,
     /// Telegram bot channel configuration.
     pub telegram: Option<TelegramConfig>,
     /// Discord bot channel configuration.
@@ -6204,6 +6206,10 @@ impl ChannelsConfig {
     #[rustfmt::skip]
     pub fn channels_except_webhook(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
         vec![
+            (
+                Box::new(ConfigWrapper::new(self.line.as_ref())),
+                self.line.is_some(),
+            ),
             (
                 Box::new(ConfigWrapper::new(self.telegram.as_ref())),
                 self.telegram.is_some(),
@@ -6331,6 +6337,7 @@ impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
             cli: true,
+            line: None,
             telegram: None,
             discord: None,
             discord_history: None,
@@ -6398,6 +6405,40 @@ fn default_multi_message_delay_ms() -> u64 {
 
 fn default_matrix_draft_update_interval_ms() -> u64 {
     1500
+}
+
+/// LINE Messaging API channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LineConfig {
+    /// Long-lived channel access token (from LINE Developers Console).
+    /// Used for both the Reply API and the Push API fallback.
+    pub channel_access_token: String,
+    /// Channel secret (from LINE Developers Console).
+    /// Used to verify the `X-Line-Signature` header on incoming webhooks.
+    pub channel_secret: String,
+    /// Allowed LINE user IDs. `["*"]` accepts anyone; empty list denies all.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// TCP port the embedded webhook server listens on. Default: `8443`.
+    #[serde(default = "default_line_webhook_port")]
+    pub webhook_port: u16,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+}
+
+fn default_line_webhook_port() -> u16 {
+    8443
+}
+
+impl ChannelConfig for LineConfig {
+    fn name() -> &'static str {
+        "LINE"
+    }
+    fn desc() -> &'static str {
+        "connect your LINE bot"
+    }
 }
 
 /// Telegram bot channel configuration.
@@ -11526,6 +11567,7 @@ auto_save = true
             cron: CronConfig::default(),
             channels_config: ChannelsConfig {
                 cli: true,
+                line: None,
                 telegram: Some(TelegramConfig {
                     bot_token: "123:ABC".into(),
                     allowed_users: vec!["user1".into()],
@@ -12560,6 +12602,7 @@ allowed_users = ["@ops:matrix.org"]
     async fn channels_config_with_imessage_and_matrix() {
         let c = ChannelsConfig {
             cli: true,
+            line: None,
             telegram: None,
             discord: None,
             discord_history: None,
@@ -12932,6 +12975,7 @@ channel_ids = ["C123", "D456"]
     async fn channels_config_with_whatsapp() {
         let c = ChannelsConfig {
             cli: true,
+            line: None,
             telegram: None,
             discord: None,
             discord_history: None,
