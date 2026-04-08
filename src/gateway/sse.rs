@@ -188,7 +188,9 @@ impl crate::observability::Observer for BroadcastObserver {
         };
 
         self.buffer.push(json.clone());
-        let _ = self.tx.send(json);
+        if let Err(e) = self.tx.send(json) {
+            tracing::warn!(error = %e, "failed to send SSE event");
+        }
     }
 
     fn record_metric(&self, metric: &crate::observability::traits::ObserverMetric) {

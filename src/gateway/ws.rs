@@ -175,15 +175,20 @@ async fn handle_socket(
                 "message": format!("Failed to initialise agent: {e}"),
                 "code": "AGENT_INIT_FAILED"
             });
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
-            let _ = sender
+            if let Err(e) = sender.send(Message::Text(err.to_string().into())).await {
+                tracing::warn!(error = %e, "failed to send agent init error to WebSocket client");
+            }
+            if let Err(e) = sender
                 .send(Message::Close(Some(axum::extract::ws::CloseFrame {
                     code: 1011,
                     reason: axum::extract::ws::Utf8Bytes::from_static(
                         "Agent initialization failed",
                     ),
                 })))
-                .await;
+                .await
+            {
+                tracing::warn!(error = %e, "failed to close WebSocket connection after agent init failure");
+            }
             return;
         }
     };
@@ -203,7 +208,9 @@ async fn handle_socket(
         // Set session name if provided (non-empty) on connect
         if let Some(ref name) = session_name {
             if !name.is_empty() {
-                let _ = backend.set_session_name(&session_key, name);
+                if let Err(e) = backend.set_session_name(&session_key, name) {
+                    tracing::warn!(error = %e, "failed to set session name on connect");
+                }
                 effective_name = Some(name.clone());
             }
         }
@@ -223,9 +230,12 @@ async fn handle_socket(
     if let Some(ref name) = effective_name {
         session_start["name"] = serde_json::Value::String(name.clone());
     }
-    let _ = sender
+    if let Err(e) = sender
         .send(Message::Text(session_start.to_string().into()))
-        .await;
+        .await
+    {
+        tracing::warn!(error = %e, "failed to send session start message");
+    }
 
     // ── Optional connect handshake ──────────────────────────────────
     // The first message may be a `{"type":"connect",...}` frame carrying
@@ -254,7 +264,9 @@ async fn handle_socket(
                             "type": "connected",
                             "message": "Connection established"
                         });
-                        let _ = sender.send(Message::Text(ack.to_string().into())).await;
+                        if let Err(e) = sender.send(Message::Text(ack.to_string().into())).await {
+                            tracing::warn!(error = %e, "failed to send connection ack");
+                        }
                     } else {
                         // Not a connect message — fall through to normal processing
                         first_msg_fallback = Some(text.to_string());
@@ -278,7 +290,9 @@ async fn handle_socket(
                     // Persist user message
                     if let Some(ref backend) = state.session_backend {
                         let user_msg = crate::providers::ChatMessage::user(&content);
-                        let _ = backend.append(&session_key, &user_msg);
+                        if let Err(e) = backend.append(&session_key, &user_msg) {
+                            tracing::warn!(error = %e, "failed to append user message to session (fallback)");
+                        }
                     }
                     process_chat_message(&state, &mut agent, &mut sender, &content, &session_key)
                         .await;
@@ -291,14 +305,18 @@ async fn handle_socket(
                         "Unsupported message type \"{unknown_type}\". Send {{\"type\":\"message\",\"content\":\"your text\"}}"
                     )
                 });
-                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                if let Err(e) = sender.send(Message::Text(err.to_string().into())).await {
+                    tracing::warn!(error = %e, "failed to send unsupported message type error");
+                }
             }
         } else {
             let err = serde_json::json!({
                 "type": "error",
                 "message": "Invalid JSON. Send {\"type\":\"message\",\"content\":\"your text\"}"
             });
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            if let Err(e) = sender.send(Message::Text(err.to_string().into())).await {
+                tracing::warn!(error = %e, "failed to send invalid JSON error");
+            }
         }
     }
 
@@ -326,7 +344,9 @@ async fn handle_socket(
                             "message": format!("Invalid JSON: {}", e),
                             "code": "INVALID_JSON"
                         });
-                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        if let Err(e) = sender.send(Message::Text(err.to_string().into())).await {
+                            tracing::warn!(error = %e, "failed to send parse error to WebSocket client");
+                        }
                         continue;
                     }
                 };
@@ -340,7 +360,9 @@ async fn handle_socket(
                         ),
                         "code": "UNKNOWN_MESSAGE_TYPE"
                     });
-                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                    if let Err(e) = sender.send(Message::Text(err.to_string().into())).await {
+                        tracing::warn!(error = %e, "failed to send unknown message type error");
+                    }
                     continue;
                 }
 
@@ -351,7 +373,9 @@ async fn handle_socket(
                         "message": "Message content cannot be empty",
                         "code": "EMPTY_CONTENT"
                     });
-                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                    if let Err(e) = sender.send(Message::Text(err.to_string().into())).await {
+                        tracing::warn!(error = %e, "failed to send empty content error");
+                    }
                     continue;
                 }
 
@@ -364,7 +388,9 @@ async fn handle_socket(
                             "message": e.to_string(),
                             "code": "SESSION_BUSY"
                         });
-                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        if let Err(e) = sender.send(Message::Text(err.to_string().into())).await {
+                            tracing::warn!(error = %e, "failed to send session busy error");
+                        }
                         continue;
                     }
                 };
@@ -372,7 +398,9 @@ async fn handle_socket(
                 // Persist user message
                 if let Some(ref backend) = state.session_backend {
                     let user_msg = crate::providers::ChatMessage::user(&content);
-                    let _ = backend.append(&session_key, &user_msg);
+                    if let Err(e) = backend.append(&session_key, &user_msg) {
+                        tracing::warn!(error = %e, "failed to append user message to session");
+                    }
                 }
 
                 process_chat_message(&state, &mut agent, &mut sender, &content, &session_key).await;
@@ -381,7 +409,9 @@ async fn handle_socket(
             // ── Broadcast event (cron/heartbeat results) ──────────────
             event = broadcast_rx.recv() => {
                 if let Ok(event) = event {
-                    let _ = sender.send(Message::Text(event.to_string().into())).await;
+                    if let Err(e) = sender.send(Message::Text(event.to_string().into())).await {
+                        tracing::warn!(error = %e, "failed to send broadcast event to WebSocket client");
+                    }
                 }
             }
         }
@@ -409,16 +439,20 @@ async fn process_chat_message(
         .unwrap_or_else(|| "unknown".to_string());
 
     // Broadcast agent_start event
-    let _ = state.event_tx.send(serde_json::json!({
+    if let Err(e) = state.event_tx.send(serde_json::json!({
         "type": "agent_start",
         "provider": provider_label,
         "model": state.model,
-    }));
+    })) {
+        tracing::warn!(error = %e, "failed to broadcast agent_start event");
+    }
 
     // Set session state to running
     let turn_id = uuid::Uuid::new_v4().to_string();
     if let Some(ref backend) = state.session_backend {
-        let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
+        if let Err(e) = backend.set_session_state(session_key, "running", Some(&turn_id)) {
+            tracing::warn!(error = %e, "failed to set session state to running");
+        }
     }
 
     // Channel for streaming turn events from the agent.
@@ -450,7 +484,9 @@ async fn process_chat_message(
                     serde_json::json!({ "type": "tool_result", "name": name, "output": output })
                 }
             };
-            let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
+            if let Err(e) = sender.send(Message::Text(ws_msg.to_string().into())).await {
+                tracing::warn!(error = %e, "failed to send turn event to WebSocket client");
+            }
         }
     };
 
@@ -461,7 +497,9 @@ async fn process_chat_message(
             // Persist assistant response
             if let Some(ref backend) = state.session_backend {
                 let assistant_msg = crate::providers::ChatMessage::assistant(&response);
-                let _ = backend.append(session_key, &assistant_msg);
+                if let Err(e) = backend.append(session_key, &assistant_msg) {
+                    tracing::warn!(error = %e, "failed to append assistant response to session");
+                }
             }
 
             // Fire-and-forget memory consolidation so facts from WS sessions
@@ -490,30 +528,40 @@ async fn process_chat_message(
             // Send chunk_reset so the client clears any accumulated draft
             // before the authoritative done message.
             let reset = serde_json::json!({ "type": "chunk_reset" });
-            let _ = sender.send(Message::Text(reset.to_string().into())).await;
+            if let Err(e) = sender.send(Message::Text(reset.to_string().into())).await {
+                tracing::warn!(error = %e, "failed to send chunk_reset to WebSocket client");
+            }
 
             let done = serde_json::json!({
                 "type": "done",
                 "full_response": response,
             });
-            let _ = sender.send(Message::Text(done.to_string().into())).await;
+            if let Err(e) = sender.send(Message::Text(done.to_string().into())).await {
+                tracing::warn!(error = %e, "failed to send done message to WebSocket client");
+            }
 
             // Set session state to idle
             if let Some(ref backend) = state.session_backend {
-                let _ = backend.set_session_state(session_key, "idle", None);
+                if let Err(e) = backend.set_session_state(session_key, "idle", None) {
+                    tracing::warn!(error = %e, "failed to set session state to idle");
+                }
             }
 
             // Broadcast agent_end event
-            let _ = state.event_tx.send(serde_json::json!({
+            if let Err(e) = state.event_tx.send(serde_json::json!({
                 "type": "agent_end",
                 "provider": provider_label,
                 "model": state.model,
-            }));
+            })) {
+                tracing::warn!(error = %e, "failed to broadcast agent_end event");
+            }
         }
         Err(e) => {
             // Set session state to error
             if let Some(ref backend) = state.session_backend {
-                let _ = backend.set_session_state(session_key, "error", Some(&turn_id));
+                if let Err(e) = backend.set_session_state(session_key, "error", Some(&turn_id)) {
+                    tracing::warn!(error = %e, "failed to set session state to error");
+                }
             }
 
             tracing::error!(error = %e, "Agent turn failed");
@@ -535,14 +583,18 @@ async fn process_chat_message(
                 "message": sanitized,
                 "code": error_code,
             });
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            if let Err(e) = sender.send(Message::Text(err.to_string().into())).await {
+                tracing::warn!(error = %e, "failed to send turn error to WebSocket client");
+            }
 
             // Broadcast error event
-            let _ = state.event_tx.send(serde_json::json!({
+            if let Err(e) = state.event_tx.send(serde_json::json!({
                 "type": "error",
                 "component": "ws_chat",
                 "message": sanitized,
-            }));
+            })) {
+                tracing::warn!(error = %e, "failed to broadcast agent error event");
+            }
         }
     }
 }

@@ -255,7 +255,9 @@ impl Memory for QdrantMemory {
         };
 
         // Delete any existing point with the same key first
-        let _ = self.forget(key).await;
+        if let Err(e) = self.forget(key).await {
+            tracing::warn!(error = %e, key = %key, "failed to forget existing key in qdrant before upsert");
+        }
 
         // Upsert point
         let upsert_body = serde_json::json!({

@@ -370,11 +370,13 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
                 error,
             } => {
                 if let Some(tx) = pending.write().remove(&call_id) {
-                    let _ = tx.send(NodeInvocationResult {
+                    if let Err(e) = tx.send(NodeInvocationResult {
                         success,
                         output,
                         error,
-                    });
+                    }) {
+                        tracing::warn!(?e, "failed to send node invocation result");
+                    }
                 }
             }
         }

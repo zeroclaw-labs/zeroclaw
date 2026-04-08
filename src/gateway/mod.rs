@@ -1109,7 +1109,9 @@ pub async fn run_gateway(
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(async move {
-            let _ = shutdown_rx.changed().await;
+            if let Err(e) = shutdown_rx.changed().await {
+                tracing::warn!(error = %e, "shutdown receiver disconnected unexpectedly");
+            }
             tracing::info!("🦀 ZeroClaw Gateway shutting down...");
         })
         .await?;
@@ -1423,7 +1425,7 @@ async fn handle_webhook(
 
     if state.auto_save && !memory::should_skip_autosave_content(message) {
         let key = webhook_memory_key();
-        let _ = state
+        if let Err(e) = state
             .mem
             .store(
                 &key,
@@ -1431,7 +1433,10 @@ async fn handle_webhook(
                 MemoryCategory::Conversation,
                 session_id.as_deref(),
             )
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, "failed to store webhook message in memory");
+        }
     }
 
     let provider_label = state
@@ -1656,7 +1661,7 @@ async fn handle_whatsapp_message(
         // Auto-save to memory
         if state.auto_save && !memory::should_skip_autosave_content(&msg.content) {
             let key = whatsapp_memory_key(msg);
-            let _ = state
+            if let Err(e) = state
                 .mem
                 .store(
                     &key,
@@ -1664,7 +1669,10 @@ async fn handle_whatsapp_message(
                     MemoryCategory::Conversation,
                     Some(&session_id),
                 )
-                .await;
+                .await
+            {
+                tracing::warn!(error = %e, "failed to store WhatsApp message in memory");
+            }
         }
 
         match Box::pin(run_gateway_chat_with_tools(
@@ -1685,12 +1693,15 @@ async fn handle_whatsapp_message(
             }
             Err(e) => {
                 tracing::error!("LLM error for WhatsApp message: {e:#}");
-                let _ = wa
+                if let Err(e) = wa
                     .send(&SendMessage::new(
                         "Sorry, I couldn't process your message right now.",
                         &msg.reply_target,
                     ))
-                    .await;
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to send WhatsApp error reply");
+                }
             }
         }
     }
@@ -1775,7 +1786,7 @@ async fn handle_linq_webhook(
         // Auto-save to memory
         if state.auto_save && !memory::should_skip_autosave_content(&msg.content) {
             let key = linq_memory_key(msg);
-            let _ = state
+            if let Err(e) = state
                 .mem
                 .store(
                     &key,
@@ -1783,7 +1794,10 @@ async fn handle_linq_webhook(
                     MemoryCategory::Conversation,
                     Some(&session_id),
                 )
-                .await;
+                .await
+            {
+                tracing::warn!(error = %e, "failed to store Linq message in memory");
+            }
         }
 
         // Call the LLM
@@ -1805,12 +1819,15 @@ async fn handle_linq_webhook(
             }
             Err(e) => {
                 tracing::error!("LLM error for Linq message: {e:#}");
-                let _ = linq
+                if let Err(e) = linq
                     .send(&SendMessage::new(
                         "Sorry, I couldn't process your message right now.",
                         &msg.reply_target,
                     ))
-                    .await;
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to send Linq error reply");
+                }
             }
         }
     }
@@ -1890,7 +1907,7 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
         // Auto-save to memory
         if state.auto_save && !memory::should_skip_autosave_content(&msg.content) {
             let key = wati_memory_key(msg);
-            let _ = state
+            if let Err(e) = state
                 .mem
                 .store(
                     &key,
@@ -1898,7 +1915,10 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
                     MemoryCategory::Conversation,
                     Some(&session_id),
                 )
-                .await;
+                .await
+            {
+                tracing::warn!(error = %e, "failed to store WATI message in memory");
+            }
         }
 
         // Call the LLM
@@ -1920,12 +1940,15 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
             }
             Err(e) => {
                 tracing::error!("LLM error for WATI message: {e:#}");
-                let _ = wati
+                if let Err(e) = wati
                     .send(&SendMessage::new(
                         "Sorry, I couldn't process your message right now.",
                         &msg.reply_target,
                     ))
-                    .await;
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to send WATI error reply");
+                }
             }
         }
     }
@@ -2007,7 +2030,7 @@ async fn handle_nextcloud_talk_webhook(
 
         if state.auto_save && !memory::should_skip_autosave_content(&msg.content) {
             let key = nextcloud_talk_memory_key(msg);
-            let _ = state
+            if let Err(e) = state
                 .mem
                 .store(
                     &key,
@@ -2015,7 +2038,10 @@ async fn handle_nextcloud_talk_webhook(
                     MemoryCategory::Conversation,
                     Some(&session_id),
                 )
-                .await;
+                .await
+            {
+                tracing::warn!(error = %e, "failed to store Nextcloud Talk message in memory");
+            }
         }
 
         match Box::pin(run_gateway_chat_with_tools(
@@ -2035,12 +2061,15 @@ async fn handle_nextcloud_talk_webhook(
             }
             Err(e) => {
                 tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
-                let _ = nextcloud_talk
+                if let Err(e) = nextcloud_talk
                     .send(&SendMessage::new(
                         "Sorry, I couldn't process your message right now.",
                         &msg.reply_target,
                     ))
-                    .await;
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to send Nextcloud Talk error reply");
+                }
             }
         }
     }
@@ -2154,7 +2183,9 @@ async fn handle_admin_shutdown(
         message: "Gateway shutdown initiated".to_string(),
     };
 
-    let _ = state.shutdown_tx.send(true);
+    if let Err(e) = state.shutdown_tx.send(true) {
+        tracing::warn!(error = %e, "failed to send shutdown signal");
+    }
 
     Ok((StatusCode::OK, Json(body)))
 }

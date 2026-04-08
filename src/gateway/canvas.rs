@@ -224,7 +224,9 @@ async fn handle_canvas_socket(socket: WebSocket, state: AppState, canvas_id: Str
                 "type": "error",
                 "error": "Maximum canvas count reached",
             });
-            let _ = sender.send(Message::Text(msg.to_string().into())).await;
+            if let Err(e) = sender.send(Message::Text(msg.to_string().into())).await {
+                tracing::warn!(error = %e, "failed to send canvas max count error");
+            }
             return;
         }
     };
@@ -236,7 +238,9 @@ async fn handle_canvas_socket(socket: WebSocket, state: AppState, canvas_id: Str
             "canvas_id": canvas_id,
             "frame": frame,
         });
-        let _ = sender.send(Message::Text(msg.to_string().into())).await;
+        if let Err(e) = sender.send(Message::Text(msg.to_string().into())).await {
+            tracing::warn!(error = %e, "failed to send canvas snapshot");
+        }
     }
 
     // Send a connected acknowledgement
@@ -244,7 +248,9 @@ async fn handle_canvas_socket(socket: WebSocket, state: AppState, canvas_id: Str
         "type": "connected",
         "canvas_id": canvas_id,
     });
-    let _ = sender.send(Message::Text(ack.to_string().into())).await;
+    if let Err(e) = sender.send(Message::Text(ack.to_string().into())).await {
+        tracing::warn!(error = %e, "failed to send canvas connection ack");
+    }
 
     // Spawn a task that forwards broadcast updates to the WebSocket
     let canvas_id_clone = canvas_id.clone();
@@ -272,7 +278,9 @@ async fn handle_canvas_socket(socket: WebSocket, state: AppState, canvas_id: Str
                         "canvas_id": canvas_id_clone,
                         "missed_frames": n,
                     });
-                    let _ = sender.send(Message::Text(msg.to_string().into())).await;
+                    if let Err(e) = sender.send(Message::Text(msg.to_string().into())).await {
+                        tracing::warn!(error = %e, "failed to send canvas lagged notification");
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }

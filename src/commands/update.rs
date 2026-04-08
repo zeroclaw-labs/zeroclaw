@@ -131,7 +131,9 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
     match smoke_test(&current_exe).await {
         Ok(()) => {
             // Cleanup backup on success
-            let _ = tokio::fs::remove_file(&backup_path).await;
+            if let Err(e) = tokio::fs::remove_file(&backup_path).await {
+                tracing::warn!(error = %e, path = %backup_path.display(), "failed to remove backup file after successful update");
+            }
             println!("Successfully updated to v{}!", update_info.latest_version);
             Ok(())
         }
@@ -378,7 +380,9 @@ async fn swap_binary(new: &Path, target: &Path) -> Result<()> {
 
 async fn rollback_binary(backup: &Path, target: &Path) -> Result<()> {
     // Remove-then-copy to avoid ETXTBSY if the target is somehow still mapped.
-    let _ = tokio::fs::remove_file(target).await;
+    if let Err(e) = tokio::fs::remove_file(target).await {
+        tracing::warn!(error = %e, path = %target.display(), "failed to remove target binary before rollback");
+    }
     tokio::fs::copy(backup, target)
         .await
         .context("failed to restore backup binary")?;
