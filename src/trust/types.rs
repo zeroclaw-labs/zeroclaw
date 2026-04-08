@@ -2,9 +2,11 @@ use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use zeroclaw_macros::Configurable;
 
 /// Configuration for trust scoring
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[prefix = "trust"]
 pub struct TrustConfig {
     /// Initial trust score for new domains (default 0.8)
     #[serde(default = "default_initial_score")]

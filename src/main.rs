@@ -35,7 +35,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use dialoguer::Password;
+use dialoguer::{Password, Select};
 use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -587,11 +587,74 @@ Examples:
         install: bool,
     },
 
+    /// View or change config properties by dotted path
+    #[command(long_about = "\
+View, set, or initialize config properties.
+
+Properties are addressed by dotted path (e.g. channels.matrix.mention-only).
+Secret fields (API keys, tokens) automatically use masked input.
+Enum fields offer interactive selection when value is omitted.
+
+Examples:
+  zeroclaw props list                                  # list all properties
+  zeroclaw props list --secrets                        # list only secrets
+  zeroclaw props list --filter channels.matrix         # filter by prefix
+  zeroclaw props get channels.matrix.mention-only      # get a value
+  zeroclaw props set channels.matrix.mention-only true # set a value
+  zeroclaw props set channels.matrix.access-token      # secret: masked input
+  zeroclaw props set channels.matrix.stream-mode       # enum: interactive select
+  zeroclaw props init channels.matrix                  # init section with defaults
+
+Property path tab completion is included automatically in `zeroclaw completions <shell>`.")]
+    Props {
+        #[command(subcommand)]
+        props_command: PropsCommands,
+    },
+
     /// Manage WASM plugins
     #[cfg(feature = "plugins-wasm")]
     Plugin {
         #[command(subcommand)]
         plugin_command: PluginCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PropsCommands {
+    /// List all config properties with current values
+    List {
+        /// Filter by path prefix (e.g. "channels.telegram")
+        #[arg(short, long)]
+        filter: Option<String>,
+        /// Show only secret (encrypted) fields
+        #[arg(long)]
+        secrets: bool,
+    },
+    /// Get a config property value
+    Get {
+        /// Property path (e.g. channels.telegram.mention-only)
+        path: String,
+    },
+    /// Set a config property (secret fields auto-prompt for masked input)
+    Set {
+        /// Property path
+        path: String,
+        /// New value (omit for secret fields to get masked input)
+        value: Option<String>,
+        /// Skip interactive prompts — require value on command line, accept raw strings for enums
+        #[arg(long)]
+        no_interactive: bool,
+    },
+    /// Initialize unconfigured sections with defaults (enabled=false)
+    Init {
+        /// Section prefix (e.g. channels.matrix). Omit to init all.
+        section: Option<String>,
+    },
+    /// Print matching property paths for shell completion (hidden)
+    #[command(hide = true)]
+    Complete {
+        /// Partial path to complete
+        partial: Option<String>,
     },
 }
 
@@ -1621,6 +1684,142 @@ async fn main() -> Result<()> {
             }
         },
 
+        Commands::Props { props_command } => match props_command {
+            PropsCommands::List { filter, secrets } => {
+                let entries = config.prop_fields();
+                let mut current_category = "";
+                for entry in &entries {
+                    if secrets && !entry.is_secret {
+                        continue;
+                    }
+                    if let Some(ref f) = filter {
+                        if !entry.name.starts_with(f.as_str()) {
+                            continue;
+                        }
+                    }
+                    if entry.category != current_category {
+                        if !current_category.is_empty() {
+                            println!();
+                        }
+                        println!("{}:", entry.category);
+                        current_category = entry.category;
+                    }
+                    let lock = if entry.is_secret { " \u{1f512}" } else { "" };
+                    println!(
+                        "  {:<45} = {:<20} ({}){lock}",
+                        entry.name, entry.display_value, entry.type_hint
+                    );
+                }
+                Ok(())
+            }
+            PropsCommands::Get { path } => {
+                if Config::prop_is_secret(&path) {
+                    let entries = config.prop_fields();
+                    let is_set = entries
+                        .iter()
+                        .find(|e| e.name == path)
+                        .map(|e| e.display_value != "<unset>")
+                        .unwrap_or(false);
+                    if is_set {
+                        println!("{path} is set (encrypted secret \u{2014} value not displayed)");
+                    } else {
+                        println!("{path} is not set (encrypted secret)");
+                    }
+                } else {
+                    match config.get_prop(&path) {
+                        Ok(value) => println!("{value}"),
+                        Err(e) => anyhow::bail!("{e}"),
+                    }
+                }
+                Ok(())
+            }
+            PropsCommands::Set {
+                path,
+                value,
+                no_interactive,
+            } => {
+                if no_interactive {
+                    // Scripted mode: require value on CLI, no prompts
+                    let val = value.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Value required in --no-interactive mode. Usage: zeroclaw props set --no-interactive {path} <value>"
+                        )
+                    })?;
+                    config.set_prop(&path, &val)?;
+                } else if Config::prop_is_secret(&path) {
+                    if value.is_some() {
+                        eprintln!(
+                            "  \u{26a0} {path} is an encrypted secret \u{2014} using masked input."
+                        );
+                    }
+                    let secret_value = dialoguer::Password::new()
+                        .with_prompt(format!("Enter value for {path}"))
+                        .interact()?;
+                    let secret_value = secret_value.trim().to_string();
+                    if secret_value.is_empty() {
+                        anyhow::bail!("Value cannot be empty.");
+                    }
+                    config.set_prop(&path, &secret_value)?;
+                } else if let Some(val) = value {
+                    config.set_prop(&path, &val)?;
+                } else {
+                    // Enum fields get interactive selection; everything else needs a value
+                    let variants = config
+                        .prop_fields()
+                        .into_iter()
+                        .find(|f| f.name == path)
+                        .and_then(|info| {
+                            let get_variants = info.enum_variants?;
+                            let variants = get_variants();
+                            let current_index = variants
+                                .iter()
+                                .position(|v| v == &info.display_value)
+                                .unwrap_or(0);
+                            Some((variants, current_index))
+                        });
+                    if let Some((variants, current_index)) = variants {
+                        let selected = Select::new()
+                            .with_prompt(format!("Select value for {path}"))
+                            .items(&variants)
+                            .default(current_index)
+                            .interact()?;
+                        config.set_prop(&path, &variants[selected])?;
+                    } else {
+                        anyhow::bail!("Value required. Usage: zeroclaw props set {path} <value>");
+                    }
+                }
+                config.save().await?;
+                println!("{path} updated.");
+                Ok(())
+            }
+            PropsCommands::Init { section } => {
+                let initialized = config.init_defaults(section.as_deref());
+                if initialized.is_empty() {
+                    println!("All sections already configured.");
+                } else {
+                    println!(
+                        "Initialized {} section(s) with defaults:",
+                        initialized.len()
+                    );
+                    for name in &initialized {
+                        println!("  {name}");
+                    }
+                    config.save().await?;
+                    println!("\nRun `zeroclaw props list` to review, then set required fields.");
+                }
+                Ok(())
+            }
+            PropsCommands::Complete { partial } => {
+                let prefix = partial.as_deref().unwrap_or("");
+                for entry in config.prop_fields() {
+                    if entry.name.starts_with(prefix) {
+                        println!("{}", entry.name);
+                    }
+                }
+                Ok(())
+            }
+        },
+
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
@@ -1847,9 +2046,57 @@ fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> R
     let bin_name = cmd.get_name().to_string();
 
     match shell {
-        CompletionShell::Bash => generate(shells::Bash, &mut cmd, bin_name.clone(), writer),
-        CompletionShell::Fish => generate(shells::Fish, &mut cmd, bin_name.clone(), writer),
-        CompletionShell::Zsh => generate(shells::Zsh, &mut cmd, bin_name.clone(), writer),
+        CompletionShell::Bash => {
+            generate(shells::Bash, &mut cmd, bin_name.clone(), writer);
+            // Wrap clap's _zeroclaw to inject dynamic props path completion
+            writeln!(
+                writer,
+                r#"
+# Dynamic completion for zeroclaw props get/set paths
+if type _zeroclaw &>/dev/null; then
+    _zeroclaw_clap_orig() {{ _zeroclaw "$@"; }}
+    _zeroclaw() {{
+        local cur="${{COMP_WORDS[COMP_CWORD]}}"
+        if [[ "${{COMP_WORDS[*]}}" =~ "props "(get|set)" " ]]; then
+            COMPREPLY=($(compgen -W "$(zeroclaw props complete "$cur" 2>/dev/null)" -- "$cur"))
+            return
+        fi
+        _zeroclaw_clap_orig "$@"
+    }}
+fi"#
+            )?;
+        }
+        CompletionShell::Fish => {
+            generate(shells::Fish, &mut cmd, bin_name.clone(), writer);
+            writeln!(
+                writer,
+                r#"
+# Dynamic completion for zeroclaw props get/set paths
+complete -c zeroclaw -n '__fish_seen_subcommand_from props; and __fish_seen_subcommand_from get set' \
+    -a '(zeroclaw props complete (commandline -ct) 2>/dev/null)' -f"#
+            )?;
+        }
+        CompletionShell::Zsh => {
+            generate(shells::Zsh, &mut cmd, bin_name.clone(), writer);
+            // Wrap clap's _zeroclaw to inject dynamic props path completion
+            writeln!(
+                writer,
+                r#"
+# Dynamic completion for zeroclaw props get/set paths
+if (( $+functions[_zeroclaw] )); then
+    functions[_zeroclaw_clap_orig]=$functions[_zeroclaw]
+    _zeroclaw() {{
+        if [[ "${{words[*]}}" == *"props "(get|set)* ]] && (( CURRENT > 3 )); then
+            local -a props
+            props=(${{(f)"$(zeroclaw props complete "$words[CURRENT]" 2>/dev/null)"}})
+            compadd -a props
+            return
+        fi
+        _zeroclaw_clap_orig "$@"
+    }}
+fi"#
+            )?;
+        }
         CompletionShell::PowerShell => {
             generate(shells::PowerShell, &mut cmd, bin_name.clone(), writer);
         }
