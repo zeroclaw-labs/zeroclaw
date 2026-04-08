@@ -853,6 +853,26 @@ impl AuthStore {
         Ok(updated > 0)
     }
 
+    /// List all channel links for a user.
+    pub fn list_user_channels(&self, user_id: &str) -> Result<Vec<UserChannelLink>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT channel, platform_uid, device_id, autonomy_mode, linked_at
+             FROM channel_links WHERE user_id = ?1 ORDER BY linked_at DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![user_id], |row| {
+            Ok(UserChannelLink {
+                channel: row.get(0)?,
+                platform_uid: row.get(1)?,
+                device_id: row.get(2)?,
+                autonomy_mode: row.get::<_, String>(3).unwrap_or_else(|_| "read_only".into()),
+                linked_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| e.into())
+    }
+
     /// Remove channel link (unlink).
     pub fn unlink_channel(&self, channel: &str, platform_uid: &str) -> Result<bool> {
         let conn = self.conn.lock();
@@ -864,6 +884,24 @@ impl AuthStore {
     }
 
     // ── Admin Operations ────────────────────────────────────────────
+
+    /// Change admin password.
+    pub fn change_admin_password(&self, username: &str, new_password: &str) -> Result<()> {
+        if new_password.len() < 4 {
+            bail!("Password must be at least 4 characters");
+        }
+        let salt = generate_salt();
+        let hash = hash_password(new_password, &salt);
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE admins SET password_hash = ?1, salt = ?2 WHERE username = ?3",
+            rusqlite::params![hash, salt, username.trim()],
+        )?;
+        if updated == 0 {
+            bail!("Admin user not found");
+        }
+        Ok(())
+    }
 
     /// Authenticate an admin user.
     pub fn authenticate_admin(&self, username: &str, password: &str) -> Result<bool> {
@@ -1041,6 +1079,16 @@ pub struct ActiveSession {
     pub device_name: Option<String>,
     pub logged_in_at: i64,
     pub expires_at: i64,
+}
+
+/// Channel link info for user-facing display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserChannelLink {
+    pub channel: String,
+    pub platform_uid: String,
+    pub device_id: Option<String>,
+    pub autonomy_mode: String,
+    pub linked_at: i64,
 }
 
 /// Full channel link record — user identity + target device + autonomy mode.

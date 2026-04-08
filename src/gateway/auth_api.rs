@@ -300,6 +300,53 @@ pub async fn handle_auth_set_password(
     }
 }
 
+// ── GET /api/user/profile ────────────────────────────────────────
+
+/// User profile (username, email, created_at, device count).
+pub async fn handle_user_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let auth_store = match state.auth_store.as_ref() {
+        Some(s) => s,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Auth not configured"}))).into_response(),
+    };
+    let token = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|a| a.strip_prefix("Bearer ")).unwrap_or("");
+    let session = match auth_store.validate_session(token) {
+        Some(s) => s,
+        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "인증이 필요합니다."}))).into_response(),
+    };
+    let user = auth_store.get_user(&session.user_id).ok().flatten();
+    let devices = auth_store.list_devices(&session.user_id).unwrap_or_default();
+    Json(serde_json::json!({
+        "user_id": session.user_id,
+        "username": user.as_ref().map(|u| u.username.as_str()),
+        "email": user.as_ref().and_then(|u| u.email.as_deref()),
+        "created_at": user.as_ref().map(|u| u.created_at),
+        "device_count": devices.len(),
+    })).into_response()
+}
+
+// ── GET /api/user/channels ──────────────────────────────────────
+
+/// List channel links for the authenticated user.
+pub async fn handle_user_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let auth_store = match state.auth_store.as_ref() {
+        Some(s) => s,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Auth not configured"}))).into_response(),
+    };
+    let token = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|a| a.strip_prefix("Bearer ")).unwrap_or("");
+    let session = match auth_store.validate_session(token) {
+        Some(s) => s,
+        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "인증이 필요합니다."}))).into_response(),
+    };
+    let channels = auth_store.list_user_channels(&session.user_id).unwrap_or_default();
+    Json(serde_json::to_value(channels).unwrap_or_default()).into_response()
+}
+
 // ── GET /api/auth/devices ───────────────────────────────────────
 
 pub async fn handle_auth_devices_list(

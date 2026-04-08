@@ -1284,6 +1284,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/auth/set-password",
             post(auth_api::handle_auth_set_password),
         )
+        .route("/api/user/profile", get(auth_api::handle_user_profile))
+        .route(
+            "/api/user/channels",
+            get(auth_api::handle_user_channels),
+        )
         .route("/api/auth/devices", get(auth_api::handle_auth_devices_list))
         .route(
             "/api/auth/devices",

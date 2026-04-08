@@ -37,6 +37,7 @@ const DEFAULT_ANALYTICS_WINDOW_SECS: u64 = 30 * 86400;
 pub fn admin_router() -> Router<AppState> {
     Router::new()
         .route("/login", post(handle_admin_login))
+        .route("/change-password", post(handle_admin_change_password))
         .route("/users", get(handle_admin_users))
         .route("/usage", get(handle_admin_usage))
         .route("/usage/users", get(handle_admin_usage_users))
@@ -95,6 +96,35 @@ async fn handle_admin_login(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("인증 처리 중 문제가 발생했습니다: {e}")})),
+        ),
+    }
+}
+
+/// POST /api/admin/dashboard/change-password
+async fn handle_admin_change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_admin_auth(&state, &headers) {
+        return e;
+    }
+    let auth_store = state.auth_store.as_ref().unwrap();
+    let new_password = body["new_password"].as_str().unwrap_or("");
+    if new_password.len() < 4 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "비밀번호는 4자 이상이어야 합니다."})),
+        );
+    }
+    match auth_store.change_admin_password("admin", new_password) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"message": "관리자 비밀번호가 변경되었습니다."})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("비밀번호 변경에 실패했습니다: {e}")})),
         ),
     }
 }

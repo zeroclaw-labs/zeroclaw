@@ -318,12 +318,41 @@ export async function authRegister(
   return response.json() as Promise<AuthRegisterResponse>;
 }
 
+/** Generate a browser fingerprint for device deduplication. */
+async function getBrowserFingerprint(): Promise<string> {
+  const parts = [
+    navigator.userAgent,
+    navigator.language,
+    screen.width + 'x' + screen.height,
+    screen.colorDepth?.toString() ?? '',
+    Intl.DateTimeFormat().resolvedOptions().timeZone,
+    navigator.hardwareConcurrency?.toString() ?? '',
+  ];
+  const raw = parts.join('|');
+  // SHA-256 hash of the concatenated parts
+  try {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw));
+    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+  } catch {
+    // Fallback for environments without crypto.subtle
+    let hash = 0;
+    for (let i = 0; i < raw.length; i++) {
+      hash = ((hash << 5) - hash + raw.charCodeAt(i)) | 0;
+    }
+    return 'fp-' + Math.abs(hash).toString(36);
+  }
+}
+
 export async function authLogin(
   username: string,
   password: string,
   deviceId?: string,
   deviceName?: string,
 ): Promise<AuthLoginResponse> {
+  // Auto-generate fingerprint for device deduplication
+  const fingerprint = await getBrowserFingerprint();
+  const autoDeviceName = deviceName || `Web (${navigator.platform || 'Browser'})`;
+
   const response = await fetch(resolveUrl('/api/auth/login'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -331,7 +360,8 @@ export async function authLogin(
       username,
       password,
       device_id: deviceId,
-      device_name: deviceName,
+      device_name: autoDeviceName,
+      fingerprint,
     }),
   });
 
