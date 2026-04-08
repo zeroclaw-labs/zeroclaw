@@ -842,6 +842,14 @@ pub struct PresentationConfig {
     /// Default: false.
     #[serde(default)]
     pub simplify_tool_schemas: bool,
+
+    /// Include the model's reasoning/thinking content in the final response.
+    /// When enabled, reasoning is prepended as a blockquote above the answer.
+    /// Useful for thinking-mode models like Gemma 4 where vLLM's
+    /// --reasoning-parser separates reasoning into its own API field.
+    /// Default: false.
+    #[serde(default)]
+    pub show_reasoning: bool,
 }
 
 impl Default for PresentationConfig {
@@ -854,6 +862,7 @@ impl Default for PresentationConfig {
             overflow_dir: default_overflow_dir(),
             flatten_json_responses: false,
             simplify_tool_schemas: false,
+            show_reasoning: false,
         }
     }
 }
