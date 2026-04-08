@@ -45,6 +45,7 @@ data:
     job_type: agent for LLM reasoning, shell for deterministic scripts.
     session_target: almost always isolated. Use main only if conversation context is needed.
     prompt: follow the rules above. Read it back as if you have never seen it — does it make sense alone?
+    delivery: default to none. Use announce only for output Dan needs every run. For conditional notifications, use send_user_message inside the prompt.
 
     ## Reviewing Existing Crons
 
