@@ -86,7 +86,7 @@ spec:
             # Skills are mounted directly into the zeroclaw container, not here.
       containers:
         - name: zeroclaw
-          image: citizendaniel/zeroclaw-sam:v1.5.0
+          image: citizendaniel/zeroclaw-sam:v1.5.1
           imagePullPolicy: IfNotPresent
           command:
             - bash
@@ -233,7 +233,7 @@ spec:
               subPath: cron-management.md
               readOnly: true
         - name: serena
-          image: citizendaniel/zeroclaw-sam:v1.5.0
+          image: citizendaniel/zeroclaw-sam:v1.5.1
           imagePullPolicy: IfNotPresent
           command:
             - sh
