@@ -1363,9 +1363,9 @@ pub async fn handle_api_sessions_list(
                 .unwrap_or_else(|| "idle".to_string());
 
             let mut entry = serde_json::json!({
-                "id": session_id,
+                "session_id": session_id,
                 "channel": channel,
-                "started_at": meta.created_at.to_rfc3339(),
+                "created_at": meta.created_at.to_rfc3339(),
                 "last_activity": meta.last_activity.to_rfc3339(),
                 "status": status,
                 "message_count": meta.message_count,
@@ -1521,9 +1521,9 @@ pub async fn handle_api_sessions_running(
         .filter_map(|meta| {
             let session_id = meta.key.strip_prefix("gw_")?;
             Some(serde_json::json!({
-                "id": session_id,
+                "session_id": session_id,
                 "channel": "gateway",
-                "started_at": meta.created_at.to_rfc3339(),
+                "created_at": meta.created_at.to_rfc3339(),
                 "last_activity": meta.last_activity.to_rfc3339(),
                 "status": "running",
                 "message_count": meta.message_count,
