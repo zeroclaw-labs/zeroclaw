@@ -6377,6 +6377,7 @@ pub struct ChannelsConfig {
     #[serde(default = "default_true")]
     pub cli: bool,
     /// LINE Messaging API channel configuration.
+    #[nested]
     pub line: Option<LineConfig>,
     /// Telegram bot channel configuration.
     #[nested]
@@ -6738,13 +6739,19 @@ fn default_matrix_draft_update_interval_ms() -> u64 {
 }
 
 /// LINE Messaging API channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[prefix = "channels.line"]
 pub struct LineConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
     /// Long-lived channel access token (from LINE Developers Console).
     /// Used for both the Reply API and the Push API fallback.
+    #[secret]
     pub channel_access_token: String,
     /// Channel secret (from LINE Developers Console).
     /// Used to verify the `X-Line-Signature` header on incoming webhooks.
+    #[secret]
     pub channel_secret: String,
     /// Allowed LINE user IDs. `["*"]` accepts anyone; empty list denies all.
     #[serde(default)]

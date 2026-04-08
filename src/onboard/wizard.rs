@@ -5685,6 +5685,7 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                 println!("      https://<your-host>:{webhook_port}/line/webhook");
 
                 config.line = Some(LineConfig {
+                    enabled: true,
                     channel_access_token,
                     channel_secret,
                     allowed_users,
