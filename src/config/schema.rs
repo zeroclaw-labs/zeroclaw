@@ -1398,7 +1398,7 @@ fn default_keep_tool_context_turns() -> usize {
 }
 
 fn default_agent_max_tool_iterations() -> usize {
-    10
+    5
 }
 
 fn default_agent_max_history_messages() -> usize {
@@ -11986,7 +11986,7 @@ reasoning_effort = "turbo"
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(cfg.compact_context);
-        assert_eq!(cfg.max_tool_iterations, 10);
+        assert_eq!(cfg.max_tool_iterations, 5);
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");

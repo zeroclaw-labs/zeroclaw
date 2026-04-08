@@ -22,7 +22,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 use tokio::time::{self, Duration};
 
-const MIN_POLL_SECONDS: u64 = 5;
+const MIN_POLL_SECONDS: u64 = 1;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 

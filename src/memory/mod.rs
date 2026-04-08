@@ -110,10 +110,29 @@ pub fn should_skip_autosave_content(content: &str) -> bool {
     }
 
     let lowered = normalized.to_ascii_lowercase();
-    lowered.starts_with("[cron:")
+
+    // Skip system/synthetic patterns
+    if lowered.starts_with("[cron:")
         || lowered.starts_with("[heartbeat task")
         || lowered.starts_with("[distilled_")
         || lowered.contains("distilled_index_sig:")
+    {
+        return true;
+    }
+
+    // Skip assistant self-talk patterns to prevent duplicate memory saves
+    // when the agent's own responses get echoed back
+    if lowered.starts_with("i am")
+        || lowered.starts_with("as an ai")
+        || lowered.starts_with("as a language model")
+        || lowered.starts_with("you're right")
+        || lowered.starts_with("i understand")
+        || lowered.starts_with("i see")
+    {
+        return true;
+    }
+
+    false
 }
 
 #[derive(Clone, PartialEq, Eq)]

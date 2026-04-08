@@ -36,7 +36,7 @@ fn default_source_max_chars() -> usize {
     50_000
 }
 fn default_timeout_secs() -> u64 {
-    60
+    30
 }
 fn default_identifier_policy() -> String {
     "strict".to_string()
@@ -724,7 +724,7 @@ mod tests {
         assert_eq!(config.max_passes, 3);
         assert_eq!(config.summary_max_chars, 4_000);
         assert_eq!(config.source_max_chars, 50_000);
-        assert_eq!(config.timeout_secs, 60);
+        assert_eq!(config.timeout_secs, 30);
         assert!(config.summary_model.is_none());
         assert_eq!(config.identifier_policy, "strict");
     }
