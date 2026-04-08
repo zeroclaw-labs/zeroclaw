@@ -21,6 +21,11 @@
 *.bash text eol=lf linguist-language=Shell
 *.ps1 text eol=crlf linguist-language=PowerShell
 
+# GitHub language stats: show only Rust
+# Mark everything as vendored, then un-vendor Rust source files
+* linguist-vendored
+*.rs linguist-vendored=false
+
 # Documentation
 *.txt text eol=lf
 LICENSE* text eol=lf

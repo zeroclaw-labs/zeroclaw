@@ -1582,10 +1582,20 @@ impl SecurityPolicy {
         autonomy_config: &crate::config::AutonomyConfig,
         workspace_dir: &Path,
     ) -> Self {
+        // When autonomy is Full, disable workspace_only so the agent can
+        // access paths outside the workspace.  Forbidden-path checks still
+        // apply, preventing access to sensitive system directories.
+        // See issue #5463.
+        let effective_workspace_only = if autonomy_config.level == AutonomyLevel::Full {
+            false
+        } else {
+            autonomy_config.workspace_only
+        };
+
         Self {
             autonomy: autonomy_config.level,
             workspace_dir: workspace_dir.to_path_buf(),
-            workspace_only: autonomy_config.workspace_only,
+            workspace_only: effective_workspace_only,
             allowed_commands: autonomy_config.allowed_commands.clone(),
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
             allowed_roots: autonomy_config
@@ -2200,6 +2210,39 @@ mod tests {
         assert!(!policy.block_high_risk_commands);
         assert_eq!(policy.shell_env_passthrough, vec!["DATABASE_URL"]);
         assert_eq!(policy.workspace_dir, PathBuf::from("/tmp/test-workspace"));
+    }
+
+    #[test]
+    fn from_config_full_autonomy_overrides_workspace_only() {
+        // Issue #5463: Full autonomy should disable workspace_only even if the
+        // config default keeps it true.
+        let autonomy_config = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let workspace = PathBuf::from("/tmp/test-workspace");
+        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+
+        assert_eq!(policy.autonomy, AutonomyLevel::Full);
+        assert!(
+            !policy.workspace_only,
+            "Full autonomy must override workspace_only to false"
+        );
+    }
+
+    #[test]
+    fn from_config_supervised_preserves_workspace_only() {
+        let autonomy_config = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let workspace = PathBuf::from("/tmp/test-workspace");
+        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+
+        assert!(
+            policy.workspace_only,
+            "Supervised autonomy must preserve workspace_only default (true)"
+        );
     }
 
     #[test]
