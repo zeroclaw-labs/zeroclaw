@@ -7,60 +7,34 @@ data:
   science-curator.md: |
     ---
     name: science-curator
-    version: 1.0.0
-    description: Curates science and space news from NASA, ESA, and other sources. Use when Dan asks about science news, space news, or interesting recent discoveries.
+    version: 2.0.0
+    description: Curates science and space news. Use for science news requests or daily cron.
     ---
 
-    # Science & Space News Curator
+    # Science News Curator
 
-    You curate interesting science and space stories for Dan. This runs
-    as a daily cron job but can also be triggered on-demand.
+    Curates science and space stories for Dan. Runs as daily cron or on-demand.
 
     ## Tool Routing
 
-    Prefer Python urllib (via shell) over the browser tool. The browser
-    launches full Chromium render cycles — expensive and slow for pages
-    that serve clean HTML. Use Python for RSS/Atom feeds and static HTML.
-    Only use the browser for JavaScript-rendered SPAs.
+    Use Python urllib via shell for all sources. Only use browser for JavaScript-rendered SPAs.
 
     ## Sources
 
-    Check these sources for recent stories (past week):
-
-    | Source | Approach |
-    |--------|----------|
-    | NASA News (https://www.nasa.gov/news) | Python: fetch HTML, parse headlines |
-    | ESA News (https://www.esa.int/News) | Python: fetch HTML, parse headlines |
-    | Space.com | Python: fetch RSS feed if available, else HTML |
-    | ScienceDaily | Python: fetch HTML (secondary, skip if first 3 have enough) |
+    Fetch recent stories (past week) from: NASA News (nasa.gov/news), ESA News (esa.int/News), Space.com, ScienceDaily (secondary, skip if others have enough). Use Python to fetch HTML and parse headlines.
 
     ## Process
 
-    1. **Dedup first**: `memory_recall` with key pattern `science-news/` to see
-       what stories you've already saved. Skip any story already in memory.
-    2. Fetch each source and identify 3-5 new stories not already in memory
-    3. For each story, save to memory with key `science-news/YYYY-MM-DD/story-slug`:
-       - Headline and brief summary (2-3 sentences)
-       - Why it's interesting
-       - Source URL
-    4. Send Dan a brief digest via Signal only if something is genuinely
-       noteworthy (major discovery, mission milestone). Most days, save
-       to memory silently without messaging.
+    1. Dedup: memory_recall key pattern science-news/ to check existing stories.
+    2. Fetch sources, identify 3-5 new stories not in memory.
+    3. Save each to memory with key science-news/YYYY-MM-DD/story-slug: headline, 2-3 sentence summary, why interesting, source URL.
+    4. Message Dan via Signal only if genuinely noteworthy (major discovery, mission milestone). Most days, save silently.
 
-    ## Criteria for "interesting"
+    ## Criteria
 
     Prioritize: discoveries, mission milestones, technology breakthroughs.
-    Deprioritize: policy/budget news, personnel changes, routine updates.
+    Deprioritize: policy, budget, personnel, routine updates.
 
-    ## Output format (when messaging Dan)
+    ## Message Format (when messaging)
 
-    Keep it scannable — Dan reads on mobile:
-
-    ```
-    🔭 Science roundup — [date]
-
-    **[Headline 1]** — [1 sentence why it matters]
-    **[Headline 2]** — [1 sentence why it matters]
-
-    Full details saved to memory.
-    ```
+    Keep scannable for mobile. Lead with date, then headline + one sentence per story. End with "Full details saved to memory."

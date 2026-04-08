@@ -7,283 +7,89 @@ data:
   k8s-delegation.md: |
     ---
     name: k8s-delegation
-    version: 1.0.0
-    description: Structures K8s infrastructure tasks for delegation to Walter via ACP. Use whenever Dan asks about deploying, managing, debugging, or checking status of anything in the Kubernetes cluster — including the todolist namespace. Also use when Dan mentions Walter, ACP, cluster status, pod health, namespace state, or asks what's running.
+    version: 2.0.0
+    description: Delegate K8s tasks to Walter via ACP. Use for any cluster work.
     always: false
     ---
 
-    # K8s Task Delegation to Walter
+    # K8s Delegation to Walter
 
-    Walter is the K8s infrastructure agent. He has kubectl access, the scrapyard-applications
-    repo, and Serena memories. He does NOT have access to your memory, conversation history,
-    or any context you haven't explicitly included in the ACP message.
+    Walter is the K8s infrastructure agent. He has kubectl, the scrapyard-applications repo, and Serena memories. He has no access to your memory or conversation history.
 
-    ## When This Applies
+    ## Core Rule
 
-    Any time you need something done in the Kubernetes cluster:
-    - Deploy an application
-    - Check pod/service/namespace status
-    - Debug failing resources
-    - Create or modify manifests
-    - Manage storage, networking, certificates
+    One work order = one deployable unit. Do not combine multiple steps.
 
-    ## The One Rule
+    ## Work Order Format
 
-    **One work order = one deployable unit.**
+    Every acp-client send message must follow this structure:
+    TASK: one sentence describing what to do.
+    NAMESPACE: target namespace.
+    CONTEXT: what exists already, repo location, patterns to follow.
+    REQUIREMENTS: specific requirements as a list.
+    VERIFICATION: what to check when done (pod status, commit paths, service endpoints).
+    REPO PATH: path in scrapyard-applications repo.
 
-    Don't send "deploy a todo list app" as a single message. Walter will lose track.
-    Break it down. Each ACP message should produce one verifiable outcome.
+    ## Deployment Sequence
 
-    ## Work Order Template
-
-    Structure every `acp-client send` message like this:
-
-        TASK: [One sentence — what to do]
-        NAMESPACE: [target namespace]
-
-        CONTEXT:
-        [Everything Walter needs to know. Include:
-        - What exists already (namespace, other resources)
-        - Repo location for manifests
-        - Relevant patterns to follow]
-
-        REQUIREMENTS:
-        - [Specific requirement 1]
-        - [Specific requirement 2]
-
-        VERIFICATION:
-        When done, report:
-        - [What to check — e.g., "kubectl get pods -n todolist showing Running"]
-        - [What to commit — e.g., "manifest committed to repo"]
-
-        REPO PATH: 04_scrapyard_test_projects/<app_dir>/
-
-    ## Breaking Down Deployments
-
-    A typical app deployment breaks into these atomic steps (send each as a separate
-    ACP work order, in order, after verifying the previous one succeeded):
-
-    1. **Namespace** — Create namespace with istio labels
-    2. **Secrets** — Create VaultStaticSecret CRDs (if app needs secrets)
-    3. **Storage** — Create PVCs (if app needs persistent storage)
-    4. **Database** — Deploy database (if app needs one — e.g., CNPG PostgreSQL)
-    5. **Application** — Create Deployment + Service for the app
-    6. **External access** — Walter creates Certificate, Gateway, VirtualService
-       manifests and submits a PR (he can't apply these directly). Wait for Dan to
-       merge before testing external access.
-    7. **Verification** — Final check: all pods running, service resolving, external access working
-
-    Skip steps that don't apply (e.g., skip secrets/database for a simple static app).
-
-    ## Example: Deploying an app to the todolist namespace
-
-    **Step 1 — Check what exists:**
-
-        acp-client send "TASK: Report current state of the todolist namespace.
-
-        CONTEXT:
-        Check what resources currently exist in the todolist namespace.
-
-        VERIFICATION:
-        Report: namespaces, deployments, services, PVCs, pods, and their statuses."
-
-    Wait for result with `acp-client wait <id> --timeout 600`. Then proceed based on what exists.
-
-    **Step 2 — Create deployment:**
-
-        acp-client send "TASK: Create a Deployment and Service for Vikunja in the todolist namespace.
-
-        NAMESPACE: todolist
-
-        CONTEXT:
-        The todolist namespace already exists with istio ambient mode.
-        Follow the plain-manifests pattern from the scrapyard-applications repo.
-        Manifests go in: 04_scrapyard_test_projects/34_todolist/
-
-        REQUIREMENTS:
-        - Image: vikunja/vikunja:0.24.6 (pinned tag)
-        - Port: 3456
-        - Memory request 256Mi, limit 512Mi
-        - CPU request 100m
-        - Security context: runAsNonRoot, drop ALL capabilities
-        - Readiness probe on port 3456
-        - automountServiceAccountToken: false
-        - Create a matching ClusterIP Service
-
-        VERIFICATION:
-        When done, report:
-        - Exact pod name and status (kubectl get pods -n todolist)
-        - Service endpoint (kubectl get svc -n todolist)
-        - Manifests committed to scrapyard-applications repo with file paths
-
-        REPO PATH: 04_scrapyard_test_projects/34_todolist/"
+    Send each step as a separate work order. Verify before proceeding to the next.
+    1. Namespace with istio labels.
+    2. Secrets (VaultStaticSecret CRDs, if needed).
+    3. Storage (PVCs, if needed).
+    4. Database (CNPG PostgreSQL, if needed).
+    5. Application (Deployment + Service).
+    6. External access (Certificate + Gateway + VirtualService). Walter submits a PR for these. Wait for Dan to merge before testing.
+    7. Final verification.
+    Skip steps that do not apply.
 
     ## After Each Work Order
 
-    1. Use `acp-client wait <session_id> --timeout 600`
-    2. Read Walter's response carefully
-    3. Check for concrete evidence:
-       - Resource names and statuses (not just "done")
-       - Commit reference or file paths
-       - Any errors or blockers flagged
-    4. If something failed, send a follow-up with the error context
-    5. If successful, proceed to the next step
-    6. Clean up: `acp-client delete <session_id>`
+    acp-client wait ID --timeout 600. Read response for concrete evidence (resource names, statuses, commits). If failed, send follow-up with error context. If successful, proceed. Clean up with acp-client delete ID.
 
-    ## Monitoring Walter's Progress
+    ## Monitoring
 
-    Don't blindly wait for Walter to finish. Use progress checks:
+    acp-client progress ID to check status. acp-client inject ID "message" to course-correct mid-task.
 
-        # Check what Walter is doing (shows partial output)
-        acp-client progress <session_id>
+    ## Walter's PRs
 
-    If Walter has been working for more than 5 minutes with no progress, or if you
-    see him going in the wrong direction, inject a course correction:
+    When Walter submits a PR: note the PR number, tell Dan with the URL and what to do after merging. Do not send follow-up tasks that depend on PR'd resources until Dan confirms merge.
 
-        # Send a mid-task message — Walter sees it on his next tool iteration
-        acp-client inject <session_id> "CORRECTION: Use SQLite instead of Postgres for this deployment."
+    ## PR Review Feedback
 
-    Injected messages appear in Walter's context as [Mid-turn message from user].
-    He will see them after his current tool call completes.
+    When Dan requests changes on Walter's PR: send Walter a task with the PR number, tell him to read comments with gitea-pr comments N, make changes, push, and reply.
 
-    ## Recommended Flow (replaces blind wait)
+    ## Do Not
 
-        # 1. Send the work order
-        acp-client send "TASK: ..."
-        # → PENDING acp_session_id=abc-123
-
-        # 2. Wait with timeout — but check progress if it's taking long
-        acp-client wait abc-123 --timeout 600
-
-        # If wait times out or you need to redirect:
-        acp-client progress abc-123
-        acp-client inject abc-123 "Walter, prioritize getting the deployment running first. Skip external access for now."
-
-        # 3. Get the final result
-        acp-client result abc-123
-
-        # 4. Cleanup
-        acp-client delete abc-123
-
-    ## Handling Walter's PRs
-
-    Walter now has his own Gitea account and submits PRs for resources he can't
-    apply directly (VirtualServices, Certificates, Gateways).
-
-    When Walter's response includes a "PR SUBMITTED" section:
-    1. **Note the PR number and URL**
-    2. **Tell Dan** — "Walter deployed the core app but needs your review on
-       PR #N for external access. Link: <url>"
-    3. **Include what Dan needs to do after merging** — Walter will specify
-       the `kubectl apply` commands
-    4. **Don't send Walter follow-up tasks that depend on the PR'd resources**
-       until Dan confirms the PR is merged
-
-    ### Example notification to Dan:
-    "Walter has the Vikunja deployment running (pods healthy, service up).
-    For external access at vikunja.coffee-anon.com, he's submitted PR #42
-    on Gitea: <url>. After you merge, apply the VirtualService and Certificate
-    with: `kubectl apply -f 04_scrapyard_test_projects/34_todolist/05_certificate.yaml -f 04_scrapyard_test_projects/34_todolist/07_virtualservice.yaml`"
-
-    ### Sending Walter PR Review Feedback
-
-    When Dan reviews Walter's PR and requests changes:
-
-    1. **Send Walter a review task:**
-
-            acp-client send "TASK: Address review comments on PR #<number>.
-
-            CONTEXT:
-            Dan reviewed your PR and left feedback.
-            Read the review comments with gitea-pr comments <number>.
-
-            REQUIREMENTS:
-            - Read all review comments
-            - Make the requested changes on the PR branch
-            - Push the update
-            - Reply on the PR acknowledging the changes (gitea-pr reply)
-
-            VERIFICATION:
-            Report what changes you made and confirm the push + reply."
-
-    2. Wait for result: `acp-client wait <session_id> --timeout 600`
-
-    3. Tell Dan: "Walter has pushed updates to PR #N addressing your feedback."
-
-    4. If Walter couldn't address something, flag it to Dan with context.
-
-    ## What NOT to Do
-
-    - Don't send multi-step deployment plans as a single message
-    - Don't reference "the plan" or "what we discussed" — Walter has no context
-    - Don't skip verification between steps — errors compound
-    - Don't assume Walter remembers previous sessions (check his response)
-    - Don't let Walter run for 20+ minutes without checking progress
-    - Don't send Walter to address review comments without including the PR number
+    Send multi-step plans as one message. Reference prior context Walter does not have. Skip verification between steps. Let Walter run 20+ minutes without checking progress.
   vikunja-project-manager.md: |
     ---
     name: vikunja-project-manager
-    version: 1.0.0
-    description: Manage project status and tasks via the Vikunja CLI. Use whenever Dan asks about project status, task tracking, TODO lists, or wants to communicate progress on work items. Also use after completing multi-step work that Dan explicitly requested to track. Do not use proactively in cron sessions unless the cron prompt specifically calls for Vikunja operations.
+    version: 2.0.0
+    description: Manage tasks via Vikunja CLI. Use for project status, task tracking, and TODO lists.
     ---
 
     # Vikunja Project Manager
 
-    You have a `vikunja` CLI tool that manages projects and tasks on the
-    team's Vikunja instance (todolist.coffee-anon.com). Use it to track
-    work status, create actionable task lists, and report progress.
-
-    The tool is already on your PATH and authenticated — just run it
-    directly via your shell tool (e.g., `vikunja projects`). Do not
-    check for tokens or try alternative approaches. If it fails, report
-    the error output.
-
-    ## When to use this
-
-    - Dan asks about project status or what's being worked on
-    - You complete a piece of work and want to record it
-    - Dan asks you to create a task list or project plan
-    - You need to check what's outstanding before starting work
+    CLI tool on PATH, already authenticated. Run via shell (e.g., vikunja projects).
 
     ## Commands
 
-    ```
-    vikunja projects                        # List all projects
-    vikunja project create --title "..."    # Create a new project
-    vikunja tasks <project-id>              # List tasks in a project
-    vikunja task create <project-id> --title "..." [--description "..."] [--due "YYYY-MM-DD"] [--priority 1-5] [--assignee <username>]
-    vikunja task update <task-id> [--done] [--title "..."] [--assignee <username>]
-    vikunja task assign <task-id> --user <username>
-    vikunja task comment <task-id> --body "..."
-    ```
+    vikunja projects — list all projects.
+    vikunja project create --title "..." — create project.
+    vikunja tasks PROJECT_ID — list tasks.
+    vikunja task create PROJECT_ID --title "..." [--description "..."] [--due "YYYY-MM-DD"] [--priority 1-5] [--assignee USERNAME] — create task.
+    vikunja task update TASK_ID [--done] [--title "..."] [--assignee USERNAME] — update task.
+    vikunja task assign TASK_ID --user USERNAME — assign task.
+    vikunja task comment TASK_ID --body "..." — add comment.
 
     ## Users
 
-    Known usernames: `dan`, `sam`, `admin`. Use these with `--assignee`
-    when creating tasks or `--user` when assigning. Tasks show assignees
-    as `@username` in the listing. Assign Dan to tasks that are his
-    action items; assign yourself to tasks you're tracking.
+    Known usernames: dan, sam, admin. Assign Dan to his action items, yourself to tasks you track.
 
     ## Workflow
 
-    **Starting a new initiative:**
-    1. `vikunja projects` — check if a project already exists before creating one
-    2. `vikunja project create --title "Initiative Name"` (only if needed)
-    2. Break work into tasks with priorities and due dates
-    3. Report the project ID and task list to Dan
+    New initiative: check if project exists first, create if needed, break into tasks with priorities and due dates.
+    Updating: vikunja tasks ID to see state, task update --done when complete, task comment for decisions or blockers.
+    Reporting: vikunja tasks ID, then summarize done/in-progress/blocked.
 
-    **Updating progress:**
-    1. `vikunja tasks <project-id>` to see current state
-    2. `vikunja task update <id> --done` when work completes
-    3. `vikunja task comment <id> --body "context"` for decisions or blockers
-
-    **Reporting status:**
-    1. `vikunja tasks <project-id>` for the full list
-    2. Summarize: done, in progress, blocked
-
-    ## Tips
-
-    - Priority 1 (lowest) through 5 (highest) for urgency
-    - Due dates for time-sensitive work: `--due "2026-03-20"`
-    - Task titles should be short and actionable
-    - The default task list view filters out completed tasks
+    Priority 1 (lowest) through 5 (highest). Due dates: --due "YYYY-MM-DD". Task titles should be short and actionable.

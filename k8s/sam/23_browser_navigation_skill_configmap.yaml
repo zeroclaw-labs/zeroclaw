@@ -7,113 +7,47 @@ data:
   browser-navigation.md: |
     ---
     name: browser-navigation
-    version: 1.0.0
-    description: >
-      Guides browser tool usage — when to snapshot vs screenshot, navigation
-      patterns, selector strategies, and recovery from unexpected page states.
-      Use this skill whenever you need to visit a website, check a web page,
-      scrape content, interact with a web UI, or any task involving URLs that
-      aren't simple API calls. If you're about to call the browser tool, check
-      this skill first.
+    version: 2.0.0
+    description: Guides browser tool usage. Consult before calling the browser tool.
+    always: false
     ---
 
     # Browser Navigation
 
-    The browser tool controls a headless Chromium instance via the agent-browser
-    daemon. It's stateful — the page, load state, and scroll position all persist
-    between calls. These patterns prevent the most common mistakes.
+    The browser controls headless Chromium. Page state persists between calls.
 
-    ## Browser vs Python HTTP
+    ## Browser vs Python
 
-    Before reaching for the browser, ask: does this need a rendered page?
-
-    - **Use browser** for: pages with JavaScript rendering, SPAs, clicking through
-      UIs, filling forms, reading content that requires visual layout
-    - **Use Python urllib/shell** for: REST APIs, JSON endpoints, downloading files,
-      anything with a predictable response format
-
-    The browser is expensive (full Chromium render cycle per action). A 3-line
-    Python script is faster and more reliable for structured data.
+    Use browser for: JavaScript-rendered pages, SPAs, clicking UIs, filling forms.
+    Use Python urllib via shell for: REST APIs, JSON endpoints, file downloads, predictable responses.
+    Python is faster and cheaper. Only use browser when rendering is required.
 
     ## Snapshot vs Screenshot
 
-    **Snapshot** returns the accessibility tree as structured text with `ref`
-    identifiers for each interactive element. This is your primary tool for
-    understanding what's on the page — it's searchable, parseable, and gives
-    you refs to click or fill elements.
+    Snapshot: returns accessibility tree with ref identifiers for interaction. Primary tool for reading pages.
+    Screenshot: returns visual image. Use only for visual verification.
+    Always snapshot first on a new page. Use refs from snapshot to interact.
 
-    **Screenshot** returns a visual image you can see (you're multimodal) but
-    can't search or parse. Use it only for visual verification.
+    ## Navigation Pattern
 
-    **Decision rule:**
-    - Need to read, search, or interact → snapshot
-    - Need to verify something looks right visually → screenshot
-    - Starting a new page → always snapshot first
+    1. browser action=open url=TARGET
+    2. browser action=wait ms=2000
+    3. browser action=snapshot
+    If snapshot is empty, wait longer and retry. Check action=get_url to confirm location.
 
-    ## Navigation Sequence
+    ## Targeting Elements (order of preference)
 
-    Every page visit follows this pattern:
+    1. Refs from snapshot: action=click selector="@e42". Most reliable.
+    2. Semantic find: action=find by=text value="Submit" find_action=click. Options for by: text, role, label, placeholder, testid.
+    3. CSS selectors: action=click selector="#submit-btn". Only when you know the exact selector.
 
-    1. `browser` with `action: open, url: "https://..."`
-    2. `browser` with `action: wait, ms: 2000` — JS-heavy pages need render time
-    3. `browser` with `action: snapshot` — understand what loaded
+    ## Recovery
 
-    If the snapshot looks empty or incomplete, the page may still be rendering.
-    Wait longer (3-5 seconds) and snapshot again. Check `action: get_url` to
-    confirm you're on the right page.
+    Empty snapshot: wait longer, retry. Check get_url for redirects.
+    Element not found: scroll down (action=scroll direction=down pixels=500), snapshot again. Check for modal overlays.
+    Form submission fails: try action=press key=Enter instead of button click. Check for validation errors.
+    Login wall or CAPTCHA: report to Dan.
 
-    ## Targeting Elements
+    ## Avoid
 
-    Three strategies, in order of preference:
-
-    **Refs from snapshot** — After a snapshot, each interactive element has a
-    ref like `@e1`, `@e2`, etc. Use `action: click, selector: "@e42"` to
-    interact. Most reliable because the ref matches the current DOM state.
-
-    **Semantic find** — Use when you know the visible text or role without
-    needing a snapshot first: `action: find, by: text, value: "Submit", action: click`
-
-    The `by` parameter:
-    - `text` — visible text content ("Sign In", "Next Page")
-    - `role` — ARIA role (button, link, heading, textbox)
-    - `label` — form field label ("Email", "Password")
-    - `placeholder` — input placeholder text
-    - `testid` — data-testid attribute (rare, for test-instrumented pages)
-
-    **CSS selectors** — `action: click, selector: "#submit-btn"`. Use only when
-    you know the exact selector. Fragile on unfamiliar pages.
-
-    ## Recovery Patterns
-
-    **Empty snapshot after navigation:**
-    Wait longer, then snapshot again. If still empty, verify the URL loaded
-    correctly with `action: get_url`. Some pages redirect — you may not be
-    where you think you are.
-
-    **Element not found:**
-    The element may be below the fold. Scroll down with
-    `action: scroll, direction: down, pixels: 500`, then snapshot again.
-    Also check for modal overlays or cookie consent banners blocking the page —
-    dismiss those first.
-
-    **Form submission doesn't work:**
-    Some forms need `action: press, key: Enter` after filling, not a button
-    click. Check for client-side validation errors in the snapshot.
-
-    **Login wall or CAPTCHA:**
-    Report to Dan — you can't solve CAPTCHAs or log in without credentials.
-    If Dan provides credentials, use `action: fill` for username/password fields,
-    then submit.
-
-    ## Common Mistakes
-
-    - Screenshotting to read text — snapshot or get_text is faster and parseable
-    - Guessing CSS selectors without a snapshot — snapshot first, use @eN refs
-    - Using wrong ref format — it's `@e1` not `ref=1` or `#ref1`
-    - Rapid-fire actions without waits — the browser is async, give it time
-    - Retrying the same failing action — if it failed twice, change your approach
-    - Using browser for API calls — use Python urllib instead
-    - Letting snapshots accumulate — large snapshots (10-70KB each) grow the
-      context fast. If visiting multiple sites, `action: close` between them
-    - Using image_info(include_base64: true) when snapshot would suffice —
-      screenshots are expensive (large base64 in context). Prefer snapshot
+    Screenshotting to read text (use snapshot or get_text). Guessing CSS selectors without a snapshot. Wrong ref format (use @e1 not ref=1). Rapid-fire actions without waits. Using browser for API calls. Letting snapshots accumulate (use action=close between sites).
