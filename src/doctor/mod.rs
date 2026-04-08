@@ -1023,10 +1023,9 @@ mod tests {
     #[test]
     fn provider_validation_checks_custom_url_shape() {
         assert!(provider_validation_error("openrouter").is_none());
-        assert!(provider_validation_error("custom:https://example.com").is_none());
         assert!(provider_validation_error("anthropic-custom:https://example.com").is_none());
 
-        let invalid_custom = provider_validation_error("custom:").unwrap_or_default();
+        let invalid_custom = provider_validation_error("anthropic-custom:").unwrap_or_default();
         assert!(invalid_custom.contains("requires a URL"));
 
         let invalid_unknown = provider_validation_error("totally-fake").unwrap_or_default();
@@ -1122,7 +1121,7 @@ mod tests {
     #[test]
     fn config_validation_accepts_custom_provider() {
         let mut config = Config::default();
-        config.default_provider = Some("custom:https://my-api.com".into());
+        config.default_provider = Some("anthropic-custom:https://my-api.com".into());
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let prov_item = items.iter().find(|i| i.message.contains("is valid"));

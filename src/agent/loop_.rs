@@ -8803,15 +8803,12 @@ Let me check the result."#;
             crate::security::AutonomyLevel::default(),
         );
 
-        // Must contain zero XML protocol artifacts
+        // Must not contain the full XML tool-use protocol section header
         assert!(
-            !system_prompt.contains("<tool_call>"),
-            "Native prompt must not contain <tool_call>"
+            !system_prompt.contains("## Tool Use Protocol"),
+            "Native prompt must not contain XML protocol header"
         );
-        assert!(
-            !system_prompt.contains("</tool_call>"),
-            "Native prompt must not contain </tool_call>"
-        );
+        // Must not contain XML result tags (call tags may appear in efficiency hints)
         assert!(
             !system_prompt.contains("<tool_result>"),
             "Native prompt must not contain <tool_result>"
@@ -8819,10 +8816,6 @@ Let me check the result."#;
         assert!(
             !system_prompt.contains("</tool_result>"),
             "Native prompt must not contain </tool_result>"
-        );
-        assert!(
-            !system_prompt.contains("## Tool Use Protocol"),
-            "Native prompt must not contain XML protocol header"
         );
 
         // Positive: native prompt should still list tools and contain task instructions

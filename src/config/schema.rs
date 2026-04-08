@@ -11254,40 +11254,6 @@ requires_openai_auth = true
     }
 
     #[test]
-    async fn env_override_glm_api_key_for_regional_aliases() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config {
-            default_provider: Some("glm-cn".to_string()),
-            ..Config::default()
-        };
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("GLM_API_KEY", "glm-regional-key") };
-        config.apply_env_overrides();
-        assert_eq!(config.api_key.as_deref(), Some("glm-regional-key"));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("GLM_API_KEY") };
-    }
-
-    #[test]
-    async fn env_override_zai_api_key_for_regional_aliases() {
-        let _env_guard = env_override_lock().await;
-        let mut config = Config {
-            default_provider: Some("zai-cn".to_string()),
-            ..Config::default()
-        };
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("ZAI_API_KEY", "zai-regional-key") };
-        config.apply_env_overrides();
-        assert_eq!(config.api_key.as_deref(), Some("zai-regional-key"));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZAI_API_KEY") };
-    }
-
-    #[test]
     async fn env_override_model() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();

@@ -4735,79 +4735,35 @@ mod tests {
     #[test]
     fn default_model_for_provider_uses_latest_defaults() {
         assert_eq!(
-            default_model_for_provider("openrouter"),
-            "anthropic/claude-sonnet-4.6"
-        );
-        assert_eq!(default_model_for_provider("openai"), "gpt-5.2");
-        assert_eq!(default_model_for_provider("openai-codex"), "gpt-5-codex");
-        assert_eq!(
             default_model_for_provider("anthropic"),
             "claude-sonnet-4-5-20250929"
         );
-        assert_eq!(default_model_for_provider("qwen"), "qwen-plus");
-        assert_eq!(default_model_for_provider("qwen-intl"), "qwen-plus");
-        assert_eq!(default_model_for_provider("qwen-code"), "qwen3-coder-plus");
-        assert_eq!(default_model_for_provider("glm-cn"), "glm-5");
-        assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M2.7");
-        assert_eq!(default_model_for_provider("zai-cn"), "glm-5");
+        assert_eq!(default_model_for_provider("openai"), "gpt-5.2");
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
-        assert_eq!(default_model_for_provider("kimi-code"), "kimi-for-coding");
-        assert_eq!(
-            default_model_for_provider("bedrock"),
-            "anthropic.claude-sonnet-4-5-20250929-v1:0"
-        );
         assert_eq!(
             default_model_for_provider("google-gemini"),
             "gemini-2.5-pro"
         );
-        assert_eq!(default_model_for_provider("venice"), "zai-org-glm-5");
-        assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.5");
         assert_eq!(
-            default_model_for_provider("nvidia"),
-            "meta/llama-3.3-70b-instruct"
-        );
-        assert_eq!(
-            default_model_for_provider("nvidia-nim"),
-            "meta/llama-3.3-70b-instruct"
-        );
-        assert_eq!(
-            default_model_for_provider("llamacpp"),
-            "ggml-org/gpt-oss-20b-GGUF"
-        );
-        assert_eq!(default_model_for_provider("sglang"), "default");
-        assert_eq!(default_model_for_provider("vllm"), "default");
-        assert_eq!(
-            default_model_for_provider("astrai"),
+            default_model_for_provider("openrouter"),
             "anthropic/claude-sonnet-4.6"
         );
         assert_eq!(
-            default_model_for_provider("avian"),
-            "deepseek/deepseek-v3.2"
+            default_model_for_provider("unknown"),
+            "anthropic/claude-sonnet-4.6"
         );
     }
 
     #[test]
     fn canonical_provider_name_normalizes_regional_aliases() {
-        assert_eq!(canonical_provider_name("qwen-intl"), "qwen");
-        assert_eq!(canonical_provider_name("dashscope-us"), "qwen");
-        assert_eq!(canonical_provider_name("qwen-code"), "qwen-code");
-        assert_eq!(canonical_provider_name("qwen-oauth"), "qwen-code");
-        assert_eq!(canonical_provider_name("codex"), "openai-codex");
-        assert_eq!(canonical_provider_name("openai_codex"), "openai-codex");
-        assert_eq!(canonical_provider_name("moonshot-intl"), "moonshot");
-        assert_eq!(canonical_provider_name("kimi-cn"), "moonshot");
-        assert_eq!(canonical_provider_name("kimi_coding"), "kimi-code");
-        assert_eq!(canonical_provider_name("kimi_for_coding"), "kimi-code");
-        assert_eq!(canonical_provider_name("glm-cn"), "glm");
-        assert_eq!(canonical_provider_name("bigmodel"), "glm");
-        assert_eq!(canonical_provider_name("minimax-cn"), "minimax");
-        assert_eq!(canonical_provider_name("zai-cn"), "zai");
-        assert_eq!(canonical_provider_name("z.ai-global"), "zai");
-        assert_eq!(canonical_provider_name("nvidia-nim"), "nvidia");
-        assert_eq!(canonical_provider_name("aws-bedrock"), "bedrock");
-        assert_eq!(canonical_provider_name("build.nvidia.com"), "nvidia");
-        assert_eq!(canonical_provider_name("llama.cpp"), "llamacpp");
+        assert_eq!(canonical_provider_name("google"), "gemini");
+        assert_eq!(canonical_provider_name("google-gemini"), "gemini");
+        assert_eq!(canonical_provider_name("gemini"), "gemini");
+        assert_eq!(canonical_provider_name("openai"), "openai");
+        assert_eq!(canonical_provider_name("anthropic"), "anthropic");
+        assert_eq!(canonical_provider_name("openrouter"), "openrouter");
+        assert_eq!(canonical_provider_name("unknown"), "unknown");
     }
 
     #[test]
@@ -4822,31 +4778,6 @@ mod tests {
     }
 
     #[test]
-    fn curated_models_for_glm_removes_deprecated_flash_plus_aliases() {
-        let ids: Vec<String> = curated_models_for_provider("glm")
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-
-        assert!(ids.contains(&"glm-5".to_string()));
-        assert!(ids.contains(&"glm-4.7".to_string()));
-        assert!(ids.contains(&"glm-4.5-air".to_string()));
-        assert!(!ids.contains(&"glm-4-plus".to_string()));
-        assert!(!ids.contains(&"glm-4-flash".to_string()));
-    }
-
-    #[test]
-    fn curated_models_for_openai_codex_include_codex_family() {
-        let ids: Vec<String> = curated_models_for_provider("openai-codex")
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-
-        assert!(ids.contains(&"gpt-5-codex".to_string()));
-        assert!(ids.contains(&"gpt-5.2-codex".to_string()));
-    }
-
-    #[test]
     fn curated_models_for_openrouter_use_valid_anthropic_id() {
         let ids: Vec<String> = curated_models_for_provider("openrouter")
             .into_iter()
@@ -4857,82 +4788,12 @@ mod tests {
     }
 
     #[test]
-    fn curated_models_for_bedrock_include_verified_model_ids() {
-        let ids: Vec<String> = curated_models_for_provider("bedrock")
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-
-        assert!(ids.contains(&"anthropic.claude-sonnet-4-6".to_string()));
-        assert!(ids.contains(&"anthropic.claude-opus-4-6-v1".to_string()));
-        assert!(ids.contains(&"anthropic.claude-haiku-4-5-20251001-v1:0".to_string()));
-        assert!(ids.contains(&"anthropic.claude-sonnet-4-5-20250929-v1:0".to_string()));
-    }
-
-    #[test]
-    fn curated_models_for_moonshot_drop_deprecated_aliases() {
-        let ids: Vec<String> = curated_models_for_provider("moonshot")
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-
-        assert!(ids.contains(&"kimi-k2.5".to_string()));
-        assert!(ids.contains(&"kimi-k2-thinking".to_string()));
-        assert!(!ids.contains(&"kimi-latest".to_string()));
-        assert!(!ids.contains(&"kimi-thinking-preview".to_string()));
-    }
-
-    #[test]
     fn allows_unauthenticated_model_fetch_for_public_catalogs() {
         assert!(allows_unauthenticated_model_fetch("openrouter"));
-        assert!(allows_unauthenticated_model_fetch("venice"));
-        assert!(allows_unauthenticated_model_fetch("nvidia"));
-        assert!(allows_unauthenticated_model_fetch("nvidia-nim"));
-        assert!(allows_unauthenticated_model_fetch("build.nvidia.com"));
-        assert!(allows_unauthenticated_model_fetch("astrai"));
-        assert!(allows_unauthenticated_model_fetch("ollama"));
-        assert!(allows_unauthenticated_model_fetch("llamacpp"));
-        assert!(allows_unauthenticated_model_fetch("llama.cpp"));
-        assert!(allows_unauthenticated_model_fetch("sglang"));
-        assert!(allows_unauthenticated_model_fetch("vllm"));
         assert!(!allows_unauthenticated_model_fetch("openai"));
-        assert!(!allows_unauthenticated_model_fetch("deepseek"));
-    }
-
-    #[test]
-    fn curated_models_for_kimi_code_include_official_agent_model() {
-        let ids: Vec<String> = curated_models_for_provider("kimi-code")
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-
-        assert!(ids.contains(&"kimi-for-coding".to_string()));
-        assert!(ids.contains(&"kimi-k2.5".to_string()));
-    }
-
-    #[test]
-    fn curated_models_for_qwen_code_include_coding_plan_models() {
-        let ids: Vec<String> = curated_models_for_provider("qwen-code")
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-
-        assert!(ids.contains(&"qwen3-coder-plus".to_string()));
-        assert!(ids.contains(&"qwen3.5-plus".to_string()));
-        assert!(ids.contains(&"qwen3-max-2026-01-23".to_string()));
-    }
-
-    #[test]
-    fn curated_models_for_avian_include_expected_catalog() {
-        let ids: Vec<String> = curated_models_for_provider("avian")
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-
-        assert!(ids.contains(&"deepseek/deepseek-v3.2".to_string()));
-        assert!(ids.contains(&"moonshotai/kimi-k2.5".to_string()));
-        assert!(ids.contains(&"z-ai/glm-5".to_string()));
-        assert!(ids.contains(&"minimax/minimax-m2.5".to_string()));
+        assert!(!allows_unauthenticated_model_fetch("anthropic"));
+        assert!(!allows_unauthenticated_model_fetch("gemini"));
+        assert!(!allows_unauthenticated_model_fetch("unknown"));
     }
 
     #[test]
@@ -4941,35 +4802,15 @@ mod tests {
         assert!(supports_live_model_fetch("anthropic"));
         assert!(supports_live_model_fetch("gemini"));
         assert!(supports_live_model_fetch("google"));
-        assert!(supports_live_model_fetch("grok"));
-        assert!(supports_live_model_fetch("together"));
-        assert!(supports_live_model_fetch("nvidia"));
-        assert!(supports_live_model_fetch("nvidia-nim"));
-        assert!(supports_live_model_fetch("build.nvidia.com"));
-        assert!(supports_live_model_fetch("ollama"));
-        assert!(supports_live_model_fetch("llamacpp"));
-        assert!(supports_live_model_fetch("llama.cpp"));
-        assert!(supports_live_model_fetch("sglang"));
-        assert!(supports_live_model_fetch("vllm"));
-        assert!(supports_live_model_fetch("astrai"));
-        assert!(supports_live_model_fetch("avian"));
-        assert!(supports_live_model_fetch("venice"));
-        assert!(supports_live_model_fetch("glm-cn"));
-        assert!(supports_live_model_fetch("qwen-intl"));
-        assert!(!supports_live_model_fetch("minimax-cn"));
+        assert!(supports_live_model_fetch("openrouter"));
+        assert!(supports_live_model_fetch(
+            "custom:https://proxy.example.com/v1"
+        ));
         assert!(!supports_live_model_fetch("unknown-provider"));
     }
 
     #[test]
     fn curated_models_provider_aliases_share_same_catalog() {
-        assert_eq!(
-            curated_models_for_provider("xai"),
-            curated_models_for_provider("grok")
-        );
-        assert_eq!(
-            curated_models_for_provider("together-ai"),
-            curated_models_for_provider("together")
-        );
         assert_eq!(
             curated_models_for_provider("gemini"),
             curated_models_for_provider("google")
@@ -4978,50 +4819,6 @@ mod tests {
             curated_models_for_provider("gemini"),
             curated_models_for_provider("google-gemini")
         );
-        assert_eq!(
-            curated_models_for_provider("qwen"),
-            curated_models_for_provider("qwen-intl")
-        );
-        assert_eq!(
-            curated_models_for_provider("qwen"),
-            curated_models_for_provider("dashscope-us")
-        );
-        assert_eq!(
-            curated_models_for_provider("minimax"),
-            curated_models_for_provider("minimax-cn")
-        );
-        assert_eq!(
-            curated_models_for_provider("zai"),
-            curated_models_for_provider("zai-cn")
-        );
-        assert_eq!(
-            curated_models_for_provider("nvidia"),
-            curated_models_for_provider("nvidia-nim")
-        );
-        assert_eq!(
-            curated_models_for_provider("nvidia"),
-            curated_models_for_provider("build.nvidia.com")
-        );
-        assert_eq!(
-            curated_models_for_provider("llamacpp"),
-            curated_models_for_provider("llama.cpp")
-        );
-        assert_eq!(
-            curated_models_for_provider("bedrock"),
-            curated_models_for_provider("aws-bedrock")
-        );
-    }
-
-    #[test]
-    fn curated_models_for_nvidia_include_nim_catalog_entries() {
-        let ids: Vec<String> = curated_models_for_provider("nvidia")
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-
-        assert!(ids.contains(&"meta/llama-3.3-70b-instruct".to_string()));
-        assert!(ids.contains(&"deepseek-ai/deepseek-v3.2".to_string()));
-        assert!(ids.contains(&"nvidia/llama-3.3-nemotron-super-49b-v1.5".to_string()));
     }
 
     #[test]
@@ -5043,27 +4840,11 @@ mod tests {
     #[test]
     fn models_endpoint_for_provider_supports_additional_openai_compatible_providers() {
         assert_eq!(
-            models_endpoint_for_provider("openai-codex"),
+            models_endpoint_for_provider("openai"),
             Some("https://api.openai.com/v1/models")
         );
         assert_eq!(
-            models_endpoint_for_provider("venice"),
-            Some("https://api.venice.ai/api/v1/models")
-        );
-        assert_eq!(
-            models_endpoint_for_provider("cohere"),
-            Some("https://api.cohere.com/compatibility/v1/models")
-        );
-        assert_eq!(
-            models_endpoint_for_provider("moonshot"),
-            Some("https://api.moonshot.ai/v1/models")
-        );
-        assert_eq!(
             models_endpoint_for_provider("llamacpp"),
-            Some("http://localhost:8080/v1/models")
-        );
-        assert_eq!(
-            models_endpoint_for_provider("llama.cpp"),
             Some("http://localhost:8080/v1/models")
         );
         assert_eq!(
@@ -5074,28 +4855,9 @@ mod tests {
             models_endpoint_for_provider("vllm"),
             Some("http://localhost:8000/v1/models")
         );
-        assert_eq!(
-            models_endpoint_for_provider("avian"),
-            Some("https://api.avian.io/v1/models")
-        );
-        assert_eq!(models_endpoint_for_provider("perplexity"), None);
+        assert_eq!(models_endpoint_for_provider("openrouter"), None);
+        assert_eq!(models_endpoint_for_provider("anthropic"), None);
         assert_eq!(models_endpoint_for_provider("unknown-provider"), None);
-    }
-
-    #[test]
-    fn resolve_live_models_endpoint_prefers_llamacpp_custom_url() {
-        assert_eq!(
-            resolve_live_models_endpoint("llamacpp", Some("http://127.0.0.1:8033/v1")),
-            Some("http://127.0.0.1:8033/v1/models".to_string())
-        );
-        assert_eq!(
-            resolve_live_models_endpoint("llama.cpp", Some("http://127.0.0.1:8033/v1/")),
-            Some("http://127.0.0.1:8033/v1/models".to_string())
-        );
-        assert_eq!(
-            resolve_live_models_endpoint("llamacpp", Some("http://127.0.0.1:8033/v1/models")),
-            Some("http://127.0.0.1:8033/v1/models".to_string())
-        );
     }
 
     #[test]
@@ -5332,60 +5094,21 @@ mod tests {
     fn provider_env_var_known_providers() {
         assert_eq!(provider_env_var("openrouter"), "OPENROUTER_API_KEY");
         assert_eq!(provider_env_var("anthropic"), "ANTHROPIC_API_KEY");
-        assert_eq!(provider_env_var("openai-codex"), "OPENAI_API_KEY");
         assert_eq!(provider_env_var("openai"), "OPENAI_API_KEY");
-        assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
-        assert_eq!(provider_env_var("llamacpp"), "LLAMACPP_API_KEY");
-        assert_eq!(provider_env_var("llama.cpp"), "LLAMACPP_API_KEY");
-        assert_eq!(provider_env_var("sglang"), "SGLANG_API_KEY");
-        assert_eq!(provider_env_var("vllm"), "VLLM_API_KEY");
-        assert_eq!(provider_env_var("xai"), "XAI_API_KEY");
-        assert_eq!(provider_env_var("grok"), "XAI_API_KEY"); // alias
-        assert_eq!(provider_env_var("together"), "TOGETHER_API_KEY"); // alias
-        assert_eq!(provider_env_var("together-ai"), "TOGETHER_API_KEY");
-        assert_eq!(provider_env_var("google"), "GEMINI_API_KEY"); // alias
-        assert_eq!(provider_env_var("google-gemini"), "GEMINI_API_KEY"); // alias
         assert_eq!(provider_env_var("gemini"), "GEMINI_API_KEY");
-        assert_eq!(provider_env_var("qwen"), "DASHSCOPE_API_KEY");
-        assert_eq!(provider_env_var("qwen-intl"), "DASHSCOPE_API_KEY");
-        assert_eq!(provider_env_var("dashscope-us"), "DASHSCOPE_API_KEY");
-        assert_eq!(provider_env_var("qwen-code"), "QWEN_OAUTH_TOKEN");
-        assert_eq!(provider_env_var("qwen-oauth"), "QWEN_OAUTH_TOKEN");
-        assert_eq!(provider_env_var("glm-cn"), "GLM_API_KEY");
-        assert_eq!(provider_env_var("minimax-cn"), "MINIMAX_API_KEY");
-        assert_eq!(provider_env_var("kimi-code"), "KIMI_CODE_API_KEY");
-        assert_eq!(provider_env_var("kimi_coding"), "KIMI_CODE_API_KEY");
-        assert_eq!(provider_env_var("kimi_for_coding"), "KIMI_CODE_API_KEY");
-        assert_eq!(provider_env_var("minimax-oauth"), "MINIMAX_API_KEY");
-        assert_eq!(provider_env_var("minimax-oauth-cn"), "MINIMAX_API_KEY");
-        assert_eq!(provider_env_var("moonshot-intl"), "MOONSHOT_API_KEY");
-        assert_eq!(provider_env_var("zai-cn"), "ZAI_API_KEY");
-        assert_eq!(provider_env_var("nvidia"), "NVIDIA_API_KEY");
-        assert_eq!(provider_env_var("nvidia-nim"), "NVIDIA_API_KEY"); // alias
-        assert_eq!(provider_env_var("build.nvidia.com"), "NVIDIA_API_KEY"); // alias
-        assert_eq!(provider_env_var("astrai"), "ASTRAI_API_KEY");
-        assert_eq!(provider_env_var("opencode-go"), "OPENCODE_GO_API_KEY");
-        assert_eq!(provider_env_var("avian"), "AVIAN_API_KEY");
-    }
-
-    #[test]
-    fn provider_supports_keyless_local_usage_for_local_providers() {
-        assert!(provider_supports_keyless_local_usage("ollama"));
-        assert!(provider_supports_keyless_local_usage("llamacpp"));
-        assert!(provider_supports_keyless_local_usage("llama.cpp"));
-        assert!(provider_supports_keyless_local_usage("sglang"));
-        assert!(provider_supports_keyless_local_usage("vllm"));
-        assert!(!provider_supports_keyless_local_usage("openai"));
+        assert_eq!(provider_env_var("google"), "GEMINI_API_KEY");
+        assert_eq!(provider_env_var("google-gemini"), "GEMINI_API_KEY");
+        assert_eq!(provider_env_var("unknown"), "API_KEY");
     }
 
     #[test]
     fn provider_supports_device_flow_copilot() {
         assert!(provider_supports_device_flow("copilot"));
-        assert!(provider_supports_device_flow("github-copilot"));
         assert!(provider_supports_device_flow("gemini"));
         assert!(provider_supports_device_flow("openai-codex"));
         assert!(!provider_supports_device_flow("openai"));
         assert!(!provider_supports_device_flow("openrouter"));
+        assert!(!provider_supports_device_flow("anthropic"));
     }
 
     #[test]

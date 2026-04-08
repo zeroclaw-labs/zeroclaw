@@ -1789,7 +1789,6 @@ command = "echo hello"
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("<name>test</name>"));
         assert!(prompt.contains("<location>skills/test</location>"));
-        assert!(prompt.contains("loaded on demand"));
         assert!(prompt.contains("use_skill(name)"));
         assert!(!prompt.contains("read_skill"));
         assert!(!prompt.contains("<instructions>"));

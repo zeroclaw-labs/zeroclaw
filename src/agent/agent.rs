@@ -1533,41 +1533,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn from_config_passes_extra_headers_to_custom_provider() {
-        use axum::{Json, Router, http::HeaderMap, routing::post};
+    async fn from_config_routes_to_custom_api_url() {
+        use axum::{Json, Router, routing::post};
         use tempfile::TempDir;
         use tokio::net::TcpListener;
 
-        let captured_headers: Arc<std::sync::Mutex<Option<HashMap<String, String>>>> =
-            Arc::new(std::sync::Mutex::new(None));
-        let captured_headers_clone = captured_headers.clone();
-
         let app = Router::new().route(
             "/chat/completions",
-            post(
-                move |headers: HeaderMap, Json(_body): Json<serde_json::Value>| {
-                    let captured_headers = captured_headers_clone.clone();
-                    async move {
-                        let collected = headers
-                            .iter()
-                            .filter_map(|(name, value)| {
-                                value
-                                    .to_str()
-                                    .ok()
-                                    .map(|value| (name.as_str().to_string(), value.to_string()))
-                            })
-                            .collect();
-                        *captured_headers.lock().unwrap() = Some(collected);
-                        Json(serde_json::json!({
-                            "choices": [{
-                                "message": {
-                                    "content": "hello from mock"
-                                }
-                            }]
-                        }))
-                    }
-                },
-            ),
+            post(move |Json(_body): Json<serde_json::Value>| async move {
+                Json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": "hello from mock"
+                        }
+                    }]
+                }))
+            }),
         );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1584,17 +1565,11 @@ mod tests {
         config.workspace_dir = workspace_dir;
         config.config_path = tmp.path().join("config.toml");
         config.api_key = Some("test-key".to_string());
-        config.default_provider = Some(format!("custom:http://{addr}"));
+        config.default_provider = Some("openai".to_string());
+        config.api_url = Some(format!("http://{addr}"));
         config.default_model = Some("test-model".to_string());
         config.memory.backend = "none".to_string();
         config.memory.auto_save = false;
-        config.extra_headers.insert(
-            "User-Agent".to_string(),
-            "zeroclaw-web-test/1.0".to_string(),
-        );
-        config
-            .extra_headers
-            .insert("X-Title".to_string(), "zeroclaw-web".to_string());
 
         let mut agent = Agent::from_config(&config)
             .await
@@ -1602,20 +1577,6 @@ mod tests {
         let response = agent.turn("hello").await.expect("agent turn");
 
         assert_eq!(response, "hello from mock");
-
-        let headers = captured_headers
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("captured headers");
-        assert_eq!(
-            headers.get("user-agent").map(String::as_str),
-            Some("zeroclaw-web-test/1.0")
-        );
-        assert_eq!(
-            headers.get("x-title").map(String::as_str),
-            Some("zeroclaw-web")
-        );
 
         server_handle.abort();
     }

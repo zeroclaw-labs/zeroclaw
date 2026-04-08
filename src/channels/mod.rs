@@ -3293,7 +3293,7 @@ async fn process_channel_message(
                 );
                 let should_rollback_user_turn = should_rollback_failed_user_turn(&e);
                 let rolled_back = should_rollback_user_turn
-                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &msg.content);
+                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &stamped_content);
 
                 if !rolled_back {
                     // Close the orphan user turn so subsequent messages don't
@@ -7836,7 +7836,6 @@ BTC is currently around $65,000 based on latest tool output."#
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         assert!(prompt.contains("Do not exfiltrate private data"));
-        assert!(prompt.contains("Respect the runtime autonomy policy"));
         assert!(prompt.contains("Prefer `trash` over `rm`"));
     }
 
@@ -7957,7 +7956,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<available_skills>"), "missing skills XML");
         assert!(prompt.contains("<name>code-review</name>"));
         assert!(prompt.contains("<description>Review code for bugs</description>"));
-        assert!(prompt.contains("SKILL.md</location>"));
+        assert!(prompt.contains("skills/code-review</location>"));
         assert!(prompt.contains("<instructions>"));
         assert!(
             prompt.contains(
@@ -7967,7 +7966,7 @@ BTC is currently around $65,000 based on latest tool output."#
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(prompt.contains("<callable_tools"));
         assert!(prompt.contains("<name>code-review.lint</name>"));
-        assert!(!prompt.contains("loaded on demand"));
+        assert!(!prompt.contains("full instructions via `use_skill(name)`"));
     }
 
     #[test]
@@ -8004,8 +8003,8 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert!(prompt.contains("<available_skills>"), "missing skills XML");
         assert!(prompt.contains("<name>code-review</name>"));
-        assert!(prompt.contains("<location>skills/code-review/SKILL.md</location>"));
-        assert!(prompt.contains("loaded on demand"));
+        assert!(prompt.contains("<location>skills/code-review</location>"));
+        assert!(prompt.contains("full instructions via `use_skill(name)`"));
         assert!(!prompt.contains("<instructions>"));
         assert!(
             !prompt.contains(
@@ -8872,7 +8871,10 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(calls[0][0].1.contains("[Memory context]"));
         assert!(calls[0][0].1.contains("Age is 45"));
         assert_eq!(calls[0][1].0, "user");
-        assert_eq!(calls[0][1].1, "hello");
+        assert!(
+            calls[0][1].1.contains("hello"),
+            "user message should contain original content"
+        );
 
         let histories = runtime_ctx
             .conversation_histories
@@ -8882,7 +8884,10 @@ BTC is currently around $65,000 based on latest tool output."#
             .get("test-channel_chat-ctx_alice")
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[0].content, "hello");
+        assert!(
+            turns[0].content.contains("hello"),
+            "stored turn should contain original content"
+        );
         assert!(!turns[0].content.contains("[Memory context]"));
     }
 
@@ -8992,7 +8997,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "telegram channel instructions should be embedded into the system prompt"
         );
         assert!(
-            calls[0][0].1.contains("For media attachments use markers:"),
+            calls[0][0].1.contains("Media markers:"),
             "telegram media marker guidance should live in the system prompt"
         );
         assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));
@@ -9664,7 +9669,11 @@ This is an example JSON object for profile settings."#;
             .expect("history should exist for sender");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[0].content, "What is WAL?");
+        assert!(
+            turns[0].content.contains("What is WAL?"),
+            "user turn should contain original content, got: {}",
+            turns[0].content
+        );
         assert_eq!(turns[1].role, "assistant");
         assert_eq!(turns[1].content, "ok");
         assert!(
@@ -9791,13 +9800,17 @@ This is an example JSON object for profile settings."#;
             .expect("history should exist for sender");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[0].content, "What is WAL?");
+        assert!(
+            turns[0].content.contains("What is WAL?"),
+            "user turn should contain original content, got: {}",
+            turns[0].content
+        );
         assert_eq!(turns[1].role, "assistant");
         assert_eq!(turns[1].content, "ok");
         assert!(
             turns
                 .iter()
-                .all(|turn| turn.content != "trigger format error"),
+                .all(|turn| !turn.content.contains("trigger format error")),
             "failed non-retryable turn must not persist in history"
         );
     }

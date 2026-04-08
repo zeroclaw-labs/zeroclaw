@@ -244,6 +244,12 @@ jobs:
           name: web-dist
           path: web/dist/
 
+      - name: Install mold linker
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y mold
+
       - name: Install cross compiler
         if: matrix.cross_compiler
         run: |
@@ -274,6 +280,9 @@ jobs:
           else
             cargo build --release --locked --features "${FEATURES}" --target ${{ matrix.target }}
           fi
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
       - name: Check binary size
         shell: bash

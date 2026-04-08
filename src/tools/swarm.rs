@@ -956,8 +956,10 @@ mod tests {
         );
         let result = tool
             .execute(json!({"swarm": "rout", "prompt": "test"}))
-            .await
-            .unwrap();
-        assert!(!result.success);
+            .await;
+        assert!(
+            result.is_err(),
+            "Expected error for unknown provider 'ollama'"
+        );
     }
 }

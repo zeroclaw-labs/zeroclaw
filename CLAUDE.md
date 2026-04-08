@@ -18,6 +18,7 @@ _No custom slash commands defined yet._
 ## Active Technologies
 - Rust (edition 2021, stable toolchain) + tokio, serde, reqwest, teloxide (Telegram), slack-morphism (Slack) (001-simplify-channels-providers)
 - SQLite (session_sqlite), JSONL (session_store), in-memory (001-simplify-channels-providers)
+- Rust (edition 2024, stable toolchain) + tokio, serde, reqwest, teloxide (Telegram), slack-morphism (Slack), axum (gateway) (002-fix-tests-fast-builds)
 
 ## Recent Changes
 - 001-simplify-channels-providers: Added Rust (edition 2021, stable toolchain) + tokio, serde, reqwest, teloxide (Telegram), slack-morphism (Slack)
