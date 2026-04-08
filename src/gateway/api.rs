@@ -1355,7 +1355,8 @@ pub async fn handle_api_sessions_list(
             // Otherwise default to "gateway"
             let channel = "gateway";
             // Determine status based on session state
-            let status = backend.get_session_state(&meta.key)
+            let status = backend
+                .get_session_state(&meta.key)
                 .ok()
                 .flatten()
                 .map(|s| s.state)
