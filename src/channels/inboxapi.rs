@@ -4,6 +4,7 @@
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -105,6 +106,9 @@ struct Credentials {
     /// The provisioned email address (informational).
     #[serde(default)]
     email_address: String,
+    /// RFC3339 cursor for incremental polling. Stored so restarts are idempotent.
+    #[serde(default)]
+    last_poll_cursor: Option<String>,
 }
 
 /// Runtime token state shared across send/listen/health operations.
@@ -190,9 +194,8 @@ impl InboxApiChannel {
         let mut req = self
             .client
             .post(&self.config.endpoint)
-            // Prefer a single JSON response; streaming SSE responses can hang if the server
-            // keeps the connection open.
-            .header("Accept", "application/json")
+            // InboxAPI MCP requires clients to accept both JSON and SSE.
+            .header("Accept", "application/json, text/event-stream")
             .json(&payload);
         if let Some(token) = auth_token {
             req = req.bearer_auth(token);
@@ -205,8 +208,7 @@ impl InboxApiChannel {
             return Err(anyhow!("MCP request failed ({}): {}", status, body));
         }
 
-        let body_text = resp.text().await?;
-        let body: serde_json::Value = Self::parse_sse_response(&body_text)?;
+        let body: serde_json::Value = Self::parse_mcp_response(resp).await?;
 
         // Check for JSON-RPC error
         if let Some(err) = body.get("error") {
@@ -218,6 +220,37 @@ impl InboxApiChannel {
             .get("result")
             .cloned()
             .unwrap_or(serde_json::Value::Null))
+    }
+
+    async fn parse_mcp_response(resp: reqwest::Response) -> Result<serde_json::Value> {
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if content_type.starts_with("text/event-stream") {
+            return Self::parse_sse_stream(resp).await;
+        }
+
+        let body_text = resp.text().await?;
+        Self::parse_sse_response(&body_text)
+    }
+
+    async fn parse_sse_stream(resp: reqwest::Response) -> Result<serde_json::Value> {
+        let mut stream = resp.bytes_stream();
+        let mut buffer = String::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            if let Ok(value) = Self::parse_sse_response(&buffer) {
+                return Ok(value);
+            }
+        }
+
+        Self::parse_sse_response(&buffer)
     }
 
     /// Parse a response body that may be SSE-formatted or plain JSON.
@@ -499,12 +532,14 @@ impl InboxApiChannel {
         };
 
         // Persist updated credentials
+        let last_poll_cursor = self.last_poll_time.lock().await.clone();
         if let Err(e) = self.save_credentials(&Credentials {
             account_name: persisted_account_name,
             access_token: access_token.clone(),
             refresh_token: new_refresh,
             expires_at,
             email_address,
+            last_poll_cursor,
         }) {
             warn!("Failed to persist refreshed InboxAPI credentials: {e}");
         }
@@ -524,6 +559,7 @@ impl InboxApiChannel {
 
         // 1. Try loading existing credentials
         if let Some(creds) = self.load_credentials() {
+            *self.last_poll_time.lock().await = creds.last_poll_cursor.clone();
             let ts = self.apply_credentials(&creds);
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -681,6 +717,7 @@ impl InboxApiChannel {
             refresh_token: refresh_token.clone(),
             expires_at,
             email_address: email_address.clone(),
+            last_poll_cursor: None,
         };
 
         self.save_credentials(&creds)?;
@@ -719,13 +756,16 @@ impl InboxApiChannel {
 
         // Use timestamp cursor for incremental polling
         let since = self.last_poll_time.lock().await.clone();
+        let tool_name = if since.is_some() {
+            "search_emails"
+        } else {
+            "get_emails"
+        };
         if let Some(ref ts) = since {
             args["since"] = serde_json::json!(ts);
         }
 
-        let result = self
-            .call_mcp_tool("search_emails", args, Some(&token))
-            .await?;
+        let result = self.call_mcp_tool(tool_name, args, Some(&token)).await?;
 
         let content_text = match Self::extract_text_content(&result) {
             Some(text) => text,
@@ -745,7 +785,8 @@ impl InboxApiChannel {
             arr
         } else {
             warn!(
-                "InboxAPI search_emails returned unrecognized format: {}",
+                "InboxAPI {} returned unrecognized format: {}",
+                tool_name,
                 emails
                     .as_object()
                     .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
@@ -842,7 +883,16 @@ impl InboxApiChannel {
 
         // Advance the since cursor for next poll
         if let Some(ts) = latest_received_at {
-            *self.last_poll_time.lock().await = Some(Self::format_cursor(ts));
+            let cursor = Self::format_cursor(ts);
+            *self.last_poll_time.lock().await = Some(cursor.clone());
+
+            // Persist cursor so restarts don't re-ingest the same batch.
+            if let Some(mut creds) = self.load_credentials() {
+                creds.last_poll_cursor = Some(cursor);
+                if let Err(e) = self.save_credentials(&creds) {
+                    warn!("Failed to persist InboxAPI poll cursor: {e}");
+                }
+            }
         }
 
         Ok(())
@@ -1205,6 +1255,7 @@ mod tests {
             refresh_token: "ref-tok-456".into(),
             expires_at: 1_700_000_000,
             email_address: "test-bot@abc.inboxapi.ai".into(),
+            last_poll_cursor: None,
         };
         let json = serde_json::to_string(&creds).unwrap();
         let parsed: Credentials = serde_json::from_str(&json).unwrap();
