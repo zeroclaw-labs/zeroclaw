@@ -387,6 +387,56 @@ impl WhatsAppWebChannel {
         retry_count.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Fix up an LID-based reply target to a deliverable phone JID when
+    /// a resolved phone number is available.
+    ///
+    /// LID JIDs (e.g. `159193097105449@lid`) are internal WhatsApp identifiers
+    /// that cannot receive messages.  When the reply target ends with `@lid`
+    /// and `normalized` contains a phone number (from the allowlist match or
+    /// LID→PN mapping), this converts it to `{digits}@s.whatsapp.net`.
+    ///
+    /// # Returns
+    ///
+    /// The (possibly converted) reply target string.
+    ///
+    /// # Behavior when `normalized` is `None`
+    ///
+    /// When the reply target is an LID JID but no phone number could be
+    /// resolved (`normalized` is `None`), the original LID target is returned
+    /// unchanged and a warning is logged.  This can happen when a message
+    /// passes a permissive policy (e.g. `dm_policy = "all"` or
+    /// `group_policy = "all"`) but the sender's phone number is not in the
+    /// allowlist and could not be resolved via the LID→PN mapping provided
+    /// by WhatsApp's servers.
+    ///
+    /// In this case the agent still processes the inbound message and
+    /// attempts delivery to the LID target.  The send will fail server-side
+    /// because LID JIDs are not routable.  This is intentional: silently
+    /// dropping the response would hide a configuration issue, whereas a
+    /// server-side rejection (plus the logged warning) gives operators a
+    /// clear signal that the sender's phone number needs to be added to the
+    /// allowlist or that the LID→PN mapping was unavailable.
+    fn fixup_lid_reply_target(reply_target: &str, normalized: Option<&str>) -> String {
+        if !reply_target.ends_with("@lid") {
+            return reply_target.to_string();
+        }
+
+        if let Some(n) = normalized {
+            let digits: String = n.chars().filter(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                tracing::debug!(
+                    "WhatsApp Web: LID→phone reply target fixup: {reply_target} → {digits}@s.whatsapp.net"
+                );
+                return format!("{digits}@s.whatsapp.net");
+            }
+        }
+
+        tracing::warn!(
+            "WhatsApp Web: reply target is LID ({reply_target}) but no phone number resolved; response may not be delivered"
+        );
+        reply_target.to_string()
+    }
+
     /// Return the session file paths to remove (primary + WAL + SHM sidecars).
     fn session_file_paths(expanded_session_path: &str) -> [String; 3] {
         [
@@ -1227,21 +1277,12 @@ impl Channel for WhatsAppWebChannel {
                                 // reply target so the response is deliverable.
                                 // This covers self-chat, DMs, and any future case
                                 // where WhatsApp routes via LID.
-                                if reply_target.ends_with("@lid") {
-                                    if let Some(ref n) = normalized {
-                                        let digits: String = n.chars().filter(|c| c.is_ascii_digit()).collect();
-                                        if !digits.is_empty() {
-                                            tracing::debug!(
-                                                "WhatsApp Web: LID→phone reply target fixup: {reply_target} → {digits}@s.whatsapp.net"
-                                            );
-                                            reply_target = format!("{digits}@s.whatsapp.net");
-                                        }
-                                    } else {
-                                        tracing::warn!(
-                                            "WhatsApp Web: reply target is LID ({reply_target}) but no phone number resolved; response may not be delivered"
-                                        );
-                                    }
-                                }
+                                // See `fixup_lid_reply_target` docs for behavior
+                                // when `normalized` is None.
+                                reply_target = Self::fixup_lid_reply_target(
+                                    &reply_target,
+                                    normalized.as_deref(),
+                                );
 
                                 let normalized = normalized.unwrap_or_else(|| sender.clone());
 
@@ -2138,6 +2179,53 @@ mod tests {
             false,
         );
         assert_eq!(*ch.bot_phone.lock(), None);
+    }
+
+    // ── LID reply-target fixup tests ──
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn fixup_lid_reply_target_converts_when_phone_available() {
+        // When the reply target is an LID JID and a normalized phone number
+        // is available, the target should be converted to a phone JID.
+        let result =
+            WhatsAppWebChannel::fixup_lid_reply_target("159193097105449@lid", Some("+15551234567"));
+        assert_eq!(result, "15551234567@s.whatsapp.net");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn fixup_lid_reply_target_warns_when_no_phone_available() {
+        // When the reply target is an LID JID but no phone number is
+        // resolved, the original LID target is returned unchanged.
+        // (A tracing::warn is emitted but we verify the return value.)
+        let result = WhatsAppWebChannel::fixup_lid_reply_target("159193097105449@lid", None);
+        assert_eq!(result, "159193097105449@lid");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn fixup_lid_reply_target_preserves_non_lid_targets() {
+        // Non-LID targets (phone JIDs, group JIDs) must not be modified.
+        let phone_jid = "15551234567@s.whatsapp.net";
+        assert_eq!(
+            WhatsAppWebChannel::fixup_lid_reply_target(phone_jid, Some("+15551234567")),
+            phone_jid
+        );
+        assert_eq!(
+            WhatsAppWebChannel::fixup_lid_reply_target(phone_jid, None),
+            phone_jid
+        );
+
+        let group_jid = "120363123456789012@g.us";
+        assert_eq!(
+            WhatsAppWebChannel::fixup_lid_reply_target(group_jid, Some("+15551234567")),
+            group_jid
+        );
+        assert_eq!(
+            WhatsAppWebChannel::fixup_lid_reply_target(group_jid, None),
+            group_jid
+        );
     }
 
     // ---- Media attachment marker parsing tests ----
