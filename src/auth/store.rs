@@ -7,6 +7,7 @@
 
 use anyhow::{bail, Result};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -150,6 +151,47 @@ impl AuthStore {
         let has_email: bool = conn.prepare("SELECT email FROM users LIMIT 0").is_ok();
         if !has_email {
             let _ = conn.execute_batch("ALTER TABLE users ADD COLUMN email TEXT;");
+        }
+
+        // ── Usage analytics table ──
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS usage_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                category TEXT NOT NULL,
+                event_count INTEGER NOT NULL DEFAULT 1,
+                total_chars INTEGER NOT NULL DEFAULT 0,
+                recorded_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_usage_user ON usage_stats(user_id);
+            CREATE INDEX IF NOT EXISTS idx_usage_cat ON usage_stats(category);
+            CREATE INDEX IF NOT EXISTS idx_usage_time ON usage_stats(recorded_at);",
+        )?;
+
+        // ── Admin credentials table ──
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS admins (
+                username TEXT PRIMARY KEY COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );",
+        )?;
+
+        // Ensure default admin exists (password: admin — must change on first login)
+        let admin_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM admins",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        if admin_count == 0 {
+            let salt = generate_salt();
+            let hash = hash_password("admin", &salt);
+            let now = epoch_secs() as i64;
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO admins (username, password_hash, salt, created_at) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["admin", hash, salt, now],
+            );
         }
 
         Ok(Self {
@@ -783,6 +825,185 @@ impl AuthStore {
         )?;
         Ok(deleted > 0)
     }
+
+    // ── Admin Operations ────────────────────────────────────────────
+
+    /// Authenticate an admin user.
+    pub fn authenticate_admin(&self, username: &str, password: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let row = conn.query_row(
+            "SELECT password_hash, salt FROM admins WHERE username = ?1",
+            rusqlite::params![username.trim()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        );
+        match row {
+            Ok((stored_hash, salt)) => {
+                let candidate = hash_password(password, &salt);
+                Ok(constant_time_eq(candidate.as_bytes(), stored_hash.as_bytes()))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// List all registered users with device count and online status.
+    pub fn list_all_users(&self, online_threshold_secs: u64) -> Result<Vec<AdminUserInfo>> {
+        let conn = self.conn.lock();
+        let now = epoch_secs() as i64;
+        let threshold = now - online_threshold_secs as i64;
+
+        let mut stmt = conn.prepare(
+            "SELECT u.id, u.username, u.email, u.created_at,
+                    (SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id) AS device_count,
+                    (SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id AND d.last_seen > ?1) AS online_count,
+                    (SELECT MAX(d.last_seen) FROM devices d WHERE d.user_id = u.id) AS last_active
+             FROM users u
+             ORDER BY u.created_at DESC",
+        )?;
+
+        let rows = stmt.query_map(rusqlite::params![threshold], |row| {
+            Ok(AdminUserInfo {
+                user_id: row.get(0)?,
+                username: row.get(1)?,
+                email: row.get(2)?,
+                created_at: row.get(3)?,
+                device_count: row.get(4)?,
+                online_device_count: row.get(5)?,
+                last_active: row.get(6)?,
+            })
+        })?;
+
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| e.into())
+    }
+
+    /// Record a usage event for analytics.
+    pub fn record_usage(&self, user_id: &str, category: &str, chars: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        let now = epoch_secs() as i64;
+        conn.execute(
+            "INSERT INTO usage_stats (user_id, category, event_count, total_chars, recorded_at)
+             VALUES (?1, ?2, 1, ?3, ?4)",
+            rusqlite::params![user_id, category, chars, now],
+        )?;
+        Ok(())
+    }
+
+    /// Aggregate usage stats for all users grouped by category.
+    pub fn usage_summary(&self, since_secs: u64) -> Result<Vec<UsageStat>> {
+        let conn = self.conn.lock();
+        let since = (epoch_secs() - since_secs) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT category,
+                    SUM(event_count) AS total_events,
+                    SUM(total_chars) AS total_chars,
+                    COUNT(DISTINCT user_id) AS unique_users
+             FROM usage_stats
+             WHERE recorded_at > ?1
+             GROUP BY category
+             ORDER BY total_events DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![since], |row| {
+            Ok(UsageStat {
+                category: row.get(0)?,
+                total_events: row.get(1)?,
+                total_chars: row.get(2)?,
+                unique_users: row.get(3)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| e.into())
+    }
+
+    /// Per-user usage stats for the admin dashboard.
+    pub fn per_user_usage(&self, since_secs: u64) -> Result<Vec<UserUsageStat>> {
+        let conn = self.conn.lock();
+        let since = (epoch_secs() - since_secs) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT u.username, us.category,
+                    SUM(us.event_count) AS events,
+                    SUM(us.total_chars) AS chars
+             FROM usage_stats us
+             JOIN users u ON us.user_id = u.id
+             WHERE us.recorded_at > ?1
+             GROUP BY u.username, us.category
+             ORDER BY events DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![since], |row| {
+            Ok(UserUsageStat {
+                username: row.get(0)?,
+                category: row.get(1)?,
+                events: row.get(2)?,
+                chars: row.get(3)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| e.into())
+    }
+
+    /// Active sessions (who is logged in right now).
+    pub fn active_sessions(&self) -> Result<Vec<ActiveSession>> {
+        let conn = self.conn.lock();
+        let now = epoch_secs() as i64;
+        let mut stmt = conn.prepare(
+            "SELECT u.username, s.device_id, s.device_name, s.created_at, s.expires_at
+             FROM sessions s
+             JOIN users u ON s.user_id = u.id
+             WHERE s.expires_at > ?1
+             ORDER BY s.created_at DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![now], |row| {
+            Ok(ActiveSession {
+                username: row.get(0)?,
+                device_id: row.get(1)?,
+                device_name: row.get(2)?,
+                logged_in_at: row.get(3)?,
+                expires_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| e.into())
+    }
+}
+
+/// Admin dashboard user info.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminUserInfo {
+    pub user_id: String,
+    pub username: String,
+    pub email: Option<String>,
+    pub created_at: i64,
+    pub device_count: i64,
+    pub online_device_count: i64,
+    pub last_active: Option<i64>,
+}
+
+/// Aggregated usage stat by category.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageStat {
+    pub category: String,
+    pub total_events: i64,
+    pub total_chars: i64,
+    pub unique_users: i64,
+}
+
+/// Per-user usage stat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserUsageStat {
+    pub username: String,
+    pub category: String,
+    pub events: i64,
+    pub chars: i64,
+}
+
+/// Active session info.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveSession {
+    pub username: String,
+    pub device_id: Option<String>,
+    pub device_name: Option<String>,
+    pub logged_in_at: i64,
+    pub expires_at: i64,
 }
 
 /// Full channel link record — user identity + target device + autonomy mode.

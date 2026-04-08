@@ -508,6 +508,21 @@ pub async fn handle_api_chat(
                     cost_usd: None,
                 });
 
+            // ── Record usage analytics for admin dashboard ──
+            if let Some(ref auth_store) = state.auth_store {
+                let category = crate::memory::traits::InteractionCategory::classify(
+                    &enriched_message,
+                    &[],
+                )
+                .to_string();
+                let user_id = chat_body
+                    .session_id
+                    .as_deref()
+                    .unwrap_or("anonymous");
+                let chars = enriched_message.len() as i64 + safe_response.len() as i64;
+                let _ = auth_store.record_usage(user_id, &category, chars);
+            }
+
             let body = serde_json::json!({
                 "reply": safe_response,
                 "model": model_label,
