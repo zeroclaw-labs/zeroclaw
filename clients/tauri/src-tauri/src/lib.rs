@@ -1262,8 +1262,8 @@ fn write_zeroclaw_config(
 
 /// Save a channel configuration block to config.toml.
 ///
-/// Merges the channel settings into the existing `[channels.<name>]` section
-/// so the user doesn't have to manually edit the TOML file.
+/// Merges the channel settings into the existing `[channels_config.<name>]`
+/// section so the user doesn't have to manually edit the TOML file.
 #[tauri::command]
 fn save_channel_config(
     channel_name: String,
@@ -1282,13 +1282,27 @@ fn save_channel_config(
         .parse()
         .unwrap_or_else(|_| toml::Table::new());
 
-    // Get or create [channels.<channel_name>]
+    // Migration: if a stale [channels] section exists (from a previous bug),
+    // move its contents to [channels_config] so the user's saved tokens aren't lost.
+    if let Some(toml::Value::Table(stale)) = table.remove("channels") {
+        let dest = table
+            .entry("channels_config".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let Some(dest_table) = dest.as_table_mut() {
+            for (k, v) in stale {
+                dest_table.entry(k).or_insert(v);
+            }
+        }
+    }
+
+    // Get or create [channels_config.<channel_name>]
+    // ZeroClaw uses `channels_config` (not `channels`) as the TOML section key.
     let channels = table
-        .entry("channels".to_string())
+        .entry("channels_config".to_string())
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
     let channels_table = channels
         .as_table_mut()
-        .ok_or("channels is not a table")?;
+        .ok_or("channels_config is not a table")?;
     let channel = channels_table
         .entry(channel_name.clone())
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
