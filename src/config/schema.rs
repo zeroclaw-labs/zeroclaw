@@ -835,6 +835,13 @@ pub struct PresentationConfig {
     /// syntax (`{`, `}`, `:`, `"`). Default: false.
     #[serde(default)]
     pub flatten_json_responses: bool,
+
+    /// Simplify tool schemas for models with limited schema parsing capacity.
+    /// Truncates descriptions to first sentence, strips behavioral instructions,
+    /// removes optional parameters, and shortens parameter descriptions.
+    /// Default: false.
+    #[serde(default)]
+    pub simplify_tool_schemas: bool,
 }
 
 impl Default for PresentationConfig {
@@ -846,6 +853,7 @@ impl Default for PresentationConfig {
             show_metadata: default_true(),
             overflow_dir: default_overflow_dir(),
             flatten_json_responses: false,
+            simplify_tool_schemas: false,
         }
     }
 }
