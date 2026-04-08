@@ -798,4 +798,80 @@ mod tests {
         assert_eq!(action["type"], "string");
         assert_eq!(action["description"].as_str().unwrap(), "Browser action.");
     }
+
+    // ── Integration tests with realistic schemas ──
+
+    #[test]
+    fn simplify_realistic_file_read_schema() {
+        let spec = ToolSpec {
+            name: "file_read".into(),
+            description: "Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; other binary files are read with lossy UTF-8 conversion. Sensitive files are blocked by default.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file. Relative paths resolve from workspace; outside paths require policy allowlist."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Starting line number (1-based, default: 1)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of lines to return (default: all)"
+                    }
+                },
+                "required": ["path"]
+            }),
+        };
+        let result = simplify_tool_spec(&spec);
+        assert_eq!(result.description, "Read file contents with line numbers.");
+        let props = result.parameters["properties"].as_object().unwrap();
+        assert_eq!(props.len(), 1);
+        assert!(props.contains_key("path"));
+        assert_eq!(props["path"]["description"].as_str().unwrap(), "Path to the file.");
+    }
+
+    #[test]
+    fn simplify_realistic_browser_schema() {
+        let spec = ToolSpec {
+            name: "browser".into(),
+            description: "Control a headless Chromium browser. Supports navigation, clicking, form filling, screenshots, and accessibility snapshots. Use snapshot for reading page content.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["open", "snapshot", "click", "fill", "screenshot", "wait", "scroll", "find"],
+                        "description": "Browser action. Common actions and required params: open(url), get_text(selector), click(selector)."
+                    },
+                    "url": {"type": "string", "description": "URL to navigate to (for open action)"},
+                    "selector": {"type": "string", "description": "Element selector."},
+                    "value": {"type": "string", "description": "Value to fill or search for."},
+                    "direction": {"type": "string", "description": "Scroll direction."},
+                    "ms": {"type": "integer", "description": "Milliseconds to wait."}
+                },
+                "required": ["action"]
+            }),
+        };
+        let result = simplify_tool_spec(&spec);
+        assert_eq!(result.description, "Control a headless Chromium browser.");
+        let props = result.parameters["properties"].as_object().unwrap();
+        assert_eq!(props.len(), 1);
+        assert!(props.contains_key("action"));
+        assert!(props["action"]["enum"].is_array());
+        assert_eq!(props["action"]["description"].as_str().unwrap(), "Browser action.");
+    }
+
+    #[test]
+    fn simplify_realistic_bg_run_behavioral() {
+        let spec = ToolSpec {
+            name: "bg_run".into(),
+            description: "Execute a tool in the background and return a job ID immediately. Use this for long-running operations where you don't want to block. Check results with bg_status.".into(),
+            parameters: json!({"type": "object", "properties": {"tool": {"type": "string", "description": "Tool name."}}, "required": ["tool"]}),
+        };
+        let result = simplify_tool_spec(&spec);
+        assert_eq!(result.description, "Execute a tool in the background and return a job ID immediately.");
+    }
 }
