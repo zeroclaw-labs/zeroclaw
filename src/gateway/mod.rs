@@ -803,6 +803,9 @@ pub async fn run_gateway(
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // Clone shutdown_tx for the session cleanup task (must be done before state creation)
+    let shutdown_tx_for_cleanup = shutdown_tx.clone();
+
     // Node registry for dynamic node discovery
     let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
 
@@ -881,6 +884,51 @@ pub async fn run_gateway(
             None
         },
     };
+
+    // Spawn session cleanup background task to prevent memory accumulation
+    // in long-running gateway processes (especially on WSL2).
+    // Periodically evicts idle session slots from memory and cleans up stale
+    // persisted sessions based on TTL configuration.
+    {
+        let session_queue = Arc::clone(&state.session_queue);
+        let session_backend = state.session_backend.clone();
+        let ttl_hours = config.gateway.session_ttl_hours;
+        let shutdown = shutdown_tx_for_cleanup.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 minutes
+            let mut shutdown = shutdown;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // Evict idle session slots from memory
+                        let evicted = session_queue.evict_idle().await;
+                        if evicted > 0 {
+                            tracing::debug!("Evicted {evicted} idle session slots from memory");
+                        }
+
+                        // Clean up stale persisted sessions if TTL is configured
+                        if ttl_hours > 0 {
+                            if let Some(ref backend) = session_backend {
+                                match backend.cleanup_stale(ttl_hours) {
+                                    Ok(cleaned) if cleaned > 0 => {
+                                        tracing::info!("Cleaned up {cleaned} stale sessions (TTL: {ttl_hours}h)");
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        tracing::warn!("Failed to cleanup stale sessions: {e}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ = shutdown.changed() => {
+                        tracing::debug!("Session cleanup task shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     // Config PUT needs larger body limit (1MB)
     let config_put_router = Router::new()
