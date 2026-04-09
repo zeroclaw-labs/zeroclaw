@@ -1,7 +1,9 @@
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,16 +83,20 @@ impl HttpRequestTool {
         }
     }
 
-    fn parse_headers(&self, headers: &serde_json::Value) -> Vec<(String, String)> {
-        let mut result = Vec::new();
+    fn parse_headers(&self, headers: &serde_json::Value) -> anyhow::Result<HeaderMap> {
+        let mut result = HeaderMap::new();
         if let Some(obj) = headers.as_object() {
             for (key, value) in obj {
                 if let Some(str_val) = value.as_str() {
-                    result.push((key.clone(), str_val.to_string()));
+                    let header_name = HeaderName::from_str(key)
+                        .map_err(|e| anyhow::anyhow!("Invalid header name '{key}': {e}"))?;
+                    let header_value = HeaderValue::from_str(str_val)
+                        .map_err(|e| anyhow::anyhow!("Invalid value for header '{key}': {e}"))?;
+                    result.insert(header_name, header_value);
                 }
             }
         }
-        result
+        Ok(result)
     }
 
     fn redact_headers_for_display(headers: &[(String, String)]) -> Vec<(String, String)> {
@@ -116,7 +122,7 @@ impl HttpRequestTool {
         &self,
         url: &str,
         method: reqwest::Method,
-        headers: Vec<(String, String)>,
+        headers: HeaderMap,
         body: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
         let timeout_secs = if self.timeout_secs == 0 {
@@ -132,11 +138,7 @@ impl HttpRequestTool {
         let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.http_request");
         let client = builder.build()?;
 
-        let mut request = client.request(method, url);
-
-        for (key, value) in headers {
-            request = request.header(&key, &value);
-        }
+        let mut request = client.request(method, url).headers(headers);
 
         if let Some(body_str) = body {
             request = request.body(body_str.to_string());
@@ -249,7 +251,16 @@ impl Tool for HttpRequestTool {
             }
         };
 
-        let request_headers = self.parse_headers(&headers_val);
+        let request_headers = match self.parse_headers(&headers_val) {
+            Ok(h) => h,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
 
         match self
             .execute_request(&url, method, request_headers, body)
@@ -319,62 +330,51 @@ fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
 }
 
 fn normalize_domain(raw: &str) -> Option<String> {
-    let mut d = raw.trim().to_lowercase();
-    if d.is_empty() {
+    let input = raw.trim();
+    if input.is_empty() || input.chars().any(char::is_whitespace) {
         return None;
     }
 
-    if let Some(stripped) = d.strip_prefix("https://") {
-        d = stripped.to_string();
-    } else if let Some(stripped) = d.strip_prefix("http://") {
-        d = stripped.to_string();
+    // Support raw IP literals in allowlists (e.g. "::1", "2001:db8::1", "127.0.0.1").
+    let bare_ip = input.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare_ip.parse::<std::net::IpAddr>() {
+        return Some(ip.to_string().to_lowercase());
     }
 
-    if let Some((host, _)) = d.split_once('/') {
-        d = host.to_string();
-    }
+    let parsed = reqwest::Url::parse(input)
+        .or_else(|_| reqwest::Url::parse(&format!("https://{input}")))
+        .ok()?;
 
-    d = d.trim_start_matches('.').trim_end_matches('.').to_string();
-
-    if let Some((host, _)) = d.split_once(':') {
-        d = host.to_string();
-    }
-
-    if d.is_empty() || d.chars().any(char::is_whitespace) {
+    let host = parsed.host_str()?;
+    let normalized = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_start_matches('.')
+        .trim_end_matches('.');
+    if normalized.is_empty() {
         return None;
     }
 
-    Some(d)
+    Some(normalized.to_lowercase())
 }
 
 fn extract_host(url: &str) -> anyhow::Result<String> {
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .ok_or_else(|| anyhow::anyhow!("Only http:// and https:// URLs are allowed"))?;
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("Invalid URL format: {e}"))?;
 
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Invalid URL"))?;
-
-    if authority.is_empty() {
-        anyhow::bail!("URL must include a host");
-    }
-
-    if authority.contains('@') {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
         anyhow::bail!("URL userinfo is not allowed");
     }
 
-    if authority.starts_with('[') {
-        anyhow::bail!("IPv6 hosts are not supported in http_request");
-    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("URL must include a host"))?;
 
-    let host = authority
-        .split(':')
-        .next()
-        .unwrap_or_default()
+    let host = host
         .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
         .trim_end_matches('.')
         .to_lowercase();
 
@@ -390,11 +390,16 @@ fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
         return true;
     }
 
+    let host_is_ip = host.parse::<std::net::IpAddr>().is_ok();
     allowed_domains.iter().any(|domain| {
-        host == domain
-            || host
-                .strip_suffix(domain)
-                .is_some_and(|prefix| prefix.ends_with('.'))
+        if host_is_ip || domain.parse::<std::net::IpAddr>().is_ok() {
+            host == domain
+        } else {
+            host == domain
+                || host
+                    .strip_suffix(domain)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        }
     })
 }
 
@@ -483,6 +488,18 @@ mod tests {
     fn normalize_domain_strips_scheme_path_and_case() {
         let got = normalize_domain("  HTTPS://Docs.Example.com/path ").unwrap();
         assert_eq!(got, "docs.example.com");
+    }
+
+    #[test]
+    fn normalize_domain_accepts_ipv6_literal() {
+        let got = normalize_domain("[2001:db8::1]").unwrap();
+        assert_eq!(got, "2001:db8::1");
+    }
+
+    #[test]
+    fn extract_host_normalizes_ipv6_without_brackets() {
+        let got = extract_host("https://[2001:db8::1]:443/path").unwrap();
+        assert_eq!(got, "2001:db8::1");
     }
 
     #[test]
@@ -781,23 +798,11 @@ mod tests {
             "Content-Type": "application/json",
             "X-API-Key": "my-key"
         });
-        let parsed = tool.parse_headers(&headers);
+        let parsed = tool.parse_headers(&headers).unwrap();
         assert_eq!(parsed.len(), 3);
-        assert!(
-            parsed
-                .iter()
-                .any(|(k, v)| k == "Authorization" && v == "Bearer secret")
-        );
-        assert!(
-            parsed
-                .iter()
-                .any(|(k, v)| k == "X-API-Key" && v == "my-key")
-        );
-        assert!(
-            parsed
-                .iter()
-                .any(|(k, v)| k == "Content-Type" && v == "application/json")
-        );
+        assert_eq!(parsed["authorization"], "Bearer secret");
+        assert_eq!(parsed["x-api-key"], "my-key");
+        assert_eq!(parsed["content-type"], "application/json");
     }
 
     #[test]
@@ -872,8 +877,10 @@ mod tests {
 
     #[test]
     fn ssrf_alternate_notations_rejected_by_validate_url() {
-        // Even if is_private_or_local_host doesn't flag these, they
-        // fail the allowlist because they're treated as hostnames.
+        // Alternate notations must be blocked by validation.
+        // Depending on URL canonicalization, they may be rejected either as:
+        // - private/local hosts, or
+        // - allowlist mismatches.
         let tool = test_tool(vec!["example.com"]);
         for notation in [
             "http://0177.0.0.1",
@@ -883,8 +890,8 @@ mod tests {
         ] {
             let err = tool.validate_url(notation).unwrap_err().to_string();
             assert!(
-                err.contains("allowed_domains"),
-                "Expected allowlist rejection for {notation}, got: {err}"
+                err.contains("allowed_domains") || err.contains("local/private"),
+                "Expected secure rejection for {notation}, got: {err}"
             );
         }
     }
@@ -957,13 +964,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_ipv6_host() {
-        let tool = test_tool(vec!["example.com"]);
-        let err = tool
-            .validate_url("http://[::1]:8080/path")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("IPv6"));
+    fn validate_accepts_public_ipv6_host_when_allowlisted() {
+        let tool = test_tool(vec!["2607:f8b0:4004:800::200e"]);
+        assert!(
+            tool.validate_url("https://[2607:f8b0:4004:800::200e]/path")
+                .is_ok()
+        );
     }
 
     // ── allow_private_hosts opt-in tests ────────────────────────
@@ -1010,6 +1016,12 @@ mod tests {
         assert!(tool.validate_url("https://172.16.0.1").is_ok());
         assert!(tool.validate_url("https://192.168.1.1").is_ok());
         assert!(tool.validate_url("http://localhost:8123").is_ok());
+    }
+
+    #[test]
+    fn allow_private_hosts_permits_ipv6_loopback_when_allowlisted() {
+        let tool = test_tool_with_private(vec!["::1"], true);
+        assert!(tool.validate_url("https://[::1]:8443").is_ok());
     }
 
     #[test]
