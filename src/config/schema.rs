@@ -2965,6 +2965,21 @@ pub struct WebSearchConfig {
     /// SearXNG instance URL (required if provider is "searxng"), e.g. "https://searx.example.com"
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
+    /// SearXNG authentication token
+    #[serde(default)]
+    pub searxng_auth_token: Option<String>,
+    /// SearXNG language (e.g. "en-US", "ja-JP", or "auto")
+    #[serde(default = "default_searxng_language")]
+    pub searxng_language: String,
+    /// CSV list of SearXNG engines to search (e.g. "google,bing")
+    #[serde(default)]
+    pub searxng_engines: String,
+    /// SearXNG SafeSearch level (0=none, 1=moderate, 2=strict)
+    #[serde(default, deserialize_with = "deserialize_searxng_safesearch")]
+    pub searxng_safesearch: u8,
+    /// Maximum number of retries for SearXNG
+    #[serde(default = "default_searxng_max_retries")]
+    pub searxng_max_retries: usize,
     /// Maximum results per search (1-10)
     #[serde(default = "default_web_search_max_results")]
     pub max_results: usize,
@@ -2981,8 +2996,29 @@ fn default_web_search_max_results() -> usize {
     5
 }
 
+fn deserialize_searxng_safesearch<'de, D>(deserializer: D) -> std::result::Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: u8 = serde::Deserialize::deserialize(deserializer)?;
+    if value > 2 {
+        return Err(serde::de::Error::custom(format!(
+            "searxng_safesearch {value} is invalid (expected 0, 1, or 2)"
+        )));
+    }
+    Ok(value)
+}
+
 fn default_web_search_timeout_secs() -> u64 {
     15
+}
+
+fn default_searxng_language() -> String {
+    "auto".into()
+}
+
+fn default_searxng_max_retries() -> usize {
+    3
 }
 
 impl Default for WebSearchConfig {
@@ -2992,6 +3028,11 @@ impl Default for WebSearchConfig {
             provider: default_web_search_provider(),
             brave_api_key: None,
             searxng_instance_url: None,
+            searxng_auth_token: None,
+            searxng_language: default_searxng_language(),
+            searxng_engines: String::new(),
+            searxng_safesearch: 0,
+            searxng_max_retries: default_searxng_max_retries(),
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
         }
@@ -15934,6 +15975,53 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert_eq!(config.enforcement.reserve_percent, 10);
     }
 
+    #[tokio::test]
+    async fn web_search_config_toml_roundtrip() {
+        let wsc = WebSearchConfig {
+            enabled: true,
+            provider: "searxng".into(),
+            brave_api_key: Some("brave-key".into()),
+            searxng_instance_url: Some("https://searx.example.com".into()),
+            searxng_auth_token: Some("auth-tok".into()),
+            searxng_language: "ja-JP".into(),
+            searxng_engines: "google,bing".into(),
+            searxng_safesearch: 1,
+            searxng_max_retries: 5,
+            max_results: 10,
+            timeout_secs: 30,
+        };
+        let toml_str = toml::to_string(&wsc).unwrap();
+        let parsed: WebSearchConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.provider, "searxng");
+        assert_eq!(parsed.searxng_safesearch, 1);
+        assert_eq!(parsed.searxng_max_retries, 5);
+        assert_eq!(parsed.searxng_language, "ja-JP");
+        assert_eq!(parsed.searxng_engines, "google,bing");
+    }
+
+    #[test]
+    async fn test_searxng_safesearch_validation() {
+        // Valid values
+        for v in 0..=2 {
+            let toml_str = format!("searxng_safesearch = {v}");
+            let parsed: std::result::Result<WebSearchConfigFieldsOnly, _> =
+                toml::from_str(&toml_str);
+            assert!(parsed.is_ok());
+        }
+
+        // Invalid value
+        let toml_str = "searxng_safesearch = 3";
+        let parsed: std::result::Result<WebSearchConfigFieldsOnly, toml::de::Error> =
+            toml::from_str(toml_str);
+        assert!(parsed.is_err());
+        assert!(parsed.unwrap_err().to_string().contains("is invalid"));
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct WebSearchConfigFieldsOnly {
+        #[serde(deserialize_with = "deserialize_searxng_safesearch")]
+        searxng_safesearch: u8,
+    }
     // ── Configurable macro tests ──
 
     #[test]
