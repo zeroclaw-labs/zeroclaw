@@ -8,7 +8,7 @@
     nixpkgs.url = "nixpkgs/nixos-unstable";
   };
 
-  outputs = { flake-utils, fenix, nixpkgs, ... }:
+  outputs = { self, flake-utils, fenix, nixpkgs, ... }:
     let
       nixosModule = { pkgs, ... }: {
         nixpkgs.overlays = [ fenix.overlays.default ];
@@ -23,6 +23,41 @@
           pkgs.rust-analyzer
         ];
       };
+
+      # Build ZeroClaw package for the given system
+      mkZeroClawPackage = { system, pkgs }:
+        let
+          rustToolchain = pkgs.fenix.stable.withComponents [
+            "cargo"
+            "clippy"
+            "rust-src"
+            "rustc"
+            "rustfmt"
+          ];
+        in
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "zeroclaw";
+          version = "0.6.9";
+          src = ./.;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+          };
+          nativeBuildInputs = [ rustToolchain ];
+          buildInputs = with pkgs; [
+            openssl
+            pkg-config
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.darwin.apple_sdk.frameworks.Security
+            pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
+          ];
+          PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
+          meta = with pkgs.lib; {
+            description = "ZeroClaw — Personal AI Assistant";
+            homepage = "https://github.com/zeroclaw-labs/zeroclaw";
+            license = with licenses; [ mit asl20 ];
+            mainProgram = "zeroclaw";
+          };
+        };
     in
     flake-utils.lib.eachDefaultSystem (system:
       let
@@ -37,13 +72,27 @@
           "rustc"
           "rustfmt"
         ];
+        zeroclawPackage = mkZeroClawPackage { inherit system pkgs; };
       in {
-        packages.default = fenix.packages.${system}.stable.toolchain;
+        packages = {
+          default = zeroclawPackage;
+          zeroclaw = zeroclawPackage;
+        };
+        apps.default = {
+          type = "app";
+          program = "${zeroclawPackage}/bin/zeroclaw";
+        };
         devShells.default = pkgs.mkShell {
           packages = [
             rustToolchain
             pkgs.rust-analyzer
+            pkgs.openssl
+            pkgs.pkg-config
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.darwin.apple_sdk.frameworks.Security
+            pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
           ];
+          PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
         };
       }) // {
       nixosConfigurations = {
