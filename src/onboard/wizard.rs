@@ -7825,6 +7825,7 @@ mod tests {
             url: "https://mattermost.example.com".into(),
             bot_token: "token".into(),
             channel_id: Some("channel".into()),
+            channel_ids: Vec::new(),
             allowed_users: vec!["*".into()],
             thread_replies: Some(true),
             mention_only: Some(false),

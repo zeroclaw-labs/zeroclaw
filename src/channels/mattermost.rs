@@ -12,6 +12,7 @@ pub struct MattermostChannel {
     base_url: String, // e.g., https://mm.example.com
     bot_token: String,
     channel_id: Option<String>,
+    channel_ids: Vec<String>,
     allowed_users: Vec<String>,
     /// When true (default), replies thread on the original post's root_id.
     /// When false, replies go to the channel root.
@@ -31,6 +32,7 @@ impl MattermostChannel {
         base_url: String,
         bot_token: String,
         channel_id: Option<String>,
+        channel_ids: Vec<String>,
         allowed_users: Vec<String>,
         thread_replies: bool,
         mention_only: bool,
@@ -41,6 +43,7 @@ impl MattermostChannel {
             base_url,
             bot_token,
             channel_id,
+            channel_ids,
             allowed_users,
             thread_replies,
             mention_only,
@@ -83,6 +86,155 @@ impl MattermostChannel {
     /// Empty list means deny everyone. "*" means allow everyone.
     fn is_user_allowed(&self, user_id: &str) -> bool {
         self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+    }
+
+    /// Determine which channels to monitor.
+    ///
+    /// Priority: `channel_ids` (plural) > `channel_id` (singular) > None (discover).
+    fn scoped_channel_ids(&self) -> Option<Vec<String>> {
+        if !self.channel_ids.is_empty() {
+            if self.channel_ids.iter().any(|id| id.trim() == "*") {
+                return None;
+            }
+            let mut seen = std::collections::HashSet::new();
+            let ids: Vec<String> = self
+                .channel_ids
+                .iter()
+                .filter_map(|id| {
+                    let trimmed = id.trim();
+                    (!trimmed.is_empty()).then_some(trimmed.to_string())
+                })
+                .filter(|id| seen.insert(id.clone()))
+                .collect();
+            if !ids.is_empty() {
+                return Some(ids);
+            }
+        }
+        self.channel_id
+            .as_ref()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty() && *id != "*")
+            .map(|id| vec![id.to_string()])
+    }
+
+    fn mattermost_now_ms() -> i64 {
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()) as i64
+        }
+    }
+
+    fn ensure_poll_cursor(
+        cursors: &mut std::collections::HashMap<String, i64>,
+        channel_id: &str,
+        now_ms: i64,
+    ) -> i64 {
+        *cursors.entry(channel_id.to_string()).or_insert(now_ms)
+    }
+
+    /// Discover all channels the bot has access to (public/private + DMs).
+    async fn discover_channels(&self) -> Vec<String> {
+        let mut channel_ids = Vec::new();
+        let per_page = 200;
+
+        // Get the bot's user ID for team membership + DM discovery.
+        let (bot_user_id, _) = self.get_bot_identity().await;
+        if bot_user_id.is_empty() {
+            tracing::warn!("Mattermost: cannot discover channels — failed to resolve bot identity");
+            return channel_ids;
+        }
+
+        // Discover teams the bot belongs to.
+        let teams: Vec<String> = match self
+            .http_client()
+            .get(format!(
+                "{}/api/v4/users/{}/teams",
+                self.base_url, bot_user_id
+            ))
+            .bearer_auth(&self.bot_token)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|t| t.get("id").and_then(|i| i.as_str()).map(String::from))
+                .collect(),
+            Ok(r) => {
+                tracing::warn!("Mattermost: team discovery returned {}", r.status());
+                Vec::new()
+            }
+            Err(e) => {
+                tracing::warn!("Mattermost: team discovery failed: {e}");
+                Vec::new()
+            }
+        };
+
+        // Discover channels per team.
+        for team_id in &teams {
+            let mut page: usize = 0;
+            loop {
+                let resp = match self
+                    .http_client()
+                    .get(format!(
+                        "{}/api/v4/users/{}/teams/{}/channels",
+                        self.base_url, bot_user_id, team_id
+                    ))
+                    .bearer_auth(&self.bot_token)
+                    .query(&[
+                        ("page", page.to_string()),
+                        ("per_page", per_page.to_string()),
+                    ])
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => r,
+                    Ok(r) => {
+                        tracing::warn!(
+                            "Mattermost: channel listing for team {team_id} returned {}",
+                            r.status()
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Mattermost: channel listing for team {team_id} failed: {e}"
+                        );
+                        break;
+                    }
+                };
+
+                let channels: Vec<serde_json::Value> = resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v.as_array().cloned())
+                    .unwrap_or_default();
+
+                let batch_len = channels.len();
+                for ch in channels {
+                    if let Some(id) = ch.get("id").and_then(|i| i.as_str()) {
+                        channel_ids.push(id.to_string());
+                    }
+                }
+
+                if batch_len < per_page {
+                    break;
+                }
+                page += 1;
+            }
+        }
+
+        channel_ids.sort();
+        channel_ids.dedup();
+        channel_ids
     }
 
     /// Get the bot's own user ID and username so we can ignore our own messages
@@ -250,87 +402,137 @@ impl Channel for MattermostChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        let channel_id = self
-            .channel_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Mattermost channel_id required for listening"))?;
+        let scoped_channels = self.scoped_channel_ids();
 
         let (bot_user_id, bot_username) = self.get_bot_identity().await;
-        #[allow(clippy::cast_possible_truncation)]
-        let mut last_create_at = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()) as i64;
+        let startup_ms = Self::mattermost_now_ms();
 
-        tracing::info!("Mattermost channel listening on {}...", channel_id);
+        // Per-channel cursor: channel_id -> last_create_at timestamp.
+        let mut last_create_at_by_channel: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+
+        // Auto-discovery state (used when no channels are configured).
+        let mut discovered_channels: Vec<String> = Vec::new();
+        let mut last_discovery = std::time::Instant::now();
+
+        if let Some(ref ids) = scoped_channels {
+            tracing::info!(
+                "Mattermost channel listening on {} configured channel(s): {}",
+                ids.len(),
+                ids.join(", ")
+            );
+            for id in ids {
+                last_create_at_by_channel.insert(id.clone(), startup_ms);
+            }
+        } else {
+            tracing::info!(
+                "Mattermost channel_id/channel_ids not set; listening across all accessible channels (including DMs)."
+            );
+        }
 
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-            let resp = match self
-                .http_client()
-                .get(format!(
-                    "{}/api/v4/channels/{}/posts",
-                    self.base_url, channel_id
-                ))
-                .bearer_auth(&self.bot_token)
-                .query(&[("since", last_create_at.to_string())])
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("Mattermost poll error: {e}");
-                    continue;
+            let target_channels = if let Some(ref ids) = scoped_channels {
+                ids.clone()
+            } else {
+                // Auto-discover channels periodically.
+                if discovered_channels.is_empty()
+                    || last_discovery.elapsed() >= std::time::Duration::from_secs(60)
+                {
+                    let new_channels = self.discover_channels().await;
+                    if new_channels != discovered_channels {
+                        tracing::info!(
+                            "Mattermost auto-discovery refreshed: listening on {} channel(s).",
+                            new_channels.len()
+                        );
+                    }
+                    discovered_channels = new_channels;
+                    last_discovery = std::time::Instant::now();
                 }
+                discovered_channels.clone()
             };
 
-            let data: serde_json::Value = match resp.json().await {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!("Mattermost parse error: {e}");
-                    continue;
-                }
-            };
+            if target_channels.is_empty() {
+                tracing::debug!("Mattermost: no accessible channels discovered yet");
+                continue;
+            }
 
-            if let Some(posts) = data.get("posts").and_then(|p| p.as_object()) {
-                // Process in chronological order
-                let mut post_list: Vec<_> = posts.values().collect();
-                post_list.sort_by_key(|p| p.get("create_at").and_then(|c| c.as_i64()).unwrap_or(0));
+            for channel_id in &target_channels {
+                let last_create_at = Self::ensure_poll_cursor(
+                    &mut last_create_at_by_channel,
+                    channel_id,
+                    Self::mattermost_now_ms(),
+                );
 
-                let last_create_at_before_this_batch = last_create_at;
-                for post in post_list {
-                    let create_at = post
-                        .get("create_at")
-                        .and_then(|c| c.as_i64())
-                        .unwrap_or(last_create_at);
-                    last_create_at = last_create_at.max(create_at);
+                let resp = match self
+                    .http_client()
+                    .get(format!(
+                        "{}/api/v4/channels/{}/posts",
+                        self.base_url, channel_id
+                    ))
+                    .bearer_auth(&self.bot_token)
+                    .query(&[("since", last_create_at.to_string())])
+                    .send()
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!("Mattermost poll error for {channel_id}: {e}");
+                        continue;
+                    }
+                };
 
-                    let effective_text = if post
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("")
-                        .trim()
-                        .is_empty()
-                        && post_has_audio_attachment(post)
-                    {
-                        self.try_transcribe_audio_attachment(post).await
-                    } else {
-                        None
-                    };
+                let data: serde_json::Value = match resp.json().await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!("Mattermost parse error for {channel_id}: {e}");
+                        continue;
+                    }
+                };
 
-                    if let Some(channel_msg) = self.parse_mattermost_post(
-                        post,
-                        &bot_user_id,
-                        &bot_username,
-                        last_create_at_before_this_batch,
-                        &channel_id,
-                        effective_text.as_deref(),
-                    ) {
-                        if tx.send(channel_msg).await.is_err() {
-                            return Ok(());
+                if let Some(posts) = data.get("posts").and_then(|p| p.as_object()) {
+                    // Process in chronological order
+                    let mut post_list: Vec<_> = posts.values().collect();
+                    post_list
+                        .sort_by_key(|p| p.get("create_at").and_then(|c| c.as_i64()).unwrap_or(0));
+
+                    let last_create_at_before_this_batch = last_create_at;
+                    let mut new_last_create_at = last_create_at;
+                    for post in post_list {
+                        let create_at = post
+                            .get("create_at")
+                            .and_then(|c| c.as_i64())
+                            .unwrap_or(last_create_at);
+                        new_last_create_at = new_last_create_at.max(create_at);
+
+                        let effective_text = if post
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .is_empty()
+                            && post_has_audio_attachment(post)
+                        {
+                            self.try_transcribe_audio_attachment(post).await
+                        } else {
+                            None
+                        };
+
+                        if let Some(channel_msg) = self.parse_mattermost_post(
+                            post,
+                            &bot_user_id,
+                            &bot_username,
+                            last_create_at_before_this_batch,
+                            channel_id,
+                            effective_text.as_deref(),
+                        ) {
+                            if tx.send(channel_msg).await.is_err() {
+                                return Ok(());
+                            }
                         }
                     }
+                    last_create_at_by_channel.insert(channel_id.clone(), new_last_create_at);
                 }
             }
         }
@@ -623,6 +825,7 @@ mod tests {
             "url".into(),
             "token".into(),
             None,
+            Vec::new(),
             allowed,
             thread_replies,
             false,
@@ -635,6 +838,7 @@ mod tests {
             "url".into(),
             "token".into(),
             None,
+            Vec::new(),
             vec!["*".into()],
             true,
             true,
@@ -647,6 +851,7 @@ mod tests {
             "https://mm.example.com/".into(),
             "token".into(),
             None,
+            Vec::new(),
             vec![],
             false,
             false,
@@ -658,6 +863,83 @@ mod tests {
     fn mattermost_allowlist_wildcard() {
         let ch = make_channel(vec!["*".into()], false);
         assert!(ch.is_user_allowed("any-id"));
+    }
+
+    #[test]
+    fn mattermost_channel_ids_wildcard_enables_discovery() {
+        let ch = MattermostChannel::new(
+            "url".into(),
+            "token".into(),
+            None,
+            vec!["*".into()],
+            vec!["*".into()],
+            false,
+            false,
+        );
+
+        assert_eq!(ch.scoped_channel_ids(), None);
+    }
+
+    #[test]
+    fn mattermost_single_channel_wildcard_enables_discovery() {
+        let ch = MattermostChannel::new(
+            "url".into(),
+            "token".into(),
+            Some(" * ".into()),
+            Vec::new(),
+            vec!["*".into()],
+            false,
+            false,
+        );
+
+        assert_eq!(ch.scoped_channel_ids(), None);
+    }
+
+    #[test]
+    fn mattermost_channel_ids_deduplicate_explicit_ids() {
+        let ch = MattermostChannel::new(
+            "url".into(),
+            "token".into(),
+            None,
+            vec!["chan-a".into(), "chan-b".into(), "chan-a".into()],
+            vec!["*".into()],
+            false,
+            false,
+        );
+
+        assert_eq!(
+            ch.scoped_channel_ids(),
+            Some(vec!["chan-a".into(), "chan-b".into()])
+        );
+    }
+
+    #[test]
+    fn mattermost_single_channel_id_is_trimmed() {
+        let ch = MattermostChannel::new(
+            "url".into(),
+            "token".into(),
+            Some(" chan-a ".into()),
+            Vec::new(),
+            vec!["*".into()],
+            false,
+            false,
+        );
+
+        assert_eq!(ch.scoped_channel_ids(), Some(vec!["chan-a".into()]));
+    }
+
+    #[test]
+    fn mattermost_ensure_poll_cursor_bootstraps_only_new_channels() {
+        let mut cursors = std::collections::HashMap::new();
+        cursors.insert("existing".to_string(), 111);
+
+        let existing = MattermostChannel::ensure_poll_cursor(&mut cursors, "existing", 222);
+        let discovered = MattermostChannel::ensure_poll_cursor(&mut cursors, "discovered", 333);
+
+        assert_eq!(existing, 111);
+        assert_eq!(discovered, 333);
+        assert_eq!(cursors.get("existing"), Some(&111));
+        assert_eq!(cursors.get("discovered"), Some(&333));
     }
 
     #[test]
@@ -1428,6 +1710,7 @@ mod tests {
                 mock_server.uri(),
                 "test_token".to_string(),
                 None,
+                Vec::new(),
                 vec!["*".into()],
                 false,
                 false,
@@ -1478,6 +1761,7 @@ mod tests {
                 mock_server.uri(),
                 "test_token".to_string(),
                 None,
+                Vec::new(),
                 vec!["*".into()],
                 false,
                 false,
