@@ -152,6 +152,10 @@ pub async fn handle_ws_chat(
 /// Gateway session key prefix to avoid collisions with channel sessions.
 const GW_SESSION_PREFIX: &str = "gw_";
 
+fn should_skip_resumed_session_message(message: &crate::providers::ChatMessage) -> bool {
+    message.role == "assistant" && crate::memory::is_internal_context_leak_content(&message.content)
+}
+
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
@@ -195,9 +199,21 @@ async fn handle_socket(
     let mut effective_name: Option<String> = None;
     if let Some(ref backend) = state.session_backend {
         let messages = backend.load(&session_key);
-        if !messages.is_empty() {
-            message_count = messages.len();
-            agent.seed_history(&messages);
+        let original_count = messages.len();
+        let filtered_messages: Vec<_> = messages
+            .into_iter()
+            .filter(|message| !should_skip_resumed_session_message(message))
+            .collect();
+
+        if filtered_messages.len() < original_count {
+            let _ = backend.delete_session(&session_key);
+            for message in &filtered_messages {
+                let _ = backend.append(&session_key, message);
+            }
+        }
+        if !filtered_messages.is_empty() {
+            message_count = filtered_messages.len();
+            agent.seed_history(&filtered_messages);
             resumed = true;
         }
         // Set session name if provided (non-empty) on connect
@@ -626,5 +642,19 @@ mod tests {
             "zeroclaw.v1, bearer.zc_tok, other".parse().unwrap(),
         );
         assert_eq!(extract_ws_token(&headers, None), Some("zc_tok"));
+    }
+
+    #[test]
+    fn resumed_session_filter_skips_memory_context_prompt_leaks() {
+        let poisoned = crate::providers::ChatMessage::assistant(
+            "[Memory context]\n- user_msg: hi\n\n[2026-04-09 07:57:11 +02:00] hi",
+        );
+        let healthy =
+            crate::providers::ChatMessage::assistant("Hello! How can I assist you today?");
+        let user = crate::providers::ChatMessage::user("hi");
+
+        assert!(should_skip_resumed_session_message(&poisoned));
+        assert!(!should_skip_resumed_session_message(&healthy));
+        assert!(!should_skip_resumed_session_message(&user));
     }
 }

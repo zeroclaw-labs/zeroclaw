@@ -331,7 +331,10 @@ async fn build_context(
                 if memory::is_assistant_autosave_key(&entry.key) {
                     continue;
                 }
-                if memory::should_skip_autosave_content(&entry.content) {
+                if memory::should_skip_recalled_memory_content(&entry.content) {
+                    continue;
+                }
+                if memory::is_exact_query_echo(&entry.content, user_msg) {
                     continue;
                 }
                 // Skip entries containing tool_result blocks — they can leak
@@ -8116,6 +8119,32 @@ Tail"#;
         assert!(context.contains("user_msg_real"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
+    }
+
+    #[tokio::test]
+    async fn build_context_excludes_exact_query_echoes() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        mem.store(
+            "user_msg_echo",
+            "hello there",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "user_msg_preference",
+            "hello there with concise follow-up guidance",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let context = build_context(&mem, "hello there", 0.0, None).await;
+        assert!(!context.contains("user_msg_echo"));
+        assert!(context.contains("user_msg_preference"));
     }
 
     // ═══════════════════════════════════════════════════════════════════════

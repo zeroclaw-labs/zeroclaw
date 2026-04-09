@@ -1355,12 +1355,16 @@ fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
     crate::providers::reliable::is_non_retryable(error)
 }
 
-fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
+fn should_skip_memory_context_entry(key: &str, content: &str, user_msg: &str) -> bool {
     if memory::is_assistant_autosave_key(key) {
         return true;
     }
 
-    if memory::should_skip_autosave_content(content) {
+    if memory::should_skip_recalled_memory_content(content) {
+        return true;
+    }
+
+    if memory::is_exact_query_echo(content, user_msg) {
         return true;
     }
 
@@ -1885,7 +1889,7 @@ async fn build_memory_context(
                 break;
             }
 
-            if should_skip_memory_context_entry(&entry.key, &entry.content) {
+            if should_skip_memory_context_entry(&entry.key, &entry.content, user_msg) {
                 continue;
             }
 
@@ -6109,39 +6113,55 @@ mod tests {
     fn memory_context_skip_rules_exclude_history_blobs() {
         assert!(should_skip_memory_context_entry(
             "telegram_123_history",
-            r#"[{"role":"user"}]"#
+            r#"[{"role":"user"}]"#,
+            ""
         ));
         assert!(should_skip_memory_context_entry(
             "assistant_resp_legacy",
-            "fabricated memory"
+            "fabricated memory",
+            ""
         ));
-        assert!(!should_skip_memory_context_entry("telegram_123_45", "hi"));
+        assert!(should_skip_memory_context_entry(
+            "telegram_123_45",
+            "hi",
+            ""
+        ));
+        assert!(!should_skip_memory_context_entry(
+            "telegram_123_46",
+            "Please summarize today's status",
+            ""
+        ));
 
         // Entries containing image markers must be skipped to prevent
         // auto-saved photo messages from duplicating image blocks (#2403).
         assert!(should_skip_memory_context_entry(
             "telegram_user_msg_99",
-            "[IMAGE:/tmp/workspace/photo_1_2.jpg]"
+            "[IMAGE:/tmp/workspace/photo_1_2.jpg]",
+            ""
         ));
         assert!(should_skip_memory_context_entry(
             "telegram_user_msg_100",
-            "[IMAGE:/tmp/workspace/photo_1_2.jpg]\n\nCheck this screenshot"
+            "[IMAGE:/tmp/workspace/photo_1_2.jpg]\n\nCheck this screenshot",
+            ""
         ));
         // Plain text without image markers should not be skipped.
         assert!(!should_skip_memory_context_entry(
             "telegram_user_msg_101",
-            "Please describe the image"
+            "Please describe the image",
+            ""
         ));
 
         // Entries containing tool_result blocks must be skipped (#3402).
         assert!(should_skip_memory_context_entry(
             "telegram_user_msg_200",
             r#"[Tool results]
-<tool_result name="shell">Mon Feb 20</tool_result>"#
+<tool_result name="shell">Mon Feb 20</tool_result>"#,
+            ""
         ));
         assert!(!should_skip_memory_context_entry(
             "telegram_user_msg_201",
-            "plain text without tool results"
+            "plain text without tool results",
+            ""
         ));
     }
 
@@ -9759,6 +9779,34 @@ BTC is currently around $65,000 based on latest tool output."#
             context.contains("screenshot descriptions"),
             "plain text entry should remain in context, got: {context}"
         );
+    }
+
+    #[tokio::test]
+    async fn build_memory_context_excludes_exact_query_echo_entries() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        mem.store(
+            "webhook_msg_echo",
+            "hello there",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "greeting_preference",
+            "hello there with a friendly but concise greeting preference",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let context = build_memory_context(&mem, "hello there", 0.0, None).await;
+
+        assert!(!context.contains("webhook_msg_echo"));
+        assert!(context.contains("greeting_preference"));
     }
 
     #[tokio::test]

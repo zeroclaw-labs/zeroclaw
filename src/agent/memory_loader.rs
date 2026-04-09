@@ -58,7 +58,7 @@ impl MemoryLoader for DefaultMemoryLoader {
             if memory::is_assistant_autosave_key(&entry.key) {
                 continue;
             }
-            if memory::should_skip_autosave_content(&entry.content) {
+            if memory::should_skip_recalled_memory_content(&entry.content) {
                 continue;
             }
             if let Some(score) = entry.score {
@@ -116,7 +116,7 @@ mod tests {
             Ok(vec![MemoryEntry {
                 id: "1".into(),
                 key: "k".into(),
-                content: "v".into(),
+                content: "User prefers concise answers.".into(),
                 category: MemoryCategory::Conversation,
                 timestamp: "now".into(),
                 session_id: None,
@@ -216,7 +216,7 @@ mod tests {
             .await
             .unwrap();
         assert!(context.contains("[Memory context]"));
-        assert!(context.contains("- k: v"));
+        assert!(context.contains("- k: User prefers concise answers."));
     }
 
     #[tokio::test]
