@@ -4700,10 +4700,26 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .context("iMessage channel is not configured")?;
             Ok(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())))
         }
+        "line" => {
+            let ln = config
+                .channels_config
+                .line
+                .as_ref()
+                .context("LINE channel is not configured")?;
+            Ok(Arc::new(
+                LineChannel::new(
+                    ln.channel_access_token.clone(),
+                    ln.channel_secret.clone(),
+                    ln.allowed_users.clone(),
+                    ln.webhook_port,
+                )
+                .with_proxy_url(ln.proxy_url.clone()),
+            ))
+        }
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, discord_history, imessage"
+            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line"
         ),
     }
 }
@@ -4755,18 +4771,22 @@ fn collect_configured_channels(
     let mut channels = Vec::new();
 
     if let Some(ref ln) = config.channels_config.line {
-        channels.push(ConfiguredChannel {
-            display_name: "LINE",
-            channel: Arc::new(
-                LineChannel::new(
-                    ln.channel_access_token.clone(),
-                    ln.channel_secret.clone(),
-                    ln.allowed_users.clone(),
-                    ln.webhook_port,
-                )
-                .with_proxy_url(ln.proxy_url.clone()),
-            ),
-        });
+        if ln.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "LINE",
+                channel: Arc::new(
+                    LineChannel::new(
+                        ln.channel_access_token.clone(),
+                        ln.channel_secret.clone(),
+                        ln.allowed_users.clone(),
+                        ln.webhook_port,
+                    )
+                    .with_proxy_url(ln.proxy_url.clone()),
+                ),
+            });
+        } else {
+            tracing::info!("LINE channel configured but disabled (enabled = false)");
+        }
     }
 
     if let Some(ref tg) = config.channels_config.telegram {
