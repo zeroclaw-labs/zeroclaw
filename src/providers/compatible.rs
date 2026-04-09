@@ -473,6 +473,24 @@ impl OpenAiCompatibleProvider {
             .collect()
     }
 
+    /// Returns true if the given model requires system messages to be merged
+    /// into the first user message because its prompt template cannot handle
+    /// the `system` role reliably (e.g. DeepSeek V3.2 Jinja rendering errors).
+    fn model_requires_system_merge(model: &str) -> bool {
+        let id = model
+            .rsplit('/')
+            .next()
+            .unwrap_or(model)
+            .to_ascii_lowercase();
+        id.contains("deepseek-v3") || id.contains("deepseek_v3")
+    }
+
+    /// Whether system messages should be flattened into the first user message,
+    /// either because the provider was configured that way or the model requires it.
+    fn effective_merge_system(&self, model: &str) -> bool {
+        self.merge_system_into_user || Self::model_requires_system_merge(model)
+    }
+
     fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
         let id = model.rsplit('/').next().unwrap_or(model);
         let supports_reasoning_effort = id.starts_with("gpt-5") || id.contains("codex");
@@ -1654,16 +1672,17 @@ impl Provider for OpenAiCompatibleProvider {
     ) -> anyhow::Result<String> {
         let credential = self.credential.as_deref();
 
+        let merge = self.effective_merge_system(model);
         let mut messages = Vec::new();
 
-        if self.merge_system_into_user {
+        if merge {
             let content = match system_prompt {
                 Some(sys) => format!("{sys}\n\n{message}"),
                 None => message.to_string(),
             };
             messages.push(Message {
                 role: "user".to_string(),
-                content: Self::to_message_content("user", &content, !self.merge_system_into_user),
+                content: Self::to_message_content("user", &content, !merge),
             });
         } else {
             if let Some(sys) = system_prompt {
@@ -1697,7 +1716,7 @@ impl Provider for OpenAiCompatibleProvider {
             fallback_messages.push(ChatMessage::system(system_prompt));
         }
         fallback_messages.push(ChatMessage::user(message));
-        let fallback_messages = if self.merge_system_into_user {
+        let fallback_messages = if merge {
             Self::flatten_system_messages(&fallback_messages)
         } else {
             fallback_messages
@@ -1781,7 +1800,8 @@ impl Provider for OpenAiCompatibleProvider {
     ) -> anyhow::Result<String> {
         let credential = self.credential.as_deref();
 
-        let effective_messages = if self.merge_system_into_user {
+        let merge = self.effective_merge_system(model);
+        let effective_messages = if merge {
             Self::flatten_system_messages(messages)
         } else {
             messages.to_vec()
@@ -1790,11 +1810,7 @@ impl Provider for OpenAiCompatibleProvider {
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: Self::to_message_content(
-                    &m.role,
-                    &m.content,
-                    !self.merge_system_into_user,
-                ),
+                content: Self::to_message_content(&m.role, &m.content, !merge),
             })
             .collect();
 
@@ -1889,7 +1905,8 @@ impl Provider for OpenAiCompatibleProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_deref();
 
-        let effective_messages = if self.merge_system_into_user {
+        let merge = self.effective_merge_system(model);
+        let effective_messages = if merge {
             Self::flatten_system_messages(messages)
         } else {
             messages.to_vec()
@@ -1898,11 +1915,7 @@ impl Provider for OpenAiCompatibleProvider {
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: Self::to_message_content(
-                    &m.role,
-                    &m.content,
-                    !self.merge_system_into_user,
-                ),
+                content: Self::to_message_content(&m.role, &m.content, !merge),
             })
             .collect();
 
@@ -2000,18 +2013,16 @@ impl Provider for OpenAiCompatibleProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_deref();
 
+        let merge = self.effective_merge_system(model);
         let tools = Self::convert_tool_specs(request.tools);
-        let effective_messages = if self.merge_system_into_user {
+        let effective_messages = if merge {
             Self::flatten_system_messages(request.messages)
         } else {
             request.messages.to_vec()
         };
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            messages: Self::convert_messages_for_native(
-                &effective_messages,
-                !self.merge_system_into_user,
-            ),
+            messages: Self::convert_messages_for_native(&effective_messages, !merge),
             temperature,
             stream: Some(false),
             reasoning_effort: self.reasoning_effort_for_model(model),
@@ -2151,8 +2162,9 @@ impl Provider for OpenAiCompatibleProvider {
 
         let credential = self.credential.clone();
 
+        let merge = self.effective_merge_system(model);
         let has_tools = request.tools.is_some_and(|tools| !tools.is_empty());
-        let effective_messages = if self.merge_system_into_user {
+        let effective_messages = if merge {
             Self::flatten_system_messages(request.messages)
         } else {
             request.messages.to_vec()
@@ -2163,10 +2175,7 @@ impl Provider for OpenAiCompatibleProvider {
         let payload = if has_tools {
             serde_json::to_value(NativeChatRequest {
                 model: model.to_string(),
-                messages: Self::convert_messages_for_native(
-                    &effective_messages,
-                    !self.merge_system_into_user,
-                ),
+                messages: Self::convert_messages_for_native(&effective_messages, !merge),
                 temperature,
                 reasoning_effort: self.reasoning_effort.clone(),
                 tool_stream,
@@ -2180,11 +2189,7 @@ impl Provider for OpenAiCompatibleProvider {
                 .iter()
                 .map(|message| Message {
                     role: message.role.clone(),
-                    content: Self::to_message_content(
-                        &message.role,
-                        &message.content,
-                        !self.merge_system_into_user,
-                    ),
+                    content: Self::to_message_content(&message.role, &message.content, !merge),
                 })
                 .collect();
 
@@ -2280,17 +2285,29 @@ impl Provider for OpenAiCompatibleProvider {
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         let credential = self.credential.clone();
 
+        let merge = self.effective_merge_system(model);
         let mut messages = Vec::new();
-        if let Some(sys) = system_prompt {
+        if merge {
+            let content = match system_prompt {
+                Some(sys) => format!("{sys}\n\n{message}"),
+                None => message.to_string(),
+            };
             messages.push(Message {
-                role: "system".to_string(),
-                content: MessageContent::Text(sys.to_string()),
+                role: "user".to_string(),
+                content: Self::to_message_content("user", &content, !merge),
+            });
+        } else {
+            if let Some(sys) = system_prompt {
+                messages.push(Message {
+                    role: "system".to_string(),
+                    content: MessageContent::Text(sys.to_string()),
+                });
+            }
+            messages.push(Message {
+                role: "user".to_string(),
+                content: Self::to_message_content("user", message, !merge),
             });
         }
-        messages.push(Message {
-            role: "user".to_string(),
-            content: Self::to_message_content("user", message, !self.merge_system_into_user),
-        });
 
         let request = ApiChatRequest {
             model: model.to_string(),
@@ -2368,7 +2385,8 @@ impl Provider for OpenAiCompatibleProvider {
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         let credential = self.credential.clone();
 
-        let effective_messages = if self.merge_system_into_user {
+        let merge = self.effective_merge_system(model);
+        let effective_messages = if merge {
             Self::flatten_system_messages(messages)
         } else {
             messages.to_vec()
@@ -2377,11 +2395,7 @@ impl Provider for OpenAiCompatibleProvider {
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: Self::to_message_content(
-                    &m.role,
-                    &m.content,
-                    !self.merge_system_into_user,
-                ),
+                content: Self::to_message_content(&m.role, &m.content, !merge),
             })
             .collect();
 
