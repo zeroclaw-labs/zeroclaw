@@ -1367,7 +1367,11 @@ fn extract_download_urls_from_history(history: &[ChatMessage], start_index: usiz
         let content = if msg.role == "tool" {
             serde_json::from_str::<serde_json::Value>(&msg.content)
                 .ok()
-                .and_then(|v| v.get("content").and_then(|c| c.as_str()).map(str::to_string))
+                .and_then(|v| {
+                    v.get("content")
+                        .and_then(|c| c.as_str())
+                        .map(str::to_string)
+                })
                 .unwrap_or_default()
         } else {
             msg.content.clone()
@@ -2088,10 +2092,11 @@ async fn process_channel_message(
                 if missing.is_empty() {
                     delivered_response
                 } else {
-                    let suffix = missing
-                        .iter()
-                        .map(|u| format!("\nDownload: {u}"))
-                        .collect::<String>();
+                    let mut suffix = String::new();
+                    for u in &missing {
+                        suffix.push_str("\nDownload: ");
+                        suffix.push_str(u.as_str());
+                    }
                     format!("{delivered_response}{suffix}")
                 }
             };
@@ -3216,13 +3221,19 @@ fn collect_configured_channels(
                 );
                 channels.push(ConfiguredChannel {
                     display_name: "Feishu",
-                    channel: Arc::new(LarkChannel::from_config(lk).with_workspace_dir(config.workspace_dir.clone())),
+                    channel: Arc::new(
+                        LarkChannel::from_config(lk)
+                            .with_workspace_dir(config.workspace_dir.clone()),
+                    ),
                 });
             }
         } else {
             channels.push(ConfiguredChannel {
                 display_name: "Lark",
-                channel: Arc::new(LarkChannel::from_lark_config(lk).with_workspace_dir(config.workspace_dir.clone())),
+                channel: Arc::new(
+                    LarkChannel::from_lark_config(lk)
+                        .with_workspace_dir(config.workspace_dir.clone()),
+                ),
             });
         }
     }
@@ -3231,7 +3242,10 @@ fn collect_configured_channels(
     if let Some(ref fs) = config.channels_config.feishu {
         channels.push(ConfiguredChannel {
             display_name: "Feishu",
-            channel: Arc::new(LarkChannel::from_feishu_config(fs).with_workspace_dir(config.workspace_dir.clone())),
+            channel: Arc::new(
+                LarkChannel::from_feishu_config(fs)
+                    .with_workspace_dir(config.workspace_dir.clone()),
+            ),
         });
     }
 

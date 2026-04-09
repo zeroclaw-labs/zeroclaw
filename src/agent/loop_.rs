@@ -2236,6 +2236,11 @@ pub(crate) async fn run_tool_call_loop(
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
+    // Tracks signatures of failed calls so the model may retry each once.
+    // On first failure the signature is removed from seen_tool_signatures and
+    // recorded here; on second failure it stays in seen_tool_signatures and
+    // further retries are blocked by the normal dedup path.
+    let mut failed_tool_signatures: HashSet<(String, String)> = HashSet::new();
     // Counts how many consecutive iterations had zero real tool executions
     // (every call was deduplicated or otherwise skipped before dispatch).
     // When this reaches 2 the agent is stuck in a dedup loop and we bail early.
@@ -2789,6 +2794,17 @@ pub(crate) async fn run_tool_call_loop(
                 hooks
                     .fire_after_tool_call(&call.name, &tool_result_obj, outcome.duration)
                     .await;
+            }
+
+            // ── Failure retry: allow model to retry a failed call once ───────────
+            // Remove the signature from seen so the next attempt is not deduped,
+            // but only on the first failure. On a second failure the sig stays in
+            // seen_tool_signatures and further retries are blocked normally.
+            if !outcome.success {
+                let sig = tool_call_signature(&call.name, &call.arguments);
+                if failed_tool_signatures.insert(sig.clone()) {
+                    seen_tool_signatures.remove(&sig);
+                }
             }
 
             // ── Progress: tool completion ───────────────────────
@@ -3799,6 +3815,63 @@ mod tests {
         }
     }
 
+    /// Fails on the first `fail_first_n` calls, succeeds afterward.
+    struct FlakyTool {
+        name: String,
+        invocations: Arc<AtomicUsize>,
+        fail_first_n: usize,
+    }
+
+    impl FlakyTool {
+        fn new(name: &str, invocations: Arc<AtomicUsize>, fail_first_n: usize) -> Self {
+            Self {
+                name: name.to_string(),
+                invocations,
+                fail_first_n,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for FlakyTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "Fails on first N calls for retry tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            let n = self.invocations.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_first_n {
+                Ok(crate::tools::ToolResult {
+                    success: false,
+                    output: "transient error".to_string(),
+                    error: Some("transient error".to_string()),
+                })
+            } else {
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "ok".to_string(),
+                    error: None,
+                })
+            }
+        }
+    }
+
     struct DelayTool {
         name: String,
         delay_ms: u64,
@@ -4276,12 +4349,17 @@ mod tests {
 {"name":"count_tool","arguments":{"value":"A"}}
 </tool_call>"#;
         let provider = ScriptedProvider::from_text_responses(vec![
-            same_call, same_call, same_call, "should not reach",
+            same_call,
+            same_call,
+            same_call,
+            "should not reach",
         ]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> =
-            vec![Box::new(CountingTool::new("count_tool", Arc::clone(&invocations)))];
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -4320,6 +4398,140 @@ mod tests {
             invocations.load(Ordering::SeqCst),
             1,
             "tool should execute exactly once (on iteration 1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_allows_retry_of_failed_tool_call() {
+        // Scenario: the model calls a tool that fails once, then retries with the same
+        // arguments. The retry should be allowed (not deduped) because the first call
+        // failed. The loop should complete successfully.
+        //
+        // Iteration 1: call flaky_tool → fails → sig removed from seen, added to failed
+        // Iteration 2: call flaky_tool → NOT in seen → executes → succeeds
+        // Iteration 3: provider returns "done"
+        let same_call = r#"<tool_call>
+{"name":"flaky_tool","arguments":{"value":"A"}}
+</tool_call>"#;
+        let provider = ScriptedProvider::from_text_responses(vec![same_call, same_call, "done"]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(FlakyTool::new(
+            "flaky_tool",
+            Arc::clone(&invocations),
+            1,
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run flaky tool"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            10,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "loop should not bail when model retries a failed call: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap(), "done");
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            2,
+            "flaky tool should execute twice (first call fails, retry succeeds)"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_bails_after_repeated_failed_calls() {
+        // Scenario: a tool always fails. The model retries the same call repeatedly.
+        // The loop should allow exactly one retry (two executions total) and then bail
+        // when the second failure keeps the sig blocked and two consecutive iterations
+        // are fully deduped.
+        //
+        // Iteration 1: call always_fail → fails → first failure → sig removed from seen
+        // Iteration 2: call always_fail → executes → fails → second failure → sig stays in seen
+        // Iteration 3: call always_fail → deduped → consecutive_all_deduped = 1
+        // Iteration 4: call always_fail → deduped → consecutive_all_deduped = 2 → bail
+        let same_call = r#"<tool_call>
+{"name":"always_fail","arguments":{"value":"A"}}
+</tool_call>"#;
+        let provider = ScriptedProvider::from_text_responses(vec![
+            same_call,
+            same_call,
+            same_call,
+            same_call,
+            same_call,
+            "should not reach",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(FlakyTool::new(
+            "always_fail",
+            Arc::clone(&invocations),
+            usize::MAX,
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run always failing tool"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            20,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "loop must bail on stuck always-failing tool"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("stuck") || err.contains("dedup"),
+            "error should mention dedup/stuck: {err}"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            2,
+            "tool should execute exactly twice (initial call + one retry)"
         );
     }
 
@@ -6220,7 +6432,10 @@ Let me check the result."#;
 
         assert!(!outcome.success);
         assert!(outcome.output.contains("content"));
-        assert!(!outcome.output.contains("path,"), "path should not be flagged");
+        assert!(
+            !outcome.output.contains("path,"),
+            "path should not be flagged"
+        );
     }
 
     #[tokio::test]
