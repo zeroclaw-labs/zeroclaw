@@ -2909,6 +2909,12 @@ async fn process_channel_message(
                     match event {
                         DraftEvent::Clear => {
                             accumulated.clear();
+                            // Notify the channel about the clear via an empty update, which signals
+                            // multi-message stream modes to safely reset tracking offsets.
+                            if let Err(e) = channel.update_draft(&reply_target, &draft_id, "").await
+                            {
+                                tracing::debug!("Draft clear handler failed: {e}");
+                            }
                         }
                         DraftEvent::Progress(text) => {
                             let visible = strip_think_tags_inline(&text);

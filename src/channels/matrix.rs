@@ -1550,7 +1550,7 @@ impl Channel for MatrixChannel {
                 // Return a synthetic ID so the draft_updater task runs.
                 // Capture thread context for paragraph delivery.
                 let room_id = Self::extract_room_id(&message.recipient, &self.room_id);
-                self.multi_message_sent_len.lock().await.clear();
+                self.multi_message_sent_len.lock().await.remove(&room_id);
                 self.multi_message_thread_ts
                     .lock()
                     .await
@@ -1619,7 +1619,16 @@ impl Channel for MatrixChannel {
                     return Ok(());
                 }
 
-                let new_text = &text[sent_so_far..];
+                let new_text = match text.get(sent_so_far..) {
+                    Some(slice) => slice,
+                    None => {
+                        // Falling back to 0 if sent_so_far is not on a char boundary. While this
+                        // prevents a panic, it may cause re-delivery of already sent paragraphs.
+                        // Note: In practice, offsets originate from \n boundaries and should be safe.
+                        sent_map.insert(room_id.clone(), 0);
+                        return Ok(());
+                    }
+                };
                 // Scan for paragraph boundaries (\n\n outside code fences).
                 let mut scan_pos = 0;
                 let mut in_fence = false;
@@ -1640,13 +1649,15 @@ impl Channel for MatrixChannel {
                         in_fence = !in_fence;
                     }
 
-                    // Detect \n\n paragraph boundary outside fences.
                     if !in_fence
                         && ch == b'\n'
                         && scan_pos + 1 < bytes.len()
                         && bytes[scan_pos + 1] == b'\n'
                     {
-                        let paragraph = new_text[..scan_pos].trim().to_string();
+                        let Some(para) = new_text.get(..scan_pos) else {
+                            continue;
+                        };
+                        let paragraph = para.trim().to_string();
                         if !paragraph.is_empty() {
                             let msg = SendMessage::new(&paragraph, recipient)
                                 .in_thread(thread_ts.clone());
@@ -1718,18 +1729,20 @@ impl Channel for MatrixChannel {
                 let sent_so_far = sent_map.get(&room_id).copied().unwrap_or(0);
 
                 if text.len() > sent_so_far {
-                    let remaining = text[sent_so_far..].trim().to_string();
-                    if !remaining.is_empty() {
-                        let thread_ts = self
-                            .multi_message_thread_ts
-                            .lock()
-                            .await
-                            .get(&room_id)
-                            .cloned()
-                            .flatten();
-                        let msg = SendMessage::new(&remaining, recipient).in_thread(thread_ts);
-                        if let Err(e) = self.send(&msg).await {
-                            tracing::debug!("Multi-message final flush failed: {e}");
+                    if let Some(remaining_slice) = text.get(sent_so_far..) {
+                        let remaining = remaining_slice.trim().to_string();
+                        if !remaining.is_empty() {
+                            let thread_ts = self
+                                .multi_message_thread_ts
+                                .lock()
+                                .await
+                                .get(&room_id)
+                                .cloned()
+                                .flatten();
+                            let msg = SendMessage::new(&remaining, recipient).in_thread(thread_ts);
+                            if let Err(e) = self.send(&msg).await {
+                                tracing::debug!("Multi-message final flush failed: {e}");
+                            }
                         }
                     }
                 }
@@ -2316,5 +2329,49 @@ mod tests {
         let sanitized = MatrixChannel::sanitize_error_for_log(&"auth failed: sk-proj-abc123xyz");
         assert!(!sanitized.contains("sk-proj-abc123xyz"));
         assert!(sanitized.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn channel_name_is_matrix() {
+        let ch = make_channel();
+        assert_eq!(ch.name(), "matrix");
+    }
+
+    #[test]
+    fn matrix_allowlist_filters() {
+        let ch = MatrixChannel::new(
+            "h".into(),
+            "t".into(),
+            "r".into(),
+            vec!["@alice:m".into(), "@bob:m".into()],
+        );
+        assert!(ch.is_user_allowed("@alice:m"));
+        assert!(ch.is_user_allowed("@bob:m"));
+        assert!(!ch.is_user_allowed("@eve:m"));
+    }
+
+    #[tokio::test]
+    async fn update_draft_multibyte_boundary_safety() {
+        let ch = make_channel().with_streaming(crate::config::StreamMode::MultiMessage, 1000, 800);
+
+        let room_id = "!room:matrix.org";
+        let text = "🦀文字"; // 🦀(4 bytes), 文(3 bytes), 字(3 bytes). boundaries: 0, 4, 7, 10
+
+        // Setup initial sent_len at an invalid boundary (index 2 is middle of 🦀)
+        ch.multi_message_sent_len
+            .lock()
+            .await
+            .insert(room_id.to_string(), 2);
+
+        // This should trigger the safe fallback in update_draft
+        ch.update_draft(room_id, "msg", text)
+            .await
+            .expect("update_draft should not error on fallback");
+
+        let sent_len = *ch.multi_message_sent_len.lock().await.get(room_id).unwrap();
+        assert_eq!(
+            sent_len, 0,
+            "Counter should be reset to 0 after hitting invalid boundary"
+        );
     }
 }
