@@ -332,6 +332,27 @@ pub fn register_skill_tools(
     }
 }
 
+/// Register SOP (Standard Operating Procedure) tools when `sop.sops_dir` is configured.
+///
+/// Returns a `Vec` of tool arcs that the caller can extend into the main registry.
+/// Extracted from `all_tools_with_runtime` to reduce function complexity and
+/// isolate the SOP subsystem's dependency surface (only needs `root_config.sop`).
+fn register_sop_tools(root_config: &crate::config::Config) -> Vec<Arc<dyn Tool>> {
+    let Some(_) = root_config.sop.sops_dir.as_ref() else {
+        return Vec::new();
+    };
+    let sop_engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+        root_config.sop.clone(),
+    )));
+    vec![
+        Arc::new(SopListTool::new(Arc::clone(&sop_engine))),
+        Arc::new(SopExecuteTool::new(Arc::clone(&sop_engine))),
+        Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))),
+        Arc::new(SopApproveTool::new(Arc::clone(&sop_engine))),
+        Arc::new(SopStatusTool::new(Arc::clone(&sop_engine))),
+    ]
+}
+
 /// Create full tool registry including memory tools and optional Composio
 #[allow(
     clippy::implicit_hasher,
@@ -778,16 +799,7 @@ pub fn all_tools_with_runtime(
     )));
 
     // SOP tools (registered when sops_dir is configured)
-    if root_config.sop.sops_dir.is_some() {
-        let sop_engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
-            root_config.sop.clone(),
-        )));
-        tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(&sop_engine))));
-    }
+    tool_arcs.extend(register_sop_tools(root_config));
 
     if let Some(key) = composio_key {
         if !key.is_empty() {
