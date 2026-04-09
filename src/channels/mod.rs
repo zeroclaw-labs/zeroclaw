@@ -639,6 +639,7 @@ fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
     reply_target: &str,
+    sender: &str,
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
@@ -672,7 +673,10 @@ fn build_channel_system_prompt(
     if !reply_target.is_empty() {
         let context = format!(
             "\n\nChannel context: You are currently responding on channel={channel_name}, \
-             reply_target={reply_target}. When scheduling delayed messages or reminders \
+             reply_target={reply_target}, sender={sender}. \
+             The sender field is the platform-specific user ID of the person who sent \
+             this message. Use it to distinguish between different users. \
+             When scheduling delayed messages or reminders \
              via cron_add for this conversation, use delivery={{\"mode\":\"announce\",\
              \"channel\":\"{channel_name}\",\"to\":\"{reply_target}\"}} so the message \
              reaches the user."
@@ -2077,6 +2081,28 @@ async fn classify_channel_reply_intent(
     Ok(AssistantChannelOutcome::Reply(String::new()))
 }
 
+/// Strip `<think>...</think>` blocks from streaming draft text so reasoning
+/// tokens are never shown to the user in partial updates.
+fn strip_think_tags_inline(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        if let Some(start) = rest.find("<think>") {
+            result.push_str(&rest[..start]);
+            if let Some(end) = rest[start..].find("</think>") {
+                rest = &rest[start + end + "</think>".len()..];
+            } else {
+                // Unclosed tag: drop the tail to avoid leaking partial reasoning.
+                break;
+            }
+        } else {
+            result.push_str(rest);
+            break;
+        }
+    }
+    result.trim().to_string()
+}
+
 fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
@@ -2737,8 +2763,12 @@ async fn process_channel_message(
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
-    let mut system_prompt =
-        build_channel_system_prompt(&base_system_prompt, &msg.channel, &msg.reply_target);
+    let mut system_prompt = build_channel_system_prompt(
+        &base_system_prompt,
+        &msg.channel,
+        &msg.reply_target,
+        &msg.sender,
+    );
     if !memory_context.is_empty() {
         let _ = write!(system_prompt, "\n\n{memory_context}");
     }
@@ -2887,8 +2917,9 @@ async fn process_channel_message(
                             }
                         }
                         DraftEvent::Progress(text) => {
+                            let visible = strip_think_tags_inline(&text);
                             if let Err(e) = channel
-                                .update_draft_progress(&reply_target, &draft_id, &text)
+                                .update_draft_progress(&reply_target, &draft_id, &visible)
                                 .await
                             {
                                 tracing::debug!("Draft progress update failed: {e}");
@@ -2896,8 +2927,9 @@ async fn process_channel_message(
                         }
                         DraftEvent::Content(text) => {
                             accumulated.push_str(&text);
+                            let visible = strip_think_tags_inline(&accumulated);
                             if let Err(e) = channel
-                                .update_draft(&reply_target, &draft_id, &accumulated)
+                                .update_draft(&reply_target, &draft_id, &visible)
                                 .await
                             {
                                 tracing::debug!("Draft update failed: {e}");
@@ -4486,8 +4518,196 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 qq.allowed_users.clone(),
             )))
         }
+        "lark" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                let lk = config
+                    .channels_config
+                    .lark
+                    .as_ref()
+                    .context("Lark channel is not configured")?;
+                Ok(Arc::new(LarkChannel::from_lark_config(lk)))
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            {
+                anyhow::bail!("Lark channel requires the `channel-lark` feature");
+            }
+        }
+        "feishu" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                if let Some(ref fs) = config.channels_config.feishu {
+                    return Ok(Arc::new(LarkChannel::from_feishu_config(fs)));
+                }
+                // Legacy: [channels_config.lark] with use_feishu = true
+                let lk = config
+                    .channels_config
+                    .lark
+                    .as_ref()
+                    .context("Feishu channel is not configured")?;
+                Ok(Arc::new(LarkChannel::from_config(lk)))
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            {
+                anyhow::bail!("Feishu channel requires the `channel-lark` feature");
+            }
+        }
+        "dingtalk" => {
+            let dt = config
+                .channels_config
+                .dingtalk
+                .as_ref()
+                .context("DingTalk channel is not configured")?;
+            Ok(Arc::new(
+                DingTalkChannel::new(
+                    dt.client_id.clone(),
+                    dt.client_secret.clone(),
+                    dt.allowed_users.clone(),
+                )
+                .with_proxy_url(dt.proxy_url.clone()),
+            ))
+        }
+        "wecom" => {
+            let wc = config
+                .channels_config
+                .wecom
+                .as_ref()
+                .context("WeCom channel is not configured")?;
+            Ok(Arc::new(WeComChannel::new(
+                wc.webhook_key.clone(),
+                wc.allowed_users.clone(),
+            )))
+        }
+        "nextcloud_talk" | "nextcloud-talk" => {
+            let nc = config
+                .channels_config
+                .nextcloud_talk
+                .as_ref()
+                .context("Nextcloud Talk channel is not configured")?;
+            Ok(Arc::new(NextcloudTalkChannel::new_with_proxy(
+                nc.base_url.clone(),
+                nc.app_token.clone(),
+                nc.bot_name.clone().unwrap_or_default(),
+                nc.allowed_users.clone(),
+                nc.proxy_url.clone(),
+            )))
+        }
+        "wati" => {
+            let wati_cfg = config
+                .channels_config
+                .wati
+                .as_ref()
+                .context("WATI channel is not configured")?;
+            Ok(Arc::new(WatiChannel::new_with_proxy(
+                wati_cfg.api_token.clone(),
+                wati_cfg.api_url.clone(),
+                wati_cfg.tenant_id.clone(),
+                wati_cfg.allowed_numbers.clone(),
+                wati_cfg.proxy_url.clone(),
+            )))
+        }
+        "linq" => {
+            let lq = config
+                .channels_config
+                .linq
+                .as_ref()
+                .context("Linq channel is not configured")?;
+            Ok(Arc::new(LinqChannel::new(
+                lq.api_token.clone(),
+                lq.from_phone.clone(),
+                lq.allowed_senders.clone(),
+            )))
+        }
+        "email" => {
+            let em = config
+                .channels_config
+                .email
+                .as_ref()
+                .context("Email channel is not configured")?;
+            Ok(Arc::new(EmailChannel::new(em.clone())))
+        }
+        "gmail_push" | "gmail-push" => {
+            let gp = config
+                .channels_config
+                .gmail_push
+                .as_ref()
+                .context("Gmail Push channel is not configured")?;
+            Ok(Arc::new(GmailPushChannel::new(gp.clone())))
+        }
+        "irc" => {
+            let irc_cfg = config
+                .channels_config
+                .irc
+                .as_ref()
+                .context("IRC channel is not configured")?;
+            Ok(Arc::new(IrcChannel::new(irc::IrcChannelConfig {
+                server: irc_cfg.server.clone(),
+                port: irc_cfg.port,
+                nickname: irc_cfg.nickname.clone(),
+                username: irc_cfg.username.clone(),
+                channels: irc_cfg.channels.clone(),
+                allowed_users: irc_cfg.allowed_users.clone(),
+                server_password: irc_cfg.server_password.clone(),
+                nickserv_password: irc_cfg.nickserv_password.clone(),
+                sasl_password: irc_cfg.sasl_password.clone(),
+                verify_tls: irc_cfg.verify_tls.unwrap_or(true),
+            })))
+        }
+        "twitter" => {
+            let tw = config
+                .channels_config
+                .twitter
+                .as_ref()
+                .context("X/Twitter channel is not configured")?;
+            Ok(Arc::new(TwitterChannel::new(
+                tw.bearer_token.clone(),
+                tw.allowed_users.clone(),
+            )))
+        }
+        "mochat" => {
+            let mc = config
+                .channels_config
+                .mochat
+                .as_ref()
+                .context("Mochat channel is not configured")?;
+            Ok(Arc::new(MochatChannel::new(
+                mc.api_url.clone(),
+                mc.api_token.clone(),
+                mc.allowed_users.clone(),
+                mc.poll_interval_secs,
+            )))
+        }
+        "discord_history" | "discord-history" => {
+            let dh = config
+                .channels_config
+                .discord_history
+                .as_ref()
+                .context("Discord History channel is not configured")?;
+            let discord_mem =
+                crate::memory::SqliteMemory::new_named(&config.workspace_dir, "discord")
+                    .context("Discord History: failed to open discord.db")?;
+            Ok(Arc::new(DiscordHistoryChannel::new(
+                dh.bot_token.clone(),
+                dh.guild_id.clone(),
+                dh.allowed_users.clone(),
+                dh.channel_ids.clone(),
+                Arc::new(discord_mem),
+                dh.store_dms,
+                dh.respond_to_dms,
+            )))
+        }
+        "imessage" => {
+            let im = config
+                .channels_config
+                .imessage
+                .as_ref()
+                .context("iMessage channel is not configured")?;
+            Ok(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())))
+        }
         other => anyhow::bail!(
-            "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, matrix, whatsapp, qq"
+            "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
+            matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
+            email, gmail_push, irc, twitter, mochat, discord_history, imessage"
         ),
     }
 }
@@ -11746,6 +11966,50 @@ This is an example JSON object for profile settings."#;
         assert_eq!(result, clean_text);
     }
 
+    // ── Tests for strip_think_tags_inline (streaming draft sanitization) ──
+
+    #[test]
+    fn strip_think_tags_inline_removes_single_block() {
+        assert_eq!(
+            strip_think_tags_inline("<think>reasoning</think>Hello"),
+            "Hello"
+        );
+    }
+
+    #[test]
+    fn strip_think_tags_inline_removes_multiple_blocks() {
+        assert_eq!(
+            strip_think_tags_inline("<think>a</think>X<think>b</think>Y"),
+            "XY"
+        );
+    }
+
+    #[test]
+    fn strip_think_tags_inline_handles_unclosed_block() {
+        assert_eq!(
+            strip_think_tags_inline("visible<think>hidden tail"),
+            "visible"
+        );
+    }
+
+    #[test]
+    fn strip_think_tags_inline_preserves_text_without_tags() {
+        assert_eq!(strip_think_tags_inline("plain text"), "plain text");
+    }
+
+    #[test]
+    fn strip_think_tags_inline_handles_empty_string() {
+        assert_eq!(strip_think_tags_inline(""), "");
+    }
+
+    #[test]
+    fn strip_think_tags_inline_strips_surrounding_whitespace() {
+        assert_eq!(
+            strip_think_tags_inline("<think>hidden</think>  Answer  "),
+            "Answer"
+        );
+    }
+
     // ── Tests for #4827: tool context preservation ──────────────
 
     #[test]
@@ -11824,5 +12088,34 @@ This is an example JSON object for profile settings."#;
     fn default_keep_tool_context_turns_is_two() {
         let config = crate::config::schema::AgentConfig::default();
         assert_eq!(config.keep_tool_context_turns, 2);
+    }
+
+    #[test]
+    fn build_channel_system_prompt_includes_sender_id() {
+        let prompt = build_channel_system_prompt(
+            "You are a helpful assistant.",
+            "mattermost",
+            "channel123:root456",
+            "user_abc123",
+        );
+        assert!(prompt.contains("sender=user_abc123"));
+        assert!(prompt.contains("channel=mattermost"));
+        assert!(prompt.contains("reply_target=channel123:root456"));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_omits_context_when_reply_target_empty() {
+        let prompt = build_channel_system_prompt("Base prompt.", "mattermost", "", "user_abc123");
+        assert!(!prompt.contains("sender="));
+        assert!(!prompt.contains("Channel context:"));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_sender_distinguishes_users() {
+        let prompt_a = build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_aaa");
+        let prompt_b = build_channel_system_prompt("Base.", "mattermost", "ch:thread", "user_bbb");
+        assert!(prompt_a.contains("sender=user_aaa"));
+        assert!(prompt_b.contains("sender=user_bbb"));
+        assert_ne!(prompt_a, prompt_b);
     }
 }
