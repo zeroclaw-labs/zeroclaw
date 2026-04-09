@@ -64,7 +64,16 @@ pub struct PruneStats {
 // ---------------------------------------------------------------------------
 
 fn estimate_tokens(messages: &[ChatMessage]) -> usize {
-    messages.iter().map(|m| m.content.len() / 4).sum()
+    let raw: usize = messages
+        .iter()
+        .map(|m| m.content.len().div_ceil(4) + 4)
+        .sum();
+    // Apply 1.2x safety margin consistent with context_compressor to avoid
+    // underestimation that leads to context_length_exceeded errors.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        (raw as f64 * 1.2) as usize
+    }
 }
 
 // ---------------------------------------------------------------------------

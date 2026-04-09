@@ -9367,6 +9367,43 @@ async fn ensure_bootstrap_files(workspace_dir: &Path) -> Result<()> {
 }
 
 impl Config {
+    /// Return top-level TOML keys in `raw_toml` that Config does not recognise.
+    ///
+    /// Keys present in `Config::default()` serialization pass immediately.
+    /// Remaining keys are probed: the key is deserialized in isolation and
+    /// the result compared to the default — a changed output means serde
+    /// consumed it (covers `Option<T>` fields and `#[serde(alias)]` names).
+    pub fn unknown_keys(raw_toml: &str) -> Vec<String> {
+        let raw: toml::Table = match raw_toml.parse() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        static DEFAULTS: OnceLock<toml::Table> = OnceLock::new();
+        let defaults = DEFAULTS.get_or_init(|| {
+            toml::to_string(&Config::default())
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default()
+        });
+        raw.keys()
+            .filter(|key| {
+                if defaults.contains_key(key.as_str()) {
+                    return false;
+                }
+                let mut t = toml::Table::new();
+                t.insert((*key).clone(), raw[key.as_str()].clone());
+                let consumed = toml::to_string(&t)
+                    .ok()
+                    .and_then(|s| toml::from_str::<Config>(&s).ok())
+                    .and_then(|c| toml::to_string(&c).ok())
+                    .and_then(|s| s.parse::<toml::Table>().ok())
+                    .is_some_and(|t| t != *defaults);
+                !consumed
+            })
+            .cloned()
+            .collect()
+    }
+
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
@@ -9443,24 +9480,10 @@ impl Config {
             // TOML table keys against what Config actually deserializes.
             // This replaces the previous serde_ignored-based approach which
             // had false-positive issues with #[serde(default)] nested structs.
-            if let Ok(raw) = contents.parse::<toml::Table>() {
-                // Build the set of known top-level keys from a default Config
-                // serialization round-trip.  This is computed once and cached.
-                static KNOWN_KEYS: OnceLock<Vec<String>> = OnceLock::new();
-                let known = KNOWN_KEYS.get_or_init(|| {
-                    toml::to_string(&Config::default())
-                        .ok()
-                        .and_then(|s| s.parse::<toml::Table>().ok())
-                        .map(|t| t.keys().cloned().collect())
-                        .unwrap_or_default()
-                });
-                for key in raw.keys() {
-                    if !known.contains(key) {
-                        tracing::warn!(
-                            "Unknown config key ignored: \"{key}\". Check config.toml for typos or deprecated options.",
-                        );
-                    }
-                }
+            for key in Self::unknown_keys(&contents) {
+                tracing::warn!(
+                    "Unknown config key ignored: \"{key}\". Check config.toml for typos or deprecated options.",
+                );
             }
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();

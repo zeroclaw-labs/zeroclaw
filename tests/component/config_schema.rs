@@ -9,6 +9,20 @@ use zeroclaw::config::{AutonomyConfig, ChannelsConfig, Config, GatewayConfig, Se
 // Invalid value fail-fast
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Regression test for #5414, #5320, #5483, #5507: Option<T> fields
+/// (api_key) and serde aliases (model_provider) must not be flagged as
+/// unknown config keys.
+#[test]
+fn config_valid_keys_not_flagged_as_unknown() {
+    // api_key: Option<T> defaulting to None — TOML omits it.
+    // model_provider: serde alias for default_provider.
+    let unknown = Config::unknown_keys("api_key = \"sk-test\"\nmodel_provider = \"ollama\"\n");
+    assert!(
+        unknown.is_empty(),
+        "api_key and model_provider should not be flagged as unknown, got: {unknown:?}",
+    );
+}
+
 #[test]
 fn config_unknown_keys_parse_without_error() {
     let toml_str = r#"

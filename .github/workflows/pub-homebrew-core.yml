@@ -206,9 +206,9 @@ jobs:
           bot_email="${BOT_EMAIL:-${fork_owner}@users.noreply.github.com}"
 
           # Pre-flight: verify token has push access to the fork
+          # Note: classic PATs may not return .permissions on forked repos; treat as warning, not hard fail.
           if ! gh api "repos/${BOT_FORK_REPO}" --jq '.permissions.push' 2>/dev/null | grep -q true; then
-            echo "::error::Token lacks push access to ${BOT_FORK_REPO}. Ensure HOMEBREW_CORE_BOT_TOKEN (or HOMEBREW_UPSTREAM_PR_TOKEN) is a PAT with 'Contents: write' scope for ${BOT_FORK_REPO}."
-            exit 1
+            echo "::warning::Could not confirm push access to ${BOT_FORK_REPO} via API (classic PATs may not report fork permissions). Attempting push anyway."
           fi
 
           git -C "$repo_dir" config user.name "$fork_owner"
