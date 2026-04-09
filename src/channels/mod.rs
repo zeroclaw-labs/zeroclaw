@@ -28,6 +28,7 @@ pub mod imessage;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
 pub mod lark;
+#[cfg(feature = "channel-line")]
 pub mod line;
 pub mod link_enricher;
 pub mod linq;
@@ -78,6 +79,7 @@ pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 #[cfg(feature = "channel-lark")]
 pub use lark::LarkChannel;
+#[cfg(feature = "channel-line")]
 pub use line::LineChannel;
 pub use linq::LinqChannel;
 #[cfg(feature = "channel-matrix")]
@@ -4700,6 +4702,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .context("iMessage channel is not configured")?;
             Ok(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())))
         }
+        #[cfg(feature = "channel-line")]
         "line" => {
             let ln = config
                 .channels_config
@@ -4770,6 +4773,7 @@ fn collect_configured_channels(
     let _ = matrix_skip_context;
     let mut channels = Vec::new();
 
+    #[cfg(feature = "channel-line")]
     if let Some(ref ln) = config.channels_config.line {
         if ln.enabled {
             channels.push(ConfiguredChannel {
@@ -10639,6 +10643,7 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    #[cfg(feature = "channel-line")]
     #[test]
     fn collect_configured_channels_includes_line_when_enabled() {
         let mut config = Config::default();
@@ -10657,6 +10662,7 @@ This is an example JSON object for profile settings."#;
         assert!(channels.iter().any(|e| e.channel.name() == "line"));
     }
 
+    #[cfg(feature = "channel-line")]
     #[test]
     fn collect_configured_channels_excludes_line_when_disabled() {
         let mut config = Config::default();
@@ -11758,6 +11764,7 @@ This is an example JSON object for profile settings."#;
         }
     }
 
+    #[cfg(feature = "channel-line")]
     #[test]
     fn build_channel_by_id_unconfigured_line_returns_error() {
         let config = Config::default();
@@ -11770,6 +11777,7 @@ This is an example JSON object for profile settings."#;
         }
     }
 
+    #[cfg(feature = "channel-line")]
     #[test]
     fn build_channel_by_id_configured_line_succeeds() {
         let mut config = Config::default();

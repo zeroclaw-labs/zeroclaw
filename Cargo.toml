@@ -248,6 +248,7 @@ hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
 channel-feishu = ["channel-lark"]  # Alias for Feishu users (Lark and Feishu are the same platform)
+channel-line = []
 observability-prometheus = ["dep:prometheus"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 peripheral-rpi = ["rppal"]
@@ -283,6 +284,7 @@ ci-all = [
     "hardware",
     "channel-matrix",
     "channel-lark",
+    "channel-line",
     "observability-prometheus",
     "observability-otel",
     "peripheral-rpi",
