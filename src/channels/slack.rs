@@ -3207,11 +3207,12 @@ impl SlackChannel {
 
 const SLACK_TRUNCATION_INDICATOR: &str = "\n\n...[message truncated]";
 
-/// Split `text` into chunks of at most `max_chars`, breaking at newline or
+/// Split `text` into chunks of at most `max_bytes` bytes, breaking at newline or
 /// space boundaries when possible. Returns at most `max_chunks` pieces; if the
 /// text would require more, the last chunk includes a truncation indicator.
-fn split_text_into_chunks(text: &str, max_chars: usize, max_chunks: usize) -> Vec<String> {
-    if text.len() <= max_chars {
+/// UTF-8 safe: slice points are floored to the nearest char boundary.
+fn split_text_into_chunks(text: &str, max_bytes: usize, max_chunks: usize) -> Vec<String> {
+    if text.len() <= max_bytes {
         return vec![text.to_string()];
     }
 
@@ -3221,18 +3222,21 @@ fn split_text_into_chunks(text: &str, max_chars: usize, max_chunks: usize) -> Ve
     while !remaining.is_empty() && chunks.len() < max_chunks {
         let is_last_slot = chunks.len() + 1 == max_chunks;
 
-        if remaining.len() <= max_chars && !is_last_slot {
+        if remaining.len() <= max_bytes && !is_last_slot {
             chunks.push(remaining.to_string());
             break;
         }
 
         if is_last_slot {
             // Last allowed slot: if remaining fits, just push it.
-            if remaining.len() <= max_chars {
+            if remaining.len() <= max_bytes {
                 chunks.push(remaining.to_string());
             } else {
                 // Truncate with indicator.
-                let avail = max_chars - SLACK_TRUNCATION_INDICATOR.len();
+                let avail = crate::util::floor_char_boundary(
+                    remaining,
+                    max_bytes.saturating_sub(SLACK_TRUNCATION_INDICATOR.len()),
+                );
                 let break_at = remaining[..avail]
                     .rfind('\n')
                     .map(|i| i + 1)
@@ -3246,7 +3250,7 @@ fn split_text_into_chunks(text: &str, max_chars: usize, max_chunks: usize) -> Ve
         }
 
         // Normal chunk: find a good break point.
-        let limit = max_chars.min(remaining.len());
+        let limit = crate::util::floor_char_boundary(remaining, max_bytes);
         let break_at = remaining[..limit]
             .rfind('\n')
             .map(|i| i + 1)
@@ -5056,5 +5060,31 @@ mod tests {
             assert_eq!(map.get("C123"), Some(&"1741234567.000100".to_string()),);
             assert_eq!(map.get("C999"), None);
         }
+    }
+
+    #[test]
+    fn split_text_into_chunks_safe_on_multibyte_utf8() {
+        // Use a mix of ASCII and multibyte Unicode characters to test chunking at UTF-8 boundaries,
+        // making sure splitting does not break in the middle of a multibyte char.
+        let line = "这是一些多字节字符: 漢字，Русский, 😀, 𝄞, ────\n";
+        // Make line long enough to approach a chunk boundary with multibyte at the edge.
+        let long_line = format!("{}{}", "a".repeat(SLACK_BLOCK_TEXT_MAX_CHARS - 5), "═\n");
+        let text = format!("{}{}", long_line, line.repeat(5));
+        let text = text.repeat(20); // Produce a text long enough to require splitting.
+
+        let chunks = split_text_into_chunks(
+            &text,
+            SLACK_BLOCK_TEXT_MAX_CHARS,
+            SLACK_MAX_BLOCKS_PER_MESSAGE,
+        );
+        for chunk in &chunks {
+            assert!(chunk.len() <= SLACK_BLOCK_TEXT_MAX_CHARS);
+            // Should not break inside a multibyte character
+            assert!(chunk.is_char_boundary(chunk.len()));
+        }
+        // Reassembled content should be a prefix of the original
+        let reassembled: String = chunks.concat();
+        assert!(!reassembled.is_empty());
+        assert!(text.starts_with(&reassembled));
     }
 }

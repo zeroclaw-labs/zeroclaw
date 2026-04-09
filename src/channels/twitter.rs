@@ -367,8 +367,9 @@ fn split_tweet_text(text: &str, max_len: usize) -> Vec<String> {
             break;
         }
 
-        // Find last space within limit
-        let split_at = remaining[..max_len].rfind(' ').unwrap_or(max_len);
+        // Find last space within limit (UTF-8 safe slice)
+        let limit = crate::util::floor_char_boundary(remaining, max_len);
+        let split_at = remaining[..limit].rfind(' ').unwrap_or(limit);
 
         chunks.push(remaining[..split_at].to_string());
         remaining = remaining[split_at..].trim_start();

@@ -1156,14 +1156,6 @@ fn format_input_params_hint(schema: Option<&serde_json::Value>) -> String {
     format!(" [params: {}]", keys.join(", "))
 }
 
-fn floor_char_boundary_compat(text: &str, index: usize) -> usize {
-    let mut end = index.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
-}
-
 /// Build a human-readable schema hint from a full tool schema response.
 ///
 /// Used in execute error messages so the LLM can see the expected parameter
@@ -1199,7 +1191,7 @@ fn format_schema_hint(schema: &serde_json::Value) -> Option<String> {
             // Truncate long descriptions to keep the hint concise.
             // Use char boundary to avoid panic on multi-byte UTF-8.
             let short = if desc.len() > 80 {
-                let end = floor_char_boundary_compat(desc, 77);
+                let end = crate::util::floor_char_boundary(desc, 77);
                 format!("{}...", &desc[..end])
             } else {
                 desc.to_string()
@@ -1556,11 +1548,14 @@ mod tests {
     }
 
     #[test]
-    fn floor_char_boundary_compat_handles_multibyte_offsets() {
+    fn floor_char_boundary_handles_multibyte_offsets() {
         let text = "abc😀def";
         // Byte offset 5 is inside the 4-byte emoji, so boundary should floor to 3.
-        assert_eq!(floor_char_boundary_compat(text, 5), 3);
-        assert_eq!(floor_char_boundary_compat(text, usize::MAX), text.len());
+        assert_eq!(crate::util::floor_char_boundary(text, 5), 3);
+        assert_eq!(
+            crate::util::floor_char_boundary(text, usize::MAX),
+            text.len()
+        );
     }
 
     #[test]

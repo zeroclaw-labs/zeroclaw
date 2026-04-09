@@ -312,9 +312,10 @@ impl Channel for BlueskyChannel {
         };
 
         // Bluesky posts have a 300-character limit (grapheme clusters).
-        // For longer content, truncate with an indicator.
+        // For longer content, truncate with an indicator (UTF-8 safe).
         let text = if message.content.len() > 300 {
-            format!("{}...", &message.content[..297])
+            let end = crate::util::floor_char_boundary(&message.content, 297);
+            format!("{}...", &message.content[..end])
         } else {
             message.content.clone()
         };
