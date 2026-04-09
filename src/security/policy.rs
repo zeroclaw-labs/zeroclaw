@@ -1221,11 +1221,15 @@ impl SecurityPolicy {
                 return false;
             }
 
-            // Validate arguments for the command
-            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
-            if !self.is_args_safe(base_cmd, &args) {
+            // Validate arguments for the command.
+            // Preserve original case for flag matching (e.g. git -C vs -c),
+            // while keeping a lowercased copy for case-insensitive checks elsewhere.
+            let args_orig: Vec<String> = words.map(|w| w.to_string()).collect();
+            let args: Vec<String> = args_orig.iter().map(|w| w.to_ascii_lowercase()).collect();
+            if !self.is_args_safe(base_cmd, &args_orig) {
                 return false;
             }
+            let _ = args; // lowercased args available for future use
         }
 
         // At least one command must be present
