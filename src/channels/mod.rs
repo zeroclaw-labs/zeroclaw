@@ -269,6 +269,10 @@ struct ChannelRouteSelection {
     /// the global `api_key` in [`ChannelRuntimeContext`] when creating the
     /// provider for this route.
     api_key: Option<String>,
+    /// Route-specific context window override (in tokens). When set, takes
+    /// precedence over the global `context_token_budget` for preemptive
+    /// trimming and proactive compression.
+    context_window: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1033,6 +1037,7 @@ fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection
         provider: defaults.default_provider,
         model: defaults.model,
         api_key: None,
+        context_window: None,
     }
 }
 
@@ -1816,8 +1821,10 @@ async fn handle_runtime_command_if_needed(
                     current.provider = route.provider.clone();
                     current.model = route.model.clone();
                     current.api_key = route.api_key.clone();
+                    current.context_window = route.context_window;
                 } else {
                     current.model = model.clone();
+                    current.context_window = None;
                 }
                 set_route_selection(ctx, &sender_key, current.clone());
 
@@ -2576,9 +2583,15 @@ async fn process_channel_message(
                 provider: matched_route.provider.clone(),
                 model: matched_route.model.clone(),
                 api_key: matched_route.api_key.clone(),
+                context_window: matched_route.context_window,
             };
         }
     }
+
+    // Use route-specific context window when available, otherwise fall back
+    // to the global max_context_tokens config. This lets large-context models
+    // (e.g. 200k+ behind litellm) avoid aggressive preemptive trimming.
+    let effective_context_budget = route.context_window.unwrap_or(ctx.context_token_budget);
 
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let mut active_provider = match get_or_create_provider(
@@ -2783,7 +2796,7 @@ async fn process_channel_message(
         let cc_config = ctx.prompt_config.agent.context_compression.clone();
         let compressor = crate::agent::context_compressor::ContextCompressor::new(
             cc_config,
-            ctx.context_token_budget,
+            effective_context_budget,
         )
         .with_memory(Arc::clone(&ctx.memory));
         match compressor
@@ -3064,7 +3077,7 @@ async fn process_channel_message(
                         Some(model_switch_callback.clone()),
                         &ctx.pacing,
                         ctx.max_tool_result_chars,
-                        ctx.context_token_budget,
+                        effective_context_budget,
                         None, // shared_budget
                     ),
                     ),
@@ -7693,6 +7706,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 provider: "openrouter".to_string(),
                 model: "route-model".to_string(),
                 api_key: None,
+                context_window: None,
             },
         );
 
@@ -11198,6 +11212,7 @@ This is an example JSON object for profile settings."#;
             provider: "vision-provider".into(),
             model: "gpt-4-vision".into(),
             api_key: None,
+            context_window: None,
         }];
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -11318,6 +11333,7 @@ This is an example JSON object for profile settings."#;
             provider: "vision-provider".into(),
             model: "gpt-4-vision".into(),
             api_key: None,
+            context_window: None,
         }];
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -11430,6 +11446,7 @@ This is an example JSON object for profile settings."#;
             provider: "vision-provider".into(),
             model: "gpt-4-vision".into(),
             api_key: None,
+            context_window: None,
         }];
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -11555,12 +11572,14 @@ This is an example JSON object for profile settings."#;
                 provider: "fast-provider".into(),
                 model: "fast-model".into(),
                 api_key: None,
+                context_window: None,
             },
             crate::config::ModelRouteConfig {
                 hint: "code".into(),
                 provider: "code-provider".into(),
                 model: "code-model".into(),
                 api_key: None,
+                context_window: None,
             },
         ];
 
