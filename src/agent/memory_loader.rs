@@ -116,7 +116,7 @@ mod tests {
             Ok(vec![MemoryEntry {
                 id: "1".into(),
                 key: "k".into(),
-                content: "v".into(),
+                content: "User prefers concise answers.".into(),
                 category: MemoryCategory::Conversation,
                 timestamp: "now".into(),
                 session_id: None,
@@ -216,7 +216,7 @@ mod tests {
             .await
             .unwrap();
         assert!(context.contains("[Memory context]"));
-        assert!(context.contains("- k: v"));
+        assert!(context.contains("- k: User prefers concise answers."));
     }
 
     #[tokio::test]
