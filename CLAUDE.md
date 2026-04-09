@@ -26,6 +26,20 @@ Key extension points:
 - `src/runtime/traits.rs` (`RuntimeAdapter`)
 - `src/peripherals/traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
 
+## 1.1) Knowledge Routing
+
+ZeroClaw development produces two kinds of knowledge:
+
+- **Code knowledge** (architecture, patterns, conventions): stays in this repo — CLAUDE.md, code comments, docs/
+- **Operational knowledge** (deployment patterns, infrastructure interactions, incident findings): goes to the scrapyard wiki at `~/github_projects/scrapyard-wiki/`
+
+After work that involves K8s manifests, deployment strategies, provider configurations, networking, or incident debugging, ingest operational findings into the scrapyard wiki using `/wiki-ingest`. The wiki is shared across all cluster projects — knowledge filed there compounds.
+
+ZeroClaw-specific entries in the scrapyard wiki:
+- `wiki/services/zeroclaw` — deployment topology, configmaps, agent architecture
+- `wiki/services/signal-cli` — signal-cli daemon, registration, SPQR
+- `wiki/decisions/gemma4-migration` — Gemma 4 constraints and configuration
+
 ## 2) Deep Architecture Observations (Why This Protocol Exists)
 
 These codebase realities should drive every design decision:
