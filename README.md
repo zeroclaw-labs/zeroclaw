@@ -91,39 +91,82 @@ Auth profile rotation (OAuth vs API keys) + failover: [Model failover](docs/refe
 
 Runtime: Rust stable toolchain. Single binary, no runtime dependencies.
 
-### Homebrew (macOS/Linuxbrew)
+### Package managers
+
+#### Homebrew (macOS/Linuxbrew)
 
 ```bash
 brew install zeroclaw
 ```
 
-### Cargo binstall (cross-platform)
+#### Cargo binstall (cross-platform)
 
 The fastest way to install ZeroClaw from crates.io without compiling:
 
 ```bash
 # Install cargo-binstall if you don't have it
- cargo install cargo-binstall
+cargo install cargo-binstall
 
 # Install ZeroClaw
- cargo binstall zeroclaw
+cargo binstall zeroclaw
 ```
 
-### Nix (Linux/macOS)
+#### Nix (Linux/macOS)
 
 Run directly without installing:
 
 ```bash
- nix run github:zeroclaw-labs/zeroclaw
+nix run github:zeroclaw-labs/zeroclaw
 ```
 
 Or install via nix profile:
 
 ```bash
- nix profile install github:zeroclaw-labs/zeroclaw
+nix profile install github:zeroclaw-labs/zeroclaw
 ```
 
-### One-click bootstrap
+#### Scoop (Windows)
+
+```bash
+scoop install zeroclaw
+```
+
+### Pre-built binaries
+
+#### Docker
+
+Run with Docker (no local build required):
+
+```bash
+docker run -d --name zeroclaw \
+  -p 42617:42617 \
+  -v "$HOME/.zeroclaw:/zeroclaw-data/.zeroclaw" \
+  -v "$HOME/zeroclaw-workspace:/zeroclaw-data/workspace" \
+  ghcr.io/zeroclaw-labs/zeroclaw:latest
+```
+
+Or use docker-compose:
+
+```bash
+# Clone the repository to get docker-compose.yml
+git clone https://github.com/zeroclaw-labs/zeroclaw.git
+cd zeroclaw
+docker compose up -d
+```
+
+#### GitHub Releases
+
+Download pre-built binaries from [GitHub Releases](https://github.com/zeroclaw-labs/zeroclaw/releases/latest) for:
+
+- Linux: `x86_64`, `aarch64`, `armv7`
+- macOS: `x86_64`, `aarch64` (Apple Silicon)
+- Windows: `x86_64`
+
+Extract and place the binary in your `PATH`.
+
+### Build from source
+
+#### One-click bootstrap (recommended for development)
 
 ```bash
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
@@ -132,6 +175,20 @@ cd zeroclaw
 ```
 
 `zeroclaw onboard` runs automatically after install to configure your workspace and provider.
+
+#### Cargo install (requires Rust toolchain)
+
+If you already have Rust installed:
+
+```bash
+cargo install zeroclaw
+```
+
+To install a specific version:
+
+```bash
+cargo install zeroclaw --version 0.6.9
+```
 
 ## Quick start (TL;DR)
 
@@ -163,7 +220,9 @@ zeroclaw doctor
 
 Upgrading? Run `zeroclaw doctor` after updating.
 
-### From source (development)
+### Development build (from source)
+
+For local development or contributing to ZeroClaw:
 
 ```bash
 git clone https://github.com/zeroclaw-labs/zeroclaw.git

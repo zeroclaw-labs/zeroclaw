@@ -2,15 +2,91 @@
 
 This page defines the fastest supported path to install and initialize ZeroClaw.
 
-Last verified: **February 20, 2026**.
+Last verified: **April 2026**.
 
-## Option 0: Homebrew (macOS/Linuxbrew)
+## Package Managers (Recommended)
+
+### Homebrew (macOS/Linuxbrew)
 
 ```bash
 brew install zeroclaw
 ```
 
-## Option A (Recommended): Clone + local script
+### Cargo binstall (Cross-platform)
+
+The fastest way to install ZeroClaw from crates.io without compiling:
+
+```bash
+# Install cargo-binstall if you don't have it
+cargo install cargo-binstall
+
+# Install ZeroClaw
+cargo binstall zeroclaw
+```
+
+### Nix (Linux/macOS)
+
+Run directly without installing:
+
+```bash
+nix run github:zeroclaw-labs/zeroclaw
+```
+
+Or install via nix profile:
+
+```bash
+nix profile install github:zeroclaw-labs/zeroclaw
+```
+
+### Scoop (Windows)
+
+```bash
+scoop install zeroclaw
+```
+
+## Pre-built Binaries
+
+### Docker
+
+Run ZeroClaw without any local installation:
+
+```bash
+docker run -d --name zeroclaw \
+  -p 42617:42617 \
+  -v "$HOME/.zeroclaw:/zeroclaw-data/.zeroclaw" \
+  -v "$HOME/zeroclaw-workspace:/zeroclaw-data/workspace" \
+  ghcr.io/zeroclaw-labs/zeroclaw:latest
+```
+
+Or use docker-compose for persistent deployment:
+
+```bash
+git clone https://github.com/zeroclaw-labs/zeroclaw.git
+cd zeroclaw
+docker compose up -d
+```
+
+### GitHub Releases
+
+Download pre-built binaries for your platform from [GitHub Releases](https://github.com/zeroclaw-labs/zeroclaw/releases/latest):
+
+- Linux: `x86_64`, `aarch64`, `armv7`
+- macOS: `x86_64`, `aarch64` (Apple Silicon)
+- Windows: `x86_64`
+
+Extract and place the binary in your `PATH`.
+
+## Build from Source
+
+### Cargo install (requires Rust)
+
+If you have Rust installed:
+
+```bash
+cargo install zeroclaw
+```
+
+### Clone + local script (development)
 
 ```bash
 git clone https://github.com/zeroclaw-labs/zeroclaw.git
