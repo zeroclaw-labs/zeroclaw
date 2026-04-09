@@ -1,0 +1,33 @@
+# Researcher Agent — optimized for web research tasks
+#
+# Uses the default provider/model from the main config.
+# Uncomment to override:
+# provider = "openai"
+# model = "pakllm"
+
+# Context and truncation
+max_context_tokens = 32000
+max_tool_result_chars = 5000
+
+# Behavior
+agentic = true
+max_iterations = 20
+max_depth = 2
+
+# Tools: focused on research capabilities
+allowed_tools = [
+    "web_search",
+    "web_fetch",
+    "file_read",
+    "file_write",
+    "memory_recall",
+    "memory_store",
+    "calculator",
+]
+
+# Memory isolation
+# memory_namespace = "researcher"
+
+# Timeouts (generous for web research)
+timeout_secs = 120
+agentic_timeout_secs = 600

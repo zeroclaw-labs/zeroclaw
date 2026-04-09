@@ -53,7 +53,7 @@ pub enum BackgroundTaskStatus {
 /// Background results are persisted to `workspace/delegate_results/{task_id}.json`
 /// and can be retrieved via `action: "check_result"`.
 pub struct DelegateTool {
-    agents: Arc<HashMap<String, DelegateAgentConfig>>,
+    agents: Arc<RwLock<HashMap<String, DelegateAgentConfig>>>,
     security: Arc<SecurityPolicy>,
     /// Global credential fallback (from config.api_key)
     fallback_credential: Option<String>,
@@ -73,6 +73,12 @@ pub struct DelegateTool {
     cancellation_token: CancellationToken,
     /// Optional memory instance for namespace isolation on delegate agents.
     memory: Option<Arc<dyn Memory>>,
+    /// Skills prompt injection mode inherited from root config.
+    /// Fixes #5155: sub-agents now respect the global `skills.prompt_injection_mode`.
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    /// Optional concurrency semaphore shared with SpawnAgentTool.
+    /// When set, limits how many sub-agents run simultaneously.
+    subagent_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl DelegateTool {
@@ -96,7 +102,7 @@ impl DelegateTool {
         provider_runtime_options: providers::ProviderRuntimeOptions,
     ) -> Self {
         Self {
-            agents: Arc::new(agents),
+            agents: Arc::new(RwLock::new(agents)),
             security,
             fallback_credential,
             provider_runtime_options,
@@ -107,6 +113,8 @@ impl DelegateTool {
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
             memory: None,
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            subagent_semaphore: None,
         }
     }
 
@@ -136,7 +144,7 @@ impl DelegateTool {
         provider_runtime_options: providers::ProviderRuntimeOptions,
     ) -> Self {
         Self {
-            agents: Arc::new(agents),
+            agents: Arc::new(RwLock::new(agents)),
             security,
             fallback_credential,
             provider_runtime_options,
@@ -147,6 +155,8 @@ impl DelegateTool {
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
             memory: None,
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            subagent_semaphore: None,
         }
     }
 
@@ -198,6 +208,31 @@ impl DelegateTool {
         self
     }
 
+    /// Set the skills prompt injection mode for sub-agent system prompts.
+    /// Fixes #5155: propagates `skills.prompt_injection_mode` from root config.
+    pub fn with_skills_prompt_mode(
+        mut self,
+        mode: crate::config::SkillsPromptInjectionMode,
+    ) -> Self {
+        self.skills_prompt_mode = mode;
+        self
+    }
+
+    /// Inject a pre-existing shared agent registry (used by WorkspaceAgentManager).
+    pub fn with_shared_agents(
+        mut self,
+        agents: Arc<RwLock<HashMap<String, DelegateAgentConfig>>>,
+    ) -> Self {
+        self.agents = agents;
+        self
+    }
+
+    /// Attach a shared concurrency semaphore for sub-agent execution.
+    pub fn with_subagent_semaphore(mut self, sem: Arc<tokio::sync::Semaphore>) -> Self {
+        self.subagent_semaphore = Some(sem);
+        self
+    }
+
     /// Wrap memory with namespace isolation if configured for the given agent.
     /// Returns the namespaced memory if memory_namespace is set, otherwise returns
     /// the original memory.
@@ -242,7 +277,7 @@ impl Tool for DelegateTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        let agent_names: Vec<&str> = self.agents.keys().map(|s: &String| s.as_str()).collect();
+        let agent_names: Vec<String> = self.agents.read().keys().cloned().collect();
         json!({
             "type": "object",
             "additionalProperties": false,
@@ -263,7 +298,7 @@ impl Tool for DelegateTool {
                         if agent_names.is_empty() {
                             "(none configured)".to_string()
                         } else {
-                            agent_names.join(", ")
+                            agent_names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
                         }
                     )
                 },
@@ -384,12 +419,22 @@ impl DelegateTool {
             .map(str::trim)
             .unwrap_or("");
 
+        // Acquire concurrency permit if semaphore is configured.
+        let _permit = match &self.subagent_semaphore {
+            Some(sem) => Some(
+                sem.acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("subagent semaphore closed"))?,
+            ),
+            None => None,
+        };
+
         // Look up agent config
-        let agent_config = match self.agents.get(agent_name) {
+        let agent_config = match self.agents.read().get(agent_name).cloned() {
             Some(cfg) => cfg,
             None => {
-                let available: Vec<&str> =
-                    self.agents.keys().map(|s: &String| s.as_str()).collect();
+                let available: Vec<String> =
+                    self.agents.read().keys().cloned().collect::<Vec<String>>();
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -470,7 +515,7 @@ impl DelegateTool {
             return self
                 .execute_agentic(
                     agent_name,
-                    agent_config,
+                    &agent_config,
                     &*provider,
                     &full_prompt,
                     temperature,
@@ -480,7 +525,7 @@ impl DelegateTool {
 
         // Build enriched system prompt for non-agentic sub-agent.
         let enriched_system_prompt =
-            self.build_enriched_system_prompt(agent_config, &[], &self.workspace_dir);
+            self.build_enriched_system_prompt(&agent_config, &[], &self.workspace_dir);
         let system_prompt_ref = enriched_system_prompt.as_deref();
 
         // Wrap the provider call in a timeout to prevent indefinite blocking
@@ -549,11 +594,11 @@ impl DelegateTool {
         args: &serde_json::Value,
     ) -> anyhow::Result<ToolResult> {
         // Validate agent exists and check depth/security before spawning
-        let agent_config = match self.agents.get(agent_name) {
-            Some(cfg) => cfg.clone(),
+        let agent_config = match self.agents.read().get(agent_name).cloned() {
+            Some(cfg) => cfg,
             None => {
-                let available: Vec<&str> =
-                    self.agents.keys().map(|s: &String| s.as_str()).collect();
+                let available: Vec<String> =
+                    self.agents.read().keys().cloned().collect::<Vec<String>>();
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -651,6 +696,8 @@ impl DelegateTool {
                 workspace_dir: workspace_dir.clone(),
                 cancellation_token: child_token.clone(),
                 memory: None,
+                skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+                subagent_semaphore: None,
             };
 
             let args_inner = json!({
@@ -761,9 +808,9 @@ impl DelegateTool {
 
         // Validate all agents exist before starting any
         for name in &agent_names {
-            if !self.agents.contains_key(name) {
-                let available: Vec<&str> =
-                    self.agents.keys().map(|s: &String| s.as_str()).collect();
+            if !self.agents.read().contains_key(name) {
+                let available: Vec<String> =
+                    self.agents.read().keys().cloned().collect::<Vec<String>>();
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -809,6 +856,8 @@ impl DelegateTool {
                     workspace_dir,
                     cancellation_token,
                     memory: None,
+                    skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+                    subagent_semaphore: None,
                 };
                 let result = Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)).await;
                 (agent_name, result)
@@ -1048,7 +1097,7 @@ impl DelegateTool {
             model_name: &agent_config.model,
             tools: sub_tools,
             skills: &skills,
-            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            skills_prompt_mode: self.skills_prompt_mode,
             identity_config: None,
             dispatcher_instructions: "",
             tool_descriptions: None,
@@ -1140,7 +1189,9 @@ impl DelegateTool {
         }
         history.push(ChatMessage::user(full_prompt.to_string()));
 
-        let noop_observer = NoopObserver;
+        let noop_observer = SubagentObserver {
+            agent_name: agent_name.to_string(),
+        };
 
         let agentic_timeout_secs = agent_config
             .agentic_timeout_secs
@@ -1169,9 +1220,9 @@ impl DelegateTool {
                 None,
                 None,
                 &crate::config::PacingConfig::default(),
-                0,    // max_tool_result_chars: inherit from parent config in future
-                0,    // context_token_budget: 0 = disabled for subagents
-                None, // shared_budget: TODO thread from parent in future
+                agent_config.max_tool_result_chars.unwrap_or(0),
+                agent_config.max_context_tokens.unwrap_or(0),
+                None, // shared_budget
             ),
         )
         .await;
@@ -1239,15 +1290,72 @@ impl Tool for ToolArcRef {
     }
 }
 
-struct NoopObserver;
+/// Observer that logs sub-agent events via tracing so they appear in journalctl.
+struct SubagentObserver {
+    agent_name: String,
+}
 
-impl Observer for NoopObserver {
-    fn record_event(&self, _event: &ObserverEvent) {}
+impl Observer for SubagentObserver {
+    fn record_event(&self, event: &ObserverEvent) {
+        match event {
+            ObserverEvent::ToolCallStart { tool, .. } => {
+                tracing::info!(agent = %self.agent_name, tool = %tool, "▶ [subagent] tool start");
+            }
+            ObserverEvent::ToolCall {
+                tool,
+                duration,
+                success,
+            } => {
+                tracing::info!(
+                    agent = %self.agent_name,
+                    tool = %tool,
+                    duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                    success = success,
+                    "◀ [subagent] tool done"
+                );
+            }
+            ObserverEvent::LlmRequest {
+                provider,
+                model,
+                messages_count,
+            } => {
+                tracing::info!(
+                    agent = %self.agent_name,
+                    provider = %provider,
+                    model = %model,
+                    messages = messages_count,
+                    "🔄 [subagent] LLM request"
+                );
+            }
+            ObserverEvent::LlmResponse {
+                duration,
+                success,
+                error_message,
+                ..
+            } => {
+                if *success {
+                    tracing::info!(
+                        agent = %self.agent_name,
+                        duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                        "✓ [subagent] LLM response"
+                    );
+                } else {
+                    tracing::warn!(
+                        agent = %self.agent_name,
+                        duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                        error = ?error_message,
+                        "✗ [subagent] LLM error"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
 
     fn record_metric(&self, _metric: &ObserverMetric) {}
 
     fn name(&self) -> &str {
-        "noop"
+        "subagent-tracing"
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1287,6 +1395,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         agents.insert(
@@ -1305,6 +1415,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         agents
@@ -1462,6 +1574,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
         }
     }
 
@@ -1578,6 +1692,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1692,6 +1808,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1733,6 +1851,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -2022,6 +2142,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2076,6 +2198,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
         };
 
         struct MockShellTool;
@@ -2147,6 +2271,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2176,6 +2302,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2210,6 +2338,8 @@ mod tests {
             agentic_timeout_secs: Some(600),
             skills_directory: None,
             memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2266,6 +2396,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2294,6 +2426,8 @@ mod tests {
                 agentic_timeout_secs: Some(0),
                 skills_directory: None,
                 memory_namespace: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2322,6 +2456,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2350,6 +2486,8 @@ mod tests {
                 agentic_timeout_secs: Some(5000),
                 skills_directory: None,
                 memory_namespace: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2378,6 +2516,8 @@ mod tests {
                 agentic_timeout_secs: Some(3600),
                 skills_directory: None,
                 memory_namespace: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2402,6 +2542,8 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2435,6 +2577,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: Some("skills/code-review".to_string()),
             memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2482,6 +2626,8 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            max_context_tokens: None,
+            max_tool_result_chars: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];

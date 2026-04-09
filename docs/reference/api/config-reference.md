@@ -277,6 +277,8 @@ Delegate sub-agent configurations. Each key under `[agents]` defines a named sub
 | `timeout_secs` | `120` | Timeout in seconds for non-agentic provider calls (1–3600) |
 | `agentic_timeout_secs` | `300` | Timeout in seconds for agentic sub-agent loops (1–3600) |
 | `skills_directory` | unset | Optional skills directory path (workspace-relative) for scoped skill loading |
+| `max_context_tokens` | unset | Cap on the total tokens sent in the sub-agent context window; truncates oldest messages when exceeded |
+| `max_tool_result_chars` | unset | Maximum characters retained from each tool result; longer outputs are truncated with a summary marker |
 
 Notes:
 
@@ -310,6 +312,27 @@ system_prompt = "You are an expert code reviewer focused on security and perform
 agentic = true
 allowed_tools = ["file_read", "shell"]
 skills_directory = "skills/code-review"
+```
+
+## `[delegate]`
+
+Concurrency controls for sub-agent execution.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_concurrent_subagents` | int | `0` | Maximum concurrent sub-agents. `0` = unlimited. Prevents LLM slot saturation on capacity-limited backends. |
+
+Notes:
+
+- When `max_concurrent_subagents > 0`, a shared semaphore limits the total number of simultaneously executing sub-agents across both `delegate` and `spawn_agent` invocations.
+- Excess requests wait for a permit rather than failing.
+- Recommended values: `1` for 1-2 LLM slots, `2` for 3-4 slots, `3-4` for 5+ slots, `0` (unlimited) for cloud APIs.
+
+Example:
+
+```toml
+[delegate]
+max_concurrent_subagents = 2
 ```
 
 ## `[runtime]`

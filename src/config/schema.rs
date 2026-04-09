@@ -609,6 +609,11 @@ pub struct DelegateToolConfig {
     /// Default: 300 seconds.
     #[serde(default = "default_delegate_agentic_timeout_secs")]
     pub agentic_timeout_secs: u64,
+    /// Maximum number of sub-agents (delegate + spawn) that can run concurrently.
+    /// Prevents slot saturation on LLM backends with limited capacity (e.g. llama.cpp).
+    /// `0` means unlimited (default).
+    #[serde(default)]
+    pub max_concurrent_subagents: usize,
 }
 
 impl Default for DelegateToolConfig {
@@ -616,6 +621,7 @@ impl Default for DelegateToolConfig {
         Self {
             timeout_secs: DEFAULT_DELEGATE_TIMEOUT_SECS,
             agentic_timeout_secs: DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
+            max_concurrent_subagents: 0,
         }
     }
 }
@@ -669,6 +675,14 @@ pub struct DelegateAgentConfig {
     /// preventing cross-contamination with memory from other agents.
     #[serde(default)]
     pub memory_namespace: Option<String>,
+    /// Maximum context window in tokens for this agent.
+    /// When `None` or `0`, the sub-agent runs without a context budget limit.
+    #[serde(default)]
+    pub max_context_tokens: Option<usize>,
+    /// Maximum characters per tool result for this agent.
+    /// When `None` or `0`, tool results are not truncated.
+    #[serde(default)]
+    pub max_tool_result_chars: Option<usize>,
 }
 
 fn default_delegate_timeout_secs() -> u64 {
@@ -677,6 +691,91 @@ fn default_delegate_timeout_secs() -> u64 {
 
 fn default_delegate_agentic_timeout_secs() -> u64 {
     DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS
+}
+
+// ── Workspace Agents ───────────────────────────────────────────
+
+/// Agent definition loaded from `workspace/agents/<name>/config.toml`.
+///
+/// Fields with `Option` fall back to the global defaults (`default_provider`,
+/// `default_model`) when not set.  The system prompt is assembled externally
+/// by reading the accompanying `IDENTITY.md` / `TOOLS.md` files, so it does
+/// not appear here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceAgentConfig {
+    /// Provider name override (falls back to `default_provider`).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model name override (falls back to `default_model`).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Temperature override.
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// Enable agentic sub-agent mode (multi-turn tool-call loop).
+    #[serde(default = "default_workspace_agent_agentic")]
+    pub agentic: bool,
+    /// Allowlist of tool names available to this agent in agentic mode.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// Maximum tool-call iterations in agentic mode.
+    #[serde(default = "default_max_tool_iterations")]
+    pub max_iterations: usize,
+    /// Max recursion depth for nested delegation.
+    #[serde(default = "default_max_depth")]
+    pub max_depth: u32,
+    /// Optional timeout in seconds for non-agentic calls.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Optional timeout in seconds for agentic runs.
+    #[serde(default)]
+    pub agentic_timeout_secs: Option<u64>,
+    /// Optional memory namespace for isolation (defaults to agent name).
+    #[serde(default)]
+    pub memory_namespace: Option<String>,
+    /// Maximum context window in tokens for this agent.
+    #[serde(default)]
+    pub max_context_tokens: Option<usize>,
+    /// Maximum characters per tool result for this agent.
+    #[serde(default)]
+    pub max_tool_result_chars: Option<usize>,
+}
+
+fn default_workspace_agent_agentic() -> bool {
+    true
+}
+
+impl WorkspaceAgentConfig {
+    /// Convert into a `DelegateAgentConfig`, filling in defaults and the
+    /// concatenated system prompt assembled from the agent's folder files.
+    pub fn into_delegate_config(
+        self,
+        agent_name: &str,
+        system_prompt: Option<String>,
+        skills_directory: Option<String>,
+        default_provider: &str,
+        default_model: &str,
+    ) -> DelegateAgentConfig {
+        DelegateAgentConfig {
+            provider: self.provider.unwrap_or_else(|| default_provider.to_owned()),
+            model: self.model.unwrap_or_else(|| default_model.to_owned()),
+            system_prompt,
+            api_key: None,
+            temperature: self.temperature,
+            max_depth: self.max_depth,
+            agentic: self.agentic,
+            allowed_tools: self.allowed_tools,
+            max_iterations: self.max_iterations,
+            timeout_secs: self.timeout_secs,
+            agentic_timeout_secs: self.agentic_timeout_secs,
+            skills_directory,
+            memory_namespace: self
+                .memory_namespace
+                .or_else(|| Some(agent_name.to_owned())),
+            max_context_tokens: self.max_context_tokens,
+            max_tool_result_chars: self.max_tool_result_chars,
+        }
+    }
 }
 
 // ── Swarms ──────────────────────────────────────────────────────
@@ -12020,6 +12119,8 @@ default_temperature = 0.7
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                max_context_tokens: None,
+                max_tool_result_chars: None,
             },
         );
 
