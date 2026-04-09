@@ -374,6 +374,9 @@ impl Agent {
                 self.history.push(ConversationMessage::Chat(msg.clone()));
             }
         }
+        // Trim immediately after seeding to prevent unbounded memory growth
+        // when persisted sessions contain thousands of messages.
+        self.trim_history();
     }
 
     pub async fn from_config(config: &Config) -> Result<Self> {
