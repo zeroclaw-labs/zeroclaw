@@ -13,7 +13,7 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
-/// Delegates coding tasks to the Codex CLI (`codex -q`).
+/// Delegates coding tasks to the Codex CLI.
 ///
 /// This creates a two-tier agent architecture: ZeroClaw orchestrates high-level
 /// tasks and delegates complex coding work to Codex, which has its own
@@ -39,7 +39,7 @@ impl Tool for CodexCliTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a coding task to Codex CLI (codex -q). Supports file editing and bash execution. Use for complex coding work that benefits from Codex's full agent loop."
+        "Delegate a coding task to Codex CLI (codex exec). Supports file editing and bash execution. Use for complex coding work that benefits from Codex's full agent loop."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -152,7 +152,7 @@ impl Tool for CodexCliTool {
             "codex"
         };
         let mut cmd = Command::new(codex_bin);
-        cmd.arg("-q").arg(prompt);
+        cmd.arg("exec").arg(prompt);
 
         // Environment: clear everything, pass only safe vars + configured passthrough.
         cmd.env_clear();
