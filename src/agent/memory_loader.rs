@@ -58,7 +58,7 @@ impl MemoryLoader for DefaultMemoryLoader {
             if memory::is_assistant_autosave_key(&entry.key) {
                 continue;
             }
-            if memory::should_skip_autosave_content(&entry.content) {
+            if memory::should_skip_recalled_memory_content(&entry.content) {
                 continue;
             }
             if let Some(score) = entry.score {

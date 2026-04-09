@@ -331,7 +331,7 @@ async fn build_context(
                 if memory::is_assistant_autosave_key(&entry.key) {
                     continue;
                 }
-                if memory::should_skip_autosave_content(&entry.content) {
+                if memory::should_skip_recalled_memory_content(&entry.content) {
                     continue;
                 }
                 if memory::is_exact_query_echo(&entry.content, user_msg) {

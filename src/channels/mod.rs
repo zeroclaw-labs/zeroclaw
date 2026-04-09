@@ -1360,7 +1360,7 @@ fn should_skip_memory_context_entry(key: &str, content: &str, user_msg: &str) ->
         return true;
     }
 
-    if memory::should_skip_autosave_content(content) {
+    if memory::should_skip_recalled_memory_content(content) {
         return true;
     }
 

@@ -122,6 +122,45 @@ pub fn should_skip_autosave_content(content: &str) -> bool {
         || lowered.contains("distilled_index_sig:")
 }
 
+/// Filter persisted memory entries that should not be re-injected into a prompt.
+///
+/// This is intentionally narrower than `should_skip_autosave_content`: autosave
+/// ingress should reject very short chatter, but recall should still allow short
+/// factual memories like "Age is 45" while excluding synthetic noise.
+pub fn should_skip_recalled_memory_content(content: &str) -> bool {
+    let normalized = content.trim();
+    if normalized.is_empty() {
+        return true;
+    }
+
+    if is_internal_context_leak_content(normalized) {
+        return true;
+    }
+
+    let lowered = normalized.to_ascii_lowercase();
+    if lowered.starts_with("[cron:")
+        || lowered.starts_with("[heartbeat task")
+        || lowered.starts_with("[distilled_")
+        || lowered.contains("distilled_index_sig:")
+    {
+        return true;
+    }
+
+    let compact = lowered.split_whitespace().collect::<Vec<_>>().join(" ");
+    matches!(
+        compact.as_str(),
+        "hi" | "hello"
+            | "hey"
+            | "ok"
+            | "okay"
+            | "thanks"
+            | "thank you"
+            | "cool"
+            | "nice"
+            | "got it"
+    )
+}
+
 pub fn is_exact_query_echo(content: &str, query: &str) -> bool {
     fn normalize(value: &str) -> String {
         value
@@ -476,6 +515,22 @@ mod tests {
             "[Heartbeat Task | high] Execute scheduled patrol"
         ));
         assert!(!should_skip_autosave_content(
+            "User prefers concise answers."
+        ));
+    }
+
+    #[test]
+    fn recalled_memory_filter_keeps_short_facts_but_drops_trivial_chat() {
+        assert!(should_skip_recalled_memory_content("hi"));
+        assert!(should_skip_recalled_memory_content("  thank   you "));
+        assert!(should_skip_recalled_memory_content(
+            "[Heartbeat Task | high] Execute scheduled patrol"
+        ));
+        assert!(should_skip_recalled_memory_content(
+            "[Memory context]\n- user_msg: hi"
+        ));
+        assert!(!should_skip_recalled_memory_content("Age is 45"));
+        assert!(!should_skip_recalled_memory_content(
             "User prefers concise answers."
         ));
     }
