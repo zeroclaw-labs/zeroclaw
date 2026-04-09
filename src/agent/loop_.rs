@@ -1215,10 +1215,7 @@ pub async fn run_tool_call_loop(
         .try_with(Clone::clone)
         .ok()
         .flatten();
-    let tool_choice_override = TOOL_LOOP_TOOL_CHOICE
-        .try_with(Clone::clone)
-        .ok()
-        .flatten();
+    let tool_choice_override = tool_choice_override();
     let mut progress_tracker = ProgressTracker::default();
     let mut active_model = model.to_string();
     let bypass_non_cli_approval_for_turn =
