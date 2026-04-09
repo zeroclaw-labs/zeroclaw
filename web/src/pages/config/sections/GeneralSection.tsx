@@ -22,6 +22,7 @@ const PROVIDER_OPTIONS = [
   { value: 'openrouter', label: 'OpenRouter' },
   { value: 'anthropic', label: 'Anthropic' },
   { value: 'openai', label: 'OpenAI' },
+  { value: 'copilot', label: 'GitHub Copilot' },
   { value: 'ollama', label: 'Ollama' },
   { value: 'gemini', label: 'Google Gemini' },
   { value: 'azure-openai', label: 'Azure OpenAI' },
@@ -81,6 +82,29 @@ const MODELS_BY_PROVIDER: Record<string, { value: string; label: string }[]> = {
     { value: 'gpt-4o', label: 'GPT-4o' },
     { value: 'gpt-4o-mini', label: 'GPT-4o Mini' },
     { value: 'o1-preview', label: 'o1 Preview' },
+  ],
+  copilot: [
+    { value: 'gpt-5.4', label: 'GPT-5.4' },
+    { value: 'gpt-5.4-mini', label: 'GPT-5.4 Mini (recommended)' },
+    { value: 'gpt-5.3', label: 'GPT-5.3' },
+    { value: 'gpt-5.3-codex', label: 'GPT-5.3 Codex' },
+    { value: 'gpt-5.2', label: 'GPT-5.2' },
+    { value: 'gpt-5.2-codex', label: 'GPT-5.2 Codex' },
+    { value: 'gpt-5.1', label: 'GPT-5.1' },
+    { value: 'gpt-5.1-codex', label: 'GPT-5.1 Codex' },
+    { value: 'gpt-5.1-codex-max', label: 'GPT-5.1 Codex Max' },
+    { value: 'gpt-5-mini', label: 'GPT-5 Mini' },
+    { value: 'gpt-4.1', label: 'GPT-4.1' },
+    { value: 'gpt-4o', label: 'GPT-4o' },
+    { value: 'claude-opus-4.6', label: 'Claude Opus 4.6' },
+    { value: 'claude-opus-4.5', label: 'Claude Opus 4.5' },
+    { value: 'claude-sonnet-4.5', label: 'Claude Sonnet 4.5' },
+    { value: 'claude-haiku-4.5', label: 'Claude Haiku 4.5' },
+    { value: 'gemini-3.1-pro', label: 'Gemini 3.1 Pro' },
+    { value: 'gemini-3-pro', label: 'Gemini 3 Pro' },
+    { value: 'gemini-3-flash', label: 'Gemini 3 Flash' },
+    { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro' },
+    { value: 'grok-code-fast-1', label: 'Grok Code Fast 1' },
   ],
   gemini: [
     { value: 'gemini-3.1-pro', label: 'Gemini 3.1 Pro' },
@@ -149,22 +173,37 @@ const MODELS_BY_PROVIDER: Record<string, { value: string; label: string }[]> = {
 };
 
 export default function GeneralSection({ config, onUpdate }: Props) {
-  const provider = (config.default_provider as string) ?? 'openrouter';
+  const rawProvider = (config.default_provider as string) ?? 'openrouter';
+
+  function normalizeProvider(p: string) {
+    if (!p) return p;
+    const lower = p.toLowerCase();
+    if (lower === 'github-copilot') return 'copilot';
+    return lower;
+  }
+
+  const provider = normalizeProvider(rawProvider);
   const modelOptions = MODELS_BY_PROVIDER[provider];
   const currentModel = (config.default_model as string) ?? '';
 
   // When provider changes, auto-select the first model for that provider
   const handleProviderChange = (v: string) => {
-    onUpdate('default_provider', v);
-    const models = MODELS_BY_PROVIDER[v];
+    const canonical = normalizeProvider(v);
+    onUpdate('default_provider', canonical);
+    const models = MODELS_BY_PROVIDER[canonical];
     if (models && models.length > 0) {
-      onUpdate('default_model', models[0]!.value);
+      // If switching to Copilot, prefer the recommended mini model as default
+      if (canonical === 'copilot') {
+        onUpdate('default_model', 'gpt-5.4-mini');
+      } else {
+        onUpdate('default_model', models[0]!.value);
+      }
     }
   };
 
   return (
     <SectionCard
-      icon={<Zap className="h-5 w-5" />}
+      icon={<Zap className='h-5 w-5' />}
       title={t('config.section.general')}
       defaultOpen
     >
@@ -187,15 +226,15 @@ export default function GeneralSection({ config, onUpdate }: Props) {
               ...modelOptions,
             ]}
           />
-        ) : (
-          <input
-            type="text"
-            value={currentModel}
-            onChange={(e) => onUpdate('default_model', e.target.value)}
-            placeholder="model name"
-            className="input-electric text-sm px-3 py-1.5 w-52 font-mono"
-          />
-        )}
+          ) : (
+            <input
+              type={'text'}
+              value={currentModel}
+              onChange={(e) => onUpdate('default_model', e.target.value)}
+              placeholder={'model name'}
+              className={'input-electric text-sm px-3 py-1.5 w-52 font-mono'}
+            />
+          )}
       </FieldRow>
       <FieldRow label={t('config.field.default_temperature')} description={t('config.field.default_temperature.desc')}>
         <Slider

@@ -197,6 +197,21 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             },
         },
         IntegrationEntry {
+            name: "GitHub Copilot",
+            description: "OAuth-backed provider with Copilot models",
+            category: IntegrationCategory::AiModel,
+            status_fn: |c| {
+                if c.default_provider
+                    .as_deref()
+                    .is_some_and(|provider| matches!(provider, "copilot" | "github-copilot"))
+                {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
             name: "Google",
             description: "Gemini 2.5 Pro/Flash",
             category: IntegrationCategory::AiModel,
@@ -949,6 +964,18 @@ mod tests {
         assert!(matches!(
             (email.status_fn)(&config),
             IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn github_copilot_entry_is_present_and_active_when_selected() {
+        let mut config = Config::default();
+        config.default_provider = Some("copilot".to_string());
+        let entries = all_integrations();
+        let copilot = entries.iter().find(|e| e.name == "GitHub Copilot").unwrap();
+        assert!(matches!(
+            (copilot.status_fn)(&config),
+            IntegrationStatus::Active
         ));
     }
 

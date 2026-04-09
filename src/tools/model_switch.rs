@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::get_model_switch_state;
-use crate::providers;
+use crate::providers::{self, copilot::COPILOT_MODEL_CHOICES};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
@@ -211,12 +211,18 @@ impl ModelSwitchTool {
         // Return common models for known providers
         let models = match provider.to_lowercase().as_str() {
             "openai" => vec![
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-4.1",
                 "gpt-4o",
                 "gpt-4o-mini",
                 "gpt-4-turbo",
                 "gpt-4",
                 "gpt-3.5-turbo",
             ],
+            "copilot" | "github-copilot" => {
+                COPILOT_MODEL_CHOICES.iter().map(|(id, _)| *id).collect()
+            }
             "anthropic" => vec![
                 "claude-sonnet-4-6",
                 "claude-sonnet-4-5",
@@ -242,7 +248,15 @@ impl ModelSwitchTool {
                 "mistral-small-latest",
                 "mistral-nemo",
             ],
-            "google" | "gemini" => vec!["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
+            "google" | "gemini" => vec![
+                "gemini-3.1-pro",
+                "gemini-3-pro",
+                "gemini-3-flash",
+                "gemini-2.5-pro",
+                "gemini-2.0-flash",
+                "gemini-1.5-pro",
+                "gemini-1.5-flash",
+            ],
             "xai" | "grok" => vec!["grok-2", "grok-2-vision", "grok-beta"],
             _ => vec![],
         };

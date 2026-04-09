@@ -15,9 +15,9 @@ use crate::memory::{
     default_memory_backend_key, memory_backend_profile, selectable_memory_backends,
 };
 use crate::providers::{
-    canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias,
-    is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_zai_alias,
-    is_zai_cn_alias,
+    canonical_china_provider_name, copilot::COPILOT_MODEL_CHOICES, is_glm_alias, is_glm_cn_alias,
+    is_minimax_alias, is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias,
+    is_zai_alias, is_zai_cn_alias,
 };
 use anyhow::{Context, Result, bail};
 use console::style;
@@ -771,10 +771,10 @@ async fn run_quick_setup_with_home(
             println!("    3. Status:   zeroclaw status");
         } else if provider_supports_device_flow(&provider_name) {
             if canonical_provider_name(&provider_name) == "copilot" {
-                println!("    1. Chat:              zeroclaw agent -m \"Hello!\"");
-                println!("       (device / OAuth auth will prompt on first run)");
-                println!("    2. Gateway:           zeroclaw gateway");
-                println!("    3. Status:            zeroclaw status");
+                println!("    1. Login:             zeroclaw models auth login-github-copilot");
+                println!("    2. Chat:              zeroclaw agent -m \"Hello!\"");
+                println!("    3. Gateway:           zeroclaw gateway");
+                println!("    4. Status:            zeroclaw status");
             } else {
                 println!(
                     "    1. Login:             zeroclaw auth login --provider {}",
@@ -858,6 +858,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "openai" => "gpt-5.2".into(),
         "openai-codex" => "gpt-5-codex".into(),
+        "copilot" => "gpt-5.4-mini".into(),
         "venice" => "zai-org-glm-5".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "mistral" => "mistral-large-latest".into(),
@@ -960,6 +961,10 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             ),
             ("o4-mini".to_string(), "o4-mini (fallback)".to_string()),
         ],
+        "copilot" => COPILOT_MODEL_CHOICES
+            .iter()
+            .map(|(id, label)| ((*id).to_string(), (*label).to_string()))
+            .collect(),
         "venice" => vec![
             (
                 "zai-org-glm-5".to_string(),
@@ -2359,6 +2364,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 "openai-codex",
                 "OpenAI Codex (ChatGPT subscription OAuth, no API key)",
             ),
+            (
+                "github-copilot",
+                "GitHub Copilot (GitHub OAuth subscription, no API key)",
+            ),
             ("deepseek", "DeepSeek — V3 & R1 (affordable)"),
             ("mistral", "Mistral — Large & Codestral"),
             ("xai", "xAI — Grok 3 & 4"),
@@ -3081,6 +3090,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "openrouter" => "OPENROUTER_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai-codex" | "openai" => "OPENAI_API_KEY",
+        "copilot" => "COPILOT_GITHUB_TOKEN",
         "ollama" => "OLLAMA_API_KEY",
         "llamacpp" => "LLAMACPP_API_KEY",
         "sglang" => "SGLANG_API_KEY",
@@ -7083,6 +7093,8 @@ mod tests {
         );
         assert_eq!(default_model_for_provider("openai"), "gpt-5.2");
         assert_eq!(default_model_for_provider("openai-codex"), "gpt-5-codex");
+        assert_eq!(default_model_for_provider("copilot"), "gpt-5.4-mini");
+        assert_eq!(default_model_for_provider("github-copilot"), "gpt-5.4-mini");
         assert_eq!(
             default_model_for_provider("anthropic"),
             "claude-sonnet-4-5-20250929"
@@ -7162,6 +7174,21 @@ mod tests {
 
         assert!(ids.contains(&"gpt-5.2".to_string()));
         assert!(ids.contains(&"gpt-5-mini".to_string()));
+    }
+
+    #[test]
+    fn curated_models_for_copilot_include_latest_choices() {
+        let ids: Vec<String> = curated_models_for_provider("github-copilot")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        let expected: Vec<String> = COPILOT_MODEL_CHOICES
+            .iter()
+            .map(|(id, _)| (*id).to_string())
+            .collect();
+
+        assert_eq!(ids, expected);
     }
 
     #[test]
@@ -7677,6 +7704,8 @@ mod tests {
         assert_eq!(provider_env_var("anthropic"), "ANTHROPIC_API_KEY");
         assert_eq!(provider_env_var("openai-codex"), "OPENAI_API_KEY");
         assert_eq!(provider_env_var("openai"), "OPENAI_API_KEY");
+        assert_eq!(provider_env_var("copilot"), "COPILOT_GITHUB_TOKEN");
+        assert_eq!(provider_env_var("github-copilot"), "COPILOT_GITHUB_TOKEN");
         assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
         assert_eq!(provider_env_var("llamacpp"), "LLAMACPP_API_KEY");
         assert_eq!(provider_env_var("llama.cpp"), "LLAMACPP_API_KEY");
