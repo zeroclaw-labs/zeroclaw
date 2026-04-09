@@ -55,6 +55,28 @@ pub(crate) fn truncate_tool_result(output: &str, max_chars: usize) -> String {
     )
 }
 
+/// Truncate a tool message's content, preserving JSON structure when the
+/// message stores `tool_call_id` alongside `content` (native tool-call
+/// format). Without this, `truncate_tool_result` destroys the JSON envelope
+/// and downstream providers receive a `null` `call_id` (#5425).
+pub(crate) fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
+    if max_chars == 0 || msg_content.len() <= max_chars {
+        return msg_content.to_string();
+    }
+    if let Ok(mut obj) =
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(msg_content)
+    {
+        if obj.contains_key("tool_call_id") {
+            if let Some(serde_json::Value::String(inner)) = obj.get("content") {
+                let truncated = truncate_tool_result(inner, max_chars);
+                obj.insert("content".to_string(), serde_json::Value::String(truncated));
+                return serde_json::to_string(&obj).unwrap_or_else(|_| msg_content.to_string());
+            }
+        }
+    }
+    truncate_tool_result(msg_content, max_chars)
+}
+
 /// Aggressively trim old tool result messages in history to recover from
 /// context overflow. Keeps the last `protect_last_n` messages untouched.
 /// Returns total characters saved.
@@ -68,7 +90,7 @@ pub(crate) fn fast_trim_tool_results(
     for msg in &mut history[..cutoff] {
         if msg.role == "tool" && msg.content.len() > trim_to {
             let original_len = msg.content.len();
-            msg.content = truncate_tool_result(&msg.content, trim_to);
+            msg.content = truncate_tool_message(&msg.content, trim_to);
             saved += original_len - msg.content.len();
         }
     }
