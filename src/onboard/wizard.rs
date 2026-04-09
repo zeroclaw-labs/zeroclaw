@@ -5098,6 +5098,7 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                 };
 
                 config.mattermost = Some(MattermostConfig {
+                    enabled: true,
                     url: url.trim().to_string(),
                     bot_token,
                     channel_id,

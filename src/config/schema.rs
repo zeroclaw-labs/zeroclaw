@@ -9514,7 +9514,6 @@ impl Config {
             // Decrypt all #[secret]-annotated fields via Configurable derive
             config.decrypt_secrets(&store)?;
 
-
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(

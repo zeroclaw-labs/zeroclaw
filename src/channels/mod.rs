@@ -4885,7 +4885,7 @@ fn collect_configured_channels(
                     .with_credentials(mm.bot_id.clone(), mm.bot_password.clone())
                     .with_transcription(config.transcription.clone()),
                 ),
-            });      
+            });
         } else {
             tracing::info!("Mattermost channel configured but disabled (enabled = false)");
         }
