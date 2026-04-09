@@ -33,7 +33,7 @@ pub struct LineChannel {
     webhook_port: u16,
     /// Latest replyToken per recipient (userId or groupId).
     /// Populated by `listen()`, consumed once by `send()`.
-    reply_tokens: Arc<RwLock<HashMap<String, String>>>,
+    pending_tokens: Arc<RwLock<HashMap<String, String>>>,
     client: reqwest::Client,
 }
 
@@ -58,7 +58,7 @@ impl LineChannel {
             channel_secret,
             allowed_users,
             webhook_port,
-            reply_tokens: Arc::new(RwLock::new(HashMap::new())),
+            pending_tokens: Arc::new(RwLock::new(HashMap::new())),
             client: crate::config::build_channel_proxy_client("channel.line", None),
         }
     }
@@ -288,7 +288,7 @@ impl Channel for LineChannel {
     /// If no token is available (already consumed or expired), fall back to
     /// the Push API.
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let reply_token = self.reply_tokens.write().remove(&message.recipient);
+        let reply_token = self.pending_tokens.write().remove(&message.recipient);
 
         if let Some(token) = reply_token {
             match self.send_reply(&token, &message.content).await {
@@ -332,7 +332,7 @@ impl Channel for LineChannel {
             channel_secret: String,
             bot_user_id: String,
             allowed_users: Vec<String>,
-            reply_tokens: Arc<RwLock<HashMap<String, String>>>,
+            pending_tokens: Arc<RwLock<HashMap<String, String>>>,
         }
 
         let state = Arc::new(LineState {
@@ -340,7 +340,7 @@ impl Channel for LineChannel {
             channel_secret: self.channel_secret.clone(),
             bot_user_id: bot_info.user_id,
             allowed_users: self.allowed_users.clone(),
-            reply_tokens: Arc::clone(&self.reply_tokens),
+            pending_tokens: Arc::clone(&self.pending_tokens),
         });
 
         async fn handle_webhook(
@@ -482,7 +482,7 @@ impl Channel for LineChannel {
                 if let Some(token) = event.get("replyToken").and_then(|t| t.as_str()) {
                     if !token.is_empty() {
                         state
-                            .reply_tokens
+                            .pending_tokens
                             .write()
                             .insert(recipient.clone(), token.to_string());
                     }
