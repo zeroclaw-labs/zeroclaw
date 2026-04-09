@@ -2212,8 +2212,8 @@ pub struct GatewayConfig {
     #[serde(default = "default_true")]
     pub session_persistence: bool,
 
-    /// Auto-archive stale gateway sessions older than N hours. 0 = disabled. Default: 0.
-    #[serde(default)]
+    /// Auto-archive stale gateway sessions older than N hours. 0 = disabled. Default: 168 (7 days).
+    #[serde(default = "default_session_ttl_hours")]
     pub session_ttl_hours: u32,
 
     /// Pairing dashboard configuration
@@ -2245,6 +2245,10 @@ fn default_webhook_rate_limit() -> u32 {
 
 fn default_idempotency_ttl_secs() -> u64 {
     300
+}
+
+fn default_session_ttl_hours() -> u32 {
+    168 // 7 days
 }
 
 fn default_gateway_rate_limit_max_keys() -> usize {
@@ -2279,7 +2283,7 @@ impl Default for GatewayConfig {
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             session_persistence: true,
-            session_ttl_hours: 0,
+            session_ttl_hours: default_session_ttl_hours(),
             pairing_dashboard: PairingDashboardConfig::default(),
             tls: None,
         }
@@ -6491,8 +6495,8 @@ pub struct ChannelsConfig {
     /// SQLite provides FTS5 search, metadata tracking, and TTL cleanup.
     #[serde(default = "default_session_backend")]
     pub session_backend: String,
-    /// Auto-archive stale sessions older than this many hours. `0` disables. Default: `0`.
-    #[serde(default)]
+    /// Auto-archive stale sessions older than this many hours. `0` disables. Default: `168` (7 days).
+    #[serde(default = "default_session_ttl_hours")]
     pub session_ttl_hours: u32,
     /// Inbound message debounce window in milliseconds. When a sender fires
     /// multiple messages within this window, they are accumulated and dispatched
@@ -6698,7 +6702,7 @@ impl Default for ChannelsConfig {
             show_tool_calls: false,
             session_persistence: true,
             session_backend: default_session_backend(),
-            session_ttl_hours: 0,
+            session_ttl_hours: default_session_ttl_hours(),
             debounce_ms: 0,
         }
     }
