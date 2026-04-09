@@ -585,12 +585,19 @@ impl Agent {
     }
 
     /// Trims history for `ConversationMessage` (which wraps `ChatMessage` in an
-    /// enum). After the bulk drop, skips leading orphan [`ToolResults`] when
-    /// the cut splits an `AssistantToolCalls` / `ToolResults` pair, then aligns
-    /// the first retained message to a user [`Chat`] turn (same intent as
+    /// enum). After the bulk drop, skips leading orphan `ToolResults` when the
+    /// cut splits an `AssistantToolCalls` / `ToolResults` pair, then aligns the
+    /// first retained message to a user `Chat` turn (same intent as
     /// [`crate::agent::history::align_to_user_boundary`] on `ChatMessage`
     /// history). The shared helper is typed for `ChatMessage` only, so this
     /// stays on `ConversationMessage` without a type-level refactor.
+    ///
+    /// Note: a retained prefix whose first entry is a user `Chat` cannot start
+    /// with orphan `ToolResults` (different variant). The second loop alone
+    /// would also advance past leading `ToolResults`, since they are not
+    /// `ConversationMessage::Chat` with `role == "user"`. We still run the
+    /// explicit `ToolResults` scan first so the Anthropic failure mode stays
+    /// obvious in the source.
     fn trim_history(&mut self) {
         let max = self.config.max_history_messages;
         if self.history.len() <= max {
@@ -619,6 +626,11 @@ impl Agent {
             // has no matching tool_use, causing providers (e.g. Anthropic) to
             // reject the request with "messages.0.content.0: unexpected
             // tool_use_id found in tool_result blocks".
+            //
+            // (Once the first retained message is a user `Chat`, it cannot be
+            // this orphan; the user-alignment loop below would also skip past
+            // leading `ToolResults` for the same reason. This block stays as a
+            // direct, minimal guard and for clarity next to the provider error.)
             while drop_count < other_messages.len()
                 && matches!(
                     &other_messages[drop_count],
