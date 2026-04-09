@@ -150,8 +150,6 @@ spec:
                   name: zeroclaw-config-secrets
                   key: VIKUNJA_API_TOKEN
                   optional: true
-            - name: ZEROCLAW_TOOL_CHOICE
-              value: "required"
             - name: VIKUNJA_BASE_URL
               value: "http://vikunja.todolist.svc.cluster.local:3456"
             - name: ACP_AUTH_TOKEN
