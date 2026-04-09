@@ -358,6 +358,40 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(true)
     }
 
+    fn clear_session_messages(&self, session_key: &str) -> std::io::Result<bool> {
+        let conn = self.conn.lock();
+
+        // Check if session exists
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if !exists {
+            return Ok(false);
+        }
+
+        // Delete messages (FTS5 trigger handles sessions_fts cleanup)
+        conn.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+
+        // Update metadata to reset message count
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE session_metadata SET message_count = 0, last_activity = ?1 WHERE session_key = ?2",
+            params![now, session_key],
+        )
+        .map_err(std::io::Error::other)?;
+
+        Ok(true)
+    }
+
     fn set_session_name(&self, session_key: &str, name: &str) -> std::io::Result<()> {
         let conn = self.conn.lock();
         let name_val = if name.is_empty() { None } else { Some(name) };

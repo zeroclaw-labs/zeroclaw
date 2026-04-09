@@ -1342,6 +1342,40 @@ pub async fn handle_api_session_messages(
     .into_response()
 }
 
+/// DELETE /api/sessions/{id}/messages — clear persisted gateway WebSocket chat transcript
+pub async fn handle_api_session_messages_clear(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session persistence is disabled"})),
+        )
+            .into_response();
+    };
+
+    let session_key = format!("gw_{id}");
+    match backend.clear_session_messages(&session_key) {
+        Ok(true) => Json(serde_json::json!({"cleared": true, "session_id": id})).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to clear session messages: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 /// DELETE /api/sessions/{id} — delete a gateway session
 pub async fn handle_api_session_delete(
     State(state): State<AppState>,
