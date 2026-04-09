@@ -890,18 +890,37 @@ impl GeminiProvider {
             anyhow::bail!("loadCodeAssist failed (HTTP {status}): {body}");
         }
 
-        #[derive(Deserialize)]
-        struct LoadCodeAssistResponse {
-            #[serde(rename = "cloudaicompanionProject")]
-            cloudaicompanion_project: Option<String>,
-        }
+        let body = response.text().await?;
+        tracing::trace!("loadCodeAssist raw response: {body}");
 
-        let result: LoadCodeAssistResponse = response.json().await?;
-        let project = result
-            .cloudaicompanion_project
-            .filter(|p| !p.trim().is_empty())
+        let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+            anyhow::anyhow!("loadCodeAssist response parse error: {e}; body={body}")
+        })?;
+
+        // Extract project string from a JSON value that may be a plain string
+        // or an object with a "projectId" key (API format changed ~Apr 2026).
+        let extract_project = |v: &serde_json::Value| -> Option<String> {
+            if let Some(s) = v.as_str() {
+                return Self::normalize_non_empty(s);
+            }
+            if let Some(s) = v.get("projectId").and_then(|p| p.as_str()) {
+                return Self::normalize_non_empty(s);
+            }
+            None
+        };
+
+        // Try both field names; Google renamed the field in Apr 2026.
+        let project = json
+            .get("currentCloudaicompanionProject")
+            .and_then(extract_project)
+            .or_else(|| {
+                json.get("cloudaicompanionProject")
+                    .and_then(extract_project)
+            })
             .or(project_seed)
-            .ok_or_else(|| anyhow::anyhow!("loadCodeAssist response missing project context"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("loadCodeAssist response missing project context; body={body}")
+            })?;
 
         // Cache for future calls
         {
@@ -2271,5 +2290,79 @@ mod tests {
         // System messages should use Part::text
         let system_part = Part::text("You are helpful");
         assert!(matches!(system_part, Part::Text { .. }));
+    }
+
+    // ── loadCodeAssist project extraction ────────────────────────────────
+
+    /// Helper: simulate extract_project logic for unit testing.
+    fn extract_project_from_value(v: &serde_json::Value) -> Option<String> {
+        if let Some(s) = v.as_str() {
+            return GeminiProvider::normalize_non_empty(s);
+        }
+        if let Some(s) = v.get("projectId").and_then(|p| p.as_str()) {
+            return GeminiProvider::normalize_non_empty(s);
+        }
+        None
+    }
+
+    #[test]
+    fn load_code_assist_extracts_project_from_string_field() {
+        let body = serde_json::json!({
+            "cloudaicompanionProject": "my-project-123"
+        });
+        let project = body
+            .get("currentCloudaicompanionProject")
+            .and_then(extract_project_from_value)
+            .or_else(|| {
+                body.get("cloudaicompanionProject")
+                    .and_then(extract_project_from_value)
+            });
+        assert_eq!(project, Some("my-project-123".to_string()));
+    }
+
+    #[test]
+    fn load_code_assist_extracts_project_from_object_field() {
+        // New format: cloudaicompanionProject is an object with projectId
+        let body = serde_json::json!({
+            "cloudaicompanionProject": { "projectId": "my-project-456" }
+        });
+        let project = body
+            .get("currentCloudaicompanionProject")
+            .and_then(extract_project_from_value)
+            .or_else(|| {
+                body.get("cloudaicompanionProject")
+                    .and_then(extract_project_from_value)
+            });
+        assert_eq!(project, Some("my-project-456".to_string()));
+    }
+
+    #[test]
+    fn load_code_assist_prefers_current_field_over_legacy_field() {
+        // Apr 2026 format: currentCloudaicompanionProject takes priority
+        let body = serde_json::json!({
+            "cloudaicompanionProject": "old-project",
+            "currentCloudaicompanionProject": "new-project"
+        });
+        let project = body
+            .get("currentCloudaicompanionProject")
+            .and_then(extract_project_from_value)
+            .or_else(|| {
+                body.get("cloudaicompanionProject")
+                    .and_then(extract_project_from_value)
+            });
+        assert_eq!(project, Some("new-project".to_string()));
+    }
+
+    #[test]
+    fn load_code_assist_returns_none_when_no_project_fields_present() {
+        let body = serde_json::json!({ "someOtherField": "value" });
+        let project = body
+            .get("currentCloudaicompanionProject")
+            .and_then(extract_project_from_value)
+            .or_else(|| {
+                body.get("cloudaicompanionProject")
+                    .and_then(extract_project_from_value)
+            });
+        assert_eq!(project, None);
     }
 }
