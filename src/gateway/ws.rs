@@ -421,6 +421,43 @@ async fn process_chat_message(
         let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
     }
 
+    // ── Multimodal image processing ─────────────────────────────────
+    // Process [IMAGE:] markers in the message content, similar to webhook.
+    let multimodal_config = state.config.lock().multimodal.clone();
+    let temp_messages = vec![crate::providers::ChatMessage::user(content.to_string())];
+    let processed_content =
+        match crate::multimodal::prepare_messages_for_provider(&temp_messages, &multimodal_config)
+            .await
+        {
+            Ok(prepared) => {
+                if prepared.contains_images {
+                    // Extract the processed user message content with data URIs
+                    prepared
+                        .messages
+                        .into_iter()
+                        .next()
+                        .map(|m| m.content)
+                        .unwrap_or_else(|| content.to_string())
+                } else {
+                    content.to_string()
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Multimodal image processing failed");
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": format!("Image processing failed: {}", e),
+                    "code": "MULTIMODAL_ERROR",
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                // Set session state to error
+                if let Some(ref backend) = state.session_backend {
+                    let _ = backend.set_session_state(session_key, "error", Some(&turn_id));
+                }
+                return;
+            }
+        };
+
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
 
@@ -429,8 +466,7 @@ async fn process_chat_message(
     // `agent` into a spawned task (it is `&mut`), so we use a join
     // instead — `turn_streamed` writes to the channel and we drain it
     // from the other branch.
-    let content_owned = content.to_string();
-    let turn_fut = async { agent.turn_streamed(&content_owned, event_tx).await };
+    let turn_fut = async { agent.turn_streamed(&processed_content, event_tx).await };
 
     // Drive both futures concurrently: the agent turn produces events
     // and we relay them over WebSocket.
@@ -470,7 +506,7 @@ async fn process_chat_message(
                 let mem = state.mem.clone();
                 let provider = state.provider.clone();
                 let model = state.model.clone();
-                let user_msg = content.to_string();
+                let user_msg = processed_content.clone();
                 let assistant_resp = response.clone();
                 tokio::spawn(async move {
                     if let Err(e) = crate::memory::consolidation::consolidate_turn(
