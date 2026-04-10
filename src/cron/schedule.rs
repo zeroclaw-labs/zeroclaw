@@ -20,9 +20,13 @@ pub fn next_run_for_schedule(schedule: &Schedule, from: DateTime<Utc>) -> Result
                 })?;
                 Ok(next_local.with_timezone(&Utc))
             } else {
-                cron.after(&from)
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("No future occurrence for expression: {expr}"))
+                // Default to OS local timezone so schedules match user
+                // expectations instead of always using UTC (#5220).
+                let local_from = from.with_timezone(&chrono::Local);
+                let next_local = cron.after(&local_from).next().ok_or_else(|| {
+                    anyhow::anyhow!("No future occurrence for expression: {expr}")
+                })?;
+                Ok(next_local.with_timezone(&Utc))
             }
         }
         Schedule::At { at } => Ok(*at),
@@ -165,7 +169,7 @@ fn normalize_weekday_field(field: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Datelike, TimeZone};
+    use chrono::{Datelike, Offset, TimeZone};
 
     #[test]
     fn next_run_for_schedule_supports_every_and_at() {
@@ -258,7 +262,7 @@ mod tests {
         let sunday = Utc.with_ymd_and_hms(2026, 2, 15, 0, 0, 0).unwrap();
         let schedule = Schedule::Cron {
             expr: "0 9 * * 1-5".into(),
-            tz: None,
+            tz: Some("UTC".into()),
         };
         let next = next_run_for_schedule(&schedule, sunday).unwrap();
         // Should be Monday 2026-02-16 at 09:00 UTC (weekday = Mon)
@@ -272,7 +276,7 @@ mod tests {
         let friday_evening = Utc.with_ymd_and_hms(2026, 2, 20, 18, 0, 0).unwrap();
         let schedule = Schedule::Cron {
             expr: "0 9 * * 1-5".into(),
-            tz: None,
+            tz: Some("UTC".into()),
         };
         let next = next_run_for_schedule(&schedule, friday_evening).unwrap();
         // Should be Monday 2026-02-23 at 09:00 UTC
@@ -286,7 +290,7 @@ mod tests {
         let monday = Utc.with_ymd_and_hms(2026, 2, 16, 0, 0, 0).unwrap();
         let schedule = Schedule::Cron {
             expr: "0 10 * * 0".into(),
-            tz: None,
+            tz: Some("UTC".into()),
         };
         let next = next_run_for_schedule(&schedule, monday).unwrap();
         assert_eq!(next.weekday(), chrono::Weekday::Sun);
@@ -298,9 +302,32 @@ mod tests {
         let monday = Utc.with_ymd_and_hms(2026, 2, 16, 0, 0, 0).unwrap();
         let schedule = Schedule::Cron {
             expr: "0 10 * * 7".into(),
-            tz: None,
+            tz: Some("UTC".into()),
         };
         let next = next_run_for_schedule(&schedule, monday).unwrap();
         assert_eq!(next.weekday(), chrono::Weekday::Sun);
+    }
+
+    #[test]
+    fn no_tz_defaults_to_local_timezone() {
+        let from = Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap();
+        let schedule_no_tz = Schedule::Cron {
+            expr: "0 9 * * *".into(),
+            tz: None,
+        };
+        let schedule_utc = Schedule::Cron {
+            expr: "0 9 * * *".into(),
+            tz: Some("UTC".into()),
+        };
+        let next_local = next_run_for_schedule(&schedule_no_tz, from).unwrap();
+        let next_utc = next_run_for_schedule(&schedule_utc, from).unwrap();
+        assert!(next_local > from);
+        assert!(next_utc > from);
+        let local_offset = chrono::Local::now().offset().fix().local_minus_utc();
+        if local_offset == 0 {
+            assert_eq!(next_local, next_utc);
+        } else {
+            assert_ne!(next_local, next_utc);
+        }
     }
 }

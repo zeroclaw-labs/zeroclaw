@@ -455,6 +455,75 @@ impl Channel for YourChannel {
 }
 ```
 
+## How to Mark Config Fields as Secrets
+
+ZeroClaw uses a `#[derive(Configurable)]` proc macro to automatically handle secret
+field discovery, encryption, decryption, and CLI management. When adding a new
+channel, provider, or integration with sensitive fields (API keys, tokens, passwords):
+
+1. Add `Configurable` and `Default` to the derive list, `#[prefix]` on the struct,
+   and an `enabled` field:
+
+```rust
+use zeroclaw_macros::Configurable;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[prefix = "channels.your-channel"]
+pub struct YourChannelConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    #[secret]
+    pub bot_token: String,
+    #[secret]
+    pub webhook_secret: Option<String>,
+    // Non-secret fields — no annotation needed
+    pub room_id: String,
+}
+```
+
+2. If your struct is nested inside a parent (e.g., `ChannelsConfig`), add `#[nested]`
+   on the parent's field so the tree traversal finds it:
+
+```rust
+pub struct ChannelsConfig {
+    #[nested]
+    pub your_channel: Option<YourChannelConfig>,
+}
+```
+
+That's it. The `#[secret]` annotation automatically:
+- Includes the field in `zeroclaw props list --secrets`
+- Makes it settable via `zeroclaw props set channels.your-channel.bot-token`
+- Encrypts it on config save and decrypts on load
+- Converts the field name from `snake_case` to `kebab-case` in the CLI
+
+Field names are derived automatically: `bot_token` on a struct with
+`#[prefix = "channels.your-channel"]` becomes `channels.your-channel.bot-token`.
+
+### Adding enum fields
+
+If your config struct has an enum field (e.g. `stream_mode: StreamMode`), the enum
+type must implement `HasPropKind`. Add it to the `impl_enum_prop_kind!` block in
+`src/config/schema.rs`:
+
+```rust
+impl_enum_prop_kind!(
+    // ... existing enums ...
+    YourNewEnum,
+);
+```
+
+If the enum is defined outside `schema.rs`, add the impl at the enum's definition site:
+
+```rust
+impl crate::config::HasPropKind for YourNewEnum {
+    const PROP_KIND: crate::config::PropKind = crate::config::PropKind::Enum;
+}
+```
+
+The compiler will error if this is missing — the error names the trait and the type.
+
 ## How to Add a New Observer
 
 Create `src/observability/your_observer.rs`:

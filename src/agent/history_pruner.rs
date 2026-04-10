@@ -1,6 +1,7 @@
 use crate::providers::traits::ChatMessage;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use zeroclaw_macros::Configurable;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -18,7 +19,8 @@ fn default_collapse() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[prefix = "agent.history-pruning"]
 pub struct HistoryPrunerConfig {
     /// Enable history pruning. Default: false.
     #[serde(default)]
@@ -62,7 +64,16 @@ pub struct PruneStats {
 // ---------------------------------------------------------------------------
 
 fn estimate_tokens(messages: &[ChatMessage]) -> usize {
-    messages.iter().map(|m| m.content.len() / 4).sum()
+    let raw: usize = messages
+        .iter()
+        .map(|m| m.content.len().div_ceil(4) + 4)
+        .sum();
+    // Apply 1.2x safety margin consistent with context_compressor to avoid
+    // underestimation that leads to context_length_exceeded errors.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        (raw as f64 * 1.2) as usize
+    }
 }
 
 // ---------------------------------------------------------------------------
