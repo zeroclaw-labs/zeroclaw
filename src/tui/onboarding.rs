@@ -567,6 +567,22 @@ impl App {
     }
 }
 
+fn provider_supports_keyless_local_usage(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        "ollama" | "llamacpp" | "sglang" | "vllm" | "osaurus"
+    )
+}
+
+fn provider_uses_oauth_without_api_key(provider_id: &str) -> bool {
+    matches!(provider_id, "openai-codex")
+}
+
+fn provider_skips_api_key_input(provider_id: &str) -> bool {
+    provider_supports_keyless_local_usage(provider_id)
+        || provider_uses_oauth_without_api_key(provider_id)
+}
+
 // ── Public entry point ──────────────────────────────────────────────
 
 pub async fn run_tui_onboarding() -> Result<()> {
@@ -723,6 +739,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "Telegram" => {
             if config.channels_config.telegram.is_none() {
                 config.channels_config.telegram = Some(TelegramConfig {
+                    enabled: true,
                     bot_token: String::from("YOUR_TELEGRAM_BOT_TOKEN"),
                     allowed_users: vec![],
                     stream_mode: StreamMode::default(),
@@ -737,6 +754,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "Discord" => {
             if config.channels_config.discord.is_none() {
                 config.channels_config.discord = Some(DiscordConfig {
+                    enabled: true,
                     bot_token: String::from("YOUR_DISCORD_BOT_TOKEN"),
                     guild_id: None,
                     allowed_users: vec![],
@@ -754,6 +772,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "Slack" => {
             if config.channels_config.slack.is_none() {
                 config.channels_config.slack = Some(SlackConfig {
+                    enabled: true,
                     bot_token: String::from("xoxb-YOUR_SLACK_BOT_TOKEN"),
                     app_token: Some(String::from("xapp-YOUR_SLACK_APP_TOKEN")),
                     channel_id: None,
@@ -773,6 +792,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "WhatsApp" => {
             if config.channels_config.whatsapp.is_none() {
                 config.channels_config.whatsapp = Some(WhatsAppConfig {
+                    enabled: true,
                     access_token: Some(String::from("YOUR_WHATSAPP_ACCESS_TOKEN")),
                     phone_number_id: Some(String::from("YOUR_PHONE_NUMBER_ID")),
                     verify_token: Some(String::from("YOUR_VERIFY_TOKEN")),
@@ -795,6 +815,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "Signal" => {
             if config.channels_config.signal.is_none() {
                 config.channels_config.signal = Some(SignalConfig {
+                    enabled: true,
                     http_url: String::from("http://127.0.0.1:8080"),
                     account: String::from("YOUR_SIGNAL_PHONE_NUMBER"),
                     group_id: None,
@@ -808,6 +829,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "IRC" => {
             if config.channels_config.irc.is_none() {
                 config.channels_config.irc = Some(IrcConfig {
+                    enabled: true,
                     server: String::from("irc.libera.chat"),
                     port: 6697,
                     nickname: String::from("zeroclaw-bot"),
@@ -824,6 +846,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "iMessage" => {
             if config.channels_config.imessage.is_none() {
                 config.channels_config.imessage = Some(IMessageConfig {
+                    enabled: true,
                     allowed_contacts: vec![],
                 });
             }
@@ -831,6 +854,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "Matrix" => {
             if config.channels_config.matrix.is_none() {
                 config.channels_config.matrix = Some(MatrixConfig {
+                    enabled: true,
                     homeserver: String::from("https://matrix.org"),
                     access_token: String::from("YOUR_MATRIX_ACCESS_TOKEN"),
                     user_id: None,
@@ -849,6 +873,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "Mattermost" => {
             if config.channels_config.mattermost.is_none() {
                 config.channels_config.mattermost = Some(MattermostConfig {
+                    enabled: true,
                     url: String::from("https://mattermost.example.com"),
                     bot_token: String::from("YOUR_MATTERMOST_BOT_TOKEN"),
                     channel_id: None,
@@ -863,6 +888,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "Nextcloud Talk" => {
             if config.channels_config.nextcloud_talk.is_none() {
                 config.channels_config.nextcloud_talk = Some(NextcloudTalkConfig {
+                    enabled: true,
                     base_url: String::from("https://cloud.example.com"),
                     app_token: String::from("YOUR_NEXTCLOUD_APP_TOKEN"),
                     webhook_secret: None,
@@ -875,6 +901,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "Feishu/Lark" => {
             if config.channels_config.feishu.is_none() {
                 config.channels_config.feishu = Some(FeishuConfig {
+                    enabled: true,
                     app_id: String::from("YOUR_FEISHU_APP_ID"),
                     app_secret: String::from("YOUR_FEISHU_APP_SECRET"),
                     encrypt_key: None,
@@ -887,6 +914,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
             }
             if config.channels_config.lark.is_none() {
                 config.channels_config.lark = Some(LarkConfig {
+                    enabled: true,
                     app_id: String::from("YOUR_LARK_APP_ID"),
                     app_secret: String::from("YOUR_LARK_APP_SECRET"),
                     encrypt_key: None,
@@ -1154,7 +1182,14 @@ fn handle_input(app: &mut App, key: KeyCode) {
                 nav_down(&mut app.provider_idx, max);
                 scroll_into_view(&mut app.provider_scroll, app.provider_idx, 16);
             }
-            KeyCode::Enter => app.screen = Screen::ApiKeyInput,
+            KeyCode::Enter => {
+                if provider_skips_api_key_input(app.selected_provider_id()) {
+                    app.api_key_input.clear();
+                    app.screen = Screen::ProviderNotes;
+                } else {
+                    app.screen = Screen::ApiKeyInput;
+                }
+            }
             KeyCode::Esc => app.screen = Screen::ProviderTier,
             _ => {}
         },
@@ -1164,7 +1199,7 @@ fn handle_input(app: &mut App, key: KeyCode) {
             KeyCode::Backspace => {
                 app.api_key_input.pop();
             }
-            KeyCode::Enter if !app.api_key_input.is_empty() => {
+            KeyCode::Enter => {
                 app.screen = Screen::ProviderNotes;
             }
             KeyCode::Esc => {
@@ -1990,9 +2025,30 @@ fn render_api_key(frame: &mut Frame, area: Rect, app: &App) {
         },
         layout[1],
     );
+    let provider_id = app.selected_provider_id();
+    let prompt = if provider_uses_oauth_without_api_key(provider_id) {
+        format!(
+            "{} uses OAuth (no API key). Press Enter to continue.",
+            app.selected_provider()
+        )
+    } else if provider_supports_keyless_local_usage(provider_id) {
+        format!(
+            "{} is local-first (no API key required). Press Enter to continue.",
+            app.selected_provider()
+        )
+    } else if provider_id == "bedrock" {
+        "Bedrock uses AWS credentials (AK/SK), not a single API key. Press Enter to continue."
+            .to_string()
+    } else {
+        format!(
+            "Enter {} API key (or press Enter to skip)",
+            app.selected_provider()
+        )
+    };
+
     frame.render_widget(
         InputPrompt {
-            label: &format!("Enter {} API key", app.selected_provider()),
+            label: &prompt,
             input: &app.api_key_input,
             masked: true,
         },
@@ -2020,10 +2076,23 @@ fn render_provider_notes(frame: &mut Frame, area: Rect, app: &App) {
         },
         layout[1],
     );
+    let provider_id = app.selected_provider_id();
+    let api_key_status = if !app.api_key_input.is_empty() {
+        "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022} (set)".to_string()
+    } else if provider_uses_oauth_without_api_key(provider_id) {
+        "OAuth login required (no API key)".to_string()
+    } else if provider_supports_keyless_local_usage(provider_id) {
+        "not required (local provider)".to_string()
+    } else if provider_id == "bedrock" {
+        "use AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY".to_string()
+    } else {
+        "not set (optional for now)".to_string()
+    };
+
     frame.render_widget(
         ConfirmedLine {
             label: "API key",
-            value: "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022} (set)",
+            value: &api_key_status,
         },
         layout[2],
     );
@@ -3385,6 +3454,7 @@ mod tests {
         let mut config = Config::default();
         // Pre-set a Telegram config with a real token
         config.channels_config.telegram = Some(TelegramConfig {
+            enabled: true,
             bot_token: "REAL_TOKEN_123".to_string(),
             allowed_users: vec!["alice".to_string()],
             stream_mode: StreamMode::default(),
@@ -3666,6 +3736,38 @@ mod tests {
         );
         assert!(config.hooks.enabled);
         assert_eq!(config.gateway.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn provider_select_skips_api_key_for_openai_codex() {
+        let mut app = test_app();
+        app.screen = Screen::ProviderSelect;
+        app.provider_tier_idx = 0;
+        app.provider_idx = 4; // OpenAI Codex
+
+        handle_input(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::ProviderNotes);
+    }
+
+    #[test]
+    fn provider_select_skips_api_key_for_ollama_local() {
+        let mut app = test_app();
+        app.screen = Screen::ProviderSelect;
+        app.provider_tier_idx = 4;
+        app.provider_idx = 0; // Ollama
+
+        handle_input(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::ProviderNotes);
+    }
+
+    #[test]
+    fn api_key_screen_allows_empty_enter_to_continue() {
+        let mut app = test_app();
+        app.screen = Screen::ApiKeyInput;
+        app.api_key_input.clear();
+
+        handle_input(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::ProviderNotes);
     }
 
     // ── TOML round-trip: verify serialization ───────────────────────

@@ -3861,6 +3861,13 @@ pub async fn run(
         }
     });
 
+    // ── Cost tracking context (scoped for CLI / cron / web agents) ──
+    let cost_tracking_context: Option<ToolLoopCostTrackingContext> =
+        crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.workspace_dir)
+            .map(|tracker| {
+                ToolLoopCostTrackingContext::new(tracker, Arc::new(config.cost.prices.clone()))
+            });
+
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
 
@@ -3955,33 +3962,37 @@ pub async fn run(
         #[allow(unused_assignments)]
         let mut response = String::new();
         loop {
-            match run_tool_call_loop(
-                provider.as_ref(),
-                &mut history,
-                &tools_registry,
-                observer.as_ref(),
-                &provider_name,
-                &model_name,
-                effective_temperature,
-                false,
-                approval_manager.as_ref(),
-                channel_name,
-                None,
-                &config.multimodal,
-                config.agent.max_tool_iterations,
-                None,
-                None,
-                None,
-                &excluded_tools,
-                &config.agent.tool_call_dedup_exempt,
-                activated_handle.as_ref(),
-                Some(model_switch_callback.clone()),
-                &config.pacing,
-                config.agent.max_tool_result_chars,
-                config.agent.max_context_tokens,
-                None, // shared_budget
-            )
-            .await
+            match TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(
+                    cost_tracking_context.clone(),
+                    run_tool_call_loop(
+                        provider.as_ref(),
+                        &mut history,
+                        &tools_registry,
+                        observer.as_ref(),
+                        &provider_name,
+                        &model_name,
+                        effective_temperature,
+                        false,
+                        approval_manager.as_ref(),
+                        channel_name,
+                        None,
+                        &config.multimodal,
+                        config.agent.max_tool_iterations,
+                        None,
+                        None,
+                        None,
+                        &excluded_tools,
+                        &config.agent.tool_call_dedup_exempt,
+                        activated_handle.as_ref(),
+                        Some(model_switch_callback.clone()),
+                        &config.pacing,
+                        config.agent.max_tool_result_chars,
+                        config.agent.max_context_tokens,
+                        None, // shared_budget
+                    ),
+                )
+                .await
             {
                 Ok(resp) => {
                     response = resp;
@@ -4261,33 +4272,37 @@ pub async fn run(
             });
 
             let response = loop {
-                match run_tool_call_loop(
-                    provider.as_ref(),
-                    &mut history,
-                    &tools_registry,
-                    observer.as_ref(),
-                    &provider_name,
-                    &model_name,
-                    turn_temperature,
-                    true,
-                    approval_manager.as_ref(),
-                    channel_name,
-                    None,
-                    &config.multimodal,
-                    config.agent.max_tool_iterations,
-                    Some(cancel_token.clone()),
-                    Some(delta_tx.clone()),
-                    None,
-                    &excluded_tools,
-                    &config.agent.tool_call_dedup_exempt,
-                    activated_handle.as_ref(),
-                    Some(model_switch_callback.clone()),
-                    &config.pacing,
-                    config.agent.max_tool_result_chars,
-                    config.agent.max_context_tokens,
-                    None, // shared_budget
-                )
-                .await
+                match TOOL_LOOP_COST_TRACKING_CONTEXT
+                    .scope(
+                        cost_tracking_context.clone(),
+                        run_tool_call_loop(
+                            provider.as_ref(),
+                            &mut history,
+                            &tools_registry,
+                            observer.as_ref(),
+                            &provider_name,
+                            &model_name,
+                            turn_temperature,
+                            true,
+                            approval_manager.as_ref(),
+                            channel_name,
+                            None,
+                            &config.multimodal,
+                            config.agent.max_tool_iterations,
+                            Some(cancel_token.clone()),
+                            Some(delta_tx.clone()),
+                            None,
+                            &excluded_tools,
+                            &config.agent.tool_call_dedup_exempt,
+                            activated_handle.as_ref(),
+                            Some(model_switch_callback.clone()),
+                            &config.pacing,
+                            config.agent.max_tool_result_chars,
+                            config.agent.max_context_tokens,
+                            None, // shared_budget
+                        ),
+                    )
+                    .await
                 {
                     Ok(resp) => break resp,
                     Err(e) => {
@@ -4884,6 +4899,39 @@ mod tests {
         // Head (3 chars) + tail (2 chars) from original should be preserved
         assert!(result.starts_with("abc"));
         assert!(result.ends_with("yz"));
+    }
+
+    // ── truncate_tool_message tests ─────────────────────────────
+
+    #[test]
+    fn truncate_tool_message_preserves_json_structure() {
+        use crate::agent::history::truncate_tool_message;
+        let big_content = "x".repeat(5000);
+        let msg = serde_json::json!({
+            "tool_call_id": "call_abc123",
+            "content": big_content,
+        })
+        .to_string();
+        let result = truncate_tool_message(&msg, 2000);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["tool_call_id"], "call_abc123");
+        assert!(parsed["content"].as_str().unwrap().contains("[... "));
+    }
+
+    #[test]
+    fn truncate_tool_message_plain_text_fallback() {
+        use crate::agent::history::truncate_tool_message;
+        let plain = "a".repeat(5000);
+        let result = truncate_tool_message(&plain, 2000);
+        assert!(result.contains("[... "));
+        assert!(result.len() < 5000);
+    }
+
+    #[test]
+    fn truncate_tool_message_short_passthrough() {
+        use crate::agent::history::truncate_tool_message;
+        let msg = r#"{"tool_call_id":"call_1","content":"ok"}"#;
+        assert_eq!(truncate_tool_message(msg, 2000), msg);
     }
 
     // ── fast_trim_tool_results tests ────────────────────────────
