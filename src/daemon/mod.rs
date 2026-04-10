@@ -1,5 +1,5 @@
 use crate::config::Config;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::Utc;
 use std::future::Future;
 use std::path::PathBuf;
@@ -45,6 +45,55 @@ async fn wait_for_shutdown_signal() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayBindMode {
+    StartFresh,
+    ReuseExisting,
+    PortOccupied,
+}
+
+fn local_gateway_probe_host(host: &str) -> String {
+    match host {
+        "0.0.0.0" | "::" | "[::]" => "127.0.0.1".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn format_http_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+async fn detect_gateway_bind_mode(host: &str, port: u16) -> GatewayBindMode {
+    if port == 0 {
+        return GatewayBindMode::StartFresh;
+    }
+
+    let probe_host = local_gateway_probe_host(host);
+    let health_url = format!("http://{}:{port}/health", format_http_host(&probe_host));
+    if let Ok(response) = reqwest::Client::new()
+        .get(&health_url)
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await
+    {
+        if response.status().is_success() {
+            return GatewayBindMode::ReuseExisting;
+        }
+    }
+
+    match tokio::net::TcpListener::bind((probe_host.as_str(), port)).await {
+        Ok(listener) => {
+            drop(listener);
+            GatewayBindMode::StartFresh
+        }
+        Err(_) => GatewayBindMode::PortOccupied,
+    }
+}
+
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
@@ -66,7 +115,23 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
-    {
+    let gateway_mode = detect_gateway_bind_mode(&host, port).await;
+    match gateway_mode {
+        GatewayBindMode::StartFresh => {}
+        GatewayBindMode::ReuseExisting => {
+            crate::health::mark_component_ok("gateway");
+            tracing::info!("Reusing existing gateway at http://{host}:{port}");
+        }
+        GatewayBindMode::PortOccupied => {
+            bail!(
+                "Gateway port {host}:{port} is already in use by another process. \
+                 Stop the conflicting process, restart the existing ZeroClaw gateway, \
+                 or run `zeroclaw daemon --port <other-port>`."
+            );
+        }
+    }
+
+    if gateway_mode == GatewayBindMode::StartFresh {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
         let gateway_event_tx = event_tx.clone();
@@ -157,9 +222,20 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
-    println!("   Components: gateway, channels, heartbeat, scheduler");
+    println!(
+        "   Components: {}, channels, heartbeat, scheduler",
+        if gateway_mode == GatewayBindMode::ReuseExisting {
+            "existing gateway"
+        } else {
+            "gateway"
+        }
+    );
     if config.gateway.require_pairing {
-        println!("   Pairing:    enabled (code appears in gateway output above)");
+        if gateway_mode == GatewayBindMode::ReuseExisting {
+            println!("   Pairing:    enabled (managed by existing gateway)");
+        } else {
+            println!("   Pairing:    enabled (code appears in gateway output above)");
+        }
     }
     println!("   Ctrl+C or SIGTERM to stop");
 
@@ -994,6 +1070,67 @@ mod tests {
     fn detects_no_supervised_channels() {
         let config = Config::default();
         assert!(!has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn probe_host_uses_loopback_for_wildcard_binds() {
+        assert_eq!(local_gateway_probe_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(local_gateway_probe_host("[::]"), "127.0.0.1");
+        assert_eq!(local_gateway_probe_host("127.0.0.1"), "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn detect_gateway_bind_mode_reuses_existing_healthy_gateway() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                .await
+                .unwrap();
+        });
+
+        let mode = detect_gateway_bind_mode("127.0.0.1", port).await;
+        assert_eq!(mode, GatewayBindMode::ReuseExisting);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn detect_gateway_bind_mode_flags_non_gateway_port_as_occupied() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::oneshot;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = shutdown_rx.await;
+        });
+
+        let mode = detect_gateway_bind_mode("127.0.0.1", port).await;
+        assert_eq!(mode, GatewayBindMode::PortOccupied);
+
+        let _ = shutdown_tx.send(());
+        server.await.unwrap();
     }
 
     #[test]
