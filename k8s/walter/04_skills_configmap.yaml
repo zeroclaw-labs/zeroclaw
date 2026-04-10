@@ -274,7 +274,7 @@ data:
   cron-management.md: |
     ---
     name: cron-management
-    version: 1.0.0
+    version: 1.1.0
     description: >
       Guides creation, modification, and review of your own cron jobs. Use this
       skill BEFORE calling cron_add or cron_update — it prevents the classes of
@@ -296,17 +296,63 @@ data:
     doesn't just run once — it runs forever until someone notices. That's why
     getting the prompt right matters more here than anywhere else.
 
+    ## Shared Infrastructure Awareness
+
+    You share a GPU backend with other agents, coding tools, and interactive
+    users. The model backend has a small number of parallel slots (currently 4).
+    Every agent cron run occupies one or more slots for 30–120 seconds of
+    thinking and tool calls. When multiple crons fire in the same window, they
+    saturate the backend and cause cascading failures: 429 rate limits, 500
+    timeouts, and multi-minute response delays for Dan's interactive messages.
+
+    This is why frequency matters more than it might seem. A "quick check"
+    cron that runs hourly might sound harmless, but in practice it collides
+    with other agents' crons and interactive conversations often enough to
+    cause real pain.
+
+    **Frequency guidance:**
+
+    Daily is the right default for most agent crons. Think of it this way —
+    if a cron runs and finds nothing to do 90% of the time, it's running too
+    often. Match frequency to how fast the underlying state actually changes:
+
+    - **Daily or twice-daily** — the sweet spot for summaries, task reviews,
+      hygiene checks. State rarely changes faster than this.
+    - **Every 3–6 hours** — reasonable for things with faster-moving state,
+      like PR review monitors where feedback might arrive mid-day.
+    - **More frequent than every 3 hours** — ask Dan first. The infrastructure
+      cost is real and compounds with every additional cron. Even if your cron
+      exits quickly when idle, it still occupies a slot for the LLM call that
+      decides "nothing to do."
+    - **Sub-hourly** — this almost certainly doesn't belong as an agent cron.
+      If something needs sub-hourly monitoring, it's probably better as a
+      shell cron (no LLM slot needed) with a simple HTTP check or script.
+
+    **Slot budget:**
+    - Before creating a cron, run `cron_list` and count your existing agent
+      crons. If you already have 3+, consider whether the new one can replace
+      or merge with an existing one rather than adding to the total.
+    - A single daily cron that checks 3 things is better than 3 separate ones.
+
+    The scheduler automatically applies a small deterministic time offset
+    (0–14 minutes) to each agent cron based on its job ID. This spreads
+    jobs that would otherwise fire at the same wall-clock minute. You don't
+    need to manually pick odd minutes — but you should still avoid scheduling
+    many crons at the same hour, since the jitter window is only 15 minutes.
+
     ## Before Creating a Cron Job
 
-    Ask yourself three questions:
+    Ask yourself these questions:
 
     1. **Does this need to be a cron?** If it's a one-time task, just do it
        now — don't create a cron. If in doubt, do it once manually first.
        Only promote to a cron after you've confirmed the pattern repeats.
 
-    2. **What's the right frequency?** Start less frequent than you think.
-       Hourly is aggressive for most things. Daily is usually fine. Each run
-       costs tokens.
+    2. **What's the right frequency?** Default to daily — see the frequency
+       guidance above. Ask yourself how fast the underlying state actually
+       changes. If the answer is "maybe once a day," daily is right. If you
+       find yourself wanting something more frequent than every 3 hours,
+       check with Dan first — the shared infrastructure cost adds up fast.
 
     3. **What should the cron do when there's nothing to report?** The answer
        is almost always "end immediately and stay silent." If you can't

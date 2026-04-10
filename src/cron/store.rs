@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::cron::schedule::agent_jitter_minutes;
 use crate::cron::{
     next_run_for_schedule, schedule_cron_expression, validate_schedule, CronJob, CronJobPatch,
     CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
@@ -80,8 +81,15 @@ pub fn add_agent_job(
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
-    let next_run = next_run_for_schedule(&schedule, now)?;
     let id = Uuid::new_v4().to_string();
+    let next_run = {
+        let base = next_run_for_schedule(&schedule, now)?;
+        if matches!(schedule, Schedule::At { .. }) {
+            base
+        } else {
+            base + chrono::Duration::minutes(agent_jitter_minutes(&id))
+        }
+    };
     let expression = schedule_cron_expression(&schedule).unwrap_or_default();
     let schedule_json = serde_json::to_string(&schedule)?;
     let delivery = delivery.unwrap_or_default();
@@ -221,7 +229,14 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
     }
 
     if schedule_changed {
-        job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
+        let base = next_run_for_schedule(&job.schedule, Utc::now())?;
+        job.next_run = if matches!(job.job_type, JobType::Agent)
+            && !matches!(job.schedule, Schedule::At { .. })
+        {
+            base + chrono::Duration::minutes(agent_jitter_minutes(&job.id))
+        } else {
+            base
+        };
     }
 
     with_connection(config, |conn| {
@@ -282,7 +297,14 @@ pub fn reschedule_after_run(
     output: &str,
 ) -> Result<()> {
     let now = Utc::now();
-    let next_run = next_run_for_schedule(&job.schedule, now)?;
+    let next_run = {
+        let base = next_run_for_schedule(&job.schedule, now)?;
+        if matches!(job.job_type, JobType::Agent) && !matches!(job.schedule, Schedule::At { .. }) {
+            base + chrono::Duration::minutes(agent_jitter_minutes(&job.id))
+        } else {
+            base
+        }
+    };
     let status = if success { "ok" } else { "error" };
     let bounded_output = truncate_cron_output(output);
 

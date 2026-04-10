@@ -2,7 +2,27 @@ use crate::cron::Schedule;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use cron::Schedule as CronExprSchedule;
+use std::hash::{Hash, Hasher};
 use std::str::FromStr;
+
+/// Maximum jitter window in minutes for agent cron jobs.
+const MAX_JITTER_MINUTES: u64 = 15;
+
+/// Compute a deterministic jitter offset (in minutes) for an agent cron job.
+///
+/// Uses a hash of the job ID to produce a stable offset in `0..MAX_JITTER_MINUTES`.
+/// The same job always gets the same offset, but different jobs spread naturally
+/// across the window. This prevents thundering-herd saturation of shared model
+/// backend slots when multiple agents schedule crons at round times like `0 * * * *`.
+///
+/// Only intended for recurring agent jobs — callers should skip this for shell jobs
+/// and one-shot (`Schedule::At`) schedules.
+pub fn agent_jitter_minutes(job_id: &str) -> i64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    job_id.hash(&mut hasher);
+    let hash = hasher.finish();
+    (hash % MAX_JITTER_MINUTES) as i64
+}
 
 pub fn next_run_for_schedule(schedule: &Schedule, from: DateTime<Utc>) -> Result<DateTime<Utc>> {
     match schedule {
@@ -98,6 +118,51 @@ mod tests {
         let at_schedule = Schedule::At { at };
         let next_at = next_run_for_schedule(&at_schedule, now).unwrap();
         assert_eq!(next_at, at);
+    }
+
+    #[test]
+    fn agent_jitter_is_deterministic() {
+        let id = "32a1f6be-dc83-4a5f-ae3f-cad6823b9cbe";
+        let j1 = agent_jitter_minutes(id);
+        let j2 = agent_jitter_minutes(id);
+        assert_eq!(j1, j2, "same job ID must produce same jitter");
+    }
+
+    #[test]
+    fn agent_jitter_stays_in_range() {
+        // Test a variety of IDs to confirm the jitter stays within bounds.
+        let ids = [
+            "aaaaaaaa-0000-0000-0000-000000000000",
+            "bbbbbbbb-1111-1111-1111-111111111111",
+            "cccccccc-2222-2222-2222-222222222222",
+            "deadbeef-dead-beef-dead-beefdeadbeef",
+            "12345678-abcd-ef01-2345-6789abcdef01",
+        ];
+        for id in &ids {
+            let j = agent_jitter_minutes(id);
+            assert!(
+                (0..15).contains(&j),
+                "jitter for {id} was {j}, expected 0..15"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_jitter_varies_across_ids() {
+        // With 5 different UUIDs we should see at least 2 distinct jitter values.
+        let ids = [
+            "aaaaaaaa-0000-0000-0000-000000000000",
+            "bbbbbbbb-1111-1111-1111-111111111111",
+            "cccccccc-2222-2222-2222-222222222222",
+            "deadbeef-dead-beef-dead-beefdeadbeef",
+            "12345678-abcd-ef01-2345-6789abcdef01",
+        ];
+        let jitters: std::collections::HashSet<i64> =
+            ids.iter().map(|id| agent_jitter_minutes(id)).collect();
+        assert!(
+            jitters.len() >= 2,
+            "expected spread across IDs, got {jitters:?}"
+        );
     }
 
     #[test]

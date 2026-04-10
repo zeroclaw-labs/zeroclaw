@@ -11,7 +11,8 @@ pub mod scheduler;
 
 #[allow(unused_imports)]
 pub use schedule::{
-    next_run_for_schedule, normalize_expression, schedule_cron_expression, validate_schedule,
+    agent_jitter_minutes, next_run_for_schedule, normalize_expression, schedule_cron_expression,
+    validate_schedule,
 };
 #[allow(unused_imports)]
 pub use store::{
