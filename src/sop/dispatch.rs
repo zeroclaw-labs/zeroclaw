@@ -1,6 +1,6 @@
 //! Unified SOP event dispatch helpers.
 //!
-//! All event sources (MQTT, webhook, cron, peripheral) route through
+//! All event sources (MQTT, webhook, cron) route through
 //! `dispatch_sop_event` so that locking, audit, and health bookkeeping
 //! happen in exactly one place.
 
@@ -216,28 +216,6 @@ pub fn process_headless_results(results: &[DispatchResult]) {
             DispatchResult::NoMatch => {}
         }
     }
-}
-
-// ── Peripheral signal helper ────────────────────────────────────
-
-/// Convenience wrapper for peripheral hardware callbacks.
-///
-/// Builds a `SopEvent` with source `Peripheral` and topic `"{board}/{signal}"`
-/// then dispatches it through the standard path.
-pub async fn dispatch_peripheral_signal(
-    engine: &Arc<Mutex<SopEngine>>,
-    audit: &SopAuditLogger,
-    board: &str,
-    signal: &str,
-    payload: Option<&str>,
-) -> Vec<DispatchResult> {
-    let event = SopEvent {
-        source: SopTriggerSource::Peripheral,
-        topic: Some(format!("{board}/{signal}")),
-        payload: payload.map(String::from),
-        timestamp: now_iso8601(),
-    };
-    dispatch_sop_event(engine, audit, event).await
 }
 
 // ── Cron SOP cache + check ──────────────────────────────────────
@@ -592,43 +570,6 @@ mod tests {
             }
             other => panic!("Expected Started, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn peripheral_signal_dispatches_to_matching_sop() {
-        let engine = test_engine(vec![test_sop(
-            "gpio-sop",
-            vec![SopTrigger::Peripheral {
-                board: "nucleo".into(),
-                signal: "pin_3".into(),
-                condition: None,
-            }],
-        )]);
-        let audit = test_audit();
-
-        let results =
-            dispatch_peripheral_signal(&engine, &audit, "nucleo", "pin_3", Some("1")).await;
-        assert_eq!(results.len(), 1);
-        assert!(
-            matches!(&results[0], DispatchResult::Started { sop_name, .. } if sop_name == "gpio-sop" )
-        );
-    }
-
-    #[tokio::test]
-    async fn peripheral_signal_no_match_returns_empty() {
-        let engine = test_engine(vec![test_sop(
-            "gpio-sop",
-            vec![SopTrigger::Peripheral {
-                board: "nucleo".into(),
-                signal: "pin_3".into(),
-                condition: None,
-            }],
-        )]);
-        let audit = test_audit();
-
-        let results = dispatch_peripheral_signal(&engine, &audit, "rpi", "gpio_5", None).await;
-        assert_eq!(results.len(), 1);
-        assert!(matches!(&results[0], DispatchResult::NoMatch));
     }
 
     #[test]

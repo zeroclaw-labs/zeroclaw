@@ -4,7 +4,7 @@ SOPs are deterministic procedures executed by the `SopEngine`. They provide expl
 
 ## Quick Paths
 
-- **Connect Events:** [Connectivity & Fan-In](connectivity.md) — trigger SOPs via MQTT, webhooks, cron, or peripherals.
+- **Connect Events:** [Connectivity & Fan-In](connectivity.md) — trigger SOPs via MQTT, webhooks, or cron.
 - **Write SOPs:** [Syntax Reference](syntax.md) — required file layout and trigger/step syntax.
 - **Monitor:** [Observability & Audit](observability.md) — where run state and audit entries are stored.
 - **Examples:** [Cookbook](cookbook.md) — reusable SOP patterns.
@@ -13,7 +13,7 @@ SOPs are deterministic procedures executed by the `SopEngine`. They provide expl
 
 - SOP definitions are loaded from `<workspace>/sops/<sop_name>/SOP.toml` plus optional `SOP.md`.
 - CLI `zeroclaw sop` currently manages definitions only: `list`, `validate`, `show`.
-- SOP runs are started by event fan-in (MQTT/webhook/cron/peripheral) or by the in-agent tool `sop_execute`.
+- SOP runs are started by event fan-in (MQTT/webhook/cron) or by the in-agent tool `sop_execute`.
 - Run progression uses tools: `sop_status`, `sop_approve`, `sop_advance`.
 - SOP audit records are persisted in the configured Memory backend under category `sop`.
 
@@ -24,7 +24,6 @@ graph LR
     MQTT[MQTT] -->|topic match| Dispatch
     WH[POST /sop/* or /webhook] -->|path match| Dispatch
     CRON[Scheduler] -->|window check| Dispatch
-    GPIO[Peripheral] -->|board/signal match| Dispatch
 
     Dispatch --> Engine[SOP Engine]
     Engine --> Run[SOP Run]

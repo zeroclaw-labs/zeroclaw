@@ -343,46 +343,6 @@ async fn build_context(
     context
 }
 
-/// Build hardware datasheet context from RAG when peripherals are enabled.
-/// Includes pin-alias lookup (e.g. "red_led" → 13) when query matches, plus retrieved chunks.
-fn build_hardware_context(
-    rag: &crate::rag::HardwareRag,
-    user_msg: &str,
-    boards: &[String],
-    chunk_limit: usize,
-) -> String {
-    if rag.is_empty() || boards.is_empty() {
-        return String::new();
-    }
-
-    let mut context = String::new();
-
-    // Pin aliases: when user says "red led", inject "red_led: 13" for matching boards
-    let pin_ctx = rag.pin_alias_context(user_msg, boards);
-    if !pin_ctx.is_empty() {
-        context.push_str(&pin_ctx);
-    }
-
-    let chunks = rag.retrieve(user_msg, boards, chunk_limit);
-    if chunks.is_empty() && pin_ctx.is_empty() {
-        return String::new();
-    }
-
-    if !chunks.is_empty() {
-        context.push_str("[Hardware documentation]\n");
-    }
-    for chunk in chunks {
-        let board_tag = chunk.board.as_deref().unwrap_or("generic");
-        let _ = writeln!(
-            context,
-            "--- {} ({}) ---\n{}\n",
-            chunk.source, board_tag, chunk.content
-        );
-    }
-    context.push('\n');
-    context
-}
-
 // Tool execution moved to `super::tool_execution`.
 pub(crate) use super::tool_execution::{
     ToolExecutionOutcome, execute_tools_parallel, execute_tools_sequential,
@@ -3452,7 +3412,7 @@ pub(crate) async fn run_tool_call_loop(
 
 // ── CLI Entrypoint ───────────────────────────────────────────────────────
 // Wires up all subsystems (observer, runtime, security, memory, tools,
-// provider, hardware RAG, peripherals) and enters either single-shot or
+// provider) and enters either single-shot or
 // interactive REPL mode. The interactive loop manages history compaction
 // and hard trimming to keep the context window bounded.
 
@@ -3463,7 +3423,6 @@ pub async fn run(
     provider_override: Option<String>,
     model_override: Option<String>,
     temperature: f64,
-    peripheral_overrides: Vec<String>,
     interactive: bool,
     session_state_file: Option<PathBuf>,
     allowed_tools: Option<Vec<String>>,
@@ -3488,15 +3447,7 @@ pub async fn run(
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
-    // ── Peripherals (merge peripheral tools into registry) ─
-    if !peripheral_overrides.is_empty() {
-        tracing::info!(
-            peripherals = ?peripheral_overrides,
-            "Peripheral overrides from CLI (config boards take precedence)"
-        );
-    }
-
-    // ── Tools (including memory tools and peripherals) ────────────
+    // ── Tools (including memory tools) ────────────────────────────
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),
@@ -3528,13 +3479,6 @@ pub async fn run(
         &config,
         None,
     );
-
-    let peripheral_tools: Vec<Box<dyn Tool>> =
-        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
-    if !peripheral_tools.is_empty() {
-        tracing::info!(count = peripheral_tools.len(), "Peripheral tools added");
-        tools_registry.extend(peripheral_tools);
-    }
 
     // ── Capability-based tool access control ─────────────────────
     // When `allowed_tools` is `Some(list)`, restrict the tool registry to only
@@ -3672,26 +3616,6 @@ pub async fn run(
         model: model_name.to_string(),
     });
 
-    // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
-    let hardware_rag: Option<crate::rag::HardwareRag> = config
-        .peripherals
-        .datasheet_dir
-        .as_ref()
-        .filter(|d| !d.trim().is_empty())
-        .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
-        .and_then(Result::ok)
-        .filter(|r: &crate::rag::HardwareRag| !r.is_empty());
-    if let Some(ref rag) = hardware_rag {
-        tracing::info!(chunks = rag.len(), "Hardware RAG loaded");
-    }
-
-    let board_names: Vec<String> = config
-        .peripherals
-        .boards
-        .iter()
-        .map(|b| b.board.clone())
-        .collect();
-
     // ── Load locale-aware tool descriptions ────────────────────────
     let i18n_locale = config
         .locale
@@ -3797,7 +3721,7 @@ pub async fn run(
                 .await;
         }
 
-        // Inject memory + hardware RAG context into user message
+        // Inject memory context into user message
         let mem_context = build_context(
             mem.as_ref(),
             &effective_msg,
@@ -3805,13 +3729,8 @@ pub async fn run(
             memory_session_id.as_deref(),
         )
         .await;
-        let rag_limit = if config.agent.compact_context { 2 } else { 5 };
-        let hw_context = hardware_rag
-            .as_ref()
-            .map(|r| build_hardware_context(r, &effective_msg, &board_names, rag_limit))
-            .unwrap_or_default();
         let skill_hint = crate::agent::prompt::build_skill_hint(&skills, &effective_msg);
-        let context = format!("{mem_context}{hw_context}{skill_hint}");
+        let context = format!("{mem_context}{skill_hint}");
         let enriched = crate::agent::prompt::timestamp_prefix(&effective_msg, Some(&context));
 
         let mut history = vec![
@@ -4063,7 +3982,7 @@ pub async fn run(
                     .await;
             }
 
-            // Inject memory + hardware RAG context into user message
+            // Inject memory context into user message
             let mem_context = build_context(
                 mem.as_ref(),
                 &effective_input,
@@ -4071,13 +3990,8 @@ pub async fn run(
                 memory_session_id.as_deref(),
             )
             .await;
-            let rag_limit = if config.agent.compact_context { 2 } else { 5 };
-            let hw_context = hardware_rag
-                .as_ref()
-                .map(|r| build_hardware_context(r, &effective_input, &board_names, rag_limit))
-                .unwrap_or_default();
             let skill_hint = crate::agent::prompt::build_skill_hint(&skills, &effective_input);
-            let context = format!("{mem_context}{hw_context}{skill_hint}");
+            let context = format!("{mem_context}{skill_hint}");
             let enriched = crate::agent::prompt::timestamp_prefix(&effective_input, Some(&context));
 
             history.push(ChatMessage::user(&enriched));
@@ -4311,8 +4225,8 @@ pub async fn run(
     Ok(final_output)
 }
 
-/// Process a single message through the full agent (with tools, peripherals, memory).
-/// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
+/// Process a single message through the full agent (with tools, memory).
+/// Used by channels (Telegram, Discord, etc.) to enable tool use.
 pub async fn process_message(
     config: Config,
     message: &str,
@@ -4366,10 +4280,6 @@ pub async fn process_message(
         &config,
         None,
     );
-    let peripheral_tools: Vec<Box<dyn Tool>> =
-        crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
-    tools_registry.extend(peripheral_tools);
-
     // ── Wire MCP tools (non-fatal) — process_message path ────────
     // NOTE: Same ordering contract as the CLI path above — MCP tools must be
     // injected after filter_primary_agent_tools_or_fail (or equivalent built-in
@@ -4459,21 +4369,6 @@ pub async fn process_message(
     )?;
     provider.set_session_id(session_id);
 
-    let hardware_rag: Option<crate::rag::HardwareRag> = config
-        .peripherals
-        .datasheet_dir
-        .as_ref()
-        .filter(|d| !d.trim().is_empty())
-        .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
-        .and_then(Result::ok)
-        .filter(|r: &crate::rag::HardwareRag| !r.is_empty());
-    let board_names: Vec<String> = config
-        .peripherals
-        .boards
-        .iter()
-        .map(|b| b.board.clone())
-        .collect();
-
     // ── Load locale-aware tool descriptions ────────────────────────
     let i18n_locale = config
         .locale
@@ -4543,13 +4438,8 @@ pub async fn process_message(
         session_id,
     )
     .await;
-    let rag_limit = if config.agent.compact_context { 2 } else { 5 };
-    let hw_context = hardware_rag
-        .as_ref()
-        .map(|r| build_hardware_context(r, effective_msg_ref, &board_names, rag_limit))
-        .unwrap_or_default();
     let skill_hint = crate::agent::prompt::build_skill_hint(&skills, effective_msg_ref);
-    let context = format!("{mem_context}{hw_context}{skill_hint}");
+    let context = format!("{mem_context}{skill_hint}");
     let enriched = crate::agent::prompt::timestamp_prefix(effective_msg_ref, Some(&context));
 
     let mut history = vec![

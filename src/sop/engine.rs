@@ -695,28 +695,6 @@ fn trigger_matches(trigger: &SopTrigger, event: &SopEvent) -> bool {
             event.topic.as_deref().map_or(false, |t| t == path)
         }
 
-        (
-            SopTrigger::Peripheral {
-                board,
-                signal,
-                condition,
-            },
-            SopTriggerSource::Peripheral,
-        ) => {
-            let topic_match = event.topic.as_deref().map_or(false, |t| {
-                let expected = format!("{board}/{signal}");
-                t == expected
-            });
-            if !topic_match {
-                return false;
-            }
-            // Evaluate condition against payload (None condition = unconditional)
-            match condition {
-                Some(cond) => evaluate_condition(cond, event.payload.as_deref()),
-                None => true,
-            }
-        }
-
         (SopTrigger::Cron { expression }, SopTriggerSource::Cron) => {
             event.topic.as_deref().map_or(false, |t| t == expression)
         }
@@ -1263,58 +1241,6 @@ mod tests {
             timestamp: now_iso8601(),
         };
         assert!(engine.match_trigger(&event).is_empty());
-    }
-
-    #[test]
-    fn peripheral_condition_filters_by_payload() {
-        let sop = Sop {
-            triggers: vec![SopTrigger::Peripheral {
-                board: "nucleo".into(),
-                signal: "pin_3".into(),
-                condition: Some("> 0".into()),
-            }],
-            ..test_sop("periph-cond", SopExecutionMode::Auto, SopPriority::High)
-        };
-        let engine = engine_with_sops(vec![sop]);
-
-        // Positive signal
-        let event = SopEvent {
-            source: SopTriggerSource::Peripheral,
-            topic: Some("nucleo/pin_3".into()),
-            payload: Some("1".into()),
-            timestamp: now_iso8601(),
-        };
-        assert_eq!(engine.match_trigger(&event).len(), 1);
-
-        // Zero signal — does not meet condition
-        let event = SopEvent {
-            source: SopTriggerSource::Peripheral,
-            topic: Some("nucleo/pin_3".into()),
-            payload: Some("0".into()),
-            timestamp: now_iso8601(),
-        };
-        assert!(engine.match_trigger(&event).is_empty());
-    }
-
-    #[test]
-    fn peripheral_no_condition_matches_any() {
-        let sop = Sop {
-            triggers: vec![SopTrigger::Peripheral {
-                board: "rpi".into(),
-                signal: "gpio_5".into(),
-                condition: None,
-            }],
-            ..test_sop("periph-nocond", SopExecutionMode::Auto, SopPriority::Normal)
-        };
-        let engine = engine_with_sops(vec![sop]);
-
-        let event = SopEvent {
-            source: SopTriggerSource::Peripheral,
-            topic: Some("rpi/gpio_5".into()),
-            payload: Some("0".into()),
-            timestamp: now_iso8601(),
-        };
-        assert_eq!(engine.match_trigger(&event).len(), 1);
     }
 
     // ── Run lifecycle ───────────────────────────────────

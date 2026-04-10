@@ -4,7 +4,7 @@ use serde_json::Value;
 ///
 /// Condition syntax:
 ///   - JSON path comparison: `$.key.subkey > 85`
-///   - Direct numeric comparison: `> 0` (used by peripheral triggers)
+///   - Direct numeric comparison: `> 0`
 ///
 /// Supported operators: `>=`, `<=`, `!=`, `>`, `<`, `==`
 ///
@@ -336,7 +336,7 @@ mod tests {
         assert!(evaluate_condition(r#"$.active == "true""#, Some(payload)));
     }
 
-    // ── Direct conditions (peripheral) ──────────────────
+    // ── Direct numeric conditions ──────────────────────
 
     #[test]
     fn direct_gt() {

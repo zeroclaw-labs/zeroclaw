@@ -30,7 +30,7 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 </p>
 
 
-ZeroClaw is a personal AI assistant you run on your own devices. It answers you on the channels you already use (WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Matrix, IRC, Email, Bluesky, Nostr, Mattermost, Nextcloud Talk, DingTalk, Lark, QQ, Reddit, LinkedIn, Twitter, MQTT, WeChat Work, and more). It has a web dashboard for real-time control and can connect to hardware peripherals (ESP32, STM32, Arduino, Raspberry Pi). The Gateway is just the control plane — the product is the assistant.
+ZeroClaw is a personal AI assistant you run on your own devices. It answers you on the channels you already use (WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Matrix, IRC, Email, Bluesky, Nostr, Mattermost, Nextcloud Talk, DingTalk, Lark, QQ, Reddit, LinkedIn, Twitter, MQTT, WeChat Work, and more). It has a web dashboard for real-time control. The Gateway is just the control plane — the product is the assistant.
 
 If you want a personal, single-user assistant that feels local, fast, and always-on, this is it.
 
@@ -180,9 +180,8 @@ Use this board for important notices (breaking changes, security advisories, mai
 - **Local-first Gateway** — single control plane for sessions, channels, tools, cron, SOPs, and events.
 - **Multi-channel inbox** — WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Matrix, IRC, Email, Bluesky, Nostr, Mattermost, Nextcloud Talk, DingTalk, Lark, QQ, Reddit, LinkedIn, Twitter, MQTT, WeChat Work, WebSocket, and more.
 - **Multi-agent orchestration (Hands)** — autonomous agent swarms that run on schedule and grow smarter over time.
-- **Standard Operating Procedures (SOPs)** — event-driven workflow automation with MQTT, webhook, cron, and peripheral triggers.
+- **Standard Operating Procedures (SOPs)** — event-driven workflow automation with MQTT, webhook, and cron triggers.
 - **Web Dashboard** — React 19 + Vite web UI with real-time chat, memory browser, config editor, cron manager, and tool inspector.
-- **Hardware peripherals** — ESP32, STM32 Nucleo, Arduino, Raspberry Pi GPIO via the `Peripheral` trait.
 - **First-class tools** — shell, file I/O, browser, git, web fetch/search, MCP, Jira, Notion, Google Workspace, and 70+ more.
 - **Lifecycle hooks** — intercept and modify LLM calls, tool executions, and messages at every stage.
 - **Skills platform** — bundled, community, and workspace skills with security auditing.
@@ -255,16 +254,6 @@ React 19 + Vite 6 + Tailwind CSS 4 web dashboard served directly from the Gatewa
 - **Integrations** — integration status and setup
 - **Pairing** — device pairing management
 
-### Firmware targets
-
-| Target | Platform | Purpose |
-|--------|----------|---------|
-| ESP32 | Espressif ESP32 | Wireless peripheral agent |
-| ESP32-UI | ESP32 + Display | Agent with visual interface |
-| STM32 Nucleo | STM32 (ARM Cortex-M) | Industrial peripheral |
-| Arduino | Arduino | Basic sensor/actuator bridge |
-| Uno Q Bridge | Arduino Uno | Serial bridge to agent |
-
 ### Tools + automation
 
 - **Core:** shell, file read/write/edit, git operations, glob search, content search
@@ -274,7 +263,6 @@ React 19 + Vite 6 + Tailwind CSS 4 web dashboard served directly from the Gatewa
 - **Scheduling:** cron add/remove/update/run, schedule tool
 - **Memory:** recall, store, forget, knowledge, project intel
 - **Advanced:** delegate (agent-to-agent), swarm, model switch/routing, security ops, cloud ops
-- **Hardware:** board info, memory map, memory read (feature-gated)
 
 ### Runtime + safety
 
@@ -457,11 +445,6 @@ zeroclaw auth login --provider <name>
 zeroclaw auth status
 zeroclaw auth use --provider <name> --profile <profile>
 
-# Hardware peripherals
-zeroclaw hardware discover    # Scan for connected devices
-zeroclaw peripheral list      # List connected peripherals
-zeroclaw peripheral flash     # Flash firmware to device
-
 # Migration
 zeroclaw migrate openclaw --dry-run
 zeroclaw migrate openclaw
@@ -616,7 +599,6 @@ Use these when you're past the onboarding flow and want the deeper reference.
 
 - Network deployment guide: [docs/ops/network-deployment.md](docs/ops/network-deployment.md)
 - Proxy agent playbook: [docs/ops/proxy-agent-playbook.md](docs/ops/proxy-agent-playbook.md)
-- Hardware guides: [docs/hardware/README.md](docs/hardware/README.md)
 
 ## Smooth Crab 🦀
 
@@ -655,7 +637,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](docs/contributing/cla.md). I
 - New `Tool` → `src/tools/`
 - New `Memory` → `src/memory/`
 - New `Tunnel` → `src/tunnel/`
-- New `Peripheral` → `src/peripherals/`
 - New `Skill` → `~/.zeroclaw/workspace/skills/<name>/`
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->

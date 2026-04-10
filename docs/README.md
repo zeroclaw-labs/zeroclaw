@@ -27,7 +27,6 @@ Last refreshed: **February 21, 2026**.
 - Need production/service operations? → [ops/README.md](ops/README.md)
 - Seeing failures or regressions? → [troubleshooting.md](ops/troubleshooting.md)
 - Working on security hardening or roadmap? → [security/README.md](security/README.md)
-- Working with boards/peripherals? → [hardware/README.md](hardware/README.md)
 - Contributing/reviewing/CI workflow? → [contributing/README.md](contributing/README.md)
 - Want the full map? → [SUMMARY.md](SUMMARY.md)
 
@@ -37,7 +36,6 @@ Last refreshed: **February 21, 2026**.
 - Reference catalogs: [reference/README.md](reference/README.md)
 - Operations & deployment: [ops/README.md](ops/README.md)
 - Security docs: [security/README.md](security/README.md)
-- Hardware/peripherals: [hardware/README.md](hardware/README.md)
 - Contributing/CI: [contributing/README.md](contributing/README.md)
 - Project snapshots: [maintainers/README.md](maintainers/README.md)
 

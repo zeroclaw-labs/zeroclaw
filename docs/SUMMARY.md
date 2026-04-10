@@ -46,18 +46,7 @@ Last refreshed: **February 18, 2026**.
 - [audit-logging.md](security/audit-logging.md)
 - [security-roadmap.md](security/security-roadmap.md)
 
-### 5) Hardware & Peripherals
-
-- [hardware/README.md](hardware/README.md)
-- [hardware-peripherals-design.md](hardware/hardware-peripherals-design.md)
-- [adding-boards-and-tools.md](contributing/adding-boards-and-tools.md)
-- [nucleo-setup.md](hardware/nucleo-setup.md)
-- [arduino-uno-q-setup.md](hardware/arduino-uno-q-setup.md)
-- [datasheets/nucleo-f401re.md](hardware/datasheets/nucleo-f401re.md)
-- [datasheets/arduino-uno.md](hardware/datasheets/arduino-uno.md)
-- [datasheets/esp32.md](hardware/datasheets/esp32.md)
-
-### 6) Contribution & CI
+### 5) Contribution & CI
 
 - [contributing/README.md](contributing/README.md)
 - [../CONTRIBUTING.md](../CONTRIBUTING.md)
@@ -68,7 +57,7 @@ Last refreshed: **February 18, 2026**.
 - [extension-examples.md](contributing/extension-examples.md)
 - [testing.md](contributing/testing.md)
 
-### 7) Project Status & Snapshot
+### 6) Project Status & Snapshot
 
 - [maintainers/README.md](maintainers/README.md)
 - [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md)

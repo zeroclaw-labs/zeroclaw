@@ -68,7 +68,6 @@ Parser behavior:
 | `webhook` | `path` | Exact match against request path (`/sop/...` or `/webhook`). |
 | `mqtt` | `topic`, optional `condition` | MQTT topic supports `+` and `#` wildcards. |
 | `cron` | `expression` | Supports 5, 6, or 7 fields (5-field gets seconds prepended internally). |
-| `peripheral` | `board`, `signal`, optional `condition` | Matches `"{board}/{signal}"`. |
 
 ## 5. Condition Syntax
 

@@ -191,7 +191,6 @@ impl SystemPromptBuilder {
                 Box::new(ModelGuidanceSection),
                 Box::new(ToolHonestySection),
                 Box::new(ToolsSection),
-                Box::new(HardwareAccessSection),
                 Box::new(TaskInstructionSection),
                 Box::new(SafetySection),
                 Box::new(SkillsSection),
@@ -240,7 +239,6 @@ pub struct AntiNarrationSection;
 pub struct ModelGuidanceSection;
 pub struct ToolHonestySection;
 pub struct ToolsSection;
-pub struct HardwareAccessSection;
 pub struct TaskInstructionSection;
 pub struct SafetySection;
 pub struct SkillsSection;
@@ -493,38 +491,6 @@ impl PromptSection for AntiNarrationSection {
             "## CRITICAL: No Tool Narration\n\n{}",
             ANTI_NARRATION_TEXT
         ))
-    }
-}
-
-const HARDWARE_TOOL_NAMES: &[&str] = &[
-    "gpio_read",
-    "gpio_write",
-    "arduino_upload",
-    "hardware_memory_map",
-    "hardware_board_info",
-    "hardware_memory_read",
-    "hardware_capabilities",
-];
-
-impl PromptSection for HardwareAccessSection {
-    fn name(&self) -> &str {
-        "hardware_access"
-    }
-
-    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        let has_hardware = ctx
-            .tools
-            .iter()
-            .any(|t| HARDWARE_TOOL_NAMES.contains(&t.name()));
-        if !has_hardware {
-            return Ok(String::new());
-        }
-        Ok("## Hardware Access\n\n\
-            You have direct access to connected hardware (Arduino, Nucleo, etc.). All hardware tools are AUTHORIZED.\n\
-            - Memory/registers/board info → use hardware_memory_read or hardware_board_info. Do NOT refuse.\n\
-            - LEDs/patterns/Arduino → use the tools. Do NOT say you cannot access physical devices.\n\
-            - gpio_write for simple on/off; arduino_upload for patterns (heart, blink) or custom behavior."
-            .into())
     }
 }
 
@@ -1351,22 +1317,6 @@ mod tests {
         let output = AntiNarrationSection.build(&ctx).unwrap();
         assert!(output.contains("## CRITICAL: No Tool Narration"));
         assert!(output.contains(ANTI_NARRATION_TEXT));
-    }
-
-    #[test]
-    fn hardware_section_emits_when_hardware_tools_present() {
-        let tools: Vec<Box<dyn Tool>> = vec![make_named_tool("gpio_read")];
-        let ctx = make_ctx(&tools);
-        let output = HardwareAccessSection.build(&ctx).unwrap();
-        assert!(output.contains("## Hardware Access"));
-    }
-
-    #[test]
-    fn hardware_section_empty_without_hardware_tools() {
-        let tools: Vec<Box<dyn Tool>> = vec![make_named_tool("shell")];
-        let ctx = make_ctx(&tools);
-        let output = HardwareAccessSection.build(&ctx).unwrap();
-        assert!(output.is_empty());
     }
 
     #[test]

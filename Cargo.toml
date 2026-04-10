@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/robot-kit", "crates/aardvark-sys", "apps/tauri"]
+members = [".", "crates/robot-kit", "apps/tauri"]
 resolver = "2"
 
 [package]
@@ -95,9 +95,6 @@ zip = { version = "8.1", default-features = false, features = ["deflate-flate2"]
 anyhow = "1.0"
 thiserror = "2.0"
 
-# Aardvark I2C/SPI/GPIO USB adapter (Total Phase) — stub when SDK absent
-aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
-
 # UUID generation
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
@@ -134,7 +131,7 @@ cron = "0.15"
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 console = "0.16"
 
-# Hardware discovery (device path globbing)
+# File path globbing (glob_search tool, event matching)
 glob = "0.3"
 
 # Binary discovery (init system detection)
@@ -172,26 +169,14 @@ opentelemetry = { version = "0.31", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
 
-# Serial port for peripheral communication (STM32, etc.)
-tokio-serial = { version = "5", default-features = false, optional = true }
-
-# USB device enumeration (hardware discovery) — only on platforms nusb supports
-# (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
-[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
-nusb = { version = "0.2", default-features = false, optional = true }
-
-# probe-rs for STM32/Nucleo memory read (Phase B)
-probe-rs = { version = "0.31", optional = true }
-
-# PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
+# PDF extraction for PDF read tool (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
 
 # WASM plugin runtime (extism)
 extism = { version = "1.20", optional = true }
 
-# Raspberry Pi GPIO / Landlock (Linux only) — target-specific to avoid compile failure on macOS
+# Landlock (Linux only) — target-specific to avoid compile failure on macOS
 [target.'cfg(target_os = "linux")'.dependencies]
-rppal = { version = "0.22", optional = true }
 landlock = { version = "0.4", optional = true }
 
 # Unix-specific dependencies (for root check, etc.)
@@ -200,10 +185,8 @@ libc = "0.2"
 
 [features]
 default = ["observability-prometheus", "skill-creation"]
-hardware = ["nusb", "tokio-serial"]
 observability-prometheus = ["dep:prometheus"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
-peripheral-rpi = ["rppal"]
 # Browser backend feature alias used by cfg(feature = "browser-native")
 browser-native = ["dep:fantoccini"]
 # Backward-compatible alias for older invocations
@@ -215,9 +198,7 @@ sandbox-bubblewrap = []
 landlock = ["sandbox-landlock"]
 # Prometheus metrics observer (requires 64-bit atomics; disable on 32-bit targets)
 metrics = ["observability-prometheus"]
-# probe = probe-rs for Nucleo memory read (adds ~50 deps; optional)
-probe = ["dep:probe-rs"]
-# rag-pdf = PDF ingestion for datasheet RAG
+# rag-pdf = PDF text extraction for file_read and pdf_read tools
 rag-pdf = ["dep:pdf-extract"]
 # skill-creation = Autonomous skill creation from successful multi-step tasks
 skill-creation = []
@@ -228,14 +209,11 @@ webauthn = []
 # Meta-feature for CI: all features except those requiring system C libraries
 # not available on standard CI runners.
 ci-all = [
-    "hardware",
     "observability-prometheus",
     "observability-otel",
-    "peripheral-rpi",
     "browser-native",
     "sandbox-landlock",
     "sandbox-bubblewrap",
-    "probe",
     "rag-pdf",
     "skill-creation",
     "plugins-wasm",

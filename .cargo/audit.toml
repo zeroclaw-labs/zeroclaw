@@ -3,10 +3,21 @@
 
 [advisories]
 ignore = [
-    # wasmtime vulns via extism 1.13.0 — no upstream fix; plugins feature-gated
+    # wasmtime vulns via extism 1.20.0 — no upstream fix; plugins feature-gated
     "RUSTSEC-2026-0006",  # wasmtime f64.copysign segfault on x86-64
     "RUSTSEC-2026-0020",  # WASI guest-controlled resource exhaustion
     "RUSTSEC-2026-0021",  # WASI http fields panic
+    "RUSTSEC-2026-0085",  # wasmtime flags component value panic
+    "RUSTSEC-2026-0086",  # wasmtime 64-bit tables host data leakage
+    "RUSTSEC-2026-0087",  # wasmtime f64x2.splat segfault on x86-64
+    "RUSTSEC-2026-0088",  # wasmtime pooling allocator data leakage
+    "RUSTSEC-2026-0089",  # wasmtime table.fill host panic
+    "RUSTSEC-2026-0091",  # wasmtime string transcoding OOB write
+    "RUSTSEC-2026-0092",  # wasmtime misaligned UTF-16 panic
+    "RUSTSEC-2026-0093",  # wasmtime UTF-16 to latin1 heap OOB read
+    "RUSTSEC-2026-0094",  # wasmtime table.grow return value miscompile
+    "RUSTSEC-2026-0095",  # wasmtime Winch sandbox escape
+    "RUSTSEC-2026-0096",  # wasmtime aarch64 Cranelift sandbox escape
     # instant crate unmaintained — transitive dep via nostr; no upstream fix
     "RUSTSEC-2024-0384",
 ]

@@ -573,10 +573,6 @@ min_evaluation_threshold = 0.6
 input_price_per_million = 3.0
 output_price_per_million = 15.0
 
-[peripherals]
-enabled = true
-boards = []
-
 [agents]
 
 [coordination]
@@ -602,12 +598,6 @@ deny = []
 load_paths = []
 
 [plugins.entries]
-
-[hardware]
-enabled = true
-transport = "None"
-baud_rate = 115200
-workspace_datasheets = false
 
 [transcription]
 enabled = false
