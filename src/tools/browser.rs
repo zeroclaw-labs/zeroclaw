@@ -95,12 +95,14 @@ pub(crate) async fn optimize_screenshot(png_bytes: Vec<u8>) -> (Vec<u8>, &'stati
 
 /// Format optimized screenshot bytes as a tool result with an [IMAGE:] marker
 /// so the multimodal pipeline can extract it as a proper image content part.
-pub(crate) fn format_screenshot_result(optimized_bytes: &[u8], mime: &str, extra_info: &str) -> String {
+pub(crate) fn format_screenshot_result(
+    optimized_bytes: &[u8],
+    mime: &str,
+    extra_info: &str,
+) -> String {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(optimized_bytes);
-    format!(
-        "{extra_info}\n[IMAGE:data:{mime};base64,{b64}]"
-    )
+    format!("{extra_info}\n[IMAGE:data:{mime};base64,{b64}]")
 }
 
 /// Computer-use sidecar settings.

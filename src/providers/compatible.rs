@@ -1605,8 +1605,7 @@ impl OpenAiCompatibleProvider {
         // Tool results can contain optimized screenshots from the browser tool;
         // sending them as proper image_url content parts lets the vision model
         // actually see the image instead of receiving raw base64 text tokens.
-        let allow_images =
-            allow_user_image_parts && (role == "user" || role == "tool");
+        let allow_images = allow_user_image_parts && (role == "user" || role == "tool");
         if !allow_images {
             return MessageContent::Text(content.to_string());
         }
@@ -1661,10 +1660,9 @@ impl OpenAiCompatibleProvider {
                             .and_then(serde_json::Value::as_str)
                             .map(ToString::to_string)
                             .unwrap_or_default();
-                        let content =
-                            crate::agent::loop_::parsing::strip_unparsed_tool_call_tags(
-                                &raw_content,
-                            );
+                        let content = crate::agent::loop_::parsing::strip_unparsed_tool_call_tags(
+                            &raw_content,
+                        );
 
                         let reasoning_content = value
                             .get("reasoning_content")
@@ -1745,9 +1743,7 @@ impl OpenAiCompatibleProvider {
             // fell through to the generic path (empty tool_calls, failed parse).
             let content_str = if message.role == "assistant" {
                 std::borrow::Cow::Owned(
-                    crate::agent::loop_::parsing::strip_unparsed_tool_call_tags(
-                        &message.content,
-                    ),
+                    crate::agent::loop_::parsing::strip_unparsed_tool_call_tags(&message.content),
                 )
             } else {
                 std::borrow::Cow::Borrowed(message.content.as_str())
@@ -2239,8 +2235,7 @@ impl Provider for OpenAiCompatibleProvider {
             } else {
                 // Use configured tool_choice if set (e.g. "required" for Gemma 4),
                 // otherwise default to "auto".
-                crate::agent::loop_::tool_choice_override()
-                    .or_else(|| Some("auto".to_string()))
+                crate::agent::loop_::tool_choice_override().or_else(|| Some("auto".to_string()))
             },
         };
 
@@ -2390,7 +2385,10 @@ impl Provider for OpenAiCompatibleProvider {
             max_tokens: self.effective_max_tokens(),
             stream: Some(false),
             tool_choice: if tools.is_some() {
-                request.tool_choice.clone().or_else(|| Some("auto".to_string()))
+                request
+                    .tool_choice
+                    .clone()
+                    .or_else(|| Some("auto".to_string()))
             } else {
                 None
             },
@@ -4979,7 +4977,8 @@ mod tests {
                         &serde_json::json!({
                             "tool_call_id": "call_1",
                             "content": image_content
-                        }).to_string(),
+                        })
+                        .to_string(),
                     ),
                 ],
             ),
@@ -4989,7 +4988,8 @@ mod tests {
                     &serde_json::json!({
                         "tool_call_id": "no_match",
                         "content": image_content
-                    }).to_string(),
+                    })
+                    .to_string(),
                 )],
             ),
             (
@@ -5002,8 +5002,7 @@ mod tests {
         ];
 
         for (label, messages) in test_cases {
-            let native =
-                OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+            let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
             let wire_json = serde_json::to_string(&native).unwrap();
 
             assert!(

@@ -331,7 +331,10 @@ impl SignalChannel {
         if !self.ignore_attachments {
             if let Some(attachments) = &data_msg.attachments {
                 for att in attachments {
-                    let ct = att.get("contentType").and_then(|v| v.as_str()).unwrap_or("");
+                    let ct = att
+                        .get("contentType")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let data = att.get("data").and_then(|v| v.as_str()).unwrap_or("");
                     if ct.starts_with("image/") && !data.is_empty() {
                         if !content.is_empty() {
@@ -392,13 +395,18 @@ impl SignalChannel {
         let receipt_type = receipt.receipt_type.as_deref().unwrap_or("UNKNOWN");
         let timestamps = receipt.timestamps.as_deref().unwrap_or(&[]);
 
-        let sender = envelope.source_number.as_deref()
+        let sender = envelope
+            .source_number
+            .as_deref()
             .or(envelope.source.as_deref())?;
 
-        let ts_display: Vec<String> = timestamps.iter().map(|ts| {
-            let secs = ts / 1000;
-            format!("{secs}")
-        }).collect();
+        let ts_display: Vec<String> = timestamps
+            .iter()
+            .map(|ts| {
+                let secs = ts / 1000;
+                format!("{secs}")
+            })
+            .collect();
 
         let verb = match receipt_type {
             "DELIVERY" => "delivered to",
@@ -523,7 +531,9 @@ impl Channel for SignalChannel {
                                             if tx.send(msg).await.is_err() {
                                                 return Ok(());
                                             }
-                                        } else if let Some(receipt_line) = Self::format_receipt(envelope) {
+                                        } else if let Some(receipt_line) =
+                                            Self::format_receipt(envelope)
+                                        {
                                             pending_receipts.push(receipt_line);
                                         }
                                     }
@@ -699,7 +709,10 @@ mod tests {
     async fn send_draft_returns_none_when_edits_disabled() {
         let ch = make_channel();
         let result = ch
-            .send_draft(&crate::channels::traits::SendMessage::new("test", "+1111111111"))
+            .send_draft(&crate::channels::traits::SendMessage::new(
+                "test",
+                "+1111111111",
+            ))
             .await
             .unwrap();
         assert!(result.is_none());
@@ -714,7 +727,10 @@ mod tests {
         assert_eq!(body["edit_timestamp"], 1773509376671_i64);
         assert_eq!(body["message"], "updated text");
         assert_eq!(body["number"], "+1234567890"); // bot's account
-        assert!(body.get("editTimestamp").is_none(), "must NOT use camelCase editTimestamp");
+        assert!(
+            body.get("editTimestamp").is_none(),
+            "must NOT use camelCase editTimestamp"
+        );
     }
 
     #[test]

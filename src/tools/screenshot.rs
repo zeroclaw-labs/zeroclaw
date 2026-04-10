@@ -252,8 +252,7 @@ impl ScreenshotTool {
         match tokio::fs::read(output_path).await {
             Ok(bytes) => {
                 let raw_len = bytes.len();
-                let (optimized, mime) =
-                    super::browser::optimize_screenshot(bytes).await;
+                let (optimized, mime) = super::browser::optimize_screenshot(bytes).await;
                 let info = format!(
                     "Screenshot saved to: {}\nOriginal: {}KB, optimized: {}KB",
                     output_path.display(),

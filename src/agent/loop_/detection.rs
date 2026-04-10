@@ -345,7 +345,12 @@ mod tests {
     fn failure_streak_triggers_warning() {
         let mut det = LoopDetector::new(default_config());
         for i in 0..5 {
-            det.record_call("shell", &format!(r#"{{"cmd":"bad{i}"}}"#), &format!("error: not found {i}"), false);
+            det.record_call(
+                "shell",
+                &format!(r#"{{"cmd":"bad{i}"}}"#),
+                &format!("error: not found {i}"),
+                false,
+            );
         }
         match det.check() {
             DetectionVerdict::InjectWarning(msg) => {

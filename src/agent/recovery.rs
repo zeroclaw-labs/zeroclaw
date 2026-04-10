@@ -38,10 +38,7 @@ pub fn classify_error(err: &anyhow::Error) -> ErrorRecoverability {
     if crate::agent::loop_::is_tool_iteration_limit_error(err) {
         return ErrorRecoverability::Fatal;
     }
-    if err
-        .downcast_ref::<ProviderCapabilityError>()
-        .is_some()
-    {
+    if err.downcast_ref::<ProviderCapabilityError>().is_some() {
         return ErrorRecoverability::Fatal;
     }
 

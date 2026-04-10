@@ -162,7 +162,10 @@ impl AcpSessionStore {
     /// Look up a transport session by ID.
     pub fn get(&self, id: &str) -> Option<AcpTransportSession> {
         let sessions = self.sessions.lock();
-        sessions.get(id).filter(|s| s.created_at.elapsed() < self.ttl).cloned()
+        sessions
+            .get(id)
+            .filter(|s| s.created_at.elapsed() < self.ttl)
+            .cloned()
     }
 
     /// Update a session in place.
@@ -237,11 +240,7 @@ fn jsonrpc_result(id: &serde_json::Value, result: serde_json::Value) -> serde_js
     })
 }
 
-fn jsonrpc_error(
-    id: &serde_json::Value,
-    code: i64,
-    message: &str,
-) -> serde_json::Value {
+fn jsonrpc_error(id: &serde_json::Value, code: i64, message: &str) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -259,7 +258,10 @@ fn jsonrpc_notification(method: &str, params: serde_json::Value) -> serde_json::
 
 /// Wrap a JSON-RPC result as an SSE `data:` line.
 fn sse_line(value: &serde_json::Value) -> String {
-    format!("data: {}\n\n", serde_json::to_string(value).unwrap_or_default())
+    format!(
+        "data: {}\n\n",
+        serde_json::to_string(value).unwrap_or_default()
+    )
 }
 
 // ── Handlers ─────────────────────────────────────────────────────
@@ -288,11 +290,8 @@ pub async fn handle_acp(
     }
 
     // Rate limit
-    let rate_key = super::client_key_from_request(
-        Some(peer_addr),
-        &headers,
-        state.trust_forwarded_headers,
-    );
+    let rate_key =
+        super::client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
     if !state.rate_limiter.allow_webhook(&rate_key) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -331,25 +330,22 @@ pub async fn handle_acp(
     match req.method.as_str() {
         "initialize" => handle_initialize(&req, acp_store).into_response(),
         "session/new" => handle_session_new(&req, &headers, acp_store).into_response(),
-        "session/prompt" => {
-            handle_session_prompt(&req, &headers, acp_store, &state).await
-        }
-        "session/inject" => {
-            handle_session_inject(&req, &headers, acp_store).await
-        }
+        "session/prompt" => handle_session_prompt(&req, &headers, acp_store, &state).await,
+        "session/inject" => handle_session_inject(&req, &headers, acp_store).await,
         _ => (
             StatusCode::BAD_REQUEST,
-            Json(jsonrpc_error(&req.id, -32601, &format!("Unknown method: {}", req.method))),
+            Json(jsonrpc_error(
+                &req.id,
+                -32601,
+                &format!("Unknown method: {}", req.method),
+            )),
         )
             .into_response(),
     }
 }
 
 /// `DELETE /acp` — tear down a transport session.
-pub async fn handle_acp_delete(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn handle_acp_delete(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let acp_store = match state.acp_sessions.as_ref() {
         Some(store) => store,
         None => {
@@ -565,7 +561,14 @@ async fn handle_session_prompt(
         tracing::info!("ACP agent task spawned, calling run_acp_agent_loop");
         let inner_tx = tx.clone();
         let join_result = tokio::spawn(async move {
-            run_acp_agent_loop(config, &prompt_text, existing_history, Some(injection_rx), inner_tx).await
+            run_acp_agent_loop(
+                config,
+                &prompt_text,
+                existing_history,
+                Some(injection_rx),
+                inner_tx,
+            )
+            .await
         })
         .await;
 
@@ -600,7 +603,11 @@ async fn handle_session_prompt(
             Err(join_err) => {
                 if join_err.is_cancelled() {
                     tracing::info!("ACP agent task was cancelled (session evicted or replaced)");
-                    let err = jsonrpc_error(&request_id, -32000, "Task cancelled: session was replaced or deleted");
+                    let err = jsonrpc_error(
+                        &request_id,
+                        -32000,
+                        "Task cancelled: session was replaced or deleted",
+                    );
                     let _ = tx_panic.send(sse_line(&err)).await;
                 } else {
                     let panic_msg = if join_err.is_panic() {
@@ -616,11 +623,8 @@ async fn handle_session_prompt(
                         format!("task error: {join_err}")
                     };
                     tracing::error!(panic = %panic_msg, "ACP agent loop PANICKED");
-                    let err = jsonrpc_error(
-                        &request_id,
-                        -32000,
-                        &format!("Agent panic: {panic_msg}"),
-                    );
+                    let err =
+                        jsonrpc_error(&request_id, -32000, &format!("Agent panic: {panic_msg}"));
                     let _ = tx_panic.send(sse_line(&err)).await;
                 }
             }
@@ -701,10 +705,7 @@ async fn handle_session_inject(
                         inject_len = inject_text.len(),
                         "ACP session/inject: message queued"
                     );
-                    let result = jsonrpc_result(
-                        &req.id,
-                        serde_json::json!({"injected": true}),
-                    );
+                    let result = jsonrpc_result(&req.id, serde_json::json!({"injected": true}));
                     sse_response(sse_line(&result))
                 }
                 Err(_) => {
@@ -760,7 +761,8 @@ async fn run_acp_agent_loop(
         "run_acp_agent_loop: calling process_message_with_history"
     );
     let result =
-        crate::agent::process_message_with_history(config, message, existing_history, injection_rx).await;
+        crate::agent::process_message_with_history(config, message, existing_history, injection_rx)
+            .await;
     match &result {
         Ok((text, hist)) => tracing::info!(
             response_len = text.len(),
@@ -800,10 +802,7 @@ mod tests {
         session.agent_session_id = Some("test-agent-123".to_string());
         store.update(session);
         let updated = store.get(&id).unwrap();
-        assert_eq!(
-            updated.agent_session_id.as_deref(),
-            Some("test-agent-123")
-        );
+        assert_eq!(updated.agent_session_id.as_deref(), Some("test-agent-123"));
     }
 
     #[test]
@@ -918,7 +917,13 @@ mod tests {
         assert!(!session_id.is_empty());
 
         // Content-Type must be text/event-stream
-        let ct = resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert!(ct.contains("text/event-stream"));
 
         // Body contains JSON-RPC result with serverInfo
@@ -947,7 +952,10 @@ mod tests {
         let resp = handle_session_new(&req, &headers, &store);
         let body = extract_sse_body(resp).await;
         let msg = parse_sse_jsonrpc(&body);
-        assert!(msg["error"]["message"].as_str().unwrap().contains("Invalid or expired"));
+        assert!(msg["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid or expired"));
     }
 
     #[tokio::test]
@@ -1013,7 +1021,9 @@ mod tests {
 
         // Simulate first prompt adding to history
         let mut session = store.get(&id).unwrap();
-        session.history.push(crate::providers::ChatMessage::user("first prompt"));
+        session
+            .history
+            .push(crate::providers::ChatMessage::user("first prompt"));
         session
             .history
             .push(crate::providers::ChatMessage::assistant("first response"));
@@ -1025,10 +1035,14 @@ mod tests {
 
         // Simulate second prompt appending to history
         let mut session = store.get(&id).unwrap();
-        session.history.push(crate::providers::ChatMessage::user("follow-up"));
         session
             .history
-            .push(crate::providers::ChatMessage::assistant("follow-up response"));
+            .push(crate::providers::ChatMessage::user("follow-up"));
+        session
+            .history
+            .push(crate::providers::ChatMessage::assistant(
+                "follow-up response",
+            ));
         store.update(session);
 
         // Verify full history chain
@@ -1045,7 +1059,8 @@ mod tests {
         // Update session 1
         let mut s1 = store.get(&id1).unwrap();
         s1.agent_session_id = Some("agent-1".into());
-        s1.history.push(crate::providers::ChatMessage::user("session 1 msg"));
+        s1.history
+            .push(crate::providers::ChatMessage::user("session 1 msg"));
         store.update(s1);
 
         // Update session 2
@@ -1107,9 +1122,8 @@ mod tests {
         let store = AcpSessionStore::new(3600);
         let id = store.create();
 
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<
-            crate::channels::injection::InjectedMessage,
-        >();
+        let (tx, _rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::channels::injection::InjectedMessage>();
 
         let mut session = store.get(&id).unwrap();
         session.injection_tx = Some(tx);
@@ -1125,9 +1139,8 @@ mod tests {
         let id = store.create();
 
         // Set injection_tx
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<
-            crate::channels::injection::InjectedMessage,
-        >();
+        let (tx, _rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::channels::injection::InjectedMessage>();
         let mut session = store.get(&id).unwrap();
         session.injection_tx = Some(tx);
         store.update(session);
@@ -1174,9 +1187,8 @@ mod tests {
     async fn session_inject_with_active_channel_queues_message() {
         let store = AcpSessionStore::new(3600);
         let transport_id = store.create();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<
-            crate::channels::injection::InjectedMessage,
-        >();
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::channels::injection::InjectedMessage>();
         let mut session = store.get(&transport_id).unwrap();
         session.agent_session_id = Some("acp:test-456".to_string());
         session.injection_tx = Some(tx);
@@ -1199,7 +1211,9 @@ mod tests {
         let msg = parse_sse_jsonrpc(&body);
         assert_eq!(msg["result"]["injected"], true);
 
-        let injected = rx.try_recv().expect("should have received injected message");
+        let injected = rx
+            .try_recv()
+            .expect("should have received injected message");
         assert_eq!(injected.content, "CORRECTION: use SQLite");
         assert_eq!(injected.channel, "acp");
     }
@@ -1232,9 +1246,8 @@ mod tests {
     async fn session_inject_empty_message_returns_error() {
         let store = AcpSessionStore::new(3600);
         let transport_id = store.create();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<
-            crate::channels::injection::InjectedMessage,
-        >();
+        let (tx, _rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::channels::injection::InjectedMessage>();
         let mut session = store.get(&transport_id).unwrap();
         session.injection_tx = Some(tx);
         store.update(session);
@@ -1264,9 +1277,8 @@ mod tests {
     async fn session_inject_closed_channel_returns_error() {
         let store = AcpSessionStore::new(3600);
         let transport_id = store.create();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
-            crate::channels::injection::InjectedMessage,
-        >();
+        let (tx, rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::channels::injection::InjectedMessage>();
         let mut session = store.get(&transport_id).unwrap();
         session.injection_tx = Some(tx);
         store.update(session);

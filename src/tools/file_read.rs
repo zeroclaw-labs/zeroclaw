@@ -413,7 +413,7 @@ mod tests {
 
         let tool = FileReadTool::new(test_security_allows_outside_workspace(workspace.clone()));
         let result = tool
-            .execute(json!({"path": format!("~/{}", target_rel)}))
+            .execute(json!({ "path": format!("~/{}", target_rel) }))
             .await
             .unwrap();
         assert!(

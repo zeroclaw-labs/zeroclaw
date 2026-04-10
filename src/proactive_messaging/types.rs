@@ -117,9 +117,7 @@ pub enum GuardrailDecision {
 /// Why a proactive message was blocked.
 #[derive(Debug, Clone)]
 pub enum GuardrailDenialReason {
-    QuietHours {
-        window_end_description: String,
-    },
+    QuietHours { window_end_description: String },
     RateLimitHourly,
     RateLimitDaily,
     QueueFull,

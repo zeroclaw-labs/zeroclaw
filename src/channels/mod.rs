@@ -16,7 +16,6 @@
 
 pub(crate) mod ack_reaction;
 pub mod acp;
-pub(crate) mod injection;
 pub mod bluebubbles;
 pub mod clawdtalk;
 pub mod cli;
@@ -25,6 +24,7 @@ pub mod discord;
 pub mod email_channel;
 pub mod github;
 pub mod imessage;
+pub(crate) mod injection;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
 pub mod lark;
@@ -94,14 +94,14 @@ use crate::security::{LeakDetector, LeakResult, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
+use chrono::{DateTime, FixedOffset, Utc};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use arc_swap::ArcSwap;
-use chrono::{DateTime, FixedOffset, Utc};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
@@ -1229,9 +1229,12 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         recovery: crate::config::RecoveryConfig::default(),
         strip_prior_reasoning: false,
         context_window_tokens: 128_000,
-        loop_detection_no_progress_threshold: crate::config::AgentConfig::default().loop_detection_no_progress_threshold,
-        loop_detection_ping_pong_cycles: crate::config::AgentConfig::default().loop_detection_ping_pong_cycles,
-        loop_detection_failure_streak: crate::config::AgentConfig::default().loop_detection_failure_streak,
+        loop_detection_no_progress_threshold: crate::config::AgentConfig::default()
+            .loop_detection_no_progress_threshold,
+        loop_detection_ping_pong_cycles: crate::config::AgentConfig::default()
+            .loop_detection_ping_pong_cycles,
+        loop_detection_failure_streak: crate::config::AgentConfig::default()
+            .loop_detection_failure_streak,
     }
 }
 
@@ -3984,9 +3987,8 @@ or tune thresholds in config.",
                         accumulated.push_str(visible_delta);
                     }
                 }
-                let display_text = with_thinking_prefix(
-                    &strip_progress_section_markers(&accumulated),
-                );
+                let display_text =
+                    with_thinking_prefix(&strip_progress_section_markers(&accumulated));
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &display_text)
                     .await
@@ -4214,9 +4216,7 @@ or tune thresholds in config.",
                     compact_sender_history(ctx.as_ref(), &history_key);
                 }
                 history.push(ChatMessage::user(
-                    crate::agent::recovery::recovery_prompt_attempt_final(
-                        &persisted_user_content,
-                    ),
+                    crate::agent::recovery::recovery_prompt_attempt_final(&persisted_user_content),
                 ));
             }
 
@@ -4251,9 +4251,7 @@ or tune thresholds in config.",
                     Some(route.model.as_str()),
                     None,
                     Some(true),
-                    Some(&format!(
-                        "recovered on attempt {recovery_attempt}"
-                    )),
+                    Some(&format!("recovered on attempt {recovery_attempt}")),
                     serde_json::json!({
                         "recovery_attempts": recovery_attempt,
                     }),
@@ -4464,26 +4462,20 @@ or tune thresholds in config.",
                         &delivered_response,
                     ) {
                         store
-                            .add(
-                                crate::heartbeat::pending_followups::PendingFollowup {
-                                    channel: msg.channel.clone(),
-                                    reply_target: msg.reply_target.clone(),
-                                    history_key: history_key.clone(),
-                                    created_at: std::time::SystemTime::now(),
-                                    ttl_secs: runtime_defaults
-                                        .recovery
-                                        .stale_followup_timeout_secs,
-                                    context_summary:
-                                        crate::heartbeat::pending_followups::truncate_for_summary(
-                                            &delivered_response,
-                                            200,
-                                        ),
-                                    nudge_count: 0,
-                                    max_nudges: runtime_defaults
-                                        .recovery
-                                        .stale_followup_max_nudges,
-                                },
-                            )
+                            .add(crate::heartbeat::pending_followups::PendingFollowup {
+                                channel: msg.channel.clone(),
+                                reply_target: msg.reply_target.clone(),
+                                history_key: history_key.clone(),
+                                created_at: std::time::SystemTime::now(),
+                                ttl_secs: runtime_defaults.recovery.stale_followup_timeout_secs,
+                                context_summary:
+                                    crate::heartbeat::pending_followups::truncate_for_summary(
+                                        &delivered_response,
+                                        200,
+                                    ),
+                                nudge_count: 0,
+                                max_nudges: runtime_defaults.recovery.stale_followup_max_nudges,
+                            })
                             .await;
                     }
                 }
@@ -10440,9 +10432,12 @@ BTC is currently around $65,000 based on latest tool output."#
                         recovery: crate::config::RecoveryConfig::default(),
                         strip_prior_reasoning: false,
                         context_window_tokens: 128_000,
-                        loop_detection_no_progress_threshold: crate::config::AgentConfig::default().loop_detection_no_progress_threshold,
-                        loop_detection_ping_pong_cycles: crate::config::AgentConfig::default().loop_detection_ping_pong_cycles,
-                        loop_detection_failure_streak: crate::config::AgentConfig::default().loop_detection_failure_streak,
+                        loop_detection_no_progress_threshold: crate::config::AgentConfig::default()
+                            .loop_detection_no_progress_threshold,
+                        loop_detection_ping_pong_cycles: crate::config::AgentConfig::default()
+                            .loop_detection_ping_pong_cycles,
+                        loop_detection_failure_streak: crate::config::AgentConfig::default()
+                            .loop_detection_failure_streak,
                     },
                     perplexity_filter: crate::config::PerplexityFilterConfig::default(),
                     outbound_leak_guard: crate::config::OutboundLeakGuardConfig::default(),
@@ -12098,14 +12093,24 @@ BTC is currently around $65,000 based on latest tool output."#
         let mem = SqliteMemory::new(tmp.path()).unwrap();
 
         // Store two entries — "old" first, "recent" second
-        mem.store("fact_old", "Old fact from last week", MemoryCategory::Conversation, None)
-            .await
-            .unwrap();
+        mem.store(
+            "fact_old",
+            "Old fact from last week",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
         // Small delay so timestamps differ
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        mem.store("fact_recent", "Recent fact from today", MemoryCategory::Conversation, None)
-            .await
-            .unwrap();
+        mem.store(
+            "fact_recent",
+            "Recent fact from today",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
 
         let context = build_memory_context(&mem, "fact", 0.0, None).await;
 
@@ -13277,7 +13282,9 @@ BTC is currently around $65,000 based on latest tool output."#;
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new(ArcSwap::from_pointee("You are a helpful assistant.".to_string())),
+            system_prompt: Arc::new(ArcSwap::from_pointee(
+                "You are a helpful assistant.".to_string(),
+            )),
             prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
@@ -13358,7 +13365,9 @@ BTC is currently around $65,000 based on latest tool output."#;
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new(ArcSwap::from_pointee("You are a helpful assistant.".to_string())),
+            system_prompt: Arc::new(ArcSwap::from_pointee(
+                "You are a helpful assistant.".to_string(),
+            )),
             prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,

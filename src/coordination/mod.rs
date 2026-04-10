@@ -1659,7 +1659,7 @@ mod tests {
                     CoordinationPayload::DelegateTask {
                         task_id: format!("task-{index}"),
                         summary: format!("work-{index}"),
-                        metadata: json!({"idx": index}),
+                        metadata: json!({ "idx": index }),
                     },
                 );
                 envelope.id = format!("msg-{index}");

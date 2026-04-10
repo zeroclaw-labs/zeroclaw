@@ -437,7 +437,7 @@ fn handle_streaming(
                     let sanitized = crate::providers::sanitize_api_error(&e.to_string());
                     record_failure(&state, &provider_label, &model_clone, duration, &sanitized);
 
-                    let error_json = serde_json::json!({"error": sanitized});
+                    let error_json = serde_json::json!({ "error": sanitized });
                     let output = format!("data: {error_json}\n\ndata: [DONE]\n\n");
                     Ok(axum::body::Bytes::from(output))
                 }
@@ -493,7 +493,7 @@ fn handle_streaming(
                     let sanitized = crate::providers::sanitize_api_error(&e.to_string());
                     record_failure(&state, &provider_label, &model_clone, duration, &sanitized);
 
-                    let error_json = serde_json::json!({"error": sanitized});
+                    let error_json = serde_json::json!({ "error": sanitized });
                     let output = format!("data: {error_json}\n\ndata: [DONE]\n\n");
                     Ok(axum::body::Bytes::from(output))
                 }
@@ -577,7 +577,7 @@ fn handle_streaming(
                 duration,
                 &msg,
             );
-            let error_json = serde_json::json!({"error": msg});
+            let error_json = serde_json::json!({ "error": msg });
             Ok(axum::body::Bytes::from(format!("data: {error_json}\n\n")))
         }
     });

@@ -650,9 +650,9 @@ client_secret = "secret"
     fn extract_text_content_bounds_rich_text_recursion_depth() {
         let mut deep = serde_json::json!({"text": "deep-content"});
         for _ in 0..24 {
-            deep = serde_json::json!({"children": [deep]});
+            deep = serde_json::json!({ "children": [deep] });
         }
-        let data = serde_json::json!({"richText": deep});
+        let data = serde_json::json!({ "richText": deep });
 
         assert_eq!(DingTalkChannel::extract_text_content(&data), None);
     }

@@ -147,7 +147,8 @@ impl Tool for ManageOutboundQueueTool {
             }
             "keep" => Ok(ToolResult {
                 success: true,
-                output: "Acknowledged. Queued messages will be kept for later delivery.".to_string(),
+                output: "Acknowledged. Queued messages will be kept for later delivery."
+                    .to_string(),
                 error: None,
             }),
             other => Ok(ToolResult {

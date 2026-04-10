@@ -1739,7 +1739,7 @@ mod tests {
                 "description": "Test action"
             }));
         }
-        let json_str = json!({"items": items}).to_string();
+        let json_str = json!({ "items": items }).to_string();
         let resp: ComposioToolsResponse = serde_json::from_str(&json_str).unwrap();
         assert_eq!(resp.items.len(), 100);
     }

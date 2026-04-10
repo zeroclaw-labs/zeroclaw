@@ -1,8 +1,6 @@
 use super::store;
 use super::types::{GuardrailDecision, GuardrailDenialReason, MessagePriority};
-use crate::config::{
-    ProactiveMessagingConfig, ProactiveMessagingRateLimits, QuietHoursWindow,
-};
+use crate::config::{ProactiveMessagingConfig, ProactiveMessagingRateLimits, QuietHoursWindow};
 use chrono::{Duration, Timelike, Utc};
 use std::path::Path;
 

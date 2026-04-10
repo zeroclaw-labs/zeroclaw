@@ -3738,14 +3738,10 @@ fn default_non_cli_excluded_tools() -> Vec<String> {
 }
 
 fn default_private_session_excluded_tools() -> Vec<String> {
-    [
-        "memory_store",
-        "memory_forget",
-        "memory_observe",
-    ]
-    .into_iter()
-    .map(std::string::ToString::to_string)
-    .collect()
+    ["memory_store", "memory_forget", "memory_observe"]
+        .into_iter()
+        .map(std::string::ToString::to_string)
+        .collect()
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -4453,14 +4449,30 @@ pub struct RecoveryConfig {
     pub stale_followup_max_nudges: u32,
 }
 
-fn default_recovery_enabled() -> bool { true }
-fn default_recovery_max_attempts() -> u32 { 2 }
-fn default_recovery_backoff_base_ms() -> u64 { 3000 }
-fn default_recovery_backoff_multiplier() -> f64 { 3.0 }
-fn default_recovery_temperature() -> f64 { 0.3 }
-fn default_recovery_compress_on_final() -> bool { true }
-fn default_stale_followup_timeout() -> u64 { 300 }
-fn default_stale_followup_max_nudges() -> u32 { 2 }
+fn default_recovery_enabled() -> bool {
+    true
+}
+fn default_recovery_max_attempts() -> u32 {
+    2
+}
+fn default_recovery_backoff_base_ms() -> u64 {
+    3000
+}
+fn default_recovery_backoff_multiplier() -> f64 {
+    3.0
+}
+fn default_recovery_temperature() -> f64 {
+    0.3
+}
+fn default_recovery_compress_on_final() -> bool {
+    true
+}
+fn default_stale_followup_timeout() -> u64 {
+    300
+}
+fn default_stale_followup_max_nudges() -> u32 {
+    2
+}
 
 impl Default for RecoveryConfig {
     fn default() -> Self {
@@ -8359,7 +8371,12 @@ impl Config {
         }
 
         let mut seen_private_excluded = std::collections::HashSet::new();
-        for (i, tool_name) in self.autonomy.private_session_excluded_tools.iter().enumerate() {
+        for (i, tool_name) in self
+            .autonomy
+            .private_session_excluded_tools
+            .iter()
+            .enumerate()
+        {
             let normalized = tool_name.trim();
             if normalized.is_empty() {
                 anyhow::bail!("autonomy.private_session_excluded_tools[{i}] must not be empty");
@@ -9660,7 +9677,6 @@ impl Config {
                 self.gateway.paired_tokens = parsed;
             }
         }
-
     }
 
     pub async fn save(&self) -> Result<()> {
@@ -12647,9 +12663,9 @@ requires_openai_auth = true
         config.default_provider = Some("openai".to_string());
         config.supports_responses_fallback = Some(false);
 
-        let err = config.validate().expect_err(
-            "supports_responses_fallback should be rejected for non-custom provider",
-        );
+        let err = config
+            .validate()
+            .expect_err("supports_responses_fallback should be rejected for non-custom provider");
         assert!(err.to_string().contains(
             "supports_responses_fallback is only valid when default_provider uses the custom:<url> format"
         ));

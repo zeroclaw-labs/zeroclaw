@@ -44,19 +44,14 @@ pub(super) fn estimated_history_tokens(history: &[ChatMessage]) -> usize {
 /// Providers like Anthropic and OpenAI filter stale reasoning server-side,
 /// but proxy stacks (e.g. LiteLLM → llama.cpp) pass everything through.
 pub(super) fn strip_prior_reasoning(messages: &mut [ChatMessage]) {
-    let last_assistant_idx = messages
-        .iter()
-        .rposition(|m| m.role == "assistant");
+    let last_assistant_idx = messages.iter().rposition(|m| m.role == "assistant");
     for (i, msg) in messages.iter_mut().enumerate() {
         if msg.role != "assistant" || Some(i) == last_assistant_idx {
             continue;
         }
         if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&msg.content) {
             if value.get("reasoning_content").is_some() {
-                value
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("reasoning_content");
+                value.as_object_mut().unwrap().remove("reasoning_content");
                 msg.content = value.to_string();
             }
         }
@@ -300,9 +295,8 @@ pub(crate) async fn checkpoint_conversation(
         return "Nothing to checkpoint — conversation is empty.".to_string();
     }
 
-    let transcript = build_compaction_transcript(
-        &non_system.into_iter().cloned().collect::<Vec<_>>(),
-    );
+    let transcript =
+        build_compaction_transcript(&non_system.into_iter().cloned().collect::<Vec<_>>());
 
     // Step 1: Extract and persist durable facts.
     let fact_count_before = memory.count().await.unwrap_or(0);
@@ -351,7 +345,10 @@ pub(crate) async fn checkpoint_conversation(
         .await
     {
         Ok(()) => {
-            tracing::info!("Checkpoint saved: {key} ({} chars, {facts_stored} new facts)", content.len());
+            tracing::info!(
+                "Checkpoint saved: {key} ({} chars, {facts_stored} new facts)",
+                content.len()
+            );
             let mut msg = format!(
                 "Checkpoint saved ({} conversation turns summarized).",
                 history.iter().filter(|m| m.role != "system").count()
@@ -892,10 +889,16 @@ mod tests {
 
         let stored = mem.stored.lock().unwrap();
         // Should have: 1 fact + 1 summary = 2 entries
-        assert!(stored.len() >= 2, "expected at least 2 stored entries, got {}", stored.len());
+        assert!(
+            stored.len() >= 2,
+            "expected at least 2 stored entries, got {}",
+            stored.len()
+        );
 
         // Verify the fact was stored as Core
-        let fact = stored.iter().find(|(k, _, _)| k.starts_with("compaction_fact_"));
+        let fact = stored
+            .iter()
+            .find(|(k, _, _)| k.starts_with("compaction_fact_"));
         assert!(fact.is_some(), "should store at least one durable fact");
         assert_eq!(fact.unwrap().2, "Core");
 
@@ -918,14 +921,45 @@ mod tests {
 
         #[async_trait]
         impl Memory for NullMemory {
-            async fn store(&self, _k: &str, _c: &str, _cat: MemoryCategory, _s: Option<&str>) -> anyhow::Result<()> { Ok(()) }
-            async fn recall(&self, _q: &str, _l: usize, _s: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> { Ok(vec![]) }
-            async fn get(&self, _k: &str) -> anyhow::Result<Option<MemoryEntry>> { Ok(None) }
-            async fn list(&self, _c: Option<&MemoryCategory>, _s: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> { Ok(vec![]) }
-            async fn forget(&self, _k: &str) -> anyhow::Result<bool> { Ok(true) }
-            async fn count(&self) -> anyhow::Result<usize> { Ok(0) }
-            async fn health_check(&self) -> bool { true }
-            fn name(&self) -> &str { "null" }
+            async fn store(
+                &self,
+                _k: &str,
+                _c: &str,
+                _cat: MemoryCategory,
+                _s: Option<&str>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn recall(
+                &self,
+                _q: &str,
+                _l: usize,
+                _s: Option<&str>,
+            ) -> anyhow::Result<Vec<MemoryEntry>> {
+                Ok(vec![])
+            }
+            async fn get(&self, _k: &str) -> anyhow::Result<Option<MemoryEntry>> {
+                Ok(None)
+            }
+            async fn list(
+                &self,
+                _c: Option<&MemoryCategory>,
+                _s: Option<&str>,
+            ) -> anyhow::Result<Vec<MemoryEntry>> {
+                Ok(vec![])
+            }
+            async fn forget(&self, _k: &str) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+            async fn count(&self) -> anyhow::Result<usize> {
+                Ok(0)
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+            fn name(&self) -> &str {
+                "null"
+            }
         }
 
         let mem = NullMemory;

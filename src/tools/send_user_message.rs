@@ -116,9 +116,7 @@ impl Tool for SendUserMessageTool {
                 match deliver_now(&self.config, channel, recipient, message).await {
                     Ok(()) => Ok(ToolResult {
                         success: true,
-                        output: format!(
-                            "Message sent to {recipient} on {channel}."
-                        ),
+                        output: format!("Message sent to {recipient} on {channel}."),
                         error: None,
                     }),
                     Err(e) => Ok(ToolResult {

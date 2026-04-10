@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 fn db_path(workspace_dir: &Path) -> PathBuf {
-    workspace_dir
-        .join("proactive_messaging")
-        .join("queue.db")
+    workspace_dir.join("proactive_messaging").join("queue.db")
 }
 
 fn with_connection<T>(workspace_dir: &Path, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -181,8 +179,9 @@ pub fn clear_messages(
             }
             Ok(count)
         } else {
-            let mut sql =
-                String::from("UPDATE outbound_queue SET status = 'cleared' WHERE status = 'pending'");
+            let mut sql = String::from(
+                "UPDATE outbound_queue SET status = 'cleared' WHERE status = 'pending'",
+            );
             let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
             if let Some(r) = recipient {
                 sql.push_str(" AND recipient = ?");
@@ -268,9 +267,7 @@ fn row_to_queued_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedMess
         channel: row.get(1)?,
         recipient: row.get(2)?,
         message: row.get(3)?,
-        priority: priority_str
-            .parse()
-            .unwrap_or(MessagePriority::Normal),
+        priority: priority_str.parse().unwrap_or(MessagePriority::Normal),
         reason_queued: row.get(5)?,
         source_context: row.get(6)?,
         created_at: DateTime::parse_from_rfc3339(&created_at_str)
@@ -279,9 +276,7 @@ fn row_to_queued_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedMess
         expires_at: DateTime::parse_from_rfc3339(&expires_at_str)
             .unwrap_or_else(|_| DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z").unwrap())
             .with_timezone(&Utc),
-        status: status_str
-            .parse()
-            .unwrap_or(MessageStatus::Pending),
+        status: status_str.parse().unwrap_or(MessageStatus::Pending),
     })
 }
 
@@ -338,8 +333,7 @@ mod tests {
         let pending = list_pending(ws, None, None).unwrap();
         assert!(pending.is_empty());
 
-        let sent_count =
-            count_sent_in_window(ws, Utc::now() - Duration::hours(1)).unwrap();
+        let sent_count = count_sent_in_window(ws, Utc::now() - Duration::hours(1)).unwrap();
         assert_eq!(sent_count, 1);
     }
 
@@ -349,7 +343,14 @@ mod tests {
         let ws = tmp.path();
 
         let msg = enqueue_message(
-            ws, "signal", "+1", "m1", MessagePriority::Normal, None, None, 24,
+            ws,
+            "signal",
+            "+1",
+            "m1",
+            MessagePriority::Normal,
+            None,
+            None,
+            24,
         )
         .unwrap();
 
@@ -393,7 +394,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
 
-        enqueue_message(ws, "sig", "+1", "a", MessagePriority::Normal, None, None, 24).unwrap();
+        enqueue_message(
+            ws,
+            "sig",
+            "+1",
+            "a",
+            MessagePriority::Normal,
+            None,
+            None,
+            24,
+        )
+        .unwrap();
         enqueue_message(ws, "sig", "+1", "b", MessagePriority::High, None, None, 24).unwrap();
 
         assert_eq!(count_pending(ws).unwrap(), 2);
@@ -404,9 +415,28 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
 
-        enqueue_message(ws, "signal", "+1", "a", MessagePriority::Normal, None, None, 24).unwrap();
-        enqueue_message(ws, "telegram", "99", "b", MessagePriority::Normal, None, None, 24)
-            .unwrap();
+        enqueue_message(
+            ws,
+            "signal",
+            "+1",
+            "a",
+            MessagePriority::Normal,
+            None,
+            None,
+            24,
+        )
+        .unwrap();
+        enqueue_message(
+            ws,
+            "telegram",
+            "99",
+            "b",
+            MessagePriority::Normal,
+            None,
+            None,
+            24,
+        )
+        .unwrap();
 
         let signal_only = list_pending(ws, None, Some("signal")).unwrap();
         assert_eq!(signal_only.len(), 1);

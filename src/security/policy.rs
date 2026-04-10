@@ -890,9 +890,7 @@ impl SecurityPolicy {
             }
 
             if contains_unquoted_single_ampersand(command) {
-                return Err(
-                    "command contains disallowed background chaining operator '&'".into(),
-                );
+                return Err("command contains disallowed background chaining operator '&'".into());
             }
         }
 

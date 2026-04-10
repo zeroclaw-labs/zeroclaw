@@ -204,7 +204,10 @@ impl McpTransportConn for HttpTransport {
             tracing::info!("MCP HTTP: sending Mcp-Session-Id: {sid}");
             req = req.header("Mcp-Session-Id", sid);
         } else {
-            tracing::info!("MCP HTTP: no session ID to send (method={})", request.method);
+            tracing::info!(
+                "MCP HTTP: no session ID to send (method={})",
+                request.method
+            );
         }
 
         let resp = req
