@@ -262,11 +262,20 @@ work list.
 | ADR-005: Memory backends (SQLite + Markdown) | Design | `docs/architecture/decisions/ADR-005-memory-backends.md` | #5574 | Retroactive. |
 | ADR-006: CLI as the only built-in channel | Design | `docs/architecture/decisions/ADR-006-cli-only-built-in-channel.md` | #5574 | Retroactive. |
 | ADR-007: Gateway extraction | Design | `docs/architecture/decisions/ADR-007-gateway-extraction.md` | #5574 | Retroactive. |
-| Component map (Mermaid) | Landscape | `docs/architecture/diagrams/component-map.md` | #5576 | Depends on #5559 landing — draw against actual crate topology. |
+| Component map (Mermaid) | Landscape | `docs/architecture/diagrams/component-map.md` | #5576 | Depends on #5559 landing — draw against actual crate topology showing foundation + runtime two-layer split. |
 | Data flow diagram (Mermaid) | Landscape | `docs/architecture/diagrams/data-flow.md` | #5576 | Message lifecycle through the new crate structure. |
-| Per-crate `AGENTS.md` files | Consideration | `crates/<name>/AGENTS.md` | #5576 §7 | One per new crate from #5559. Priority: `zeroclaw-api` first. |
+| `crates/zeroclaw-api/AGENTS.md` | Consideration | `crates/zeroclaw-api/AGENTS.md` | #5576 §7 | Highest priority. Contract layer — everything depends on it. Template in RFC §7.3. |
+| `crates/zeroclaw-runtime/AGENTS.md` | Consideration | `crates/zeroclaw-runtime/AGENTS.md` | #5576 §7 | Agent orchestration layer (`agent-runtime` feature). Formerly called `zeroclaw-kernel` in earlier RFC revisions — corrected in Rev. 3. |
+| `crates/zeroclaw-config/AGENTS.md` | Consideration | `crates/zeroclaw-config/AGENTS.md` | #5576 §7 | Foundation crate introduced in #5559. |
+| `crates/zeroclaw-providers/AGENTS.md` | Consideration | `crates/zeroclaw-providers/AGENTS.md` | #5576 §7 | Foundation crate introduced in #5559. |
+| `crates/zeroclaw-memory/AGENTS.md` | Consideration | `crates/zeroclaw-memory/AGENTS.md` | #5576 §7 | Foundation crate introduced in #5559. |
+| `crates/zeroclaw-infra/AGENTS.md` | Consideration | `crates/zeroclaw-infra/AGENTS.md` | #5576 §7 | Foundation crate introduced in #5559. |
+| `crates/zeroclaw-misc/AGENTS.md` | Consideration | `crates/zeroclaw-misc/AGENTS.md` | #5576 §7 | Transitional crate from #5559. AGENTS.md must document decomposition intent and what must NOT be added here. |
+| `crates/zeroclaw-tool-call-parser/AGENTS.md` | Consideration | `crates/zeroclaw-tool-call-parser/AGENTS.md` | #5576 §7 | Self-contained parser crate. Dependency list should be minimal. |
+| Per-crate `AGENTS.md` for any additional crates from #5559 | Consideration | `crates/<name>/AGENTS.md` | #5576 §7 | Confirm full crate list with singlerider once #5559 is merged. |
 | Plugin SDK documentation | Standard | `docs/contributing/plugin-sdk.md` | #5574, #5576 | Depends on WIT interface files landing (Phase 3). |
 | New `docs-contract.md` | Standard | `docs/contributing/docs-contract.md` | #5576 §9 | Replaces current stale version. Full text specified in RFC §9. |
+| Binary size optimization tracking | Landscape | `docs/architecture/binary-size.md` | #5574 §7 | Living doc tracking measured binary sizes per release against vision target (<5 MB RAM). Phase 1 baseline: 6.6 MB foundation (`--no-default-features`, stripped). Optimization pass is a dedicated second workstream after structural decomposition completes. |
 
 ---
 
@@ -276,7 +285,7 @@ work list.
 
 | Destination | Total | Completed |
 |---|---|---|
-| `repo:` | 46 | 0 |
+| `repo:` | 54 | 0 |
 | `wiki:` | 27 | 0 |
 | `delete` | 2 | 0 |
-| **Total** | **75** | **0** |
+| **Total** | **83** | **0** |
