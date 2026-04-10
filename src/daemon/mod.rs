@@ -438,40 +438,13 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             let task_start = std::time::Instant::now();
             let task_prompt = format!("[Heartbeat Task | {}] {}", task.priority, task.text);
 
-            // Recall relevant memories so heartbeat tasks have context awareness.
-            // Exclude `Conversation` memories to prevent chat context from
-            // leaking into scheduled executions (see #5415).
-            let memory_context = if let Some(ref mem) = heartbeat_memory {
-                match mem.recall(&task.text, 5, None, None, None).await {
-                    Ok(entries) if !entries.is_empty() => {
-                        let ctx: String = entries
-                            .iter()
-                            .filter(|e| {
-                                !matches!(
-                                    e.category,
-                                    crate::memory::traits::MemoryCategory::Conversation
-                                )
-                            })
-                            .map(|e| format!("- {}: {}", e.key, e.content))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        if ctx.is_empty() {
-                            None
-                        } else {
-                            Some(format!("[Memory context]\n{ctx}\n"))
-                        }
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            let prompt = match (&session_context, &memory_context) {
-                (Some(sc), Some(mc)) => format!("{mc}\n{sc}\n\n{task_prompt}"),
-                (Some(sc), None) => format!("{sc}\n\n{task_prompt}"),
-                (None, Some(mc)) => format!("{mc}\n\n{task_prompt}"),
-                (None, None) => task_prompt,
+            // Memory context is NOT pre-injected here to avoid double injection.
+            // agent::run internally calls build_context() which handles memory recall.
+            // Pre-injecting would also break the should_skip_autosave_content filter
+            // because effective_msg would start with "[Memory context]" instead of "[Heartbeat Task".
+            let prompt = match &session_context {
+                Some(sc) => format!("{sc}\n\n{task_prompt}"),
+                None => task_prompt,
             };
             let temp = config.default_temperature;
             let phase2_fut = Box::pin(crate::agent::run(

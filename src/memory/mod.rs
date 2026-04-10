@@ -112,6 +112,7 @@ pub fn should_skip_autosave_content(content: &str) -> bool {
     let lowered = normalized.to_ascii_lowercase();
     lowered.starts_with("[cron:")
         || lowered.starts_with("[heartbeat task")
+        || lowered.starts_with("[memory context]")
         || lowered.starts_with("[distilled_")
         || lowered.contains("distilled_index_sig:")
 }
@@ -444,6 +445,12 @@ mod tests {
         ));
         assert!(should_skip_autosave_content(
             "[Heartbeat Task | high] Execute scheduled patrol"
+        ));
+        assert!(should_skip_autosave_content(
+            "[Memory context]\n- key: value\n- another: data"
+        ));
+        assert!(should_skip_autosave_content(
+            "[memory context] some recalled data"
         ));
         assert!(!should_skip_autosave_content(
             "User prefers concise answers."
