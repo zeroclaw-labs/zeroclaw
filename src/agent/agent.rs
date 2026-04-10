@@ -37,6 +37,19 @@ pub enum TurnEvent {
     ToolResult { name: String, output: String },
 }
 
+#[derive(Debug)]
+pub(crate) struct StreamedTurnSuccess {
+    pub(crate) response: String,
+    pub(crate) consumed_messages: Vec<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StreamedTurnError {
+    pub(crate) error: anyhow::Error,
+    pub(crate) committed_response: String,
+    pub(crate) consumed_messages: Vec<String>,
+}
+
 pub struct Agent {
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
@@ -814,6 +827,57 @@ impl Agent {
         self.model_name.clone()
     }
 
+    fn encode_transcript_for_cache_key(messages: &[crate::providers::ChatMessage]) -> String {
+        let mut transcript = String::new();
+        for message in messages.iter().filter(|m| m.role != "system") {
+            transcript.push_str("role=");
+            transcript.push_str(&message.role.len().to_string());
+            transcript.push(':');
+            transcript.push_str(&message.role);
+            transcript.push_str(";content=");
+            transcript.push_str(&message.content.len().to_string());
+            transcript.push(':');
+            transcript.push_str(&message.content);
+            transcript.push('\n');
+        }
+        transcript
+    }
+
+    fn response_cache_key_for_messages(
+        &self,
+        messages: &[crate::providers::ChatMessage],
+        effective_model: &str,
+    ) -> Option<String> {
+        if self.temperature != 0.0 || self.response_cache.is_none() {
+            return None;
+        }
+
+        let system = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.as_str());
+        let transcript = Self::encode_transcript_for_cache_key(messages);
+
+        Some(crate::memory::response_cache::ResponseCache::cache_key(
+            effective_model,
+            system,
+            &transcript,
+        ))
+    }
+
+    fn commit_assistant_output(&mut self, assistant_text: &str, accumulated_response: &mut String) {
+        if assistant_text.is_empty() {
+            return;
+        }
+
+        self.history
+            .push(ConversationMessage::Chat(ChatMessage::assistant(
+                assistant_text.to_string(),
+            )));
+        self.trim_history();
+        accumulated_response.push_str(assistant_text);
+    }
+
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
@@ -823,40 +887,7 @@ impl Agent {
                 )));
         }
 
-        let context = self
-            .memory_loader
-            .load_context(
-                self.memory.as_ref(),
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
-            .await
-            .unwrap_or_default();
-
-        if self.auto_save {
-            let _ = self
-                .memory
-                .store(
-                    "user_msg",
-                    user_message,
-                    MemoryCategory::Conversation,
-                    self.memory_session_id.as_deref(),
-                )
-                .await;
-        }
-
-        let now = chrono::Local::now();
-        let (year, month, day) = (now.year(), now.month(), now.day());
-        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
-        let tz = now.format("%Z");
-        let date_str =
-            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
-
-        let enriched = if context.is_empty() {
-            format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
-        } else {
-            format!("[CURRENT DATE & TIME: {date_str}]\n\n{context}\n\n{user_message}")
-        };
+        let enriched = self.build_enriched_user_message(user_message).await;
 
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
@@ -866,27 +897,8 @@ impl Agent {
         for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
 
-            // Response cache: check before LLM call (only for deterministic, text-only prompts)
-            let cache_key = if self.temperature == 0.0 {
-                self.response_cache.as_ref().map(|_| {
-                    let last_user = messages
-                        .iter()
-                        .rfind(|m| m.role == "user")
-                        .map(|m| m.content.as_str())
-                        .unwrap_or("");
-                    let system = messages
-                        .iter()
-                        .find(|m| m.role == "system")
-                        .map(|m| m.content.as_str());
-                    crate::memory::response_cache::ResponseCache::cache_key(
-                        &effective_model,
-                        system,
-                        last_user,
-                    )
-                })
-            } else {
-                None
-            };
+            // Response cache: key on the full provider-visible transcript.
+            let cache_key = self.response_cache_key_for_messages(&messages, &effective_model);
 
             if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                 if let Ok(Some(cached)) = cache.get(key) {
@@ -994,74 +1006,62 @@ impl Agent {
         user_message: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
     ) -> Result<String> {
-        // ── Preamble (identical to turn) ───────────────────────────────
+        let (response, _) = self
+            .turn_streamed_with_steering(user_message, event_tx, None)
+            .await?;
+        Ok(response)
+    }
+
+    pub async fn turn_streamed_with_steering(
+        &mut self,
+        user_message: &str,
+        event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+        steering_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
+    ) -> Result<(String, Vec<String>)> {
+        match self
+            .turn_streamed_with_steering_state(user_message, event_tx, steering_rx)
+            .await
+        {
+            Ok(outcome) => Ok((outcome.response, outcome.consumed_messages)),
+            Err(err) => Err(err.error),
+        }
+    }
+
+    pub(crate) async fn turn_streamed_with_steering_state(
+        &mut self,
+        user_message: &str,
+        event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+        mut steering_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
+    ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
         if self.history.is_empty() {
-            let system_prompt = self.build_system_prompt()?;
+            let system_prompt = self
+                .build_system_prompt()
+                .map_err(|error| StreamedTurnError {
+                    error,
+                    committed_response: String::new(),
+                    consumed_messages: Vec::new(),
+                })?;
             self.history
                 .push(ConversationMessage::Chat(ChatMessage::system(
                     system_prompt,
                 )));
         }
 
-        let context = self
-            .memory_loader
-            .load_context(
-                self.memory.as_ref(),
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
-            .await
-            .unwrap_or_default();
-
-        if self.auto_save {
-            let _ = self
-                .memory
-                .store(
-                    "user_msg",
-                    user_message,
-                    MemoryCategory::Conversation,
-                    self.memory_session_id.as_deref(),
-                )
-                .await;
-        }
-
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = if context.is_empty() {
-            format!("[{now}] {user_message}")
-        } else {
-            format!("{context}[{now}] {user_message}")
-        };
-
-        self.history
-            .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
-
+        self.append_user_message_to_history(user_message).await;
+        let mut consumed_messages = vec![user_message.to_string()];
         let effective_model = self.classify_model(user_message);
+        let mut accumulated_assistant_response = String::new();
 
-        // ── Turn loop ──────────────────────────────────────────────────
         for _ in 0..self.config.max_tool_iterations {
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            if let Some(steering_rx) = steering_rx.as_mut() {
+                while let Ok(message) = steering_rx.try_recv() {
+                    self.append_user_message_to_history(&message).await;
+                    consumed_messages.push(message);
+                }
+            }
 
-            // Response cache check (same as turn)
-            let cache_key = if self.temperature == 0.0 {
-                self.response_cache.as_ref().map(|_| {
-                    let last_user = messages
-                        .iter()
-                        .rfind(|m| m.role == "user")
-                        .map(|m| m.content.as_str())
-                        .unwrap_or("");
-                    let system = messages
-                        .iter()
-                        .find(|m| m.role == "system")
-                        .map(|m| m.content.as_str());
-                    crate::memory::response_cache::ResponseCache::cache_key(
-                        &effective_model,
-                        system,
-                        last_user,
-                    )
-                })
-            } else {
-                None
-            };
+            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let cache_key = self.response_cache_key_for_messages(&messages, &effective_model);
 
             if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                 if let Ok(Some(cached)) = cache.get(key) {
@@ -1074,16 +1074,21 @@ impl Agent {
                             cached.clone(),
                         )));
                     self.trim_history();
-                    return Ok(cached);
+                    let full_response = if accumulated_assistant_response.is_empty() {
+                        cached.clone()
+                    } else {
+                        format!("{}{}", accumulated_assistant_response, cached)
+                    };
+                    return Ok(StreamedTurnSuccess {
+                        response: full_response,
+                        consumed_messages,
+                    });
                 }
                 self.observer.record_event(&ObserverEvent::CacheMiss {
                     cache_type: "response".into(),
                 });
             }
 
-            // ── Streaming LLM call ────────────────────────────────────
-            // Try streaming first; if the provider returns content we
-            // forward deltas.  Otherwise fall back to non-streaming chat.
             use futures_util::StreamExt;
 
             let stream_opts = crate::providers::traits::StreamOptions::new(true);
@@ -1143,7 +1148,6 @@ impl Agent {
                                     args: serde_json::from_str(&args).unwrap_or_default(),
                                 })
                                 .await;
-                            // NOT pushed to streamed_tool_calls — already executed by proxy
                         }
                         crate::providers::traits::StreamEvent::PreExecutedToolResult {
                             name,
@@ -1156,13 +1160,9 @@ impl Agent {
                     Err(_) => break,
                 }
             }
-            // Drop the stream so we release the borrow on provider.
             drop(stream);
 
-            // If streaming produced text, use it as the response and
-            // check for tool calls via the dispatcher.
             let response = if got_stream {
-                // Build a synthetic ChatResponse from streamed text
                 crate::providers::ChatResponse {
                     text: Some(streamed_text),
                     tool_calls: streamed_tool_calls,
@@ -1170,7 +1170,6 @@ impl Agent {
                     reasoning_content: None,
                 }
             } else {
-                // Fall back to non-streaming chat
                 match self
                     .provider
                     .chat(
@@ -1188,7 +1187,13 @@ impl Agent {
                     .await
                 {
                     Ok(resp) => resp,
-                    Err(err) => return Err(err),
+                    Err(error) => {
+                        return Err(StreamedTurnError {
+                            error,
+                            committed_response: accumulated_assistant_response,
+                            consumed_messages,
+                        });
+                    }
                 }
             };
 
@@ -1200,7 +1205,24 @@ impl Agent {
                     text
                 };
 
-                // Store in response cache
+                if let Some(steering_rx) = steering_rx.as_mut() {
+                    let mut drained_any = false;
+                    while let Ok(message) = steering_rx.try_recv() {
+                        if !drained_any {
+                            self.commit_assistant_output(
+                                &final_text,
+                                &mut accumulated_assistant_response,
+                            );
+                            drained_any = true;
+                        }
+                        self.append_user_message_to_history(&message).await;
+                        consumed_messages.push(message);
+                    }
+                    if drained_any {
+                        continue;
+                    }
+                }
+
                 if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                     let token_count = response
                         .usage
@@ -1211,7 +1233,6 @@ impl Agent {
                     let _ = cache.put(key, &effective_model, &final_text, token_count as u32);
                 }
 
-                // If we didn't stream, send the full response as a single chunk
                 if !got_stream && !final_text.is_empty() {
                     let _ = event_tx
                         .send(TurnEvent::Chunk {
@@ -1226,15 +1247,25 @@ impl Agent {
                     )));
                 self.trim_history();
 
-                return Ok(final_text);
+                let full_response = if accumulated_assistant_response.is_empty() {
+                    final_text.clone()
+                } else {
+                    format!("{}{}", accumulated_assistant_response, final_text)
+                };
+                return Ok(StreamedTurnSuccess {
+                    response: full_response,
+                    consumed_messages,
+                });
             }
 
-            // ── Tool calls ─────────────────────────────────────────────
             if !text.is_empty() {
                 self.history
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         text.clone(),
                     )));
+                if got_stream {
+                    accumulated_assistant_response.push_str(&text);
+                }
             }
 
             self.history.push(ConversationMessage::AssistantToolCalls {
@@ -1243,7 +1274,6 @@ impl Agent {
                 reasoning_content: response.reasoning_content.clone(),
             });
 
-            // Notify about each tool call
             for call in &calls {
                 let _ = event_tx
                     .send(TurnEvent::ToolCall {
@@ -1255,7 +1285,6 @@ impl Agent {
 
             let results = self.execute_tools(&calls).await;
 
-            // Notify about each tool result
             for result in &results {
                 let _ = event_tx
                     .send(TurnEvent::ToolResult {
@@ -1270,10 +1299,58 @@ impl Agent {
             self.trim_history();
         }
 
-        anyhow::bail!(
-            "Agent exceeded maximum tool iterations ({})",
-            self.config.max_tool_iterations
-        )
+        Err(StreamedTurnError {
+            error: anyhow::anyhow!(
+                "Agent exceeded maximum tool iterations ({})",
+                self.config.max_tool_iterations
+            ),
+            committed_response: accumulated_assistant_response,
+            consumed_messages,
+        })
+    }
+
+    async fn build_enriched_user_message(&self, user_message: &str) -> String {
+        let context = self
+            .memory_loader
+            .load_context(
+                self.memory.as_ref(),
+                user_message,
+                self.memory_session_id.as_deref(),
+            )
+            .await
+            .unwrap_or_default();
+
+        if self.auto_save {
+            let _ = self
+                .memory
+                .store(
+                    "user_msg",
+                    user_message,
+                    MemoryCategory::Conversation,
+                    self.memory_session_id.as_deref(),
+                )
+                .await;
+        }
+
+        let now = chrono::Local::now();
+        let (year, month, day) = (now.year(), now.month(), now.day());
+        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
+        let tz = now.format("%Z");
+        let date_str =
+            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
+
+        if context.is_empty() {
+            format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
+        } else {
+            format!("[CURRENT DATE & TIME: {date_str}]\n\n{context}\n\n{user_message}")
+        }
+    }
+
+    async fn append_user_message_to_history(&mut self, user_message: &str) {
+        let enriched = self.build_enriched_user_message(user_message).await;
+
+        self.history
+            .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
     }
 
     pub async fn run_single(&mut self, message: &str) -> Result<String> {
@@ -1803,6 +1880,145 @@ mod tests {
             matches!(&history[2], ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi there")
         );
         assert_eq!(history.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn build_enriched_user_message_keeps_turn_prompt_format_for_streamed_path() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let enriched = agent.build_enriched_user_message("hello").await;
+        assert!(enriched.starts_with("[CURRENT DATE & TIME: "));
+        assert!(enriched.ends_with("\n\nhello"));
+    }
+
+    #[test]
+    fn response_cache_key_distinguishes_structurally_different_transcripts() {
+        let single_message = vec![
+            crate::providers::ChatMessage::system("system"),
+            crate::providers::ChatMessage::assistant(
+                "first line
+user:second line",
+            ),
+        ];
+        let split_messages = vec![
+            crate::providers::ChatMessage::system("system"),
+            crate::providers::ChatMessage::assistant("first line"),
+            crate::providers::ChatMessage::user("second line"),
+        ];
+
+        let single_transcript = Agent::encode_transcript_for_cache_key(&single_message);
+        let split_transcript = Agent::encode_transcript_for_cache_key(&split_messages);
+
+        assert_ne!(single_transcript, split_transcript);
+    }
+
+    #[tokio::test]
+    async fn response_cache_keeps_structurally_different_transcripts_distinct() {
+        let unique = format!(
+            "zeroclaw-response-cache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        let workspace_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir should be created");
+
+        let cache = Arc::new(
+            crate::memory::response_cache::ResponseCache::new(&workspace_dir, 5, 32)
+                .expect("response cache should initialize"),
+        );
+
+        let build_memory = || {
+            let memory_cfg = crate::config::MemoryConfig {
+                backend: "none".into(),
+                ..crate::config::MemoryConfig::default()
+            };
+            Arc::from(
+                crate::memory::create_memory(&memory_cfg, &workspace_dir, None)
+                    .expect("memory creation should succeed with valid config"),
+            ) as Arc<dyn Memory>
+        };
+
+        let build_observer =
+            || Arc::from(crate::observability::NoopObserver {}) as Arc<dyn Observer>;
+
+        let mut first_agent = Agent::builder()
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![crate::providers::ChatResponse {
+                    text: Some("cached-one".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                }]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(build_memory())
+            .observer(build_observer())
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(workspace_dir.clone())
+            .temperature(0.0)
+            .response_cache(Some(cache.clone()))
+            .build()
+            .expect("agent builder should succeed with valid config");
+        first_agent.seed_history(&[crate::providers::ChatMessage::assistant(
+            "first line
+user:second line",
+        )]);
+
+        let mut second_agent = Agent::builder()
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![crate::providers::ChatResponse {
+                    text: Some("cached-two".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                }]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(build_memory())
+            .observer(build_observer())
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(workspace_dir.clone())
+            .temperature(0.0)
+            .response_cache(Some(cache))
+            .build()
+            .expect("agent builder should succeed with valid config");
+        second_agent.seed_history(&[
+            crate::providers::ChatMessage::assistant("first line"),
+            crate::providers::ChatMessage::user("second line"),
+        ]);
+
+        let first = first_agent.turn("follow up").await.unwrap();
+        let second = second_agent.turn("follow up").await.unwrap();
+
+        assert_eq!(first, "cached-one");
+        assert_eq!(second, "cached-two");
+
+        let _ = std::fs::remove_dir_all(&workspace_dir);
     }
 
     /// Mock provider that captures whether tool specs were passed to `stream_chat`
