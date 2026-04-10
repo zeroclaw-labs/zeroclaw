@@ -174,7 +174,11 @@ async fn run_agent_job(
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
-    let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
+    let delivery_suffix = match (&job.delivery.channel, &job.delivery.to) {
+        (Some(ch), Some(to)) => format!(" deliver_to:{ch}/{to}"),
+        _ => String::new(),
+    };
+    let prefixed_prompt = format!("[cron:{} {name}{delivery_suffix}] {prompt}", job.id);
     let model_override = job.model.clone();
 
     let run_result = match job.session_target {
@@ -527,6 +531,16 @@ pub(crate) async fn deliver_announcement(
             #[cfg(not(feature = "channel-matrix"))]
             {
                 anyhow::bail!("matrix delivery channel requires `channel-matrix` feature");
+            }
+        }
+        "signal" => {
+            if let Some(live_channel) = crate::channels::get_live_channel("signal") {
+                live_channel.send(&SendMessage::new(output, target)).await?;
+            } else {
+                anyhow::bail!(
+                    "signal delivery requires an active signal channel session; \
+                     start daemon/channels with signal enabled"
+                );
             }
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),

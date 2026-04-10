@@ -24,6 +24,7 @@ pub mod discord;
 pub mod email_channel;
 pub mod github;
 pub mod imessage;
+pub(crate) mod injection;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
 pub mod lark;
@@ -93,6 +94,8 @@ use crate::security::{LeakDetector, LeakResult, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
+use chrono::{DateTime, FixedOffset, Utc};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -227,7 +230,11 @@ enum ChannelRuntimeCommand {
     ApproveTool(String),
     UnapproveTool(String),
     ListApprovals,
+    Checkpoint,
+    PrivateSession,
 }
+
+type PrivateSessionSet = Arc<Mutex<HashSet<String>>>;
 
 const APPROVAL_ALL_TOOLS_ONCE_TOKEN: &str = "__all_tools_once__";
 
@@ -259,6 +266,12 @@ struct ChannelRuntimeDefaults {
     multimodal: crate::config::MultimodalConfig,
     query_classification: crate::config::QueryClassificationConfig,
     model_routes: Vec<crate::config::ModelRouteConfig>,
+    recovery: crate::config::RecoveryConfig,
+    strip_prior_reasoning: bool,
+    context_window_tokens: usize,
+    loop_detection_no_progress_threshold: usize,
+    loop_detection_ping_pong_cycles: usize,
+    loop_detection_failure_streak: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,6 +311,20 @@ const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "zeroclaw.service"
 const OPENRC_STATUS_ARGS: [&str; 2] = ["zeroclaw", "status"];
 const OPENRC_RESTART_ARGS: [&str; 2] = ["zeroclaw", "restart"];
 
+/// Configuration snapshot captured at startup for rebuilding the system prompt
+/// on `/new` without restarting the daemon.
+#[derive(Clone)]
+struct SystemPromptRebuildConfig {
+    /// Owned tool descriptions: `(name, description)`.
+    tool_descs: Vec<(String, String)>,
+    skills: Vec<crate::skills::Skill>,
+    identity_config: crate::config::IdentityConfig,
+    bootstrap_max_chars: Option<usize>,
+    native_tools: bool,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    autonomy: crate::config::AutonomyConfig,
+}
+
 #[derive(Clone)]
 struct ChannelRuntimeContext {
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
@@ -306,7 +333,9 @@ struct ChannelRuntimeContext {
     memory: Arc<dyn Memory>,
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
     observer: Arc<dyn Observer>,
-    system_prompt: Arc<String>,
+    system_prompt: Arc<ArcSwap<String>>,
+    /// Frozen config snapshot used to rebuild the system prompt on `/new`.
+    prompt_rebuild_config: Arc<SystemPromptRebuildConfig>,
     model: Arc<String>,
     temperature: f64,
     auto_save_memory: bool,
@@ -333,6 +362,15 @@ struct ChannelRuntimeContext {
     approval_manager: Arc<ApprovalManager>,
     safety_heartbeat: Option<SafetyHeartbeatConfig>,
     startup_perplexity_filter: crate::config::PerplexityFilterConfig,
+    proactive_messaging: Arc<crate::config::ProactiveMessagingConfig>,
+    /// Sender keys currently in `/private` (ephemeral) mode.
+    /// Private sessions disable auto-save and hide memory tools.
+    private_sessions: PrivateSessionSet,
+    /// Tools excluded when sender is in private mode (from config).
+    private_session_excluded_tools: Vec<String>,
+    /// Per-conversation injection queues for mid-turn message injection.
+    /// Populated when a loop starts for a sender, removed on exit.
+    injection_queues: injection::InjectionQueueMap,
 }
 
 #[derive(Clone)]
@@ -378,6 +416,24 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
 
 fn assistant_memory_key(msg: &traits::ChannelMessage) -> String {
     format!("assistant_resp_{}", conversation_memory_key(msg))
+}
+
+/// Strip the Signal delivery-receipt prefix from message content so that
+/// slash commands are detected from the raw user text.
+///
+/// Signal's `listen()` prepends a `[Message delivery status …]\n\n` block
+/// to `msg.content`.  This is fine for LLM context but breaks command
+/// parsing because the content no longer starts with `/`.
+fn strip_receipt_prefix(content: &str) -> &str {
+    const PREFIX: &str = "[Message delivery status since your last message:\n";
+    let trimmed = content.trim_start();
+    if trimmed.starts_with(PREFIX) {
+        // Find the closing "]\n\n" that ends the receipt block.
+        if let Some(end) = trimmed.find("]\n\n") {
+            return trimmed[end + 3..].trim_start();
+        }
+    }
+    content
 }
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
@@ -772,6 +828,15 @@ fn strip_progress_section_markers(text: &str) -> String {
     text.replace(crate::agent::loop_::DRAFT_PROGRESS_SECTION_START, "")
         .replace(crate::agent::loop_::DRAFT_PROGRESS_SECTION_END, "")
 }
+
+/// Prefix used on intermediate draft updates so the user knows the agent
+/// is still working.  Stripped from the final `finalize_draft` call.
+const DRAFT_THINKING_PREFIX: &str = "Thinking \u{1f4ad}\n";
+
+fn with_thinking_prefix(text: &str) -> String {
+    format!("{DRAFT_THINKING_PREFIX}{text}")
+}
+
 fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
@@ -878,6 +943,8 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
     match base_command.as_str() {
         // History reset commands are safe for all channels.
         "/new" | "/clear" => Some(ChannelRuntimeCommand::NewSession),
+        "/checkpoint" => Some(ChannelRuntimeCommand::Checkpoint),
+        "/private" => Some(ChannelRuntimeCommand::PrivateSession),
         "/approve-all-once" => Some(ChannelRuntimeCommand::RequestAllToolsOnce),
         "/approve-request" => Some(ChannelRuntimeCommand::RequestToolApproval(tail)),
         "/approve-confirm" => Some(ChannelRuntimeCommand::ConfirmToolApproval(tail)),
@@ -1099,6 +1166,12 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         multimodal: config.multimodal.clone(),
         query_classification: config.query_classification.clone(),
         model_routes: config.model_routes.clone(),
+        recovery: config.recovery.clone(),
+        strip_prior_reasoning: config.strip_prior_reasoning,
+        context_window_tokens: config.context_window_tokens,
+        loop_detection_no_progress_threshold: config.agent.loop_detection_no_progress_threshold,
+        loop_detection_ping_pong_cycles: config.agent.loop_detection_ping_pong_cycles,
+        loop_detection_failure_streak: config.agent.loop_detection_failure_streak,
     }
 }
 
@@ -1153,6 +1226,15 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         multimodal: ctx.multimodal.clone(),
         query_classification: ctx.query_classification.clone(),
         model_routes: ctx.model_routes.clone(),
+        recovery: crate::config::RecoveryConfig::default(),
+        strip_prior_reasoning: false,
+        context_window_tokens: 128_000,
+        loop_detection_no_progress_threshold: crate::config::AgentConfig::default()
+            .loop_detection_no_progress_threshold,
+        loop_detection_ping_pong_cycles: crate::config::AgentConfig::default()
+            .loop_detection_ping_pong_cycles,
+        loop_detection_failure_streak: crate::config::AgentConfig::default()
+            .loop_detection_failure_streak,
     }
 }
 
@@ -1192,6 +1274,13 @@ fn snapshot_non_cli_excluded_tools(ctx: &ChannelRuntimeContext) -> Vec<String> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
+}
+
+fn is_sender_private(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
+    ctx.private_sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(sender_key)
 }
 
 fn filtered_tool_specs_for_runtime(
@@ -1817,6 +1906,41 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
         .remove(sender_key);
 }
 
+/// Rebuild the system prompt from identity files and swap it in atomically.
+///
+/// Called on `/new` so that changes to TOOLS.md, AGENTS.md, and other bootstrap
+/// files are picked up without restarting the daemon.
+fn rebuild_system_prompt(ctx: &ChannelRuntimeContext) {
+    let cfg = &ctx.prompt_rebuild_config;
+    let tool_descs: Vec<(&str, &str)> = cfg
+        .tool_descs
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_str()))
+        .collect();
+    let mut prompt = build_system_prompt_with_mode(
+        ctx.workspace_dir.as_path(),
+        ctx.model.as_str(),
+        &tool_descs,
+        &cfg.skills,
+        Some(&cfg.identity_config),
+        cfg.bootstrap_max_chars,
+        cfg.native_tools,
+        cfg.skills_prompt_mode,
+    );
+    if !cfg.native_tools {
+        let excluded: Vec<String> = ctx
+            .non_cli_excluded_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let filtered_specs =
+            filtered_tool_specs_for_runtime(ctx.tools_registry.as_ref(), &excluded);
+        prompt.push_str(&build_tool_instructions_from_specs(&filtered_specs));
+    }
+    prompt.push_str(&build_shell_policy_instructions(&cfg.autonomy));
+    ctx.system_prompt.store(Arc::new(prompt));
+}
+
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
     let mut histories = ctx
         .conversation_histories
@@ -1931,6 +2055,12 @@ fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
     }
 
     if key.trim().to_ascii_lowercase().ends_with("_history") {
+        return true;
+    }
+
+    // Safety net: filter out cron prompts and slash commands that may have
+    // been saved before the write-time filter was deployed.
+    if crate::agent::loop_::should_skip_autosave(content) {
         return true;
     }
 
@@ -2133,8 +2263,11 @@ async fn handle_runtime_command_if_needed(
     msg: &traits::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
 ) -> bool {
-    let is_slash_command = msg.content.trim_start().starts_with('/');
-    let Some(mut command) = parse_runtime_command(&msg.channel, &msg.content) else {
+    // Signal prepends delivery/read receipt metadata to msg.content.
+    // Strip it so slash commands like /private and /new are detected.
+    let user_text = strip_receipt_prefix(&msg.content);
+    let is_slash_command = user_text.trim_start().starts_with('/');
+    let Some(mut command) = parse_runtime_command(&msg.channel, user_text) else {
         return false;
     };
 
@@ -2366,7 +2499,57 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::NewSession => {
             clear_sender_history(ctx, &sender_key);
+            // Also exit private mode so the new session starts clean.
+            ctx.private_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&sender_key);
+            rebuild_system_prompt(ctx);
             "Conversation history cleared. Starting fresh.".to_string()
+        }
+        ChannelRuntimeCommand::Checkpoint => {
+            let history: Vec<ChatMessage> = ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&sender_key)
+                .cloned()
+                .unwrap_or_default();
+
+            if history.is_empty() {
+                "Nothing to checkpoint — no conversation history for this session.".to_string()
+            } else {
+                let current = get_route_selection(ctx, &sender_key);
+                match get_or_create_provider(ctx, &current.provider).await {
+                    Ok(provider) => {
+                        crate::agent::loop_::history::checkpoint_conversation(
+                            &history,
+                            provider.as_ref(),
+                            &current.model,
+                            ctx.memory.as_ref(),
+                        )
+                        .await
+                    }
+                    Err(e) => {
+                        let safe = providers::sanitize_api_error(&e.to_string());
+                        format!("Checkpoint failed — could not initialize provider: {safe}")
+                    }
+                }
+            }
+        }
+        ChannelRuntimeCommand::PrivateSession => {
+            let mut set = ctx
+                .private_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if set.remove(&sender_key) {
+                "Private mode disabled. Auto-save and memory tools restored.".to_string()
+            } else {
+                set.insert(sender_key.clone());
+                "Private mode enabled. Auto-save disabled and memory tools hidden for this session.\n\
+                 Use /private again to return to normal mode, or /new to start a fresh (non-private) session."
+                    .to_string()
+            }
         }
         ChannelRuntimeCommand::RequestAllToolsOnce => {
             let req = ctx.approval_manager.create_non_cli_pending_request(
@@ -2883,14 +3066,19 @@ async fn build_memory_context(
     let mut context = String::new();
 
     if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
-        let mut included = 0usize;
-        let mut used_chars = 0usize;
+        // Collect qualifying entries first, then sort chronologically so the
+        // model sees older context first and the current message last.
+        let mut qualifying: Vec<(usize, String)> = Vec::new();
 
-        for entry in entries.iter().filter(|e| match e.score {
-            Some(score) => score >= min_relevance_score,
-            None => true, // keep entries without a score (e.g. non-vector backends)
-        }) {
-            if included >= MEMORY_CONTEXT_MAX_ENTRIES {
+        for (idx, entry) in entries
+            .iter()
+            .filter(|e| match e.score {
+                Some(score) => score >= min_relevance_score,
+                None => true, // keep entries without a score (e.g. non-vector backends)
+            })
+            .enumerate()
+        {
+            if qualifying.len() >= MEMORY_CONTEXT_MAX_ENTRIES {
                 break;
             }
 
@@ -2904,14 +3092,29 @@ async fn build_memory_context(
                 entry.content.clone()
             };
 
-            let line = format!("- {}: {}\n", entry.key, content);
+            qualifying.push((idx, content));
+        }
+
+        // Sort by timestamp ascending (oldest first) so the model naturally
+        // gives more weight to recent entries near the current message.
+        qualifying.sort_by(|a, b| entries[a.0].timestamp.cmp(&entries[b.0].timestamp));
+
+        let mut used_chars = 0usize;
+        let mut included = 0usize;
+
+        for (idx, content) in &qualifying {
+            let entry = &entries[*idx];
+            let age = format_memory_age(&entry.timestamp);
+            let line = format!("- {} ({}): {}\n", entry.key, age, content);
             let line_chars = line.chars().count();
             if used_chars + line_chars > MEMORY_CONTEXT_MAX_CHARS {
                 break;
             }
 
             if included == 0 {
-                context.push_str("[Memory context]\n");
+                context.push_str(
+                    "[Memory context — recalled from prior conversations, oldest first]\n",
+                );
             }
 
             context.push_str(&line);
@@ -2925,6 +3128,26 @@ async fn build_memory_context(
     }
 
     context
+}
+
+/// Format a memory timestamp as a human-readable relative age string.
+fn format_memory_age(timestamp: &str) -> String {
+    let parsed: Option<DateTime<FixedOffset>> = DateTime::parse_from_rfc3339(timestamp).ok();
+    let Some(ts) = parsed else {
+        return timestamp.to_string();
+    };
+    let delta = Utc::now().signed_duration_since(ts);
+    if delta.num_minutes() < 2 {
+        "just now".to_string()
+    } else if delta.num_minutes() < 60 {
+        format!("{}m ago", delta.num_minutes())
+    } else if delta.num_hours() < 24 {
+        format!("{}h ago", delta.num_hours())
+    } else if delta.num_days() == 1 {
+        "yesterday".to_string()
+    } else {
+        format!("{}d ago", delta.num_days())
+    }
 }
 
 /// Extract a compact summary of tool interactions from history messages added
@@ -3442,6 +3665,12 @@ or tune thresholds in config.",
     }
 
     let history_key = conversation_history_key(&msg);
+
+    // Component 3: clear any pending followup for this sender (conversation continued)
+    if let Some(store) = crate::heartbeat::pending_followups::global_store() {
+        store.remove(&history_key).await;
+    }
+
     let conversation_lock = {
         let mut locks = ctx.conversation_locks.lock().await;
         locks
@@ -3524,8 +3753,11 @@ or tune thresholds in config.",
             return;
         }
     };
+    let sender_is_private = is_sender_private(ctx.as_ref(), &history_key);
     if runtime_defaults.auto_save_memory
+        && !sender_is_private
         && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !crate::agent::loop_::should_skip_autosave(&msg.content)
     {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
@@ -3597,6 +3829,18 @@ or tune thresholds in config.",
                     last_turn.content = format!("{memory_context}{}", last_turn.content);
                 }
             }
+
+            // Inject queued outbound messages as context so the agent can
+            // address and optionally clear them.
+            let queue_context = crate::proactive_messaging::build_queue_context(
+                &ctx.proactive_messaging,
+                &ctx.workspace_dir,
+                &msg.channel,
+                &msg.sender,
+            );
+            if !queue_context.is_empty() {
+                last_turn.content = format!("{queue_context}{}", last_turn.content);
+            }
         }
     }
 
@@ -3604,13 +3848,22 @@ or tune thresholds in config.",
         msg.channel == "cli" || should_expose_internal_tool_details(&msg.content);
     let progress_mode =
         effective_progress_mode_for_message(msg.channel.as_str(), expose_internal_tool_details);
-    let excluded_tools_snapshot = if msg.channel == "cli" {
+    let mut excluded_tools_snapshot = if msg.channel == "cli" {
         Vec::new()
     } else {
         snapshot_non_cli_excluded_tools(ctx.as_ref())
     };
+    // In private mode, also exclude memory-related tools.
+    if sender_is_private {
+        for tool in &ctx.private_session_excluded_tools {
+            if !excluded_tools_snapshot.contains(tool) {
+                excluded_tools_snapshot.push(tool.clone());
+            }
+        }
+    }
+    let current_system_prompt = ctx.system_prompt.load();
     let mut system_prompt = build_channel_system_prompt(
-        ctx.system_prompt.as_str(),
+        current_system_prompt.as_str(),
         &msg.channel,
         &msg.reply_target,
         expose_internal_tool_details,
@@ -3623,9 +3876,35 @@ or tune thresholds in config.",
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let _ = trim_channel_prompt_history(&mut history);
+
+    // Register injection queue so concurrent messages for this sender can be
+    // injected mid-turn instead of waiting for the loop to finish.
+    let history_key = conversation_history_key(&msg);
+    let (injection_tx, injection_rx) =
+        tokio::sync::mpsc::unbounded_channel::<injection::InjectedMessage>();
+    {
+        let mut queues = ctx
+            .injection_queues
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        queues.insert(history_key.clone(), injection_tx);
+    }
+    let _injection_guard =
+        injection::InjectionGuard::new(Arc::clone(&ctx.injection_queues), history_key.clone());
+
     let use_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
+
+    // When the channel supports draft updates (e.g. Signal with edit_messages),
+    // upgrade progress mode to at least Compact so LLM content text alongside
+    // tool calls is surfaced in the draft, while internal bookkeeping lines
+    // (e.g. "🤔 Thinking…", "💬 Got N tool calls") are still filtered out.
+    let progress_mode = if use_streaming && progress_mode == ProgressMode::Off {
+        ProgressMode::Compact
+    } else {
+        progress_mode
+    };
 
     tracing::debug!(
         channel = %msg.channel,
@@ -3635,7 +3914,7 @@ or tune thresholds in config.",
         "Draft streaming decision"
     );
 
-    let (delta_tx, delta_rx) = if use_streaming {
+    let (mut delta_tx, delta_rx) = if use_streaming {
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
         (Some(tx), Some(rx))
     } else {
@@ -3698,11 +3977,18 @@ or tune thresholds in config.",
                         {
                             continue;
                         }
+                        // Clear everything and show only the latest status line.
+                        // The tool execution table will be re-populated by
+                        // DRAFT_PROGRESS_BLOCK_SENTINEL deltas as tools run.
+                        accumulated.clear();
+                        accumulated.push_str(visible_delta);
+                    } else {
+                        // Streaming final-response chunks — keep accumulating.
+                        accumulated.push_str(visible_delta);
                     }
-
-                    accumulated.push_str(visible_delta);
                 }
-                let display_text = strip_progress_section_markers(&accumulated);
+                let display_text =
+                    with_thinking_prefix(&strip_progress_section_markers(&accumulated));
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &display_text)
                     .await
@@ -3754,7 +4040,7 @@ or tune thresholds in config.",
 
     let (approval_prompt_tx, mut approval_prompt_rx) =
         tokio::sync::mpsc::unbounded_channel::<NonCliApprovalPrompt>();
-    let non_cli_approval_context = if msg.channel != "cli" && target_channel.is_some() {
+    let mut non_cli_approval_context = if msg.channel != "cli" && target_channel.is_some() {
         Some(NonCliApprovalContext {
             sender: msg.sender.clone(),
             reply_target: msg.reply_target.clone(),
@@ -3792,36 +4078,195 @@ or tune thresholds in config.",
     } else {
         None
     };
-    let llm_result = tokio::select! {
-        () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
-        result = tokio::time::timeout(
-            Duration::from_secs(timeout_budget_secs),
-            crate::agent::loop_::scope_cost_enforcement_context(
-                cost_enforcement_context,
-                run_tool_call_loop_with_non_cli_approval_context(
-                    active_provider.as_ref(),
-                    &mut history,
-                    ctx.tools_registry.as_ref(),
-                    ctx.observer.as_ref(),
-                    route.provider.as_str(),
-                    route.model.as_str(),
-                    runtime_defaults.temperature,
-                    true,
-                    Some(ctx.approval_manager.as_ref()),
-                    msg.channel.as_str(),
-                    non_cli_approval_context,
-                    &runtime_defaults.multimodal,
-                    runtime_defaults.max_tool_iterations,
-                    Some(cancellation_token.clone()),
-                    delta_tx,
-                    ctx.hooks.as_deref(),
-                    &excluded_tools_snapshot,
-                    progress_mode,
-                    ctx.safety_heartbeat.clone(),
-                ),
-            ),
-        ) => LlmExecutionResult::Completed(result),
+    // ── Recovery-aware invocation ────────────────────────────────────────
+    //
+    // The first attempt runs normally.  If it fails with a recoverable
+    // error (e.g. model narrates tool use instead of emitting tool calls),
+    // we restore history, inject a recovery prompt, and retry — up to
+    // `max_recovery_attempts` times with exponential backoff.
+    let recovery_cfg = &runtime_defaults.recovery;
+    let max_recovery = if recovery_cfg.enabled {
+        recovery_cfg.max_recovery_attempts
+    } else {
+        0
     };
+    let mut recovery_attempt: u32 = 0;
+    let mut injection_rx_opt = Some(injection_rx);
+
+    let llm_result = loop {
+        let history_snapshot = if recovery_attempt == 0 {
+            // Only snapshot before the first attempt — subsequent snapshots
+            // are taken after the rollback, which produces the same state.
+            history.clone()
+        } else {
+            // History was already restored from snapshot before this attempt.
+            history.clone()
+        };
+
+        // First attempt uses the real streaming channel; recovery attempts
+        // do not (the draft updater is already done / cancelled).
+        let attempt_delta_tx = if recovery_attempt == 0 {
+            delta_tx.take()
+        } else {
+            None
+        };
+
+        // Approval context can only be moved once.
+        let attempt_approval_ctx = if recovery_attempt == 0 {
+            non_cli_approval_context.take()
+        } else {
+            // Recovery attempts skip non-CLI approval prompts — the original
+            // approval dispatcher is already shut down.
+            None
+        };
+
+        let attempt_temperature = if recovery_attempt > 0 && recovery_cfg.recovery_temperature > 0.0
+        {
+            recovery_cfg.recovery_temperature
+        } else {
+            runtime_defaults.temperature
+        };
+
+        let attempt_result = tokio::select! {
+            () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
+            result = tokio::time::timeout(
+                Duration::from_secs(timeout_budget_secs),
+                crate::agent::loop_::scope_cost_enforcement_context(
+                    cost_enforcement_context.clone(),
+                    run_tool_call_loop_with_non_cli_approval_context(
+                        active_provider.as_ref(),
+                        &mut history,
+                        ctx.tools_registry.as_ref(),
+                        ctx.observer.as_ref(),
+                        route.provider.as_str(),
+                        route.model.as_str(),
+                        attempt_temperature,
+                        true,
+                        Some(ctx.approval_manager.as_ref()),
+                        msg.channel.as_str(),
+                        attempt_approval_ctx,
+                        &runtime_defaults.multimodal,
+                        runtime_defaults.max_tool_iterations,
+                        Some(cancellation_token.clone()),
+                        attempt_delta_tx,
+                        ctx.hooks.as_deref(),
+                        &excluded_tools_snapshot,
+                        progress_mode,
+                        ctx.safety_heartbeat.clone(),
+                        runtime_defaults.strip_prior_reasoning,
+                        Some(crate::agent::loop_::ToolLoopCompactionContext {
+                            memory: Some(std::sync::Arc::clone(&ctx.memory)),
+                            max_history_messages: MAX_CHANNEL_HISTORY,
+                            context_window_tokens: runtime_defaults.context_window_tokens,
+                        }),
+                        Some(crate::agent::loop_::detection::LoopDetectionConfig {
+                            no_progress_threshold: runtime_defaults.loop_detection_no_progress_threshold,
+                            ping_pong_cycles: runtime_defaults.loop_detection_ping_pong_cycles,
+                            failure_streak_threshold: runtime_defaults.loop_detection_failure_streak,
+                        }),
+                        if recovery_attempt == 0 { injection_rx_opt.take() } else { None },
+                    ),
+                ),
+            ) => LlmExecutionResult::Completed(result),
+        };
+
+        // Check if this attempt failed with a recoverable error and we
+        // have retries remaining.
+        let should_retry = match &attempt_result {
+            LlmExecutionResult::Completed(Ok(Err(e)))
+                if recovery_attempt < max_recovery
+                    && crate::agent::recovery::classify_error(e)
+                        == crate::agent::recovery::ErrorRecoverability::Recoverable =>
+            {
+                true
+            }
+            _ => false,
+        };
+
+        if should_retry {
+            recovery_attempt += 1;
+
+            // Extract the error message for logging before we move on.
+            let err_msg = if let LlmExecutionResult::Completed(Ok(Err(ref e))) = attempt_result {
+                scrub_credentials(&e.to_string())
+            } else {
+                String::new()
+            };
+
+            // Restore history to pre-failure state.
+            history = history_snapshot;
+
+            // Exponential backoff.
+            let backoff_ms = (recovery_cfg.backoff_base_ms as f64
+                * recovery_cfg
+                    .backoff_multiplier
+                    .powi(recovery_attempt.saturating_sub(1) as i32))
+                as u64;
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+
+            // Inject recovery prompt.
+            if recovery_attempt < max_recovery && !recovery_cfg.compress_on_final_attempt {
+                // Intermediate attempt: firm re-instruction.
+                history.push(ChatMessage::user(
+                    crate::agent::recovery::RECOVERY_PROMPT_ATTEMPT_2.to_string(),
+                ));
+            } else {
+                // Final attempt: compress context + re-state original request.
+                if recovery_cfg.compress_on_final_attempt {
+                    compact_sender_history(ctx.as_ref(), &history_key);
+                }
+                history.push(ChatMessage::user(
+                    crate::agent::recovery::recovery_prompt_attempt_final(&persisted_user_content),
+                ));
+            }
+
+            runtime_trace::record_event(
+                "conversation_recovery_attempt",
+                Some(msg.channel.as_str()),
+                Some(route.provider.as_str()),
+                Some(route.model.as_str()),
+                None,
+                None,
+                Some(&format!(
+                    "recovery attempt {recovery_attempt}/{max_recovery}"
+                )),
+                serde_json::json!({
+                    "attempt": recovery_attempt,
+                    "max_attempts": max_recovery,
+                    "backoff_ms": backoff_ms,
+                    "error": err_msg,
+                }),
+            );
+
+            continue; // retry
+        }
+
+        // Log successful recovery if we retried at least once.
+        if recovery_attempt > 0 {
+            if let LlmExecutionResult::Completed(Ok(Ok(_))) = &attempt_result {
+                runtime_trace::record_event(
+                    "conversation_recovery_success",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(true),
+                    Some(&format!("recovered on attempt {recovery_attempt}")),
+                    serde_json::json!({
+                        "recovery_attempts": recovery_attempt,
+                    }),
+                );
+            }
+        }
+
+        break attempt_result;
+    };
+
+    // ── Clean up streaming / approval / typing tasks ──────────────────
+    // Move the non_cli_approval_context binding so the compiler does not
+    // complain about the `take()` inside the loop requiring mutability
+    // after this point.  The variable was already consumed above.
+    let _ = non_cli_approval_context;
 
     if let Some(handle) = draft_updater {
         let _ = handle.await;
@@ -3991,6 +4436,7 @@ or tune thresholds in config.",
                 ChatMessage::assistant(&history_response),
             );
             if runtime_defaults.auto_save_memory
+                && !sender_is_private
                 && delivered_response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
             {
                 let assistant_key = assistant_memory_key(&msg);
@@ -4009,6 +4455,32 @@ or tune thresholds in config.",
                 started_at.elapsed().as_millis(),
                 truncate_with_ellipsis(&delivered_response, 80)
             );
+            // Component 3: track responses that imply follow-up work
+            if runtime_defaults.recovery.stale_followup_enabled {
+                if let Some(store) = crate::heartbeat::pending_followups::global_store() {
+                    if crate::heartbeat::pending_followups::response_implies_followup(
+                        &delivered_response,
+                    ) {
+                        store
+                            .add(crate::heartbeat::pending_followups::PendingFollowup {
+                                channel: msg.channel.clone(),
+                                reply_target: msg.reply_target.clone(),
+                                history_key: history_key.clone(),
+                                created_at: std::time::SystemTime::now(),
+                                ttl_secs: runtime_defaults.recovery.stale_followup_timeout_secs,
+                                context_summary:
+                                    crate::heartbeat::pending_followups::truncate_for_summary(
+                                        &delivered_response,
+                                        200,
+                                    ),
+                                nudge_count: 0,
+                                max_nudges: runtime_defaults.recovery.stale_followup_max_nudges,
+                            })
+                            .await;
+                    }
+                }
+            }
+
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     if let Err(e) = channel
@@ -4174,21 +4646,55 @@ or tune thresholds in config.",
                 if !rolled_back {
                     // Close the orphan user turn so subsequent messages don't
                     // inherit this failed request as unfinished context.
+                    let history_marker = if recovery_attempt > 0 {
+                        "[Task paused after recovery attempts — ask to retry or try a different approach]"
+                    } else {
+                        "[Task failed — not continuing this request]"
+                    };
                     append_sender_turn(
                         ctx.as_ref(),
                         &history_key,
-                        ChatMessage::assistant("[Task failed — not continuing this request]"),
+                        ChatMessage::assistant(history_marker),
                     );
                 }
+
+                // Log exhausted recovery if we retried.
+                if recovery_attempt > 0 {
+                    runtime_trace::record_event(
+                        "conversation_recovery_exhausted",
+                        Some(msg.channel.as_str()),
+                        Some(route.provider.as_str()),
+                        Some(route.model.as_str()),
+                        None,
+                        Some(false),
+                        Some(&format!(
+                            "all {recovery_attempt} recovery attempts exhausted"
+                        )),
+                        serde_json::json!({
+                            "recovery_attempts": recovery_attempt,
+                            "error": scrub_credentials(&e.to_string()),
+                        }),
+                    );
+                }
+
+                let user_error = if recovery_attempt > 0 {
+                    format!(
+                        "⚠️ I tried {} approach{} but couldn't complete that action. You can ask me to try again.",
+                        recovery_attempt + 1,
+                        if recovery_attempt > 0 { "es" } else { "" },
+                    )
+                } else {
+                    format!("⚠️ Error: {e}")
+                };
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                            .finalize_draft(&msg.reply_target, draft_id, &user_error)
                             .await;
                     } else {
                         let _ = channel
                             .send(
-                                &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
+                                &SendMessage::new(user_error, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
@@ -4272,6 +4778,49 @@ async fn run_message_dispatch_loop(
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
+        // ── Mid-turn injection: route to active loop if one exists ──
+        // Skip injection when the channel uses cancel-and-restart interruption
+        // (e.g. Telegram with interrupt_on_new_message=true), since the intent
+        // there is to replace the running loop, not augment it.
+        {
+            let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
+            let uses_cancel_interrupt =
+                runtime_defaults.interrupt_on_new_message && msg.channel == "telegram";
+            if !uses_cancel_interrupt {
+                let history_key = conversation_history_key(&msg);
+                let maybe_tx = {
+                    let queues = ctx
+                        .injection_queues
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    queues.get(&history_key).cloned()
+                };
+                if let Some(tx) = maybe_tx {
+                    let injected = injection::InjectedMessage {
+                        content: msg.content.clone(),
+                        channel: msg.channel.clone(),
+                        sender: msg.sender.clone(),
+                    };
+                    if tx.send(injected).is_ok() {
+                        tracing::info!(
+                            channel = %msg.channel,
+                            sender = %msg.sender,
+                            "mid-turn injection: queued message for active loop"
+                        );
+                        // Acknowledge with 👀 reaction so user knows it was received
+                        if let Some(channel) = ctx.channels_by_name.get(&msg.channel) {
+                            let _ = channel
+                                .add_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
+                                .await;
+                        }
+                        continue; // skip spawning a new worker
+                    }
+                    // tx.send failed — receiver dropped (loop just ended).
+                    // Fall through to normal dispatch.
+                }
+            }
+        }
+
         let permit = match Arc::clone(&semaphore).acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => break,
@@ -5028,6 +5577,7 @@ fn collect_configured_channels(
                 sig.allowed_from.clone(),
                 sig.ignore_attachments,
                 sig.ignore_stories,
+                sig.edit_messages,
             )),
         });
     }
@@ -5373,6 +5923,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_level: config.effective_provider_reasoning_level(),
         custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
+        custom_provider_supports_responses_fallback: config.supports_responses_fallback,
         max_tokens_override: None,
         model_support_vision: config.model_support_vision,
     };
@@ -5597,6 +6148,19 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
 
+    let prompt_rebuild_config = Arc::new(SystemPromptRebuildConfig {
+        tool_descs: tool_descs
+            .iter()
+            .map(|(n, d)| (n.to_string(), d.to_string()))
+            .collect(),
+        skills: skills.clone(),
+        identity_config: config.identity.clone(),
+        bootstrap_max_chars,
+        native_tools,
+        skills_prompt_mode: config.skills.prompt_injection_mode,
+        autonomy: config.autonomy.clone(),
+    });
+
     if !skills.is_empty() {
         println!(
             "  🧩 Skills:   {}",
@@ -5729,7 +6293,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         memory: Arc::clone(&mem),
         tools_registry: Arc::clone(&tools_registry),
         observer,
-        system_prompt: Arc::new(system_prompt),
+        system_prompt: Arc::new(ArcSwap::from_pointee(system_prompt)),
+        prompt_rebuild_config,
         model: Arc::new(model.clone()),
         temperature,
         auto_save_memory: config.memory.auto_save,
@@ -5771,6 +6336,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         } else {
             None
         },
+        proactive_messaging: Arc::new(config.proactive_messaging.clone()),
+        private_sessions: Arc::new(Mutex::new(HashSet::new())),
+        private_session_excluded_tools: config.autonomy.private_session_excluded_tools.clone(),
+        injection_queues: Arc::new(Mutex::new(HashMap::new())),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -5830,6 +6399,18 @@ mod tests {
             autonomy.auto_approve.push("mock_price".to_string());
         }
         Arc::new(ApprovalManager::from_config(&autonomy))
+    }
+
+    fn test_prompt_rebuild_config() -> Arc<SystemPromptRebuildConfig> {
+        Arc::new(SystemPromptRebuildConfig {
+            tool_descs: Vec::new(),
+            skills: Vec::new(),
+            identity_config: crate::config::IdentityConfig::default(),
+            bootstrap_max_chars: None,
+            native_tools: false,
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::default(),
+            autonomy: crate::config::AutonomyConfig::default(),
+        })
     }
 
     #[test]
@@ -5910,6 +6491,125 @@ mod tests {
             Some(ChannelRuntimeCommand::ListApprovals)
         );
         assert_eq!(parse_runtime_command("slack", "/models"), None);
+    }
+
+    #[test]
+    fn parse_runtime_command_recognises_checkpoint() {
+        assert_eq!(
+            parse_runtime_command("signal", "/checkpoint"),
+            Some(ChannelRuntimeCommand::Checkpoint)
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/checkpoint"),
+            Some(ChannelRuntimeCommand::Checkpoint)
+        );
+        assert_eq!(
+            parse_runtime_command("discord", "/checkpoint"),
+            Some(ChannelRuntimeCommand::Checkpoint)
+        );
+    }
+
+    #[test]
+    fn parse_runtime_command_recognises_private() {
+        assert_eq!(
+            parse_runtime_command("signal", "/private"),
+            Some(ChannelRuntimeCommand::PrivateSession)
+        );
+        assert_eq!(
+            parse_runtime_command("slack", "/private"),
+            Some(ChannelRuntimeCommand::PrivateSession)
+        );
+        assert_eq!(
+            parse_runtime_command("discord", "/private"),
+            Some(ChannelRuntimeCommand::PrivateSession)
+        );
+    }
+
+    #[test]
+    fn strip_receipt_prefix_extracts_slash_command() {
+        let content = "[Message delivery status since your last message:\n\
+            [SIGNAL:DELIVERY_RECEIPT] Message delivered to abc (original timestamps: 123)\n\
+            [SIGNAL:READ_RECEIPT] Message read by abc (original timestamps: 123)]\n\n\
+            /private";
+        assert_eq!(strip_receipt_prefix(content), "/private");
+    }
+
+    #[test]
+    fn strip_receipt_prefix_passthrough_without_receipts() {
+        assert_eq!(strip_receipt_prefix("/new"), "/new");
+        assert_eq!(strip_receipt_prefix("hello world"), "hello world");
+    }
+
+    #[test]
+    fn parse_command_works_after_receipt_strip() {
+        let content = "[Message delivery status since your last message:\n\
+            [SIGNAL:READ_RECEIPT] Message read by abc (original timestamps: 123)]\n\n\
+            /private";
+        let user_text = strip_receipt_prefix(content);
+        assert_eq!(
+            parse_runtime_command("signal", user_text),
+            Some(ChannelRuntimeCommand::PrivateSession)
+        );
+    }
+
+    #[test]
+    fn receipt_prefixed_private_intercepted_not_sent_to_llm() {
+        let content = "[Message delivery status since your last message:\n\
+            [SIGNAL:DELIVERY_RECEIPT] Message delivered to abc (ts: 123)]\n\n\
+            /private";
+        let user_text = strip_receipt_prefix(content);
+
+        // Command is detected from cleaned text
+        assert_eq!(
+            parse_runtime_command("signal", user_text),
+            Some(ChannelRuntimeCommand::PrivateSession),
+        );
+
+        // Raw content would NOT be detected (the original bug)
+        assert_eq!(parse_runtime_command("signal", content), None);
+    }
+
+    #[test]
+    fn receipt_prefixed_regular_message_not_intercepted() {
+        let content = "[Message delivery status since your last message:\n\
+            [SIGNAL:READ_RECEIPT] Message read by abc (ts: 123)]\n\n\
+            hey what's up";
+        let user_text = strip_receipt_prefix(content);
+
+        // Regular messages should NOT match any command
+        assert_eq!(parse_runtime_command("signal", user_text), None);
+    }
+
+    #[test]
+    fn with_thinking_prefix_prepends_indicator() {
+        let result = with_thinking_prefix("Looking up cron jobs...");
+        assert!(result.starts_with("Thinking \u{1f4ad}\n"));
+        assert!(result.ends_with("Looking up cron jobs..."));
+    }
+
+    #[test]
+    fn with_thinking_prefix_not_in_finalized_response() {
+        // finalize_draft receives delivered_response directly — no prefix.
+        // This test documents the contract.
+        let final_response = "Here are your cron jobs: ...";
+        assert!(!final_response.starts_with(DRAFT_THINKING_PREFIX));
+    }
+
+    #[test]
+    fn private_session_toggle() {
+        let set: PrivateSessionSet = Arc::new(Mutex::new(HashSet::new()));
+        let key = "signal_alice".to_string();
+
+        // Initially not private.
+        assert!(!set.lock().unwrap().contains(&key));
+
+        // Enter private mode.
+        set.lock().unwrap().insert(key.clone());
+        assert!(set.lock().unwrap().contains(&key));
+
+        // Toggle off.
+        set.lock().unwrap().remove(&key);
+        assert!(!set.lock().unwrap().contains(&key));
     }
 
     #[test]
@@ -5994,6 +6694,22 @@ mod tests {
             "fabricated memory"
         ));
         assert!(!should_skip_memory_context_entry("telegram_123_45", "hi"));
+    }
+
+    #[test]
+    fn memory_context_skip_rules_exclude_cron_prompts() {
+        assert!(should_skip_memory_context_entry(
+            "signal_U1_msg42",
+            "[cron:7 speakr-daily-summary] You are running inside an isolated cron session..."
+        ));
+    }
+
+    #[test]
+    fn memory_context_skip_rules_allow_normal_messages() {
+        assert!(!should_skip_memory_context_entry(
+            "signal_U1_msg43",
+            "What meetings did I have today?"
+        ));
     }
 
     #[test]
@@ -6089,7 +6805,8 @@ mod tests {
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("system".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("system".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -6116,6 +6833,10 @@ mod tests {
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -6146,7 +6867,8 @@ mod tests {
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("system".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("system".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -6173,6 +6895,10 @@ mod tests {
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -6206,7 +6932,8 @@ mod tests {
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("system".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("system".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -6233,6 +6960,10 @@ mod tests {
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -6889,7 +7620,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool), Box::new(MockEchoTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -6916,6 +7648,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -6976,7 +7712,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7003,6 +7740,10 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7050,7 +7791,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7077,6 +7819,10 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7138,7 +7884,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7165,6 +7912,10 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Vec::new(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7225,7 +7976,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7252,6 +8004,10 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Vec::new(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7297,7 +8053,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7324,6 +8081,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7371,7 +8132,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7398,6 +8160,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7447,7 +8213,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7474,6 +8241,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7551,7 +8322,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7581,6 +8353,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
         assert_eq!(
             runtime_ctx
@@ -7692,7 +8468,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7719,6 +8496,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::clone(&approval_manager),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7781,7 +8562,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7808,6 +8590,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::clone(&approval_manager),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7859,7 +8645,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -7886,6 +8673,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let runtime_ctx_for_first_turn = runtime_ctx.clone();
@@ -8020,7 +8811,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8050,6 +8842,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
         assert_eq!(
             runtime_ctx
@@ -8135,7 +8931,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8165,6 +8962,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager,
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8245,7 +9046,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8275,6 +9077,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager,
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8340,7 +9146,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8367,6 +9174,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::clone(&approval_manager),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8442,7 +9253,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8469,6 +9281,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::clone(&approval_manager),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8542,7 +9358,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8572,6 +9389,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8693,7 +9514,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8723,6 +9545,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
         maybe_apply_runtime_config_update(runtime_ctx.as_ref())
             .await
@@ -8790,7 +9616,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8820,6 +9647,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8940,7 +9771,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -8970,6 +9802,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9060,7 +9896,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -9090,6 +9927,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9160,7 +10001,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -9190,6 +10032,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9282,7 +10128,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -9309,6 +10156,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9402,7 +10253,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -9429,6 +10281,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9481,7 +10337,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("default-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -9508,6 +10365,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9568,6 +10429,15 @@ BTC is currently around $65,000 based on latest tool output."#
                         multimodal: crate::config::MultimodalConfig::default(),
                         query_classification: crate::config::QueryClassificationConfig::default(),
                         model_routes: Vec::new(),
+                        recovery: crate::config::RecoveryConfig::default(),
+                        strip_prior_reasoning: false,
+                        context_window_tokens: 128_000,
+                        loop_detection_no_progress_threshold: crate::config::AgentConfig::default()
+                            .loop_detection_no_progress_threshold,
+                        loop_detection_ping_pong_cycles: crate::config::AgentConfig::default()
+                            .loop_detection_ping_pong_cycles,
+                        loop_detection_failure_streak: crate::config::AgentConfig::default()
+                            .loop_detection_failure_streak,
                     },
                     perplexity_filter: crate::config::PerplexityFilterConfig::default(),
                     outbound_leak_guard: crate::config::OutboundLeakGuardConfig::default(),
@@ -9583,7 +10453,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("startup-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -9615,6 +10486,10 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9770,7 +10645,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("llama3.2".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -9802,6 +10678,10 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         maybe_apply_runtime_config_update(runtime_ctx.as_ref())
@@ -9932,7 +10812,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -9959,6 +10840,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -10000,7 +10885,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -10027,6 +10913,10 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -10180,7 +11070,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -10209,6 +11100,10 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -10270,7 +11165,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -10299,6 +11195,10 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -10372,7 +11272,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -10401,6 +11302,10 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -10456,7 +11361,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -10485,6 +11391,10 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -10525,7 +11435,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -10554,6 +11465,10 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -11109,8 +12024,13 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
 
         let context = build_memory_context(&mem, "age", 0.0, None).await;
-        assert!(context.contains("[Memory context]"));
+        assert!(context.contains("[Memory context"));
         assert!(context.contains("Age is 45"));
+        // Should include a relative timestamp like "just now" or "Xm ago"
+        assert!(
+            context.contains("ago") || context.contains("just now"),
+            "expected relative timestamp in: {context}"
+        );
     }
 
     #[tokio::test]
@@ -11139,6 +12059,74 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!session_a_context.contains("age 31"));
     }
 
+    #[test]
+    fn format_memory_age_relative_timestamps() {
+        let now = Utc::now();
+
+        // Just now
+        let ts = now.to_rfc3339();
+        assert_eq!(format_memory_age(&ts), "just now");
+
+        // Minutes ago
+        let ts = (now - chrono::Duration::minutes(30)).to_rfc3339();
+        assert_eq!(format_memory_age(&ts), "30m ago");
+
+        // Hours ago
+        let ts = (now - chrono::Duration::hours(5)).to_rfc3339();
+        assert_eq!(format_memory_age(&ts), "5h ago");
+
+        // Yesterday
+        let ts = (now - chrono::Duration::days(1)).to_rfc3339();
+        assert_eq!(format_memory_age(&ts), "yesterday");
+
+        // Days ago
+        let ts = (now - chrono::Duration::days(3)).to_rfc3339();
+        assert_eq!(format_memory_age(&ts), "3d ago");
+
+        // Non-RFC3339 passthrough
+        assert_eq!(format_memory_age("not-a-date"), "not-a-date");
+    }
+
+    #[tokio::test]
+    async fn build_memory_context_sorts_chronologically() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        // Store two entries — "old" first, "recent" second
+        mem.store(
+            "fact_old",
+            "Old fact from last week",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        // Small delay so timestamps differ
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        mem.store(
+            "fact_recent",
+            "Recent fact from today",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let context = build_memory_context(&mem, "fact", 0.0, None).await;
+
+        // Both should appear
+        assert!(context.contains("Old fact from last week"));
+        assert!(context.contains("Recent fact from today"));
+
+        // Old entry should appear before recent entry (chronological order)
+        let old_pos = context.find("Old fact").unwrap();
+        let recent_pos = context.find("Recent fact").unwrap();
+        assert!(
+            old_pos < recent_pos,
+            "expected chronological order: old ({old_pos}) before recent ({recent_pos})"
+        );
+    }
+
     #[tokio::test]
     async fn process_channel_message_restores_per_sender_history_on_follow_ups() {
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -11156,7 +12144,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -11185,6 +12174,10 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -11252,7 +12245,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -11281,6 +12275,10 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -11347,7 +12345,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(RecallMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -11376,6 +12375,10 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -11446,7 +12449,8 @@ BTC is currently around $65,000 based on latest tool output."#
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee("test-system-prompt".to_string())),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -11475,6 +12479,10 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -12274,7 +13282,10 @@ BTC is currently around $65,000 based on latest tool output."#;
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee(
+                "You are a helpful assistant.".to_string(),
+            )),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -12303,6 +13314,10 @@ BTC is currently around $65,000 based on latest tool output."#;
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -12350,7 +13365,10 @@ BTC is currently around $65,000 based on latest tool output."#;
             memory: Arc::new(NoopMemory),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            system_prompt: Arc::new(ArcSwap::from_pointee(
+                "You are a helpful assistant.".to_string(),
+            )),
+            prompt_rebuild_config: test_prompt_rebuild_config(),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
@@ -12379,6 +13397,10 @@ BTC is currently around $65,000 based on latest tool output."#;
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            proactive_messaging: Arc::new(crate::config::ProactiveMessagingConfig::default()),
+            private_sessions: Arc::new(Mutex::new(HashSet::new())),
+            private_session_excluded_tools: Vec::new(),
+            injection_queues: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(

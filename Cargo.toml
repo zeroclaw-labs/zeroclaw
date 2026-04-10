@@ -9,10 +9,10 @@ resolver = "2"
 
 [package]
 name = "zeroclaw"
-version = "0.1.8"
+version = "1.4.15"
 edition = "2021"
 build = "build.rs"
-authors = ["theonlyhennygod"]
+authors = ["coffee-anon"]
 license = "MIT OR Apache-2.0"
 description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
@@ -48,6 +48,7 @@ shellexpand = "3.1"
 
 # JSON Schema generation for config export
 schemars = "1.2"
+strip-ansi-escapes = "0.2"
 
 # Logging - minimal
 tracing = { version = "0.1", default-features = false }
@@ -100,6 +101,9 @@ rand = "0.10"
 
 # serde-big-array for wa-rs storage (large array serialization)
 serde-big-array = { version = "0.5", optional = true }
+
+# Lock-free atomic Arc swap for hot-reloadable shared state (e.g. system prompt)
+arc-swap = "1.7"
 
 # Fast mutexes that don't poison on panic
 parking_lot = "0.12"

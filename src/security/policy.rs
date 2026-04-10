@@ -123,6 +123,7 @@ pub struct SecurityPolicy {
     pub allowed_roots: Vec<PathBuf>,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
+    pub allow_shell_redirections: bool,
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
     pub shell_env_passthrough: Vec<String>,
@@ -183,6 +184,7 @@ impl Default for SecurityPolicy {
             allowed_roots: Vec::new(),
             max_actions_per_hour: 100,
             max_cost_per_day_cents: 1000,
+            allow_shell_redirections: false,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
@@ -867,27 +869,29 @@ impl SecurityPolicy {
             return Err("readonly autonomy level blocks shell command execution".into());
         }
 
-        if command.contains('`')
-            || contains_unquoted_shell_variable_expansion(command)
-            || command.contains("<(")
-            || command.contains(">(")
-        {
-            return Err("command contains disallowed shell expansion syntax".into());
-        }
+        if !self.allow_shell_redirections {
+            if command.contains('`')
+                || contains_unquoted_shell_variable_expansion(command)
+                || command.contains("<(")
+                || command.contains(">(")
+            {
+                return Err("command contains disallowed shell expansion syntax".into());
+            }
 
-        if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
-            return Err("command contains disallowed redirection syntax".into());
-        }
+            if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
+                return Err("command contains disallowed redirection syntax".into());
+            }
 
-        if command
-            .split_whitespace()
-            .any(|w| w == "tee" || w.ends_with("/tee"))
-        {
-            return Err("command contains disallowed tee usage".into());
-        }
+            if command
+                .split_whitespace()
+                .any(|w| w == "tee" || w.ends_with("/tee"))
+            {
+                return Err("command contains disallowed tee usage".into());
+            }
 
-        if contains_unquoted_single_ampersand(command) {
-            return Err("command contains disallowed background chaining operator '&'".into());
+            if contains_unquoted_single_ampersand(command) {
+                return Err("command contains disallowed background chaining operator '&'".into());
+            }
         }
 
         let segments = split_unquoted_segments(command);
@@ -1562,6 +1566,7 @@ impl SecurityPolicy {
                 .collect(),
             max_actions_per_hour: autonomy_config.max_actions_per_hour,
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
+            allow_shell_redirections: autonomy_config.allow_shell_redirections,
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
             shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),

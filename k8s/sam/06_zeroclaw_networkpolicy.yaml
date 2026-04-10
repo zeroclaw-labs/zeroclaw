@@ -1,0 +1,99 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: zeroclaw-default-deny
+  namespace: ai-agents
+spec:
+  podSelector:
+    matchLabels:
+      app: zeroclaw
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: zeroclaw-allow-ingress
+  namespace: ai-agents
+spec:
+  podSelector:
+    matchLabels:
+      app: zeroclaw
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow ambient mesh HBONE tunnel traffic
+    - ports:
+        - protocol: TCP
+          port: 15008
+    # Allow ambient health probes (SNAT link-local address)
+    - from:
+        - ipBlock:
+            cidr: 169.254.7.127/32
+    - ports:
+        - protocol: TCP
+          port: 3000
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: zeroclaw-allow-egress
+  namespace: ai-agents
+spec:
+  podSelector:
+    matchLabels:
+      app: zeroclaw
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # ACP-over-HTTP to Walter (zeroclaw-k8s-agent)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ai-agents
+          podSelector:
+            matchLabels:
+              app: zeroclaw-k8s-agent
+      ports:
+        - protocol: TCP
+          port: 3000
+        - protocol: TCP
+          port: 15008
+    # Vikunja API (todolist project management)
+    # Both the application port and HBONE port are needed because
+    # ambient mesh tunnels traffic through ztunnel on port 15008.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: todolist
+          podSelector:
+            matchLabels:
+              app: vikunja
+      ports:
+        - protocol: TCP
+          port: 3456
+        - protocol: TCP
+          port: 15008
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80

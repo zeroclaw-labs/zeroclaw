@@ -2,7 +2,6 @@ use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
-use std::fmt::Write;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,8 +9,6 @@ use std::time::Duration;
 
 /// Maximum time to wait for a screenshot command to complete.
 const SCREENSHOT_TIMEOUT_SECS: u64 = 15;
-/// Maximum base64 payload size to return (2 MB of base64 ≈ 1.5 MB image).
-const MAX_BASE64_BYTES: usize = 2_097_152;
 
 /// Tool for capturing screenshots using platform-native commands.
 ///
@@ -233,17 +230,17 @@ impl ScreenshotTool {
         })
     }
 
-    /// Read the screenshot file and return base64-encoded result.
-    #[allow(clippy::incompatible_msrv)]
+    /// Read the screenshot file, optimize it, and return with an [IMAGE:] marker
+    /// so the multimodal pipeline can send it as a proper image content part.
     async fn read_and_encode(output_path: &std::path::Path) -> anyhow::Result<ToolResult> {
-        // Check file size before reading to prevent OOM on large screenshots
-        const MAX_RAW_BYTES: u64 = 1_572_864; // ~1.5 MB (base64 expands ~33%)
+        // Check file size before reading to prevent OOM
+        const MAX_RAW_BYTES: u64 = 5_242_880; // 5 MB
         if let Ok(meta) = tokio::fs::metadata(output_path).await {
             if meta.len() > MAX_RAW_BYTES {
                 return Ok(ToolResult {
                     success: true,
                     output: format!(
-                        "Screenshot saved to: {}\nSize: {} bytes (too large to base64-encode inline)",
+                        "Screenshot saved to: {}\nSize: {} bytes (too large to inline)",
                         output_path.display(),
                         meta.len(),
                     ),
@@ -254,37 +251,18 @@ impl ScreenshotTool {
 
         match tokio::fs::read(output_path).await {
             Ok(bytes) => {
-                use base64::Engine;
-                let size = bytes.len();
-                let mut encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                let truncated = if encoded.len() > MAX_BASE64_BYTES {
-                    // Base64 output is ASCII, so byte truncation is UTF-8 safe.
-                    encoded.truncate(MAX_BASE64_BYTES);
-                    true
-                } else {
-                    false
-                };
-
-                let mut output_msg = format!(
-                    "Screenshot saved to: {}\nSize: {size} bytes\nBase64 length: {}",
+                let raw_len = bytes.len();
+                let (optimized, mime) = super::browser::optimize_screenshot(bytes).await;
+                let info = format!(
+                    "Screenshot saved to: {}\nOriginal: {}KB, optimized: {}KB",
                     output_path.display(),
-                    encoded.len(),
+                    raw_len / 1024,
+                    optimized.len() / 1024,
                 );
-                if truncated {
-                    output_msg.push_str(" (truncated)");
-                }
-                let mime = match output_path.extension().and_then(|e| e.to_str()) {
-                    Some("jpg" | "jpeg") => "image/jpeg",
-                    Some("bmp") => "image/bmp",
-                    Some("gif") => "image/gif",
-                    Some("webp") => "image/webp",
-                    _ => "image/png",
-                };
-                let _ = write!(output_msg, "\ndata:{mime};base64,{encoded}");
-
+                let output = super::browser::format_screenshot_result(&optimized, mime, &info);
                 Ok(ToolResult {
                     success: true,
-                    output: output_msg,
+                    output,
                     error: None,
                 })
             }

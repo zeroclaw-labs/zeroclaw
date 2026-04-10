@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zeroclaw-skills
+  namespace: ai-agents
+data:
+  k8s-delegation.md: |
+    ---
+    name: k8s-delegation
+    version: 2.0.0
+    description: Delegate K8s tasks to Walter via ACP. Use for any cluster work.
+    always: false
+    ---
+
+    # K8s Delegation to Walter
+
+    Walter is the K8s infrastructure agent. He has kubectl, the scrapyard-applications repo, and Serena memories. He has no access to your memory or conversation history.
+
+    ## Core Rule
+
+    One work order = one deployable unit. Do not combine multiple steps.
+
+    ## Work Order Format
+
+    Every acp-client send message must follow this structure:
+    TASK: one sentence describing what to do.
+    NAMESPACE: target namespace.
+    CONTEXT: what exists already, repo location, patterns to follow.
+    REQUIREMENTS: specific requirements as a list.
+    VERIFICATION: what to check when done (pod status, commit paths, service endpoints).
+    REPO PATH: path in scrapyard-applications repo.
+
+    ## Deployment Sequence
+
+    Send each step as a separate work order. Verify before proceeding to the next.
+    1. Namespace with istio labels.
+    2. Secrets (VaultStaticSecret CRDs, if needed).
+    3. Storage (PVCs, if needed).
+    4. Database (CNPG PostgreSQL, if needed).
+    5. Application (Deployment + Service).
+    6. External access (Certificate + Gateway + VirtualService). Walter submits a PR for these. Wait for Dan to merge before testing.
+    7. Final verification.
+    Skip steps that do not apply.
+
+    ## After Each Work Order
+
+    acp-client wait ID --timeout 600. Read response for concrete evidence (resource names, statuses, commits). If failed, send follow-up with error context. If successful, proceed. Clean up with acp-client delete ID.
+
+    ## Monitoring
+
+    acp-client progress ID to check status. acp-client inject ID "message" to course-correct mid-task.
+
+    ## Walter's PRs
+
+    When Walter submits a PR: note the PR number, tell Dan with the URL and what to do after merging. Do not send follow-up tasks that depend on PR'd resources until Dan confirms merge.
+
+    ## PR Review Feedback
+
+    When Dan requests changes on Walter's PR: send Walter a task with the PR number, tell him to read comments with gitea-pr comments N, make changes, push, and reply.
+
+    ## Do Not
+
+    Send multi-step plans as one message. Reference prior context Walter does not have. Skip verification between steps. Let Walter run 20+ minutes without checking progress.
+  vikunja-project-manager.md: |
+    ---
+    name: vikunja-project-manager
+    version: 2.0.0
+    description: Manage tasks via Vikunja CLI. Use for project status, task tracking, and TODO lists.
+    ---
+
+    # Vikunja Project Manager
+
+    CLI tool on PATH, already authenticated. Run via shell (e.g., vikunja projects).
+
+    ## Commands
+
+    vikunja projects — list all projects.
+    vikunja project create --title "..." — create project.
+    vikunja tasks PROJECT_ID — list tasks.
+    vikunja task create PROJECT_ID --title "..." [--description "..."] [--due "YYYY-MM-DD"] [--priority 1-5] [--assignee USERNAME] — create task.
+    vikunja task update TASK_ID [--done] [--title "..."] [--assignee USERNAME] — update task.
+    vikunja task assign TASK_ID --user USERNAME — assign task.
+    vikunja task comment TASK_ID --body "..." — add comment.
+
+    ## Users
+
+    Known usernames: dan, sam, admin. Assign Dan to his action items, yourself to tasks you track.
+
+    ## Workflow
+
+    New initiative: check if project exists first, create if needed, break into tasks with priorities and due dates.
+    Updating: vikunja tasks ID to see state, task update --done when complete, task comment for decisions or blockers.
+    Reporting: vikunja tasks ID, then summarize done/in-progress/blocked.
+
+    Priority 1 (lowest) through 5 (highest). Due dates: --due "YYYY-MM-DD". Task titles should be short and actionable.

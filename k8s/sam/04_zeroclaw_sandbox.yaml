@@ -1,0 +1,359 @@
+# trunk-ignore(checkov/CKV_K8S_8): zeroclaw gateway does not document a dedicated liveness endpoint
+# trunk-ignore(checkov/CKV_K8S_9): zeroclaw gateway does not document a dedicated readiness endpoint
+apiVersion: agents.x-k8s.io/v1alpha1
+kind: Sandbox
+metadata:
+  name: zeroclaw
+  namespace: ai-agents
+spec:
+  replicas: 1
+  podTemplate:
+    metadata:
+      labels:
+        app: zeroclaw
+    spec:
+      serviceAccountName: zeroclaw-sa
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        runAsNonRoot: false
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: regcred
+      initContainers:
+        - name: init-zeroclaw-config
+          image: debian:bookworm-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -ec
+            - |
+              mkdir -p /data/.zeroclaw /data/.zeroclaw/workspace
+              # Always sync config.toml from ConfigMap template.
+              # Secrets are injected via env vars, not in the config file.
+              echo "Syncing config.toml from ConfigMap template"
+              cp /etc/zeroclaw-template/config.toml /data/.zeroclaw/config.toml
+              chmod 600 /data/.zeroclaw/config.toml
+              # Read-only identity files are mounted directly into the zeroclaw
+              # container. Writable files (MEMORY.md, USER.md) are seeded to
+              # the PVC only if missing, so Sam can update them.
+              for f in MEMORY.md USER.md; do
+                if [ ! -f "/data/.zeroclaw/workspace/$f" ] && [ -f "/etc/zeroclaw-template/identity/$f" ]; then
+                  echo "Seeding writable $f"
+                  cp "/etc/zeroclaw-template/identity/$f" "/data/.zeroclaw/workspace/$f"
+                fi
+              done
+              # Skills are mounted directly into the zeroclaw container via subPath.
+              # Create the skills directory so ZeroClaw can discover them.
+              mkdir -p /data/.zeroclaw/workspace/skills/k8s-delegation
+              mkdir -p /data/.zeroclaw/workspace/skills/vikunja-project-manager
+              mkdir -p /data/.zeroclaw/workspace/skills/daily-meeting-summary
+              mkdir -p /data/.zeroclaw/workspace/skills/science-curator
+              mkdir -p /data/.zeroclaw/workspace/skills/browser-navigation
+              mkdir -p /data/.zeroclaw/workspace/skills/cron-management
+              mkdir -p /data/.zeroclaw/workspace/skills/wiki-management
+              # Seed Serena project config if missing.
+              # This lets activate_project work without auto-detection
+              # (which fails on markdown-only workspaces).
+              mkdir -p /data/workspace/.serena
+              echo "Syncing .serena/project.yml"
+              printf '%s\n' 'project_name: sam' 'languages:' '  - bash' '  - toml' '  - yaml' \
+                > /data/workspace/.serena/project.yml
+              chown 1000:1000 /data/workspace/.serena /data/workspace/.serena/project.yml
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: zeroclaw-data
+              mountPath: /data
+            - name: zeroclaw-config-template
+              mountPath: /etc/zeroclaw-template/config.toml
+              subPath: config.toml
+              readOnly: true
+            - name: zeroclaw-identity
+              mountPath: /etc/zeroclaw-template/identity
+              readOnly: true
+            # Skills are mounted directly into the zeroclaw container, not here.
+      containers:
+        - name: zeroclaw
+          image: citizendaniel/zeroclaw-sam:v1.5.7
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - -ec
+            - |
+              mkdir -p /data/.zeroclaw /data/workspace /tmp/agent-browser
+              cd /data/workspace
+              # Pre-start the agent-browser daemon so it's warm when zeroclaw
+              # needs it. Redirect stdin from /dev/null so process.stdin.resume()
+              # inside the daemon doesn't trigger SIGTTIN when run in background.
+              node /opt/sam-tools/npm-global/lib/node_modules/agent-browser/dist/daemon.js </dev/null &
+              # Wait up to 180s for the socket to appear before starting zeroclaw.
+              echo "Waiting for agent-browser daemon socket..."
+              for _i in $(seq 1 180); do
+                [ -S /tmp/agent-browser/default.sock ] && echo "Daemon ready." && break
+                sleep 1
+              done
+              [ -S /tmp/agent-browser/default.sock ] || echo "Warning: daemon socket not ready, starting zeroclaw anyway"
+              # Wait for Serena MCP sidecar to be ready.
+              echo "Waiting for Serena MCP server on port 9121..."
+              for _i in $(seq 1 60); do
+                if (echo > /dev/tcp/127.0.0.1/9121) 2>/dev/null; then echo "Serena ready." && break; fi
+                sleep 1
+              done
+              (echo > /dev/tcp/127.0.0.1/9121) 2>/dev/null || echo "Warning: Serena not ready, starting zeroclaw anyway"
+              exec zeroclaw daemon
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          env:
+            - name: HOME
+              value: /data
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: zeroclaw-config-secrets
+                  key: api_key
+            - name: ZEROCLAW_GATEWAY_PAIRED_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: zeroclaw-config-secrets
+                  key: gateway-paired-tokens
+                  optional: true
+            - name: AGENT_BROWSER_SOCKET_DIR
+              value: /tmp/agent-browser
+            - name: AGENT_BROWSER_ARGS
+              value: "--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage"
+            - name: PLAYWRIGHT_BROWSERS_PATH
+              value: /opt/sam-tools/home/.cache/ms-playwright
+            - name: SPEAKR_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: zeroclaw-config-secrets
+                  key: SPEAKR_API_TOKEN
+                  optional: true
+            - name: VIKUNJA_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: zeroclaw-config-secrets
+                  key: VIKUNJA_API_TOKEN
+                  optional: true
+            - name: VIKUNJA_BASE_URL
+              value: "http://vikunja.todolist.svc.cluster.local:3456"
+            - name: ACP_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: zeroclaw-k8s-agent-secrets
+                  key: gateway-paired-tokens
+                  optional: true
+            - name: SERENA_SESSION_FILE
+              value: /data/.zeroclaw/serena-session-id
+            - name: SERENA_DEFAULT_PROJECT
+              value: /data/workspace
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: true
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: zeroclaw-data
+              mountPath: /data
+            - name: acp-client
+              mountPath: /usr/local/bin/acp-client
+              subPath: acp-client.py
+              readOnly: true
+            - name: vikunja-tool
+              mountPath: /usr/local/bin/vikunja
+              subPath: vikunja.py
+              readOnly: true
+            # Identity files mounted directly from ConfigMap.
+            - name: zeroclaw-identity
+              mountPath: /data/.zeroclaw/workspace/AGENTS.md
+              subPath: AGENTS.md
+              readOnly: true
+            - name: zeroclaw-identity
+              mountPath: /data/.zeroclaw/workspace/TOOLS.md
+              subPath: TOOLS.md
+              readOnly: true
+            - name: zeroclaw-identity
+              mountPath: /data/.zeroclaw/workspace/IDENTITY.md
+              subPath: IDENTITY.md
+              readOnly: true
+            - name: zeroclaw-identity
+              mountPath: /data/.zeroclaw/workspace/SOUL.md
+              subPath: SOUL.md
+              readOnly: true
+            # Skills mounted directly — no init container copy needed.
+            - name: zeroclaw-skills
+              mountPath: /data/.zeroclaw/workspace/skills/k8s-delegation/SKILL.md
+              subPath: k8s-delegation.md
+              readOnly: true
+            - name: zeroclaw-skills
+              mountPath: /data/.zeroclaw/workspace/skills/vikunja-project-manager/SKILL.md
+              subPath: vikunja-project-manager.md
+              readOnly: true
+            - name: skill-meeting-summary
+              mountPath: /data/.zeroclaw/workspace/skills/daily-meeting-summary/SKILL.md
+              subPath: daily-meeting-summary.md
+              readOnly: true
+            - name: skill-meeting-summary
+              mountPath: /data/.zeroclaw/workspace/skills/daily-meeting-summary/speakr-fetch.py
+              subPath: speakr-fetch.py
+              readOnly: true
+            - name: skill-meeting-summary
+              mountPath: /data/.zeroclaw/workspace/skills/daily-meeting-summary/speakr-transcript.py
+              subPath: speakr-transcript.py
+              readOnly: true
+            - name: skill-science-curator
+              mountPath: /data/.zeroclaw/workspace/skills/science-curator/SKILL.md
+              subPath: science-curator.md
+              readOnly: true
+            - name: skill-browser-navigation
+              mountPath: /data/.zeroclaw/workspace/skills/browser-navigation/SKILL.md
+              subPath: browser-navigation.md
+              readOnly: true
+            - name: skill-cron-management
+              mountPath: /data/.zeroclaw/workspace/skills/cron-management/SKILL.md
+              subPath: cron-management.md
+              readOnly: true
+            - name: skill-wiki-management
+              mountPath: /data/.zeroclaw/workspace/skills/wiki-management/SKILL.md
+              subPath: wiki-management.md
+              readOnly: true
+        - name: serena
+          image: citizendaniel/zeroclaw-sam:v1.5.7
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -ec
+            - |
+              mkdir -p /data/workspace
+              cd /data/workspace
+              exec /opt/sam-tools/home/.local/bin/serena start-mcp-server \
+                --transport streamable-http \
+                --port 9121 \
+                --enable-web-dashboard false \
+                --enable-gui-log-window false \
+                --project /data/workspace
+          ports:
+            - name: serena-mcp
+              containerPort: 9121
+              protocol: TCP
+          env:
+            - name: HOME
+              value: /opt/sam-tools/home
+            - name: UV_TOOL_DIR
+              value: /opt/sam-tools/home/.local/share/uv/tools
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: zeroclaw-data
+              mountPath: /data
+        - name: signal-api-adapter
+          image: citizendaniel/signal-api-adapter:v1.3.0
+          imagePullPolicy: Always
+          ports:
+            - name: signal-adapt
+              containerPort: 8686
+              protocol: TCP
+          env:
+            - name: BRIDGE_BASE_URL
+              value: http://signal-cli-daemon.ai-agents.svc.cluster.local:8686
+            - name: LISTEN_ADDR
+              value: :8686
+            - name: POLL_TIMEOUT_SECONDS
+              value: "20"
+            - name: SIGNAL_ACCOUNT
+              value: "+19038905805"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: zeroclaw-config-template
+          configMap:
+            name: zeroclaw-config
+        - name: zeroclaw-identity
+          configMap:
+            name: zeroclaw-identity
+        - name: zeroclaw-skills
+          configMap:
+            name: zeroclaw-skills
+        - name: skill-meeting-summary
+          configMap:
+            name: zeroclaw-skill-meeting-summary
+            items:
+              - key: daily-meeting-summary.md
+                path: daily-meeting-summary.md
+              - key: speakr-fetch.py
+                path: speakr-fetch.py
+                mode: 0755
+              - key: speakr-transcript.py
+                path: speakr-transcript.py
+                mode: 0755
+        - name: skill-science-curator
+          configMap:
+            name: zeroclaw-skill-science-curator
+        - name: skill-browser-navigation
+          configMap:
+            name: zeroclaw-skill-browser-navigation
+        - name: skill-cron-management
+          configMap:
+            name: zeroclaw-skill-cron-management
+        - name: skill-wiki-management
+          configMap:
+            name: zeroclaw-skill-wiki-management
+        - name: acp-client
+          configMap:
+            name: acp-client
+            defaultMode: 0755
+        - name: vikunja-tool
+          configMap:
+            name: zeroclaw-vikunja-tool
+            defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata:
+        name: zeroclaw-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: rook-ceph-block
+        resources:
+          requests:
+            storage: 10Gi

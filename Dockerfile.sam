@@ -1,0 +1,164 @@
+# syntax=docker/dockerfile:1.7
+
+# ── Stage 1: Build zeroclaw ──────────────────────────────────
+FROM rust:1.93-slim AS builder
+WORKDIR /app
+ARG ZEROCLAW_CARGO_FEATURES=""
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y pkg-config && rm -rf /var/lib/apt/lists/*
+
+# Dep-cache pass (same as existing Dockerfile)
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY crates/robot-kit/Cargo.toml crates/robot-kit/Cargo.toml
+COPY crates/zeroclaw-types/Cargo.toml crates/zeroclaw-types/Cargo.toml
+COPY crates/zeroclaw-core/Cargo.toml crates/zeroclaw-core/Cargo.toml
+RUN mkdir -p src benches crates/robot-kit/src crates/zeroclaw-types/src crates/zeroclaw-core/src \
+    && echo "fn main() {}" > src/main.rs \
+    && echo "fn main() {}" > benches/agent_benchmarks.rs \
+    && echo "pub fn placeholder() {}" > crates/robot-kit/src/lib.rs \
+    && echo "pub fn placeholder() {}" > crates/zeroclaw-types/src/lib.rs \
+    && echo "pub fn placeholder() {}" > crates/zeroclaw-core/src/lib.rs
+RUN --mount=type=cache,id=zeroclaw-sam-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=zeroclaw-sam-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=zeroclaw-sam-target,target=/app/target,sharing=locked \
+    if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
+      cargo build --release --features "$ZEROCLAW_CARGO_FEATURES"; \
+    else \
+      cargo build --release --locked; \
+    fi
+RUN rm -rf src benches crates/robot-kit/src crates/zeroclaw-types/src crates/zeroclaw-core/src
+
+# Real source build
+COPY src/ src/
+COPY benches/ benches/
+COPY crates/ crates/
+COPY firmware/ firmware/
+COPY templates/ templates/
+COPY web/ web/
+RUN mkdir -p web/dist && \
+    if [ ! -f web/dist/index.html ]; then \
+      printf '<!doctype html><html><body><h1>Dashboard Unavailable</h1></body></html>' > web/dist/index.html; \
+    fi
+RUN --mount=type=cache,id=zeroclaw-sam-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=zeroclaw-sam-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=zeroclaw-sam-target,target=/app/target,sharing=locked \
+    if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
+      cargo build --release --features "$ZEROCLAW_CARGO_FEATURES"; \
+    else \
+      cargo build --release --locked; \
+    fi && \
+    cp target/release/zeroclaw /app/zeroclaw && strip /app/zeroclaw
+
+# ── Stage 2: Sam tools ──────────────────────────────────────
+# Use trixie-slim to match the runtime's Python 3.13 (avoids virtualenv
+# version mismatch when uv creates Serena's venv with the system python).
+FROM debian:trixie-slim AS tools
+
+ENV HOME=/opt/sam-tools/home
+ENV NODE_VERSION=20.18.1
+ENV PATH="/opt/sam-tools/node/bin:/opt/sam-tools/npm-global/bin:/opt/sam-tools/home/.local/bin:${PATH}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl xz-utils git ca-certificates python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js from official tarball
+RUN mkdir -p /opt/sam-tools/node /opt/sam-tools/npm-global /opt/sam-tools/home/.local/bin \
+    && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+       | tar -xJ --no-same-owner -C /opt/sam-tools/ \
+    && mv /opt/sam-tools/node-v${NODE_VERSION}-linux-x64/* /opt/sam-tools/node/ \
+    && rmdir /opt/sam-tools/node-v${NODE_VERSION}-linux-x64
+
+# npm global packages
+RUN npm config set prefix /opt/sam-tools/npm-global \
+    && npm install -g @upstash/context7-mcp agent-browser@0.18.0
+
+# Playwright Chromium + system deps (fixes the 21 missing shared libraries)
+RUN npx playwright install --with-deps chromium
+
+# uv (Python package manager)
+RUN curl -fsSL https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-gnu.tar.gz \
+    | tar -xz --no-same-owner -C /opt/sam-tools/home/.local/bin --strip-components=1
+
+# Serena
+RUN printf '[safe]\n\tdirectory = *\n' > /opt/sam-tools/home/.gitconfig \
+    && GIT_CONFIG_GLOBAL=/opt/sam-tools/home/.gitconfig \
+       uv tool install git+https://github.com/oraios/serena
+
+# ── Stage 3: Runtime ────────────────────────────────────────
+# Must use trixie to match rust:1.93-slim's glibc (2.41). bookworm has 2.36
+# which is too old for the compiled zeroclaw binary.
+FROM debian:trixie-slim
+
+# Chromium system deps + python3 (needed by Serena/uv) + git (needed by Serena LSP)
+# Trixie uses t64 suffixes for time_t-transitioned packages.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates python3 git \
+    libglib2.0-0t64 libnss3 libnspr4 \
+    libx11-6 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
+    libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libdrm2 libgbm1 \
+    libpango-1.0-0 libcairo2 libasound2t64 libexpat1 libdbus-1-3 \
+    libxcb1 libxkbcommon0 libatspi2.0-0t64 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Zeroclaw binary
+COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
+
+# Node.js runtime + npm global packages
+COPY --from=tools /opt/sam-tools/node /opt/sam-tools/node
+COPY --from=tools /opt/sam-tools/npm-global /opt/sam-tools/npm-global
+
+# Playwright browsers (HOME=/opt/sam-tools/home in tools stage)
+COPY --from=tools /opt/sam-tools/home/.cache/ms-playwright /opt/sam-tools/home/.cache/ms-playwright
+
+# uv + Serena binaries + tool-installed packages (Serena lives under .local/share/uv)
+COPY --from=tools /opt/sam-tools/home/.local /opt/sam-tools/home/.local
+
+# Git config (safe.directory = * for Serena)
+COPY --from=tools /opt/sam-tools/home/.gitconfig /opt/sam-tools/home/.gitconfig
+
+# Serena config + memories directory (must exist and be writable by uid 1000)
+RUN mkdir -p /opt/sam-tools/home/.serena/memories/global && \
+    printf '%s\n' \
+      'language_backend: LSP' \
+      'gui_log_window: false' \
+      'web_dashboard: false' \
+      'web_dashboard_open_on_launch: false' \
+      'default_modes:' \
+      '  - interactive' \
+      '  - editing' \
+      'projects:' \
+      '  sam:' \
+      '    path: /data/workspace' \
+      > /opt/sam-tools/home/.serena/serena_config.yml
+
+# serena-cli script (copied into build context before build)
+COPY serena-cli /opt/sam-tools/npm-global/bin/serena-cli
+RUN chmod +x /opt/sam-tools/npm-global/bin/serena-cli
+
+# Create passwd/group entries for uid 1000 so getpwuid() succeeds.
+# Without this, the bash language server (used by Serena) fails with
+# "getpwuid(): uid not found: 1000".
+RUN groupadd -g 1000 sam && useradd -u 1000 -g 1000 -d /data -s /bin/bash sam
+
+# Serena sidecar (uid 1000) needs write access to its memories and npm cache.
+# The npm cache is created as root during the tools build stage; Serena's
+# runtime npm install (for language servers like bash-language-server) needs
+# write access.
+RUN mkdir -p /opt/sam-tools/home/.npm && \
+    chown -R 1000:1000 /opt/sam-tools/home/.serena /opt/sam-tools/home/.npm
+
+ENV HOME=/data
+ENV PATH="/opt/sam-tools/node/bin:/opt/sam-tools/npm-global/bin:/opt/sam-tools/home/.local/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ENV NPM_CONFIG_PREFIX=/opt/sam-tools/npm-global
+ENV AGENT_BROWSER_SOCKET_DIR=/tmp/agent-browser
+ENV AGENT_BROWSER_ARGS="--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage"
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/sam-tools/home/.cache/ms-playwright
+ENV UV_TOOL_DIR=/opt/sam-tools/home/.local/share/uv/tools
+
+WORKDIR /data
+USER 1000:1000
+ENTRYPOINT ["/usr/local/bin/zeroclaw"]
+CMD ["daemon"]

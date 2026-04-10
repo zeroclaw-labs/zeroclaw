@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zeroclaw-skill-science-curator
+  namespace: ai-agents
+data:
+  science-curator.md: |
+    ---
+    name: science-curator
+    version: 2.0.0
+    description: Curates science and space news. Use for science news requests or daily cron.
+    ---
+
+    # Science News Curator
+
+    Curates science and space stories for Dan. Runs as daily cron or on-demand.
+
+    ## Tool Routing
+
+    Use Python urllib via shell for all sources. Only use browser for JavaScript-rendered SPAs.
+
+    ## Sources
+
+    Fetch recent stories (past week) from: NASA News (nasa.gov/news), ESA News (esa.int/News), Space.com, ScienceDaily (secondary, skip if others have enough). Use Python to fetch HTML and parse headlines.
+
+    ## Process
+
+    1. Dedup: memory_recall key pattern science-news/ to check existing stories.
+    2. Fetch sources, identify 3-5 new stories not in memory.
+    3. Save each to memory with key science-news/YYYY-MM-DD/story-slug: headline, 2-3 sentence summary, why interesting, source URL.
+    4. Message Dan via Signal only if genuinely noteworthy (major discovery, mission milestone). Most days, save silently.
+
+    ## Criteria
+
+    Prioritize: discoveries, mission milestones, technology breakthroughs.
+    Deprioritize: policy, budget, personnel, routine updates.
+
+    ## Message Format (when messaging)
+
+    Keep scannable for mobile. Lead with date, then headline + one sentence per story. End with "Full details saved to memory."

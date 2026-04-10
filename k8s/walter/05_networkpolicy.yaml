@@ -1,0 +1,86 @@
+# Network policy for zeroclaw-k8s-agent (Walter).
+# Scoped to the zeroclaw-k8s-agent pod and port 3000.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-zeroclaw-k8s-agent
+  namespace: ai-agents
+spec:
+  podSelector:
+    matchLabels:
+      app: zeroclaw-k8s-agent
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow HBONE tunnel traffic (ambient mesh)
+    - ports:
+        - protocol: TCP
+          port: 15008
+    # Allow ambient health probes (SNAT link-local address)
+    - from:
+        - ipBlock:
+            cidr: 169.254.7.127/32
+    # ACP-over-HTTP from any in-cluster pod (including zeroclaw/Sam)
+    - from:
+        - namespaceSelector: {}
+          podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 3000
+    # Kubelet health probes from node network
+    - from:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 3000
+  egress:
+    # HBONE tunnel traffic (ambient mesh egress)
+    - ports:
+        - protocol: TCP
+          port: 15008
+    # DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # LiteLLM proxy
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: llama
+          podSelector:
+            matchLabels:
+              app: litellm
+      ports:
+        - protocol: TCP
+          port: 4000
+    # Kubernetes API server access is handled by CiliumNetworkPolicy
+    # (06_cilium_kube_api_policy.yaml) using toEntities: kube-apiserver.
+    # HTTPS — Git clone / external registries
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+    # Gitea on local network
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 3000

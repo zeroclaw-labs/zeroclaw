@@ -22,6 +22,89 @@ use std::time::Duration;
 use tokio::process::Command;
 use tracing::debug;
 
+// ── Screenshot optimization ─────────────────────────────────────────────
+// Screenshots from browser tools can be very large PNGs (1280x720 → ~800KB
+// raw → ~1MB base64 → ~109K tokens). This blows through most model context
+// windows. We resize and JPEG-compress screenshots before embedding them,
+// matching the approach used by multimodal.rs for user-supplied images.
+//
+// Max dimension is higher than multimodal's 512px because screenshots
+// contain text that needs to be legible for vision models.
+const SCREENSHOT_MAX_DIMENSION: u32 = 1024;
+const SCREENSHOT_TARGET_BYTES: usize = 200 * 1024; // 200KB JPEG target
+
+/// Optimize raw PNG screenshot bytes: resize to max 1024px, compress to JPEG.
+/// Returns `(optimized_bytes, mime_type)`. Falls back to original on error.
+fn optimize_screenshot_blocking(png_bytes: &[u8]) -> (Vec<u8>, &'static str) {
+    let decoded = match image::load_from_memory(png_bytes) {
+        Ok(img) => img,
+        Err(_) => return (png_bytes.to_vec(), "image/png"),
+    };
+
+    let resized = if decoded.width() > SCREENSHOT_MAX_DIMENSION
+        || decoded.height() > SCREENSHOT_MAX_DIMENSION
+    {
+        decoded.thumbnail(SCREENSHOT_MAX_DIMENSION, SCREENSHOT_MAX_DIMENSION)
+    } else {
+        decoded
+    };
+
+    for quality in [80_u8, 65, 50, 35] {
+        let mut buf = Vec::new();
+        {
+            let mut cursor = std::io::Cursor::new(&mut buf);
+            let mut encoder =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality);
+            if encoder.encode_image(&resized).is_err() {
+                return (png_bytes.to_vec(), "image/png");
+            }
+        }
+        if buf.len() <= SCREENSHOT_TARGET_BYTES {
+            return (buf, "image/jpeg");
+        }
+        // Keep the last attempt even if over target — still better than raw PNG.
+        if quality == 35 && buf.len() < png_bytes.len() {
+            return (buf, "image/jpeg");
+        }
+    }
+
+    (png_bytes.to_vec(), "image/png")
+}
+
+/// Async wrapper for screenshot optimization.
+pub(crate) async fn optimize_screenshot(png_bytes: Vec<u8>) -> (Vec<u8>, &'static str) {
+    let original_len = png_bytes.len();
+    let (optimized, mime) =
+        tokio::task::spawn_blocking(move || optimize_screenshot_blocking(&png_bytes))
+            .await
+            .unwrap_or_else(|_| (Vec::new(), "image/png"));
+    if optimized.is_empty() {
+        // spawn_blocking panicked; caller should handle gracefully
+        return (Vec::new(), "image/png");
+    }
+    if optimized.len() < original_len {
+        tracing::info!(
+            original_bytes = original_len,
+            optimized_bytes = optimized.len(),
+            mime,
+            "screenshot optimized for prompt"
+        );
+    }
+    (optimized, mime)
+}
+
+/// Format optimized screenshot bytes as a tool result with an [IMAGE:] marker
+/// so the multimodal pipeline can extract it as a proper image content part.
+pub(crate) fn format_screenshot_result(
+    optimized_bytes: &[u8],
+    mime: &str,
+    extra_info: &str,
+) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(optimized_bytes);
+    format!("{extra_info}\n[IMAGE:data:{mime};base64,{b64}]")
+}
+
 /// Computer-use sidecar settings.
 #[derive(Clone)]
 pub struct ComputerUseConfig {
@@ -674,7 +757,8 @@ impl BrowserTool {
                     args.push("--full");
                 }
                 let resp = self.run_command(&args).await?;
-                self.to_result(resp)
+                // Optimize screenshot before returning to keep token usage manageable.
+                self.screenshot_to_optimized_result(resp).await
             }
 
             BrowserAction::Wait { selector, ms, text } => {
@@ -777,6 +861,27 @@ impl BrowserTool {
                         .with_context(|| "rust_native backend retry after session reset failed")?
                 }
             };
+
+            // Optimize screenshots before returning to keep token usage manageable.
+            if output.get("action").and_then(|v| v.as_str()) == Some("screenshot") {
+                if let Some(b64_str) = output.get("png_base64").and_then(|v| v.as_str()) {
+                    use base64::Engine;
+                    if let Ok(raw_png) = base64::engine::general_purpose::STANDARD.decode(b64_str) {
+                        let raw_len = raw_png.len();
+                        let (optimized, mime) = optimize_screenshot(raw_png).await;
+                        let info = format!(
+                            "Screenshot captured (original: {}KB, optimized: {}KB)",
+                            raw_len / 1024,
+                            optimized.len() / 1024
+                        );
+                        return Ok(ToolResult {
+                            success: true,
+                            output: format_screenshot_result(&optimized, mime, &info),
+                            error: None,
+                        });
+                    }
+                }
+            }
 
             Ok(ToolResult {
                 success: true,
@@ -1110,6 +1215,81 @@ impl BrowserTool {
             })
         }
     }
+
+    /// Convert an agent-browser screenshot response into an optimized tool result.
+    /// Extracts the base64 PNG from the response JSON, resizes/compresses it,
+    /// and returns an [IMAGE:] marker for the multimodal pipeline.
+    async fn screenshot_to_optimized_result(
+        &self,
+        resp: AgentBrowserResponse,
+    ) -> anyhow::Result<ToolResult> {
+        if !resp.success {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: resp.error,
+            });
+        }
+
+        let data = match resp.data {
+            Some(d) => d,
+            None => {
+                return Ok(ToolResult {
+                    success: true,
+                    output: "Screenshot captured (no data returned)".into(),
+                    error: None,
+                });
+            }
+        };
+
+        // agent-browser returns screenshot data as either:
+        // - { "screenshot": "<base64 png>" }          (common)
+        // - { "png_base64": "<base64 png>" }           (alternate key)
+        // - or nested inside data.result, etc.
+        let b64_png = data
+            .get("screenshot")
+            .or_else(|| data.get("png_base64"))
+            .or_else(|| data.get("result").and_then(|r| r.get("screenshot")))
+            .and_then(|v| v.as_str());
+
+        let Some(b64_str) = b64_png else {
+            // No recognizable screenshot field — return raw JSON as before.
+            let output = serde_json::to_string_pretty(&data).unwrap_or_default();
+            return Ok(ToolResult {
+                success: true,
+                output,
+                error: None,
+            });
+        };
+
+        // Decode, optimize, and format as [IMAGE:] marker.
+        use base64::Engine;
+        let raw_png = match base64::engine::general_purpose::STANDARD.decode(b64_str) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: true,
+                    output: format!("Screenshot captured but base64 decode failed: {e}"),
+                    error: None,
+                });
+            }
+        };
+
+        let raw_len = raw_png.len();
+        let (optimized, mime) = optimize_screenshot(raw_png).await;
+        let info = format!(
+            "Screenshot captured (original: {}KB, optimized: {}KB)",
+            raw_len / 1024,
+            optimized.len() / 1024
+        );
+        let output = format_screenshot_result(&optimized, mime, &info);
+
+        Ok(ToolResult {
+            success: true,
+            output,
+            error: None,
+        })
+    }
 }
 
 #[async_trait]
@@ -1138,7 +1318,7 @@ impl Tool for BrowserTool {
                              "hover", "scroll", "is_visible", "close", "find",
                              "mouse_move", "mouse_click", "mouse_drag", "key_type",
                              "key_press", "screen_capture"],
-                    "description": "Browser action to perform (OS-level actions require backend=computer_use)"
+                    "description": "Browser action. Common actions and required params: open(url), get_text(selector — use 'body' for full page), click(selector), fill(selector, value), find(by, value, find_action), scroll(direction), snapshot(), screenshot(), press(key), hover(selector). OS-level actions (mouse_move, mouse_click, key_type, etc.) require backend=computer_use."
                 },
                 "url": {
                     "type": "string",
@@ -1146,11 +1326,11 @@ impl Tool for BrowserTool {
                 },
                 "selector": {
                     "type": "string",
-                    "description": "Element selector: @ref (e.g. @e1), CSS (#id, .class), or text=..."
+                    "description": "Element selector: @ref (e.g. @e1), CSS (#id, .class), text=..., or 'body' for full page. Required for get_text, click, fill, type, hover, is_visible."
                 },
                 "value": {
                     "type": "string",
-                    "description": "Value to fill or type"
+                    "description": "Value to fill, type, or search for. Required for fill, find."
                 },
                 "text": {
                     "type": "string",
@@ -1192,7 +1372,7 @@ impl Tool for BrowserTool {
                 "direction": {
                     "type": "string",
                     "enum": ["up", "down", "left", "right"],
-                    "description": "Scroll direction"
+                    "description": "Scroll direction: up, down, left, right. Required for scroll."
                 },
                 "pixels": {
                     "type": "integer",

@@ -28,6 +28,10 @@ pub struct SignalChannel {
     allowed_from: Vec<String>,
     ignore_attachments: bool,
     ignore_stories: bool,
+    /// Enable progressive message editing: send "🧠 Working..." then edit
+    /// in-place with intermediate progress and final response.  Requires
+    /// signal-cli REST API v2 (`editMessage` RPC).
+    edit_messages: bool,
 }
 
 // ── signal-cli SSE event JSON shapes ────────────────────────────
@@ -48,6 +52,8 @@ struct Envelope {
     data_message: Option<DataMessage>,
     #[serde(rename = "storyMessage", default)]
     story_message: Option<serde_json::Value>,
+    #[serde(rename = "receiptMessage", default)]
+    receipt_message: Option<ReceiptMessage>,
     #[serde(default)]
     timestamp: Option<u64>,
 }
@@ -70,6 +76,14 @@ struct GroupInfo {
     group_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ReceiptMessage {
+    #[serde(rename = "type")]
+    receipt_type: Option<String>,
+    #[serde(default)]
+    timestamps: Option<Vec<u64>>,
+}
+
 impl SignalChannel {
     pub fn new(
         http_url: String,
@@ -78,6 +92,7 @@ impl SignalChannel {
         allowed_from: Vec<String>,
         ignore_attachments: bool,
         ignore_stories: bool,
+        edit_messages: bool,
     ) -> Self {
         let http_url = http_url.trim_end_matches('/').to_string();
         Self {
@@ -87,6 +102,7 @@ impl SignalChannel {
             allowed_from,
             ignore_attachments,
             ignore_stories,
+            edit_messages,
         }
     }
 
@@ -215,6 +231,74 @@ impl SignalChannel {
         Ok(parsed.get("result").cloned())
     }
 
+    /// Build the JSON body for the `/v2/send` REST endpoint.
+    ///
+    /// The v2 REST API is required for message editing — the JSON-RPC `send`
+    /// method silently ignores edit parameters.
+    fn build_v2_send_body(
+        &self,
+        recipient: &str,
+        text: &str,
+        edit_timestamp: Option<i64>,
+    ) -> serde_json::Value {
+        let recipients = match Self::parse_recipient_target(recipient) {
+            RecipientTarget::Direct(id) => serde_json::json!([id]),
+            RecipientTarget::Group(gid) => serde_json::json!([gid]),
+        };
+
+        let mut body = serde_json::json!({
+            "message": text,
+            "number": &self.account,
+            "recipients": recipients,
+        });
+
+        if let Some(ts) = edit_timestamp {
+            body["edit_timestamp"] = serde_json::json!(ts);
+        }
+
+        body
+    }
+
+    /// Send a message via the `/v2/send` REST endpoint, returning the
+    /// response timestamp as a string (used as message ID for edits).
+    async fn v2_send(
+        &self,
+        recipient: &str,
+        text: &str,
+        edit_timestamp: Option<i64>,
+    ) -> anyhow::Result<Option<String>> {
+        let url = format!("{}/v2/send", self.http_url);
+        let body = self.build_v2_send_body(recipient, text, edit_timestamp);
+
+        let resp = self
+            .http_client()
+            .post(&url)
+            .timeout(Duration::from_secs(30))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Signal v2/send error ({status}): {text}");
+        }
+
+        let parsed: serde_json::Value = resp.json().await?;
+        let ts = parsed
+            .get("timestamp")
+            .and_then(|t| t.as_str().or_else(|| t.as_i64().map(|_| "")))
+            .map(String::from)
+            .or_else(|| {
+                parsed
+                    .get("timestamp")
+                    .and_then(|t| t.as_i64())
+                    .map(|t| t.to_string())
+            });
+        Ok(ts)
+    }
+
     /// Process a single SSE envelope, returning a ChannelMessage if valid.
     fn process_envelope(&self, envelope: &Envelope) -> Option<ChannelMessage> {
         // Skip story messages when configured
@@ -232,7 +316,41 @@ impl SignalChannel {
             }
         }
 
-        let text = data_msg.message.as_deref().filter(|t| !t.is_empty())?;
+        // Build content: start with text (may be empty for image-only messages).
+        let mut content = data_msg
+            .message
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .unwrap_or("")
+            .to_string();
+
+        // Append [IMAGE:data:<mime>;base64,<data>] markers for enriched image
+        // attachments so the multimodal pipeline can send them to vision-capable
+        // LLMs.  Non-image attachments and attachments without inline data are
+        // silently skipped (consistent with ignore_attachments=false semantics).
+        if !self.ignore_attachments {
+            if let Some(attachments) = &data_msg.attachments {
+                for att in attachments {
+                    let ct = att
+                        .get("contentType")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let data = att.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                    if ct.starts_with("image/") && !data.is_empty() {
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(&format!("[IMAGE:data:{ct};base64,{data}]"));
+                    }
+                }
+            }
+        }
+
+        // Nothing usable (no text and no image attachments).
+        if content.is_empty() {
+            return None;
+        }
+
         let sender = Self::sender(envelope)?;
 
         if !self.is_sender_allowed(&sender) {
@@ -262,11 +380,45 @@ impl SignalChannel {
             id: format!("sig_{timestamp}"),
             sender: sender.clone(),
             reply_target: target,
-            content: text.to_string(),
+            content,
             channel: "signal".to_string(),
             timestamp: timestamp / 1000, // millis → secs
             thread_ts: None,
         })
+    }
+
+    /// Format a receipt envelope as a human-readable status line for buffering.
+    /// Instead of sending receipts as independent messages (which trigger LLM turns),
+    /// they are buffered and prepended to the next real message.
+    fn format_receipt(envelope: &Envelope) -> Option<String> {
+        let receipt = envelope.receipt_message.as_ref()?;
+        let receipt_type = receipt.receipt_type.as_deref().unwrap_or("UNKNOWN");
+        let timestamps = receipt.timestamps.as_deref().unwrap_or(&[]);
+
+        let sender = envelope
+            .source_number
+            .as_deref()
+            .or(envelope.source.as_deref())?;
+
+        let ts_display: Vec<String> = timestamps
+            .iter()
+            .map(|ts| {
+                let secs = ts / 1000;
+                format!("{secs}")
+            })
+            .collect();
+
+        let verb = match receipt_type {
+            "DELIVERY" => "delivered to",
+            "READ" => "read by",
+            "VIEWED" => "viewed by",
+            _ => "acknowledged by",
+        };
+
+        Some(format!(
+            "[SIGNAL:{receipt_type}_RECEIPT] Message {verb} {sender} (original timestamps: {})",
+            ts_display.join(", ")
+        ))
     }
 }
 
@@ -335,6 +487,7 @@ impl Channel for SignalChannel {
             let mut bytes_stream = resp.bytes_stream();
             let mut buffer = String::new();
             let mut current_data = String::new();
+            let mut pending_receipts: Vec<String> = Vec::new();
 
             while let Some(chunk) = bytes_stream.next().await {
                 let chunk = match chunk {
@@ -370,10 +523,18 @@ impl Channel for SignalChannel {
                             match serde_json::from_str::<SseEnvelope>(&current_data) {
                                 Ok(sse) => {
                                     if let Some(ref envelope) = sse.envelope {
-                                        if let Some(msg) = self.process_envelope(envelope) {
+                                        if let Some(mut msg) = self.process_envelope(envelope) {
+                                            // Discard buffered receipts — they waste LLM context tokens
+                                            if !pending_receipts.is_empty() {
+                                                pending_receipts.clear();
+                                            }
                                             if tx.send(msg).await.is_err() {
                                                 return Ok(());
                                             }
+                                        } else if let Some(receipt_line) =
+                                            Self::format_receipt(envelope)
+                                        {
+                                            pending_receipts.push(receipt_line);
                                         }
                                     }
                                 }
@@ -397,8 +558,13 @@ impl Channel for SignalChannel {
                 match serde_json::from_str::<SseEnvelope>(&current_data) {
                     Ok(sse) => {
                         if let Some(ref envelope) = sse.envelope {
-                            if let Some(msg) = self.process_envelope(envelope) {
+                            if let Some(mut msg) = self.process_envelope(envelope) {
+                                if !pending_receipts.is_empty() {
+                                    pending_receipts.clear();
+                                }
                                 let _ = tx.send(msg).await;
+                            } else if let Some(receipt_line) = Self::format_receipt(envelope) {
+                                pending_receipts.push(receipt_line);
                             }
                         }
                     }
@@ -447,6 +613,47 @@ impl Channel for SignalChannel {
         // auto-expire after ~15s on the client side.
         Ok(())
     }
+
+    fn supports_draft_updates(&self) -> bool {
+        self.edit_messages
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        if !self.edit_messages {
+            return Ok(None);
+        }
+
+        let text = if message.content.is_empty() {
+            "\u{1f9e0} Working..."
+        } else {
+            &message.content
+        };
+
+        self.v2_send(&message.recipient, text, None).await
+    }
+
+    async fn update_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let edit_ts: i64 = message_id.parse().map_err(|_| {
+            anyhow::anyhow!("invalid Signal draft message ID (expected timestamp): {message_id}")
+        })?;
+
+        self.v2_send(recipient, text, Some(edit_ts)).await
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.update_draft(recipient, message_id, text).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -461,6 +668,7 @@ mod tests {
             vec!["+1111111111".to_string()],
             false,
             false,
+            false,
         )
     }
 
@@ -472,7 +680,82 @@ mod tests {
             vec!["*".to_string()],
             true,
             true,
+            false,
         )
+    }
+
+    fn make_channel_with_edits() -> SignalChannel {
+        SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            None,
+            vec!["+1111111111".to_string()],
+            false,
+            false,
+            true, // edit_messages enabled
+        )
+    }
+
+    #[test]
+    fn supports_draft_updates_follows_edit_messages_flag() {
+        let ch_off = make_channel();
+        assert!(!ch_off.supports_draft_updates());
+
+        let ch_on = make_channel_with_edits();
+        assert!(ch_on.supports_draft_updates());
+    }
+
+    #[tokio::test]
+    async fn send_draft_returns_none_when_edits_disabled() {
+        let ch = make_channel();
+        let result = ch
+            .send_draft(&crate::channels::traits::SendMessage::new(
+                "test",
+                "+1111111111",
+            ))
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn build_v2_send_body_includes_edit_timestamp_for_edits() {
+        let ch = make_channel_with_edits();
+        let body = ch.build_v2_send_body("+1111111111", "updated text", Some(1773509376671));
+
+        // Must use snake_case edit_timestamp (v2 REST API), not camelCase editTimestamp (JSON-RPC)
+        assert_eq!(body["edit_timestamp"], 1773509376671_i64);
+        assert_eq!(body["message"], "updated text");
+        assert_eq!(body["number"], "+1234567890"); // bot's account
+        assert!(
+            body.get("editTimestamp").is_none(),
+            "must NOT use camelCase editTimestamp"
+        );
+    }
+
+    #[test]
+    fn build_v2_send_body_omits_edit_timestamp_for_new_messages() {
+        let ch = make_channel_with_edits();
+        let body = ch.build_v2_send_body("+1111111111", "hello", None);
+
+        assert!(body.get("edit_timestamp").is_none());
+        assert_eq!(body["message"], "hello");
+    }
+
+    #[test]
+    fn build_v2_send_body_uses_recipients_for_direct() {
+        let ch = make_channel_with_edits();
+        let body = ch.build_v2_send_body("+1111111111", "test", None);
+
+        assert_eq!(body["recipients"], serde_json::json!(["+1111111111"]));
+    }
+
+    #[test]
+    fn build_v2_send_body_uses_recipients_for_group() {
+        let ch = make_channel_with_edits();
+        let body = ch.build_v2_send_body("group:testgroup123", "test", None);
+
+        assert_eq!(body["recipients"], serde_json::json!(["testgroup123"]));
     }
 
     fn make_envelope(source_number: Option<&str>, message: Option<&str>) -> Envelope {
@@ -486,6 +769,7 @@ mod tests {
                 attachments: None,
             }),
             story_message: None,
+            receipt_message: None,
             timestamp: Some(1_700_000_000_000),
         }
     }
@@ -508,6 +792,7 @@ mod tests {
             "+1234567890".to_string(),
             None,
             vec![],
+            false,
             false,
             false,
         );
@@ -539,6 +824,7 @@ mod tests {
             "+1234567890".to_string(),
             None,
             vec![],
+            false,
             false,
             false,
         );
@@ -703,6 +989,7 @@ mod tests {
             source_number: Some("+1111111111".to_string()),
             data_message: None,
             story_message: None,
+            receipt_message: None,
             timestamp: Some(1000),
         };
         assert_eq!(SignalChannel::sender(&env), Some("+1111111111".to_string()));
@@ -715,6 +1002,7 @@ mod tests {
             source_number: None,
             data_message: None,
             story_message: None,
+            receipt_message: None,
             timestamp: Some(1000),
         };
         assert_eq!(SignalChannel::sender(&env), Some("uuid-123".to_string()));
@@ -730,6 +1018,7 @@ mod tests {
             vec!["*".to_string()],
             false,
             false,
+            false,
         );
         let env = Envelope {
             source: Some(uuid.to_string()),
@@ -741,6 +1030,7 @@ mod tests {
                 attachments: None,
             }),
             story_message: None,
+            receipt_message: None,
             timestamp: Some(1_700_000_000_000),
         };
         let msg = ch.process_envelope(&env).unwrap();
@@ -763,6 +1053,7 @@ mod tests {
             vec!["*".to_string()],
             false,
             false,
+            false,
         );
         let env = Envelope {
             source: Some(uuid.to_string()),
@@ -776,6 +1067,7 @@ mod tests {
                 attachments: None,
             }),
             story_message: None,
+            receipt_message: None,
             timestamp: Some(1_700_000_000_000),
         };
         let msg = ch.process_envelope(&env).unwrap();
@@ -794,6 +1086,7 @@ mod tests {
             source_number: None,
             data_message: None,
             story_message: None,
+            receipt_message: None,
             timestamp: None,
         };
         assert_eq!(SignalChannel::sender(&env), None);
@@ -851,6 +1144,7 @@ mod tests {
                 attachments: Some(vec![serde_json::json!({"contentType": "image/png"})]),
             }),
             story_message: None,
+            receipt_message: None,
             timestamp: Some(1_700_000_000_000),
         };
         assert!(ch.process_envelope(&env).is_none());

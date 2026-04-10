@@ -38,8 +38,12 @@ otp-secret
 *.key
 *.pem
 credentials.json
+*.kubeconfig
 /config.toml
 .worktrees/
+
+# Build artifacts
+k8s/**/.tmp/
 
 # Nix
 result

@@ -163,6 +163,7 @@ pub async fn run_research_phase(
             } else {
                 None // Prompt-guided: tools are in system prompt
             },
+            tool_choice: None,
         };
 
         let response: ChatResponse = provider.chat(request, model, temperature).await?;

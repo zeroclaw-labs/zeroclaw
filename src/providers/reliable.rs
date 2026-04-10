@@ -469,7 +469,7 @@ impl Provider for ReliableProvider {
                                         "Provider call failed, retrying"
                                     );
                                     tokio::time::sleep(Duration::from_millis(wait)).await;
-                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(30_000);
                                 }
                             }
                         }
@@ -592,7 +592,7 @@ impl Provider for ReliableProvider {
                                         "Provider call failed, retrying"
                                     );
                                     tokio::time::sleep(Duration::from_millis(wait)).await;
-                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(30_000);
                                 }
                             }
                         }
@@ -723,7 +723,7 @@ impl Provider for ReliableProvider {
                                         "Provider call failed, retrying"
                                     );
                                     tokio::time::sleep(Duration::from_millis(wait)).await;
-                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(30_000);
                                 }
                             }
                         }
@@ -764,6 +764,7 @@ impl Provider for ReliableProvider {
                         let req = ChatRequest {
                             messages: request.messages,
                             tools: request.tools,
+                            tool_choice: request.tool_choice.clone(),
                         };
                         match provider.chat(req, sent_model, temperature).await {
                             Ok(resp) => {
@@ -839,7 +840,7 @@ impl Provider for ReliableProvider {
                                         "Provider call failed, retrying"
                                     );
                                     tokio::time::sleep(Duration::from_millis(wait)).await;
-                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(30_000);
                                 }
                             }
                         }
@@ -1909,6 +1910,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            tool_choice: None,
         };
         let result = provider.chat(request, "test-model", 0.0).await.unwrap();
 
@@ -1945,6 +1947,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            tool_choice: None,
         };
         let result = provider.chat(request, "test-model", 0.0).await.unwrap();
 
@@ -2016,6 +2019,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            tool_choice: None,
         };
         let err = provider
             .chat(request, "test", 0.0)
@@ -2135,6 +2139,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            tool_choice: None,
         };
         let result = provider.chat(request, "claude-opus", 0.0).await.unwrap();
         assert_eq!(result.text.as_deref(), Some("ok from sonnet"));
@@ -2183,6 +2188,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            tool_choice: None,
         };
         let result = provider.chat(request, "test", 0.0).await.unwrap();
         assert_eq!(result.text.as_deref(), Some("from fallback"));

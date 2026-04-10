@@ -68,6 +68,7 @@ pub(crate) mod onboard;
 pub mod peripherals;
 #[allow(unused_imports)]
 pub(crate) mod plugins;
+pub(crate) mod proactive_messaging;
 pub mod providers;
 pub mod rag;
 pub mod runtime;

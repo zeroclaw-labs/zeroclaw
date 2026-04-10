@@ -16,6 +16,48 @@ const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 /// Safety cap for durable facts extracted during pre-compaction flush.
 const COMPACTION_MAX_FLUSH_FACTS: usize = 8;
 
+/// Fraction of `context_window_tokens` at which mid-loop compaction fires.
+/// Set to 70% to leave headroom for the system prompt, tool specs, and the
+/// next LLM response.
+const COMPACTION_TRIGGER_RATIO: f64 = 0.70;
+
+/// Derive the mid-loop compaction threshold from the configured context window.
+pub(super) fn compaction_token_threshold(context_window_tokens: usize) -> usize {
+    (context_window_tokens as f64 * COMPACTION_TRIGGER_RATIO) as usize
+}
+
+/// How many recent non-system messages to keep when the mid-loop trim fires.
+/// Larger than `COMPACTION_KEEP_RECENT_MESSAGES` to preserve more working
+/// context during an active tool sequence.
+pub(super) const COMPACTION_KEEP_RECENT_MESSAGES_FOR_TRIM: usize = 30;
+
+/// Rough chars-to-tokens factor: 1 token ≈ 3 chars + 4 overhead per message.
+/// Matches the estimation used in `channels/mod.rs`.
+pub(super) fn estimated_history_tokens(history: &[ChatMessage]) -> usize {
+    history
+        .iter()
+        .map(|m| (m.content.chars().count().saturating_add(2) / 3).saturating_add(4))
+        .sum()
+}
+
+/// Strip `reasoning_content` from all assistant messages except the last one.
+/// Providers like Anthropic and OpenAI filter stale reasoning server-side,
+/// but proxy stacks (e.g. LiteLLM → llama.cpp) pass everything through.
+pub(super) fn strip_prior_reasoning(messages: &mut [ChatMessage]) {
+    let last_assistant_idx = messages.iter().rposition(|m| m.role == "assistant");
+    for (i, msg) in messages.iter_mut().enumerate() {
+        if msg.role != "assistant" || Some(i) == last_assistant_idx {
+            continue;
+        }
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&msg.content) {
+            if value.get("reasoning_content").is_some() {
+                value.as_object_mut().unwrap().remove("reasoning_content");
+                msg.content = value.to_string();
+            }
+        }
+    }
+}
+
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
 pub(super) fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
@@ -41,7 +83,7 @@ pub(super) fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     history.drain(start..trim_end);
 }
 
-pub(super) fn build_compaction_transcript(messages: &[ChatMessage]) -> String {
+pub(crate) fn build_compaction_transcript(messages: &[ChatMessage]) -> String {
     let mut transcript = String::new();
     for msg in messages {
         let role = msg.role.to_uppercase();
@@ -150,10 +192,11 @@ pub(super) async fn auto_compact_history(
 }
 
 /// Extract durable facts from a conversation transcript and store them as
-/// `Core` memories. Called before compaction discards old messages.
+/// `Core` memories. Called before compaction discards old messages, and
+/// by the `/checkpoint` command to persist facts on demand.
 ///
 /// Best-effort: failures are logged but never block compaction.
-async fn flush_durable_facts(
+pub(crate) async fn flush_durable_facts(
     provider: &dyn Provider,
     model: &str,
     transcript: &str,
@@ -227,6 +270,99 @@ fn parse_fact_line(line: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((key, content))
+}
+
+/// Maximum characters for the checkpoint conversation summary stored to memory.
+const CHECKPOINT_MAX_SUMMARY_CHARS: usize = 3_000;
+
+/// Persist a snapshot of the current conversation to brain.db so it survives
+/// pod restarts and `/new` resets.
+///
+/// Two things are stored:
+/// 1. **Durable facts** — extracted by `flush_durable_facts()` into `Core` memory.
+/// 2. **Conversation summary** — an LLM-generated bullet-point summary stored
+///    under a timestamped key in the `Conversation` category.
+///
+/// Returns a human-readable status message.
+pub(crate) async fn checkpoint_conversation(
+    history: &[ChatMessage],
+    provider: &dyn Provider,
+    model: &str,
+    memory: &dyn Memory,
+) -> String {
+    let non_system: Vec<_> = history.iter().filter(|m| m.role != "system").collect();
+    if non_system.is_empty() {
+        return "Nothing to checkpoint — conversation is empty.".to_string();
+    }
+
+    let transcript =
+        build_compaction_transcript(&non_system.into_iter().cloned().collect::<Vec<_>>());
+
+    // Step 1: Extract and persist durable facts.
+    let fact_count_before = memory.count().await.unwrap_or(0);
+    flush_durable_facts(provider, model, &transcript, memory).await;
+    let fact_count_after = memory.count().await.unwrap_or(0);
+    let facts_stored = fact_count_after.saturating_sub(fact_count_before);
+
+    // Step 2: Generate a conversation summary.
+    let summarizer_system = "You are a conversation checkpoint engine. \
+        Summarize the entire conversation into concise context that would help \
+        the same agent resume seamlessly after a restart. \
+        Preserve: user preferences, commitments, decisions, unresolved tasks, \
+        key facts, what was being worked on, and any pending action items. \
+        Omit: filler, greetings, verbose tool logs. \
+        Output plain text bullet points only.";
+
+    let summarizer_user = format!(
+        "Summarize this conversation for checkpoint preservation \
+         (max 20 bullet points).\n\n{}",
+        transcript
+    );
+
+    let summary = match provider
+        .chat_with_system(Some(summarizer_system), &summarizer_user, model, 0.2)
+        .await
+    {
+        Ok(raw) => truncate_with_ellipsis(&raw, CHECKPOINT_MAX_SUMMARY_CHARS),
+        Err(e) => {
+            tracing::warn!("Checkpoint summary generation failed: {e}");
+            // Fall back to a truncated transcript so we still save something.
+            truncate_with_ellipsis(&transcript, CHECKPOINT_MAX_SUMMARY_CHARS)
+        }
+    };
+
+    // Step 3: Store the summary with a timestamped key.
+    let now = chrono::Local::now();
+    let key = format!("checkpoint_{}", now.format("%Y%m%d_%H%M%S"));
+    let content = format!(
+        "[Conversation checkpoint — {}]\n{}",
+        now.format("%Y-%m-%d %H:%M:%S"),
+        summary.trim()
+    );
+
+    match memory
+        .store(&key, &content, MemoryCategory::Core, None)
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(
+                "Checkpoint saved: {key} ({} chars, {facts_stored} new facts)",
+                content.len()
+            );
+            let mut msg = format!(
+                "Checkpoint saved ({} conversation turns summarized).",
+                history.iter().filter(|m| m.role != "system").count()
+            );
+            if facts_stored > 0 {
+                msg.push_str(&format!(" Extracted {facts_stored} durable fact(s)."));
+            }
+            msg
+        }
+        Err(e) => {
+            tracing::warn!("Failed to store checkpoint: {e}");
+            format!("Checkpoint failed: {e}")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -625,5 +761,221 @@ mod tests {
         assert_eq!(stored.len(), COMPACTION_MAX_FLUSH_FACTS);
         assert_eq!(stored[0].0, "compaction_fact_k0");
         assert_eq!(stored[7].0, "compaction_fact_k7");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_stores_summary_and_facts() {
+        use crate::memory::{MemoryCategory, MemoryEntry};
+        use std::sync::{Arc, Mutex};
+
+        struct CheckpointCapture {
+            stored: Mutex<Vec<(String, String, String)>>, // (key, content, category)
+        }
+
+        #[async_trait]
+        impl Memory for CheckpointCapture {
+            async fn store(
+                &self,
+                key: &str,
+                content: &str,
+                category: MemoryCategory,
+                _session_id: Option<&str>,
+            ) -> anyhow::Result<()> {
+                let cat = format!("{category:?}");
+                self.stored
+                    .lock()
+                    .unwrap()
+                    .push((key.to_string(), content.to_string(), cat));
+                Ok(())
+            }
+            async fn recall(
+                &self,
+                _q: &str,
+                _l: usize,
+                _s: Option<&str>,
+            ) -> anyhow::Result<Vec<MemoryEntry>> {
+                Ok(vec![])
+            }
+            async fn get(&self, _k: &str) -> anyhow::Result<Option<MemoryEntry>> {
+                Ok(None)
+            }
+            async fn list(
+                &self,
+                _c: Option<&MemoryCategory>,
+                _s: Option<&str>,
+            ) -> anyhow::Result<Vec<MemoryEntry>> {
+                Ok(vec![])
+            }
+            async fn forget(&self, _k: &str) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+            async fn count(&self) -> anyhow::Result<usize> {
+                let stored = self.stored.lock().unwrap();
+                Ok(stored.len())
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+            fn name(&self) -> &str {
+                "checkpoint-capture"
+            }
+        }
+
+        /// Provider that returns facts for the first call, summary for the second.
+        struct CheckpointProvider {
+            call_count: Mutex<usize>,
+        }
+
+        #[async_trait]
+        impl Provider for CheckpointProvider {
+            async fn chat_with_system(
+                &self,
+                _system: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temp: f64,
+            ) -> anyhow::Result<String> {
+                let mut count = self.call_count.lock().unwrap();
+                *count += 1;
+                if *count == 1 {
+                    Ok("[project_status] Working on Kubernetes deployment".to_string())
+                } else {
+                    Ok("- User discussed K8s deployment\n- Action: update image tag".to_string())
+                }
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temp: f64,
+            ) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: Some("ok".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                    quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
+                })
+            }
+        }
+
+        let mem = Arc::new(CheckpointCapture {
+            stored: Mutex::new(Vec::new()),
+        });
+        let provider = CheckpointProvider {
+            call_count: Mutex::new(0),
+        };
+
+        let history = vec![
+            ChatMessage::system("You are an AI assistant."),
+            ChatMessage::user("Deploy the new image to staging"),
+            ChatMessage::assistant("I'll update the deployment manifest."),
+            ChatMessage::user("Great, also bump the version tag"),
+        ];
+
+        let result = checkpoint_conversation(&history, &provider, "test-model", mem.as_ref()).await;
+
+        assert!(
+            result.contains("Checkpoint saved"),
+            "should report success, got: {result}"
+        );
+        assert!(
+            result.contains("3 conversation turns"),
+            "should count non-system turns, got: {result}"
+        );
+
+        let stored = mem.stored.lock().unwrap();
+        // Should have: 1 fact + 1 summary = 2 entries
+        assert!(
+            stored.len() >= 2,
+            "expected at least 2 stored entries, got {}",
+            stored.len()
+        );
+
+        // Verify the fact was stored as Core
+        let fact = stored
+            .iter()
+            .find(|(k, _, _)| k.starts_with("compaction_fact_"));
+        assert!(fact.is_some(), "should store at least one durable fact");
+        assert_eq!(fact.unwrap().2, "Core");
+
+        // Verify the checkpoint summary was stored as Core
+        let checkpoint = stored.iter().find(|(k, _, _)| k.starts_with("checkpoint_"));
+        assert!(checkpoint.is_some(), "should store checkpoint summary");
+        assert!(
+            checkpoint.unwrap().1.contains("[Conversation checkpoint"),
+            "summary should have checkpoint header"
+        );
+        assert_eq!(checkpoint.unwrap().2, "Core");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_empty_conversation_returns_early() {
+        use crate::memory::{MemoryCategory, MemoryEntry};
+        use std::sync::Mutex;
+
+        struct NullMemory;
+
+        #[async_trait]
+        impl Memory for NullMemory {
+            async fn store(
+                &self,
+                _k: &str,
+                _c: &str,
+                _cat: MemoryCategory,
+                _s: Option<&str>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn recall(
+                &self,
+                _q: &str,
+                _l: usize,
+                _s: Option<&str>,
+            ) -> anyhow::Result<Vec<MemoryEntry>> {
+                Ok(vec![])
+            }
+            async fn get(&self, _k: &str) -> anyhow::Result<Option<MemoryEntry>> {
+                Ok(None)
+            }
+            async fn list(
+                &self,
+                _c: Option<&MemoryCategory>,
+                _s: Option<&str>,
+            ) -> anyhow::Result<Vec<MemoryEntry>> {
+                Ok(vec![])
+            }
+            async fn forget(&self, _k: &str) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+            async fn count(&self) -> anyhow::Result<usize> {
+                Ok(0)
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+            fn name(&self) -> &str {
+                "null"
+            }
+        }
+
+        let mem = NullMemory;
+        let provider = StaticSummaryProvider;
+
+        // Only a system message — no actual conversation
+        let history = vec![ChatMessage::system("You are an AI assistant.")];
+        let result = checkpoint_conversation(&history, &provider, "test-model", &mem).await;
+        assert!(
+            result.contains("empty"),
+            "should say conversation is empty, got: {result}"
+        );
+
+        // Completely empty
+        let history: Vec<ChatMessage> = vec![];
+        let result = checkpoint_conversation(&history, &provider, "test-model", &mem).await;
+        assert!(result.contains("empty"));
     }
 }

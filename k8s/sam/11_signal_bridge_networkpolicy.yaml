@@ -1,0 +1,44 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: signal-bridge-allow-from-zeroclaw
+  namespace: ai-agents
+spec:
+  podSelector:
+    matchLabels:
+      app: signal-bridge
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow ambient mesh HBONE traffic from local workloads in this namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ai-agents
+    - from:
+        - podSelector:
+            matchLabels:
+              app: zeroclaw
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: zeroclaw-allow-to-signal-bridge
+  namespace: ai-agents
+spec:
+  podSelector:
+    matchLabels:
+      app: zeroclaw
+  policyTypes:
+    - Egress
+  egress:
+    # Allow ambient mesh HBONE traffic to workloads in this namespace.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ai-agents
+    - to:
+        - podSelector:
+            matchLabels:
+              app: signal-bridge

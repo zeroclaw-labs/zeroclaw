@@ -1720,3 +1720,58 @@ pub(super) fn parse_structured_tool_calls(
 
     result
 }
+
+/// Strip all `<tool_call>...</tool_call>` blocks (and alias variants) from text.
+///
+/// When the model emits malformed or empty tool-call tags, they get preserved
+/// in the assistant message as raw text. If this text is sent back to
+/// llama-server in conversation history, the Jinja chat template parser
+/// interprets them structurally and crashes with errors like "Invalid url value"
+/// or "Failed to parse input."
+///
+/// This function removes every tool-call tag pair (and unclosed open tags),
+/// preserving the surrounding text.
+pub(crate) fn strip_unparsed_tool_call_tags(text: &str) -> String {
+    // Fast path: no tags at all
+    if !TOOL_CALL_OPEN_TAGS.iter().any(|tag| text.contains(tag)) {
+        return text.to_string();
+    }
+
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while !remaining.is_empty() {
+        // Find the next open tag
+        let next_open = TOOL_CALL_OPEN_TAGS
+            .iter()
+            .filter_map(|tag| remaining.find(tag).map(|pos| (pos, *tag)))
+            .min_by_key(|(pos, _)| *pos);
+
+        let Some((open_pos, open_tag)) = next_open else {
+            // No more open tags — append rest and done
+            result.push_str(remaining);
+            break;
+        };
+
+        // Append text before the tag
+        result.push_str(&remaining[..open_pos]);
+
+        let after_open = &remaining[open_pos + open_tag.len()..];
+
+        // Find the closest matching close tag
+        let close_found = TOOL_CALL_CLOSE_TAGS
+            .iter()
+            .filter_map(|tag| after_open.find(tag).map(|pos| (pos, *tag)))
+            .min_by_key(|(pos, _)| *pos);
+
+        if let Some((close_pos, close_tag)) = close_found {
+            // Skip the entire open...close block
+            remaining = &after_open[close_pos + close_tag.len()..];
+        } else {
+            // Unclosed open tag — skip just the tag itself, keep the rest
+            remaining = after_open;
+        }
+    }
+
+    result
+}

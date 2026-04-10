@@ -188,7 +188,10 @@ Runtime in-chat commands while channel server is running:
   - `/models <provider>`
   - `/model`
   - `/model <model-id>`
-  - `/new`
+- Session management (all non-CLI channels):
+  - `/new` / `/clear` — reset conversation history and exit private mode
+  - `/checkpoint` — persist durable facts + conversation summary to memory (survives pod restarts)
+  - `/private` — toggle ephemeral mode (disables auto-save, hides memory tools). `/new` also exits private mode.
 - Supervised tool approvals (all non-CLI channels):
   - `/approve-request <tool-name>` (create pending approval request)
   - `/approve-confirm <request-id>` (confirm pending request; same sender + same chat/channel only)

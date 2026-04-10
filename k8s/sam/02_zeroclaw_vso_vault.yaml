@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: zeroclaw-vault-sa
+  namespace: ai-agents
+
+---
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultAuth
+metadata:
+  name: zeroclaw-static-auth
+  namespace: ai-agents
+spec:
+  method: kubernetes
+  mount: scrapyard
+  kubernetes:
+    role: zeroclaw-all
+    serviceAccount: zeroclaw-vault-sa
+    audiences:
+      - vault
+
+---
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultStaticSecret
+metadata:
+  name: zeroclaw-config-secret
+  namespace: ai-agents
+spec:
+  vaultAuthRef: zeroclaw-static-auth
+  mount: kvv2
+  type: kv-v2
+  path: zeroclaw/zeroclaw-config
+  refreshAfter: 30s
+  destination:
+    name: zeroclaw-config-secrets
+    create: true

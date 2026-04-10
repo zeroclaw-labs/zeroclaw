@@ -1,0 +1,439 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zeroclaw-k8s-agent-skills
+  namespace: ai-agents
+data:
+  k8s-manifest-builder.md: |
+    ---
+    name: k8s-manifest-builder
+    version: 2.0.0
+    description: Structured workflow for creating, deploying, and maintaining K8s manifests in the scrapyard cluster. Use for any deployment, service creation, infrastructure task, or PR review feedback in the todolist namespace.
+    always: true
+    ---
+
+    # K8s Manifest Builder
+
+    You receive tasks from Sam via ACP. Each task is a self-contained work order.
+    This workflow keeps you on track and ensures the reviewer (Dan) sees clean,
+    consistent PRs.
+
+    ## Workflow: Receive → Check → Build → Classify → Apply → Verify → Commit → Report
+
+    ### Step 1: RECEIVE — Parse the work order
+
+    Extract from Sam's message:
+    - **Task**: What to create/modify/debug
+    - **Namespace**: Where (default: todolist)
+    - **Requirements**: Constraints (image, ports, resources, security)
+    - **Verification**: What Sam expects you to prove
+
+    If anything is genuinely ambiguous, say so. Don't guess.
+
+    ### Step 2: CHECK — What exists already?
+
+    ```bash
+    kubectl get namespace <ns> 2>/dev/null
+    kubectl get all -n <ns>
+    list_memories
+    ls /data/workspace/scrapyard-applications/04_scrapyard_test_projects/
+    ```
+
+    Don't duplicate resources. Don't overwrite existing work without reason.
+
+    ### Step 3: BUILD — Create manifests in the repo
+
+    **One directory per app.** All manifests for a single application — including
+    its database, cache, workers, secrets, and networking — go in ONE directory.
+    This matters because the reviewer sees the entire directory as a unit, and
+    applying manifests from scattered directories causes ordering problems and
+    duplicate resource conflicts (e.g., two namespace manifests with different
+    labels — whichever applies last silently wins).
+
+    ```
+    04_scrapyard_test_projects/NN_<app_name>/
+      00_namespace.yaml        (exactly once per namespace)
+      01_vso_vault.yaml        (all VaultStaticSecrets for this app)
+      02_pvc.yaml              (all PVCs)
+      03_deployment.yaml       (or 03_app.yaml + 03_db.yaml for multiple)
+      04_service.yaml
+      05_certificate.yaml      (external access — targets istio-system)
+      06_gateway.yaml          (external access — targets istio-system)
+      07_virtualservice.yaml   (external access)
+    ```
+
+    If you need multiple deployments (app + database), use descriptive filenames
+    in the same directory — not separate directories per component.
+
+    **Mandatory in every Deployment:**
+    - Pinned image tag (never `:latest`)
+    - Resource requests + memory limits
+    - `runAsNonRoot`, drop ALL capabilities, `seccompProfile: RuntimeDefault`
+    - `automountServiceAccountToken: false`
+    - Readiness probe (at minimum)
+
+    **Secrets:** Use VaultStaticSecret, not raw K8s Secrets. Raw Secrets with
+    hardcoded credentials should never appear in the repo — they bypass Vault's
+    audit trail and rotation.
+
+    **Namespace label:** `istio.io/dataplane-mode: ambient` (check existing namespace)
+
+    **Templates** for Certificate, Gateway, VirtualService, and VaultStaticSecret
+    are in your TOOLS.md under "Deployment Patterns." Follow them exactly.
+
+    ### Step 4: CLASSIFY — Can I apply this?
+
+    Classify by resource kind (not namespace):
+
+    **Direct-apply:** Deployments, Services, ConfigMaps, PVCs, ServiceAccounts,
+    Jobs, NetworkPolicies, VaultStaticSecrets, VaultAuth, CNPG resources — anything
+    in namespaces where you have RBAC.
+
+    **Must PR:** VirtualServices, Gateways, Certificates (regardless of namespace),
+    ClusterRoles, ClusterRoleBindings, anything outside your RBAC scope.
+
+    If unsure: `kubectl auth can-i create <resource> -n <ns>`
+
+    Complete direct-apply work first (Steps 5→6→7), then do the PR path. This
+    prevents accidentally committing direct-apply manifests to a feature branch.
+
+    ### Step 5: APPLY — Deploy to cluster
+
+    ```bash
+    kubectl apply -f <manifest.yaml>
+    ```
+
+    Apply in order: namespace → secrets → storage → database → app → service.
+    If forbidden, use the PR path instead.
+
+    ### Step 5-PR: BRANCH + PR (for privileged manifests)
+
+    ```bash
+    gitea-pr sync
+    cd /data/workspace/scrapyard-applications
+    git checkout -b walter/<app>-<purpose>
+    # Add manifests, commit, push
+    git add <files>
+    git commit -m "feat(<app>): add <resource> for <purpose>"
+    git push origin walter/<app>-<purpose>
+    gitea-pr create --title "feat(<app>): <description>" \
+      --head "walter/<app>-<purpose>" \
+      --body "## What ..."
+    git checkout main
+    ```
+
+    Include in the PR body: what manifests are included, why they need a PR,
+    and what commands to run after merge.
+
+    ### Step 6: VERIFY — Prove it works
+
+    ```bash
+    kubectl get pods -n <ns> -o wide
+    kubectl get endpoints -n <ns>
+    kubectl get events -n <ns> --sort-by='.lastTimestamp' | tail -20
+    ```
+
+    If pods aren't Running within 60 seconds, debug with `describe` and `logs`.
+
+    ### Step 7: COMMIT — Save to repo
+
+    ```bash
+    cd /data/workspace/scrapyard-applications
+    git add 04_scrapyard_test_projects/<app_dir>/
+    git commit -m "feat(<app>): <what was created/changed>"
+    git push
+    ```
+
+    ### Step 8: REPORT — Tell Sam what happened
+
+    ```
+    RESULT: [success/partial/failed]
+
+    CREATED:
+    - [resource type] [name] in [namespace] — [status]
+
+    VERIFIED:
+    - Pods: [names and statuses]
+    - Services: [names and endpoints]
+
+    COMMITTED:
+    - [file paths added/modified]
+    - [commit hash]
+
+    ISSUES:
+    - [Any problems, blockers, or things Sam should know]
+
+    PR SUBMITTED:  (if applicable)
+    - PR #<number>: <title> — <url>
+    - After merge: kubectl apply -f <paths>
+    - Blocked until merged: <what won't work>
+    ```
+
+    ---
+
+    ## Addressing PR Review Comments
+
+    When Sam or the cron monitor tells you to address review comments, follow
+    these phases. They're separate from Steps 1-8 above.
+
+    ### Phase READ
+
+    ```bash
+    gitea-pr comments <pr-number>
+    ```
+
+    Extract what to change, what to fix, and any questions. If no comments
+    are returned, report back before proceeding — don't guess.
+
+    ### Phase BRANCH
+
+    ```bash
+    gitea-pr status <pr-number>       # find branch name
+    gitea-pr sync
+    git fetch origin
+    git checkout <branch>
+    git pull origin <branch>
+    ```
+
+    ### Phase FIX
+
+    Start by reviewing your full changeset — the reviewer sees all of it:
+
+    ```bash
+    git diff main..HEAD --name-only
+    ```
+
+    Before touching any files, check for structural problems:
+    - **Stale files** from earlier iterations that you've since replaced
+    - **Scattered directories** for the same app (consolidate into one)
+    - **Duplicate resources** (e.g., two namespace manifests, two Certificates
+      for the same domain) — these cause silent conflicts when applied
+
+    Then make the requested changes. Edit files in place rather than recreating
+    them — this preserves git history and avoids introducing unrelated diffs.
+
+    Think about the principle behind each comment, not just the specific file.
+    If the reviewer says "use VaultStaticSecret instead of raw Secrets," that
+    applies to every secret in your PR, not just the one they pointed to.
+    Catching all instances now saves a review round-trip.
+
+    ### Phase PUSH
+
+    Self-review before committing:
+
+    ```bash
+    git diff main..HEAD --stat
+    ```
+
+    Check that no files contradict the reviewer's feedback and no duplicate
+    resources remain. Then commit, push, and return to main:
+
+    ```bash
+    git add <files>
+    git commit -m "fix(<app>): address review feedback on PR #<number>"
+    git push origin <branch>
+    git checkout main
+    ```
+
+    ### Phase REPLY
+
+    ```bash
+    gitea-pr reply <pr-number> --body "Changes pushed. Summary:
+    - <change 1>
+    - <change 2>
+    — Walter (K8s Agent)"
+    ```
+
+    ### Phase REPORT
+
+    ```
+    RESULT: review-addressed
+    PR: #<number>
+    CHANGES MADE:
+    - <what and why>
+    PUSHED: <commit> to <branch>
+    REMAINING:
+    - <anything you couldn't address>
+    ```
+
+    ---
+
+    ## Reference
+
+    **Mid-task messages from Sam** appear as `[Mid-turn message from user]`.
+    Read them immediately — Sam's corrections override the original work order.
+
+    **Fork hygiene:** Feature branches for PRs, main for direct-apply commits.
+    After a PR merges: `gitea-pr sync`, delete the local and remote branch.
+
+    **Recovery:** If you lose track, check `kubectl get all -n <ns>`, `ls <app_dir>/`,
+    and `list_memories`, then resume from the last verified step.
+
+    **Memory:** After completing a task, save to Serena: what was deployed,
+    decisions made, and any blockers discovered.
+  cron-management.md: |
+    ---
+    name: cron-management
+    version: 1.1.0
+    description: >
+      Guides creation, modification, and review of your own cron jobs. Use this
+      skill BEFORE calling cron_add or cron_update — it prevents the classes of
+      bugs that have caused real incidents (stale prompts persisting for weeks,
+      infinite cron loops, memory-only status checks). Also use when reviewing
+      existing crons for hygiene, when Dan asks about your scheduled tasks, or
+      when you notice a cron behaving unexpectedly. Trigger this skill whenever
+      you're about to schedule, automate, or set up any recurring task — even
+      if you don't think of it as "cron management." If the words "every,"
+      "daily," "periodic," "recurring," or "check on this regularly" come up,
+      consult this skill first.
+    always: false
+    ---
+
+    # Cron Management
+
+    Your cron jobs are stored in SQLite on a persistent volume. They survive pod
+    restarts, redeployments, and config changes indefinitely. A bad cron job
+    doesn't just run once — it runs forever until someone notices. That's why
+    getting the prompt right matters more here than anywhere else.
+
+    ## Shared Infrastructure Awareness
+
+    You share a GPU backend with other agents, coding tools, and interactive
+    users. The model backend has a small number of parallel slots (currently 4).
+    Every agent cron run occupies one or more slots for 30–120 seconds of
+    thinking and tool calls. When multiple crons fire in the same window, they
+    saturate the backend and cause cascading failures: 429 rate limits, 500
+    timeouts, and multi-minute response delays for Dan's interactive messages.
+
+    This is why frequency matters more than it might seem. A "quick check"
+    cron that runs hourly might sound harmless, but in practice it collides
+    with other agents' crons and interactive conversations often enough to
+    cause real pain.
+
+    **Frequency guidance:**
+
+    Daily is the right default for most agent crons. Think of it this way —
+    if a cron runs and finds nothing to do 90% of the time, it's running too
+    often. Match frequency to how fast the underlying state actually changes:
+
+    - **Daily or twice-daily** — the sweet spot for summaries, task reviews,
+      hygiene checks. State rarely changes faster than this.
+    - **Every 3–6 hours** — reasonable for things with faster-moving state,
+      like PR review monitors where feedback might arrive mid-day.
+    - **More frequent than every 3 hours** — ask Dan first. The infrastructure
+      cost is real and compounds with every additional cron. Even if your cron
+      exits quickly when idle, it still occupies a slot for the LLM call that
+      decides "nothing to do."
+    - **Sub-hourly** — this almost certainly doesn't belong as an agent cron.
+      If something needs sub-hourly monitoring, it's probably better as a
+      shell cron (no LLM slot needed) with a simple HTTP check or script.
+
+    **Slot budget:**
+    - Before creating a cron, run `cron_list` and count your existing agent
+      crons. If you already have 3+, consider whether the new one can replace
+      or merge with an existing one rather than adding to the total.
+    - A single daily cron that checks 3 things is better than 3 separate ones.
+
+    The scheduler automatically applies a small deterministic time offset
+    (0–14 minutes) to each agent cron based on its job ID. This spreads
+    jobs that would otherwise fire at the same wall-clock minute. You don't
+    need to manually pick odd minutes — but you should still avoid scheduling
+    many crons at the same hour, since the jitter window is only 15 minutes.
+
+    ## Before Creating a Cron Job
+
+    Ask yourself these questions:
+
+    1. **Does this need to be a cron?** If it's a one-time task, just do it
+       now — don't create a cron. If in doubt, do it once manually first.
+       Only promote to a cron after you've confirmed the pattern repeats.
+
+    2. **What's the right frequency?** Default to daily — see the frequency
+       guidance above. Ask yourself how fast the underlying state actually
+       changes. If the answer is "maybe once a day," daily is right. If you
+       find yourself wanting something more frequent than every 3 hours,
+       check with Dan first — the shared infrastructure cost adds up fast.
+
+    3. **What should the cron do when there's nothing to report?** The answer
+       is almost always "end immediately and stay silent." If you can't
+       articulate a clear exit condition, the cron isn't well-defined enough
+       — stop and rethink before creating it.
+
+    4. **Should it notify anyone?** Most crons should work silently (delivery
+       mode `none`). Only use `announce` when the output is genuinely
+       actionable. Status reports that say "everything is fine" are noise.
+
+    ## Writing the Cron Prompt
+
+    The prompt runs in an **isolated session** — no conversation history, no
+    memory of what you were just doing. It only sees: the system prompt, and
+    the cron prompt itself.
+
+    ### Reference skills by name, don't inline instructions
+
+    Skills are synced from ConfigMaps on every pod restart. Cron prompts are
+    not. If you inline the logic, it fossilizes — when the skill gets updated,
+    your cron keeps running the old version.
+
+    ### Reference entities by role, not by name
+
+    Names change (Goose → Walter). Roles don't. If your prompt must use a
+    specific name or endpoint, add a note reminding yourself to verify it's
+    current.
+
+    ### Include explicit exit conditions
+
+    Every cron prompt needs a clear "do nothing" path. Without one, the model
+    will find something to do — even if that means inventing work.
+
+    Template:
+    ```
+    [What to check]
+
+    If [nothing-to-do condition]: end immediately. Do not save a memory,
+    do not write a status update. Silence means everything is on track.
+
+    If [action condition]: [specific, bounded action].
+    ```
+
+    ### Constrain scope explicitly
+
+    The model in an isolated session has full tool access and will use it
+    creatively if the prompt is vague. Be specific about what the cron should
+    and should not do.
+
+    ### Prevent infinite loops
+
+    If the prompt calls `cron_run`, it creates another session running the
+    same prompt, which calls `cron_run` again... forever.
+
+    Include in every agent cron prompt:
+    ```
+    Do not call cron_run — you are already inside the cron job.
+    ```
+
+    If you suspect a cron is looping, the immediate fix is `cron_remove
+    <job_id>` to stop the bleeding, then redesign the prompt with tighter
+    scope before recreating it.
+
+    ## Cron Job Parameters Checklist
+
+    | Parameter | Guidance |
+    |-----------|----------|
+    | **name** | Descriptive, unique |
+    | **schedule** | Start conservative. Daily > hourly |
+    | **job_type** | `agent` for LLM reasoning. `shell` for deterministic scripts |
+    | **session_target** | Almost always `isolated` |
+    | **prompt** | Read it back as if you've never seen it — does it make sense without context? |
+    | **delivery** | Default to `none`. Use `announce` only for output that must be seen every run |
+
+    ## Reviewing Existing Crons
+
+    Check each job against:
+
+    1. **Still relevant?** If completed or superseded, `cron_remove` it.
+    2. **Prompt still accurate?** Check names, endpoints, skill references
+       against current reality.
+    3. **Frequency appropriate?** Demote or remove over-frequent jobs.
+    4. **Clear exit condition?** If not, it's wasting tokens every run.
+    5. **Uses live tools?** Memory-only crons drift from reality.

@@ -51,6 +51,7 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod manage_outbound_queue;
 pub mod mcp_client;
 pub mod mcp_protocol;
 pub mod mcp_tool;
@@ -71,6 +72,7 @@ pub mod quota_tools;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
+pub mod send_user_message;
 pub mod shell;
 pub mod subagent_list;
 pub mod subagent_manage;
@@ -122,6 +124,7 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+pub use manage_outbound_queue::ManageOutboundQueueTool;
 pub use mcp_client::McpRegistry;
 pub use mcp_tool::McpToolWrapper;
 pub use memory_forget::MemoryForgetTool;
@@ -139,6 +142,7 @@ pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
+pub use send_user_message::SendUserMessageTool;
 pub use shell::ShellTool;
 pub use subagent_list::SubAgentListTool;
 pub use subagent_manage::SubAgentManageTool;
@@ -380,6 +384,18 @@ pub fn all_tools_with_runtime(
         )),
     ];
 
+    // Proactive messaging tools (gated by config)
+    if root_config.proactive_messaging.enabled {
+        tool_arcs.push(Arc::new(SendUserMessageTool::new(
+            config.clone(),
+            security.clone(),
+        )));
+        tool_arcs.push(Arc::new(ManageOutboundQueueTool::new(
+            config.clone(),
+            security.clone(),
+        )));
+    }
+
     if has_shell_access {
         tool_arcs.push(Arc::new(ShellTool::new_with_syscall_detector(
             security.clone(),
@@ -560,6 +576,7 @@ pub fn all_tools_with_runtime(
             custom_provider_api_mode: root_config
                 .provider_api
                 .map(|mode| mode.as_compatible_mode()),
+            custom_provider_supports_responses_fallback: root_config.supports_responses_fallback,
             max_tokens_override: None,
             model_support_vision: root_config.model_support_vision,
         };

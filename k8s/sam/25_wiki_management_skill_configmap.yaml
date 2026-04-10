@@ -1,0 +1,123 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zeroclaw-skill-wiki-management
+  namespace: ai-agents
+data:
+  wiki-management.md: |
+    ---
+    name: wiki-management
+    version: 1.0.0
+    description: >
+      Maintain a structured markdown wiki as your primary knowledge store. Use this
+      skill whenever you learn something worth keeping, ingest a document or URL,
+      answer a question that requires accumulated knowledge, or need to check what
+      you know about a topic. Also use when Dan says "remember this", "what do we
+      know about", "add this to the wiki", "look up", or asks about any topic where
+      your wiki might have relevant pages. If you are about to use memory_store for
+      anything other than a quick transient fact, use the wiki instead.
+    always: false
+    ---
+
+    # Wiki Management
+
+    Your wiki is a persistent, structured knowledge base at /data/workspace/wiki/.
+    It grows as you ingest sources, answer questions, and learn from tasks.
+    The wiki is your primary knowledge store. Use memory_store only for transient
+    session-level facts. Anything worth keeping across sessions goes in the wiki.
+
+    ## Directory Structure
+
+    /data/workspace/wiki/
+      index.md        — catalog of all pages with one-line summaries
+      log.md          — append-only operations log
+      sources/        — immutable raw documents (never modify after saving)
+      entities/       — pages about people, projects, systems, services
+      concepts/       — pages about topics, decisions, patterns, technologies
+      syntheses/      — cross-cutting analysis spanning multiple entities/concepts
+
+    ## Bootstrap
+
+    On first use, create the directory structure and seed files:
+    shell: mkdir -p /data/workspace/wiki/sources /data/workspace/wiki/entities /data/workspace/wiki/concepts /data/workspace/wiki/syntheses
+    Then file_write /data/workspace/wiki/index.md and /data/workspace/wiki/log.md with initial headers.
+
+    ## Operations
+
+    ### Ingest
+
+    When Dan shares a document, URL content, meeting summary, or any knowledge source:
+    1. Save raw source to sources/ with descriptive filename. Never modify after saving.
+    2. Identify entities (people, projects, systems) and concepts (topics, decisions, patterns).
+    3. For each: check if page exists (glob_search). If yes, file_edit to add dated section. If new, file_write using page template.
+    4. If source connects multiple topics, write a synthesis page.
+    5. Update index.md with new pages.
+    6. Append to log.md: date, operation, source, pages created/updated.
+
+    ### Query
+
+    When Dan asks about a topic or you need accumulated knowledge:
+    1. Search index.md for relevant pages.
+    2. Use content_search across wiki/ if not obvious from index.
+    3. Read relevant pages, synthesize answer, cite wiki pages.
+    4. File discoveries back: update pages with new insights, note gaps with "Gap:" prefix.
+    5. Append query and outcome to log.md.
+
+    ### Lint
+
+    Daily cron or on-demand. Check:
+    1. Pages missing from index.md.
+    2. Index entries with no matching file.
+    3. "Gap:" markers across all pages.
+    4. Stale pages (not updated in 30+ days, referencing active projects).
+    If issues: send Dan a summary. If clean: end silently.
+
+    Cron: name=wiki-lint, schedule=0 9 * * 1-5, timezone=America/Vancouver, job_type=agent, session_target=isolated.
+    Cron prompt: "You are in an isolated cron session. Do not call cron_run. Run wiki lint. Scan all wiki pages for missing index entries, orphaned references, Gap markers, stale pages. If clean end immediately. If issues send Dan a summary via send_user_message."
+
+    ## Page Template
+
+    Every wiki page:
+    # [Title]
+    Category: entity | concept | synthesis
+    Created: YYYY-MM-DD
+    Last updated: YYYY-MM-DD
+    Related: [[other-page]], [[another-page]]
+
+    ## Summary
+    One paragraph.
+
+    ## Details
+    Organized by topic with dated section headers for new information.
+
+    ## Open Questions
+    Unresolved questions prefixed with "Gap:" for lint.
+
+    ## Cross-References
+
+    Use [[page-name]] for links (e.g., [[walter]], [[istio-ambient-mesh]]).
+    Always add reciprocal references: if A links B, B should link A.
+    These are plain text now. The wiki module will make them real links later.
+
+    ## What Goes Where
+
+    Entities (wiki/entities/): people, projects, systems, services.
+    Concepts (wiki/concepts/): technologies, decisions, patterns.
+    Syntheses (wiki/syntheses/): cross-cutting analysis connecting multiple entities/concepts.
+
+    ## Ingest Triggers
+
+    - Dan shares a document or URL
+    - Meeting summary completes (key decisions and action items)
+    - Multi-step task completed with lessons learned
+    - Dan makes a decision worth recording
+    - Discovery during research
+
+    ## Tools
+
+    file_read, file_write, file_edit: page CRUD.
+    glob_search: find pages by name.
+    content_search: full-text search across wiki.
+    memory_store: quick-lookup cache only (wiki-ref/page-name = one-line summary).
+    send_user_message: lint notifications.
+    cron_add: lint scheduling.

@@ -1,0 +1,377 @@
+# Zeroclaw K8s Infrastructure Agent (Walter).
+#
+# Runs as an ACP-over-HTTP server (JSON-RPC 2.0 + SSE) that Sam can
+# delegate Kubernetes tasks to. Persists conversation history across
+# prompts and uses Serena for cross-session memory.
+#
+# ACP Protocol:
+#   POST   /acp — JSON-RPC requests (initialize, session/new, session/prompt)
+#   DELETE /acp — Tear down session
+#
+# In-cluster endpoint:
+#   http://zeroclaw-k8s-agent.ai-agents.svc.cluster.local:3000/acp
+---
+apiVersion: agents.x-k8s.io/v1alpha1
+kind: Sandbox
+metadata:
+  name: zeroclaw-k8s-agent
+  namespace: ai-agents
+spec:
+  replicas: 1
+  podTemplate:
+    metadata:
+      labels:
+        app: zeroclaw-k8s-agent
+        agent-role: k8s-infrastructure
+        protocol: acp-http
+    spec:
+      # TODO: rename SA from goose-todolist-configurator → walter-k8s-agent
+      # (requires coordinated cluster-side SA rename + RBAC rebind)
+      serviceAccountName: goose-todolist-configurator
+      automountServiceAccountToken: true
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        runAsNonRoot: false
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: regcred
+      initContainers:
+        - name: install-kubectl
+          image: alpine:3.21
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -ec
+            - |
+              mkdir -p /data/bin
+              KUBECTL_VERSION="v1.32.3"
+              if [ -x /data/bin/kubectl ]; then
+                echo "kubectl already installed"
+              else
+                echo "Installing kubectl ${KUBECTL_VERSION}..."
+                ARCH=$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
+                wget -qO /data/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl"
+                chmod +x /data/bin/kubectl
+                echo "kubectl installed"
+              fi
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: zeroclaw-k8s-data
+              mountPath: /data
+        - name: init-config
+          image: debian:bookworm-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -ec
+            - |
+              mkdir -p /data/.zeroclaw /data/.zeroclaw/workspace /data/.kube
+              # Sync config.toml from ConfigMap.
+              echo "Syncing config.toml"
+              cp /etc/zeroclaw-template/config.toml /data/.zeroclaw/config.toml
+              chmod 600 /data/.zeroclaw/config.toml
+              # Seed identity files into workspace if missing.
+              for f in IDENTITY.md TOOLS.md AGENTS.md; do
+                if [ ! -f "/data/.zeroclaw/workspace/$f" ] && [ -f "/etc/zeroclaw-template/identity/$f" ]; then
+                  echo "Seeding $f"
+                  cp "/etc/zeroclaw-template/identity/$f" "/data/.zeroclaw/workspace/$f"
+                fi
+              done
+              # Always sync skills from ConfigMap (overwrite to pick up updates).
+              for f in /etc/zeroclaw-template/skills/*.md; do
+                [ -f "$f" ] || continue
+                skill_name=$(basename "$f" .md)
+                mkdir -p "/data/.zeroclaw/workspace/skills/$skill_name"
+                echo "Syncing skill $skill_name"
+                cp "$f" "/data/.zeroclaw/workspace/skills/$skill_name/SKILL.md"
+              done
+              # Copy gitea-pr tool to /data/bin (on PATH).
+              if [ -f /etc/zeroclaw-template/gitea-pr/gitea-pr.py ]; then
+                echo "Installing gitea-pr tool"
+                cp /etc/zeroclaw-template/gitea-pr/gitea-pr.py /data/bin/gitea-pr
+                chmod +x /data/bin/gitea-pr
+              fi
+              if [ -f /etc/zeroclaw-template/gitea-pr/pr-review-gate.py ]; then
+                echo "Installing pr-review-gate tool"
+                cp /etc/zeroclaw-template/gitea-pr/pr-review-gate.py /data/bin/pr-review-gate
+                chmod +x /data/bin/pr-review-gate
+              fi
+              # Copy cron seed script (executed by zeroclaw container on startup).
+              if [ -f /etc/zeroclaw-template/cron-seed/seed-cron.py ]; then
+                cp /etc/zeroclaw-template/cron-seed/seed-cron.py /data/.zeroclaw/seed-cron.py
+                chmod 644 /data/.zeroclaw/seed-cron.py
+              fi
+              # Generate kubeconfig using auto-refreshing SA token.
+              cat > /data/.kube/config <<'KUBEEOF'
+              apiVersion: v1
+              kind: Config
+              clusters:
+                - cluster:
+                    certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                    server: https://kubernetes.default.svc
+                  name: in-cluster
+              contexts:
+                - context:
+                    cluster: in-cluster
+                    namespace: todolist
+                    user: k8s-agent
+                  name: todolist
+              current-context: todolist
+              users:
+                - name: k8s-agent
+                  user:
+                    tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+              KUBEEOF
+              chmod 600 /data/.kube/config
+              # Seed Serena project config.
+              mkdir -p /data/workspace/.serena
+              printf '%s\n' 'project_name: k8s-agent' 'languages:' '  - bash' '  - yaml' \
+                > /data/workspace/.serena/project.yml
+              chown -R 1000:1000 /data
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: zeroclaw-k8s-data
+              mountPath: /data
+            - name: config-template
+              mountPath: /etc/zeroclaw-template/config.toml
+              subPath: config.toml
+              readOnly: true
+            - name: identity
+              mountPath: /etc/zeroclaw-template/identity
+              readOnly: true
+            - name: skills
+              mountPath: /etc/zeroclaw-template/skills
+              readOnly: true
+            - name: gitea-pr-tool
+              mountPath: /etc/zeroclaw-template/gitea-pr
+              readOnly: true
+            - name: cron-seed
+              mountPath: /etc/zeroclaw-template/cron-seed
+              readOnly: true
+        - name: git-setup
+          image: alpine/git:2.47.2
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              mkdir -p /data/.config/git
+              cat > /data/.config/git/config <<GITEOF
+              [credential]
+                  helper = store --file=/data/.config/git/credentials
+              [user]
+                  name = Walter (K8s Agent)
+                  email = k8s-agent@scrapyard.local
+              [safe]
+                  directory = /data/workspace/scrapyard-applications
+              GITEOF
+              echo "https://walter-k8s-agent:${GITEA_API_TOKEN}@gitea.coffee-anon.com" > /data/.config/git/credentials
+              chmod 600 /data/.config/git/credentials
+              REPO_DIR="/data/workspace/scrapyard-applications"
+              if [ -d "${REPO_DIR}/.git" ]; then
+                echo "Repository exists, syncing with upstream..."
+                cd "${REPO_DIR}"
+                git remote set-url origin https://gitea.coffee-anon.com/walter-k8s-agent/scrapyard-applications.git 2>/dev/null || true
+                git remote add upstream https://gitea.coffee-anon.com/dan/scrapyard-applications.git 2>/dev/null || \
+                  git remote set-url upstream https://gitea.coffee-anon.com/dan/scrapyard-applications.git
+                git fetch upstream
+                git checkout main
+                git merge --ff-only upstream/main || echo "Fork sync failed (non-ff), continuing with existing state"
+                git push origin main || echo "Push to fork main failed, continuing"
+              else
+                echo "Cloning Walter's fork of scrapyard-applications..."
+                git clone https://gitea.coffee-anon.com/walter-k8s-agent/scrapyard-applications.git "${REPO_DIR}"
+                cd "${REPO_DIR}"
+                git remote add upstream https://gitea.coffee-anon.com/dan/scrapyard-applications.git
+                git fetch upstream
+              fi
+          env:
+            - name: GITEA_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: zeroclaw-k8s-agent-secrets
+                  key: gitea-api-token
+            - name: HOME
+              value: /data
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: zeroclaw-k8s-data
+              mountPath: /data
+      containers:
+        - name: zeroclaw
+          image: citizendaniel/zeroclaw-sam:v1.4.12
+          imagePullPolicy: Always
+          command:
+            - bash
+            - -ec
+            - |
+              export PATH="/data/bin:$PATH"
+              mkdir -p /data/.zeroclaw /data/workspace
+              cd /data/workspace
+              # Wait for Serena MCP sidecar to be ready.
+              echo "Waiting for Serena MCP server on port 9121..."
+              for _i in $(seq 1 60); do
+                if (echo > /dev/tcp/127.0.0.1/9121) 2>/dev/null; then echo "Serena ready." && break; fi
+                sleep 1
+              done
+              (echo > /dev/tcp/127.0.0.1/9121) 2>/dev/null || echo "Warning: Serena not ready, starting zeroclaw anyway"
+              # Seed pr-review-monitor cron job. Run once now, and schedule
+              # a retry 30s after zeroclaw starts in case it recreates the DB.
+              python3 /data/.zeroclaw/seed-cron.py || echo "Warning: initial cron seed failed"
+              (sleep 30 && python3 /data/.zeroclaw/seed-cron.py) &
+              exec zeroclaw daemon
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          env:
+            - name: HOME
+              value: /data
+            - name: RUST_LOG
+              value: "info,zeroclaw::gateway::acp_server=debug,zeroclaw::agent=debug,zeroclaw::providers=debug"
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: zeroclaw-k8s-agent-secrets
+                  key: api_key
+            - name: ZEROCLAW_GATEWAY_PAIRED_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: zeroclaw-k8s-agent-secrets
+                  key: gateway-paired-tokens
+                  optional: true
+            - name: KUBECONFIG
+              value: /data/.kube/config
+            - name: GIT_CONFIG_GLOBAL
+              value: /data/.config/git/config
+            - name: SERENA_SESSION_FILE
+              value: /data/.zeroclaw/serena-session-id
+            - name: SERENA_DEFAULT_PROJECT
+              value: /data/workspace
+            - name: GITEA_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: zeroclaw-k8s-agent-secrets
+                  key: gitea-api-token
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: true
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: zeroclaw-k8s-data
+              mountPath: /data
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+        - name: serena
+          image: citizendaniel/zeroclaw-sam:v1.4.12
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -ec
+            - |
+              mkdir -p /data/workspace
+              cd /data/workspace
+              exec /opt/sam-tools/home/.local/bin/serena start-mcp-server \
+                --transport streamable-http \
+                --port 9121 \
+                --enable-web-dashboard false \
+                --enable-gui-log-window false \
+                --project /data/workspace
+          ports:
+            - name: serena-mcp
+              containerPort: 9121
+              protocol: TCP
+          env:
+            - name: HOME
+              value: /opt/sam-tools/home
+            - name: UV_TOOL_DIR
+              value: /opt/sam-tools/home/.local/share/uv/tools
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: zeroclaw-k8s-data
+              mountPath: /data
+      volumes:
+        - name: config-template
+          configMap:
+            name: zeroclaw-k8s-agent-config
+        - name: identity
+          configMap:
+            name: zeroclaw-k8s-agent-identity
+        - name: skills
+          configMap:
+            name: zeroclaw-k8s-agent-skills
+        - name: gitea-pr-tool
+          configMap:
+            name: zeroclaw-k8s-agent-gitea-pr
+        - name: cron-seed
+          configMap:
+            name: zeroclaw-k8s-agent-cron-seed
+  volumeClaimTemplates:
+    - metadata:
+        name: zeroclaw-k8s-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: rook-ceph-block
+        resources:
+          requests:
+            storage: 10Gi

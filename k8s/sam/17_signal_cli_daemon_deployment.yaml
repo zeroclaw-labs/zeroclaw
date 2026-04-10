@@ -1,0 +1,82 @@
+# trunk-ignore(checkov/CKV_K8S_8): signal-cli daemon health endpoint may vary by version
+# trunk-ignore(checkov/CKV_K8S_9): signal-cli daemon readiness endpoint may vary by version
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signal-cli-daemon
+  namespace: ai-agents
+  labels:
+    app: signal-cli-daemon
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: signal-cli-daemon
+  template:
+    metadata:
+      labels:
+        app: signal-cli-daemon
+    spec:
+      serviceAccountName: signal-cli-daemon-sa
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: signal-cli-daemon
+          image: registry.gitlab.com/packaging/signal-cli/signal-cli-native:v0-14-1-2
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -ec
+            - |
+              exec signal-cli --config /home/.local/share/signal-cli daemon --http 0.0.0.0:8080
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+                - bash
+                - -ec
+                - exec 3<>/dev/tcp/127.0.0.1/8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command:
+                - bash
+                - -ec
+                - exec 3<>/dev/tcp/127.0.0.1/8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: signal-cli-daemon-data
+              mountPath: /home/.local/share/signal-cli
+      volumes:
+        - name: signal-cli-daemon-data
+          persistentVolumeClaim:
+            claimName: signal-cli-daemon-data

@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signal-bridge
+  namespace: ai-agents
+  labels:
+    app: signal-bridge
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: signal-bridge
+  template:
+    metadata:
+      labels:
+        app: signal-bridge
+    spec:
+      serviceAccountName: signal-bridge-sa
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: signal-bridge
+          image: docker.io/bbernhard/signal-cli-rest-api:0.97
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: MODE
+              value: native
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -ec
+                - nc -z 127.0.0.1 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -ec
+                - nc -z 127.0.0.1 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: signal-bridge-data
+              mountPath: /home/.local/share/signal-cli
+      volumes:
+        - name: signal-bridge-data
+          persistentVolumeClaim:
+            claimName: signal-bridge-data

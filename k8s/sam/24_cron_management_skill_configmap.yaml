@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zeroclaw-skill-cron-management
+  namespace: ai-agents
+data:
+  cron-management.md: |
+    ---
+    name: cron-management
+    version: 2.0.0
+    description: Guides creation, modification, and review of cron jobs. Consult before cron_add or cron_update.
+    always: false
+    ---
+
+    # Cron Management
+
+    Cron jobs persist in SQLite across restarts. A bad cron runs forever until removed.
+    Consult this skill whenever you schedule, automate, or set up any recurring task.
+
+    ## Before Creating a Cron
+
+    1. Is this recurring or one-time? One-time tasks: just do it now, do not create a cron.
+    2. Run cron_list. If you have 3+ agent crons, merge or replace before adding another.
+    3. Default frequency: daily. More frequent than every 3 hours: ask Dan first.
+    4. Define the exit condition: what does "nothing to do" look like? If unclear, rethink.
+    5. Default delivery: none. Only use announce for output Dan needs every run. For conditional notifications, use send_user_message inside the prompt.
+
+    ## Writing the Cron Prompt
+
+    The prompt runs in an isolated session with no conversation history.
+    It only sees: system prompt, MEMORY.md, and the cron prompt itself.
+
+    Rules for every cron prompt:
+    - Reference skills by name, not inline instructions. Skills update via ConfigMap; inlined logic fossilizes.
+    - Reference entities by role, not name. Names change (Goose became Walter). Roles are stable.
+    - Include an explicit exit condition: "If nothing to report: end immediately. Do not save memory, do not message Dan."
+    - Use live tools (vikunja CLI, acp-client, shell), not just memory_recall. Memory is a cache that goes stale.
+    - Constrain scope. Specify exactly what to check and what to do. Vague prompts cause runaway sessions.
+    - Include "Do not call cron_run — you are already inside the cron job." in every agent prompt.
+
+    ## cron_add Parameters
+
+    name: descriptive and unique (speakr-daily-summary, vikunja-task-review).
+    schedule: start conservative, daily over hourly. Timezone: America/Vancouver or America/Edmonton.
+    job_type: agent for LLM reasoning, shell for deterministic scripts.
+    session_target: almost always isolated. Use main only if conversation context is needed.
+    prompt: follow the rules above. Read it back as if you have never seen it — does it make sense alone?
+    delivery: default to none. Use announce only for output Dan needs every run. For conditional notifications, use send_user_message inside the prompt.
+
+    ## Reviewing Existing Crons
+
+    Check each job: still relevant? Prompt still accurate (names, endpoints, tools)? Frequency appropriate? Has exit condition? Uses live tools not just memory?
+    Remove completed or abandoned crons. Downgrade overly frequent ones.
+
+    ## Modifying a Cron
+
+    Read the current prompt first via cron_list. Make targeted changes. Verify after updating.
+
+    ## Shared Infrastructure
+
+    You share a GPU backend (4 parallel slots) with other agents and interactive users.
+    Each agent cron occupies a slot for 30-120 seconds. Multiple crons in the same window cause 429 rate limits and response delays.
+    The scheduler applies 0-14 minute jitter automatically, but avoid scheduling many crons at the same hour.
+    Sub-hourly agent crons almost never make sense. Use shell crons for fast checks instead.
+
+    ## Frequency Guide
+
+    Daily or twice-daily: summaries, task reviews, hygiene checks. Default choice.
+    Every 3-6 hours: fast-moving state like PR review monitors.
+    More frequent than 3 hours: ask Dan first.
+    Sub-hourly: use a shell cron, not an agent cron.

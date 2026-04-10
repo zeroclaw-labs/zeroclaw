@@ -209,6 +209,13 @@ pub struct Config {
     /// Optional API protocol mode for `custom:` providers.
     #[serde(default)]
     pub provider_api: Option<ProviderApiMode>,
+    /// Opt-in switch for the chat→responses fallback on `custom:` providers.
+    /// Default: off. Enable only when the backend's `/v1/chat/completions`
+    /// endpoint is known-flaky and `/v1/responses` is known-stable. Against
+    /// LiteLLM/hosted_vllm backends this fallback converts transient transport
+    /// errors into non-retryable 400s (see incidents/2026-04-10).
+    #[serde(default)]
+    pub supports_responses_fallback: Option<bool>,
     /// Default model routed through the selected provider (e.g. `"anthropic/claude-sonnet-4-6"`).
     #[serde(alias = "model")]
     pub default_model: Option<String>,
@@ -273,9 +280,16 @@ pub struct Config {
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
 
+    /// Conversation recovery configuration (`[recovery]`).
+    #[serde(default)]
+    pub recovery: RecoveryConfig,
+
     /// Cron job configuration (`[cron]`).
     #[serde(default)]
     pub cron: CronConfig,
+    /// Proactive messaging configuration (`[proactive_messaging]`).
+    #[serde(default)]
+    pub proactive_messaging: ProactiveMessagingConfig,
 
     /// Goal loop configuration for autonomous long-term goal execution (`[goal_loop]`).
     #[serde(default)]
@@ -378,6 +392,10 @@ pub struct Config {
     #[serde(default)]
     pub agents_ipc: AgentsIpcConfig,
 
+    /// Tool output presentation layer (`[presentation]`).
+    #[serde(default)]
+    pub presentation: PresentationConfig,
+
     /// External MCP server connections (`[mcp]`).
     #[serde(default, alias = "mcpServers")]
     pub mcp: McpConfig,
@@ -388,6 +406,20 @@ pub struct Config {
     /// - `Some(false)`: force vision support off
     #[serde(default)]
     pub model_support_vision: Option<bool>,
+
+    /// Strip `reasoning_content` from prior assistant turns before sending
+    /// requests. Useful when the backend (e.g. LiteLLM proxy → llama.cpp)
+    /// does not automatically filter stale reasoning tokens the way the
+    /// Anthropic and OpenAI APIs do server-side. Defaults to `false`.
+    #[serde(default)]
+    pub strip_prior_reasoning: bool,
+
+    /// Context window size in tokens for the active model. Used to determine
+    /// when mid-loop compaction and trimming should fire during tool-call
+    /// sequences. Set this to match your model's actual context limit.
+    /// Defaults to 128000 (128K). Compaction triggers at ~70% of this value.
+    #[serde(default = "default_context_window_tokens")]
+    pub context_window_tokens: usize,
 
     /// WASM plugin engine configuration (`[wasm]` section).
     #[serde(default)]
@@ -424,6 +456,12 @@ pub struct ProviderConfig {
     /// (e.g. OpenAI Codex `/responses` reasoning effort).
     #[serde(default)]
     pub reasoning_level: Option<String>,
+    /// Override the `tool_choice` parameter sent to the model when tools are available.
+    /// Default: `"auto"` (model decides whether to call tools).
+    /// Set to `"required"` for models like Gemma 4 that need guided decoding to
+    /// reliably produce structured tool calls instead of narrating intent.
+    #[serde(default)]
+    pub tool_choice: Option<String>,
     /// Optional transport override for providers that support multiple transports.
     /// Supported values: "auto", "websocket", "sse".
     ///
@@ -554,6 +592,10 @@ impl std::fmt::Debug for Config {
             .field("api_url_configured", &self.api_url.is_some())
             .field("default_provider", &self.default_provider)
             .field("provider_api", &self.provider_api)
+            .field(
+                "supports_responses_fallback",
+                &self.supports_responses_fallback,
+            )
             .field("default_model", &self.default_model)
             .field("model_providers", &model_provider_ids)
             .field("default_temperature", &self.default_temperature)
@@ -779,6 +821,77 @@ impl Default for AgentsIpcConfig {
             staleness_secs: default_agents_ipc_staleness_secs(),
         }
     }
+}
+
+/// Tool output presentation layer configuration.
+/// Controls how raw tool output is processed before the LLM sees it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PresentationConfig {
+    /// Maximum lines before overflow triggers. Default: 200.
+    #[serde(default = "default_max_output_lines")]
+    pub max_output_lines: usize,
+
+    /// Maximum bytes before overflow triggers. Default: 51200 (50KB).
+    #[serde(default = "default_max_output_bytes")]
+    pub max_output_bytes: usize,
+
+    /// Strip ANSI escape codes from tool output. Default: true.
+    #[serde(default = "default_true")]
+    pub strip_ansi: bool,
+
+    /// Append exit code/status and duration footer to tool results. Default: true.
+    #[serde(default = "default_true")]
+    pub show_metadata: bool,
+
+    /// Directory for overflow file storage. Default: "/tmp/cmd-output".
+    #[serde(default = "default_overflow_dir")]
+    pub overflow_dir: String,
+
+    /// Convert JSON tool responses to pipe-delimited plain text before sending
+    /// to the LLM. Prevents collision with Gemma 4's native tool response
+    /// syntax (`{`, `}`, `:`, `"`). Default: false.
+    #[serde(default)]
+    pub flatten_json_responses: bool,
+
+    /// Simplify tool schemas for models with limited schema parsing capacity.
+    /// Truncates descriptions to first sentence, strips behavioral instructions,
+    /// removes optional parameters, and shortens parameter descriptions.
+    /// Default: false.
+    #[serde(default)]
+    pub simplify_tool_schemas: bool,
+
+    /// Include the model's reasoning/thinking content in the final response.
+    /// When enabled, reasoning is prepended as a blockquote above the answer.
+    /// Useful for thinking-mode models like Gemma 4 where vLLM's
+    /// --reasoning-parser separates reasoning into its own API field.
+    /// Default: false.
+    #[serde(default)]
+    pub show_reasoning: bool,
+}
+
+impl Default for PresentationConfig {
+    fn default() -> Self {
+        Self {
+            max_output_lines: default_max_output_lines(),
+            max_output_bytes: default_max_output_bytes(),
+            strip_ansi: default_true(),
+            show_metadata: default_true(),
+            overflow_dir: default_overflow_dir(),
+            flatten_json_responses: false,
+            simplify_tool_schemas: false,
+            show_reasoning: false,
+        }
+    }
+}
+
+fn default_max_output_lines() -> usize {
+    200
+}
+fn default_max_output_bytes() -> usize {
+    51_200
+}
+fn default_overflow_dir() -> String {
+    "/tmp/cmd-output".into()
 }
 
 fn default_coordination_enabled() -> bool {
@@ -1062,7 +1175,7 @@ pub struct AgentConfig {
     pub loop_detection_ping_pong_cycles: usize,
     /// Loop detection: consecutive failure streak threshold.
     /// Triggers when the same tool fails this many times in a row.
-    /// Set to `0` to disable. Default: `3`.
+    /// Set to `0` to disable. Default: `5`.
     #[serde(default = "default_loop_detection_failure_streak")]
     pub loop_detection_failure_streak: usize,
     /// Safety heartbeat injection interval inside `run_tool_call_loop`.
@@ -1122,6 +1235,10 @@ pub struct AgentSessionConfig {
     pub max_messages: usize,
 }
 
+fn default_context_window_tokens() -> usize {
+    128_000
+}
+
 fn default_agent_max_tool_iterations() -> usize {
     20
 }
@@ -1159,7 +1276,7 @@ fn default_loop_detection_ping_pong_cycles() -> usize {
 }
 
 fn default_loop_detection_failure_streak() -> usize {
-    3
+    5
 }
 
 fn default_safety_heartbeat_interval() -> usize {
@@ -1755,6 +1872,10 @@ pub struct GatewayConfig {
     /// Node-control protocol scaffold (`[gateway.node_control]`).
     #[serde(default)]
     pub node_control: NodeControlConfig,
+
+    /// ACP server settings (`[gateway.acp_server]`).
+    #[serde(default)]
+    pub acp_server: AcpServerConfig,
 }
 
 /// Node-control scaffold settings under `[gateway.node_control]`.
@@ -1773,6 +1894,49 @@ pub struct NodeControlConfig {
     /// Empty means "no explicit allowlist" (accept all IDs).
     #[serde(default)]
     pub allowed_node_ids: Vec<String>,
+}
+
+/// ACP-over-HTTP server settings under `[gateway.acp_server]`.
+///
+/// When enabled, zeroclaw exposes a `/acp` endpoint that speaks JSON-RPC 2.0
+/// over HTTP+SSE, allowing other agents to delegate tasks via the ACP protocol.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AcpServerConfig {
+    /// Enable the ACP server endpoint (`POST /acp`, `DELETE /acp`).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Maximum session lifetime in seconds before automatic cleanup.
+    #[serde(default = "default_acp_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+
+    /// Maximum number of concurrent ACP transport sessions.
+    ///
+    /// When a new `initialize` request would exceed this limit, the oldest
+    /// session is cancelled and evicted. Set to `1` to ensure only one
+    /// caller can run a task at a time (e.g. one session for Sam).
+    ///
+    /// Default: `1`.
+    #[serde(default = "default_acp_max_concurrent_sessions")]
+    pub max_concurrent_sessions: usize,
+}
+
+impl Default for AcpServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            session_ttl_secs: default_acp_session_ttl_secs(),
+            max_concurrent_sessions: default_acp_max_concurrent_sessions(),
+        }
+    }
+}
+
+fn default_acp_max_concurrent_sessions() -> usize {
+    1
+}
+
+fn default_acp_session_ttl_secs() -> u64 {
+    7200 // 2 hours
 }
 
 fn default_gateway_port() -> u16 {
@@ -1822,6 +1986,7 @@ impl Default for GatewayConfig {
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             node_control: NodeControlConfig::default(),
+            acp_server: AcpServerConfig::default(),
         }
     }
 }
@@ -3427,6 +3592,17 @@ pub struct AutonomyConfig {
     /// Maximum cost per day in cents per policy. Default: `1000`.
     pub max_cost_per_day_cents: u32,
 
+    /// Allow shell redirection (`>`, `<`, `2>&1`), process substitution,
+    /// variable expansion, `tee`, and background (`&`) in shell commands.
+    ///
+    /// By default these are blocked to prevent accidental data exfiltration.
+    /// Set to `true` for agents that need full shell access (e.g. a K8s
+    /// infrastructure agent running kubectl).
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub allow_shell_redirections: bool,
+
     /// Require explicit approval for medium-risk shell commands.
     #[serde(default = "default_true")]
     pub require_approval_for_medium_risk: bool,
@@ -3476,6 +3652,13 @@ pub struct AutonomyConfig {
     /// model in tool specs.
     #[serde(default = "default_non_cli_excluded_tools")]
     pub non_cli_excluded_tools: Vec<String>,
+
+    /// Additional tools to exclude when a sender is in `/private` mode.
+    ///
+    /// Private sessions disable auto-save and hide these tools from the model.
+    /// Typically memory-related tools so conversations stay ephemeral.
+    #[serde(default = "default_private_session_excluded_tools")]
+    pub private_session_excluded_tools: Vec<String>,
 
     /// Optional allowlist for who can manage non-CLI approval commands.
     ///
@@ -3554,6 +3737,13 @@ fn default_non_cli_excluded_tools() -> Vec<String> {
     .collect()
 }
 
+fn default_private_session_excluded_tools() -> Vec<String> {
+    ["memory_store", "memory_forget", "memory_observe"]
+        .into_iter()
+        .map(std::string::ToString::to_string)
+        .collect()
+}
+
 fn is_valid_env_var_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
@@ -3611,6 +3801,7 @@ impl Default for AutonomyConfig {
             ],
             max_actions_per_hour: 100,
             max_cost_per_day_cents: 1000,
+            allow_shell_redirections: false,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
@@ -3620,6 +3811,7 @@ impl Default for AutonomyConfig {
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
             non_cli_excluded_tools: default_non_cli_excluded_tools(),
+            private_session_excluded_tools: default_private_session_excluded_tools(),
             non_cli_approval_approvers: Vec::new(),
             non_cli_natural_language_approval_mode: NonCliNaturalLanguageApprovalMode::default(),
             non_cli_natural_language_approval_mode_by_channel: HashMap::new(),
@@ -4024,7 +4216,7 @@ fn default_provider_retries() -> u32 {
 }
 
 fn default_provider_backoff_ms() -> u64 {
-    500
+    1500
 }
 
 fn default_channel_backoff_secs() -> u64 {
@@ -4207,6 +4399,97 @@ pub struct ClassificationRule {
 
 // ── Heartbeat ────────────────────────────────────────────────────
 
+/// Conversation recovery configuration (`[recovery]` section).
+///
+/// Controls automatic retry behaviour when the agent loop fails with a
+/// recoverable error (e.g. the model narrates an action instead of emitting
+/// a tool call).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RecoveryConfig {
+    /// Enable automatic retry-around-loop for recoverable errors. Default: `true`.
+    #[serde(default = "default_recovery_enabled")]
+    pub enabled: bool,
+
+    /// Maximum number of recovery attempts around the tool-call loop (on top
+    /// of the single in-loop retry that already exists). Default: `2`.
+    #[serde(default = "default_recovery_max_attempts")]
+    pub max_recovery_attempts: u32,
+
+    /// Initial backoff in milliseconds before the first recovery attempt.
+    /// Default: `3000` (3 seconds).
+    #[serde(default = "default_recovery_backoff_base_ms")]
+    pub backoff_base_ms: u64,
+
+    /// Exponential multiplier applied to backoff for subsequent attempts.
+    /// Default: `3.0` (3s, 9s).
+    #[serde(default = "default_recovery_backoff_multiplier")]
+    pub backoff_multiplier: f64,
+
+    /// Temperature override for recovery attempts. `0.0` means use the
+    /// default temperature. Default: `0.3`.
+    #[serde(default = "default_recovery_temperature")]
+    pub recovery_temperature: f64,
+
+    /// Whether to compact conversation history before the final recovery
+    /// attempt. Default: `true`.
+    #[serde(default = "default_recovery_compress_on_final")]
+    pub compress_on_final_attempt: bool,
+
+    /// Enable stale-followup detection via heartbeat. Default: `false`.
+    #[serde(default)]
+    pub stale_followup_enabled: bool,
+
+    /// Seconds before a pending follow-up is considered stale. Default: `300`.
+    #[serde(default = "default_stale_followup_timeout")]
+    pub stale_followup_timeout_secs: u64,
+
+    /// Maximum nudge messages sent for a single stale follow-up before giving
+    /// up. Default: `2`.
+    #[serde(default = "default_stale_followup_max_nudges")]
+    pub stale_followup_max_nudges: u32,
+}
+
+fn default_recovery_enabled() -> bool {
+    true
+}
+fn default_recovery_max_attempts() -> u32 {
+    2
+}
+fn default_recovery_backoff_base_ms() -> u64 {
+    3000
+}
+fn default_recovery_backoff_multiplier() -> f64 {
+    3.0
+}
+fn default_recovery_temperature() -> f64 {
+    0.3
+}
+fn default_recovery_compress_on_final() -> bool {
+    true
+}
+fn default_stale_followup_timeout() -> u64 {
+    300
+}
+fn default_stale_followup_max_nudges() -> u32 {
+    2
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_recovery_enabled(),
+            max_recovery_attempts: default_recovery_max_attempts(),
+            backoff_base_ms: default_recovery_backoff_base_ms(),
+            backoff_multiplier: default_recovery_backoff_multiplier(),
+            recovery_temperature: default_recovery_temperature(),
+            compress_on_final_attempt: default_recovery_compress_on_final(),
+            stale_followup_enabled: false,
+            stale_followup_timeout_secs: default_stale_followup_timeout(),
+            stale_followup_max_nudges: default_stale_followup_max_nudges(),
+        }
+    }
+}
+
 /// Heartbeat configuration for periodic health pings (`[heartbeat]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HeartbeatConfig {
@@ -4293,6 +4576,112 @@ impl Default for CronConfig {
         Self {
             enabled: true,
             max_run_history: default_max_run_history(),
+        }
+    }
+}
+
+// ── Proactive Messaging ──────────────────────────────────────────
+
+/// Proactive messaging configuration (`[proactive_messaging]` section).
+///
+/// When enabled, agents can proactively send messages to users via
+/// `send_user_message`. Messages are gated by quiet hours and rate limits,
+/// and queued when delivery is denied by quiet hours.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProactiveMessagingConfig {
+    /// Enable the proactive messaging subsystem. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Quiet-hours windows during which messages are queued instead of sent.
+    #[serde(default)]
+    pub quiet_hours: Vec<QuietHoursWindow>,
+    /// Rate limits for proactive messages.
+    #[serde(default)]
+    pub rate_limits: ProactiveMessagingRateLimits,
+    /// Queue configuration for deferred messages.
+    #[serde(default)]
+    pub queue: ProactiveMessagingQueueConfig,
+}
+
+impl Default for ProactiveMessagingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            quiet_hours: Vec::new(),
+            rate_limits: ProactiveMessagingRateLimits::default(),
+            queue: ProactiveMessagingQueueConfig::default(),
+        }
+    }
+}
+
+/// A time window during which proactive messages are queued for later delivery.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct QuietHoursWindow {
+    /// Start hour (0–23, inclusive). E.g. `22` for 10 PM.
+    pub start_hour: u8,
+    /// End hour (0–23, exclusive). E.g. `7` for 7 AM. Wraps past midnight when `end < start`.
+    pub end_hour: u8,
+    /// IANA timezone (e.g. `"America/New_York"`). Default: `"UTC"`.
+    #[serde(default = "default_quiet_hours_timezone")]
+    pub timezone: String,
+}
+
+fn default_quiet_hours_timezone() -> String {
+    "UTC".to_string()
+}
+
+/// Rate limits for the proactive messaging subsystem.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProactiveMessagingRateLimits {
+    /// Maximum proactive messages per hour. Default: `10`.
+    #[serde(default = "default_pm_max_per_hour")]
+    pub max_per_hour: u32,
+    /// Maximum proactive messages per day. Default: `50`.
+    #[serde(default = "default_pm_max_per_day")]
+    pub max_per_day: u32,
+}
+
+fn default_pm_max_per_hour() -> u32 {
+    10
+}
+
+fn default_pm_max_per_day() -> u32 {
+    50
+}
+
+impl Default for ProactiveMessagingRateLimits {
+    fn default() -> Self {
+        Self {
+            max_per_hour: default_pm_max_per_hour(),
+            max_per_day: default_pm_max_per_day(),
+        }
+    }
+}
+
+/// Queue settings for deferred proactive messages.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProactiveMessagingQueueConfig {
+    /// Maximum number of pending messages in the queue. Default: `100`.
+    #[serde(default = "default_pm_max_pending")]
+    pub max_pending: usize,
+    /// Time-to-live for queued messages in hours. Default: `24`.
+    #[serde(default = "default_pm_ttl_hours")]
+    pub ttl_hours: u64,
+}
+
+fn default_pm_max_pending() -> usize {
+    100
+}
+
+fn default_pm_ttl_hours() -> u64 {
+    24
+}
+
+impl Default for ProactiveMessagingQueueConfig {
+    fn default() -> Self {
+        Self {
+            max_pending: default_pm_max_pending(),
+            ttl_hours: default_pm_ttl_hours(),
         }
     }
 }
@@ -5150,6 +5539,12 @@ pub struct SignalConfig {
     /// Skip incoming story messages.
     #[serde(default)]
     pub ignore_stories: bool,
+    /// Enable progressive message editing: send a draft message when the agent
+    /// starts working, update it with intermediate status, then replace it with
+    /// the final response. Requires signal-cli REST API v2 (`/v2/send` with
+    /// `edit_timestamp`). Defaults to false.
+    #[serde(default)]
+    pub edit_messages: bool,
 }
 
 impl ChannelConfig for SignalConfig {
@@ -6431,6 +6826,7 @@ impl Default for Config {
             api_url: None,
             default_provider: Some(DEFAULT_PROVIDER_NAME.to_string()),
             provider_api: None,
+            supports_responses_fallback: None,
             default_model: Some(DEFAULT_MODEL_NAME.to_string()),
             model_providers: HashMap::new(),
             provider: ProviderConfig::default(),
@@ -6447,7 +6843,9 @@ impl Default for Config {
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
+            recovery: RecoveryConfig::default(),
             cron: CronConfig::default(),
+            proactive_messaging: ProactiveMessagingConfig::default(),
             goal_loop: GoalLoopConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
@@ -6474,8 +6872,11 @@ impl Default for Config {
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            presentation: PresentationConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
+            strip_prior_reasoning: false,
+            context_window_tokens: default_context_window_tokens(),
             wasm: WasmConfig::default(),
         }
     }
@@ -7969,6 +8370,32 @@ impl Config {
             }
         }
 
+        let mut seen_private_excluded = std::collections::HashSet::new();
+        for (i, tool_name) in self
+            .autonomy
+            .private_session_excluded_tools
+            .iter()
+            .enumerate()
+        {
+            let normalized = tool_name.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("autonomy.private_session_excluded_tools[{i}] must not be empty");
+            }
+            if !normalized
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                anyhow::bail!(
+                    "autonomy.private_session_excluded_tools[{i}] contains invalid characters: {normalized}"
+                );
+            }
+            if !seen_private_excluded.insert(normalized.to_string()) {
+                anyhow::bail!(
+                    "autonomy.private_session_excluded_tools contains duplicate entry: {normalized}"
+                );
+            }
+        }
+
         // Security OTP / estop
         if self.security.otp.token_ttl_secs == 0 {
             anyhow::bail!("security.otp.token_ttl_secs must be greater than 0");
@@ -8438,6 +8865,17 @@ impl Config {
         {
             anyhow::bail!(
                 "provider_api is only valid when default_provider uses the custom:<url> format"
+            );
+        }
+
+        if self.supports_responses_fallback.is_some()
+            && !self
+                .default_provider
+                .as_deref()
+                .is_some_and(|provider| provider.starts_with("custom:"))
+        {
+            anyhow::bail!(
+                "supports_responses_fallback is only valid when default_provider uses the custom:<url> format"
             );
         }
 
@@ -9226,6 +9664,19 @@ impl Config {
         }
 
         set_runtime_proxy_config(self.proxy.clone());
+
+        // Gateway paired tokens: ZEROCLAW_GATEWAY_PAIRED_TOKENS (comma-separated)
+        if let Ok(tokens) = std::env::var("ZEROCLAW_GATEWAY_PAIRED_TOKENS") {
+            let parsed: Vec<String> = tokens
+                .split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+            if !parsed.is_empty() {
+                self.gateway.paired_tokens = parsed;
+            }
+        }
     }
 
     pub async fn save(&self) -> Result<()> {
@@ -9843,6 +10294,34 @@ allowed_roots = []
     }
 
     #[test]
+    async fn config_validate_rejects_duplicate_private_session_excluded_tools() {
+        let mut cfg = Config::default();
+        cfg.autonomy.private_session_excluded_tools =
+            vec!["memory_store".into(), "memory_store".into()];
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("autonomy.private_session_excluded_tools contains duplicate entry"));
+    }
+
+    #[test]
+    async fn private_session_excluded_tools_default() {
+        let cfg = Config::default();
+        assert!(cfg
+            .autonomy
+            .private_session_excluded_tools
+            .contains(&"memory_store".to_string()));
+        assert!(cfg
+            .autonomy
+            .private_session_excluded_tools
+            .contains(&"memory_forget".to_string()));
+        assert!(cfg
+            .autonomy
+            .private_session_excluded_tools
+            .contains(&"memory_observe".to_string()));
+    }
+
+    #[test]
     async fn runtime_config_default() {
         let r = RuntimeConfig::default();
         assert_eq!(r.kind, "native");
@@ -10015,6 +10494,7 @@ ws_url = "ws://127.0.0.1:3002"
             api_url: None,
             default_provider: Some("openrouter".into()),
             provider_api: None,
+            supports_responses_fallback: None,
             default_model: Some("gpt-4o".into()),
             model_providers: HashMap::new(),
             provider: ProviderConfig::default(),
@@ -10031,6 +10511,7 @@ ws_url = "ws://127.0.0.1:3002"
                 forbidden_paths: vec!["/secret".into()],
                 max_actions_per_hour: 50,
                 max_cost_per_day_cents: 1000,
+                allow_shell_redirections: false,
                 require_approval_for_medium_risk: false,
                 block_high_risk_commands: true,
                 shell_env_passthrough: vec!["DATABASE_URL".into()],
@@ -10040,6 +10521,7 @@ ws_url = "ws://127.0.0.1:3002"
                 always_ask: vec![],
                 allowed_roots: vec![],
                 non_cli_excluded_tools: vec![],
+                private_session_excluded_tools: vec![],
                 non_cli_approval_approvers: vec![],
                 non_cli_natural_language_approval_mode:
                     NonCliNaturalLanguageApprovalMode::RequestConfirm,
@@ -10066,7 +10548,9 @@ ws_url = "ws://127.0.0.1:3002"
                 target: Some("telegram".into()),
                 to: Some("123456".into()),
             },
+            recovery: RecoveryConfig::default(),
             cron: CronConfig::default(),
+            proactive_messaging: ProactiveMessagingConfig::default(),
             goal_loop: GoalLoopConfig::default(),
             channels_config: ChannelsConfig {
                 cli: true,
@@ -10130,8 +10614,11 @@ ws_url = "ws://127.0.0.1:3002"
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            presentation: PresentationConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
+            strip_prior_reasoning: false,
+            context_window_tokens: default_context_window_tokens(),
             wasm: WasmConfig::default(),
         };
 
@@ -10462,6 +10949,7 @@ tool_dispatcher = "xml"
             api_url: None,
             default_provider: Some("openrouter".into()),
             provider_api: None,
+            supports_responses_fallback: None,
             default_model: Some("test-model".into()),
             model_providers: HashMap::new(),
             provider: ProviderConfig::default(),
@@ -10480,7 +10968,9 @@ tool_dispatcher = "xml"
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            recovery: RecoveryConfig::default(),
             cron: CronConfig::default(),
+            proactive_messaging: ProactiveMessagingConfig::default(),
             goal_loop: GoalLoopConfig::default(),
             channels_config: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
@@ -10505,8 +10995,11 @@ tool_dispatcher = "xml"
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
+            presentation: PresentationConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
+            strip_prior_reasoning: false,
+            context_window_tokens: default_context_window_tokens(),
             wasm: WasmConfig::default(),
         };
 
@@ -10995,6 +11488,7 @@ allowed_users = ["@ops:matrix.org"]
             allowed_from: vec!["+1111111111".into()],
             ignore_attachments: true,
             ignore_stories: false,
+            edit_messages: true,
         };
         let json = serde_json::to_string(&sc).unwrap();
         let parsed: SignalConfig = serde_json::from_str(&json).unwrap();
@@ -11004,6 +11498,7 @@ allowed_users = ["@ops:matrix.org"]
         assert_eq!(parsed.allowed_from.len(), 1);
         assert!(parsed.ignore_attachments);
         assert!(!parsed.ignore_stories);
+        assert!(parsed.edit_messages);
     }
 
     #[test]
@@ -11015,6 +11510,7 @@ allowed_users = ["@ops:matrix.org"]
             allowed_from: vec!["*".into()],
             ignore_attachments: false,
             ignore_stories: true,
+            edit_messages: false,
         };
         let toml_str = toml::to_string(&sc).unwrap();
         let parsed: SignalConfig = toml::from_str(&toml_str).unwrap();
@@ -11513,6 +12009,7 @@ channel_id = "C123"
                 auth_token: Some("node-token".into()),
                 allowed_node_ids: vec!["node-1".into(), "node-2".into()],
             },
+            acp_server: AcpServerConfig::default(),
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -12157,6 +12654,20 @@ requires_openai_auth = true
             .expect_err("provider_api should be rejected for non-custom provider");
         assert!(err.to_string().contains(
             "provider_api is only valid when default_provider uses the custom:<url> format"
+        ));
+    }
+
+    #[test]
+    async fn supports_responses_fallback_requires_custom_default_provider() {
+        let mut config = Config::default();
+        config.default_provider = Some("openai".to_string());
+        config.supports_responses_fallback = Some(false);
+
+        let err = config
+            .validate()
+            .expect_err("supports_responses_fallback should be rejected for non-custom provider");
+        assert!(err.to_string().contains(
+            "supports_responses_fallback is only valid when default_provider uses the custom:<url> format"
         ));
     }
 
@@ -13055,6 +13566,35 @@ default_model = "legacy-model"
         assert_eq!(config.gateway.port, 9000);
 
         std::env::remove_var("PORT");
+    }
+
+    #[test]
+    async fn env_override_gateway_paired_tokens() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        assert!(config.gateway.paired_tokens.is_empty());
+
+        std::env::set_var("ZEROCLAW_GATEWAY_PAIRED_TOKENS", "tok-a,tok-b, tok-c ");
+        config.apply_env_overrides();
+        assert_eq!(
+            config.gateway.paired_tokens,
+            vec!["tok-a", "tok-b", "tok-c"]
+        );
+
+        std::env::remove_var("ZEROCLAW_GATEWAY_PAIRED_TOKENS");
+    }
+
+    #[test]
+    async fn env_override_gateway_paired_tokens_empty_ignored() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.gateway.paired_tokens = vec!["existing".to_string()];
+
+        std::env::set_var("ZEROCLAW_GATEWAY_PAIRED_TOKENS", "  ");
+        config.apply_env_overrides();
+        assert_eq!(config.gateway.paired_tokens, vec!["existing"]);
+
+        std::env::remove_var("ZEROCLAW_GATEWAY_PAIRED_TOKENS");
     }
 
     #[test]

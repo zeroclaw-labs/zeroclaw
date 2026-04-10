@@ -1,0 +1,34 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: signal-cli-daemon-allow-from-zeroclaw
+  namespace: ai-agents
+spec:
+  podSelector:
+    matchLabels:
+      app: signal-cli-daemon
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ai-agents
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: zeroclaw-allow-to-signal-cli-daemon
+  namespace: ai-agents
+spec:
+  podSelector:
+    matchLabels:
+      app: zeroclaw
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: signal-cli-daemon

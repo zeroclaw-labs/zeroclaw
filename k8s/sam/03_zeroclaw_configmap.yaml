@@ -1,0 +1,222 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zeroclaw-config
+  namespace: ai-agents
+data:
+  config.toml: |
+      # Secrets are injected via environment variables (highest priority):
+      #   API_KEY                          — LiteLLM proxy API key
+      #   ZEROCLAW_GATEWAY_PAIRED_TOKENS   — comma-separated gateway auth tokens
+      default_provider = "custom:https://assistant-api.coffee-anon.com/v1"
+      # LiteLLM v1.82.0 has no working /v1/responses passthrough for hosted_vllm;
+      # the chat→responses fallback converts transport errors into non-retryable
+      # 400s (scrapyard-wiki/incidents/2026-04-10). Keep explicitly disabled.
+      supports_responses_fallback = false
+      default_model = "litellm-sam"
+      default_temperature = 0.9
+      model_support_vision = true
+      strip_prior_reasoning = true
+      context_window_tokens = 131072
+
+      [autonomy]
+      level = "full"
+      workspace_only = false
+      allowed_commands = ["*"]
+      forbidden_paths = [
+          "/etc",
+          "/root",
+          "/home",
+          "/usr",
+          "/bin",
+          "/sbin",
+          "/lib",
+          "/opt",
+          "/boot",
+          "/dev",
+          "/proc",
+          "/sys",
+          "/var",
+          "/tmp",
+          "~/.ssh",
+          "~/.gnupg",
+          "~/.aws",
+          "~/.config",
+      ]
+      allowed_roots = ["/tmp/cmd-output"]
+      max_actions_per_hour = 9999
+      max_cost_per_day_cents = 500
+      require_approval_for_medium_risk = false
+      block_high_risk_commands = false
+      non_cli_excluded_tools = [
+          # Admin/config tools — not needed for a multipurpose agent
+          "model_routing_config",
+          "web_access_config",
+          "web_search_config",
+          "proxy_config",
+          "channel_ack_config",
+          "manage_auth_profile",
+          "manage_outbound_queue",
+          "check_provider_quota",
+          "estimate_quota_cost",
+          "switch_provider",
+          "openclaw_migration",
+          "schedule",
+          # Serena duplicates of native zeroclaw tools
+          "serena__execute_shell_command",
+          "serena__search_for_pattern",
+          "serena__read_file",
+          "serena__find_file",
+          "serena__list_dir",
+          "serena__create_text_file",
+          # Serena lifecycle/admin tools
+          "serena__check_onboarding_performed",
+          "serena__onboarding",
+          "serena__initial_instructions",
+          "serena__prepare_for_new_conversation",
+          "serena__get_current_config",
+          "serena__switch_modes",
+          "serena__activate_project",
+      ]
+      non_cli_natural_language_approval_mode = "direct"
+      shell_env_passthrough = ["ACP_AUTH_TOKEN", "ACP_BASE_URL", "ACP_CWD", "SPEAKR_API_TOKEN", "VIKUNJA_API_TOKEN", "VIKUNJA_BASE_URL"]
+
+      [provider]
+
+      [research]
+      trigger = "never"
+
+      [reliability]
+      provider_retries = 5
+
+      [agent]
+      max_tool_iterations = 999
+      loop_detection_no_progress_threshold = 15
+      loop_detection_failure_streak = 10
+
+      [heartbeat]
+      enabled = true
+      interval_minutes = 30
+
+      [proactive_messaging]
+      enabled = true
+
+      [[proactive_messaging.quiet_hours]]
+      start_hour = 22
+      end_hour = 7
+      timezone = "America/Edmonton"
+
+      [goal_loop]
+      enabled = true
+      interval_minutes = 30
+      step_timeout_secs = 120
+      max_steps_per_cycle = 3
+
+      [channels_config]
+      cli = true
+      message_timeout_secs = 300
+
+      [channels_config.signal]
+      http_url = "http://127.0.0.1:8686"
+      account = "+19038905805"
+      allowed_from = ["*"]
+      ignore_attachments = false
+      ignore_stories = true
+      edit_messages = true
+
+      [memory]
+      backend = "sqlite"
+      auto_save = true
+      embedding_provider = "none"
+
+      [gateway]
+      port = 3000
+      host = "0.0.0.0"
+      require_pairing = true
+      allow_public_bind = true
+
+      [gateway.node_control]
+      enabled = true
+
+      [composio]
+      enabled = true
+
+      [secrets]
+      encrypt = false
+
+      [browser]
+      enabled = true
+      backend = "agent_browser"
+      allowed_domains = ["*"]
+
+      [identity]
+      format = "openclaw"
+
+      [cost]
+      enabled = true
+
+      [cost.prices."anthropic/claude-opus-4-20250514"]
+      input = 15.0
+      output = 75.0
+
+      [cost.prices."anthropic/claude-3.5-sonnet"]
+      input = 3.0
+      output = 15.0
+
+      [cost.prices."anthropic/claude-3-haiku"]
+      input = 0.25
+      output = 1.25
+
+      [cost.prices."openai/gpt-4o-mini"]
+      input = 0.15
+      output = 0.6
+
+      [cost.prices."anthropic/claude-sonnet-4-20250514"]
+      input = 3.0
+      output = 15.0
+
+      [cost.prices."openai/o1-preview"]
+      input = 15.0
+      output = 60.0
+
+      [cost.prices."google/gemini-1.5-pro"]
+      input = 1.25
+      output = 5.0
+
+      [cost.prices."google/gemini-2.0-flash"]
+      input = 0.1
+      output = 0.4
+
+      [cost.prices."openai/gpt-4o"]
+      input = 5.0
+      output = 15.0
+
+      [coordination]
+      enabled = true
+
+      [transcription]
+      enabled = true
+      api_url = "https://api.groq.com/openai/v1/audio/transcriptions"
+      model = "whisper-large-v3-turbo"
+
+      [agents_ipc]
+      enabled = true
+
+      [presentation]
+      max_output_lines = 200
+      max_output_bytes = 51200
+      strip_ansi = true
+      show_metadata = true
+      overflow_dir = "/tmp/cmd-output"
+      flatten_json_responses = true
+      simplify_tool_schemas = true
+      show_reasoning = true
+
+      [mcp]
+      enabled = true
+
+      [[mcp.servers]]
+      name = "serena"
+      transport = "http"
+      url = "http://127.0.0.1:9121/mcp"
+      tool_timeout_secs = 60

@@ -164,10 +164,13 @@ impl ChatResponse {
 }
 
 /// Request payload for provider chat calls.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ChatRequest<'a> {
     pub messages: &'a [ChatMessage],
     pub tools: Option<&'a [ToolSpec]>,
+    /// Override for the `tool_choice` parameter sent to the model.
+    /// When `None`, providers default to `"auto"`.
+    pub tool_choice: Option<String>,
 }
 
 /// A tool result to feed back to the LLM.
@@ -917,6 +920,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: Some(&tools),
+            tool_choice: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -934,6 +938,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: None,
+            tool_choice: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -1034,6 +1039,7 @@ mod tests {
                 ChatMessage::system("BASE_SYSTEM_PROMPT"),
             ],
             tools: Some(&tools),
+            tool_choice: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -1056,6 +1062,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::system("BASE"), ChatMessage::user("Hello")],
             tools: Some(&tools),
+            tool_choice: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -1078,6 +1085,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: Some(&tools),
+            tool_choice: None,
         };
 
         let err = provider.chat(request, "model", 0.7).await.unwrap_err();

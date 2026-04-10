@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zeroclaw-skill-browser-navigation
+  namespace: ai-agents
+data:
+  browser-navigation.md: |
+    ---
+    name: browser-navigation
+    version: 2.0.0
+    description: Guides browser tool usage. Consult before calling the browser tool.
+    always: false
+    ---
+
+    # Browser Navigation
+
+    The browser controls headless Chromium. Page state persists between calls.
+
+    ## Browser vs Python
+
+    Use browser for: JavaScript-rendered pages, SPAs, clicking UIs, filling forms.
+    Use Python urllib via shell for: REST APIs, JSON endpoints, file downloads, predictable responses.
+    Python is faster and cheaper. Only use browser when rendering is required.
+
+    ## Snapshot vs Screenshot
+
+    Snapshot: returns accessibility tree with ref identifiers for interaction. Primary tool for reading pages.
+    Screenshot: returns visual image. Use only for visual verification.
+    Always snapshot first on a new page. Use refs from snapshot to interact.
+
+    ## Navigation Pattern
+
+    1. browser action=open url=TARGET
+    2. browser action=wait ms=2000
+    3. browser action=snapshot
+    If snapshot is empty, wait longer and retry. Check action=get_url to confirm location.
+
+    ## Targeting Elements (order of preference)
+
+    1. Refs from snapshot: action=click selector="@e42". Most reliable.
+    2. Semantic find: action=find by=text value="Submit" find_action=click. Options for by: text, role, label, placeholder, testid.
+    3. CSS selectors: action=click selector="#submit-btn". Only when you know the exact selector.
+
+    ## Recovery
+
+    Empty snapshot: wait longer, retry. Check get_url for redirects.
+    Element not found: scroll down (action=scroll direction=down pixels=500), snapshot again. Check for modal overlays.
+    Form submission fails: try action=press key=Enter instead of button click. Check for validation errors.
+    Login wall or CAPTCHA: report to Dan.
+
+    ## Avoid
+
+    Screenshotting to read text (use snapshot or get_text). Guessing CSS selectors without a snapshot. Wrong ref format (use @e1 not ref=1). Rapid-fire actions without waits. Using browser for API calls. Letting snapshots accumulate (use action=close between sites).

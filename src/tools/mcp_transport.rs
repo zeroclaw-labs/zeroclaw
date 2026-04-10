@@ -144,11 +144,13 @@ impl McpTransportConn for StdioTransport {
 
 // ── HTTP Transport ───────────────────────────────────────────────────────
 
-/// HTTP-based transport (POST requests).
+/// HTTP-based transport (POST requests, streamable-http session tracking).
 pub struct HttpTransport {
     url: String,
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
+    /// MCP session ID returned by the server; sent on subsequent requests.
+    session_id: Option<String>,
 }
 
 impl HttpTransport {
@@ -168,6 +170,7 @@ impl HttpTransport {
             url,
             client,
             headers: config.headers.clone(),
+            session_id: None,
         })
     }
 }
@@ -196,6 +199,16 @@ impl McpTransportConn for HttpTransport {
         if !has_accept {
             req = req.header("Accept", MCP_STREAMABLE_ACCEPT);
         }
+        // Streamable-http session tracking: send stored session ID if present.
+        if let Some(ref sid) = self.session_id {
+            tracing::info!("MCP HTTP: sending Mcp-Session-Id: {sid}");
+            req = req.header("Mcp-Session-Id", sid);
+        } else {
+            tracing::info!(
+                "MCP HTTP: no session ID to send (method={})",
+                request.method
+            );
+        }
 
         let resp = req
             .send()
@@ -204,6 +217,21 @@ impl McpTransportConn for HttpTransport {
 
         if !resp.status().is_success() {
             bail!("MCP server returned HTTP {}", resp.status());
+        }
+
+        // Capture session ID from response for subsequent requests.
+        if let Some(sid) = resp
+            .headers()
+            .get("Mcp-Session-Id")
+            .and_then(|v| v.to_str().ok())
+        {
+            tracing::info!("MCP HTTP: captured session ID from response: {sid}");
+            self.session_id = Some(sid.to_string());
+        } else {
+            tracing::info!(
+                "MCP HTTP: no Mcp-Session-Id in response (status={})",
+                resp.status()
+            );
         }
 
         if request.id.is_none() {

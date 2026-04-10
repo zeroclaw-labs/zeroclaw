@@ -1,0 +1,64 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zeroclaw-k8s-agent-cron-seed
+  namespace: ai-agents
+data:
+  seed-cron.py: |
+    #!/usr/bin/env python3
+    """Seed the pr-review-monitor cron job into Walter's SQLite cron store.
+
+    Run once on container startup. Idempotent — skips if job already exists.
+    """
+    import sqlite3
+    import uuid
+    import os
+    from datetime import datetime, timezone
+
+    DB_PATH = "/data/.zeroclaw/workspace/cron/jobs.db"
+
+    CRON_NAME = "pr-review-monitor"
+    CRON_EXPR = "*/30 * * * *"
+    SCHEDULE_JSON = '{"kind":"cron","expr":"0 */30 * * * *","tz":"America/Edmonton"}'
+    COMMAND = "pr-review-gate"
+
+    def main():
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""CREATE TABLE IF NOT EXISTS cron_jobs (
+            id TEXT PRIMARY KEY, expression TEXT NOT NULL, command TEXT NOT NULL,
+            schedule TEXT, job_type TEXT NOT NULL DEFAULT 'shell', prompt TEXT,
+            name TEXT, session_target TEXT NOT NULL DEFAULT 'isolated', model TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1, delivery TEXT,
+            delete_after_run INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+            next_run TEXT NOT NULL, last_run TEXT, last_status TEXT, last_output TEXT)""")
+
+        row = conn.execute(
+            "SELECT id, job_type FROM cron_jobs WHERE name=?", (CRON_NAME,)
+        ).fetchone()
+
+        if row is None:
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "INSERT INTO cron_jobs "
+                "(id,expression,command,schedule,job_type,name,"
+                "session_target,enabled,delivery,delete_after_run,created_at,next_run) "
+                "VALUES (?,?,?,?,?,?,?,1,?,0,?,?)",
+                (str(uuid.uuid4()), CRON_EXPR, COMMAND, SCHEDULE_JSON, "shell",
+                 CRON_NAME, "isolated", '{"mode":"none"}', now, now))
+            conn.commit()
+            print(f"Seeded {CRON_NAME} cron job (shell)")
+        elif row[1] != "shell":
+            # Migrate: old agent-type job → shell gate.
+            conn.execute(
+                "UPDATE cron_jobs SET job_type='shell', command=?, prompt=NULL "
+                "WHERE id=?", (COMMAND, row[0]))
+            conn.commit()
+            print(f"Migrated {CRON_NAME} from agent to shell gate")
+        else:
+            print(f"{CRON_NAME} cron job already exists (shell)")
+
+        conn.close()
+
+    if __name__ == "__main__":
+        main()

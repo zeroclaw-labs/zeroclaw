@@ -209,6 +209,12 @@ impl OpenAiCompatibleProvider {
     }
 
     /// Constructor used by `custom:` providers to choose explicit protocol mode.
+    ///
+    /// `supports_responses_fallback` is opt-in: the chat→responses fallback on
+    /// `/v1/chat/completions` transport errors and 404s converts retryable
+    /// transport failures into non-retryable 400s against LiteLLM/hosted_vllm
+    /// backends. Leave it `false` unless the target backend is known to need
+    /// it (see incidents/2026-04-10 in the scrapyard wiki).
     pub fn new_custom_with_mode(
         name: &str,
         base_url: &str,
@@ -217,6 +223,7 @@ impl OpenAiCompatibleProvider {
         supports_vision: bool,
         api_mode: CompatibleApiMode,
         max_tokens_override: Option<u32>,
+        supports_responses_fallback: bool,
     ) -> Self {
         Self::new_with_options(
             name,
@@ -224,7 +231,7 @@ impl OpenAiCompatibleProvider {
             credential,
             auth_style,
             supports_vision,
-            true,
+            supports_responses_fallback,
             None,
             false,
             api_mode,
@@ -1546,6 +1553,7 @@ impl OpenAiCompatibleProvider {
                             ProviderChatRequest {
                                 messages,
                                 tools: fallback_tools,
+                                tool_choice: None,
                             },
                             model,
                             temperature,
@@ -1593,7 +1601,12 @@ impl OpenAiCompatibleProvider {
         content: &str,
         allow_user_image_parts: bool,
     ) -> MessageContent {
-        if role != "user" || !allow_user_image_parts {
+        // Parse [IMAGE:] markers for user messages and tool results.
+        // Tool results can contain optimized screenshots from the browser tool;
+        // sending them as proper image_url content parts lets the vision model
+        // actually see the image instead of receiving raw base64 text tokens.
+        let allow_images = allow_user_image_parts && (role == "user" || role == "tool");
+        if !allow_images {
             return MessageContent::Text(content.to_string());
         }
 
@@ -1638,11 +1651,18 @@ impl OpenAiCompatibleProvider {
 
                         // Some OpenAI-compatible providers (including NVIDIA NIM models)
                         // reject assistant tool-call messages if `content` is omitted.
-                        let content = value
+                        //
+                        // Strip residual <tool_call> tags from content — defense-in-depth.
+                        // If the agent loop's sanitization missed malformed tags, remove
+                        // them here before they reach llama-server's template parser.
+                        let raw_content = value
                             .get("content")
                             .and_then(serde_json::Value::as_str)
                             .map(ToString::to_string)
                             .unwrap_or_default();
+                        let content = crate::agent::loop_::parsing::strip_unparsed_tool_call_tags(
+                            &raw_content,
+                        );
 
                         let reasoning_content = value
                             .get("reasoning_content")
@@ -1679,9 +1699,14 @@ impl OpenAiCompatibleProvider {
 
                     if let Some(id) = tool_call_id {
                         if assistant_tool_call_ids.contains(&id) {
+                            let content = Self::to_message_content(
+                                "tool",
+                                &content_text,
+                                allow_user_image_parts,
+                            );
                             native_messages.push(NativeMessage {
                                 role: "tool".to_string(),
-                                content: Some(MessageContent::Text(content_text)),
+                                content: Some(content),
                                 tool_call_id: Some(id),
                                 tool_calls: None,
                                 reasoning_content: None,
@@ -1701,10 +1726,11 @@ impl OpenAiCompatibleProvider {
 
                     native_messages.push(NativeMessage {
                         role: "user".to_string(),
-                        content: Some(MessageContent::Text(format!(
-                            "[Tool result]\n{}",
-                            content_text
-                        ))),
+                        content: Some(Self::to_message_content(
+                            "user",
+                            &format!("[Tool result]\n{}", content_text),
+                            allow_user_image_parts,
+                        )),
                         tool_call_id: None,
                         tool_calls: None,
                         reasoning_content: None,
@@ -1713,11 +1739,20 @@ impl OpenAiCompatibleProvider {
                 }
             }
 
+            // Strip residual <tool_call> tags from assistant messages that
+            // fell through to the generic path (empty tool_calls, failed parse).
+            let content_str = if message.role == "assistant" {
+                std::borrow::Cow::Owned(
+                    crate::agent::loop_::parsing::strip_unparsed_tool_call_tags(&message.content),
+                )
+            } else {
+                std::borrow::Cow::Borrowed(message.content.as_str())
+            };
             native_messages.push(NativeMessage {
                 role: message.role.clone(),
                 content: Some(Self::to_message_content(
                     &message.role,
-                    &message.content,
+                    &content_str,
                     allow_user_image_parts,
                 )),
                 tool_call_id: None,
@@ -2198,7 +2233,9 @@ impl Provider for OpenAiCompatibleProvider {
             tool_choice: if tools.is_empty() {
                 None
             } else {
-                Some("auto".to_string())
+                // Use configured tool_choice if set (e.g. "required" for Gemma 4),
+                // otherwise default to "auto".
+                crate::agent::loop_::tool_choice_override().or_else(|| Some("auto".to_string()))
             },
         };
 
@@ -2347,7 +2384,14 @@ impl Provider for OpenAiCompatibleProvider {
             temperature,
             max_tokens: self.effective_max_tokens(),
             stream: Some(false),
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice: if tools.is_some() {
+                request
+                    .tool_choice
+                    .clone()
+                    .or_else(|| Some("auto".to_string()))
+            } else {
+                None
+            },
             tools,
         };
 
@@ -2729,6 +2773,7 @@ mod tests {
             true,
             CompatibleApiMode::OpenAiResponses,
             Some(2048),
+            false,
         );
 
         assert!(provider.should_use_responses_mode());
@@ -3013,6 +3058,7 @@ mod tests {
             false,
             CompatibleApiMode::OpenAiResponses,
             None,
+            false,
         );
         let text = provider
             .chat_with_system(Some("system"), "hello", "test-model", 0.2)
@@ -3025,6 +3071,94 @@ mod tests {
             hits,
             vec!["responses".to_string(), "chat".to_string()],
             "must attempt responses first, then chat-completions fallback"
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    // Regression test for incidents/2026-04-10: the chat→responses fallback
+    // converts retryable chat errors into non-retryable 400s when /v1/responses
+    // returns 400 (e.g., LiteLLM v1.82.0 + hosted_vllm). With the fallback
+    // opted out, the chat error must bubble up unchanged and /v1/responses
+    // must never be called.
+    #[tokio::test]
+    async fn chat_mode_does_not_fallback_to_responses_when_disabled() {
+        #[derive(Clone, Default)]
+        struct TrapState {
+            hits: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn chat_endpoint(
+            State(state): State<TrapState>,
+            Json(_payload): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            state.hits.lock().await.push("chat".to_string());
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": { "message": "chat endpoint missing" }
+                })),
+            )
+        }
+
+        async fn responses_endpoint(
+            State(state): State<TrapState>,
+            Json(_payload): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            state.hits.lock().await.push("responses".to_string());
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": { "message": "hosted_vllm responses not supported" }
+                })),
+            )
+        }
+
+        let state = TrapState::default();
+        let app = Router::new()
+            .route("/chat/completions", post(chat_endpoint))
+            .route("/v1/responses", post(responses_endpoint))
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("server local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+
+        let provider = OpenAiCompatibleProvider::new_custom_with_mode(
+            "custom",
+            &format!("http://{}", addr),
+            Some("test-key"),
+            AuthStyle::Bearer,
+            false,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
+            false,
+        );
+
+        let err = provider
+            .chat_with_system(None, "hello", "test-model", 0.2)
+            .await
+            .expect_err("404 from chat must not trigger responses fallback");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("404"),
+            "error should propagate the chat 404, got: {msg}"
+        );
+        assert!(
+            !msg.contains("responses fallback"),
+            "error must not mention responses fallback, got: {msg}"
+        );
+
+        let hits = state.hits.lock().await.clone();
+        assert_eq!(
+            hits,
+            vec!["chat".to_string()],
+            "responses endpoint must not be called when fallback is disabled"
         );
 
         server.abort();
@@ -3090,6 +3224,7 @@ mod tests {
             false,
             CompatibleApiMode::OpenAiResponses,
             None,
+            false,
         );
         let err = provider
             .chat_with_system(None, "hello", "test-model", 0.2)
@@ -3177,6 +3312,7 @@ mod tests {
             false,
             CompatibleApiMode::OpenAiResponses,
             None,
+            false,
         );
         let messages = vec![ChatMessage::user("run a command")];
         let tools = vec![crate::tools::ToolSpec {
@@ -3193,6 +3329,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    tool_choice: None,
                 },
                 "test-model",
                 0.2,
@@ -4195,6 +4332,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    tool_choice: None,
                 },
                 "test-model",
                 0.7,
@@ -4362,6 +4500,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    tool_choice: None,
                 },
                 "test-model",
                 0.7,
@@ -4690,5 +4829,217 @@ mod tests {
             "reasoning_content should be present when Some"
         );
         assert!(json.contains("thinking..."));
+    }
+
+    #[test]
+    fn tool_message_with_image_marker_in_fallback_path_extracts_image() {
+        use crate::providers::ChatMessage;
+
+        // Tool result with [IMAGE:] marker falls through to generic handler
+        // because tool_call_id doesn't match any assistant tool_call
+        let tool_content = serde_json::json!({
+            "tool_call_id": "orphan_call_id",
+            "content": "Screenshot captured\n[IMAGE:data:image/jpeg;base64,/9j/4AAQ]"
+        });
+
+        let messages = vec![
+            ChatMessage::user("take a screenshot".to_string()),
+            ChatMessage::tool(tool_content.to_string()),
+        ];
+
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+
+        let has_raw_marker = native.iter().any(|msg| match &msg.content {
+            Some(MessageContent::Text(t)) => t.contains("[IMAGE:"),
+            Some(MessageContent::Parts(parts)) => parts.iter().any(|p| {
+                if let MessagePart::Text { text } = p {
+                    text.contains("[IMAGE:")
+                } else {
+                    false
+                }
+            }),
+            None => false,
+        });
+
+        assert!(
+            !has_raw_marker,
+            "image should be extracted as image_url part, not left as raw [IMAGE:] text"
+        );
+    }
+
+    #[test]
+    fn tool_message_with_unparseable_json_extracts_image() {
+        use crate::providers::ChatMessage;
+
+        let raw_content = "Screenshot result\n[IMAGE:data:image/jpeg;base64,/9j/4AAQ]";
+        let messages = vec![
+            ChatMessage::user("test".to_string()),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: raw_content.to_string(),
+            },
+        ];
+
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+
+        let has_raw_marker = native.iter().any(|msg| match &msg.content {
+            Some(MessageContent::Text(t)) => t.contains("[IMAGE:"),
+            _ => false,
+        });
+
+        assert!(
+            !has_raw_marker,
+            "image should be extracted even when tool content is not valid JSON"
+        );
+    }
+
+    // ── Regression: serialized wire format must contain image_url, not raw base64 ──
+
+    #[test]
+    fn tool_result_with_image_serializes_as_content_parts_on_wire() {
+        // Build tool messages exactly as the agent loop does:
+        // assistant with tool_calls, then tool with JSON-wrapped content
+        let input = vec![
+            ChatMessage::user("Take a screenshot".to_string()),
+            ChatMessage::assistant(
+                r#"{"content":"Taking screenshot now","tool_calls":[{"id":"call_ss","name":"image_info","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(
+                r#"{"tool_call_id":"call_ss","content":"File: test.png\nSize: 1000 bytes\n[IMAGE:data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ]"}"#,
+            ),
+        ];
+
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+
+        // Serialize to JSON — this is what goes on the wire to litellm
+        let wire_json = serde_json::to_string(&native).unwrap();
+
+        // The wire format MUST have image_url content parts
+        assert!(
+            wire_json.contains("image_url"),
+            "wire JSON should contain image_url content part, got: {}",
+            &wire_json[..wire_json.len().min(500)]
+        );
+
+        // The wire format must NOT have raw [IMAGE:] markers
+        assert!(
+            !wire_json.contains("[IMAGE:"),
+            "wire JSON should not contain raw [IMAGE:] marker"
+        );
+
+        // The wire format must NOT have raw base64 outside of a url field
+        // (it should be inside {"image_url":{"url":"data:image/..."}})
+        assert!(
+            wire_json.contains(r#""url":"data:image/jpeg;base64,"#),
+            "base64 data should be inside an image_url.url field"
+        );
+    }
+
+    #[test]
+    fn tool_result_with_image_in_orphan_path_serializes_as_content_parts() {
+        // Same test but for the orphan fallback path (tool_call_id doesn't match)
+        let input = vec![
+            ChatMessage::user("Screenshot".to_string()),
+            // No matching assistant tool_call — tool message is orphaned
+            ChatMessage::tool(
+                r#"{"tool_call_id":"orphan_id","content":"Screenshot\n[IMAGE:data:image/png;base64,iVBORw0KGgo]"}"#,
+            ),
+        ];
+
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+        let wire_json = serde_json::to_string(&native).unwrap();
+
+        assert!(
+            !wire_json.contains("[IMAGE:"),
+            "orphan path wire JSON should not contain raw [IMAGE:] marker"
+        );
+    }
+
+    // ── Property: no message with [IMAGE:] should leak raw markers to wire ──
+
+    #[test]
+    fn no_image_marker_leakage_across_all_roles() {
+        let image_content = "Result\n[IMAGE:data:image/jpeg;base64,/9j/4AAQ]";
+
+        // Test every role that might contain an [IMAGE:] marker
+        let test_cases: Vec<(&str, Vec<ChatMessage>)> = vec![
+            (
+                "user message",
+                vec![ChatMessage::user(image_content.to_string())],
+            ),
+            (
+                "tool message (JSON-wrapped, matched)",
+                vec![
+                    ChatMessage::assistant(
+                        r#"{"content":"","tool_calls":[{"id":"call_1","name":"test","arguments":"{}"}]}"#,
+                    ),
+                    ChatMessage::tool(
+                        &serde_json::json!({
+                            "tool_call_id": "call_1",
+                            "content": image_content
+                        })
+                        .to_string(),
+                    ),
+                ],
+            ),
+            (
+                "tool message (JSON-wrapped, orphan)",
+                vec![ChatMessage::tool(
+                    &serde_json::json!({
+                        "tool_call_id": "no_match",
+                        "content": image_content
+                    })
+                    .to_string(),
+                )],
+            ),
+            (
+                "tool message (raw string, not JSON)",
+                vec![ChatMessage {
+                    role: "tool".to_string(),
+                    content: image_content.to_string(),
+                }],
+            ),
+        ];
+
+        for (label, messages) in test_cases {
+            let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+            let wire_json = serde_json::to_string(&native).unwrap();
+
+            assert!(
+                !wire_json.contains("[IMAGE:"),
+                "image marker leaked in '{label}': {}",
+                &wire_json[..wire_json.len().min(200)]
+            );
+        }
+    }
+
+    #[test]
+    fn convert_messages_strips_tool_call_tags_from_assistant_content() {
+        use crate::providers::ChatMessage;
+
+        // Simulate: assistant message with malformed <tool_call> in content field
+        // (from a previous turn where the model emitted an empty tag)
+        let history_json = serde_json::json!({
+            "content": "Let me check.\n<tool_call>\n</tool_call>",
+            "tool_calls": []
+        });
+        let messages = vec![
+            ChatMessage::user("Do something".to_string()),
+            ChatMessage::assistant(history_json.to_string()),
+        ];
+
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+
+        // The assistant content should not contain raw <tool_call> tags
+        for msg in &native {
+            if msg.role == "assistant" {
+                if let Some(MessageContent::Text(content)) = &msg.content {
+                    assert!(
+                        !content.contains("<tool_call>"),
+                        "assistant content should be sanitized: {content}"
+                    );
+                }
+            }
+        }
     }
 }
