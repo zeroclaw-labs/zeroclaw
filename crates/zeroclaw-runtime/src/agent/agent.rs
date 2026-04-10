@@ -1099,6 +1099,7 @@ impl Agent {
 
             let mut streamed_text = String::new();
             let mut streamed_tool_calls: Vec<zeroclaw_providers::traits::ToolCall> = Vec::new();
+            let mut streamed_reasoning = String::new();
             let mut got_stream = false;
 
             while let Some(item) = stream.next().await {
@@ -1108,6 +1109,7 @@ impl Agent {
                             if let Some(reasoning) = chunk.reasoning
                                 && !reasoning.is_empty()
                             {
+                                streamed_reasoning.push_str(&reasoning);
                                 let _ = event_tx
                                     .send(TurnEvent::Thinking { delta: reasoning })
                                     .await;
@@ -1163,7 +1165,8 @@ impl Agent {
                     text: Some(streamed_text),
                     tool_calls: streamed_tool_calls,
                     usage: None,
-                    reasoning_content: None,
+                    reasoning_content: (!streamed_reasoning.is_empty())
+                        .then_some(streamed_reasoning),
                 }
             } else {
                 // Fall back to non-streaming chat
@@ -1364,6 +1367,7 @@ pub async fn run(
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use futures_util::{StreamExt, stream};
     use parking_lot::Mutex;
     use std::collections::HashMap;
 
@@ -1436,6 +1440,74 @@ mod tests {
                 });
             }
             Ok(guard.remove(0))
+        }
+    }
+
+    struct StreamingReasoningProvider {
+        stream_calls: Mutex<usize>,
+        seen_requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    #[async_trait]
+    impl Provider for StreamingReasoningProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.seen_requests.lock().push(request.messages.to_vec());
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            let mut stream_calls = self.stream_calls.lock();
+            let call_index = *stream_calls;
+            *stream_calls += 1;
+            drop(stream_calls);
+
+            if call_index == 0 {
+                stream::iter(vec![
+                    Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                        zeroclaw_providers::traits::StreamChunk::reasoning("thinking step"),
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::ToolCall(
+                        zeroclaw_providers::traits::ToolCall {
+                            id: "tc1".into(),
+                            name: "echo".into(),
+                            arguments: "{}".into(),
+                        },
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            } else {
+                stream::empty().boxed()
+            }
         }
     }
 
@@ -1550,6 +1622,51 @@ mod tests {
                 .iter()
                 .any(|msg| matches!(msg, ConversationMessage::ToolResults(_)))
         );
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_preserves_reasoning_content_for_tool_call_replay() {
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(StreamingReasoningProvider {
+            stream_calls: Mutex::new(0),
+            seen_requests: seen_requests.clone(),
+        });
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let response = agent.turn_streamed("hi", event_tx).await.unwrap();
+
+        assert_eq!(response, "done");
+
+        let seen_requests = seen_requests.lock();
+        assert_eq!(seen_requests.len(), 1);
+        let assistant_payload = seen_requests[0]
+            .iter()
+            .find(|msg| msg.role == "assistant")
+            .expect("assistant tool-call replay should be present");
+        let payload: serde_json::Value = serde_json::from_str(&assistant_payload.content)
+            .expect("assistant payload should be JSON");
+        assert_eq!(payload["reasoning_content"].as_str(), Some("thinking step"));
+        assert!(payload["tool_calls"].is_array());
     }
 
     #[tokio::test]
