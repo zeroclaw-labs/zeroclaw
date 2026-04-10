@@ -321,11 +321,27 @@ pub fn extract_account_id_from_jwt(token: &str) -> Option<String> {
         .ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
 
+    if let Some(value) = claims
+        .get("chatgpt_account_id")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Some(value.to_string());
+    }
+
+    if let Some(value) = claims
+        .get("https://api.openai.com/auth")
+        .and_then(|v| v.get("chatgpt_account_id"))
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Some(value.to_string());
+    }
+
     for key in [
         "account_id",
         "accountId",
         "acct",
-        "sub",
         "https://api.openai.com/account_id",
     ] {
         if let Some(value) = claims.get(key).and_then(|v| v.as_str()) {
@@ -434,5 +450,31 @@ mod tests {
 
         let account = extract_account_id_from_jwt(&token);
         assert_eq!(account.as_deref(), Some("acct_123"));
+    }
+
+    #[test]
+    fn extract_account_id_from_nested_chatgpt_claims() {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"55405405-c028-4b57-9563-93119bf910b7\"}}",
+        );
+        let token = format!("{header}.{payload}.sig");
+
+        let account = extract_account_id_from_jwt(&token);
+        assert_eq!(
+            account.as_deref(),
+            Some("55405405-c028-4b57-9563-93119bf910b7")
+        );
+    }
+
+    #[test]
+    fn extract_account_id_ignores_subject_only_tokens() {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode("{\"sub\":\"windowslive|3fd7089075182c1b\"}");
+        let token = format!("{header}.{payload}.sig");
+
+        let account = extract_account_id_from_jwt(&token);
+        assert_eq!(account, None);
     }
 }

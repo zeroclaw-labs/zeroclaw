@@ -326,6 +326,15 @@ fn nonempty_preserve(text: Option<&str>) -> Option<String> {
     })
 }
 
+fn resolve_account_id_for_request(
+    profile_account_id: Option<&str>,
+    access_token: Option<&str>,
+) -> Option<String> {
+    access_token
+        .and_then(extract_account_id_from_jwt)
+        .or_else(|| first_nonempty(profile_account_id))
+}
+
 fn extract_responses_text(response: &ResponsesResponse) -> Option<String> {
     if let Some(text) = first_nonempty(response.output_text.as_deref()) {
         return Some(text);
@@ -631,11 +640,12 @@ impl OpenAiCodexProvider {
             Err(err) => return Err(err),
         };
 
-        let account_id = profile.and_then(|profile| profile.account_id).or_else(|| {
-            oauth_access_token
-                .as_deref()
-                .and_then(extract_account_id_from_jwt)
-        });
+        let account_id = resolve_account_id_for_request(
+            profile
+                .as_ref()
+                .and_then(|profile| profile.account_id.as_deref()),
+            oauth_access_token.as_deref(),
+        );
         let access_token = if use_gateway_api_key_auth {
             oauth_access_token
         } else {
@@ -768,6 +778,7 @@ impl Provider for OpenAiCodexProvider {
 mod tests {
     use super::*;
     use crate::providers::test_util::{EnvGuard, env_lock};
+    use base64::Engine;
 
     #[test]
     fn extracts_output_text_first() {
@@ -952,6 +963,27 @@ mod tests {
             resolve_reasoning_effort("gpt-5-codex", None),
             "low".to_string()
         );
+    }
+
+    #[test]
+    fn request_account_id_prefers_token_over_stale_profile_value() {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"55405405-c028-4b57-9563-93119bf910b7\"}}",
+        );
+        let token = format!("{header}.{payload}.sig");
+
+        let resolved = resolve_account_id_for_request(Some("windowslive|stale"), Some(&token));
+        assert_eq!(
+            resolved.as_deref(),
+            Some("55405405-c028-4b57-9563-93119bf910b7")
+        );
+    }
+
+    #[test]
+    fn request_account_id_falls_back_to_profile_when_token_missing() {
+        let resolved = resolve_account_id_for_request(Some("acct_123"), None);
+        assert_eq!(resolved.as_deref(), Some("acct_123"));
     }
 
     #[test]
