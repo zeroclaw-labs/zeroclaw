@@ -39,9 +39,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
 # Include every workspace member: Cargo.lock is generated for the full workspace.
-# Previously we used sed to drop `crates/robot-kit`, which made the manifest disagree
-# with the lockfile and caused `cargo --locked` to fail (Cargo refused to rewrite the lock).
-COPY crates/robot-kit/ crates/robot-kit/
+# All workspace crates must be copied to satisfy dependencies (aardvark-sys, robot-kit, zeroclaw-macros).
+COPY crates/ crates/
 # Create dummy targets declared in Cargo.toml so manifest parsing succeeds.
 RUN mkdir -p src benches \
     && echo "fn main() {}" > src/main.rs \
