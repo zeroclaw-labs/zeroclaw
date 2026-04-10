@@ -9,7 +9,7 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, ErrorKind, Write};
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -207,16 +207,50 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     eprint!("   [Y]es / [N]o / [A]lways for {}: ", request.tool_name);
     let _ = io::stderr().flush();
 
-    let stdin = io::stdin();
-    let mut line = String::new();
-    if stdin.lock().read_line(&mut line).is_err() {
-        return ApprovalResponse::No;
+    #[cfg(unix)]
+    {
+        // Prefer the controlling terminal so approval prompts do not compete
+        // with any higher-level stdin reader that may already own the pipe/PTY.
+        if let Ok(tty) = std::fs::OpenOptions::new().read(true).open("/dev/tty") {
+            let mut reader = io::BufReader::new(tty);
+            if let Ok(response) = read_approval_response(&mut reader) {
+                return response;
+            }
+        }
     }
 
-    match line.trim().to_ascii_lowercase().as_str() {
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    read_approval_response(&mut reader).unwrap_or(ApprovalResponse::No)
+}
+
+fn read_approval_response<R: BufRead>(reader: &mut R) -> io::Result<ApprovalResponse> {
+    let mut line = String::new();
+    let bytes = reader.read_line(&mut line)?;
+    if bytes == 0 {
+        return Err(io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "no approval input received",
+        ));
+    }
+    Ok(parse_approval_response(&line))
+}
+
+fn parse_approval_response(input: &str) -> ApprovalResponse {
+    let normalized = input.trim().to_ascii_lowercase();
+    match normalized.as_str() {
         "y" | "yes" => ApprovalResponse::Yes,
+        "n" | "no" => ApprovalResponse::No,
         "a" | "always" => ApprovalResponse::Always,
-        _ => ApprovalResponse::No,
+        _ => match input
+            .chars()
+            .find(|c| c.is_ascii_alphabetic())
+            .map(|c| c.to_ascii_lowercase())
+        {
+            Some('y') => ApprovalResponse::Yes,
+            Some('a') => ApprovalResponse::Always,
+            _ => ApprovalResponse::No,
+        },
     }
 }
 
@@ -262,6 +296,7 @@ fn truncate_for_summary(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::AutonomyConfig;
+    use std::io::Cursor;
 
     fn supervised_config() -> AutonomyConfig {
         AutonomyConfig {
@@ -548,6 +583,31 @@ mod tests {
         assert_eq!(json, "\"always\"");
         let parsed: ApprovalResponse = serde_json::from_str("\"no\"").unwrap();
         assert_eq!(parsed, ApprovalResponse::No);
+    }
+
+    #[test]
+    fn parse_approval_response_accepts_explicit_choices() {
+        assert_eq!(parse_approval_response("Y"), ApprovalResponse::Yes);
+        assert_eq!(parse_approval_response("yes"), ApprovalResponse::Yes);
+        assert_eq!(parse_approval_response("N"), ApprovalResponse::No);
+        assert_eq!(parse_approval_response("always"), ApprovalResponse::Always);
+    }
+
+    #[test]
+    fn parse_approval_response_accepts_wrapped_choice_tokens() {
+        assert_eq!(parse_approval_response("[Y]"), ApprovalResponse::Yes);
+        assert_eq!(parse_approval_response("(a)"), ApprovalResponse::Always);
+        assert_eq!(
+            parse_approval_response("\u{1b}[200~A\u{1b}[201~"),
+            ApprovalResponse::Always
+        );
+    }
+
+    #[test]
+    fn read_approval_response_parses_single_letter_lines() {
+        let mut input = Cursor::new(b"A\n");
+        let parsed = read_approval_response(&mut input).unwrap();
+        assert_eq!(parsed, ApprovalResponse::Always);
     }
 
     // ── ApprovalRequest ──────────────────────────────────────
