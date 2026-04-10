@@ -86,6 +86,7 @@ async fn provider_vision_support() -> Result<()> {
     let request = ChatRequest {
         messages: &messages,
         tools: None,
+        tool_choice: None,
     };
 
     // Send request to provider
@@ -154,6 +155,7 @@ async fn openai_codex_second_vision_support() -> Result<()> {
         reasoning_enabled: None,
         reasoning_level: None,
         custom_provider_api_mode: None,
+        custom_provider_supports_responses_fallback: None,
         max_tokens_override: None,
         model_support_vision: None,
     };
@@ -213,6 +215,7 @@ async fn openai_codex_second_vision_support() -> Result<()> {
     let request = ChatRequest {
         messages: &messages,
         tools: None,
+        tool_choice: None,
     };
 
     // Send request to provider

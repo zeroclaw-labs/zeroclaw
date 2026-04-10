@@ -209,6 +209,12 @@ impl OpenAiCompatibleProvider {
     }
 
     /// Constructor used by `custom:` providers to choose explicit protocol mode.
+    ///
+    /// `supports_responses_fallback` is opt-in: the chat→responses fallback on
+    /// `/v1/chat/completions` transport errors and 404s converts retryable
+    /// transport failures into non-retryable 400s against LiteLLM/hosted_vllm
+    /// backends. Leave it `false` unless the target backend is known to need
+    /// it (see incidents/2026-04-10 in the scrapyard wiki).
     pub fn new_custom_with_mode(
         name: &str,
         base_url: &str,
@@ -217,6 +223,7 @@ impl OpenAiCompatibleProvider {
         supports_vision: bool,
         api_mode: CompatibleApiMode,
         max_tokens_override: Option<u32>,
+        supports_responses_fallback: bool,
     ) -> Self {
         Self::new_with_options(
             name,
@@ -224,7 +231,7 @@ impl OpenAiCompatibleProvider {
             credential,
             auth_style,
             supports_vision,
-            true,
+            supports_responses_fallback,
             None,
             false,
             api_mode,
@@ -2768,6 +2775,7 @@ mod tests {
             true,
             CompatibleApiMode::OpenAiResponses,
             Some(2048),
+            false,
         );
 
         assert!(provider.should_use_responses_mode());
@@ -3052,6 +3060,7 @@ mod tests {
             false,
             CompatibleApiMode::OpenAiResponses,
             None,
+            false,
         );
         let text = provider
             .chat_with_system(Some("system"), "hello", "test-model", 0.2)
@@ -3064,6 +3073,94 @@ mod tests {
             hits,
             vec!["responses".to_string(), "chat".to_string()],
             "must attempt responses first, then chat-completions fallback"
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    // Regression test for incidents/2026-04-10: the chat→responses fallback
+    // converts retryable chat errors into non-retryable 400s when /v1/responses
+    // returns 400 (e.g., LiteLLM v1.82.0 + hosted_vllm). With the fallback
+    // opted out, the chat error must bubble up unchanged and /v1/responses
+    // must never be called.
+    #[tokio::test]
+    async fn chat_mode_does_not_fallback_to_responses_when_disabled() {
+        #[derive(Clone, Default)]
+        struct TrapState {
+            hits: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn chat_endpoint(
+            State(state): State<TrapState>,
+            Json(_payload): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            state.hits.lock().await.push("chat".to_string());
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": { "message": "chat endpoint missing" }
+                })),
+            )
+        }
+
+        async fn responses_endpoint(
+            State(state): State<TrapState>,
+            Json(_payload): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            state.hits.lock().await.push("responses".to_string());
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": { "message": "hosted_vllm responses not supported" }
+                })),
+            )
+        }
+
+        let state = TrapState::default();
+        let app = Router::new()
+            .route("/chat/completions", post(chat_endpoint))
+            .route("/v1/responses", post(responses_endpoint))
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("server local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+
+        let provider = OpenAiCompatibleProvider::new_custom_with_mode(
+            "custom",
+            &format!("http://{}", addr),
+            Some("test-key"),
+            AuthStyle::Bearer,
+            false,
+            CompatibleApiMode::OpenAiChatCompletions,
+            None,
+            false,
+        );
+
+        let err = provider
+            .chat_with_system(None, "hello", "test-model", 0.2)
+            .await
+            .expect_err("404 from chat must not trigger responses fallback");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("404"),
+            "error should propagate the chat 404, got: {msg}"
+        );
+        assert!(
+            !msg.contains("responses fallback"),
+            "error must not mention responses fallback, got: {msg}"
+        );
+
+        let hits = state.hits.lock().await.clone();
+        assert_eq!(
+            hits,
+            vec!["chat".to_string()],
+            "responses endpoint must not be called when fallback is disabled"
         );
 
         server.abort();
@@ -3129,6 +3226,7 @@ mod tests {
             false,
             CompatibleApiMode::OpenAiResponses,
             None,
+            false,
         );
         let err = provider
             .chat_with_system(None, "hello", "test-model", 0.2)
@@ -3216,6 +3314,7 @@ mod tests {
             false,
             CompatibleApiMode::OpenAiResponses,
             None,
+            false,
         );
         let messages = vec![ChatMessage::user("run a command")];
         let tools = vec![crate::tools::ToolSpec {

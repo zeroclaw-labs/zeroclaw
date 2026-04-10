@@ -742,6 +742,11 @@ pub struct ProviderRuntimeOptions {
     pub reasoning_enabled: Option<bool>,
     pub reasoning_level: Option<String>,
     pub custom_provider_api_mode: Option<CompatibleApiMode>,
+    /// Opt-in chat→responses fallback for `custom:` providers. Defaults to
+    /// off when `None`. Disabled-by-default because the fallback converts
+    /// reqwest transport errors on `/v1/chat/completions` into non-retryable
+    /// 400s against LiteLLM/hosted_vllm backends (incidents/2026-04-10).
+    pub custom_provider_supports_responses_fallback: Option<bool>,
     pub max_tokens_override: Option<u32>,
     pub model_support_vision: Option<bool>,
 }
@@ -757,6 +762,7 @@ impl Default for ProviderRuntimeOptions {
             reasoning_enabled: None,
             reasoning_level: None,
             custom_provider_api_mode: None,
+            custom_provider_supports_responses_fallback: None,
             max_tokens_override: None,
             model_support_vision: None,
         }
@@ -1488,6 +1494,9 @@ fn create_provider_with_url_and_options(
             let api_mode = options
                 .custom_provider_api_mode
                 .unwrap_or(CompatibleApiMode::OpenAiChatCompletions);
+            let supports_responses_fallback = options
+                .custom_provider_supports_responses_fallback
+                .unwrap_or(false);
             Ok(Box::new(OpenAiCompatibleProvider::new_custom_with_mode(
                 "Custom",
                 &base_url,
@@ -1496,6 +1505,7 @@ fn create_provider_with_url_and_options(
                 true,
                 api_mode,
                 options.max_tokens_override,
+                supports_responses_fallback,
             )))
         }
 

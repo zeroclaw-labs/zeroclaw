@@ -209,6 +209,13 @@ pub struct Config {
     /// Optional API protocol mode for `custom:` providers.
     #[serde(default)]
     pub provider_api: Option<ProviderApiMode>,
+    /// Opt-in switch for the chat→responses fallback on `custom:` providers.
+    /// Default: off. Enable only when the backend's `/v1/chat/completions`
+    /// endpoint is known-flaky and `/v1/responses` is known-stable. Against
+    /// LiteLLM/hosted_vllm backends this fallback converts transient transport
+    /// errors into non-retryable 400s (see incidents/2026-04-10).
+    #[serde(default)]
+    pub supports_responses_fallback: Option<bool>,
     /// Default model routed through the selected provider (e.g. `"anthropic/claude-sonnet-4-6"`).
     #[serde(alias = "model")]
     pub default_model: Option<String>,
@@ -585,6 +592,10 @@ impl std::fmt::Debug for Config {
             .field("api_url_configured", &self.api_url.is_some())
             .field("default_provider", &self.default_provider)
             .field("provider_api", &self.provider_api)
+            .field(
+                "supports_responses_fallback",
+                &self.supports_responses_fallback,
+            )
             .field("default_model", &self.default_model)
             .field("model_providers", &model_provider_ids)
             .field("default_temperature", &self.default_temperature)
@@ -6803,6 +6814,7 @@ impl Default for Config {
             api_url: None,
             default_provider: Some(DEFAULT_PROVIDER_NAME.to_string()),
             provider_api: None,
+            supports_responses_fallback: None,
             default_model: Some(DEFAULT_MODEL_NAME.to_string()),
             model_providers: HashMap::new(),
             provider: ProviderConfig::default(),
@@ -8839,6 +8851,17 @@ impl Config {
             );
         }
 
+        if self.supports_responses_fallback.is_some()
+            && !self
+                .default_provider
+                .as_deref()
+                .is_some_and(|provider| provider.starts_with("custom:"))
+        {
+            anyhow::bail!(
+                "supports_responses_fallback is only valid when default_provider uses the custom:<url> format"
+            );
+        }
+
         // Embedding routes
         for (i, route) in self.embedding_routes.iter().enumerate() {
             if route.hint.trim().is_empty() {
@@ -10455,6 +10478,7 @@ ws_url = "ws://127.0.0.1:3002"
             api_url: None,
             default_provider: Some("openrouter".into()),
             provider_api: None,
+            supports_responses_fallback: None,
             default_model: Some("gpt-4o".into()),
             model_providers: HashMap::new(),
             provider: ProviderConfig::default(),
@@ -10909,6 +10933,7 @@ tool_dispatcher = "xml"
             api_url: None,
             default_provider: Some("openrouter".into()),
             provider_api: None,
+            supports_responses_fallback: None,
             default_model: Some("test-model".into()),
             model_providers: HashMap::new(),
             provider: ProviderConfig::default(),
@@ -12613,6 +12638,20 @@ requires_openai_auth = true
             .expect_err("provider_api should be rejected for non-custom provider");
         assert!(err.to_string().contains(
             "provider_api is only valid when default_provider uses the custom:<url> format"
+        ));
+    }
+
+    #[test]
+    async fn supports_responses_fallback_requires_custom_default_provider() {
+        let mut config = Config::default();
+        config.default_provider = Some("openai".to_string());
+        config.supports_responses_fallback = Some(false);
+
+        let err = config.validate().expect_err(
+            "supports_responses_fallback should be rejected for non-custom provider",
+        );
+        assert!(err.to_string().contains(
+            "supports_responses_fallback is only valid when default_provider uses the custom:<url> format"
         ));
     }
 

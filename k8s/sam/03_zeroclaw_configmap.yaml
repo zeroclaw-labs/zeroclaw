@@ -9,6 +9,10 @@ data:
       #   API_KEY                          — LiteLLM proxy API key
       #   ZEROCLAW_GATEWAY_PAIRED_TOKENS   — comma-separated gateway auth tokens
       default_provider = "custom:https://assistant-api.coffee-anon.com/v1"
+      # LiteLLM v1.82.0 has no working /v1/responses passthrough for hosted_vllm;
+      # the chat→responses fallback converts transport errors into non-retryable
+      # 400s (scrapyard-wiki/incidents/2026-04-10). Keep explicitly disabled.
+      supports_responses_fallback = false
       default_model = "litellm-sam"
       default_temperature = 0.9
       model_support_vision = true
