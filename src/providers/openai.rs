@@ -393,7 +393,14 @@ impl Provider for OpenAiProvider {
             messages: Self::convert_messages(request.messages),
             temperature,
             max_tokens: self.max_tokens_override,
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice: if tools.is_some() {
+                request
+                    .tool_choice
+                    .clone()
+                    .or_else(|| Some("auto".to_string()))
+            } else {
+                None
+            },
             tools,
         };
 
