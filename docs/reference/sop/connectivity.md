@@ -122,6 +122,28 @@ expression = "0 0 8 * * *"
 
 Cron expressions support 5, 6, or 7 fields.
 
+## 4.1 Proposed Enhancement: Pre-Hook Skip Gates
+
+A useful future enhancement for cron-triggered SOPs would be a lightweight **pre-hook / precondition gate** before the heavier agent/tool path begins.
+
+Potential behavior:
+- run a cheap local command/script before starting the triggered run
+- exit `0` => proceed
+- exit `10` => skip cleanly (not a failure)
+- any other nonzero => mark pre-hook failure
+
+Why this helps:
+- avoids wasted agent runs when prerequisites are objectively missing
+- turns "nothing to do" into a clean skip instead of a noisy failure
+- fits well for inbox polling, device/API availability checks, dedupe, or quiet-hours gates
+
+Example use cases:
+- skip daily triage when the upstream mailbox/device/API is offline
+- skip when there are no unread items or changed files
+- cheaply dedupe or filter low-value cron/event triggers before invoking agent-heavy logic
+
+See issue `#5607` for the feature request and rationale.
+
 ## 5. Security Defaults
 
 | Feature | Mechanism |
