@@ -70,6 +70,9 @@ pub struct ApprovalManager {
     session_allowlist: Mutex<HashSet<String>>,
     /// Audit trail of approval decisions.
     audit_log: Mutex<Vec<ApprovalLogEntry>>,
+    /// Pending tool name awaiting user approval (for non-interactive channels).
+    /// When set, the next matching tool call will be auto-approved once.
+    pending_approval: Mutex<Option<String>>,
 }
 
 impl ApprovalManager {
@@ -82,6 +85,7 @@ impl ApprovalManager {
             non_interactive: false,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            pending_approval: Mutex::new(None),
         }
     }
 
@@ -98,6 +102,7 @@ impl ApprovalManager {
             non_interactive: true,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            pending_approval: Mutex::new(None),
         }
     }
 
@@ -145,6 +150,18 @@ impl ApprovalManager {
         if allowlist.contains(tool_name) {
             return false;
         }
+        drop(allowlist); // Release lock before checking pending
+
+        // Check for one-time pending approval (for non-interactive channels).
+        // If user has explicitly approved this tool via reply (e.g., "Run it"),
+        // allow it to proceed this one time.
+        let mut pending = self.pending_approval.lock();
+        if let Some(ref pending_tool) = *pending {
+            if pending_tool == tool_name {
+                *pending = None; // Consume the one-time approval
+                return false;
+            }
+        }
 
         // Default: supervised mode requires approval.
         true
@@ -185,6 +202,40 @@ impl ApprovalManager {
     /// Get the current session allowlist.
     pub fn session_allowlist(&self) -> HashSet<String> {
         self.session_allowlist.lock().clone()
+    }
+
+    /// Set a tool as pending approval (for non-interactive channels).
+    ///
+    /// When the tool is next requested and matches this pending approval,
+    /// it will be allowed to proceed if `approve_pending_tool` is called
+    /// with the same tool name before the next tool execution attempt.
+    pub fn set_pending_approval(&self, tool_name: &str) {
+        let mut pending = self.pending_approval.lock();
+        *pending = Some(tool_name.to_string());
+    }
+
+    /// Approve a pending tool by name (for non-interactive channels).
+    ///
+    /// This is called when the user explicitly approves a tool via channel
+    /// reply (e.g., replying "Run it" in Telegram). The next execution of
+    /// this tool will be allowed to proceed.
+    ///
+    /// Returns `true` if a matching pending tool was found and approved.
+    pub fn approve_pending_tool(&self, tool_name: &str) -> bool {
+        let pending = self.pending_approval.lock();
+        if let Some(ref pending_tool) = *pending {
+            if pending_tool == tool_name {
+                // Keep it set so needs_approval can consume it
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Clear any pending tool approval.
+    pub fn clear_pending_approval(&self) {
+        let mut pending = self.pending_approval.lock();
+        *pending = None;
     }
 
     /// Prompt the user on the CLI and return their decision.
@@ -607,5 +658,84 @@ mod tests {
             mgr.needs_approval("weather"),
             "always_ask must override auto_approve"
         );
+    }
+
+    // ── Pending approval for non-interactive channels (#5591) ──
+
+    #[test]
+    fn pending_approval_allows_one_time_execution() {
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
+        let tool_name = "git_operations";
+
+        // Initially needs approval
+        assert!(mgr.needs_approval(tool_name));
+
+        // Set pending approval
+        mgr.set_pending_approval(tool_name);
+
+        // Now should not need approval (one-time)
+        assert!(!mgr.needs_approval(tool_name));
+
+        // After consumption, should need approval again
+        assert!(mgr.needs_approval(tool_name));
+    }
+
+    #[test]
+    fn pending_approval_only_affects_matching_tool() {
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
+
+        // Set pending approval for git_operations
+        mgr.set_pending_approval("git_operations");
+
+        // git_operations should be allowed
+        assert!(!mgr.needs_approval("git_operations"));
+
+        // Other tools should still need approval
+        assert!(mgr.needs_approval("file_write"));
+        assert!(mgr.needs_approval("shell"));
+    }
+
+    #[test]
+    fn approve_pending_tool_works_correctly() {
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
+        let tool_name = "git_operations";
+
+        // Set pending approval
+        mgr.set_pending_approval(tool_name);
+
+        // Approve the pending tool
+        assert!(mgr.approve_pending_tool(tool_name));
+
+        // Non-matching tool should not be approved
+        assert!(!mgr.approve_pending_tool("shell"));
+    }
+
+    #[test]
+    fn clear_pending_approval_removes_pending() {
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
+        let tool_name = "git_operations";
+
+        // Set and verify pending approval works
+        mgr.set_pending_approval(tool_name);
+        assert!(!mgr.needs_approval(tool_name));
+
+        // Clear pending approval
+        mgr.clear_pending_approval();
+
+        // Should need approval again
+        assert!(mgr.needs_approval(tool_name));
+    }
+
+    #[test]
+    fn pending_approval_does_not_affect_always_ask_tools() {
+        let mut config = supervised_config();
+        config.always_ask = vec!["shell".into()];
+        let mgr = ApprovalManager::for_non_interactive(&config);
+
+        // Set pending approval for shell (which is in always_ask)
+        mgr.set_pending_approval("shell");
+
+        // Should still need approval because always_ask overrides
+        assert!(mgr.needs_approval("shell"));
     }
 }

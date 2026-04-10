@@ -3012,8 +3012,12 @@ pub(crate) async fn run_tool_call_loop(
 
                     // Interactive CLI: prompt the operator.
                     // Non-interactive (channels): auto-deny since no operator
-                    // is present to approve.
+                    // is present to approve, but set pending approval so the
+                    // user can approve via reply (e.g., "Run it" in Telegram).
                     let decision = if mgr.is_non_interactive() {
+                        // Set pending approval for this tool so the user can
+                        // approve it via channel reply on the next turn.
+                        mgr.set_pending_approval(&tool_name);
                         ApprovalResponse::No
                     } else {
                         mgr.prompt_cli(&request)
