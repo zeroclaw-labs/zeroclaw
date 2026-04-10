@@ -85,6 +85,11 @@ pub trait SessionBackend: Send + Sync {
         Ok(false)
     }
 
+    /// Clear all messages for a session while keeping the session entry. Returns `true` if the session existed.
+    fn clear_session_messages(&self, _session_key: &str) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
     /// Set or update the human-readable name for a session.
     fn set_session_name(&self, _session_key: &str, _name: &str) -> std::io::Result<()> {
         Ok(())
