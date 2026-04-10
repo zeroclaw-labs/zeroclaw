@@ -12,6 +12,7 @@ ZeroClaw는 현재 애플리케이션 레이어 보안(allowlist, 경로 차단,
 ## 제안된 솔루션
 
 ### 옵션 1: Firejail 통합 (Linux 권장)
+
 Firejail은 최소한의 오버헤드로 사용자 공간 sandbox를 제공합니다.
 
 ```rust
@@ -74,6 +75,7 @@ sandbox_backend = "firejail"  # 또는 "none", "bubblewrap", "docker"
 ---
 
 ### 옵션 2: Bubblewrap (이식 가능, root 불필요)
+
 Bubblewrap은 사용자 네임스페이스를 사용하여 컨테이너를 생성합니다.
 
 ```bash
@@ -94,6 +96,7 @@ bwrap --ro-bind /usr /usr \
 ---
 
 ### 옵션 3: Docker-in-Docker (무겁지만 완전한 격리)
+
 에이전트 도구를 임시 컨테이너 내에서 실행합니다.
 
 ```rust
@@ -124,6 +127,7 @@ impl DockerSandbox {
 ---
 
 ### 옵션 4: Landlock (Linux 커널 LSM, Rust 네이티브)
+
 Landlock은 컨테이너 없이 파일 시스템 접근 제어를 제공합니다.
 
 ```rust

@@ -16,6 +16,7 @@ cargo test telegram --lib
 ## 생성된 항목
 
 ### 1. **test_telegram_integration.sh** (메인 테스트 스위트)
+
    - 모든 수정사항을 커버하는 **20개 이상의 자동화 테스트**
    - **6개 테스트 단계**: 코드 품질, 빌드, 설정, 헬스, 기능, 수동
    - 통과/실패 표시기가 있는 **컬러 출력**
@@ -26,6 +27,7 @@ cargo test telegram --lib
    ```
 
 ### 2. **quick_test.sh** (빠른 검증)
+
    - 빠른 피드백을 위한 **4개 필수 테스트**
    - **10초 미만** 실행 시간
    - **pre-commit** 검사에 적합
@@ -35,6 +37,7 @@ cargo test telegram --lib
    ```
 
 ### 3. **generate_test_messages.py** (테스트 도우미)
+
    - 다양한 길이의 테스트 메시지 생성
    - 메시지 분할 기능 테스트
    - 8가지 메시지 유형
@@ -48,6 +51,7 @@ cargo test telegram --lib
    ```
 
 ### 4. **TESTING_TELEGRAM.md** (완전 가이드)
+
    - 포괄적인 테스트 문서
    - 문제 해결 가이드
    - 성능 벤치마크
@@ -172,6 +176,7 @@ python3 tests/telegram/generate_test_messages.py word
 모든 테스트를 실행한 후 확인합니다:
 
 ### 자동화 테스트
+
 - [ ] 모든 20개 자동화 테스트 통과
 - [ ] 빌드 성공적으로 완료
 - [ ] 바이너리 크기 <10MB
@@ -179,6 +184,7 @@ python3 tests/telegram/generate_test_messages.py word
 - [ ] clippy 경고 없음
 
 ### 수동 테스트
+
 - [ ] 봇이 기본 메시지에 응답
 - [ ] 긴 메시지가 올바르게 분할됨
 - [ ] 계속 표시기가 나타남
@@ -187,6 +193,7 @@ python3 tests/telegram/generate_test_messages.py word
 - [ ] 로그에 오류 없음
 
 ### 성능
+
 - [ ] 응답 시간 <3초
 - [ ] 메모리 사용량 <10MB
 - [ ] 메시지 손실 없음
@@ -299,5 +306,5 @@ RUST_LOG=debug zeroclaw channel start
 ## 지원
 
 - 이슈: https://github.com/zeroclaw-labs/zeroclaw/issues
-- 문서: [testing-telegram.md](../../tests/telegram/testing-telegram.md)
+- 문서: [testing-telegram.md](../../../../tests/manual/telegram/testing-telegram.md)
 - 도움말: `zeroclaw --help`

@@ -6,6 +6,7 @@
 > 현재 런타임 동작에 대해서는 [config-reference.md](../reference/api/config-reference.md), [operations-runbook.md](../ops/operations-runbook.md), [troubleshooting.md](../ops/troubleshooting.md)를 참고하십시오.
 
 ## 문제
+
 ZeroClaw는 작업을 로깅하지만, 다음에 대한 변조 방지 감사 추적이 부족합니다:
 - 누가 어떤 명령어를 실행했는지
 - 언제, 어떤 채널에서 실행했는지

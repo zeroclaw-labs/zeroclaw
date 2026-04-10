@@ -212,4 +212,4 @@ agent-browser get text body
 
 - [agent-browser 문서](https://github.com/vercel-labs/agent-browser)
 - [ZeroClaw 설정 레퍼런스](./config-reference.md)
-- [Skills 문서](../skills/)
+

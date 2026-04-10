@@ -6,6 +6,7 @@
 > 현재 런타임 동작에 대해서는 [config-reference.md](../reference/api/config-reference.md), [operations-runbook.md](../ops/operations-runbook.md), [troubleshooting.md](../ops/troubleshooting.md)를 참고하십시오.
 
 ## 핵심 원칙
+
 > **"보안 기능은 에어백과 같아야 합니다 — 존재하고, 보호하며, 필요할 때까지 보이지 않아야 합니다."**
 
 ## 설계: 자동 감지 (무음 모드)
@@ -265,6 +266,7 @@ impl Default for SandboxBackend {
 ## 사용자 경험 비교
 
 ### 이전 (현재)
+
 ```bash
 $ zeroclaw onboard
 [1/9] Workspace Setup...
@@ -275,6 +277,7 @@ $ zeroclaw onboard
 ```
 
 ### 이후 (마찰 없는 보안 적용)
+
 ```bash
 $ zeroclaw onboard
 [1/9] Workspace Setup...

@@ -6,6 +6,7 @@
 > 현재 런타임 동작에 대해서는 [config-reference.md](../reference/api/config-reference.md), [operations-runbook.md](../ops/operations-runbook.md), [troubleshooting.md](../ops/troubleshooting.md)를 참고하십시오.
 
 ## 핵심 질문: 보안 기능이 다음을 저해하는가...
+
 1. ❓ 빠른 크로스 컴파일 빌드?
 2. ❓ 플러그 가능한 아키텍처 (모든 것을 교체 가능)?
 3. ❓ 하드웨어 무관성 (ARM, x86, RISC-V)?
@@ -295,6 +296,7 @@ backend = "docker"
 ## 6. 종속성 영향: 최소한의 새 종속성
 
 ### 현재 종속성 (참고용)
+
 ```
 reqwest, tokio, serde, anyhow, uuid, chrono, rusqlite,
 axum, tracing, opentelemetry, ...

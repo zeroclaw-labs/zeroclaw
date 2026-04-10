@@ -89,12 +89,15 @@ cargo build --release --target aarch64-linux-android
 ## 문제 해결
 
 ### "Permission denied"
+
 ```bash
 chmod +x zeroclaw
 ```
 
 ### "not found" 또는 링커 오류
+
 기기에 맞는 올바른 아키텍처를 다운로드했는지 확인합니다.
 
 ### 구형 Android (4.x)
+
 API 레벨 16+의 `armv7-linux-androideabi` 빌드를 사용합니다.

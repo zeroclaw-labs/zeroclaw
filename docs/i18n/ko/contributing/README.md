@@ -4,7 +4,7 @@
 
 ## 핵심 정책
 
-- 기여 가이드: [../../CONTRIBUTING.md](../../CONTRIBUTING.md)
+- 기여 가이드: [CONTRIBUTING.md](../../../../CONTRIBUTING.md)
 - PR 워크플로우 규칙: [./pr-workflow.md](./pr-workflow.md)
 - 리뷰어 플레이북: [./reviewer-playbook.md](./reviewer-playbook.md)
 - CI 맵 및 소유권: [./ci-map.md](./ci-map.md)

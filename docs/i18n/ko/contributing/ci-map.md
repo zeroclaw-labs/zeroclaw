@@ -2,7 +2,7 @@
 
 이 문서는 각 GitHub 워크플로우가 무엇을 하는지, 언제 실행되는지, merge를 차단해야 하는지 설명합니다.
 
-이벤트별 전달 동작(PR, merge, push, 릴리스)에 대해서는 [`.github/workflows/master-branch-flow.md`](../../.github/workflows/master-branch-flow.md)를 참조합니다.
+이벤트별 전달 동작(PR, merge, push, 릴리스)에 대해서는 [`.github/workflows/master-branch-flow.md`](../../../../.github/workflows/master-branch-flow.md)를 참조합니다.
 
 ## Merge 차단 vs 선택적
 
