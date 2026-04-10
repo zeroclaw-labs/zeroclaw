@@ -107,6 +107,23 @@ spec:
                 sleep 1
               done
               [ -S /tmp/agent-browser/default.sock ] || echo "Warning: daemon socket not ready, starting zeroclaw anyway"
+              # Warm up Chromium before accepting agent work. The daemon socket
+              # appearing does not mean Chromium can actually launch — the first
+              # Playwright launch sometimes crashes silently, causing every
+              # subsequent browser tool call to time out until the CLI restarts
+              # the daemon. Running a warm-up page here ensures Chromium is
+              # stable before zeroclaw starts serving requests.
+              if [ -S /tmp/agent-browser/default.sock ]; then
+                echo "Warming up Chromium..."
+                for _i in 1 2 3; do
+                  if agent-browser open "https://example.com" --json 2>/dev/null | grep -q '"success":true'; then
+                    echo "Chromium warm-up complete."
+                    break
+                  fi
+                  echo "Chromium warm-up attempt $_i failed, retrying..."
+                  sleep 3
+                done
+              fi
               # Wait for Serena MCP sidecar to be ready.
               echo "Waiting for Serena MCP server on port 9121..."
               for _i in $(seq 1 60); do
