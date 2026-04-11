@@ -598,9 +598,33 @@ pub async fn run(
     temperature: f64,
     peripheral_overrides: Vec<String>,
 ) -> Result<()> {
+    run_with_observer(
+        config,
+        message,
+        provider_override,
+        model_override,
+        temperature,
+        peripheral_overrides,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+pub async fn run_with_observer(
+    config: Config,
+    message: Option<String>,
+    provider_override: Option<String>,
+    model_override: Option<String>,
+    temperature: f64,
+    peripheral_overrides: Vec<String>,
+    observer_override: Option<Arc<dyn Observer>>,
+) -> Result<()> {
     // ── Wire up agnostic subsystems ──────────────────────────────
-    let base_observer = observability::create_observer(&config.observability);
-    let observer: Arc<dyn Observer> = Arc::from(base_observer);
+    let observer: Arc<dyn Observer> = observer_override.unwrap_or_else(|| {
+        let base_observer = observability::create_observer(&config.observability);
+        Arc::from(base_observer)
+    });
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(
