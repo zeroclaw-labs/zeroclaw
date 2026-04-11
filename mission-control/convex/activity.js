@@ -6,7 +6,8 @@ const entityType = v.union(
   v.literal("goal"),
   v.literal("progress"),
   v.literal("artifact"),
-  v.literal("instruction")
+  v.literal("instruction"),
+  v.literal("deliverable")
 );
 
 const activityArgs = {

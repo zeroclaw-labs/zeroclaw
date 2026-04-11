@@ -122,3 +122,21 @@ button {
 .activity-item:hover {
   border-color: #3b6cf5;
 }
+
+
+details {
+  border: 1px solid #21314d;
+  border-radius: 10px;
+  padding: 8px;
+  background: #0d1525;
+}
+
+summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.inline-link {
+  margin-left: 8px;
+  color: #8cb3ff;
+}

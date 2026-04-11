@@ -31,15 +31,30 @@ export async function GET(_request, { params }) {
   const { runId } = params;
   const root = resultsRoot();
 
+  const resultFile = `${runId}.json`;
+  const statusFile = `${runId}.status.json`;
+  const eventsFile = `${runId}.events.jsonl`;
+
   const [state, result, events] = await Promise.all([
-    maybeReadJson(path.join(root, `${runId}.status.json`)),
-    maybeReadJson(path.join(root, `${runId}.json`)),
-    readEvents(path.join(root, `${runId}.events.jsonl`))
+    maybeReadJson(path.join(root, statusFile)),
+    maybeReadJson(path.join(root, resultFile)),
+    readEvents(path.join(root, eventsFile))
   ]);
 
   if (!state && !result) {
     return Response.json({ error: "run not found" }, { status: 404 });
   }
 
-  return Response.json({ state, result, events });
+  return Response.json({
+    state,
+    result,
+    events,
+    outputLocation: {
+      resultsRoot: root,
+      resultFile,
+      statusFile,
+      eventsFile,
+      artifactsDir: state?.workspace_path || undefined
+    }
+  });
 }
