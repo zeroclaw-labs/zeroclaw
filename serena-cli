@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+
+exec /opt/sam-tools/home/.local/bin/serena "$@"
