@@ -44,7 +44,9 @@ npm run dev
 
 ```bash
 npm run lint
-npm test
+npm run test
 ```
+
+`npm run test` executes both `tests/*.test.js` and `lib/*.test.js`.
 
 Set `NEXT_PUBLIC_CONVEX_URL` if your Convex URL differs from the default local URL.
