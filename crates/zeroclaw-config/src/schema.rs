@@ -7762,6 +7762,35 @@ impl ChannelConfig for LarkConfig {
     }
 }
 
+/// DM (1:1 chat) access policy for the LINE channel.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum LineDmPolicy {
+    /// Respond to every DM regardless of who sent it.
+    Open,
+    /// Require a one-time `/bind <code>` handshake before responding (default).
+    /// ZeroClaw prints the bind code on startup; send it once to unlock access.
+    #[default]
+    Pairing,
+    /// Respond only to LINE user IDs listed in `allowed_users`.
+    Allowlist,
+}
+
+/// Group / multi-person chat policy for the LINE channel.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum LineGroupPolicy {
+    /// Respond to every message in group/room chats.
+    Open,
+    /// Respond only when the bot is @mentioned (default).
+    #[default]
+    Mention,
+    /// Ignore all messages in group/room chats.
+    Disabled,
+}
+
 /// LINE Messaging API channel configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -7772,13 +7801,32 @@ pub struct LineConfig {
     pub enabled: bool,
     /// Long-lived channel access token (from LINE Developers Console).
     /// Used for both the Reply API and the Push API fallback.
+    /// Falls back to the `LINE_CHANNEL_ACCESS_TOKEN` environment variable if empty.
+    #[serde(default)]
     #[secret]
     pub channel_access_token: String,
     /// Channel secret (from LINE Developers Console).
     /// Used to verify the `X-Line-Signature` header on incoming webhooks.
+    /// Falls back to the `LINE_CHANNEL_SECRET` environment variable if empty.
+    #[serde(default)]
     #[secret]
     pub channel_secret: String,
-    /// Allowed LINE user IDs. `["*"]` accepts anyone; empty list denies all.
+    /// DM (1:1 chat) access policy. Default: `pairing`.
+    ///
+    /// - `open`      — respond to everyone
+    /// - `pairing`   — require one-time `/bind <code>` handshake on first contact
+    /// - `allowlist` — respond only to user IDs listed in `allowed_users`
+    #[serde(default)]
+    pub dm_policy: LineDmPolicy,
+    /// Group / multi-person chat policy. Default: `mention`.
+    ///
+    /// - `open`     — respond to every message
+    /// - `mention`  — respond only when @mentioned
+    /// - `disabled` — ignore all group messages
+    #[serde(default)]
+    pub group_policy: LineGroupPolicy,
+    /// LINE user IDs that are allowed to interact with the bot.
+    /// Used when `dm_policy = allowlist`. `["*"]` accepts everyone.
     #[serde(default)]
     pub allowed_users: Vec<String>,
     /// TCP port the embedded webhook server listens on. Default: `8443`.
@@ -11047,6 +11095,8 @@ impl_enum_prop_kind!(
     StreamMode,
     WhatsAppWebMode,
     WhatsAppChatPolicy,
+    LineDmPolicy,
+    LineGroupPolicy,
     LarkReceiveMode,
     OtpMethod,
     SandboxBackend,

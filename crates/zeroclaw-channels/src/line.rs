@@ -7,8 +7,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_config::schema::{LineDmPolicy, LineGroupPolicy};
+use zeroclaw_runtime::security::pairing::PairingGuard;
 
 type HmacSha256 = Hmac<Sha256>;
+
+const LINE_BIND_COMMAND: &str = "/bind";
 
 /// LINE Messaging API channel.
 ///
@@ -20,15 +24,30 @@ type HmacSha256 = Hmac<Sha256>;
 /// which carries the bot's own `userId` — no display-name config needed.
 /// The bot's `userId` is fetched once from `GET /v2/bot/info` at startup.
 ///
-/// In group/room chats the bot must be @mentioned to respond.
-/// In 1:1 user chats every message is accepted.
+/// ## Access policies
+///
+/// DM (1:1) access is controlled by `dm_policy`:
+/// - `open`      — respond to everyone
+/// - `pairing`   — require a one-time `/bind <code>` handshake (default)
+/// - `allowlist` — respond only to user IDs in `allowed_users`
+///
+/// Group/room access is controlled by `group_policy`:
+/// - `open`     — respond to every message
+/// - `mention`  — respond only when @mentioned (default)
+/// - `disabled` — ignore all group messages
 pub struct LineChannel {
     /// Long-lived channel access token — used for both Reply and Push APIs.
     channel_access_token: String,
     /// Channel secret — used to verify the `X-Line-Signature` header.
     channel_secret: String,
-    /// Allowed LINE user IDs. `["*"]` accepts anyone.
-    allowed_users: Vec<String>,
+    /// DM access policy.
+    dm_policy: LineDmPolicy,
+    /// Group/room access policy.
+    group_policy: LineGroupPolicy,
+    /// Allowlist — used when `dm_policy = Allowlist`.
+    allowed_users: Arc<RwLock<Vec<String>>>,
+    /// Pairing guard — `Some` when `dm_policy = Pairing`.
+    pairing: Option<Arc<PairingGuard>>,
     /// TCP port the embedded webhook server listens on.
     webhook_port: u16,
     /// Latest replyToken per recipient (userId or groupId).
@@ -47,16 +66,48 @@ struct BotInfo {
 }
 
 impl LineChannel {
+    /// Create a new `LineChannel`.
+    ///
+    /// `channel_access_token` and `channel_secret` fall back to the
+    /// `LINE_CHANNEL_ACCESS_TOKEN` and `LINE_CHANNEL_SECRET` environment
+    /// variables respectively when the config value is empty.
     pub fn new(
         channel_access_token: String,
         channel_secret: String,
+        dm_policy: LineDmPolicy,
+        group_policy: LineGroupPolicy,
         allowed_users: Vec<String>,
         webhook_port: u16,
     ) -> Self {
+        let token = if channel_access_token.is_empty() {
+            std::env::var("LINE_CHANNEL_ACCESS_TOKEN").unwrap_or_default()
+        } else {
+            channel_access_token
+        };
+        let secret = if channel_secret.is_empty() {
+            std::env::var("LINE_CHANNEL_SECRET").unwrap_or_default()
+        } else {
+            channel_secret
+        };
+
+        let pairing = if dm_policy == LineDmPolicy::Pairing && allowed_users.is_empty() {
+            let guard = PairingGuard::new(true, &[]);
+            if let Some(code) = guard.pairing_code() {
+                println!("  🔐 LINE pairing required. One-time bind code: {code}");
+                println!("     Send `{LINE_BIND_COMMAND} <code>` from your LINE account.");
+            }
+            Some(Arc::new(guard))
+        } else {
+            None
+        };
+
         Self {
-            channel_access_token,
-            channel_secret,
-            allowed_users,
+            channel_access_token: token,
+            channel_secret: secret,
+            dm_policy,
+            group_policy,
+            allowed_users: Arc::new(RwLock::new(allowed_users)),
+            pairing,
             webhook_port,
             pending_tokens: Arc::new(RwLock::new(HashMap::new())),
             client: zeroclaw_config::schema::build_channel_proxy_client("channel.line", None),
@@ -72,9 +123,13 @@ impl LineChannel {
         self
     }
 
+    /// Returns `true` if a pairing code is currently active.
     #[cfg(test)]
-    pub(crate) fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+    pub(crate) fn pairing_code_active(&self) -> bool {
+        self.pairing
+            .as_ref()
+            .and_then(|g| g.pairing_code())
+            .is_some()
     }
 
     /// Verify `X-Line-Signature: <base64(HMAC-SHA256(body, channel_secret))>`.
@@ -133,6 +188,15 @@ impl LineChannel {
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
         }
+    }
+
+    /// Extract the bind code from a `/bind <code>` message, if present.
+    fn extract_bind_code(text: &str) -> Option<&str> {
+        let text = text.trim();
+        let rest = text.strip_prefix(LINE_BIND_COMMAND)?;
+        // allow "/bind<code>" or "/bind <code>"
+        let code = rest.trim();
+        if code.is_empty() { None } else { Some(code) }
     }
 
     /// Check whether the bot (`bot_user_id`) is mentioned in the message.
@@ -336,7 +400,10 @@ impl Channel for LineChannel {
             tx: tokio::sync::mpsc::Sender<ChannelMessage>,
             channel_secret: String,
             bot_user_id: String,
-            allowed_users: Vec<String>,
+            dm_policy: LineDmPolicy,
+            group_policy: LineGroupPolicy,
+            allowed_users: Arc<RwLock<Vec<String>>>,
+            pairing: Option<Arc<PairingGuard>>,
             pending_tokens: Arc<RwLock<HashMap<String, String>>>,
         }
 
@@ -344,7 +411,10 @@ impl Channel for LineChannel {
             tx,
             channel_secret: self.channel_secret.clone(),
             bot_user_id: bot_info.user_id,
-            allowed_users: self.allowed_users.clone(),
+            dm_policy: self.dm_policy.clone(),
+            group_policy: self.group_policy.clone(),
+            allowed_users: Arc::clone(&self.allowed_users),
+            pairing: self.pairing.clone(),
             pending_tokens: Arc::clone(&self.pending_tokens),
         });
 
@@ -425,31 +495,99 @@ impl Channel for LineChannel {
                     None => continue,
                 };
 
-                // 3. Allowlist check
-                let allowed = state.allowed_users.iter().any(|u| u == "*" || u == user_id);
-                if !allowed {
-                    tracing::warn!(
-                        "LINE: ignoring message from unauthorized user: {user_id}. \
-                        Add to channels.line.allowed_users in config.toml."
-                    );
-                    continue;
-                }
-
-                // 4. Mention gate for group/room chats.
-                //    Uses LINE's native mention data (message.mention.mentionees[].userId).
-                //    If no mention data is present in a group context, skip the message.
                 let is_group = matches!(source_type, "group" | "room");
-                let mention_span = LineChannel::find_bot_mention(msg_obj, &state.bot_user_id);
 
-                if is_group && mention_span.is_none() {
-                    tracing::debug!(
-                        "LINE: skipping group message without bot mention (userId: {})",
-                        state.bot_user_id
-                    );
-                    continue;
+                // 3. Group policy gate
+                if is_group {
+                    match state.group_policy {
+                        LineGroupPolicy::Disabled => continue,
+                        LineGroupPolicy::Open => {}
+                        LineGroupPolicy::Mention => {
+                            let mention_span =
+                                LineChannel::find_bot_mention(msg_obj, &state.bot_user_id);
+                            if mention_span.is_none() {
+                                tracing::debug!(
+                                    "LINE: skipping group message without bot mention (userId: {})",
+                                    state.bot_user_id
+                                );
+                                continue;
+                            }
+                        }
+                    }
                 }
 
-                // 5. Resolve recipient (groupId/roomId for group context)
+                // 4. DM policy gate (non-group messages only)
+                if !is_group {
+                    match state.dm_policy {
+                        LineDmPolicy::Open => {}
+                        LineDmPolicy::Allowlist => {
+                            let allowed = state
+                                .allowed_users
+                                .read()
+                                .iter()
+                                .any(|u| u == "*" || u == user_id);
+                            if !allowed {
+                                tracing::warn!(
+                                    "LINE: ignoring DM from unauthorized user: {user_id}. \
+                                    Add to channels.line.allowed_users or use dm_policy = pairing."
+                                );
+                                continue;
+                            }
+                        }
+                        LineDmPolicy::Pairing => {
+                            let already_allowed = state
+                                .allowed_users
+                                .read()
+                                .iter()
+                                .any(|u| u == "*" || u == user_id);
+
+                            if !already_allowed {
+                                // Try pairing bind
+                                if let Some(code) = LineChannel::extract_bind_code(text) {
+                                    if let Some(ref guard) = state.pairing {
+                                        match guard.try_pair(code, user_id).await {
+                                            Ok(Some(_)) => {
+                                                state
+                                                    .allowed_users
+                                                    .write()
+                                                    .push(user_id.to_string());
+                                                tracing::info!("LINE: paired userId={user_id}");
+                                                // Send confirmation via Push API (no reply token yet)
+                                                // We forward a synthetic message to let the agent greet
+                                            }
+                                            Ok(None) => {
+                                                tracing::warn!(
+                                                    "LINE: invalid bind code from userId={user_id}"
+                                                );
+                                            }
+                                            Err(wait_ms) => {
+                                                tracing::warn!(
+                                                    "LINE: bind rate-limited for userId={user_id}, retry after {wait_ms}ms"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    continue; // bind commands are not forwarded to agent
+                                }
+
+                                tracing::warn!(
+                                    "LINE: ignoring message from unpaired user: {user_id}. \
+                                    Send `{LINE_BIND_COMMAND} <code>` to pair."
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                // 5. Mention gate for group messages using `mention` policy
+                let mention_span = if is_group && state.group_policy == LineGroupPolicy::Mention {
+                    LineChannel::find_bot_mention(msg_obj, &state.bot_user_id)
+                } else {
+                    None
+                };
+
+                // 6. Resolve recipient (groupId/roomId for group context)
                 let recipient = match source_type {
                     "group" => source
                         .get("groupId")
@@ -464,17 +602,13 @@ impl Channel for LineChannel {
                     _ => user_id.to_string(),
                 };
 
-                // 6. Strip the @mention span from group messages using char index/length.
-                let content = if is_group {
-                    if let Some((idx, len)) = mention_span {
-                        let stripped = LineChannel::strip_mention_range(text, idx, len);
-                        if stripped.is_empty() {
-                            continue;
-                        }
-                        stripped
-                    } else {
-                        text.trim().to_string()
+                // 7. Strip the @mention span from group messages using char index/length.
+                let content = if let Some((idx, len)) = mention_span {
+                    let stripped = LineChannel::strip_mention_range(text, idx, len);
+                    if stripped.is_empty() {
+                        continue;
                     }
+                    stripped
                 } else {
                     text.trim().to_string()
                 };
@@ -483,7 +617,7 @@ impl Channel for LineChannel {
                     continue;
                 }
 
-                // 7. Cache reply token
+                // 8. Cache reply token
                 if let Some(token) = event
                     .get("replyToken")
                     .and_then(|t| t.as_str())
@@ -559,7 +693,9 @@ mod tests {
         LineChannel::new(
             "test_access_token".into(),
             "test_secret".into(),
-            vec!["*".into()],
+            LineDmPolicy::Open,
+            LineGroupPolicy::Mention,
+            vec![],
             8444,
         )
     }
@@ -570,16 +706,97 @@ mod tests {
     }
 
     #[test]
-    fn is_user_allowed_wildcard() {
-        let ch = make_channel();
-        assert!(ch.is_user_allowed("U12345"));
+    fn pairing_mode_creates_guard_when_no_allowed_users() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "sec".into(),
+            LineDmPolicy::Pairing,
+            LineGroupPolicy::Mention,
+            vec![],
+            8444,
+        );
+        assert!(ch.pairing_code_active());
     }
 
     #[test]
-    fn is_user_allowed_specific() {
-        let ch = LineChannel::new("tok".into(), "sec".into(), vec!["Uallowed".into()], 8444);
-        assert!(ch.is_user_allowed("Uallowed"));
-        assert!(!ch.is_user_allowed("Uother"));
+    fn pairing_mode_no_guard_when_users_present() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "sec".into(),
+            LineDmPolicy::Pairing,
+            LineGroupPolicy::Mention,
+            vec!["Uallowed".into()],
+            8444,
+        );
+        assert!(!ch.pairing_code_active());
+    }
+
+    #[test]
+    fn open_mode_no_pairing_guard() {
+        let ch = make_channel();
+        assert!(!ch.pairing_code_active());
+    }
+
+    #[test]
+    fn env_var_fallback_for_token() {
+        // SAFETY: test-only, single-threaded context
+        unsafe { std::env::set_var("LINE_CHANNEL_ACCESS_TOKEN", "env-token") };
+        let ch = LineChannel::new(
+            "".into(),
+            "sec".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Mention,
+            vec![],
+            8444,
+        );
+        assert_eq!(ch.channel_access_token, "env-token");
+        // SAFETY: test-only, single-threaded context
+        unsafe { std::env::remove_var("LINE_CHANNEL_ACCESS_TOKEN") };
+    }
+
+    #[test]
+    fn env_var_fallback_for_secret() {
+        // SAFETY: test-only, single-threaded context
+        unsafe { std::env::set_var("LINE_CHANNEL_SECRET", "env-secret") };
+        let ch = LineChannel::new(
+            "tok".into(),
+            "".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Mention,
+            vec![],
+            8444,
+        );
+        assert_eq!(ch.channel_secret, "env-secret");
+        // SAFETY: test-only, single-threaded context
+        unsafe { std::env::remove_var("LINE_CHANNEL_SECRET") };
+    }
+
+    #[test]
+    fn extract_bind_code_with_space() {
+        assert_eq!(
+            LineChannel::extract_bind_code("/bind abc123"),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn extract_bind_code_no_space() {
+        assert_eq!(
+            LineChannel::extract_bind_code("/bindabc123"),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn extract_bind_code_empty_returns_none() {
+        assert_eq!(LineChannel::extract_bind_code("/bind"), None);
+        assert_eq!(LineChannel::extract_bind_code("/bind   "), None);
+    }
+
+    #[test]
+    fn extract_bind_code_other_command_returns_none() {
+        assert_eq!(LineChannel::extract_bind_code("hello"), None);
+        assert_eq!(LineChannel::extract_bind_code("/start abc"), None);
     }
 
     #[test]
@@ -605,14 +822,12 @@ mod tests {
 
     #[test]
     fn strip_mention_range_prefix() {
-        // "@Bot hello" — mention is chars 0..4 ("@Bot"), remaining " hello"
         let result = LineChannel::strip_mention_range("@Bot hello", 0, 4);
         assert_eq!(result, "hello");
     }
 
     #[test]
     fn strip_mention_range_mid() {
-        // "hey @Bot help" — mention is chars 4..8 ("@Bot")
         let result = LineChannel::strip_mention_range("hey @Bot help", 4, 4);
         assert_eq!(result, "hey help");
     }

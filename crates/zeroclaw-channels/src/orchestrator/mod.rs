@@ -4241,6 +4241,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     LineChannel::new(
                         ln.channel_access_token.clone(),
                         ln.channel_secret.clone(),
+                        ln.dm_policy.clone(),
+                        ln.group_policy.clone(),
                         ln.allowed_users.clone(),
                         ln.webhook_port,
                     )
@@ -4746,6 +4748,8 @@ fn collect_configured_channels(
                     LineChannel::new(
                         ln.channel_access_token.clone(),
                         ln.channel_secret.clone(),
+                        ln.dm_policy.clone(),
+                        ln.group_policy.clone(),
                         ln.allowed_users.clone(),
                         ln.webhook_port,
                     )
