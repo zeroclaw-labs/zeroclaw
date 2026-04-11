@@ -2,8 +2,8 @@ import "./globals.css";
 import { ConvexClientProvider } from "@/components/convex-client";
 
 export const metadata = {
-  title: "Mission Control",
-  description: "Project Workspace-centered planning and execution"
+  title: "ClawPilot Workbench",
+  description: "Workspace-first coworker flow for runtime-backed knowledge work"
 };
 
 export default function RootLayout({ children }) {

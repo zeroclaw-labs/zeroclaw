@@ -1,78 +1,91 @@
 <p align="center">
-  <img src="zeroclaw.png" alt="ClawPilot" width="200" />
+  <img src="zeroclaw.png" alt="ClawPilot" width="180" />
 </p>
 
-<h1 align="center">ClawPilot 🦀</h1>
+<h1 align="center">ClawPilot</h1>
 
 <p align="center">
-  <strong>Zero overhead. Zero compromise. 100% Rust. 100% model-agnostic.</strong><br>
-  Fast, lightweight, and secure AI runtime infrastructure for local-first, control-oriented workflows.
+  Workspace-first AI workbench and runtime for supervised local knowledge work.
 </p>
 
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
-  <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
-</p>
+> Repo name is `clawpilot`; the CLI/runtime command remains `zeroclaw` for compatibility.
 
-> **Repo name is `clawpilot`; the CLI command remains `zeroclaw` for compatibility.**
+## What ClawPilot is now
 
-```text
-~3.4MB binary · <10ms startup · 1,017 tests · 22+ providers · trait-based architecture · pluggable What is ClawPilot?
+ClawPilot combines:
+- a Rust runtime/orchestrator (`zeroclaw`) for controlled execution, and
+- a Mission Control web workbench that is now centered on **Project Workspaces**.
 
-ClawPilot is a lean, Rust-native AI runtime and tool orchestrator for people who want:
-	•	small binaries
-	•	fast startup
-	•	strict sandboxing
-	•	workspace-scoped execution
-	•	provider flexibility
-	•	low-resource deployment
-	•	no dependency on a single AI vendor
+The main user experience is:
+1. choose a workspace,
+2. pick or type a goal,
+3. monitor progress,
+4. review approvals,
+5. accept the final deliverable.
 
-It is designed for local-first, supervised, and control-oriented AI operations rather than heavyweight “assistant platform” convenience layers.
+## Workspace-first model
 
-ClawPilot runs as a compact binary, supports multiple model providers, exposes tool and channel abstractions through traits, and can be deployed on anything from a low-cost Linux board to a full desktop environment.
+A workspace stores:
+- root path and metadata,
+- workspace-level instructions,
+- optional folder-level instruction overlays,
+- goals, progress entries, and artifacts.
 
-Why teams pick ClawPilot
-	•	Lean by default — small Rust binary, fast startup, low memory footprint
-	•	Secure by design — pairing, sandboxing, explicit allowlists, workspace scoping
-	•	Fully swappable — providers, channels, tools, memory, runtime, tunnel, and identity systems are all modular
-	•	No lock-in — supports OpenAI-compatible endpoints plus a broad provider surface
-	•	Practical for constrained hardware — suitable for edge devices and low-cost Linux systems
+Runtime runs are created from workspace context (path + instructions), then tracked through status/events/results files.
 
-Highlights
-	•	🦀 Rust-native runtime with a small release binary
-	•	⚡ Fast startup and low-overhead execution
-	•	🌍 Portable deployment across ARM, x86, and RISC-V targets
-	•	🔌 Model-agnostic provider system
-	•	🧠 Hybrid memory engine with FTS5 + vector similarity
-	•	🛡️ Security guardrails with pairing, scoping, sandboxing, and allowlists
-	•	🧩 Trait-based architecture for extensibility
-	•	🤖 Channels, tools, memory, identity, and runtime adapters are all pluggable
+## Approvals and deliverables
 
-ClawPilot update highlights
+ClawPilot supports approval checkpoints for high-impact actions (for example file edits, shell actions, browser actions, and final deliverables when policy requires it).
 
-Recent ClawPilot-focused improvements include:
-	•	Unified runtime behavior with explicit fail-fast errors for unsupported runtime adapters
-	•	Expanded integrations surface with 50+ integrations and 22+ model providers
-	•	Hybrid memory engine improvements with FTS5 + vector similarity and weighted merges
-	•	Hardware-oriented peripheral workflow support for STM32, ESP32, and Raspberry Pi
-	•	Clearer Linux operator workflows and more practical runtime guardrails
+Mission Control surfaces pending approvals, review notes, and run state transitions so a human can gate execution.
 
-How ClawPilot differs from OpenClaw
-	•	OpenClaw is a broader personal-assistant/product stack with chat channel integrations, gateway endpoints, and convenience-focused setup UX
-	•	ClawPilot is a lean runtime and orchestrator focused on supervised execution, explicit control, and lower resource usage
-	•	In this fork, the emphasis is on:
-	•	Linux operator workflows
-	•	OpenRouter clarity
-	•	strong sandboxing and allowlists
-	•	practical runtime guardrails over convenience defaults
+Deliverables are read from runtime result artifacts and shown in the run review panel.
 
-In short:
-	•	OpenClaw aims for a broader assistant experience
-	•	ClawPilot aims for a lighter, more controllable runtime core
+## Phase 5 knowledge workflows
 
-Benchmark snapshot
+Mission Control now includes focused preset templates for:
+1. folder summarization,
+2. file organization / cleanup,
+3. document synthesis from local source files,
+4. data extraction from messy local files,
+5. rerun/refine from prior deliverables.
 
-The table below reflects a local benchmark snapshot and should be treated as a directional comparison, not a universal benchmark across all environments.
+These are preset goals/instruction templates over existing runtime behavior, not a separate hidden agent stack.
 
-Local machine quick benchmark: macOS arm64, Feb 2026, normalized for 0.8GHz edge hardware.
+## Run the app
+
+### Runtime (Rust)
+
+```bash
+cargo run -- --help
+```
+
+### Mission Control (Next.js + Convex)
+
+```bash
+cd mission-control
+npm install
+npx convex dev
+npm run dev
+```
+
+Optional checks:
+
+```bash
+npm run lint
+npm test
+```
+
+## How ClawPilot still differs from Claude CoWork
+
+ClawPilot is meaningfully closer to a coworker-style desktop flow, but it is still different:
+- It is self-hosted/repo-local by default, not a managed Claude product.
+- Workflow presets are explicit templates, not opaque product-native workflow engines.
+- Collaboration and memory UX are narrower; most state is workspace/run centric and file-backed.
+- Some advanced polish (deeper artifact diffing, richer rerun context stitching, broader UX automation) remains future work.
+
+## Repository map
+
+- `src/` Rust runtime, tools, providers, security, orchestration
+- `mission-control/` Next.js + Convex workspace workbench
+- `docs/` architecture and workflow documentation

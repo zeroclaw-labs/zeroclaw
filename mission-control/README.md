@@ -1,13 +1,24 @@
-# Mission Control (Next.js + Convex)
+# ClawPilot Workbench (Mission Control)
 
-This app provides a collaborative mission-control workspace with realtime screens for:
+Mission Control is now a **workspace-first workbench** for supervised knowledge work.
 
-- Task board (status + assignee `me`/`you`)
-- Content pipeline (idea to publish, scripts, image URLs)
-- Calendar for scheduled tasks and cron jobs
-- Memory documents with search
-- Team structure for primary/sub agents
-- Digital office visualization with live statuses
+Primary flow:
+1. Select a Project Workspace
+2. Pick a workflow preset or type a goal
+3. Monitor runtime progress
+4. Review approvals
+5. Receive the deliverable
+
+## Phase 5 workflow presets
+
+The workbench now ships focused presets for:
+- Folder summarization
+- File organization / cleanup
+- Document synthesis from local files
+- Data extraction from messy local files
+- Task rerun/refine from prior deliverables
+
+These presets are templates over the existing runtime queue + results bridge. They do not claim new runtime capabilities beyond what the current toolchain can execute.
 
 ## Setup
 
@@ -17,16 +28,23 @@ This app provides a collaborative mission-control workspace with realtime screen
 npm install
 ```
 
-2. Start Convex in this folder (requires Convex login/config):
+2. Start Convex in this folder:
 
 ```bash
 npx convex dev
 ```
 
-3. Run Next.js in another terminal:
+3. Start Next.js:
 
 ```bash
 npm run dev
+```
+
+4. Optional checks:
+
+```bash
+npm run lint
+npm test
 ```
 
 Set `NEXT_PUBLIC_CONVEX_URL` if your Convex URL differs from the default local URL.
