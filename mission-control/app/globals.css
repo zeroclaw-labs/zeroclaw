@@ -123,20 +123,15 @@ button {
   border-color: #3b6cf5;
 }
 
-
-details {
+pre {
+  white-space: pre-wrap;
+  overflow-x: auto;
+  background: #0b1322;
   border: 1px solid #21314d;
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 8px;
-  background: #0d1525;
 }
 
-summary {
-  cursor: pointer;
-  font-weight: 600;
-}
-
-.inline-link {
-  margin-left: 8px;
-  color: #8cb3ff;
+.approval-item {
+  background: #0f1b30;
 }

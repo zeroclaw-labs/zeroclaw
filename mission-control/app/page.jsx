@@ -31,9 +31,7 @@ export default function Page() {
   const [runState, setRunState] = useState(null);
   const [runEvents, setRunEvents] = useState([]);
   const [runResult, setRunResult] = useState(null);
-  const [outputLocation, setOutputLocation] = useState(null);
-  const [composerDraft, setComposerDraft] = useState("");
-  const [persistedRunIds, setPersistedRunIds] = useState([]);
+  const [fileDiffs, setFileDiffs] = useState({});
 
   useEffect(() => {
     seed();
@@ -51,7 +49,7 @@ export default function Page() {
       setRunState(payload.state || null);
       setRunEvents(payload.events || []);
       setRunResult(payload.result || null);
-      setOutputLocation(payload.outputLocation || null);
+      setFileDiffs(payload.fileDiffs || {});
     };
 
     load();
@@ -143,16 +141,21 @@ export default function Page() {
 
       <section className="panel" id="runtime">
         <h2>3) Live runtime status</h2>
-        <RunStatusPanel runId={activeRun?.runId || ""} state={runState} result={runResult} events={runEvents} />
-      </section>
-
-      <section className="panel" id="deliverables">
-        <h2>4) Final deliverables</h2>
-        <DeliverablesPanel
-          workspace={dashboard.activeWorkspace}
-          deliverables={sortedDeliverables}
-          onInspectRun={(runId) => setActiveRun((current) => ({ ...(current || {}), runId }))}
-          onRefine={(nextGoal) => setComposerDraft(nextGoal)}
+        <RunStatusPanel
+          runId={activeRunId}
+          state={runState}
+          result={runResult}
+          events={runEvents}
+          fileDiffs={fileDiffs}
+          onRefresh={async () => {
+            const response = await fetch(`/api/runtime/runs/${activeRunId}`, { cache: "no-store" });
+            if (!response.ok) return;
+            const payload = await response.json();
+            setRunState(payload.state || null);
+            setRunEvents(payload.events || []);
+            setRunResult(payload.result || null);
+            setFileDiffs(payload.fileDiffs || {});
+          }}
         />
       </section>
 
@@ -291,7 +294,31 @@ function RunComposer({ workspace, folderInstructions, onCreateGoal, onRunCreated
   );
 }
 
-function RunStatusPanel({ runId, state, events, result }) {
+function RunStatusPanel({ runId, state, events, result, fileDiffs, onRefresh }) {
+  const [reviewNote, setReviewNote] = useState("");
+  const [reviewBusy, setReviewBusy] = useState("");
+
+  const pendingApprovals = (state?.approvals || []).filter((item) => item.state === "pending_approval");
+
+  const updateApproval = async (approvalId, nextState) => {
+    setReviewBusy(`${approvalId}:${nextState}`);
+    try {
+      await fetch(`/api/runtime/runs/${runId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          approvalId,
+          state: nextState,
+          reviewerNote: reviewNote
+        })
+      });
+      setReviewNote("");
+      await onRefresh();
+    } finally {
+      setReviewBusy("");
+    }
+  };
+
   if (!runId) {
     return <p>No run selected yet. Create a run to stream runtime-backed status.</p>;
   }
@@ -330,6 +357,72 @@ function RunStatusPanel({ runId, state, events, result }) {
           </ul>
         ) : (
           <p className="muted">No changed files detected yet.</p>
+        )}
+      </article>
+
+      <article className="card" id="review-workbench">
+        <strong>Review workbench</strong>
+        <p className="muted">
+          Pending approvals: {pendingApprovals.length} / {(state?.approvals || []).length}
+        </p>
+        {(state?.approvals || []).length ? (
+          <div className="stack">
+            {(state?.approvals || []).map((approval) => (
+              <article className="card approval-item" key={approval.id}>
+                <div className="row">
+                  <strong>{approval.title}</strong>
+                  <span className="badge">{approval.state}</span>
+                </div>
+                <p>{approval.summary}</p>
+                {approval.target_type === "file_edit" && approval.metadata?.path && (
+                  <details>
+                    <summary>File diff preview: {approval.metadata.path}</summary>
+                    <pre>{fileDiffs[approval.metadata.path] || "Loading diff..."}</pre>
+                  </details>
+                )}
+                {(approval.target_type === "shell_command" || approval.target_type === "browser_action") && (
+                  <details>
+                    <summary>Command / action preview</summary>
+                    <pre>{JSON.stringify(approval.metadata || {}, null, 2)}</pre>
+                  </details>
+                )}
+                {approval.state === "pending_approval" && (
+                  <div className="stack">
+                    <textarea
+                      placeholder="Optional reviewer note (reason, requested revision, etc.)"
+                      value={reviewNote}
+                      onChange={(e) => setReviewNote(e.target.value)}
+                    />
+                    <div className="row">
+                      <button
+                        type="button"
+                        disabled={Boolean(reviewBusy)}
+                        onClick={() => updateApproval(approval.id, "approved")}
+                      >
+                        {reviewBusy === `${approval.id}:approved` ? "Approving..." : "Approve"}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={Boolean(reviewBusy)}
+                        onClick={() => updateApproval(approval.id, "rejected")}
+                      >
+                        {reviewBusy === `${approval.id}:rejected` ? "Rejecting..." : "Reject"}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={Boolean(reviewBusy)}
+                        onClick={() => updateApproval(approval.id, "needs_input")}
+                      >
+                        {reviewBusy === `${approval.id}:needs_input` ? "Saving..." : "Request revision"}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </article>
+            ))}
+          </div>
+        ) : (
+          <p className="muted">No approvals tracked for this run yet.</p>
         )}
       </article>
 

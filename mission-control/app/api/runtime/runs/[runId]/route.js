@@ -1,5 +1,9 @@
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import path from "node:path";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 function resultsRoot() {
   return process.env.RUNTIME_RESULTS_ROOT || "/var/lib/clawpilot/results";
@@ -27,6 +31,29 @@ async function readEvents(filePath) {
   }
 }
 
+async function loadFileDiffs(state) {
+  if (!state?.workspace_path || !Array.isArray(state?.file_changes) || state.file_changes.length === 0) {
+    return {};
+  }
+
+  const diffs = {};
+  await Promise.all(
+    state.file_changes.slice(0, 25).map(async (filePath) => {
+      try {
+        const { stdout } = await execFileAsync(
+          "git",
+          ["-C", state.workspace_path, "diff", "--", filePath],
+          { maxBuffer: 1024 * 1024 }
+        );
+        diffs[filePath] = stdout || "No diff output available.";
+      } catch (_error) {
+        diffs[filePath] = "Diff unavailable for this file.";
+      }
+    })
+  );
+  return diffs;
+}
+
 export async function GET(_request, { params }) {
   const { runId } = params;
   const root = resultsRoot();
@@ -45,16 +72,67 @@ export async function GET(_request, { params }) {
     return Response.json({ error: "run not found" }, { status: 404 });
   }
 
-  return Response.json({
-    state,
-    result,
-    events,
-    outputLocation: {
-      resultsRoot: root,
-      resultFile,
-      statusFile,
-      eventsFile,
-      artifactsDir: state?.workspace_path || undefined
-    }
-  });
+  const fileDiffs = await loadFileDiffs(state);
+  return Response.json({ state, result, events, fileDiffs });
+}
+
+export async function PATCH(request, { params }) {
+  const { runId } = params;
+  const root = resultsRoot();
+  const statusPath = path.join(root, `${runId}.status.json`);
+  const state = await maybeReadJson(statusPath);
+  if (!state) {
+    return Response.json({ error: "run not found" }, { status: 404 });
+  }
+
+  const body = await request.json();
+  const approvalId = String(body.approvalId || "").trim();
+  const nextState = String(body.state || "").trim();
+  const reviewerNote = String(body.reviewerNote || "").trim();
+
+  if (!approvalId || !["approved", "rejected", "needs_input"].includes(nextState)) {
+    return Response.json(
+      { error: "approvalId and valid state (approved|rejected|needs_input) are required" },
+      { status: 400 }
+    );
+  }
+
+  const idx = Array.isArray(state.approvals)
+    ? state.approvals.findIndex((item) => item.id === approvalId)
+    : -1;
+  if (idx < 0) {
+    return Response.json({ error: "approval not found" }, { status: 404 });
+  }
+
+  const now = new Date().toISOString();
+  state.approvals[idx] = {
+    ...state.approvals[idx],
+    state: nextState,
+    reviewer_note: reviewerNote || null,
+    updated_at: now,
+    resolved_at: now
+  };
+
+  const hasPendingBlocking = state.approvals.some(
+    (item) => item.requires_blocking && item.state === "pending_approval"
+  );
+  if (hasPendingBlocking) {
+    state.status = "pending_approval";
+    state.plan_state = "awaiting_approval";
+    state.current_step = "review_required";
+  } else if (state.approvals.some((item) => item.state === "rejected")) {
+    state.status = "rejected";
+    state.plan_state = "rejected";
+  } else if (state.approvals.some((item) => item.state === "needs_input")) {
+    state.status = "needs_input";
+    state.plan_state = "needs_input";
+  } else if (state.approvals.length > 0 && state.approvals.every((item) => item.state === "approved")) {
+    state.status = "approved";
+    state.plan_state = "approved";
+    state.current_step = "review_complete";
+  }
+
+  await writeFile(statusPath, JSON.stringify(state, null, 2));
+
+  return Response.json({ ok: true, state });
 }
