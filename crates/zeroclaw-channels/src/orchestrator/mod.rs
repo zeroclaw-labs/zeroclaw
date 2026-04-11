@@ -36,6 +36,8 @@ pub use crate::imessage::IMessageChannel;
 pub use crate::irc::IrcChannel;
 #[cfg(feature = "channel-lark")]
 pub use crate::lark::LarkChannel;
+#[cfg(feature = "channel-line")]
+pub use crate::line::LineChannel;
 pub use crate::linq::LinqChannel;
 pub use crate::mattermost::MattermostChannel;
 pub use crate::mochat::MochatChannel;
@@ -4227,10 +4229,33 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .context("iMessage channel is not configured")?;
             Ok(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())))
         }
+        "line" => {
+            #[cfg(feature = "channel-line")]
+            {
+                let ln = config
+                    .channels_config
+                    .line
+                    .as_ref()
+                    .context("LINE channel is not configured")?;
+                Ok(Arc::new(
+                    LineChannel::new(
+                        ln.channel_access_token.clone(),
+                        ln.channel_secret.clone(),
+                        ln.allowed_users.clone(),
+                        ln.webhook_port,
+                    )
+                    .with_proxy_url(ln.proxy_url.clone()),
+                ))
+            }
+            #[cfg(not(feature = "channel-line"))]
+            {
+                anyhow::bail!("LINE channel requires the `channel-line` feature");
+            }
+        }
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, discord_history, imessage"
+            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line"
         ),
     }
 }
@@ -4709,6 +4734,33 @@ fn collect_configured_channels(
     if config.channels_config.lark.is_some() || config.channels_config.feishu.is_some() {
         tracing::warn!(
             "Lark/Feishu channel is configured but this build was compiled without `channel-lark`; skipping Lark/Feishu health check."
+        );
+    }
+
+    #[cfg(feature = "channel-line")]
+    if let Some(ref ln) = config.channels_config.line {
+        if ln.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "LINE",
+                channel: Arc::new(
+                    LineChannel::new(
+                        ln.channel_access_token.clone(),
+                        ln.channel_secret.clone(),
+                        ln.allowed_users.clone(),
+                        ln.webhook_port,
+                    )
+                    .with_proxy_url(ln.proxy_url.clone()),
+                ),
+            });
+        } else {
+            tracing::info!("LINE channel configured but disabled (enabled = false)");
+        }
+    }
+
+    #[cfg(not(feature = "channel-line"))]
+    if config.channels_config.line.is_some() {
+        tracing::warn!(
+            "LINE channel is configured but this build was compiled without `channel-line`; skipping LINE health check."
         );
     }
 

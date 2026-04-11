@@ -6544,6 +6544,9 @@ pub struct ChannelsConfig {
     /// Lark channel configuration.
     #[nested]
     pub lark: Option<LarkConfig>,
+    /// LINE Messaging API channel configuration.
+    #[nested]
+    pub line: Option<LineConfig>,
     /// Feishu channel configuration.
     #[nested]
     pub feishu: Option<FeishuConfig>,
@@ -6793,6 +6796,7 @@ impl Default for ChannelsConfig {
             gmail_push: None,
             irc: None,
             lark: None,
+            line: None,
             feishu: None,
             dingtalk: None,
             wecom: None,
@@ -7755,6 +7759,47 @@ impl ChannelConfig for LarkConfig {
     }
     fn desc() -> &'static str {
         "Lark Bot"
+    }
+}
+
+/// LINE Messaging API channel configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.line"]
+pub struct LineConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Long-lived channel access token (from LINE Developers Console).
+    /// Used for both the Reply API and the Push API fallback.
+    #[secret]
+    pub channel_access_token: String,
+    /// Channel secret (from LINE Developers Console).
+    /// Used to verify the `X-Line-Signature` header on incoming webhooks.
+    #[secret]
+    pub channel_secret: String,
+    /// Allowed LINE user IDs. `["*"]` accepts anyone; empty list denies all.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// TCP port the embedded webhook server listens on. Default: `8443`.
+    #[serde(default = "default_line_webhook_port")]
+    pub webhook_port: u16,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+}
+
+fn default_line_webhook_port() -> u16 {
+    8443
+}
+
+impl ChannelConfig for LineConfig {
+    fn name() -> &'static str {
+        "LINE"
+    }
+    fn desc() -> &'static str {
+        "connect your LINE bot"
     }
 }
 
@@ -11508,6 +11553,7 @@ auto_save = true
                 gmail_push: None,
                 irc: None,
                 lark: None,
+                line: None,
                 feishu: None,
                 dingtalk: None,
                 wecom: None,
@@ -12563,6 +12609,7 @@ allowed_users = ["@ops:matrix.org"]
             gmail_push: None,
             irc: None,
             lark: None,
+            line: None,
             feishu: None,
             dingtalk: None,
             wecom: None,
@@ -12943,6 +12990,7 @@ channel_ids = ["C123", "D456"]
             gmail_push: None,
             irc: None,
             lark: None,
+            line: None,
             feishu: None,
             dingtalk: None,
             wecom: None,
