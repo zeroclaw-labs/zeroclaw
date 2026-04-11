@@ -11,8 +11,10 @@
 //!
 //! # Extension
 //!
-//! To add a new channel, implement [`Channel`] in a new submodule and wire it into
-//! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
+//! To add a new channel, implement [`Channel`] in a new top-level module in
+//! `zeroclaw-channels/src/`, declare it in `lib.rs` behind the appropriate feature
+//! gate, and wire it into [`start_channels`] here. See `AGENTS.md` §7.2 for the
+//! full change playbook.
 
 pub mod acp_server;
 pub mod media_pipeline;
