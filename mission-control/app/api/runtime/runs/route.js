@@ -56,7 +56,14 @@ export async function POST(request) {
           folder_path: String(item.folderPath || ""),
           instructions: String(item.instructions || "")
         }))
-      : []
+      : [],
+    approval_policy: {
+      require_file_edit_approval: body.approvalPolicy?.requireFileEditApproval ?? true,
+      require_shell_approval: body.approvalPolicy?.requireShellApproval ?? true,
+      require_browser_approval: body.approvalPolicy?.requireBrowserApproval ?? true,
+      require_outgoing_message_approval: body.approvalPolicy?.requireOutgoingMessageApproval ?? true,
+      require_final_deliverable_approval: body.approvalPolicy?.requireFinalDeliverableApproval ?? true
+    }
   };
 
   await writeFile(queueFile, JSON.stringify(payload, null, 2));

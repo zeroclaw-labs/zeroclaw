@@ -40,6 +40,8 @@ pub struct AgentJob {
     pub global_instructions: Option<String>,
     #[serde(default)]
     pub folder_instructions: Option<Vec<FolderInstruction>>,
+    #[serde(default)]
+    pub approval_policy: Option<RunApprovalPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,13 +60,81 @@ pub struct FolderInstruction {
     pub instructions: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunApprovalPolicy {
+    #[serde(default = "default_true")]
+    pub require_file_edit_approval: bool,
+    #[serde(default = "default_true")]
+    pub require_shell_approval: bool,
+    #[serde(default = "default_true")]
+    pub require_browser_approval: bool,
+    #[serde(default = "default_true")]
+    pub require_outgoing_message_approval: bool,
+    #[serde(default = "default_true")]
+    pub require_final_deliverable_approval: bool,
+}
+
+impl Default for RunApprovalPolicy {
+    fn default() -> Self {
+        Self {
+            require_file_edit_approval: true,
+            require_shell_approval: true,
+            require_browser_approval: true,
+            require_outgoing_message_approval: true,
+            require_final_deliverable_approval: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Queued,
     Running,
+    PendingApproval,
+    Approved,
+    Rejected,
+    NeedsInput,
     Completed,
     Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalState {
+    PendingApproval,
+    Approved,
+    Rejected,
+    NeedsInput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalTargetType {
+    FileEdit,
+    ShellCommand,
+    BrowserAction,
+    OutgoingMessage,
+    FinalDeliverable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunApproval {
+    pub id: String,
+    pub target_type: ApprovalTargetType,
+    pub title: String,
+    pub summary: String,
+    pub state: ApprovalState,
+    pub requires_blocking: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub resolved_at: Option<String>,
+    pub reviewer_note: Option<String>,
+    pub metadata: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +164,8 @@ pub struct RunState {
     pub tool_events: Vec<RunToolEvent>,
     pub file_changes: Vec<String>,
     pub artifacts: Vec<RunArtifact>,
+    #[serde(default)]
+    pub approvals: Vec<RunApproval>,
     pub created_at: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
@@ -104,14 +176,102 @@ struct RunObserver {
     state: Arc<Mutex<RunState>>,
     status_path: PathBuf,
     events_path: PathBuf,
+    approval_policy: RunApprovalPolicy,
+}
+
+fn build_approval(
+    target_type: ApprovalTargetType,
+    title: String,
+    summary: String,
+    requires_blocking: bool,
+    metadata: serde_json::Value,
+) -> RunApproval {
+    let now = Utc::now().to_rfc3339();
+    RunApproval {
+        id: Uuid::new_v4().to_string(),
+        target_type,
+        title,
+        summary,
+        state: ApprovalState::PendingApproval,
+        requires_blocking,
+        created_at: now.clone(),
+        updated_at: now,
+        resolved_at: None,
+        reviewer_note: None,
+        metadata,
+    }
+}
+
+fn sync_run_status_from_approvals(state: &mut RunState) {
+    let has_pending_blocking = state
+        .approvals
+        .iter()
+        .any(|item| item.requires_blocking && item.state == ApprovalState::PendingApproval);
+    if has_pending_blocking {
+        state.status = RunStatus::PendingApproval;
+        state.plan_state = "awaiting_approval".to_string();
+        state.current_step = "review_required".to_string();
+        return;
+    }
+
+    if state
+        .approvals
+        .iter()
+        .any(|item| item.state == ApprovalState::Rejected)
+    {
+        state.status = RunStatus::Rejected;
+        state.plan_state = "rejected".to_string();
+        return;
+    }
+
+    if state
+        .approvals
+        .iter()
+        .any(|item| item.state == ApprovalState::NeedsInput)
+    {
+        state.status = RunStatus::NeedsInput;
+        state.plan_state = "needs_input".to_string();
+        return;
+    }
+
+    let has_approvals = !state.approvals.is_empty();
+    let all_approved = has_approvals
+        && state
+            .approvals
+            .iter()
+            .all(|item| item.state == ApprovalState::Approved);
+
+    if all_approved {
+        state.status = RunStatus::Approved;
+        state.plan_state = "approved".to_string();
+    }
+}
+
+fn requires_blocking_approval(
+    policy: &RunApprovalPolicy,
+    target_type: &ApprovalTargetType,
+) -> bool {
+    match target_type {
+        ApprovalTargetType::FileEdit => policy.require_file_edit_approval,
+        ApprovalTargetType::ShellCommand => policy.require_shell_approval,
+        ApprovalTargetType::BrowserAction => policy.require_browser_approval,
+        ApprovalTargetType::OutgoingMessage => policy.require_outgoing_message_approval,
+        ApprovalTargetType::FinalDeliverable => policy.require_final_deliverable_approval,
+    }
 }
 
 impl RunObserver {
-    fn new(state: Arc<Mutex<RunState>>, status_path: PathBuf, events_path: PathBuf) -> Self {
+    fn new(
+        state: Arc<Mutex<RunState>>,
+        status_path: PathBuf,
+        events_path: PathBuf,
+        approval_policy: RunApprovalPolicy,
+    ) -> Self {
         Self {
             state,
             status_path,
             events_path,
+            approval_policy,
         }
     }
 
@@ -185,6 +345,20 @@ impl crate::observability::Observer for RunObserver {
                 self.update_state(|s| {
                     s.current_step = format!("tool:{tool}");
                     s.plan_state = "executing_tool".to_string();
+                    let target = match tool.as_str() {
+                        "shell" => Some(ApprovalTargetType::ShellCommand),
+                        "browser" | "browser_open" => Some(ApprovalTargetType::BrowserAction),
+                        _ => None,
+                    };
+                    if let Some(target_type) = target {
+                        s.approvals.push(build_approval(
+                            target_type.clone(),
+                            format!("Review tool action: {tool}"),
+                            format!("Tool `{tool}` is requesting review before acceptance."),
+                            requires_blocking_approval(&self.approval_policy, &target_type),
+                            serde_json::json!({ "tool": tool }),
+                        ));
+                    }
                     s.tool_events.push(RunToolEvent {
                         tool: tool.clone(),
                         success: None,
@@ -227,8 +401,41 @@ impl crate::observability::Observer for RunObserver {
                 self.update_state(|s| {
                     s.current_step = "turn_complete".to_string();
                     s.plan_state = "responding".to_string();
+                    s.approvals.push(build_approval(
+                        ApprovalTargetType::FinalDeliverable,
+                        "Review final deliverable".to_string(),
+                        "Validate the final output before marking the run accepted."
+                            .to_string(),
+                        self.approval_policy.require_final_deliverable_approval,
+                        serde_json::json!({}),
+                    ));
+                    sync_run_status_from_approvals(s);
                 });
                 self.append_event("turn_complete", "Turn completed", serde_json::json!({}));
+            }
+            ObserverEvent::ChannelMessage { channel, direction } => {
+                if direction == "outbound" {
+                    self.update_state(|s| {
+                        s.approvals.push(build_approval(
+                            ApprovalTargetType::OutgoingMessage,
+                            format!("Review outbound {channel} message"),
+                            format!(
+                                "An outbound `{channel}` message is queued for user-facing delivery."
+                            ),
+                            self.approval_policy.require_outgoing_message_approval,
+                            serde_json::json!({
+                                "channel": channel,
+                                "direction": direction
+                            }),
+                        ));
+                        sync_run_status_from_approvals(s);
+                    });
+                    self.append_event(
+                        "approval_needed",
+                        "Outbound message pending approval",
+                        serde_json::json!({ "channel": channel }),
+                    );
+                }
             }
             ObserverEvent::Error { component, message } => {
                 self.update_state(|s| {
@@ -245,7 +452,7 @@ impl crate::observability::Observer for RunObserver {
             ObserverEvent::AgentEnd { .. } => {
                 self.append_event("agent_end", "Agent execution finished", serde_json::json!({}));
             }
-            ObserverEvent::ChannelMessage { .. } | ObserverEvent::HeartbeatTick => {}
+            ObserverEvent::HeartbeatTick => {}
         }
     }
 
@@ -348,6 +555,7 @@ impl Orchestrator {
             workspace_path: None,
             global_instructions: None,
             folder_instructions: None,
+            approval_policy: None,
         };
 
         let queue_dir = self.queue_root.join(agent);
@@ -449,6 +657,7 @@ pub async fn run_queue_worker(
                 tool_events: Vec::new(),
                 file_changes: Vec::new(),
                 artifacts: Vec::new(),
+                approvals: Vec::new(),
                 created_at: job.created_at.clone(),
                 started_at: None,
                 finished_at: None,
@@ -459,10 +668,12 @@ pub async fn run_queue_worker(
             let files_before = git_changed_files(Path::new(&workspace_path)).unwrap_or_default();
 
             let state_ref = Arc::new(Mutex::new(initial_state));
+            let approval_policy = job.approval_policy.clone().unwrap_or_default();
             let run_observer = Arc::new(RunObserver::new(
                 state_ref.clone(),
                 status_path.clone(),
                 events_path,
+                approval_policy.clone(),
             ));
 
             let result = crate::agent::run_with_observer(
@@ -520,9 +731,19 @@ pub async fn run_queue_worker(
                         status: "updated".to_string(),
                     })
                     .collect();
+                for path in &changed_files {
+                    state.approvals.push(build_approval(
+                        ApprovalTargetType::FileEdit,
+                        format!("Review file diff: {path}"),
+                        "Inspect this file change before accepting the run.".to_string(),
+                        approval_policy.require_file_edit_approval,
+                        serde_json::json!({ "path": path }),
+                    ));
+                }
                 if let Some(msg) = failed_message {
                     state.error = Some(msg);
                 }
+                sync_run_status_from_approvals(&mut state);
             }
             let final_state = state_ref
                 .lock()
@@ -595,4 +816,94 @@ fn git_changed_files(workspace: &Path) -> Result<BTreeSet<String>> {
         .map(ToOwned::to_owned)
         .collect();
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_state() -> RunState {
+        RunState {
+            id: "run-1".to_string(),
+            agent: "default".to_string(),
+            workspace_path: "/tmp".to_string(),
+            goal: "test".to_string(),
+            status: RunStatus::Completed,
+            current_step: "completed".to_string(),
+            plan_state: "done".to_string(),
+            tool_events: Vec::new(),
+            file_changes: Vec::new(),
+            artifacts: Vec::new(),
+            approvals: Vec::new(),
+            created_at: Utc::now().to_rfc3339(),
+            started_at: None,
+            finished_at: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn approval_state_transitions_to_pending_then_approved() {
+        let mut state = base_state();
+        state.approvals.push(build_approval(
+            ApprovalTargetType::FinalDeliverable,
+            "Review final".to_string(),
+            "summary".to_string(),
+            true,
+            serde_json::json!({}),
+        ));
+
+        sync_run_status_from_approvals(&mut state);
+        assert_eq!(state.status, RunStatus::PendingApproval);
+        assert_eq!(state.plan_state, "awaiting_approval");
+
+        state.approvals[0].state = ApprovalState::Approved;
+        sync_run_status_from_approvals(&mut state);
+        assert_eq!(state.status, RunStatus::Approved);
+        assert_eq!(state.plan_state, "approved");
+    }
+
+    #[test]
+    fn approval_state_transitions_support_rejected_and_needs_input() {
+        let mut rejected_state = base_state();
+        rejected_state.approvals.push(build_approval(
+            ApprovalTargetType::ShellCommand,
+            "Review shell".to_string(),
+            "summary".to_string(),
+            true,
+            serde_json::json!({}),
+        ));
+        rejected_state.approvals[0].state = ApprovalState::Rejected;
+        sync_run_status_from_approvals(&mut rejected_state);
+        assert_eq!(rejected_state.status, RunStatus::Rejected);
+        assert_eq!(rejected_state.plan_state, "rejected");
+
+        let mut needs_input_state = base_state();
+        needs_input_state.approvals.push(build_approval(
+            ApprovalTargetType::FileEdit,
+            "Review file".to_string(),
+            "summary".to_string(),
+            true,
+            serde_json::json!({}),
+        ));
+        needs_input_state.approvals[0].state = ApprovalState::NeedsInput;
+        sync_run_status_from_approvals(&mut needs_input_state);
+        assert_eq!(needs_input_state.status, RunStatus::NeedsInput);
+        assert_eq!(needs_input_state.plan_state, "needs_input");
+    }
+
+    #[test]
+    fn non_blocking_pending_approvals_do_not_gate_run() {
+        let mut state = base_state();
+        state.approvals.push(build_approval(
+            ApprovalTargetType::OutgoingMessage,
+            "Review outbound".to_string(),
+            "summary".to_string(),
+            false,
+            serde_json::json!({}),
+        ));
+        sync_run_status_from_approvals(&mut state);
+        assert_eq!(state.status, RunStatus::Completed);
+        assert_eq!(state.plan_state, "done");
+    }
 }
