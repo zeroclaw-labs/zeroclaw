@@ -68,6 +68,15 @@ struct NativeChatRequest<'a> {
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<NativeThinkingConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeThinkingConfig {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    budget_tokens: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -178,6 +187,8 @@ struct NativeContentIn {
     kind: String,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    thinking: Option<String>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -515,6 +526,7 @@ impl AnthropicProvider {
 
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
         let mut text_parts = Vec::new();
+        let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
         let usage = response.usage.map(|u| TokenUsage {
@@ -530,6 +542,14 @@ impl AnthropicProvider {
                         && !text.is_empty()
                     {
                         text_parts.push(text);
+                    }
+                }
+                "thinking" => {
+                    if let Some(thinking) = block.thinking.as_deref().or(block.text.as_deref()) {
+                        let trimmed = thinking.trim();
+                        if !trimmed.is_empty() {
+                            thinking_parts.push(trimmed.to_string());
+                        }
                     }
                 }
                 "tool_use" => {
@@ -550,6 +570,12 @@ impl AnthropicProvider {
             }
         }
 
+        let reasoning_content = if thinking_parts.is_empty() {
+            None
+        } else {
+            Some(thinking_parts.join("\n"))
+        };
+
         ProviderChatResponse {
             text: if text_parts.is_empty() {
                 None
@@ -558,7 +584,7 @@ impl AnthropicProvider {
             },
             tool_calls,
             usage,
-            reasoning_content: None,
+            reasoning_content,
         }
     }
 
@@ -800,6 +826,7 @@ impl Provider for AnthropicProvider {
             tools: None,
             tool_choice: None,
             stream: None,
+            thinking: None,
         };
 
         let mut request = self
@@ -863,16 +890,40 @@ impl Provider for AnthropicProvider {
         } else {
             system_prompt
         };
-        tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic streaming API request");
+
+        // Extended thinking support: force temperature=1.0 and raise max_tokens if needed
+        let (effective_temperature, thinking_config) = match request.thinking {
+            Some(params) => {
+                tracing::info!(
+                    budget_tokens = params.budget_tokens,
+                    "Native extended thinking enabled; forcing temperature=1.0"
+                );
+                (
+                    1.0,
+                    Some(NativeThinkingConfig {
+                        kind: "enabled",
+                        budget_tokens: params.budget_tokens,
+                    }),
+                )
+            }
+            None => (temperature, None),
+        };
+        let effective_max_tokens = match &thinking_config {
+            Some(tc) if self.max_tokens < tc.budget_tokens => tc.budget_tokens,
+            _ => self.max_tokens,
+        };
+
+        tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic streaming API request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            max_tokens: self.max_tokens,
+            max_tokens: effective_max_tokens,
             system: system_prompt,
             messages,
-            temperature,
+            temperature: effective_temperature,
             tools: native_tools,
             tool_choice,
             stream: None,
+            thinking: thinking_config,
         };
 
         let req = self
@@ -896,6 +947,7 @@ impl Provider for AnthropicProvider {
             native_tool_calling: true,
             vision: true,
             prompt_caching: true,
+            extended_thinking: true,
         }
     }
 
@@ -946,6 +998,7 @@ impl Provider for AnthropicProvider {
             } else {
                 Some(&tool_specs)
             },
+            thinking: None,
         };
         self.chat(request, model, temperature).await
     }
@@ -1024,16 +1077,39 @@ impl Provider for AnthropicProvider {
             system_prompt
         };
 
-        tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic stream_chat request");
+        // Extended thinking support: force temperature=1.0 and raise max_tokens if needed
+        let (effective_temperature, thinking_config) = match request.thinking {
+            Some(params) => {
+                tracing::info!(
+                    budget_tokens = params.budget_tokens,
+                    "Native extended thinking enabled (stream); forcing temperature=1.0"
+                );
+                (
+                    1.0,
+                    Some(NativeThinkingConfig {
+                        kind: "enabled",
+                        budget_tokens: params.budget_tokens,
+                    }),
+                )
+            }
+            None => (temperature, None),
+        };
+        let effective_max_tokens = match &thinking_config {
+            Some(tc) if self.max_tokens < tc.budget_tokens => tc.budget_tokens,
+            _ => self.max_tokens,
+        };
+
+        tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic stream_chat request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            max_tokens: self.max_tokens,
+            max_tokens: effective_max_tokens,
             system: system_prompt,
             messages,
-            temperature,
+            temperature: effective_temperature,
             tools: native_tools,
             tool_choice,
             stream: Some(true),
+            thinking: thinking_config,
         };
 
         let body = Self::build_streaming_request(&native_request);
@@ -1696,6 +1772,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: None,
+            thinking: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();

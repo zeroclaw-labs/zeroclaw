@@ -26,6 +26,9 @@ pub struct ThinkingParams {
     pub max_tokens_adjustment: i64,
     /// Optional system prompt prefix injected before the existing system prompt.
     pub system_prompt_prefix: Option<String>,
+    /// Native extended thinking parameters, populated when the config enables
+    /// native thinking and the level has a `budget_tokens` value.
+    pub native_thinking: Option<zeroclaw_config::scattered_types::NativeThinkingParams>,
 }
 
 /// Parse a `/think:<level>` directive from the start of a message.
@@ -63,6 +66,7 @@ pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
                  unless explicitly asked. No preamble."
                     .into(),
             ),
+            native_thinking: None,
         },
         ThinkingLevel::Minimal => ThinkingParams {
             temperature_adjustment: -0.1,
@@ -72,16 +76,19 @@ pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
                  Prioritize speed over thoroughness."
                     .into(),
             ),
+            native_thinking: None,
         },
         ThinkingLevel::Low => ThinkingParams {
             temperature_adjustment: -0.05,
             max_tokens_adjustment: 0,
             system_prompt_prefix: Some("Keep reasoning light. Explain only when helpful.".into()),
+            native_thinking: None,
         },
         ThinkingLevel::Medium => ThinkingParams {
             temperature_adjustment: 0.0,
             max_tokens_adjustment: 0,
             system_prompt_prefix: None,
+            native_thinking: None,
         },
         ThinkingLevel::High => ThinkingParams {
             temperature_adjustment: 0.05,
@@ -91,6 +98,7 @@ pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
                  consider edge cases before answering."
                     .into(),
             ),
+            native_thinking: None,
         },
         ThinkingLevel::Max => ThinkingParams {
             temperature_adjustment: 0.1,
@@ -101,8 +109,35 @@ pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
                  and provide the most thorough analysis possible."
                     .into(),
             ),
+            native_thinking: None,
         },
     }
+}
+
+/// Convert a `ThinkingLevel` into parameters, resolving native extended
+/// thinking from the provided config.
+pub fn apply_thinking_level_with_config(
+    level: ThinkingLevel,
+    config: &ThinkingConfig,
+) -> ThinkingParams {
+    use zeroclaw_config::scattered_types::MAX_BUDGET_TOKENS;
+    let mut params = apply_thinking_level(level);
+    if config.native_thinking {
+        if let Some(budget) = config.budget_tokens_for(level) {
+            let clamped = budget.min(MAX_BUDGET_TOKENS);
+            if clamped < budget {
+                tracing::warn!(
+                    requested = budget,
+                    clamped = clamped,
+                    "budget_tokens exceeds maximum; clamping to {MAX_BUDGET_TOKENS}"
+                );
+            }
+            params.native_thinking = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+                budget_tokens: clamped,
+            });
+        }
+    }
+    params
 }
 
 /// Resolve the effective thinking level using the priority hierarchy:
@@ -123,6 +158,38 @@ pub fn resolve_thinking_level(
 /// Clamp a temperature value to the valid range `[0.0, 2.0]`.
 pub fn clamp_temperature(temp: f64) -> f64 {
     temp.clamp(0.0, 2.0)
+}
+
+pub struct ResolvedThinking {
+    pub effective_message: String,
+    pub params: ThinkingParams,
+    pub effective_temperature: f64,
+}
+
+pub fn resolve_thinking_from_message(
+    message: &str,
+    config: &ThinkingConfig,
+    base_temperature: f64,
+) -> ResolvedThinking {
+    use std::sync::Once;
+    static VALIDATE_ONCE: Once = Once::new();
+    VALIDATE_ONCE.call_once(|| config.warn_unknown_budget_keys());
+
+    let (directive, effective_message) = match parse_thinking_directive(message) {
+        Some((level, remaining)) => {
+            tracing::info!(thinking_level = ?level, "Thinking directive parsed from message");
+            (Some(level), remaining)
+        }
+        None => (None, message.to_string()),
+    };
+    let level = resolve_thinking_level(directive, None, config);
+    let params = apply_thinking_level_with_config(level, config);
+    let effective_temperature = clamp_temperature(base_temperature + params.temperature_adjustment);
+    ResolvedThinking {
+        effective_message,
+        params,
+        effective_temperature,
+    }
 }
 
 #[cfg(test)]
@@ -301,6 +368,7 @@ mod tests {
     fn resolve_inline_directive_takes_priority() {
         let config = ThinkingConfig {
             default_level: ThinkingLevel::Low,
+            ..ThinkingConfig::default()
         };
         let result =
             resolve_thinking_level(Some(ThinkingLevel::Max), Some(ThinkingLevel::High), &config);
@@ -311,6 +379,7 @@ mod tests {
     fn resolve_session_override_takes_priority_over_config() {
         let config = ThinkingConfig {
             default_level: ThinkingLevel::Low,
+            ..ThinkingConfig::default()
         };
         let result = resolve_thinking_level(None, Some(ThinkingLevel::High), &config);
         assert_eq!(result, ThinkingLevel::High);
@@ -320,6 +389,7 @@ mod tests {
     fn resolve_falls_back_to_config_default() {
         let config = ThinkingConfig {
             default_level: ThinkingLevel::Minimal,
+            ..ThinkingConfig::default()
         };
         let result = resolve_thinking_level(None, None, &config);
         assert_eq!(result, ThinkingLevel::Minimal);

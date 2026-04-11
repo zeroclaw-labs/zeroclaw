@@ -314,6 +314,7 @@ impl Provider for AzureOpenAiProvider {
             native_tool_calling: true,
             vision: true,
             prompt_caching: false,
+            extended_thinking: false,
         }
     }
 

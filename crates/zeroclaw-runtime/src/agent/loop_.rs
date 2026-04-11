@@ -560,6 +560,10 @@ async fn consume_provider_streaming_response(
         ChatRequest {
             messages,
             tools: request_tools,
+            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                .try_with(Clone::clone)
+                .ok()
+                .flatten(),
         },
         model,
         Some(temperature),
@@ -1152,6 +1156,10 @@ pub async fn run_tool_call_loop(
                             ChatRequest {
                                 messages: &prepared_messages.messages,
                                 tools: request_tools,
+                                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                    .try_with(Clone::clone)
+                                    .ok()
+                                    .flatten(),
                             },
                             active_model,
                             Some(temperature),
@@ -1174,6 +1182,10 @@ pub async fn run_tool_call_loop(
                 ChatRequest {
                     messages: &prepared_messages.messages,
                     tools: request_tools,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
                 },
                 active_model,
                 Some(temperature),
@@ -2012,6 +2024,10 @@ pub async fn run_tool_call_loop(
     let summary_request = zeroclaw_providers::ChatRequest {
         messages: history,
         tools: None, // No tools — force a text response
+        thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .try_with(Clone::clone)
+            .ok()
+            .flatten(),
     };
     match provider
         .chat(summary_request, model, Some(temperature))
@@ -2494,24 +2510,15 @@ pub async fn run(
     let base_system_prompt = system_prompt.clone();
 
     if let Some(msg) = message {
-        // ── Parse thinking directive from user message ─────────
-        let (thinking_directive, effective_msg) =
-            match crate::agent::thinking::parse_thinking_directive(&msg) {
-                Some((level, remaining)) => {
-                    tracing::info!(thinking_level = ?level, "Thinking directive parsed from message");
-                    (Some(level), remaining)
-                }
-                None => (None, msg.clone()),
-            };
-        let thinking_level = crate::agent::thinking::resolve_thinking_level(
-            thinking_directive,
-            None,
+        // ── Resolve thinking directive from user message ─────────
+        let resolved = crate::agent::thinking::resolve_thinking_from_message(
+            &msg,
             &config.agent.thinking,
+            temperature,
         );
-        let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
-        let effective_temperature = crate::agent::thinking::clamp_temperature(
-            temperature + thinking_params.temperature_adjustment,
-        );
+        let effective_msg = resolved.effective_message;
+        let thinking_params = resolved.params;
+        let effective_temperature = resolved.effective_temperature;
 
         // Prepend thinking system prompt prefix when present.
         if let Some(ref prefix) = thinking_params.system_prompt_prefix {
@@ -2578,37 +2585,40 @@ pub async fn run(
         #[allow(unused_assignments)]
         let mut response = String::new();
         loop {
-            match TOOL_LOOP_COST_TRACKING_CONTEXT
+            match zeroclaw_api::NATIVE_THINKING_OVERRIDE
                 .scope(
-                    cost_tracking_context.clone(),
-                    run_tool_call_loop(
-                        provider.as_ref(),
-                        &mut history,
-                        &tools_registry,
-                        observer.as_ref(),
-                        &provider_name,
-                        &model_name,
-                        effective_temperature,
-                        false,
-                        approval_manager.as_ref(),
-                        channel_name,
-                        None,
-                        &config.multimodal,
-                        config.agent.max_tool_iterations,
-                        None,
-                        None,
-                        None,
-                        &excluded_tools,
-                        &config.agent.tool_call_dedup_exempt,
-                        activated_handle.as_ref(),
-                        Some(model_switch_callback.clone()),
-                        &config.pacing,
-                        config.agent.max_tool_result_chars,
-                        config.agent.max_context_tokens,
-                        None, // shared_budget
-                        None, // channel: CLI mode — uses prompt_cli
-                        None, // receipt_generator
-                        None, // collected_receipts
+                    thinking_params.native_thinking,
+                    TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                        cost_tracking_context.clone(),
+                        run_tool_call_loop(
+                            provider.as_ref(),
+                            &mut history,
+                            &tools_registry,
+                            observer.as_ref(),
+                            &provider_name,
+                            &model_name,
+                            effective_temperature,
+                            false,
+                            approval_manager.as_ref(),
+                            channel_name,
+                            None,
+                            &config.multimodal,
+                            config.agent.max_tool_iterations,
+                            None,
+                            None,
+                            None,
+                            &excluded_tools,
+                            &config.agent.tool_call_dedup_exempt,
+                            activated_handle.as_ref(),
+                            Some(model_switch_callback.clone()),
+                            &config.pacing,
+                            config.agent.max_tool_result_chars,
+                            config.agent.max_context_tokens,
+                            None, // shared_budget
+                            None, // channel: CLI mode — uses prompt_cli
+                            None, // receipt_generator
+                            None, // collected_receipts
+                        ),
                     ),
                 )
                 .await
@@ -2774,24 +2784,15 @@ pub async fn run(
                 _ => {}
             }
 
-            // ── Parse thinking directive from interactive input ───
-            let (thinking_directive, effective_input) =
-                match crate::agent::thinking::parse_thinking_directive(&user_input) {
-                    Some((level, remaining)) => {
-                        tracing::info!(thinking_level = ?level, "Thinking directive parsed");
-                        (Some(level), remaining)
-                    }
-                    None => (None, user_input.clone()),
-                };
-            let thinking_level = crate::agent::thinking::resolve_thinking_level(
-                thinking_directive,
-                None,
+            // ── Resolve thinking directive from interactive input ───
+            let resolved = crate::agent::thinking::resolve_thinking_from_message(
+                &user_input,
                 &config.agent.thinking,
+                temperature,
             );
-            let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
-            let turn_temperature = crate::agent::thinking::clamp_temperature(
-                temperature + thinking_params.temperature_adjustment,
-            );
+            let effective_input = resolved.effective_message;
+            let thinking_params = resolved.params;
+            let turn_temperature = resolved.effective_temperature;
 
             // For non-Medium levels, temporarily patch the system prompt with prefix.
             let turn_system_prompt;
@@ -2890,37 +2891,40 @@ pub async fn run(
             });
 
             let response = loop {
-                match TOOL_LOOP_COST_TRACKING_CONTEXT
+                match zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .scope(
-                        cost_tracking_context.clone(),
-                        run_tool_call_loop(
-                            provider.as_ref(),
-                            &mut history,
-                            &tools_registry,
-                            observer.as_ref(),
-                            &provider_name,
-                            &model_name,
-                            turn_temperature,
-                            true,
-                            approval_manager.as_ref(),
-                            channel_name,
-                            None,
-                            &config.multimodal,
-                            config.agent.max_tool_iterations,
-                            Some(cancel_token.clone()),
-                            Some(delta_tx.clone()),
-                            None,
-                            &excluded_tools,
-                            &config.agent.tool_call_dedup_exempt,
-                            activated_handle.as_ref(),
-                            Some(model_switch_callback.clone()),
-                            &config.pacing,
-                            config.agent.max_tool_result_chars,
-                            config.agent.max_context_tokens,
-                            None, // shared_budget
-                            None, // channel: interactive CLI — uses prompt_cli
-                            None, // receipt_generator
-                            None, // collected_receipts
+                        thinking_params.native_thinking,
+                        TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                            cost_tracking_context.clone(),
+                            run_tool_call_loop(
+                                provider.as_ref(),
+                                &mut history,
+                                &tools_registry,
+                                observer.as_ref(),
+                                &provider_name,
+                                &model_name,
+                                turn_temperature,
+                                true,
+                                approval_manager.as_ref(),
+                                channel_name,
+                                None,
+                                &config.multimodal,
+                                config.agent.max_tool_iterations,
+                                Some(cancel_token.clone()),
+                                Some(delta_tx.clone()),
+                                None,
+                                &excluded_tools,
+                                &config.agent.tool_call_dedup_exempt,
+                                activated_handle.as_ref(),
+                                Some(model_switch_callback.clone()),
+                                &config.pacing,
+                                config.agent.max_tool_result_chars,
+                                config.agent.max_context_tokens,
+                                None, // shared_budget
+                                None, // channel: interactive CLI — uses prompt_cli
+                                None, // receipt_generator
+                                None, // collected_receipts
+                            ),
                         ),
                     )
                     .await
@@ -3376,29 +3380,20 @@ pub async fn process_message(
         system_prompt.push_str(&deferred_section);
     }
 
-    // ── Parse thinking directive from user message ─────────────
-    let (thinking_directive, effective_message) =
-        match crate::agent::thinking::parse_thinking_directive(message) {
-            Some((level, remaining)) => {
-                tracing::info!(thinking_level = ?level, "Thinking directive parsed from message");
-                (Some(level), remaining)
-            }
-            None => (None, message.to_string()),
-        };
-    let thinking_level = crate::agent::thinking::resolve_thinking_level(
-        thinking_directive,
-        None,
+    // ── Resolve thinking directive from user message ─────────────
+    let base_temperature = config
+        .providers
+        .fallback_provider()
+        .and_then(|e| e.temperature)
+        .unwrap_or(0.7);
+    let resolved = crate::agent::thinking::resolve_thinking_from_message(
+        message,
         &config.agent.thinking,
+        base_temperature,
     );
-    let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
-    let effective_temperature = crate::agent::thinking::clamp_temperature(
-        config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.temperature)
-            .unwrap_or(0.7)
-            + thinking_params.temperature_adjustment,
-    );
+    let effective_message = resolved.effective_message;
+    let thinking_params = resolved.params;
+    let effective_temperature = resolved.effective_temperature;
 
     // Prepend thinking system prompt prefix when present.
     if let Some(ref prefix) = thinking_params.system_prompt_prefix {
@@ -3439,27 +3434,31 @@ pub async fn process_message(
         excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
     }
 
-    agent_turn(
-        provider.as_ref(),
-        &mut history,
-        &tools_registry,
-        observer.as_ref(),
-        provider_name,
-        &model_name,
-        effective_temperature,
-        true,
-        "daemon",
-        None,
-        &config.multimodal,
-        config.agent.max_tool_iterations,
-        Some(&approval_manager),
-        &excluded_tools,
-        &config.agent.tool_call_dedup_exempt,
-        activated_handle_pm.as_ref(),
-        None,
-        None, // channel: process_message path has no channel ref
-    )
-    .await
+    zeroclaw_api::NATIVE_THINKING_OVERRIDE
+        .scope(
+            thinking_params.native_thinking,
+            agent_turn(
+                provider.as_ref(),
+                &mut history,
+                &tools_registry,
+                observer.as_ref(),
+                provider_name,
+                &model_name,
+                effective_temperature,
+                true,
+                "daemon",
+                None,
+                &config.multimodal,
+                config.agent.max_tool_iterations,
+                Some(&approval_manager),
+                &excluded_tools,
+                &config.agent.tool_call_dedup_exempt,
+                activated_handle_pm.as_ref(),
+                None,
+                None, // channel: process_message path has no channel ref
+            ),
+        )
+        .await
 }
 
 #[cfg(test)]
@@ -3963,6 +3962,7 @@ mod tests {
                 native_tool_calling: false,
                 vision: true,
                 prompt_caching: false,
+                extended_thinking: false,
             }
         }
 
@@ -4168,6 +4168,7 @@ mod tests {
                 native_tool_calling: true,
                 vision: false,
                 prompt_caching: false,
+                extended_thinking: false,
             }
         }
 

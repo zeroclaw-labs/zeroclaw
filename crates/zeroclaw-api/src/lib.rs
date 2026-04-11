@@ -38,4 +38,8 @@ tokio::task_local! {
     /// Session key for the currently active session.
     /// Set by the gateway WebSocket handler, read by SessionsCurrentTool.
     pub static TOOL_LOOP_SESSION_KEY: Option<String>;
+
+    /// Native extended thinking parameters, set by the outer orchestration
+    /// functions and read by `run_tool_call_loop` when building `ChatRequest`.
+    pub static NATIVE_THINKING_OVERRIDE: Option<crate::provider::NativeThinkingParams>;
 }
