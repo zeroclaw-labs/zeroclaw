@@ -72,9 +72,42 @@ jobs:
                   name: zeroclaw-${{ matrix.target }}
                   path: zeroclaw-${{ matrix.target }}.*
 
+    package-macos-intel:
+        name: Package macOS Intel (DMG)
+        runs-on: macos-13
+        timeout-minutes: 60
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  targets: x86_64-apple-darwin
+
+            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+            - name: Setup Node.js
+              uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4
+              with:
+                  node-version: "20"
+                  cache: npm
+                  cache-dependency-path: mission-control/package-lock.json
+
+            - name: Build packaged app
+              env:
+                  VERSION: ${{ github.ref_name }}
+              run: scripts/release/package_macos_intel.sh
+
+            - name: Upload macOS Intel package artifacts
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+              with:
+                  name: clawpilot-macos-intel
+                  path: |
+                      dist/ClawPilot-macos-intel-*.zip
+                      dist/ClawPilot-macos-intel-*.dmg
+
     publish:
         name: Publish Release
-        needs: build-release
+        needs: [build-release, package-macos-intel]
         runs-on: blacksmith-2vcpu-ubuntu-2404
         timeout-minutes: 15
         steps:
@@ -88,7 +121,7 @@ jobs:
             - name: Generate SHA256 checksums
               run: |
                   cd artifacts
-                  find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec sha256sum {} + | sed 's|  \./[^/]*/|  |' > SHA256SUMS
+                  find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' \) -exec sha256sum {} + | sed 's|  \./[^/]*/|  |' > SHA256SUMS
                   echo "Generated checksums:"
                   cat SHA256SUMS
 
