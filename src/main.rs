@@ -471,6 +471,24 @@ Examples:
         peripheral_command: zeroclaw::PeripheralCommands,
     },
 
+    /// Manage SOPs (Standard Operating Procedures)
+    #[command(long_about = "\
+Manage Standard Operating Procedures (SOPs).
+
+List, validate, and inspect SOPs defined in the workspace. SOPs are \
+reusable workflows with triggers (manual, webhook, MQTT, cron) and \
+ordered steps that can be executed manually or automatically.
+
+Examples:
+  zeroclaw sop list
+  zeroclaw sop validate
+  zeroclaw sop validate my-sop
+  zeroclaw sop show my-sop")]
+    Sop {
+        #[command(subcommand)]
+        sop_command: zeroclaw::SopCommands,
+    },
+
     /// Manage agent memory (list, get, stats, clear)
     #[command(long_about = "\
 Manage agent memory entries.
@@ -1521,6 +1539,8 @@ async fn main() -> Result<()> {
             ))
             .await
         }
+
+        Commands::Sop { sop_command } => sop::handle_command(sop_command, &config),
 
         Commands::Desktop {
             install: do_install,
