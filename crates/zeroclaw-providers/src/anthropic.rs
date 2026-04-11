@@ -926,7 +926,7 @@ impl Provider for AnthropicProvider {
         let (effective_temperature, thinking_config, effective_max_tokens) =
             self.resolve_thinking(request.thinking, temperature);
 
-        tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic streaming API request");
+        tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic non-streaming API request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: effective_max_tokens,
