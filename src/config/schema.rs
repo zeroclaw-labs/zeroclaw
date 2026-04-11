@@ -591,6 +591,13 @@ pub struct ModelProviderConfig {
     /// whose chat template rejects system messages at non-first positions.
     #[serde(default)]
     pub merge_system_into_user: bool,
+    /// Extra JSON parameters to include in OpenRouter API requests.
+    /// Merged at the top level of the request body, allowing any OpenRouter
+    /// feature (provider routing, transforms, etc.) without code changes.
+    /// Example: `provider_extra = { provider = { only = ["Anthropic"] } }`
+    /// See https://openrouter.ai/docs/provider-routing
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_extra: Option<serde_json::Value>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
