@@ -83,7 +83,7 @@ struct LineState {
 }
 
 fn build_webhook_router(state: Arc<LineState>) -> axum::Router {
-    use axum::{routing::post, Router};
+    use axum::{Router, routing::post};
     Router::new()
         .route("/line/webhook", post(handle_webhook))
         .with_state(state)
@@ -175,8 +175,7 @@ async fn handle_webhook(
                 LineGroupPolicy::Disabled => continue,
                 LineGroupPolicy::Open => {}
                 LineGroupPolicy::Mention => {
-                    let mention_span =
-                        LineChannel::find_bot_mention(msg_obj, &state.bot_user_id);
+                    let mention_span = LineChannel::find_bot_mention(msg_obj, &state.bot_user_id);
                     if mention_span.is_none() {
                         tracing::debug!(
                             "LINE: skipping group message without bot mention (userId: {})",
@@ -219,10 +218,7 @@ async fn handle_webhook(
                             if let Some(ref guard) = state.pairing {
                                 match guard.try_pair(code, user_id).await {
                                     Ok(Some(_)) => {
-                                        state
-                                            .allowed_users
-                                            .write()
-                                            .push(user_id.to_string());
+                                        state.allowed_users.write().push(user_id.to_string());
                                         tracing::info!("LINE: paired userId={user_id}");
                                         // Send confirmation via Push API (no reply token yet)
                                         // We forward a synthetic message to let the agent greet
@@ -700,7 +696,8 @@ impl Channel for LineChannel {
         );
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        self.listen_with_listener(listener, bot_info.user_id, tx).await
+        self.listen_with_listener(listener, bot_info.user_id, tx)
+            .await
     }
 
     async fn health_check(&self) -> bool {
@@ -841,10 +838,12 @@ mod tests {
     async fn spawn_webhook(
         ch: LineChannel,
         bot_user_id: &str,
-    ) -> (u16, mpsc::Receiver<ChannelMessage>, tokio::task::AbortHandle) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+    ) -> (
+        u16,
+        mpsc::Receiver<ChannelMessage>,
+        tokio::task::AbortHandle,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = mpsc::channel(16);
         let bot_id = bot_user_id.to_string();
@@ -1282,7 +1281,12 @@ mod tests {
         let tokens = Arc::clone(&ch.pending_tokens);
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
 
-        post_signed(port, "mysecret", &dm_event("Uuser", "ping", "reply-tok-abc")).await;
+        post_signed(
+            port,
+            "mysecret",
+            &dm_event("Uuser", "ping", "reply-tok-abc"),
+        )
+        .await;
         let _ = rx.recv().await;
 
         assert_eq!(
@@ -1305,8 +1309,7 @@ mod tests {
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
 
         // Unknown user — must be blocked
-        let status =
-            post_signed(port, "mysecret", &dm_event("Ustranger", "hello", "rt1")).await;
+        let status = post_signed(port, "mysecret", &dm_event("Ustranger", "hello", "rt1")).await;
         assert_eq!(status, 200); // HTTP still 200; message is silently dropped
 
         // Verify nothing arrived in rx within a short window
@@ -1327,8 +1330,7 @@ mod tests {
         );
         let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
 
-        let status =
-            post_signed(port, "mysecret", &dm_event("Uallowed", "secret", "rt2")).await;
+        let status = post_signed(port, "mysecret", &dm_event("Uallowed", "secret", "rt2")).await;
         assert_eq!(status, 200);
 
         let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
@@ -1429,7 +1431,10 @@ mod tests {
         .await;
 
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
-        assert!(result.is_err(), "group message must be dropped when policy=disabled");
+        assert!(
+            result.is_err(),
+            "group message must be dropped when policy=disabled"
+        );
         abort.abort();
     }
 
@@ -1482,7 +1487,10 @@ mod tests {
         .await;
 
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
-        assert!(result.is_err(), "group message without mention must be dropped");
+        assert!(
+            result.is_err(),
+            "group message without mention must be dropped"
+        );
         abort.abort();
     }
 
@@ -1577,8 +1585,7 @@ mod tests {
         );
         let (port, _rx, abort) = spawn_webhook(ch, "Ubot").await;
 
-        let status =
-            post_signed(port, "mysecret", &serde_json::json!({"events": []})).await;
+        let status = post_signed(port, "mysecret", &serde_json::json!({"events": []})).await;
         assert_eq!(status, 200);
         abort.abort();
     }
