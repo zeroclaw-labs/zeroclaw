@@ -34,6 +34,31 @@ Key extension points:
 - `src/runtime/traits.rs` (`RuntimeAdapter`)
 - `src/peripherals/traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
 
+## Stability Tiers
+
+Every workspace crate carries a stability tier per the Microkernel Architecture RFC.
+
+| Crate | Tier | Notes |
+|-------|------|-------|
+| `zeroclaw-api` | Experimental | Stable at v1.0.0 (formal milestone) |
+| `zeroclaw-config` | Beta | Stable at v0.8.0 |
+| `zeroclaw-providers` | Beta | — |
+| `zeroclaw-memory` | Beta | — |
+| `zeroclaw-infra` | Beta | — |
+| `zeroclaw-tool-call-parser` | Beta | Stable at v0.8.0 |
+| `zeroclaw-channels` | Experimental | Plugin migration at v1.0.0 |
+| `zeroclaw-tools` | Experimental | Plugin migration at v1.0.0 |
+| `zeroclaw-runtime` | Experimental | Agent runtime (agent loop, security, cron, SOP, skills, observability) |
+| `zeroclaw-gateway` | Experimental | Separate binary at v0.9.0 |
+| `zeroclaw-tui` | Experimental | TUI onboarding wizard |
+| `zeroclaw-plugins` | Experimental | WASM plugin system — foundation for v1.0.0 plugin ecosystem |
+| `zeroclaw-hardware` | Experimental | USB discovery, peripherals, serial |
+| `zeroclaw-macros` | Beta | Tightly coupled to config schema |
+
+**Tiers**: Stable = covered by breaking-change policy. Beta = breaking changes permitted in MINOR with changelog notes. Experimental = no stability guarantee.
+
+Tiers are promoted, never demoted, through deliberate team decision.
+
 ## Repository Map
 
 - `src/main.rs` — CLI entrypoint and command routing

@@ -1,0 +1,28 @@
+[package]
+name = "zeroclaw-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Memory backends, embeddings, consolidation, and retrieval for ZeroClaw."
+publish = false
+
+[dependencies]
+zeroclaw-api.workspace = true
+zeroclaw-config = { workspace = true, default-features = true }
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+parking_lot = "0.12"
+regex = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha2 = "0.10"
+tokio = { version = "1.50", default-features = false, features = ["fs", "sync", "time"] }
+tracing = { version = "0.1", default-features = false }
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+
+[dev-dependencies]
+tempfile = "3.26"
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
