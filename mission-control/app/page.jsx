@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
-import { ActivityPanel } from "@/components/activity-panel";
+import { WORKFLOW_PRESETS, buildGoalFromPreset, getWorkflowPreset } from "@/lib/workflow-presets";
 
 const POLL_MS = 2000;
 
@@ -65,12 +65,12 @@ export default function Page() {
   return (
     <main className="page">
       <header className="hero">
-        <h1>Mission Control</h1>
-        <p>Phase 2 runtime bridge (live runtime-backed runs).</p>
+        <h1>ClawPilot Workbench</h1>
+        <p>Workspace-first knowledge workflows with runtime runs, approvals, and deliverables.</p>
       </header>
 
       <section className="panel" id="workspace">
-        <h2>1) Choose workspace</h2>
+        <h2>1) Select workspace</h2>
         <WorkspacePicker
           workspaces={dashboard.workspaces}
           activeWorkspace={dashboard.activeWorkspace}
@@ -80,7 +80,7 @@ export default function Page() {
       </section>
 
       <section className="panel" id="goal">
-        <h2>2) Enter goal and create real run</h2>
+        <h2>2) Pick or type a goal</h2>
         {dashboard.activeWorkspace ? (
           <RunComposer
             workspace={dashboard.activeWorkspace}
@@ -94,8 +94,8 @@ export default function Page() {
         )}
       </section>
 
-      <section className="panel" id="runtime">
-        <h2>3) Live runtime status</h2>
+      <section className="panel" id="progress">
+        <h2>3) Monitor progress</h2>
         <RunStatusPanel
           runId={activeRunId}
           state={runState}
@@ -127,8 +127,6 @@ export default function Page() {
           />
         </section>
       )}
-
-      <ActivityPanel />
     </main>
   );
 }
@@ -180,9 +178,41 @@ function WorkspacePicker({ workspaces, activeWorkspace, onCreate, onSetActive })
 }
 
 function RunComposer({ workspace, folderInstructions, onCreateGoal, onRunCreated, goals }) {
+  const [presetId, setPresetId] = useState(WORKFLOW_PRESETS[0].id);
+  const [targetPath, setTargetPath] = useState("");
+  const [priorRunId, setPriorRunId] = useState("");
+  const [priorRuns, setPriorRuns] = useState([]);
   const [goal, setGoal] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+
+  const preset = getWorkflowPreset(presetId) || WORKFLOW_PRESETS[0];
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadRuns = async () => {
+      const response = await fetch("/api/runtime/runs", { cache: "no-store" });
+      if (!response.ok) return;
+      const payload = await response.json();
+      if (!cancelled) {
+        setPriorRuns(Array.isArray(payload.runs) ? payload.runs.slice(0, 25) : []);
+      }
+    };
+
+    loadRuns();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const applyPreset = () => {
+    const nextGoal = buildGoalFromPreset({
+      presetId,
+      targetPath: targetPath.trim() || workspace.rootPath,
+      runId: priorRunId
+    });
+    setGoal(nextGoal || "");
+  };
 
   const submit = async (event) => {
     event.preventDefault();
@@ -192,13 +222,23 @@ function RunComposer({ workspace, folderInstructions, onCreateGoal, onRunCreated
     setError("");
     try {
       await onCreateGoal({ workspaceId: workspace._id, goal: goal.trim() });
+
+      const runtimeInstructions = [
+        workspace.globalInstructions || "",
+        preset.instructionTemplate,
+        priorRunId ? `Refinement anchor run: ${priorRunId}` : ""
+      ]
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .join("\n\n");
+
       const response = await fetch("/api/runtime/runs", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           goal: goal.trim(),
           workspacePath: workspace.rootPath,
-          globalInstructions: workspace.globalInstructions || "",
+          globalInstructions: runtimeInstructions,
           folderInstructions
         })
       });
@@ -220,13 +260,44 @@ function RunComposer({ workspace, folderInstructions, onCreateGoal, onRunCreated
 
   return (
     <div className="stack">
+      <article className="card">
+        <strong>Workflow presets</strong>
+        <p className="muted">Focused Phase 5 knowledge-work flows that run on today&apos;s runtime/tools.</p>
+        <div className="stack">
+          <select value={presetId} onChange={(event) => setPresetId(event.target.value)}>
+            {WORKFLOW_PRESETS.map((item) => (
+              <option key={item.id} value={item.id}>{item.value}</option>
+            ))}
+          </select>
+          <p className="muted">{preset.description}</p>
+          {preset.requiresTargetPath && (
+            <input
+              placeholder="Target folder or file path (optional, defaults to workspace root)"
+              value={targetPath}
+              onChange={(event) => setTargetPath(event.target.value)}
+            />
+          )}
+          {preset.supportsPriorDeliverable && (
+            <select value={priorRunId} onChange={(event) => setPriorRunId(event.target.value)}>
+              <option value="">Select prior run (optional)</option>
+              {priorRuns.map((run) => (
+                <option key={run.id} value={run.id}>
+                  {run.id} · {run.status || "unknown"}
+                </option>
+              ))}
+            </select>
+          )}
+          <button type="button" onClick={applyPreset}>Draft goal from preset</button>
+        </div>
+      </article>
+
       <form className="composer" onSubmit={submit}>
         <textarea
-          placeholder="Describe the real outcome you want in this workspace"
+          placeholder="Type your workspace goal or start from a workflow preset"
           value={goal}
           onChange={(e) => setGoal(e.target.value)}
         />
-        <button type="submit" disabled={busy}>{busy ? "Creating run..." : "Create runtime run"}</button>
+        <button type="submit" disabled={busy}>{busy ? "Creating run..." : "Start workspace run"}</button>
       </form>
       {error && <p className="muted">Error: {error}</p>}
       <div className="list">
@@ -268,7 +339,7 @@ function RunStatusPanel({ runId, state, events, result, fileDiffs, onRefresh }) 
   };
 
   if (!runId) {
-    return <p>No run selected yet. Create a run to stream runtime-backed status.</p>;
+    return <p>No run selected yet. Start a workspace run to monitor progress and approvals.</p>;
   }
 
   return (
@@ -281,7 +352,7 @@ function RunStatusPanel({ runId, state, events, result, fileDiffs, onRefresh }) 
       </article>
 
       <article className="card">
-        <strong>Tool events</strong>
+        <strong>Live tool activity</strong>
         {state?.tool_events?.length ? (
           <ul>
             {state.tool_events.slice(-10).map((event, index) => (
@@ -295,21 +366,8 @@ function RunStatusPanel({ runId, state, events, result, fileDiffs, onRefresh }) 
         )}
       </article>
 
-      <article className="card">
-        <strong>Changed files / artifacts</strong>
-        {state?.file_changes?.length ? (
-          <ul>
-            {state.file_changes.map((filePath) => (
-              <li key={filePath}>{filePath}</li>
-            ))}
-          </ul>
-        ) : (
-          <p className="muted">No changed files detected yet.</p>
-        )}
-      </article>
-
-      <article className="card" id="review-workbench">
-        <strong>Review workbench</strong>
+      <article className="card" id="approvals">
+        <strong>4) Review approvals</strong>
         <p className="muted">
           Pending approvals: {pendingApprovals.length} / {(state?.approvals || []).length}
         </p>
@@ -337,7 +395,7 @@ function RunStatusPanel({ runId, state, events, result, fileDiffs, onRefresh }) 
                 {approval.state === "pending_approval" && (
                   <div className="stack">
                     <textarea
-                      placeholder="Optional reviewer note (reason, requested revision, etc.)"
+                      placeholder="Optional reviewer note"
                       value={reviewNote}
                       onChange={(e) => setReviewNote(e.target.value)}
                     />
@@ -374,6 +432,31 @@ function RunStatusPanel({ runId, state, events, result, fileDiffs, onRefresh }) 
         )}
       </article>
 
+      <article className="card" id="deliverable">
+        <strong>5) Receive deliverable</strong>
+        {result ? (
+          <div className="stack">
+            <p>Status: {result.status}</p>
+            <p>{result.summary}</p>
+          </div>
+        ) : (
+          <p className="muted">Deliverable not available yet.</p>
+        )}
+      </article>
+
+      <article className="card">
+        <strong>Changed files</strong>
+        {state?.file_changes?.length ? (
+          <ul>
+            {state.file_changes.map((filePath) => (
+              <li key={filePath}>{filePath}</li>
+            ))}
+          </ul>
+        ) : (
+          <p className="muted">No changed files detected yet.</p>
+        )}
+      </article>
+
       <article className="card">
         <strong>Runtime events</strong>
         {events.length ? (
@@ -388,14 +471,6 @@ function RunStatusPanel({ runId, state, events, result, fileDiffs, onRefresh }) 
           <p className="muted">No runtime events yet.</p>
         )}
       </article>
-
-      {result && (
-        <article className="card">
-          <strong>Result</strong>
-          <p>Status: {result.status}</p>
-          <p>{result.summary}</p>
-        </article>
-      )}
     </div>
   );
 }
@@ -414,10 +489,10 @@ function GlobalInstructionsEditor({ workspace, onSave }) {
 
   return (
     <div>
-      <h2>Global Instructions</h2>
+      <h2>Workspace instructions</h2>
       <form className="composer" onSubmit={submit}>
         <textarea value={instructions} onChange={(e) => setInstructions(e.target.value)} />
-        <button type="submit">Save global instructions</button>
+        <button type="submit">Save workspace instructions</button>
       </form>
     </div>
   );
@@ -441,7 +516,7 @@ function FolderInstructionsEditor({ workspaceId, items, onSave }) {
 
   return (
     <div>
-      <h2>Folder Instructions</h2>
+      <h2>Folder instructions</h2>
       <form className="composer" onSubmit={submit}>
         <input placeholder="Folder path (e.g. src/runtime)" value={folderPath} onChange={(e) => setFolderPath(e.target.value)} />
         <textarea placeholder="Instructions for this folder" value={instructions} onChange={(e) => setInstructions(e.target.value)} />
