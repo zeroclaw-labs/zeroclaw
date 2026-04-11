@@ -5,15 +5,15 @@ import { useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 
 const entityHrefMap = {
-  task: "/#tasks",
-  pipeline: "/#pipeline",
-  memory: "/#memories",
-  agent: "/#agents",
-  calendar: "/#calendar"
+  workspace: "/#workspace",
+  goal: "/#goal",
+  progress: "/#progress",
+  artifact: "/#artifacts",
+  instruction: "/#instructions"
 };
 
 export function ActivityPanel() {
-  const entries = useQuery(api.activity.listRecentActivity, { limit: 30 }) || [];
+  const entries = useQuery(api.activity.listRecentActivity, { limit: 20 }) || [];
 
   return (
     <section className="panel" id="activity">
@@ -28,7 +28,9 @@ export function ActivityPanel() {
                 <small>{formatRelative(entry.createdAt)}</small>
                 <small className="badge">{entry.entityType}</small>
               </div>
-              <p><b>{entry.actor}</b> · {entry.summary}</p>
+              <p>
+                <b>{entry.actor}</b> · {entry.summary}
+              </p>
               <small className="muted">{entry.action}</small>
             </Link>
           );

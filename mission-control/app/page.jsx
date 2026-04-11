@@ -5,278 +5,362 @@ import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import { ActivityPanel } from "@/components/activity-panel";
 
-const stages = ["idea", "research", "outline", "draft", "review", "design", "publish"];
-const statuses = ["todo", "in_progress", "blocked", "done"];
+const progressKinds = ["info", "update", "warning", "complete"];
+const artifactTypes = ["changed_file", "artifact"];
+const artifactStatuses = ["created", "updated", "deleted"];
 
 export default function Page() {
-  const board = useQuery(api.mission.dashboard) || { tasks: [], pipeline: [], calendar: [], memories: [], agents: [] };
-  const [memoryQuery, setMemoryQuery] = useState("");
-  const filteredMemories = useQuery(api.mission.searchMemories, { query: memoryQuery }) || [];
-
   const seed = useMutation(api.mission.seed);
-  const createTask = useMutation(api.mission.createTask);
-  const updateTask = useMutation(api.mission.updateTask);
-  const upsertPipeline = useMutation(api.mission.upsertPipeline);
-  const createCalendarEvent = useMutation(api.mission.createCalendarEvent);
-  const createMemory = useMutation(api.mission.createMemory);
+  const dashboard = useQuery(api.mission.dashboard, {}) || {
+    workspaces: [],
+    activeWorkspace: null,
+    goals: [],
+    progress: [],
+    artifacts: [],
+    folderInstructions: []
+  };
+
+  const createWorkspace = useMutation(api.mission.createWorkspace);
+  const setActiveWorkspace = useMutation(api.mission.setActiveWorkspace);
+  const upsertGlobalInstructions = useMutation(api.mission.upsertGlobalInstructions);
+  const upsertFolderInstruction = useMutation(api.mission.upsertFolderInstruction);
+  const createGoal = useMutation(api.mission.createGoal);
+  const createProgressEntry = useMutation(api.mission.createProgressEntry);
+  const createArtifact = useMutation(api.mission.createArtifact);
 
   useEffect(() => {
     seed();
   }, [seed]);
 
-  const groupedTasks = useMemo(() => {
-    return statuses.reduce((acc, status) => {
-      acc[status] = board.tasks.filter((task) => task.status === status);
-      return acc;
-    }, {});
-  }, [board.tasks]);
+  const sortedProgress = useMemo(
+    () => [...dashboard.progress].sort((a, b) => b.createdAt - a.createdAt),
+    [dashboard.progress]
+  );
+
+  const sortedArtifacts = useMemo(
+    () => [...dashboard.artifacts].sort((a, b) => b.createdAt - a.createdAt),
+    [dashboard.artifacts]
+  );
 
   return (
     <main className="page">
       <header className="hero">
         <h1>Mission Control</h1>
-        <p>Realtime collaboration hub powered by Next.js + Convex.</p>
+        <p>Project Workspace-centered planning (Phase 1).</p>
       </header>
 
-      <section className="panel" id="tasks">
-        <h2>Task Board</h2>
-        <TaskComposer onCreate={createTask} />
-        <div className="kanban">
-          {statuses.map((status) => (
-            <div className="column" key={status}>
-              <h3>{status.replace("_", " ")}</h3>
-              {groupedTasks[status]?.map((task) => (
-                <article key={task._id} className="card">
-                  <strong>{task.title}</strong>
-                  <p>{task.description || "No description"}</p>
-                  <div className="row">
-                    <select value={task.status} onChange={(e) => updateTask({ id: task._id, status: e.target.value })}>
-                      {statuses.map((value) => (
-                        <option key={value} value={value}>{value}</option>
-                      ))}
-                    </select>
-                    <select value={task.assignee} onChange={(e) => updateTask({ id: task._id, assignee: e.target.value })}>
-                      <option value="me">me</option>
-                      <option value="you">you</option>
-                    </select>
-                  </div>
-                </article>
-              ))}
-            </div>
-          ))}
-        </div>
+      <section className="panel" id="workspace">
+        <h2>1) Choose workspace</h2>
+        <WorkspacePicker
+          workspaces={dashboard.workspaces}
+          activeWorkspace={dashboard.activeWorkspace}
+          onCreate={createWorkspace}
+          onSetActive={setActiveWorkspace}
+        />
       </section>
 
-      <section className="panel" id="pipeline">
-        <h2>Content Pipeline</h2>
-        <PipelineComposer onSave={upsertPipeline} />
-        <div className="grid">
-          {stages.map((stage) => (
-            <div className="column" key={stage}>
-              <h3>{stage}</h3>
-              {board.pipeline.filter((item) => item.stage === stage).map((item) => (
-                <article key={item._id} className="card">
-                  <strong>{item.title}</strong>
-                  <p><b>Owner:</b> {item.owner}</p>
-                  <p>{item.brief || "No brief"}</p>
-                  <details>
-                    <summary>Script</summary>
-                    <pre>{item.script || "No script yet"}</pre>
-                  </details>
-                  {item.imageUrls.length > 0 && <p><b>Images:</b> {item.imageUrls.join(", ")}</p>}
-                </article>
-              ))}
-            </div>
-          ))}
-        </div>
+      <section className="panel" id="goal">
+        <h2>2) Enter goal</h2>
+        {dashboard.activeWorkspace ? (
+          <GoalComposer workspaceId={dashboard.activeWorkspace._id} onCreate={createGoal} goals={dashboard.goals} />
+        ) : (
+          <p>Create a workspace first.</p>
+        )}
       </section>
 
-      <section className="panel two-col">
-        <div id="calendar">
-          <h2>Calendar</h2>
-          <CalendarComposer onCreate={createCalendarEvent} />
-          {board.calendar
-            .slice()
-            .sort((a, b) => a.startAt - b.startAt)
-            .map((event) => (
-              <article key={event._id} className="card">
-                <strong>{event.title}</strong>
-                <p>{new Date(event.startAt).toLocaleString()} - {new Date(event.endAt).toLocaleString()}</p>
-                <p><b>{event.category}</b> · {event.owner}</p>
-                {event.notes && <p>{event.notes}</p>}
-              </article>
-            ))}
-        </div>
-
-        <div id="memories">
-          <h2>Memory Documents</h2>
-          <MemoryComposer onSave={createMemory} />
-          <input
-            placeholder="Search memories..."
-            value={memoryQuery}
-            onChange={(e) => setMemoryQuery(e.target.value)}
+      <section className="panel" id="progress">
+        <h2>3) Progress area</h2>
+        {dashboard.activeWorkspace ? (
+          <ProgressPanel
+            workspaceId={dashboard.activeWorkspace._id}
+            goals={dashboard.goals}
+            progress={sortedProgress}
+            onCreate={createProgressEntry}
           />
-          {filteredMemories.map((memory) => (
-            <article key={memory._id} className="card document">
-              <strong>{memory.title}</strong>
-              <p>{memory.body}</p>
-              <small>{memory.tags.join(" · ")}</small>
-            </article>
-          ))}
-        </div>
+        ) : (
+          <p>Select a workspace to track progress.</p>
+        )}
       </section>
+
+      <section className="panel" id="artifacts">
+        <h2>4) Changed files / artifacts area</h2>
+        {dashboard.activeWorkspace ? (
+          <ArtifactsPanel
+            workspaceId={dashboard.activeWorkspace._id}
+            artifacts={sortedArtifacts}
+            onCreate={createArtifact}
+          />
+        ) : (
+          <p>Select a workspace to track changed files and artifacts.</p>
+        )}
+      </section>
+
+      {dashboard.activeWorkspace && (
+        <section className="panel two-col" id="instructions">
+          <GlobalInstructionsEditor
+            workspace={dashboard.activeWorkspace}
+            onSave={upsertGlobalInstructions}
+          />
+          <FolderInstructionsEditor
+            workspaceId={dashboard.activeWorkspace._id}
+            items={dashboard.folderInstructions}
+            onSave={upsertFolderInstruction}
+          />
+        </section>
+      )}
 
       <ActivityPanel />
-
-      <section className="panel two-col">
-        <div id="agents">
-          <h2>Team Structure</h2>
-          {board.agents.map((agent) => (
-            <article key={agent._id} className="card">
-              <p className="avatar">{agent.avatar} {agent.name}</p>
-              <p><b>{agent.role}</b> · {agent.status}</p>
-              <p>{agent.responsibility}</p>
-            </article>
-          ))}
-        </div>
-        <div>
-          <h2>Digital Office</h2>
-          <div className="office">
-            {board.agents.map((agent) => (
-              <div className="desk" key={agent._id}>
-                <div className="pc">💻</div>
-                <div className="person">{agent.avatar}</div>
-                <p>{agent.name}</p>
-                <small>{agent.area}</small>
-                <small className={agent.status}>{agent.status}</small>
-              </div>
-            ))}
-          </div>
-        </div>
-      </section>
     </main>
   );
 }
 
-function TaskComposer({ onCreate }) {
-  const [title, setTitle] = useState("");
-  const [description, setDescription] = useState("");
-  const [assignee, setAssignee] = useState("you");
+function WorkspacePicker({ workspaces, activeWorkspace, onCreate, onSetActive }) {
+  const [form, setForm] = useState({ name: "", slug: "", rootPath: "", description: "" });
 
   const submit = async (event) => {
     event.preventDefault();
-    if (!title.trim()) return;
-    await onCreate({ title, description, assignee });
-    setTitle("");
-    setDescription("");
+    if (!form.name.trim() || !form.slug.trim() || !form.rootPath.trim()) return;
+    await onCreate({
+      name: form.name.trim(),
+      slug: form.slug.trim(),
+      rootPath: form.rootPath.trim(),
+      description: form.description.trim() || undefined
+    });
+    setForm({ name: "", slug: "", rootPath: "", description: "" });
   };
 
   return (
-    <form className="composer" onSubmit={submit}>
-      <input placeholder="Task title" value={title} onChange={(e) => setTitle(e.target.value)} />
-      <input placeholder="Description" value={description} onChange={(e) => setDescription(e.target.value)} />
-      <select value={assignee} onChange={(e) => setAssignee(e.target.value)}>
-        <option value="me">me</option>
-        <option value="you">you</option>
-      </select>
-      <button type="submit">Add task</button>
-    </form>
+    <div className="stack">
+      <div className="workspace-list">
+        {workspaces.map((workspace) => (
+          <button
+            key={workspace._id}
+            className={`workspace-item ${activeWorkspace?._id === workspace._id ? "active" : ""}`}
+            onClick={() => onSetActive({ workspaceId: workspace._id })}
+            type="button"
+          >
+            <strong>{workspace.name}</strong>
+            <small>{workspace.rootPath}</small>
+          </button>
+        ))}
+      </div>
+
+      <form className="composer" onSubmit={submit}>
+        <input placeholder="Workspace name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+        <input placeholder="Workspace slug" value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} />
+        <input placeholder="Workspace path" value={form.rootPath} onChange={(e) => setForm({ ...form, rootPath: e.target.value })} />
+        <input
+          placeholder="Description (optional)"
+          value={form.description}
+          onChange={(e) => setForm({ ...form, description: e.target.value })}
+        />
+        <button type="submit">Add workspace</button>
+      </form>
+    </div>
   );
 }
 
-function PipelineComposer({ onSave }) {
-  const [form, setForm] = useState({ title: "", stage: "idea", brief: "", script: "", imageUrls: "", owner: "you" });
+function GoalComposer({ workspaceId, onCreate, goals }) {
+  const [goal, setGoal] = useState("");
+
+  const submit = async (event) => {
+    event.preventDefault();
+    if (!goal.trim()) return;
+    await onCreate({ workspaceId, goal: goal.trim() });
+    setGoal("");
+  };
+
+  return (
+    <div className="stack">
+      <form className="composer" onSubmit={submit}>
+        <textarea
+          placeholder="Describe the outcome you want in this workspace"
+          value={goal}
+          onChange={(e) => setGoal(e.target.value)}
+        />
+        <button type="submit">Capture goal</button>
+      </form>
+      <div className="list">
+        {goals.length === 0 && <p>No goals yet.</p>}
+        {goals.map((item) => (
+          <article key={item._id} className="card">
+            <strong>{item.goal}</strong>
+            <p className="muted">Status: {item.status}</p>
+          </article>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ProgressPanel({ workspaceId, goals, progress, onCreate }) {
+  const [form, setForm] = useState({ goalId: "", title: "", detail: "", kind: "update" });
 
   const submit = async (event) => {
     event.preventDefault();
     if (!form.title.trim()) return;
-    await onSave({
-      title: form.title,
-      stage: form.stage,
-      brief: form.brief,
-      script: form.script,
-      imageUrls: form.imageUrls.split(",").map((value) => value.trim()).filter(Boolean),
-      owner: form.owner
+    await onCreate({
+      workspaceId,
+      goalId: form.goalId || undefined,
+      title: form.title.trim(),
+      detail: form.detail.trim() || undefined,
+      kind: form.kind
     });
-    setForm({ title: "", stage: "idea", brief: "", script: "", imageUrls: "", owner: "you" });
+    setForm({ goalId: "", title: "", detail: "", kind: "update" });
   };
 
   return (
-    <form className="composer" onSubmit={submit}>
-      <input placeholder="Content title" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
-      <select value={form.stage} onChange={(e) => setForm({ ...form, stage: e.target.value })}>
-        {stages.map((stage) => <option key={stage} value={stage}>{stage}</option>)}
-      </select>
-      <select value={form.owner} onChange={(e) => setForm({ ...form, owner: e.target.value })}>
-        <option value="me">me</option>
-        <option value="you">you</option>
-      </select>
-      <input placeholder="Brief" value={form.brief} onChange={(e) => setForm({ ...form, brief: e.target.value })} />
-      <textarea placeholder="Full script" value={form.script} onChange={(e) => setForm({ ...form, script: e.target.value })} />
-      <input placeholder="Image URLs (comma separated)" value={form.imageUrls} onChange={(e) => setForm({ ...form, imageUrls: e.target.value })} />
-      <button type="submit">Save pipeline item</button>
-    </form>
+    <div className="stack">
+      <form className="composer" onSubmit={submit}>
+        <select value={form.goalId} onChange={(e) => setForm({ ...form, goalId: e.target.value })}>
+          <option value="">No goal link</option>
+          {goals.map((goal) => (
+            <option key={goal._id} value={goal._id}>
+              {goal.goal}
+            </option>
+          ))}
+        </select>
+        <input placeholder="Progress title" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
+        <textarea placeholder="Progress detail" value={form.detail} onChange={(e) => setForm({ ...form, detail: e.target.value })} />
+        <select value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value })}>
+          {progressKinds.map((kind) => (
+            <option key={kind} value={kind}>
+              {kind}
+            </option>
+          ))}
+        </select>
+        <button type="submit">Log progress</button>
+      </form>
+
+      <div className="list">
+        {progress.length === 0 && <p>No progress yet.</p>}
+        {progress.map((entry) => (
+          <article key={entry._id} className="card">
+            <div className="row">
+              <strong>{entry.title}</strong>
+              <small className="badge">{entry.kind}</small>
+            </div>
+            {entry.detail && <p>{entry.detail}</p>}
+            <small className="muted">{new Date(entry.createdAt).toLocaleString()}</small>
+          </article>
+        ))}
+      </div>
+    </div>
   );
 }
 
-function CalendarComposer({ onCreate }) {
-  const now = new Date();
-  const defaultStart = new Date(now.getTime() + 60 * 60 * 1000).toISOString().slice(0, 16);
-  const defaultEnd = new Date(now.getTime() + 2 * 60 * 60 * 1000).toISOString().slice(0, 16);
-  const [form, setForm] = useState({ title: "", category: "cron", startAt: defaultStart, endAt: defaultEnd, owner: "you", notes: "" });
+function ArtifactsPanel({ workspaceId, artifacts, onCreate }) {
+  const [form, setForm] = useState({ path: "", artifactType: "changed_file", summary: "", status: "updated" });
 
   const submit = async (event) => {
     event.preventDefault();
-    if (!form.title.trim()) return;
-    await onCreate({ ...form, startAt: new Date(form.startAt).getTime(), endAt: new Date(form.endAt).getTime() });
-    setForm({ ...form, title: "", notes: "" });
+    if (!form.path.trim()) return;
+    await onCreate({
+      workspaceId,
+      path: form.path.trim(),
+      artifactType: form.artifactType,
+      summary: form.summary.trim() || undefined,
+      status: form.status
+    });
+    setForm({ path: "", artifactType: "changed_file", summary: "", status: "updated" });
   };
 
   return (
-    <form className="composer" onSubmit={submit}>
-      <input placeholder="Scheduled task" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
-      <select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })}>
-        <option value="cron">cron</option>
-        <option value="meeting">meeting</option>
-        <option value="delivery">delivery</option>
-        <option value="focus">focus</option>
-      </select>
-      <input type="datetime-local" value={form.startAt} onChange={(e) => setForm({ ...form, startAt: e.target.value })} />
-      <input type="datetime-local" value={form.endAt} onChange={(e) => setForm({ ...form, endAt: e.target.value })} />
-      <select value={form.owner} onChange={(e) => setForm({ ...form, owner: e.target.value })}>
-        <option value="me">me</option>
-        <option value="you">you</option>
-      </select>
-      <input placeholder="Notes" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
-      <button type="submit">Add event</button>
-    </form>
+    <div className="stack">
+      <form className="composer" onSubmit={submit}>
+        <input placeholder="File path or artifact path" value={form.path} onChange={(e) => setForm({ ...form, path: e.target.value })} />
+        <select value={form.artifactType} onChange={(e) => setForm({ ...form, artifactType: e.target.value })}>
+          {artifactTypes.map((value) => (
+            <option key={value} value={value}>
+              {value}
+            </option>
+          ))}
+        </select>
+        <select value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })}>
+          {artifactStatuses.map((value) => (
+            <option key={value} value={value}>
+              {value}
+            </option>
+          ))}
+        </select>
+        <input placeholder="Summary (optional)" value={form.summary} onChange={(e) => setForm({ ...form, summary: e.target.value })} />
+        <button type="submit">Log changed file/artifact</button>
+      </form>
+
+      <div className="list">
+        {artifacts.length === 0 && <p>No changed files/artifacts yet.</p>}
+        {artifacts.map((entry) => (
+          <article key={entry._id} className="card">
+            <div className="row">
+              <strong>{entry.path}</strong>
+              <small className="badge">{entry.status}</small>
+            </div>
+            <p className="muted">{entry.artifactType}</p>
+            {entry.summary && <p>{entry.summary}</p>}
+            <small className="muted">{new Date(entry.createdAt).toLocaleString()}</small>
+          </article>
+        ))}
+      </div>
+    </div>
   );
 }
 
-function MemoryComposer({ onSave }) {
-  const [title, setTitle] = useState("");
-  const [body, setBody] = useState("");
-  const [tags, setTags] = useState("");
+function GlobalInstructionsEditor({ workspace, onSave }) {
+  const [instructions, setInstructions] = useState(workspace.globalInstructions || "");
+
+  useEffect(() => {
+    setInstructions(workspace.globalInstructions || "");
+  }, [workspace._id, workspace.globalInstructions]);
 
   const submit = async (event) => {
     event.preventDefault();
-    if (!title.trim() || !body.trim()) return;
-    await onSave({
-      title,
-      body,
-      tags: tags.split(",").map((value) => value.trim()).filter(Boolean)
-    });
-    setTitle("");
-    setBody("");
-    setTags("");
+    await onSave({ workspaceId: workspace._id, instructions });
   };
 
   return (
-    <form className="composer" onSubmit={submit}>
-      <input placeholder="Memory title" value={title} onChange={(e) => setTitle(e.target.value)} />
-      <textarea placeholder="Memory body" value={body} onChange={(e) => setBody(e.target.value)} />
-      <input placeholder="Tags (comma separated)" value={tags} onChange={(e) => setTags(e.target.value)} />
-      <button type="submit">Save memory</button>
-    </form>
+    <div>
+      <h2>Global Instructions</h2>
+      <form className="composer" onSubmit={submit}>
+        <textarea value={instructions} onChange={(e) => setInstructions(e.target.value)} />
+        <button type="submit">Save global instructions</button>
+      </form>
+    </div>
+  );
+}
+
+function FolderInstructionsEditor({ workspaceId, items, onSave }) {
+  const [folderPath, setFolderPath] = useState("");
+  const [instructions, setInstructions] = useState("");
+
+  const submit = async (event) => {
+    event.preventDefault();
+    if (!folderPath.trim() || !instructions.trim()) return;
+    await onSave({
+      workspaceId,
+      folderPath: folderPath.trim(),
+      instructions: instructions.trim()
+    });
+    setFolderPath("");
+    setInstructions("");
+  };
+
+  return (
+    <div>
+      <h2>Folder Instructions</h2>
+      <form className="composer" onSubmit={submit}>
+        <input placeholder="Folder path (e.g. src/runtime)" value={folderPath} onChange={(e) => setFolderPath(e.target.value)} />
+        <textarea placeholder="Instructions for this folder" value={instructions} onChange={(e) => setInstructions(e.target.value)} />
+        <button type="submit">Add folder instruction</button>
+      </form>
+      <div className="list">
+        {items.length === 0 && <p>No folder instructions yet.</p>}
+        {items.map((item) => (
+          <article className="card" key={item._id}>
+            <strong>{item.folderPath}</strong>
+            <p>{item.instructions}</p>
+          </article>
+        ))}
+      </div>
+    </div>
   );
 }

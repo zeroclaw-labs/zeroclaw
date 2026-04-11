@@ -1,9 +1,17 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 
+const entityType = v.union(
+  v.literal("workspace"),
+  v.literal("goal"),
+  v.literal("progress"),
+  v.literal("artifact"),
+  v.literal("instruction")
+);
+
 const activityArgs = {
   actor: v.union(v.literal("me"), v.literal("you")),
-  entityType: v.union(v.literal("task"), v.literal("pipeline"), v.literal("memory"), v.literal("agent"), v.literal("calendar")),
+  entityType,
   entityId: v.string(),
   action: v.string(),
   summary: v.string(),
@@ -13,10 +21,9 @@ const activityArgs = {
 export const logActivity = mutation({
   args: activityArgs,
   handler: async (ctx, args) => {
-    const now = Date.now();
     return await ctx.db.insert("activity", {
       ...args,
-      createdAt: now
+      createdAt: Date.now()
     });
   }
 });
@@ -31,7 +38,7 @@ export const listRecentActivity = query({
 
 export const listActivityByEntity = query({
   args: {
-    entityType: v.union(v.literal("task"), v.literal("pipeline"), v.literal("memory"), v.literal("agent"), v.literal("calendar")),
+    entityType,
     entityId: v.string(),
     limit: v.optional(v.number())
   },

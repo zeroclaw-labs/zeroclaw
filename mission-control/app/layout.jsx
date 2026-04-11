@@ -3,7 +3,7 @@ import { ConvexClientProvider } from "@/components/convex-client";
 
 export const metadata = {
   title: "Mission Control",
-  description: "Task, content, memory, team, and calendar operations"
+  description: "Project Workspace-centered planning and execution"
 };
 
 export default function RootLayout({ children }) {
