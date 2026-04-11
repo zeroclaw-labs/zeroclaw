@@ -2664,6 +2664,245 @@ content during conversation.
 
 ---
 
+### 6C.1 Automatic Document Conversion & LLM-Readable Cache (Backend)
+
+> **Status**: Active (added 2026-04-11). Core feature for the "MoA as
+> personal assistant" experience — every document the user touches is
+> immediately searchable by the LLM without manual intervention.
+
+#### Why this exists
+
+Most files on a real user's computer are **PDF / HWP / HWPX / DOC(X) /
+XLS(X) / PPT(X)** — none of which an LLM can read directly. Without
+intervention, MoA can only see filenames, not contents. The user
+explicitly identified this as a critical bottleneck for the assistant
+experience: *"이용자가 채팅창에 첨부하여 업로드하는 문서들과 폴더연결로 연결한
+로컬 폴더내부에 저장되어있는 파일들은... 백그라운드에서 ai가 가장 인식하기
+쉽고 빠르게 내용을 검색할 수 있는 형식으로 변환하여... 저장하는 작업이
+필요합니다."*
+
+The auto-conversion subsystem closes this gap: **every uploaded /
+linked / web-fetched document is immediately persisted in
+LLM-friendly Markdown + HTML form inside the workspace, where the
+existing `content_search` (ripgrep) tool can find it on every future
+chat turn without any manual `document_process` calls.**
+
+#### Conversion engines (reused, not duplicated)
+
+The same `DocumentPipelineTool` already used by the chat upload handler
+provides three conversion engines, all routed by file extension:
+
+| Engine | Format | Cost | Source |
+|---|---|---|---|
+| `pdf-extract` (bundled Rust) | Digital PDF | Free, local | `cargo` dep |
+| Hancom DocsConverter API | HWP / HWPX / DOC / XLS / PPT and the `x` variants | Free | Operator-run server (`HANCOM_HOST` / `HANCOM_PORT` env) |
+| Upstage Document Parser API | Image PDF (scanned) | Paid (2.2× credit billing) | `ADMIN_UPSTAGE_API_KEY` env |
+
+The new auto-conversion subsystem is a **thin orchestration layer over
+those engines**. It does not reimplement any conversion logic.
+
+#### Storage layout
+
+```
+{workspace_dir}/documents_cache/
+├── <16-hex source-hash>/
+│   ├── <original_filename>.md      ← Markdown for the LLM (always)
+│   ├── <original_filename>.html    ← HTML when non-empty (preserved formatting)
+│   └── meta.json                   ← source path, mtime, size, engine, ts
+└── ...
+```
+
+`meta.json` records the source file's mtime + size at conversion time.
+Subsequent calls compare the live `stat()` against the recorded values
+and skip conversion when both match → **same file → instant cache hit,
+no re-conversion, no credit charge**. Filename stays the same per the
+user's "동일한 파일명으로" requirement; only the extension changes.
+
+For chat uploads, the upload bytes are first persisted to a stable
+content-hash path so two uploads of the same file produce the same
+cache key. For web PDFs, the download lives at a URL-hash path.
+
+```
+{workspace_dir}/uploads/<8-hex content-hash>/<original_filename>
+{workspace_dir}/web_downloads/<8-hex url-hash>/<derived_filename>.pdf
+```
+
+Because the cache lives **inside the workspace**, the existing
+`content_search` (ripgrep-backed) and `glob_search` tools find every
+converted document automatically — no new index, no new RAG layer.
+
+#### Three automatic trigger points
+
+1. **Chat upload** — `POST /api/document/process` (`src/gateway/api.rs`)
+   - Existing multipart upload handler.
+   - After the converter runs successfully, the handler computes a
+     content hash, persists the bytes to the stable upload path, calls
+     `DocumentCache::store_precomputed`, and returns `cache_id` /
+     `cache_markdown_path` / `stable_source_path` in the JSON response
+     so the frontend can reference the cached version.
+   - Failures degrade gracefully (cache write errors logged, response
+     unchanged) — never breaks the existing upload flow.
+
+2. **Folder linking** — `folder_index` LLM tool (`src/tools/folder_index.rs`)
+   - The agent calls this immediately after `workspace_folder_link`
+     ("이 폴더 연결해줘" → grant access → run `folder_index`).
+   - Recursively walks the folder (default depth 4, max 50 files per
+     call), classifies each file via `DocumentPipelineTool`, and runs
+     the converter only on entries that aren't already fresh in the
+     cache. Skips hidden directories, `node_modules`, `target`, `venv`,
+     `.venv`.
+   - **Image PDFs are NOT silently converted** — see §6C.2 below.
+
+3. **Web URL** — `web_fetch` tool (`src/tools/web_fetch.rs`)
+   - Builder method `with_workspace_dir` activates PDF auto-conversion
+     in the tool factory.
+   - When the URL path ends in `.pdf` and the workspace is configured,
+     the tool downloads the bytes (`max_response_size` enforced), runs
+     a `%PDF` magic-byte sanity check, routes through
+     `DocumentPipelineTool`, and persists via `DocumentCache`. The
+     resulting Markdown is returned to the agent in place of raw bytes.
+   - Non-PDF URLs and PDFs that fail the magic-byte check fall through
+     to the regular HTML provider chain (`nanohtml2text` / `firecrawl`
+     / `tavily`) unchanged.
+
+#### Idempotency rules (no duplicated work, no surprise charges)
+
+- **Same file uploaded twice** → identical content hash → identical
+  upload path → cache hit, no re-conversion.
+- **Same folder indexed twice** → `convert_and_cache` checks the cache
+  per file before running the converter; only files added or modified
+  since the previous run cost anything.
+- **Same PDF URL fetched twice** → identical URL hash → identical
+  download path → cache hit, no second download.
+
+#### Connection to the §6C frontend editor
+
+The 2-layer DocumentEditor (`DocumentViewer` + `TiptapEditor`) and the
+backend cache are complementary:
+
+- **Backend cache (this section, §6C.1)** — runs automatically in the
+  background so the LLM can search every document the user touches.
+  Output lives in `{workspace}/documents_cache/`.
+- **Frontend editor (§6C above)** — runs interactively when the user
+  opens a document for editing. Output lives in `~/.moa/documents/`.
+
+The frontend can load a cached `.md` from `documents_cache` into the
+TiptapEditor for editing without re-converting; the agent and the user
+share the same canonical Markdown. Future work: a single
+`/api/documents/<cache_id>` endpoint that serves either copy.
+
+### 6C.2 Image-PDF Consent Flow (User-Visible Dialog)
+
+> Image PDFs always cost credits (Upstage OCR, 2.2× billing). MoA must
+> never silently OCR a folder full of scanned PDFs and burn through
+> the user's balance. The `folder_index` tool runs in **two passes**:
+
+#### First pass: convert non-image, collect image-PDFs for consent
+
+```
+LLM: workspace_folder_link("~/Documents/work")        // grant access
+LLM: folder_index({ folder: "/Users/me/Documents/work" })
+
+  Internal:
+  ├─ Recursive walk → [report.pdf, contract.docx, scan_a.pdf, scan_b.pdf, ...]
+  ├─ contract.docx     → Hancom convert → cached ✅ (immediate)
+  ├─ digital_report.pdf → pdf-extract  → cached ✅ (immediate)
+  ├─ scan_a.pdf  → classify_only → image_pdf → pending_consent ⏸
+  ├─ scan_b.pdf  → classify_only → image_pdf → pending_consent ⏸
+  └─ Returns:
+     {
+       "converted": 2,
+       "pending_consent": [
+         { "path": "/Users/me/Documents/work/scan_a.pdf",
+           "size_bytes": 524288, "estimated_credits": 30 },
+         { "path": "/Users/me/Documents/work/scan_b.pdf",
+           "size_bytes": 1048576, "estimated_credits": 60 }
+       ],
+       "consent_required": true,
+       "consent_total_estimated_credits": 90,
+       "consent_message": "OCR이 필요한 이미지 PDF 2개가 발견되었습니다.\n
+                            AI가 검색하고 위 문서를 읽기 위해서는 ...
+                            (총 예상 크레딧 차감: ~90 크레딧)\n
+                            대상 파일:\n
+                              - scan_a.pdf (~30 크레딧)\n
+                              - scan_b.pdf (~60 크레딧)\n
+                            동의하시나요? '동의합니다' 또는 'yes'라고 답해주세요.\n
+                            ──────────────\n
+                            2 image PDF(s) need OCR conversion (total ~90 credits via Upstage). Reply 'yes' to convert."
+     }
+```
+
+The agent surfaces `consent_message` verbatim to the user as a chat
+dialog. The message is **bilingual** (Korean + English) so non-Korean
+users can also understand the credit cost before agreeing.
+
+#### Second pass: user agrees, agent retries with explicit allowlist
+
+```
+User:  "동의합니다"
+LLM:   folder_index({
+         folder: "/Users/me/Documents/work",
+         consent_granted_image_pdfs: [
+           "/Users/me/Documents/work/scan_a.pdf",
+           "/Users/me/Documents/work/scan_b.pdf"
+         ]
+       })
+
+  Internal:
+  ├─ contract.docx     → cache hit, skip
+  ├─ digital_report.pdf → cache hit, skip
+  ├─ scan_a.pdf → image_pdf detected → in consent allowlist → convert ✅
+  ├─ scan_b.pdf → image_pdf detected → in consent allowlist → convert ✅
+  └─ Returns: { "converted": 2, "cached": 2,
+                "pending_consent": [], "consent_required": false }
+```
+
+Per-file consent (the user agreed only to *some* of the image PDFs)
+is supported by passing only the approved paths in
+`consent_granted_image_pdfs`; non-listed image PDFs remain skipped
+even on the second pass.
+
+The legacy `skip_image_pdfs: false` argument still works as a blanket
+override for power users who want every image PDF in the tree
+converted without an explicit allowlist.
+
+### 6C.3 Component Map (Backend Auto-Conversion)
+
+| Component | File | Responsibility |
+|---|---|---|
+| `DocumentCache` | `src/services/document_cache.rs` | `convert_and_cache`, `lookup`, `store_precomputed`, `list_all`, atomic JSON metadata writes, mtime/size staleness check |
+| `FolderIndexTool` | `src/tools/folder_index.rs` | LLM-callable tool: recursive walk, per-file cache lookup, image-PDF consent flow with bilingual dialog generation |
+| `WebFetchTool::fetch_pdf_url` | `src/tools/web_fetch.rs` | URL-hash keyed PDF download + cache integration (`with_workspace_dir` builder) |
+| `handle_api_document_process` | `src/gateway/api.rs` | Multipart upload handler — adds `cache_id` / `cache_markdown_path` to the existing JSON response |
+| `DocumentPipelineTool` (existing) | `src/tools/document_pipeline.rs` | The actual conversion engines (pdf-extract, Hancom, Upstage). Untouched by this PR. |
+| `HwpxCreateTool` | `src/tools/hwpx_create.rs` | Complementary HWPX **writer** (bundled Python skill). Closes the loop: read HWPX (`document_pipeline`) + write HWPX (`hwpx_create`). |
+
+### 6C.4 What this does NOT do (deliberate non-goals)
+
+- **No file watcher.** Adding `notify` (the standard Rust file watcher
+  crate) would pull in another dep tree just to auto-detect new files
+  in linked folders. `folder_index` re-runs are essentially free
+  (cache hits cost nothing) so the user can re-index on demand. A
+  real watcher can be a follow-up PR if needed.
+- **No automatic OCR billing.** Image PDFs always require explicit
+  user consent via the two-pass flow (§6C.2). The agent must never
+  pass `skip_image_pdfs: false` without first asking the user.
+- **No content-based deduplication across cache entries.** Two
+  different files with byte-identical contents end up in two
+  different cache directories. Cheap to add later if it becomes a
+  real problem.
+- **No native Rust HWPX writer.** HWPX creation goes through the
+  bundled Python skill (`src/tools/hwpx_create.rs` +
+  `hwpx_skill/hwpx_document.py`). 359 lines of Python vs ~1,500 lines
+  of Rust for the same functionality; Python 3 is universal on the
+  Korean professional machines that need HWPX.
+- **No cache eviction.** The cache grows with the user's document
+  collection. Operators concerned about disk usage can periodically
+  clean `{workspace}/documents_cache/` and the cache will rebuild on
+  next access.
+
+---
+
 ## 7. Voice / Simultaneous Interpretation
 
 ### Goal
@@ -3463,138 +3702,18 @@ garbage and one was confirmed as a valid Cargo `bin` target:
 **Total swept**: 469 lines deleted, build still passes, all 70 dispatch
 tests still passing.
 
-### 15A.7 Document Auto-Conversion Cache (`src/services/document_cache.rs`)
+### 15A.7 Document Auto-Conversion Cache → see §6C.1
 
-> **Status**: Active. Added 2026-04-11 to make every uploaded / linked /
-> web-fetched document searchable by the LLM without manual intervention.
+> **Status**: Active. Canonical specification moved to **§6C.1
+> "Automatic Document Conversion & LLM-Readable Cache (Backend)"** so
+> it lives next to the existing §6C document-processing architecture
+> instead of being buried in the implementation-detail appendix.
 
-#### Why this exists
-
-Most files on a real user's computer are PDF / HWP / HWPX / DOC(X) /
-XLS(X) / PPT(X) — none of which an LLM can read directly. MoA already
-had `DocumentPipelineTool` (`src/tools/document_pipeline.rs`) that
-converts any of those formats into Markdown + HTML using:
-
-- bundled `pdf-extract` for digital PDFs (free, local)
-- the operator's Hancom DocsConverter server for HWP/Office (free)
-- Upstage Document Parser API for image PDFs (paid via 2.2× billing)
-
-But there was **no automatic trigger and no persistent cache** — every
-chat upload re-ran the pipeline, linked folders required the agent to
-manually call `document_process` for each file, and PDF URLs failed
-with "Unsupported content type" because `web_fetch` only handled HTML.
-
-#### What was added
-
-| File | Purpose |
-|---|---|
-| `src/services/mod.rs` | New `services/` namespace for orchestration code |
-| `src/services/document_cache.rs` | Idempotent on-disk cache: `convert_and_cache`, `lookup`, `store_precomputed`, `list_all` |
-| `src/tools/folder_index.rs` | LLM-callable tool: recursively converts every supported document inside a linked folder |
-| Modifications to `src/tools/web_fetch.rs` | PDF URL detection + auto-conversion via the cache |
-| Modifications to `src/gateway/api.rs` | `/api/document/process` now persists every upload to the cache and returns `cache_id` |
-| Modifications to `src/tools/mod.rs` | Factory wires `folder_index` and injects `workspace_dir` into `web_fetch` |
-
-**Total**: ~900 lines of new + modified code, **34 new unit tests** (11
-in document_cache, 6 in folder_index, 7 in web_fetch helpers, 10 in the
-hwpx_create tool added earlier).
-
-#### Storage layout
-
-```text
-{workspace_dir}/documents_cache/
-├── <16-hex source hash>/
-│   ├── <original_filename>.md      ← Markdown for the LLM
-│   ├── <original_filename>.html    ← Optional HTML (kept when non-empty)
-│   └── meta.json                   ← source path, mtime, size, engine, ts
-└── ...
-```
-
-`meta.json` tracks the source file's mtime + size at conversion time.
-Subsequent calls compare the live `stat()` against the recorded values
-and skip conversion when both match — same file → instant cache hit.
-
-For chat uploads, the upload bytes are first persisted to
-`{workspace}/uploads/<8-hex content hash>/<original_filename>` so two
-uploads of the same file produce the same cache key (no duplication).
-For web PDFs, the download lives at
-`{workspace}/web_downloads/<8-hex URL hash>/<derived_filename>.pdf`.
-
-Because every cached document lives **inside the workspace**, the
-existing `content_search` tool (ripgrep-backed) can search across all
-of them without any new indexing infrastructure.
-
-#### Trigger points
-
-1. **Chat upload** (`POST /api/document/process` →
-   `src/gateway/api.rs:1933`): after the converter runs, the handler
-   computes a content hash, persists the bytes to a stable upload path,
-   stores `(source_path, markdown, html, "chat-upload")` in the cache,
-   and returns `cache_id` + `cache_markdown_path` in the JSON response.
-2. **Folder linking** (`folder_index` LLM tool, `src/tools/folder_index.rs`):
-   the agent calls this immediately after `workspace_folder_link`. It
-   recursively walks the folder (default depth 4, max 50 files per call,
-   skips hidden / `node_modules` / `target`), classifies each file, and
-   runs the converter only on files that aren't already fresh in the
-   cache.
-
-   **Two-pass image-PDF consent flow** — image PDFs always cost credits
-   (Upstage OCR, 2.2× billing) so the user must approve them before
-   conversion:
-   - **First pass**: agent calls `folder_index({ folder })`. Non-image
-     documents (digital PDFs, HWP, DOC, XLS, PPT) are converted in this
-     call. Image PDFs are NOT converted; instead they are returned in
-     the response under `pending_consent: [{ path, size_bytes,
-     estimated_credits }]` along with `consent_required: true`,
-     `consent_total_estimated_credits`, and a pre-formatted bilingual
-     `consent_message` the agent can paste verbatim into the chat
-     ("OCR이 필요한 이미지 PDF N개가 발견되었습니다 ... 동의하시나요? /
-     N image PDF(s) need OCR conversion ... Reply 'yes' to convert").
-   - **Second pass**: after the user agrees, the agent re-calls
-     `folder_index({ folder, consent_granted_image_pdfs: [...] })`
-     passing the exact paths the user approved. Those files are
-     converted via Upstage OCR; non-listed image PDFs remain skipped.
-     Re-running with the same arguments is idempotent thanks to the
-     mtime/size cache check.
-
-   The legacy `skip_image_pdfs: false` argument still works as a
-   blanket override for power users who want every image PDF in the
-   tree converted without an explicit allowlist.
-3. **Web URL** (`web_fetch` tool, `src/tools/web_fetch.rs:609`): if the
-   URL path ends in `.pdf` and the workspace was injected at construction
-   time, the tool downloads the bytes (with PDF magic-byte sanity check),
-   routes through `DocumentPipelineTool`, persists via `DocumentCache`,
-   and returns Markdown to the agent. Non-PDF responses fall through to
-   the regular HTML provider chain unchanged.
-
-#### Idempotency rules
-
-- **Same file uploaded twice** → identical content hash → identical
-  upload path → cache hit, no re-conversion.
-- **Same folder indexed twice** → `convert_and_cache` per file checks
-  the cache first, only converts files added or modified since the
-  previous run.
-- **Same PDF URL fetched twice** → identical URL hash → identical
-  download path → cache hit, no second download.
-
-#### What this does NOT do (deliberate)
-
-- **No file watcher.** Adding `notify` (the standard Rust file watcher
-  crate) would pull in another dep tree just for "auto-detect new files
-  in linked folders". `folder_index` can be re-run cheaply (cache hits
-  are essentially free) so the user can re-index on demand. A real
-  watcher can be a follow-up PR if needed.
-- **No automatic OCR billing.** Image PDFs are skipped by default in
-  `folder_index` so the user is never surprised by Upstage charges. The
-  agent must explicitly pass `skip_image_pdfs: false` after disclosing
-  the cost — same consent flow as the existing `document_process` tool's
-  `classify_only` mode.
-- **No content de-duplication across cache entries.** Two different
-  files with byte-identical contents end up in two different cache
-  directories. Cheap to add later if it becomes a real problem.
-- **No native Rust HWPX writer.** HWPX creation still goes through the
-  bundled Python skill (`src/tools/hwpx_create.rs` + `hwpx_skill/`).
-  See §15A.6 reasoning.
+The full description (storage layout, three trigger points, two-pass
+image-PDF consent flow, idempotency rules, deliberate non-goals,
+component map) now lives in §6C.1, §6C.2, §6C.3 and §6C.4 above.
+This stub is kept here for changelog continuity — the feature was
+introduced 2026-04-11 alongside the other §15A entries.
 
 #### How to use the dispatch subsystem
 
