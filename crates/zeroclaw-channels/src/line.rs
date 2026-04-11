@@ -13,6 +13,8 @@ use zeroclaw_runtime::security::pairing::PairingGuard;
 type HmacSha256 = Hmac<Sha256>;
 
 const LINE_BIND_COMMAND: &str = "/bind";
+/// Maximum audio file size accepted for transcription (25 MB).
+const MAX_LINE_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 
 /// LINE Messaging API channel.
 ///
@@ -56,6 +58,10 @@ pub struct LineChannel {
     client: reqwest::Client,
     /// Base URL for the LINE Messaging API. Overrideable in tests.
     api_base_url: String,
+    /// Base URL for the LINE Content API (audio/file downloads). Overrideable in tests.
+    content_api_base_url: String,
+    /// Optional transcription manager for voice/audio messages.
+    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
 }
 
 /// Response from `GET /v2/bot/info`.
@@ -80,6 +86,48 @@ struct LineState {
     allowed_users: Arc<RwLock<Vec<String>>>,
     pairing: Option<Arc<PairingGuard>>,
     pending_tokens: Arc<RwLock<HashMap<String, String>>>,
+    /// HTTP client and credentials for downloading audio content.
+    client: reqwest::Client,
+    channel_access_token: String,
+    content_api_base_url: String,
+    /// Optional transcription manager — `None` when transcription is disabled.
+    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+}
+
+/// Download audio/voice message binary from the LINE Content API.
+///
+/// LINE stores message content at `https://api-data.line.me/v2/bot/message/{id}/content`.
+/// Audio messages are typically M4A (`audio/x-m4a`).
+async fn download_audio_content(
+    client: &reqwest::Client,
+    content_api_base_url: &str,
+    channel_access_token: &str,
+    message_id: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let url = format!("{content_api_base_url}/v2/bot/message/{message_id}/content");
+    let resp = client
+        .get(&url)
+        .bearer_auth(channel_access_token)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        anyhow::bail!("LINE: audio download failed ({status}) for message {message_id}");
+    }
+
+    let mut bytes = Vec::new();
+    let mut stream = resp;
+    while let Some(chunk) = stream.chunk().await? {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() as u64 > MAX_LINE_AUDIO_BYTES {
+            anyhow::bail!(
+                "LINE: audio exceeds {} byte limit for message {message_id}",
+                MAX_LINE_AUDIO_BYTES
+            );
+        }
+    }
+    Ok(bytes)
 }
 
 fn build_webhook_router(state: Arc<LineState>) -> axum::Router {
@@ -141,7 +189,7 @@ async fn handle_webhook(
         .as_secs();
 
     for event in &events {
-        // Only handle text message events
+        // Only handle message events (text and audio).
         if event.get("type").and_then(|t| t.as_str()) != Some("message") {
             continue;
         }
@@ -149,11 +197,57 @@ async fn handle_webhook(
             Some(m) => m,
             None => continue,
         };
-        if msg_obj.get("type").and_then(|t| t.as_str()) != Some("text") {
-            continue;
-        }
-        let text = match msg_obj.get("text").and_then(|t| t.as_str()) {
-            Some(t) if !t.trim().is_empty() => t,
+
+        let msg_type = msg_obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let msg_id = msg_obj
+            .get("id")
+            .and_then(|i| i.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Resolve message content: text directly, audio via transcription.
+        let owned_text: String;
+        let text: &str = match msg_type {
+            "text" => {
+                owned_text = match msg_obj.get("text").and_then(|t| t.as_str()) {
+                    Some(t) if !t.trim().is_empty() => t.to_string(),
+                    _ => continue,
+                };
+                &owned_text
+            }
+            "audio" => {
+                let Some(ref manager) = state.transcription_manager else {
+                    tracing::debug!("LINE: audio message ignored (transcription not configured)");
+                    continue;
+                };
+                let audio = match download_audio_content(
+                    &state.client,
+                    &state.content_api_base_url,
+                    &state.channel_access_token,
+                    &msg_id,
+                )
+                .await
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!("LINE: audio download failed for {msg_id}: {e}");
+                        continue;
+                    }
+                };
+                let transcript = match manager.transcribe(&audio, "audio.m4a").await {
+                    Ok(t) if !t.trim().is_empty() => t,
+                    Ok(_) => {
+                        tracing::debug!("LINE: empty transcript for {msg_id}");
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("LINE: transcription failed for {msg_id}: {e}");
+                        continue;
+                    }
+                };
+                owned_text = transcript;
+                &owned_text
+            }
             _ => continue,
         };
 
@@ -297,14 +391,14 @@ async fn handle_webhook(
                 .insert(recipient.clone(), token.to_string());
         }
 
-        let msg_id = msg_obj
-            .get("id")
-            .and_then(|i| i.as_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let final_msg_id = if msg_id.is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            msg_id.clone()
+        };
 
         let channel_msg = ChannelMessage {
-            id: msg_id,
+            id: final_msg_id,
             sender: user_id.to_string(),
             reply_target: recipient,
             content,
@@ -375,6 +469,8 @@ impl LineChannel {
             pending_tokens: Arc::new(RwLock::new(HashMap::new())),
             client: zeroclaw_config::schema::build_channel_proxy_client("channel.line", None),
             api_base_url: "https://api.line.me".to_string(),
+            content_api_base_url: "https://api-data.line.me".to_string(),
+            transcription_manager: None,
         }
     }
 
@@ -403,10 +499,37 @@ impl LineChannel {
         self
     }
 
+    /// Enable voice/audio transcription for incoming LINE audio messages.
+    ///
+    /// When enabled, `type = "audio"` webhook events are downloaded from the
+    /// LINE Content API and transcribed before being forwarded to the agent.
+    pub fn with_transcription(
+        mut self,
+        config: zeroclaw_config::schema::TranscriptionConfig,
+    ) -> Self {
+        if !config.enabled {
+            return self;
+        }
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(Arc::new(m));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "LINE: transcription manager init failed, audio transcription disabled: {e}"
+                );
+            }
+        }
+        self
+    }
+
     /// Override the LINE API base URL. Intended for tests.
     #[cfg(test)]
     pub(crate) fn with_api_base_url(mut self, url: &str) -> Self {
-        self.api_base_url = url.trim_end_matches('/').to_string();
+        let url = url.trim_end_matches('/').to_string();
+        // Use the same mock server for both the message API and the content API.
+        self.content_api_base_url = url.clone();
+        self.api_base_url = url;
         self
     }
 
@@ -654,6 +777,10 @@ impl LineChannel {
             allowed_users: Arc::clone(&self.allowed_users),
             pairing: self.pairing.clone(),
             pending_tokens: Arc::clone(&self.pending_tokens),
+            client: self.client.clone(),
+            channel_access_token: self.channel_access_token.clone(),
+            content_api_base_url: self.content_api_base_url.clone(),
+            transcription_manager: self.transcription_manager.clone(),
         });
 
         let app = build_webhook_router(state);
@@ -1603,6 +1730,140 @@ mod tests {
 
         let status = post_signed(port, "mysecret", &serde_json::json!({"events": []})).await;
         assert_eq!(status, 200);
+        abort.abort();
+    }
+
+    // ---- Transcription tests -----------------------------------------------
+
+    #[tokio::test]
+    async fn with_transcription_disabled_config_is_noop() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "sec".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            vec![],
+            0,
+        )
+        .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        assert!(ch.transcription_manager.is_none());
+    }
+
+    #[tokio::test]
+    async fn webhook_audio_ignored_when_transcription_not_configured() {
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            vec![],
+            0,
+        );
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        let audio_event = serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": "rt1",
+                "source": {"type": "user", "userId": "Uuser"},
+                "message": {"id": "audio001", "type": "audio", "duration": 3000}
+            }]
+        });
+        let status = post_signed(port, "mysecret", &audio_event).await;
+        assert_eq!(status, 200);
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "audio without transcription config must be ignored"
+        );
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_audio_transcribed_and_forwarded() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let api_server = MockServer::start().await;
+
+        // Mock the LINE Content API endpoint for audio download
+        Mock::given(method("GET"))
+            .and(path_regex(r"/v2/bot/message/.*/content"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("content-type", "audio/x-m4a")
+                    .set_body_bytes(b"fake-audio-bytes"),
+            )
+            .mount(&api_server)
+            .await;
+
+        // Mock the local_whisper transcription endpoint
+        let transcript = "สวัสดี นี่คือข้อความเสียง";
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": transcript})),
+            )
+            .mount(&api_server)
+            .await;
+
+        let transcription_config = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            default_provider: "local_whisper".to_string(),
+            api_key: None,
+            api_url: String::new(),
+            model: "whisper-1".to_string(),
+            language: None,
+            initial_prompt: None,
+            max_duration_secs: 120,
+            openai: None,
+            deepgram: None,
+            assemblyai: None,
+            google: None,
+            local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                url: format!("{}/v1/transcribe", api_server.uri()),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 25 * 1024 * 1024,
+                timeout_secs: 300,
+            }),
+            transcribe_non_ptt_audio: true,
+        };
+
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Open,
+            LineGroupPolicy::Open,
+            vec![],
+            0,
+        )
+        .with_api_base_url(&api_server.uri())
+        .with_transcription(transcription_config);
+
+        let (port, mut rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        let audio_event = serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": "rt1",
+                "source": {"type": "user", "userId": "Uuser"},
+                "message": {"id": "audio001", "type": "audio", "duration": 3000}
+            }]
+        });
+        post_signed(port, "mysecret", &audio_event).await;
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for transcribed message")
+            .expect("channel closed");
+
+        assert_eq!(msg.content, transcript);
+        assert_eq!(msg.sender, "Uuser");
+        assert_eq!(msg.channel, "line");
         abort.abort();
     }
 }

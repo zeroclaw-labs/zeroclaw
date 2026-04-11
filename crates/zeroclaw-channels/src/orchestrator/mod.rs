@@ -4734,7 +4734,9 @@ fn collect_configured_channels(
         if ln.enabled {
             channels.push(ConfiguredChannel {
                 display_name: "LINE",
-                channel: Arc::new(LineChannel::from_config(ln)),
+                channel: Arc::new(
+                    LineChannel::from_config(ln).with_transcription(config.transcription.clone()),
+                ),
             });
         } else {
             tracing::info!("LINE channel configured but disabled (enabled = false)");
