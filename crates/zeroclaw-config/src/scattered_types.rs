@@ -95,9 +95,10 @@ impl ThinkingConfig {
     }
 
     pub fn warn_unknown_budget_keys(&self) {
-        const VALID_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "max"];
+        use ThinkingLevel::{High, Low, Max, Medium, Minimal, Off};
+        const ALL_LEVELS: &[ThinkingLevel] = &[Off, Minimal, Low, Medium, High, Max];
         for key in self.budget_tokens.keys() {
-            if !VALID_LEVELS.contains(&key.as_str()) {
+            if !ALL_LEVELS.iter().any(|l| l.as_str() == key) {
                 tracing::warn!(
                     key = %key,
                     "Unknown thinking level in budget_tokens config; \

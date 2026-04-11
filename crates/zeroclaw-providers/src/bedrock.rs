@@ -1239,26 +1239,24 @@ impl Provider for BedrockProvider {
         let tool_config = Self::convert_tools_to_converse(request.tools);
 
         // Extended thinking support
-        let (effective_temperature, additional_fields) = match request.thinking {
-            Some(params) => {
-                tracing::info!(
-                    budget_tokens = params.budget_tokens,
-                    "Bedrock native extended thinking enabled; forcing temperature=1.0"
-                );
-                let fields = serde_json::json!({
-                    "thinking": {
-                        "type": "enabled",
-                        "budget_tokens": params.budget_tokens
-                    }
-                });
-                (1.0, Some(fields))
-            }
-            None => (temperature, None),
-        };
-        let effective_max_tokens = match request.thinking {
-            Some(params) if self.max_tokens < params.budget_tokens => params.budget_tokens,
-            _ => self.max_tokens,
-        };
+        let (effective_temperature, additional_fields, effective_max_tokens) =
+            match request.thinking {
+                Some(params) => {
+                    tracing::info!(
+                        budget_tokens = params.budget_tokens,
+                        "Bedrock native extended thinking enabled; forcing temperature=1.0"
+                    );
+                    let fields = serde_json::json!({
+                        "thinking": {
+                            "type": "enabled",
+                            "budget_tokens": params.budget_tokens
+                        }
+                    });
+                    let max_tokens = self.max_tokens.max(params.budget_tokens);
+                    (1.0, Some(fields), max_tokens)
+                }
+                None => (temperature, None, self.max_tokens),
+            };
 
         // When native thinking is active, Anthropic requires temperature=1.0 and
         // we must send it explicitly even on models that would otherwise omit it.

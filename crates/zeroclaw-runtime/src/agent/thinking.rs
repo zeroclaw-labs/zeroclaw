@@ -171,9 +171,7 @@ pub fn resolve_thinking_from_message(
     config: &ThinkingConfig,
     base_temperature: f64,
 ) -> ResolvedThinking {
-    use std::sync::Once;
-    static VALIDATE_ONCE: Once = Once::new();
-    VALIDATE_ONCE.call_once(|| config.warn_unknown_budget_keys());
+    config.warn_unknown_budget_keys();
 
     let (directive, effective_message) = match parse_thinking_directive(message) {
         Some((level, remaining)) => {

@@ -588,6 +588,35 @@ impl AnthropicProvider {
         }
     }
 
+    /// Resolve thinking parameters for an API request. Returns the effective
+    /// temperature (forced to 1.0 when thinking is active), the thinking
+    /// config for the request body, and the effective max_tokens (raised to
+    /// meet budget_tokens minimum when needed).
+    fn resolve_thinking(
+        &self,
+        thinking: Option<zeroclaw_api::provider::NativeThinkingParams>,
+        temperature: f64,
+    ) -> (f64, Option<NativeThinkingConfig>, u32) {
+        match thinking {
+            Some(params) => {
+                tracing::info!(
+                    budget_tokens = params.budget_tokens,
+                    "Native extended thinking enabled; forcing temperature=1.0"
+                );
+                let max_tokens = self.max_tokens.max(params.budget_tokens);
+                (
+                    1.0,
+                    Some(NativeThinkingConfig {
+                        kind: "enabled",
+                        budget_tokens: params.budget_tokens,
+                    }),
+                    max_tokens,
+                )
+            }
+            None => (temperature, None, self.max_tokens),
+        }
+    }
+
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "provider.anthropic",
@@ -891,27 +920,8 @@ impl Provider for AnthropicProvider {
             system_prompt
         };
 
-        // Extended thinking support: force temperature=1.0 and raise max_tokens if needed
-        let (effective_temperature, thinking_config) = match request.thinking {
-            Some(params) => {
-                tracing::info!(
-                    budget_tokens = params.budget_tokens,
-                    "Native extended thinking enabled; forcing temperature=1.0"
-                );
-                (
-                    1.0,
-                    Some(NativeThinkingConfig {
-                        kind: "enabled",
-                        budget_tokens: params.budget_tokens,
-                    }),
-                )
-            }
-            None => (temperature, None),
-        };
-        let effective_max_tokens = match &thinking_config {
-            Some(tc) if self.max_tokens < tc.budget_tokens => tc.budget_tokens,
-            _ => self.max_tokens,
-        };
+        let (effective_temperature, thinking_config, effective_max_tokens) =
+            self.resolve_thinking(request.thinking, temperature);
 
         tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic streaming API request");
         let native_request = NativeChatRequest {
@@ -1077,27 +1087,8 @@ impl Provider for AnthropicProvider {
             system_prompt
         };
 
-        // Extended thinking support: force temperature=1.0 and raise max_tokens if needed
-        let (effective_temperature, thinking_config) = match request.thinking {
-            Some(params) => {
-                tracing::info!(
-                    budget_tokens = params.budget_tokens,
-                    "Native extended thinking enabled (stream); forcing temperature=1.0"
-                );
-                (
-                    1.0,
-                    Some(NativeThinkingConfig {
-                        kind: "enabled",
-                        budget_tokens: params.budget_tokens,
-                    }),
-                )
-            }
-            None => (temperature, None),
-        };
-        let effective_max_tokens = match &thinking_config {
-            Some(tc) if self.max_tokens < tc.budget_tokens => tc.budget_tokens,
-            _ => self.max_tokens,
-        };
+        let (effective_temperature, thinking_config, effective_max_tokens) =
+            self.resolve_thinking(request.thinking, temperature);
 
         tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic stream_chat request");
         let native_request = NativeChatRequest {
