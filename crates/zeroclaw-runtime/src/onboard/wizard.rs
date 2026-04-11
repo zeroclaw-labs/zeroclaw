@@ -38,6 +38,9 @@ pub type NostrKeyValidator = Box<dyn Fn(&str) -> Result<String>>;
 
 /// Callbacks injected by the binary crate to wire wizard sections whose
 /// implementations live in downstream crates (zeroclaw-hardware, zeroclaw-channels).
+///
+/// NOTE: Transitional bridge — see RFC #5574 Phase 2 D4. This struct will be
+/// replaced when `zeroclaw onboard` integrates with `PluginRegistry::install`.
 #[derive(Default)]
 pub struct WizardCallbacks {
     /// Full interactive hardware setup flow. When `Some`, the wizard runs
@@ -5307,6 +5310,12 @@ fn setup_channels(
                             continue;
                         }
                     }
+                } else {
+                    println!(
+                        "  {} Key validation unavailable in this build — skipping",
+                        style("⚠").yellow().bold()
+                    );
+                    continue;
                 }
 
                 let default_relays = default_nostr_relays().join(",");
