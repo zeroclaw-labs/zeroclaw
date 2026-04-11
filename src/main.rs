@@ -2044,6 +2044,7 @@ async fn main() -> Result<()> {
 /// Build wizard callbacks that wire downstream crate functionality into the onboarding wizard.
 fn build_wizard_callbacks() -> onboard::WizardCallbacks {
     onboard::WizardCallbacks {
+        #[cfg(feature = "hardware")]
         hardware_setup: Some(Box::new(|| {
             use console::style;
             use dialoguer::{Confirm, Select};
@@ -2242,6 +2243,8 @@ fn build_wizard_callbacks() -> onboard::WizardCallbacks {
 
             Ok(hw_config)
         })),
+        #[cfg(not(feature = "hardware"))]
+        hardware_setup: None,
 
         #[cfg(feature = "channel-nostr")]
         nostr_validate_key: Some(Box::new(|key: &str| {
