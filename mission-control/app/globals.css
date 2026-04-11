@@ -122,3 +122,16 @@ button {
 .activity-item:hover {
   border-color: #3b6cf5;
 }
+
+pre {
+  white-space: pre-wrap;
+  overflow-x: auto;
+  background: #0b1322;
+  border: 1px solid #21314d;
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.approval-item {
+  background: #0f1b30;
+}
