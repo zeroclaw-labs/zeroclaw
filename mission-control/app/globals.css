@@ -13,6 +13,8 @@ body {
   padding: 24px;
   display: grid;
   gap: 20px;
+  max-width: 1100px;
+  margin: 0 auto;
 }
 
 .hero {
@@ -35,21 +37,13 @@ body {
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
 }
 
-.kanban,
-.grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 12px;
-}
-
-.column {
-  border: 1px solid #213252;
-  border-radius: 12px;
-  padding: 12px;
-  background: #0d1424;
+.stack,
+.list,
+.composer,
+.activity-list,
+.workspace-list {
   display: grid;
   gap: 10px;
-  align-content: start;
 }
 
 .card {
@@ -59,14 +53,20 @@ body {
   background: #111e33;
 }
 
-.document {
-  background: #142643;
+.workspace-item {
+  border: 1px solid #2e446c;
+  border-radius: 10px;
+  background: #0d1525;
+  color: #f2f5ff;
+  text-align: left;
+  padding: 10px;
+  display: grid;
+  gap: 6px;
 }
 
-.composer {
-  display: grid;
-  gap: 8px;
-  margin-bottom: 12px;
+.workspace-item.active {
+  border-color: #3b6cf5;
+  background: #132240;
 }
 
 input,
@@ -80,65 +80,15 @@ button {
   padding: 8px;
 }
 
+textarea {
+  min-height: 96px;
+}
+
 button {
   cursor: pointer;
   background: #2554d8;
   border-color: #3b6cf5;
   font-weight: 600;
-}
-
-pre {
-  white-space: pre-wrap;
-}
-
-.office {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 10px;
-}
-
-.desk {
-  border: 1px solid #2b3f5f;
-  border-radius: 10px;
-  text-align: center;
-  background: #0f1729;
-  padding: 10px;
-}
-
-.person {
-  font-size: 2rem;
-}
-
-.pc {
-  font-size: 1.25rem;
-}
-
-.working { color: #57d98b; }
-.idle { color: #ffbf47; }
-.reviewing { color: #8cb3ff; }
-
-.avatar {
-  font-size: 1.1rem;
-}
-
-.activity-list {
-  display: grid;
-  gap: 10px;
-}
-
-.activity-item {
-  display: grid;
-  gap: 6px;
-  border: 1px solid #21314d;
-  border-radius: 12px;
-  padding: 10px;
-  background: #111e33;
-  color: inherit;
-  text-decoration: none;
-}
-
-.activity-item:hover {
-  border-color: #3b6cf5;
 }
 
 .row {
@@ -156,4 +106,19 @@ pre {
 
 .muted {
   color: #9aa7c3;
+}
+
+.activity-item {
+  display: grid;
+  gap: 6px;
+  border: 1px solid #21314d;
+  border-radius: 12px;
+  padding: 10px;
+  background: #111e33;
+  color: inherit;
+  text-decoration: none;
+}
+
+.activity-item:hover {
+  border-color: #3b6cf5;
 }

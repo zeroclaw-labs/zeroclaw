@@ -1,63 +1,60 @@
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 
+const activityEntityType = v.union(
+  v.literal("workspace"),
+  v.literal("goal"),
+  v.literal("progress"),
+  v.literal("artifact"),
+  v.literal("instruction")
+);
+
 export default defineSchema({
-  tasks: defineTable({
-    title: v.string(),
+  projectWorkspaces: defineTable({
+    name: v.string(),
+    slug: v.string(),
+    rootPath: v.string(),
     description: v.optional(v.string()),
-    status: v.union(v.literal("todo"), v.literal("in_progress"), v.literal("blocked"), v.literal("done")),
-    assignee: v.union(v.literal("me"), v.literal("you")),
-    priority: v.union(v.literal("low"), v.literal("medium"), v.literal("high")),
+    globalInstructions: v.optional(v.string()),
+    active: v.boolean(),
     createdAt: v.number(),
     updatedAt: v.number()
-  }).index("by_status", ["status"]),
-  pipelineItems: defineTable({
-    title: v.string(),
-    stage: v.union(
-      v.literal("idea"),
-      v.literal("research"),
-      v.literal("outline"),
-      v.literal("draft"),
-      v.literal("review"),
-      v.literal("design"),
-      v.literal("publish")
-    ),
-    brief: v.optional(v.string()),
-    script: v.optional(v.string()),
-    imageUrls: v.array(v.string()),
-    owner: v.union(v.literal("me"), v.literal("you")),
+  })
+    .index("by_slug", ["slug"])
+    .index("by_active", ["active"]),
+  workspaceGoals: defineTable({
+    workspaceId: v.id("projectWorkspaces"),
+    goal: v.string(),
+    status: v.union(v.literal("queued"), v.literal("in_progress"), v.literal("blocked"), v.literal("done")),
+    createdAt: v.number(),
     updatedAt: v.number()
-  }).index("by_stage", ["stage"]),
-  calendarEvents: defineTable({
+  }).index("by_workspace", ["workspaceId"]),
+  workspaceProgress: defineTable({
+    workspaceId: v.id("projectWorkspaces"),
+    goalId: v.optional(v.id("workspaceGoals")),
     title: v.string(),
-    category: v.union(v.literal("meeting"), v.literal("cron"), v.literal("delivery"), v.literal("focus")),
-    startAt: v.number(),
-    endAt: v.number(),
-    owner: v.union(v.literal("me"), v.literal("you")),
-    notes: v.optional(v.string())
-  }).index("by_start", ["startAt"]),
-  memories: defineTable({
-    title: v.string(),
-    body: v.string(),
-    tags: v.array(v.string()),
+    detail: v.optional(v.string()),
+    kind: v.union(v.literal("info"), v.literal("update"), v.literal("warning"), v.literal("complete")),
     createdAt: v.number()
-  }).searchIndex("search_body", {
-    searchField: "body",
-    filterFields: ["tags"]
-  }),
-  agents: defineTable({
-    name: v.string(),
-    role: v.union(v.literal("developer"), v.literal("writer"), v.literal("designer"), v.literal("operator")),
-    responsibility: v.string(),
-    status: v.union(v.literal("working"), v.literal("idle"), v.literal("reviewing")),
-    area: v.string(),
-    avatar: v.string(),
+  }).index("by_workspace", ["workspaceId"]),
+  workspaceArtifacts: defineTable({
+    workspaceId: v.id("projectWorkspaces"),
+    path: v.string(),
+    artifactType: v.union(v.literal("changed_file"), v.literal("artifact")),
+    summary: v.optional(v.string()),
+    status: v.union(v.literal("created"), v.literal("updated"), v.literal("deleted")),
+    createdAt: v.number()
+  }).index("by_workspace", ["workspaceId"]),
+  folderInstructions: defineTable({
+    workspaceId: v.id("projectWorkspaces"),
+    folderPath: v.string(),
+    instructions: v.string(),
     updatedAt: v.number()
-  }).index("by_role", ["role"]),
+  }).index("by_workspace", ["workspaceId"]),
   activity: defineTable({
     createdAt: v.number(),
     actor: v.union(v.literal("me"), v.literal("you")),
-    entityType: v.union(v.literal("task"), v.literal("pipeline"), v.literal("memory"), v.literal("agent"), v.literal("calendar")),
+    entityType: activityEntityType,
     entityId: v.string(),
     action: v.string(),
     summary: v.string(),
