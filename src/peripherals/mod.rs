@@ -3,6 +3,7 @@
 //! Peripherals extend the agent with physical capabilities. See
 //! `docs/hardware-peripherals-design.md` for the full design.
 
+pub mod signal;
 pub mod traits;
 
 #[cfg(feature = "hardware")]

@@ -2617,6 +2617,58 @@ pub struct PeripheralBoardConfig {
     pub baud: u32,
 }
 
+// ── MQTT subscriber (IoT event ingestion via src/dispatch/) ─────────
+
+/// MQTT broker configuration for the IoT/home-automation event subscriber.
+///
+/// Used by `src/dispatch/mqtt.rs` to subscribe to broker topics and publish
+/// every received message into the global `EventRouter`. The actual
+/// subscription loop only compiles when the `mqtt` Cargo feature is enabled,
+/// but the configuration schema is unconditional so users can prepare their
+/// `config.toml` ahead of feature activation.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+pub struct MqttConfig {
+    /// Enable the MQTT subscriber loop on startup.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Broker URL: `mqtt://host:1883` (plaintext) or `mqtts://host:8883` (TLS).
+    #[serde(default)]
+    pub broker_url: String,
+    /// MQTT client identifier (must be unique per broker).
+    #[serde(default = "default_mqtt_client_id")]
+    pub client_id: String,
+    /// Topics to subscribe to (broker filter syntax: `+`, `#`, etc.).
+    #[serde(default)]
+    pub topics: Vec<String>,
+    /// Quality of Service: 0 = AtMostOnce, 1 = AtLeastOnce, 2 = ExactlyOnce.
+    #[serde(default = "default_mqtt_qos")]
+    pub qos: u8,
+    /// Keep-alive interval in seconds.
+    #[serde(default = "default_mqtt_keep_alive")]
+    pub keep_alive_secs: u64,
+    /// Optional username for broker authentication.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Optional password for broker authentication.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Force TLS regardless of URL scheme. `mqtts://` URLs already enable TLS.
+    #[serde(default)]
+    pub use_tls: bool,
+}
+
+fn default_mqtt_client_id() -> String {
+    "moa-dispatch".into()
+}
+
+fn default_mqtt_qos() -> u8 {
+    1
+}
+
+fn default_mqtt_keep_alive() -> u64 {
+    60
+}
+
 // ── Economic Agent Config ─────────────────────────────────────────
 
 /// Token pricing configuration for economic tracking.

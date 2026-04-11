@@ -3147,6 +3147,426 @@ These are **mandatory constraints**, not guidelines:
 
 ---
 
+## 15A. Implementation Details Beyond Original Spec (Code-Verified 2026-04-11)
+
+> This section documents implementation details that exist in the codebase but
+> were not captured in earlier sections of this document. A full code audit was
+> performed against sections 1–14 and the following improvements were
+> identified, verified, and confirmed to be working. **These improvements must
+> be preserved.**
+
+### 15A.1 Smart API Key Routing — Additional Safeguards
+
+Beyond the 3-tier routing in section "★ MoA Core Workflow", the code
+implements the following operational safeguards:
+
+- **Dual session TTLs** (`src/auth/store.rs`):
+  - `WEB_SESSION_TTL_SECS = 24 * 3600` — 24-hour sessions for persistent
+    browser use on mymoa.app.
+  - `HYBRID_PROXY_TOKEN_TTL_SECS = 15 * 60` — 15-minute hybrid-relay tokens
+    (intentionally short to limit token-theft exposure for the high-privilege
+    `/api/llm/proxy` capability).
+- **Session cleanup** (`src/auth/store.rs:cleanup_expired_sessions()`,
+  `cleanup_stale_devices()`): Periodic sweeps remove expired tokens and
+  devices that have been offline beyond a configurable threshold, preventing
+  auth-store bloat and reducing the window for replay attacks.
+- **Gateway rate limiting** (`src/gateway/mod.rs:GatewayRateLimiter`): sliding
+  window per-IP/user limits applied to `/api/chat`, webhook, and pairing
+  endpoints. Auto-sweep every `RATE_LIMITER_SWEEP_INTERVAL_SECS = 300` prevents
+  unbounded memory growth under adversarial load.
+- **Device response timeout** (`src/gateway/ws.rs`): when web chat relays to a
+  device that stops responding mid-stream, the web client receives an explicit
+  error instead of hanging. Keeps user-perceived latency bounded.
+- **Provider-specific key resolution order** (`src/gateway/openclaw_compat.rs:handle_api_chat()`):
+  `request.api_key` → `config.provider_api_keys[provider]` → `ADMIN_*_API_KEY`
+  env var. This is the authoritative order and must be preserved.
+
+### 15A.2 Channel Chat — Gateway Protection and Relay Enhancements
+
+Beyond the thin-gateway flow in section 1 (② Channel Chat), the code implements:
+
+- **Idempotency store** (`src/gateway/mod.rs:IdempotencyStore`): TTL-based
+  deduplication of webhook deliveries. Platforms like Kakao/Meta/Slack
+  frequently retry webhook calls on any non-200 response — this store prevents
+  double-processing the same message. Auto-eviction under memory pressure.
+- **MPSC-based relay to devices** (`src/gateway/channel_router.rs`): instead
+  of issuing a proxy token for every channel relay, the gateway uses a
+  bounded `tokio::sync::mpsc` channel per connected device. This avoids
+  per-message token issuance overhead and is measurably more efficient for
+  high-volume channels (e.g., group chats). The wire type is `channel_relay`
+  with an `autonomy_mode` field so the device enforces the same autonomy
+  contract as local app chat.
+- **ResponseCollector with chunked streaming**
+  (`src/gateway/channel_router.rs:ResponseCollector`): supports streamed
+  replies via `chunk` / `remote_chunk` wire types, terminating on `done` or
+  `remote_response`. 120-second collection timeout.
+- **Kakao-specific optimizations** (`src/channels/kakao.rs`):
+  - HMAC-SHA256 webhook signature verification with base64 decoding
+    (`verify_webhook_signature()`).
+  - `basicCard` rich response template with a `webLink` button for one-click
+    pairing (NOT `quickReplies`, which does not support web links on Kakao
+    Skill API).
+  - Non-blocking `tx.try_send()` for message forwarding — Kakao requires a
+    Skill response within 5 seconds; `send().await` risked timing out if the
+    dispatcher queue filled up.
+  - All error paths return valid Skill JSON (never bare `StatusCode`) so the
+    platform never falls back to its generic "메시지 처리 중 오류" error page.
+
+### 15A.3 Memory Sync — Key Derivation, 3-Tier Layering, and Ontology Sync
+
+Section 3 describes the high-level sync contract. The code implements:
+
+- **Key derivation via PBKDF2** (`src/security/device_binding.rs`): not HKDF
+  as originally specified. PBKDF2-HMAC-SHA256 with 100,000 iterations plus a
+  per-device hardware-fingerprint salt. This is intentionally stronger for
+  device-binding than HKDF alone because it resists cloning of the encrypted
+  key material to a different host. Symmetric encryption uses
+  ChaCha20-Poly1305.
+- **Full 3-tier sync layer implementation**:
+  - **Layer 1** (`src/sync/relay.rs`): `SyncRelay` in-memory TTL buffer
+    (`DEFAULT_TTL_SECS = 300` = 5 minutes). `HashMap`-backed, never persisted.
+    `sweep_expired()` for periodic cleanup, max 100 entries per device.
+  - **Layer 2** (`src/sync/protocol.rs`): `OrderBuffer` sequences deltas per
+    source device using version vectors. `DeltaAck` confirms delivery. Delta
+    IDs provide idempotency. Prevents out-of-order application when network
+    packets arrive non-sequentially.
+  - **Layer 3** (`src/sync/coordinator.rs`): `FullSyncManifest`-based
+    set-difference reconciliation for devices that have been offline longer
+    than the 5-minute Layer 1 TTL. Uses version-vector concurrency detection
+    (`VersionVector::dominates()`, `is_concurrent_with()`).
+- **Ontology action logs are read-only replicated**
+  (`src/memory/synced.rs:apply_remote_deltas()`): `OntologyActionLog` deltas
+  are applied as log entries on remote devices but never re-executed. This
+  prevents a malicious or compromised device from forcing other devices to
+  perform destructive actions (e.g., sending a real KakaoTalk message).
+- **Three timestamp fields on `OntologyAction`** (`src/ontology/types.rs`):
+  `occurred_at_utc` (primary cross-device sort key), `occurred_at_local`
+  (device's local timezone at recording time), `occurred_at_home` (user's
+  home timezone for consistent display). `home_timezone` is stored explicitly
+  so historical actions remain correctly localized even after the user moves.
+- **`actor_kind` field on `OntologyAction`**: distinguishes `User` /
+  `Agent` / `System` actors. Used by the rule engine to decide which rules
+  fire and by the UI to label who initiated an action.
+
+### 15A.4 Hot Memory Cache — Always-Cached Instruction Prefixes
+
+Beyond the profile/preferences caching mentioned in section 6★★, the hot
+cache (`src/memory/hot_cache.rs:HotMemoryCache`) unconditionally pins five
+instruction key prefixes regardless of recall frequency:
+
+```
+user_instruction_*       — ongoing user directives
+user_standing_order_*    — persistent behavioral rules
+user_cron_*              — scheduled recurring tasks (for the cron runner)
+user_reminder_*          — reminders the user has asked to be told about
+user_schedule_*          — time-bound schedule entries
+```
+
+This guarantees that cron ticks, heartbeats, and background agents always
+see the user's standing directives without an SQLite round trip (~5 ms →
+~0.01 ms, ~500× faster). The cache is invalidated on any `store`/`forget`
+matching the prefix, and fully refreshed every 5 minutes.
+
+### 15A.5 Webhook Signature Verification Coverage (Current State)
+
+Current HMAC/signature verification status per channel:
+
+| Channel   | Verified on incoming webhook? | Mechanism |
+|-----------|-------------------------------|-----------|
+| Kakao     | ✅                            | HMAC-SHA256 base64 |
+| Discord   | ✅                            | Ed25519 public key |
+| GitHub    | ✅                            | HMAC-SHA256 |
+| Line      | ✅                            | HMAC signature |
+| LinkedIn  | ✅                            | Custom signature |
+| Telegram  | ⚠️ URL secret (no HMAC)       | Webhook secret token in URL |
+| Slack     | ⚠️ Signing secret (partial)   | Needs verification code audit |
+| WhatsApp  | ⚠️ App-secret (partial)       | Needs verification code audit |
+| Others    | Relies on URL/token secrecy   | Recommended to add HMAC |
+
+**Action item**: Telegram, Slack, WhatsApp, and the remaining channels should
+audit their verification path and, where the platform provides an HMAC, use
+the same `verify_webhook_signature()` pattern as Kakao.
+
+### 15A.6 Generic Event Dispatch Subsystem (`src/dispatch/`)
+
+> **Status**: Active. Extracted 2026-04-11 from the unfinished SOP engine
+> per the option-A partial-extraction plan.
+
+#### Why this exists
+
+Commit `1a0e5547` (2026) introduced an 8,997-line SOP (Standard Operating
+Procedure) engine in `src/sop/` plus five agent-callable LLM tools, but the
+module was never wired into the build (`src/lib.rs` had no `pub mod sop;`
+declaration, `Config::sop` was missing, `SopCommands` CLI enum was absent,
+etc. — 11 compile errors when activated as-is).
+
+A code review concluded that the SOP **execution layer** (state machine,
+`WaitingApproval` status, step sequencing, approval gates, metrics) duplicates
+capabilities that are already covered better elsewhere in MoA:
+
+- **Approval gating** is already implemented in `src/approval/mod.rs`
+  (1,158 lines, fully active) plus `src/security/policy.rs` autonomy modes
+  (`ReadOnly` / `Supervised` / `Full`) and shell command risk scoring. SOP's
+  `gates.rs` would have duplicated these without adding capability.
+- **Sequential workflows with conditional branches** are what an LLM agent
+  loop already does natively. Encoding them in a sub-engine state machine
+  removes transparency and creates a non-local constraint on the agent.
+- **Cron scheduling** is already provided by `src/cron/`. SOP's cron triggers
+  were a thin wrapper.
+- **Metrics aggregation** has no value without the execution layer.
+
+What *is* genuinely valuable from the SOP design is its **event-source
+unification**: a single entry point that any subsystem (MQTT broker, HTTP
+webhook, cron tick, hardware peripheral) can use to publish events to a
+fan-out of registered handlers, with consistent audit logging.
+
+Instead of resurrecting the full SOP engine, the reusable substrate was
+extracted into a new generic module: **`src/dispatch/`**.
+
+#### What was extracted
+
+| New file | Lines | Origin | Purpose |
+|---|---|---|---|
+| `src/dispatch/condition.rs` | 451 | Verbatim from `src/sop/condition.rs` | JSON path + direct comparison DSL (`$.value > 85`, `> 0`) |
+| `src/dispatch/audit.rs` | 200 | Refactored from `src/sop/audit.rs` | Memory-backed event/result audit log, generic over `DispatchEvent` instead of SOP-specific `SopRun` |
+| `src/dispatch/router.rs` | 230 | New | `EventHandler` trait + `EventRouter` with handler registration and sequential fan-out |
+| `src/dispatch/types.rs` | 165 | New | `DispatchEvent`, `EventSource` (Mqtt/Webhook/Cron/Peripheral/Manual), `HandlerOutcome`, `DispatchResult` |
+| `src/dispatch/handlers.rs` | 320 | New | `NotificationHandler`, `AgentTriggerHandler`, `EventFilter` — composable standard handlers |
+| `src/dispatch/mqtt.rs` | 245 | New (gated `mqtt` feature) | rumqttc-based MQTT subscriber that publishes broker messages to the router |
+| `src/dispatch/mod.rs` | 80 | New | Public API + module documentation |
+| `src/peripherals/signal.rs` | 165 | New | `emit_signal(router, audit, board, signal, payload)` helper for hardware → dispatch bridging |
+| `src/peripherals/rpi.rs` (additions) | +110 | Additions | `watch_pins()` + `GpioWatcher` — RPi GPIO interrupt → emit_signal forwarding (Linux+rppal only) |
+
+**Total**: ~1,966 lines of new + reused code, **70 new unit tests** (63 in
+default build + 7 additional under `mqtt` feature), all passing. Wired into
+both `src/lib.rs` and `src/main.rs` as `pub mod dispatch;` and into
+`src/peripherals/mod.rs` as `pub mod signal;`.
+
+#### Standard handlers
+
+Three composable building blocks live in `src/dispatch/handlers.rs`:
+
+- **`EventFilter`** — declarative source/topic-prefix filter used by both
+  built-in handlers and easy to reuse in custom handlers.
+- **`NotificationHandler`** — sends a templated message via any
+  `Arc<dyn Channel>` when an event matches its filter. Template supports
+  `{topic}`, `{payload}`, and `{source}` substitution. Wires up in 3 lines:
+
+  ```rust
+  let h = NotificationHandler::new("doorbell", kakao_channel,
+      "user_123", "🚪 Doorbell at {topic}")
+      .with_filter(EventFilter::any().topic_prefix("rpi-gpio/doorbell"));
+  router.register(Arc::new(h));
+  ```
+
+- **`AgentTriggerHandler`** — pushes a synthetic `ChannelMessage` (silent =
+  true so it does not interrupt the user) into the agent dispatcher's
+  `tokio::sync::mpsc::Sender<ChannelMessage>`, so a hardware event can wake
+  the LLM agent loop with the event as context. Uses `try_send` to surface
+  back-pressure as `HandlerOutcome::Failed` instead of blocking the dispatch
+  thread.
+
+#### MQTT subscriber (`mqtt` feature)
+
+Enabled with `cargo build --features mqtt`. Adds the `rumqttc` dependency
+(rustls TLS, ~100KB binary cost) and exposes
+`dispatch::mqtt::run_mqtt_subscriber(config, router, audit, cancel)`. The
+loop:
+
+1. Validates `MqttConfig` (broker_url + topics required, refuses if disabled).
+2. Connects with optional username/password and TLS (auto-detected from
+   `mqtts://` scheme or forced via `use_tls = true`).
+3. Subscribes to all configured topics at the chosen QoS level.
+4. For every `PUBLISH` packet, builds a `DispatchEvent { source: Mqtt, ... }`
+   and routes it through `EventRouter::dispatch()` + `DispatchAuditLogger`.
+5. Honors a cancel future for graceful daemon shutdown.
+
+Reconnects are handled internally by `rumqttc::EventLoop::poll()`. The
+subscriber is _not_ a `Channel` trait implementor — it does not send chat
+messages, it only ingests broker events into the dispatch substrate.
+
+#### Raspberry Pi GPIO watcher
+
+`watch_pins(board, &[17, 27], router, audit)` (in `src/peripherals/rpi.rs`,
+behind `peripheral-rpi` feature on Linux) registers rppal interrupts on a
+set of BCM pins and forwards every level change as a `Peripheral` event with
+topic `{board}/pin_{n}` and payload `"0"` / `"1"`. The rppal callback runs
+on its own polling thread; we forward each event through an
+`UnboundedSender` into a tokio task that performs the (async) `emit_signal`
+call. Returns a `GpioWatcher` handle — drop it to stop watching and release
+the rppal pin handles.
+
+#### What was deliberately NOT extracted (deleted as dead code)
+
+After extracting the genuinely reusable substrate into `src/dispatch/`, the
+remaining SOP engine files were verified to be unused dead code (no module
+declarations, zero external references via `grep -rn "crate::sop" src/`)
+and were **deleted** in the same change:
+
+- `src/sop/engine.rs` (1,634 lines) — `SopEngine` execution state machine
+  (duplicates LLM agent reasoning + creates non-local control flow)
+- `src/sop/gates.rs` (746 lines) — `ampersona-gates` approval framework
+  (duplicates `src/approval/mod.rs` + `src/security/policy.rs`)
+- `src/sop/metrics.rs` (1,492 lines) — Per-SOP metrics aggregation
+  (no value without the execution engine)
+- `src/sop/dispatch.rs` (729 lines) — Engine-coupled dispatch
+  (replaced by the generic `src/dispatch/router.rs`)
+- `src/sop/audit.rs` (280 lines) — SOP-specific audit logger
+  (replaced by `src/dispatch/audit.rs`)
+- `src/sop/condition.rs` (451 lines) — Identical to the extracted version
+- `src/sop/types.rs` (470 lines) — `Sop` / `SopStep` / `SopTrigger` types
+- `src/sop/mod.rs` (816 lines) — TOML manifest loading (no engine to feed)
+- `src/tools/sop_{execute,list,status,advance,approve}.rs` (1,672 lines) —
+  Five LLM tools that all reference the deleted `SopEngine` and `SopAuditLogger`
+- `src/channels/mqtt.rs` (276 lines) — MQTT listener that exists only to
+  feed the deleted `dispatch_sop_event()`. Was also dead code: never declared
+  in `src/channels/mod.rs`, and `crate::config::MqttConfig` it imported never
+  existed in the schema.
+- `docs/sop/{README,syntax,cookbook,connectivity,observability}.md` —
+  Documentation describing the now-deleted feature
+
+**Total deleted**: ~8,566 lines of Rust + 5 markdown files. All deletions
+verified safe by `cargo check` (no compile errors) and `cargo test --lib
+dispatch` (53 tests passing) after removal.
+
+The original implementation remains accessible via `git show 1a0e5547` if a
+future contributor wants to revisit the workflow-engine concept. Resurrection
+would still require the 6 glue items listed in the previous version of this
+section (SopConfig schema, SopCommands CLI enum, etc.) — and would still
+need to justify why an explicit state machine adds value over the agent
+loop's native sequential reasoning.
+
+#### Codebase-wide dead code sweep (2026-04-11)
+
+After the SOP cleanup, an automated audit script was run against the entire
+`src/` tree to find every `.rs` file not reachable from `lib.rs` or
+`main.rs`. The audit identified five orphan files; four were deleted as
+garbage and one was confirmed as a valid Cargo `bin` target:
+
+- **Deleted** `src/providers/glm.rs` (361 lines) — Zhipu GLM provider with
+  JWT authentication. The same provider already exists in
+  `src/providers/compatible.rs` (line 2431) using the OpenAI-compatible
+  endpoint at `https://open.bigmodel.cn`. Maintaining two GLM providers
+  with no active user reports of the simpler one failing was YAGNI.
+- **Deleted** `src/plugins/hot_reload.rs` (36 lines) — Pure stub:
+  `HotReloadConfig { enabled: bool }` and a manager that did nothing. No
+  actual hot-reload logic.
+- **Deleted** `src/plugins/bridge/{mod,observer}.rs` (72 lines) —
+  `ObserverBridge` that wrapped another `Observer` and just delegated every
+  call. A useless wrapper that added no value over its inner observer.
+- **Kept** `src/bin/mcp_smoke.rs` (59 lines) — Cargo automatically discovers
+  `src/bin/*.rs` as separate binary targets, so this file is in the build
+  even though it is not in the library `mod` tree. `cargo check --bin
+  mcp_smoke` confirmed it compiles. Useful as an MCP server connectivity
+  smoke test.
+
+**Total swept**: 469 lines deleted, build still passes, all 70 dispatch
+tests still passing.
+
+#### How to use the dispatch subsystem
+
+```rust
+use std::sync::Arc;
+use zeroclaw::dispatch::{
+    DispatchAuditLogger, DispatchEvent, EventHandler, EventRouter,
+    EventSource, HandlerOutcome,
+};
+
+// 1. Build router and audit logger once at startup.
+let router = Arc::new(EventRouter::new());
+let audit = Arc::new(DispatchAuditLogger::new(memory.clone()));
+
+// 2. Register handlers (notification, agent trigger, ontology update, ...).
+struct DoorbellHandler;
+#[async_trait::async_trait]
+impl EventHandler for DoorbellHandler {
+    fn name(&self) -> &str { "doorbell_notifier" }
+    fn matches(&self, e: &DispatchEvent) -> bool {
+        e.topic.as_deref() == Some("rpi-gpio/gpio_17")
+    }
+    async fn handle(&self, _e: &DispatchEvent) -> anyhow::Result<HandlerOutcome> {
+        // send Kakao/Telegram notification, ring agent, etc.
+        Ok(HandlerOutcome::Handled { summary: "notified".into() })
+    }
+}
+router.register(Arc::new(DoorbellHandler));
+
+// 3. Hardware peripheral driver publishes a signal:
+use zeroclaw::peripherals::signal::emit_signal;
+let result = emit_signal(&router, &audit,
+    "rpi-gpio", "gpio_17", Some("1")).await?;
+```
+
+#### IoT / home automation integration story
+
+The dispatch subsystem is the foundation for MoA's IoT/home-automation
+capabilities. Hardware peripherals (STM32 boards via serial, RPi GPIO via
+the `rppal` driver, Arduino/Uno Q via the bridge) typically want to *react*
+to physical events — a doorbell ring, a temperature threshold, a motion
+sensor — without each driver hard-coding what to do about it.
+
+Before this extraction, the `Peripheral` trait only exposed `tools()`
+(commands the agent could call into the hardware). There was no clean way
+for hardware to wake the agent or notify the user when something happened.
+
+With `src/dispatch/` and `src/peripherals/signal.rs::emit_signal`, the flow is:
+
+```
+[GPIO line rises] (RPi rppal interrupt)
+        ↓
+peripheral driver calls emit_signal(router, audit,
+                                    "rpi-gpio", "gpio_17", Some("1"))
+        ↓
+DispatchEvent { source: Peripheral, topic: "rpi-gpio/gpio_17", ... }
+        ↓
+EventRouter fans out to all matching EventHandlers, sequentially
+        ↓
+Handler A: send KakaoTalk notification "Someone is at the door"
+Handler B: trigger agent loop with "vision: who is at the door?"
+Handler C: log to memory for the user's daily timeline
+        ↓
+DispatchAuditLogger persists event + result to the memory backend
+```
+
+Handlers are application-defined, so the same router can serve doorbells,
+temperature alerts, light sensors, and any future MQTT-/webhook-/cron-driven
+event without touching the dispatch core.
+
+#### What still needs to happen for full IoT autonomy
+
+The extracted module is the **event substrate** only. To deliver a complete
+IoT/home-automation experience, future work should add:
+
+1. **Standard handler implementations** — `NotificationHandler` (sends a
+   message via the channel of the user's choice), `AgentTriggerHandler`
+   (wakes the agent loop with the event as context), `OntologyHandler`
+   (records the event as an `OntologyAction`).
+2. **Peripheral driver hooks** — currently the peripheral driver code in
+   `src/peripherals/serial.rs`, `rpi.rs`, etc. does not call `emit_signal`
+   yet. Each driver should publish events when its underlying hardware
+   produces an asynchronous signal (line of serial output, GPIO interrupt,
+   etc.).
+3. **Configuration UI** — let the user define "if topic X then send
+   notification" mappings via the GUI, materialized as registered handlers
+   at startup.
+4. **MQTT and webhook glue** — call the same `EventRouter` from the existing
+   `src/channels/mqtt.rs` (when wired) and from the gateway's webhook routes
+   to unify all event sources.
+
+These are deliberate follow-up tasks; they are out of scope for the
+extraction PR but are the natural next steps.
+
+#### What this does NOT cover
+
+- **Approval/authorization** — covered by `src/approval/mod.rs` and
+  `src/security/policy.rs`. Do not duplicate.
+- **Long-running step sequencing** — agents handle this natively via LLM
+  reasoning + memory; no state machine needed.
+- **Per-workflow metrics** — out of scope; if needed later, add to the
+  observability subsystem rather than back to SOP.
+
+---
+
 ## 16. For AI Reviewers
 
 When reviewing a PR against this architecture:

@@ -51,6 +51,7 @@ pub mod coordination;
 pub(crate) mod cost;
 pub(crate) mod cron;
 pub(crate) mod daemon;
+pub mod dispatch;
 pub(crate) mod doctor;
 pub mod economic;
 pub mod gatekeeper;

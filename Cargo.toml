@@ -170,6 +170,12 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = ["
 # Serial port for peripheral communication (STM32, etc.)
 tokio-serial = { version = "5", default-features = false, optional = true }
 
+# MQTT subscriber for IoT/home-automation event ingestion via src/dispatch/.
+# Used by src/dispatch/mqtt.rs to subscribe to broker topics and publish each
+# message into the EventRouter. rustls TLS support pulls in the same backend
+# already used by reqwest, axum, and lettre — no additional TLS stack added.
+rumqttc = { version = "0.24", optional = true, default-features = false, features = ["use-rustls"] }
+
 # USB device enumeration (hardware discovery) — only on platforms nusb supports
 # (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
@@ -238,6 +244,8 @@ rag-pdf = ["dep:pdf-extract", "dep:lopdf"]
 wasm-tools = ["dep:wasmtime", "dep:wasmtime-wasi"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
+# mqtt = MQTT subscriber wired to src/dispatch/EventRouter for IoT events
+mqtt = ["dep:rumqttc"]
 # Optional provider feature flags used by cfg(feature = "...") guards.
 # Keep disabled by default to preserve current runtime behavior.
 firecrawl = []

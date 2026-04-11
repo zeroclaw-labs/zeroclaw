@@ -69,6 +69,7 @@ mod coordination;
 mod cost;
 mod cron;
 mod daemon;
+mod dispatch;
 mod doctor;
 mod gatekeeper;
 mod gateway;

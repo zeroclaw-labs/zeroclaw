@@ -3,7 +3,11 @@
 //! Only compiled when `peripheral-rpi` feature is enabled and target is Linux.
 //! Uses BCM pin numbering (e.g. GPIO 17, 27).
 
+use std::sync::Arc;
+
 use crate::config::PeripheralBoardConfig;
+use crate::dispatch::{DispatchAuditLogger, EventRouter};
+use crate::peripherals::signal::emit_signal;
 use crate::peripherals::traits::Peripheral;
 use crate::tools::{Tool, ToolResult};
 use async_trait::async_trait;
@@ -170,4 +174,91 @@ impl Tool for RpiGpioWriteTool {
             error: None,
         })
     }
+}
+
+/// Handle returned by [`watch_pins`]. Dropping the handle releases the GPIO
+/// interrupt registrations and stops the dispatch forwarding task.
+pub struct GpioWatcher {
+    /// Owned pins must outlive the interrupt callbacks.
+    _pins: Vec<rppal::gpio::InputPin>,
+    /// Cancel signal for the forwarding task.
+    _cancel: tokio::sync::oneshot::Sender<()>,
+}
+
+/// Start watching a set of BCM GPIO pins and publish every level change as a
+/// `Peripheral` dispatch event through `router` + `audit`.
+///
+/// The event topic is `{board}/pin_{n}` (e.g. `rpi-gpio/pin_17`) and the
+/// payload is `"0"` or `"1"`. Both edges are reported.
+///
+/// rppal's `set_async_interrupt` callback runs on rppal's own polling thread,
+/// so we forward each level change through an unbounded mpsc channel into a
+/// tokio task that performs the (async) `emit_signal` call. This keeps the
+/// interrupt latency tiny and avoids needing a tokio runtime handle inside
+/// the rppal thread.
+///
+/// Returns a [`GpioWatcher`] handle. Dropping it stops the forwarding task
+/// and releases the rppal pin handles (which clears the interrupts).
+pub fn watch_pins(
+    board: &str,
+    pins: &[u8],
+    router: Arc<EventRouter>,
+    audit: Arc<DispatchAuditLogger>,
+) -> anyhow::Result<GpioWatcher> {
+    use rppal::gpio::{Gpio, Level, Trigger};
+
+    let gpio = Gpio::new()?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u8, Level)>();
+    let mut owned_pins: Vec<rppal::gpio::InputPin> = Vec::with_capacity(pins.len());
+
+    for &pin_num in pins {
+        let mut input = gpio.get(pin_num)?.into_input_pullup();
+        let tx_clone = tx.clone();
+        // Both edges so we report falling and rising. Debouncing is the
+        // application's responsibility (configure via dispatch handler logic).
+        input
+            .set_async_interrupt(Trigger::Both, move |level| {
+                let _ = tx_clone.send((pin_num, level));
+            })
+            .map_err(|e| anyhow::anyhow!("failed to set interrupt on pin {pin_num}: {e}"))?;
+        owned_pins.push(input);
+    }
+    drop(tx); // forwarding task uses cloned senders held by callbacks
+
+    let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let board_owned = board.to_string();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut cancel_rx => {
+                    tracing::info!(board = %board_owned, "GPIO watcher: cancelled");
+                    break;
+                }
+                maybe = rx.recv() => {
+                    let Some((pin_num, level)) = maybe else {
+                        tracing::info!(board = %board_owned, "GPIO watcher: channel closed");
+                        break;
+                    };
+                    let payload = match level {
+                        Level::High => "1",
+                        Level::Low => "0",
+                    };
+                    let signal = format!("pin_{pin_num}");
+                    if let Err(e) = emit_signal(&router, &audit, &board_owned, &signal, Some(payload)).await {
+                        tracing::warn!(
+                            board = %board_owned,
+                            pin = pin_num,
+                            "GPIO watcher: emit_signal failed: {e}"
+                        );
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(GpioWatcher {
+        _pins: owned_pins,
+        _cancel: cancel_tx,
+    })
 }
