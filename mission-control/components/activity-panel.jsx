@@ -1,8 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useQuery } from "convex/react";
-import { api } from "@/convex/_generated/api";
+import { useEffect, useState } from "react";
 
 const entityHrefMap = {
   workspace: "/#workspace",
@@ -14,7 +13,25 @@ const entityHrefMap = {
 };
 
 export function ActivityPanel() {
-  const entries = useQuery(api.activity.listRecentActivity, { limit: 20 }) || [];
+  const [entries, setEntries] = useState([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const response = await fetch("/api/mission/activity?limit=20", { cache: "no-store" });
+      if (!response.ok) return;
+      const payload = await response.json();
+      if (!cancelled) {
+        setEntries(payload.entries || []);
+      }
+    };
+    load();
+    const timer = setInterval(load, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
 
   return (
     <section className="panel" id="activity">

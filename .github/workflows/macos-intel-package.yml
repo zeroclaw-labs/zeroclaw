@@ -1,0 +1,49 @@
+name: macOS Intel Package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: macos-13
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Setup Node.js
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: mission-control/package-lock.json
+
+      - name: Build packaged app
+        run: |
+          scripts/release/package_macos_intel.sh
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: clawpilot-macos-intel-zip
+          path: dist/ClawPilot-macos-intel-*.zip
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: clawpilot-macos-intel-dmg
+          path: dist/ClawPilot-macos-intel-*.dmg
