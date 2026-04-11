@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import { ActivityPanel } from "@/components/activity-panel";
+import { buildRunDeliverableInput } from "@/lib/deliverables";
 
 const POLL_MS = 2000;
 
@@ -15,7 +16,8 @@ export default function Page() {
     goals: [],
     progress: [],
     artifacts: [],
-    folderInstructions: []
+    folderInstructions: [],
+    deliverables: []
   };
 
   const createWorkspace = useMutation(api.mission.createWorkspace);
@@ -23,8 +25,9 @@ export default function Page() {
   const upsertGlobalInstructions = useMutation(api.mission.upsertGlobalInstructions);
   const upsertFolderInstruction = useMutation(api.mission.upsertFolderInstruction);
   const createGoal = useMutation(api.mission.createGoal);
+  const upsertRunDeliverable = useMutation(api.mission.upsertRunDeliverable);
 
-  const [activeRunId, setActiveRunId] = useState("");
+  const [activeRun, setActiveRun] = useState(null);
   const [runState, setRunState] = useState(null);
   const [runEvents, setRunEvents] = useState([]);
   const [runResult, setRunResult] = useState(null);
@@ -35,11 +38,11 @@ export default function Page() {
   }, [seed]);
 
   useEffect(() => {
-    if (!activeRunId) return;
+    if (!activeRun?.runId) return;
 
     let cancelled = false;
     const load = async () => {
-      const response = await fetch(`/api/runtime/runs/${activeRunId}`, { cache: "no-store" });
+      const response = await fetch(`/api/runtime/runs/${activeRun.runId}`, { cache: "no-store" });
       if (!response.ok) return;
       const payload = await response.json();
       if (cancelled) return;
@@ -55,18 +58,58 @@ export default function Page() {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [activeRunId]);
+  }, [activeRun?.runId]);
+
+  useEffect(() => {
+    const runId = activeRun?.runId;
+    if (!runId || !dashboard.activeWorkspace) return;
+    const finalStatus = String(runState?.status || "").toLowerCase();
+    const terminal = finalStatus === "completed" || finalStatus === "failed" || Boolean(runResult);
+    if (!terminal || persistedRunIds.includes(runId)) return;
+
+    const persist = async () => {
+      const deliverable = buildRunDeliverableInput({
+        workspace: dashboard.activeWorkspace,
+        runId,
+        runState,
+        runResult,
+        runEvents,
+        goalId: activeRun.goalId,
+        goal: activeRun.goal,
+        outputLocation
+      });
+
+      await upsertRunDeliverable(deliverable);
+      setPersistedRunIds((current) => [...current, runId]);
+    };
+
+    persist();
+  }, [
+    activeRun,
+    dashboard.activeWorkspace,
+    outputLocation,
+    persistedRunIds,
+    runEvents,
+    runResult,
+    runState,
+    upsertRunDeliverable
+  ]);
 
   const sortedGoals = useMemo(
     () => [...dashboard.goals].sort((a, b) => b.createdAt - a.createdAt),
     [dashboard.goals]
   );
 
+  const sortedDeliverables = useMemo(
+    () => [...dashboard.deliverables].sort((a, b) => b.updatedAt - a.updatedAt),
+    [dashboard.deliverables]
+  );
+
   return (
     <main className="page">
       <header className="hero">
         <h1>Mission Control</h1>
-        <p>Phase 2 runtime bridge (live runtime-backed runs).</p>
+        <p>Phase 4 deliverable-first runtime bridge.</p>
       </header>
 
       <section className="panel" id="workspace">
@@ -86,8 +129,10 @@ export default function Page() {
             workspace={dashboard.activeWorkspace}
             folderInstructions={dashboard.folderInstructions}
             onCreateGoal={createGoal}
-            onRunCreated={setActiveRunId}
+            onRunCreated={setActiveRun}
             goals={sortedGoals}
+            draft={composerDraft}
+            onDraftApplied={() => setComposerDraft("")}
           />
         ) : (
           <p>Create a workspace first.</p>
@@ -179,10 +224,16 @@ function WorkspacePicker({ workspaces, activeWorkspace, onCreate, onSetActive })
   );
 }
 
-function RunComposer({ workspace, folderInstructions, onCreateGoal, onRunCreated, goals }) {
+function RunComposer({ workspace, folderInstructions, onCreateGoal, onRunCreated, goals, draft, onDraftApplied }) {
   const [goal, setGoal] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!draft) return;
+    setGoal(draft);
+    onDraftApplied();
+  }, [draft, onDraftApplied]);
 
   const submit = async (event) => {
     event.preventDefault();
@@ -191,12 +242,13 @@ function RunComposer({ workspace, folderInstructions, onCreateGoal, onRunCreated
     setBusy(true);
     setError("");
     try {
-      await onCreateGoal({ workspaceId: workspace._id, goal: goal.trim() });
+      const goalText = goal.trim();
+      const goalId = await onCreateGoal({ workspaceId: workspace._id, goal: goalText });
       const response = await fetch("/api/runtime/runs", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          goal: goal.trim(),
+          goal: goalText,
           workspacePath: workspace.rootPath,
           globalInstructions: workspace.globalInstructions || "",
           folderInstructions
@@ -209,7 +261,7 @@ function RunComposer({ workspace, folderInstructions, onCreateGoal, onRunCreated
       }
 
       const payload = await response.json();
-      onRunCreated(payload.runId);
+      onRunCreated({ runId: payload.runId, goalId, goal: goalText });
       setGoal("");
     } catch (runError) {
       setError(runError.message);
@@ -396,6 +448,92 @@ function RunStatusPanel({ runId, state, events, result, fileDiffs, onRefresh }) 
           <p>{result.summary}</p>
         </article>
       )}
+    </div>
+  );
+}
+
+function DeliverablesPanel({ workspace, deliverables, onInspectRun, onRefine }) {
+  if (!workspace) {
+    return <p>Create and select a workspace to view deliverables.</p>;
+  }
+
+  return (
+    <div className="list">
+      {deliverables.length === 0 && <p>No finalized deliverables yet. Complete a run to generate one.</p>}
+      {deliverables.map((deliverable) => (
+        <article className="card" key={deliverable._id}>
+          <div className="row">
+            <strong>{deliverable.goal || "Run deliverable"}</strong>
+            <small className="badge">{deliverable.status}</small>
+          </div>
+          <p>{deliverable.summary}</p>
+          <p className="muted">Run: {deliverable.runId}</p>
+
+          <details>
+            <summary>Generated files ({deliverable.changedFiles.length})</summary>
+            <ul>
+              {deliverable.changedFiles.map((filePath) => (
+                <li key={filePath}>
+                  {filePath}
+                  <a className="inline-link" href={`file://${workspace.rootPath}/${filePath}`}>
+                    Open file
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </details>
+
+          <details>
+            <summary>Artifacts and output location</summary>
+            <p className="muted">Results root: {deliverable.outputLocation.resultsRoot}</p>
+            <p className="muted">Result file: {deliverable.outputLocation.resultFile}</p>
+            <p className="muted">Status file: {deliverable.outputLocation.statusFile}</p>
+            <p className="muted">Events file: {deliverable.outputLocation.eventsFile}</p>
+            <p className="muted">Artifacts dir: {deliverable.outputLocation.artifactsDir || workspace.rootPath}</p>
+            {deliverable.artifacts.length > 0 && (
+              <ul>
+                {deliverable.artifacts.map((artifact) => (
+                  <li key={`${artifact.path}-${artifact.status}`}>
+                    {artifact.path} · {artifact.artifactType} · {artifact.status}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </details>
+
+          <details>
+            <summary>Approvals and review history ({deliverable.approvalHistory.length})</summary>
+            {deliverable.approvalHistory.length ? (
+              <ul>
+                {deliverable.approvalHistory.map((entry, index) => (
+                  <li key={`${entry.createdAt}-${index}`}>
+                    {entry.createdAt}: {entry.eventType} · {entry.summary}
+                    {entry.status ? ` (${entry.status})` : ""}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="muted">No approval events captured for this run.</p>
+            )}
+          </details>
+
+          <details>
+            <summary>Suggested next steps</summary>
+            <ul>
+              {deliverable.suggestedNextSteps.map((step) => (
+                <li key={step}>{step}</li>
+              ))}
+            </ul>
+          </details>
+
+          <div className="row">
+            <button type="button" onClick={() => onInspectRun(deliverable.runId)}>Inspect run</button>
+            <button type="button" onClick={() => onRefine(`Refine previous run outcome: ${deliverable.goal}. Context: ${deliverable.summary}`)}>
+              Rerun / refine
+            </button>
+          </div>
+        </article>
+      ))}
     </div>
   );
 }

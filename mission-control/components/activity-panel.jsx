@@ -9,7 +9,8 @@ const entityHrefMap = {
   goal: "/#goal",
   progress: "/#progress",
   artifact: "/#artifacts",
-  instruction: "/#instructions"
+  instruction: "/#instructions",
+  deliverable: "/#deliverables"
 };
 
 export function ActivityPanel() {
