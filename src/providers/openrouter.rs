@@ -13,6 +13,7 @@ pub struct OpenRouterProvider {
     credential: Option<String>,
     timeout_secs: u64,
     max_tokens: Option<u32>,
+    provider_routing: Option<ProviderRouting>,
 }
 
 const DEFAULT_OPENROUTER_TIMEOUT_SECS: u64 = 120;
@@ -67,6 +68,24 @@ struct ResponseMessage {
     content: String,
 }
 
+/// OpenRouter provider routing configuration.
+/// See <https://openrouter.ai/docs/provider-routing>.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderRouting {
+    /// Restrict to only these providers (e.g. `["Anthropic", "OpenAI"]`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub only: Option<Vec<String>>,
+    /// Exclude these providers from selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignore: Option<Vec<String>>,
+    /// Preferred provider order (first available wins).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<Vec<String>>,
+    /// Sort strategy for provider selection (e.g. `"price"`, `"throughput"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct NativeChatRequest {
     model: String,
@@ -78,6 +97,9 @@ struct NativeChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    /// OpenRouter provider routing preferences.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<ProviderRouting>,
 }
 
 #[derive(Debug, Serialize)]
@@ -163,6 +185,7 @@ impl OpenRouterProvider {
                 .filter(|secs| *secs > 0)
                 .unwrap_or(DEFAULT_OPENROUTER_TIMEOUT_SECS),
             max_tokens: None,
+            provider_routing: None,
         }
     }
 
@@ -175,6 +198,12 @@ impl OpenRouterProvider {
     /// Set the maximum output tokens for API requests.
     pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Set OpenRouter provider routing preferences.
+    pub fn with_provider_routing(mut self, routing: Option<ProviderRouting>) -> Self {
+        self.provider_routing = routing;
         self
     }
 
@@ -513,6 +542,7 @@ impl Provider for OpenRouterProvider {
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
             max_tokens: self.max_tokens,
+            provider: self.provider_routing.clone(),
         };
 
         let response = self
@@ -604,6 +634,7 @@ impl Provider for OpenRouterProvider {
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
             max_tokens: self.max_tokens,
+            provider: self.provider_routing.clone(),
         };
 
         let response = self
@@ -1225,5 +1256,101 @@ mod tests {
         }];
 
         assert!(OpenRouterProvider::convert_tools(Some(&tools)).is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // provider routing tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn provider_routing_serializes_all_fields() {
+        let routing = ProviderRouting {
+            only: Some(vec!["Anthropic".into(), "OpenAI".into()]),
+            ignore: Some(vec!["DeepInfra".into()]),
+            order: Some(vec!["Anthropic".into()]),
+            sort: Some("price".into()),
+        };
+        let json = serde_json::to_value(&routing).unwrap();
+        assert_eq!(json["only"], serde_json::json!(["Anthropic", "OpenAI"]));
+        assert_eq!(json["ignore"], serde_json::json!(["DeepInfra"]));
+        assert_eq!(json["order"], serde_json::json!(["Anthropic"]));
+        assert_eq!(json["sort"], "price");
+    }
+
+    #[test]
+    fn provider_routing_skips_none_fields() {
+        let routing = ProviderRouting {
+            only: Some(vec!["Anthropic".into()]),
+            ignore: None,
+            order: None,
+            sort: None,
+        };
+        let json = serde_json::to_string(&routing).unwrap();
+        assert!(json.contains("\"only\""));
+        assert!(!json.contains("\"ignore\""));
+        assert!(!json.contains("\"order\""));
+        assert!(!json.contains("\"sort\""));
+    }
+
+    #[test]
+    fn native_chat_request_includes_provider_when_set() {
+        let request = NativeChatRequest {
+            model: "anthropic/claude-sonnet-4".into(),
+            messages: vec![],
+            temperature: 0.5,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            provider: Some(ProviderRouting {
+                only: Some(vec!["Anthropic".into()]),
+                ignore: None,
+                order: None,
+                sort: Some("price".into()),
+            }),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"provider\""));
+        assert!(json.contains("\"only\""));
+        assert!(json.contains("\"Anthropic\""));
+        assert!(json.contains("\"sort\""));
+        assert!(json.contains("\"price\""));
+    }
+
+    #[test]
+    fn native_chat_request_omits_provider_when_none() {
+        let request = NativeChatRequest {
+            model: "openai/gpt-4o".into(),
+            messages: vec![],
+            temperature: 0.5,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            provider: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("\"provider\""));
+    }
+
+    #[test]
+    fn with_provider_routing_sets_routing() {
+        let routing = ProviderRouting {
+            only: Some(vec!["OpenAI".into()]),
+            ignore: None,
+            order: None,
+            sort: None,
+        };
+        let provider =
+            OpenRouterProvider::new(Some("key"), None).with_provider_routing(Some(routing));
+        assert!(provider.provider_routing.is_some());
+        assert_eq!(
+            provider.provider_routing.as_ref().unwrap().only,
+            Some(vec!["OpenAI".to_string()])
+        );
+    }
+
+    #[test]
+    fn provider_routing_defaults_to_none() {
+        let provider = OpenRouterProvider::new(Some("key"), None);
+        assert!(provider.provider_routing.is_none());
     }
 }

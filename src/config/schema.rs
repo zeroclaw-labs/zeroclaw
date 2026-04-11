@@ -591,6 +591,23 @@ pub struct ModelProviderConfig {
     /// whose chat template rejects system messages at non-first positions.
     #[serde(default)]
     pub merge_system_into_user: bool,
+    /// OpenRouter provider routing: restrict to only these providers
+    /// (e.g. `["Anthropic", "OpenAI"]`).
+    /// See <https://openrouter.ai/docs/provider-routing>.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_only: Option<Vec<String>>,
+    /// OpenRouter provider routing: exclude these providers from selection.
+    /// See <https://openrouter.ai/docs/provider-routing>.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_ignore: Option<Vec<String>>,
+    /// OpenRouter provider routing: preferred provider order (first available wins).
+    /// See <https://openrouter.ai/docs/provider-routing>.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_order: Option<Vec<String>>,
+    /// OpenRouter provider routing: sort strategy (e.g. `"price"`, `"throughput"`).
+    /// See <https://openrouter.ai/docs/provider-routing>.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_sort: Option<String>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
