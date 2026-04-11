@@ -1243,8 +1243,9 @@ impl BrowserTool {
         };
 
         // agent-browser returns screenshot data as either:
-        // - { "screenshot": "<base64 png>" }          (common)
+        // - { "screenshot": "<base64 png>" }          (common, no path arg)
         // - { "png_base64": "<base64 png>" }           (alternate key)
+        // - { "path": "<file path>" }                  (when invoked with a path arg)
         // - or nested inside data.result, etc.
         let b64_png = data
             .get("screenshot")
@@ -1252,7 +1253,52 @@ impl BrowserTool {
             .or_else(|| data.get("result").and_then(|r| r.get("screenshot")))
             .and_then(|v| v.as_str());
 
-        let Some(b64_str) = b64_png else {
+        let raw_png = if let Some(b64_str) = b64_png {
+            use base64::Engine;
+            match base64::engine::general_purpose::STANDARD.decode(b64_str) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: format!("Screenshot captured but base64 decode failed: {e}"),
+                        error: None,
+                    });
+                }
+            }
+        } else if let Some(path_str) = data
+            .get("path")
+            .or_else(|| data.get("result").and_then(|r| r.get("path")))
+            .and_then(|v| v.as_str())
+        {
+            // agent-browser wrote the PNG to disk instead of returning base64.
+            // Read it so the multimodal pipeline sees an [IMAGE:] marker rather
+            // than a bare path string (otherwise the model never gets pixels).
+            const MAX_RAW_BYTES: u64 = 5_242_880; // 5 MB
+            let path = std::path::Path::new(path_str);
+            if let Ok(meta) = tokio::fs::metadata(path).await {
+                if meta.len() > MAX_RAW_BYTES {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: format!(
+                            "Screenshot saved to: {}\nSize: {} bytes (too large to inline)",
+                            path.display(),
+                            meta.len(),
+                        ),
+                        error: None,
+                    });
+                }
+            }
+            match tokio::fs::read(path).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: format!("Screenshot saved to: {}", path.display()),
+                        error: Some(format!("Failed to read screenshot file: {e}")),
+                    });
+                }
+            }
+        } else {
             // No recognizable screenshot field — return raw JSON as before.
             let output = serde_json::to_string_pretty(&data).unwrap_or_default();
             return Ok(ToolResult {
@@ -1260,19 +1306,6 @@ impl BrowserTool {
                 output,
                 error: None,
             });
-        };
-
-        // Decode, optimize, and format as [IMAGE:] marker.
-        use base64::Engine;
-        let raw_png = match base64::engine::general_purpose::STANDARD.decode(b64_str) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: true,
-                    output: format!("Screenshot captured but base64 decode failed: {e}"),
-                    error: None,
-                });
-            }
         };
 
         let raw_len = raw_png.len();
@@ -3233,5 +3266,42 @@ mod tests {
             state.reset_session().await;
             state.reset_session().await;
         });
+    }
+
+    #[tokio::test]
+    async fn screenshot_to_optimized_result_reads_file_when_only_path_returned() {
+        // Regression: when agent-browser is invoked with an explicit path, it
+        // writes the PNG to disk and returns only {"path": "..."} — no inline
+        // base64. The tool must read the file so the multimodal pipeline sees
+        // an [IMAGE:] marker instead of just a path string.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let png_path = tmp.path().join("cap.png");
+        let mut image = image::RgbImage::new(16, 16);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = image::Rgb([(x * 8) as u8, (y * 8) as u8, 128]);
+        }
+        image::DynamicImage::ImageRgb8(image)
+            .save_with_format(&png_path, image::ImageFormat::Png)
+            .expect("write png");
+
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        let resp = AgentBrowserResponse {
+            success: true,
+            data: Some(json!({ "path": png_path.to_string_lossy() })),
+            error: None,
+        };
+
+        let result = tool
+            .screenshot_to_optimized_result(resp)
+            .await
+            .expect("screenshot result");
+
+        assert!(result.success, "tool result should be success");
+        assert!(
+            result.output.contains("[IMAGE:data:image/"),
+            "output should contain an inline image marker, got: {}",
+            result.output
+        );
     }
 }
