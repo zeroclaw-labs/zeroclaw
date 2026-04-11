@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "test": "node --test tests/*.test.js"
+    "test": "node --test tests/*.test.js lib/*.test.js"
   },
   "dependencies": {
     "convex": "^1.17.0",

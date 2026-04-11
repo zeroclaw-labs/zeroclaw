@@ -1,4 +1,4 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { appendFile, readFile, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -80,6 +80,7 @@ export async function PATCH(request, { params }) {
   const { runId } = params;
   const root = resultsRoot();
   const statusPath = path.join(root, `${runId}.status.json`);
+  const eventsPath = path.join(root, `${runId}.events.jsonl`);
   const state = await maybeReadJson(statusPath);
   if (!state) {
     return Response.json({ error: "run not found" }, { status: 404 });
@@ -133,6 +134,21 @@ export async function PATCH(request, { params }) {
   }
 
   await writeFile(statusPath, JSON.stringify(state, null, 2));
+
+  const approval = state.approvals[idx] || {};
+  const approvalEvent = {
+    created_at: now,
+    event_type: "approval_reviewed",
+    message: `Approval ${approvalId} marked as ${nextState}`,
+    payload: {
+      approval_id: approvalId,
+      status: nextState,
+      reviewer_note: reviewerNote || null,
+      title: approval.title || null,
+      target_type: approval.target_type || null
+    }
+  };
+  await appendFile(eventsPath, `${JSON.stringify(approvalEvent)}\n`);
 
   return Response.json({ ok: true, state });
 }

@@ -22,17 +22,22 @@ export function ActivityPanel() {
       {entries.length === 0 && <p>No activity yet.</p>}
       <div className="activity-list">
         {entries.map((entry) => {
-          const href = entityHrefMap[entry.entityType] || "/";
+          const entityType = entry.entityType || entry.entity_type || "activity";
+          const href = entityHrefMap[entityType] || "/";
+          const createdAt = entry.createdAt || entry.created_at || Date.now();
+          const actor = entry.actor || "you";
+          const summary = entry.summary || entry.message || "activity updated";
+          const action = entry.action || entry.event_type || "event";
           return (
             <Link key={entry._id} href={href} className="activity-item">
               <div className="row">
-                <small>{formatRelative(entry.createdAt)}</small>
-                <small className="badge">{entry.entityType}</small>
+                <small>{formatRelative(createdAt)}</small>
+                <small className="badge">{entityType}</small>
               </div>
               <p>
-                <b>{entry.actor}</b> · {entry.summary}
+                <b>{actor}</b> · {summary}
               </p>
-              <small className="muted">{entry.action}</small>
+              <small className="muted">{action}</small>
             </Link>
           );
         })}

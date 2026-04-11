@@ -5,6 +5,7 @@ import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import { ActivityPanel } from "@/components/activity-panel";
 import { buildRunDeliverableInput } from "@/lib/deliverables";
+import { WORKFLOW_PRESETS, buildGoalFromPreset, getWorkflowPreset } from "@/lib/workflow-presets";
 
 const POLL_MS = 2000;
 
@@ -32,6 +33,20 @@ export default function Page() {
   const [runEvents, setRunEvents] = useState([]);
   const [runResult, setRunResult] = useState(null);
   const [fileDiffs, setFileDiffs] = useState({});
+  const [persistedRunIds, setPersistedRunIds] = useState([]);
+  const [composerDraft, setComposerDraft] = useState("");
+
+  const activeRunId = activeRun?.runId || "";
+  const outputLocation = useMemo(
+    () => ({
+      resultsRoot: "/var/lib/clawpilot/results",
+      resultFile: activeRunId ? `${activeRunId}.json` : "",
+      statusFile: activeRunId ? `${activeRunId}.status.json` : "",
+      eventsFile: activeRunId ? `${activeRunId}.events.jsonl` : "",
+      artifactsDir: dashboard.activeWorkspace?.rootPath || ""
+    }),
+    [activeRunId, dashboard.activeWorkspace?.rootPath]
+  );
 
   useEffect(() => {
     seed();
@@ -131,6 +146,7 @@ export default function Page() {
             onCreateGoal={createGoal}
             onRunCreated={setActiveRun}
             goals={sortedGoals}
+            deliverables={sortedDeliverables}
             draft={composerDraft}
             onDraftApplied={() => setComposerDraft("")}
           />
@@ -158,6 +174,18 @@ export default function Page() {
           }}
         />
       </section>
+
+      <section className="panel" id="deliverables">
+        <h2>5) Deliverables</h2>
+        <DeliverablesPanel
+          workspace={dashboard.activeWorkspace}
+          deliverables={sortedDeliverables}
+          onInspectRun={(runId) => setActiveRun((current) => ({ ...(current || {}), runId }))}
+          onRefine={(draft) => setComposerDraft(draft)}
+        />
+      </section>
+
+      <ActivityPanel />
 
       {dashboard.activeWorkspace && (
         <section className="panel two-col" id="instructions">
@@ -222,10 +250,29 @@ function WorkspacePicker({ workspaces, activeWorkspace, onCreate, onSetActive })
   );
 }
 
-function RunComposer({ workspace, folderInstructions, onCreateGoal, onRunCreated, goals, draft, onDraftApplied }) {
+function RunComposer({ workspace, folderInstructions, onCreateGoal, onRunCreated, goals, deliverables, draft, onDraftApplied }) {
   const [goal, setGoal] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [presetId, setPresetId] = useState(WORKFLOW_PRESETS[0]?.id || "");
+  const [targetPath, setTargetPath] = useState("");
+  const [priorRunId, setPriorRunId] = useState("");
+
+  const preset = getWorkflowPreset(presetId) || WORKFLOW_PRESETS[0];
+  const priorRuns = useMemo(
+    () => deliverables.map((item) => ({ id: item.runId, status: item.status })),
+    [deliverables]
+  );
+
+  const applyPreset = () => {
+    const drafted = buildGoalFromPreset({
+      presetId,
+      targetPath: targetPath.trim() || workspace.rootPath,
+      runId: priorRunId
+    });
+    if (!drafted) return;
+    setGoal(drafted);
+  };
 
   useEffect(() => {
     if (!draft) return;
@@ -248,7 +295,7 @@ function RunComposer({ workspace, folderInstructions, onCreateGoal, onRunCreated
         body: JSON.stringify({
           goal: goalText,
           workspacePath: workspace.rootPath,
-          globalInstructions: runtimeInstructions,
+          globalInstructions: workspace.globalInstructions || "",
           folderInstructions
         })
       });
