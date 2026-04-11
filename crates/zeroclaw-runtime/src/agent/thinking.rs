@@ -122,20 +122,21 @@ pub fn apply_thinking_level_with_config(
 ) -> ThinkingParams {
     use zeroclaw_config::scattered_types::MAX_BUDGET_TOKENS;
     let mut params = apply_thinking_level(level);
-    if config.native_thinking {
-        if let Some(budget) = config.budget_tokens_for(level) {
-            let clamped = budget.min(MAX_BUDGET_TOKENS);
-            if clamped < budget {
-                tracing::warn!(
-                    requested = budget,
-                    clamped = clamped,
-                    "budget_tokens exceeds maximum; clamping to {MAX_BUDGET_TOKENS}"
-                );
-            }
-            params.native_thinking = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
-                budget_tokens: clamped,
-            });
+    if config.native_thinking
+        && let Some(budget) = config.budget_tokens_for(level)
+    {
+        let clamped = budget.min(MAX_BUDGET_TOKENS);
+        if clamped < budget {
+            tracing::warn!(
+                requested = budget,
+                clamped = clamped,
+                max = MAX_BUDGET_TOKENS,
+                "budget_tokens exceeds maximum; clamping to configured limit"
+            );
         }
+        params.native_thinking = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: clamped,
+        });
     }
     params
 }

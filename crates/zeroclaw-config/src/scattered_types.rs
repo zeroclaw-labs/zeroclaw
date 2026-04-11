@@ -87,7 +87,14 @@ impl Default for ThinkingConfig {
 }
 
 impl ThinkingConfig {
+    /// Resolve the effective `budget_tokens` for a given level.
+    ///
+    /// Only levels with a built-in default (`High`, `Max`) are eligible for
+    /// native thinking. Config overrides for levels Off–Medium are ignored
+    /// to prevent accidentally forcing `temperature = 1.0` on low levels.
     pub fn budget_tokens_for(&self, level: ThinkingLevel) -> Option<u32> {
+        // Guard: only levels that have a built-in budget can use native thinking.
+        level.default_budget_tokens()?;
         if let Some(&override_val) = self.budget_tokens.get(level.as_str()) {
             return Some(override_val);
         }
