@@ -39,6 +39,14 @@ jobs:
             | tar xz -C /tmp
           echo "NODE_BIN=/tmp/node-v${NODE_VERSION}-darwin-x64/bin/node" >> "$GITHUB_ENV"
 
+      - name: Set cross-compilation environment
+        run: |
+          echo "SDKROOT=$(xcrun -sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+          echo "MACOSX_DEPLOYMENT_TARGET=10.13" >> "$GITHUB_ENV"
+
+      - name: Update dependencies to avoid yanked crates
+        run: cargo update
+
       - name: Build packaged app
         run: |
           scripts/release/package_macos_intel.sh

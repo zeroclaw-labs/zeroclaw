@@ -16,7 +16,7 @@ fi
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/bin" "$APP_DIR/runtime" "$APP_DIR/mission-control"
 
-(cd "$ROOT_DIR" && cargo build --release --locked --target "$TARGET_TRIPLE")
+(cd "$ROOT_DIR" && cargo build --release --target "$TARGET_TRIPLE")
 cp "$ROOT_DIR/target/$TARGET_TRIPLE/release/zeroclaw" "$APP_DIR/bin/zeroclaw"
 chmod +x "$APP_DIR/bin/zeroclaw"
 

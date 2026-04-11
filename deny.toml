@@ -6,7 +6,9 @@
 # unmaintained: scope of unmaintained-crate checks (all | workspace | transitive | none)
 unmaintained = "all"
 # yanked: deny | warn | allow
-yanked = "deny"
+# warn rather than deny — upstream patch releases (lopdf, opentelemetry-proto)
+# are yanking minor releases; cargo update in CI resolves to the replacement.
+yanked = "warn"
 # Ignore known unmaintained transitive deps we cannot easily replace
 ignore = [
     # bincode v2.0.1 via probe-rs — project ceased but 1.3.3 considered complete
