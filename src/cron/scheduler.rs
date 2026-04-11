@@ -28,6 +28,51 @@ pub(crate) fn is_no_reply_sentinel(output: &str) -> bool {
     output.trim().eq_ignore_ascii_case("NO_REPLY")
 }
 
+const FAILURE_NOTIFICATION_BODY_LIMIT: usize = 1000;
+
+/// Build the user-facing message body for a cron failure notification.
+/// Keeps the job name, id, and a truncated copy of the failure output so
+/// recipients can see what failed without scrolling through stack traces.
+pub(crate) fn format_failure_notification(job: &CronJob, output: &str) -> String {
+    let label = job
+        .name
+        .as_deref()
+        .filter(|n| !n.is_empty())
+        .unwrap_or(&job.id);
+    let trimmed = output.trim();
+    let body = if trimmed.chars().count() > FAILURE_NOTIFICATION_BODY_LIMIT {
+        let prefix: String = trimmed
+            .chars()
+            .take(FAILURE_NOTIFICATION_BODY_LIMIT)
+            .collect();
+        format!("{prefix}…")
+    } else {
+        trimmed.to_string()
+    };
+    format!("⚠️ Cron failed: {label}\nJob: {}\n\n{body}", job.id)
+}
+
+/// Send a best-effort failure notification to the operator-configured channel.
+/// No-op when `scheduler.failure_notify_channel` or `scheduler.failure_notify_to`
+/// is unset. Delivery errors are logged at WARN but never propagate — failure
+/// notifications must not themselves fail in a way that breaks the scheduler.
+pub(crate) async fn notify_cron_failure(config: &Config, job: &CronJob, output: &str) {
+    let (Some(channel), Some(target)) = (
+        config.scheduler.failure_notify_channel.as_deref(),
+        config.scheduler.failure_notify_to.as_deref(),
+    ) else {
+        return;
+    };
+    let message = format_failure_notification(job, output);
+    if let Err(e) = deliver_announcement(config, channel, target, &message).await {
+        tracing::warn!(
+            "Cron failure notification delivery failed for job '{}' via {}: {e}",
+            job.id,
+            channel
+        );
+    }
+}
+
 pub async fn run(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
@@ -112,20 +157,22 @@ async fn process_due_jobs(
         let security = Arc::clone(security);
         let component = component.to_owned();
         async move {
-            Box::pin(execute_and_persist_job(
+            let result = Box::pin(execute_and_persist_job(
                 &config,
                 security.as_ref(),
                 &job,
                 &component,
             ))
-            .await
+            .await;
+            (job, result)
         }
     }))
     .buffer_unordered(max_concurrent);
 
-    while let Some((job_id, success, output)) = in_flight.next().await {
+    while let Some((job, (job_id, success, output))) = in_flight.next().await {
         if !success {
             tracing::warn!("Scheduler job '{job_id}' failed: {output}");
+            notify_cron_failure(config, &job, &output).await;
         }
     }
 }
@@ -1277,6 +1324,61 @@ mod tests {
         assert!(is_no_reply_sentinel("  no_reply  "));
         assert!(!is_no_reply_sentinel("NO_REPLY please"));
         assert!(!is_no_reply_sentinel(""));
+    }
+
+    #[test]
+    fn format_failure_notification_includes_name_and_id() {
+        let mut job = test_job("");
+        job.id = "abc123".into();
+        job.name = Some("Daily News Curator".into());
+        let msg = format_failure_notification(&job, "agent job failed: All providers exhausted");
+        assert!(msg.contains("Daily News Curator"), "missing name: {msg}");
+        assert!(msg.contains("abc123"), "missing id: {msg}");
+        assert!(
+            msg.contains("agent job failed"),
+            "missing error body: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_failure_notification_falls_back_to_id_when_name_missing() {
+        let mut job = test_job("");
+        job.id = "no-name-job".into();
+        job.name = None;
+        let msg = format_failure_notification(&job, "boom");
+        assert!(
+            msg.contains("no-name-job"),
+            "id should appear when name is None: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_failure_notification_truncates_long_output() {
+        let mut job = test_job("");
+        job.id = "x".into();
+        let long = "A".repeat(2000);
+        let msg = format_failure_notification(&job, &long);
+        assert!(
+            msg.len() < 1500,
+            "message should be capped, got {} bytes",
+            msg.len()
+        );
+        assert!(
+            msg.contains('…') || msg.ends_with("..."),
+            "should mark truncation: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_cron_failure_is_noop_when_unconfigured() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        // Default config has no failure_notify_channel/to set; helper must
+        // return without attempting to deliver (would otherwise error trying
+        // to look up a None channel name).
+        let job = test_job("");
+        notify_cron_failure(&config, &job, "agent job failed: provider exhausted").await;
+        // No panic, no error: by virtue of returning at all the test passes.
     }
 
     #[tokio::test]

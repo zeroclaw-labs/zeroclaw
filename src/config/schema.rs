@@ -4265,6 +4265,14 @@ pub struct SchedulerConfig {
     /// Maximum tasks executed per scheduler polling cycle.
     #[serde(default = "default_scheduler_max_concurrent")]
     pub max_concurrent: usize,
+    /// Channel name to send a notification on cron failure (e.g. "signal", "telegram").
+    /// When both this and `failure_notify_to` are set, every failed cron run sends a
+    /// best-effort notification independent of the cron's own delivery config.
+    #[serde(default)]
+    pub failure_notify_channel: Option<String>,
+    /// Recipient identifier for the failure notification (e.g. Signal UUID, Telegram chat id).
+    #[serde(default)]
+    pub failure_notify_to: Option<String>,
 }
 
 fn default_scheduler_enabled() -> bool {
@@ -4285,6 +4293,8 @@ impl Default for SchedulerConfig {
             enabled: default_scheduler_enabled(),
             max_tasks: default_scheduler_max_tasks(),
             max_concurrent: default_scheduler_max_concurrent(),
+            failure_notify_channel: None,
+            failure_notify_to: None,
         }
     }
 }

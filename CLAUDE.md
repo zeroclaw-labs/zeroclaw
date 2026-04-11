@@ -247,6 +247,12 @@ When uncertain, classify as higher risk.
 6. **Respect queue hygiene**
     - If stacked PR: declare `Depends on #...`.
     - If replacing old PR: declare `Supersedes #...`.
+7. **Definition of done — merged, not committed**
+    - An enhancement (feature, bug fix, refactor) is NOT complete until the change is merged to `main`. A feature branch with all tests passing is work-in-progress, not done.
+    - Status summaries must distinguish "code written and tested" from "merged to main" from "deployed to cluster". Do not report completion while code still lives only on a feature branch.
+    - After merge, delete the task branch (and any associated worktree) so the local repo does not accumulate stale branches.
+    - Config-only and docs-only changes have their own equivalent of "done": "applied" means in production (ConfigMap applied to the cluster, docs pushed to the canonical branch), not "written to a staging file".
+    - Exception: if a merge is genuinely blocked (waiting on review, CI red, or explicit maintainer hold), say "on branch X, awaiting merge" and keep the branch alive — do not silently drop it.
 
 ### 6.1 Branch / Commit / PR Flow (Required)
 
