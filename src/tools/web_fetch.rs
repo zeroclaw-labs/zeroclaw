@@ -6,6 +6,7 @@ use crate::config::UrlAccessConfig;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +16,64 @@ use std::time::Duration;
 const WEB_FETCH_PROVIDER_HELP: &str =
     "Supported providers: 'nanohtml2text' (default), 'firecrawl', 'tavily'. \
      Deprecated alias: 'fast_html2md' (maps to 'nanohtml2text').";
+
+/// Heuristic: does this URL look like a PDF download?
+/// We only check the URL path (not the query string) so URLs like
+/// `https://x.com/doc.pdf?token=...` still match.
+fn url_looks_like_pdf(url: &str) -> bool {
+    let path_only = url.split('?').next().unwrap_or(url);
+    let path_only = path_only.split('#').next().unwrap_or(path_only);
+    path_only.to_ascii_lowercase().ends_with(".pdf")
+}
+
+/// 16-hex-character truncated SHA-256 of an arbitrary string.
+fn short_hex_hash(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
+/// Extract a sane filename from a PDF URL.
+/// Falls back to `download.pdf` if the URL has no usable path component.
+fn pdf_filename_from_url(url: &str) -> String {
+    // Drop query and fragment.
+    let path_only = url.split('?').next().unwrap_or(url);
+    let path_only = path_only.split('#').next().unwrap_or(path_only);
+
+    // Strip scheme + host so we are left with the path only. The host
+    // must NOT be mistaken for a filename (e.g. `https://example.com/`
+    // should not yield "example.com.pdf").
+    let after_scheme = path_only
+        .splitn(2, "://")
+        .nth(1)
+        .unwrap_or(path_only);
+    let path_only = after_scheme.splitn(2, '/').nth(1).unwrap_or("");
+
+    let last = path_only
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or("");
+
+    // Strip any leftover URL-encoded characters that would confuse the
+    // filesystem; keep alphanumerics + dot + dash + underscore.
+    let cleaned: String = last
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || ".-_".contains(c) { c } else { '_' })
+        .collect();
+    if cleaned.is_empty() {
+        "download.pdf".to_string()
+    } else if cleaned.to_ascii_lowercase().ends_with(".pdf") {
+        cleaned
+    } else {
+        format!("{cleaned}.pdf")
+    }
+}
 
 /// Web fetch tool: fetches a web page and returns text/markdown content for LLM consumption.
 ///
@@ -35,6 +94,11 @@ pub struct WebFetchTool {
     timeout_secs: u64,
     user_agent: String,
     key_index: Arc<AtomicUsize>,
+    /// Optional workspace directory for caching downloaded PDFs.
+    /// When set, PDF URLs are routed through `DocumentPipelineTool` and the
+    /// resulting Markdown is persisted via `DocumentCache` so the same URL
+    /// only converts once.
+    workspace_dir: Option<PathBuf>,
 }
 
 impl WebFetchTool {
@@ -79,7 +143,18 @@ impl WebFetchTool {
             timeout_secs,
             user_agent,
             key_index: Arc::new(AtomicUsize::new(0)),
+            workspace_dir: None,
         }
+    }
+
+    /// Builder: enable PDF URL auto-conversion + caching by attaching the
+    /// workspace directory. When this is set, any URL whose path ends in
+    /// `.pdf` (or whose Content-Type is `application/pdf`) is downloaded,
+    /// converted via `DocumentPipelineTool`, persisted via `DocumentCache`,
+    /// and the resulting Markdown is returned in place of raw HTML/PDF.
+    pub fn with_workspace_dir(mut self, workspace_dir: impl Into<PathBuf>) -> Self {
+        self.workspace_dir = Some(workspace_dir.into());
+        self
     }
 
     /// Returns the next API key from the rotation pool using round-robin, or `None` if unconfigured.
@@ -187,6 +262,87 @@ impl WebFetchTool {
                 WEB_FETCH_PROVIDER_HELP
             ),
         }
+    }
+
+    /// Download a PDF URL, run it through `DocumentPipelineTool`, persist
+    /// the conversion in `DocumentCache`, and return the resulting Markdown.
+    ///
+    /// Caching key is the URL itself (hashed) so the same link only
+    /// downloads + converts once even if the agent re-fetches it later.
+    async fn fetch_pdf_url(&self, url: &str) -> anyhow::Result<String> {
+        let workspace_dir = self
+            .workspace_dir
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("workspace_dir not configured for web PDF cache"))?;
+
+        // Stable cache key: <url-hash>/<filename-from-url>.pdf
+        let url_hash = short_hex_hash(url);
+        let filename = pdf_filename_from_url(url);
+        let stable_dir = workspace_dir.join("web_downloads").join(&url_hash);
+        let stable_source = stable_dir.join(&filename);
+
+        let cache = crate::services::document_cache::DocumentCache::new(workspace_dir)
+            .map_err(|e| anyhow::anyhow!("init document cache: {e}"))?;
+
+        // Cache hit? return immediately without re-downloading.
+        if let Some(hit) = cache.lookup(&stable_source).await? {
+            let md = tokio::fs::read_to_string(&hit.markdown_path)
+                .await
+                .map_err(|e| anyhow::anyhow!("read cached markdown: {e}"))?;
+            return Ok(md);
+        }
+
+        // Download the PDF bytes (capped at max_response_size to avoid OOM).
+        let client = self.build_http_client()?;
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("PDF GET failed: {e}"))?;
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "PDF GET HTTP {}",
+                response.status().as_u16()
+            ));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| anyhow::anyhow!("PDF body read failed: {e}"))?;
+        if bytes.len() > self.max_response_size {
+            return Err(anyhow::anyhow!(
+                "PDF too large: {} bytes > {} limit",
+                bytes.len(),
+                self.max_response_size
+            ));
+        }
+
+        // Sanity check: PDF magic bytes. If the server returned HTML
+        // disguised as a `.pdf` URL we want to fall back to the HTML path.
+        if !bytes.starts_with(b"%PDF") {
+            return Err(anyhow::anyhow!(
+                "URL ends in .pdf but response body is not a PDF (no %PDF magic)"
+            ));
+        }
+
+        tokio::fs::create_dir_all(&stable_dir)
+            .await
+            .map_err(|e| anyhow::anyhow!("create web_downloads dir: {e}"))?;
+        tokio::fs::write(&stable_source, &bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("write downloaded pdf: {e}"))?;
+
+        let pipeline =
+            crate::tools::document_pipeline::DocumentPipelineTool::new((*self.security).clone());
+        let cached = cache
+            .convert_and_cache(&stable_source, &pipeline)
+            .await
+            .map_err(|e| anyhow::anyhow!("PDF convert+cache failed: {e}"))?;
+
+        let md = tokio::fs::read_to_string(&cached.markdown_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("read fresh markdown: {e}"))?;
+        Ok(md)
     }
 
     /// Builds a `reqwest::Client` with the configured timeout, user-agent, and proxy settings.
@@ -462,6 +618,32 @@ impl Tool for WebFetchTool {
             }
         };
 
+        // ── PDF auto-conversion ──
+        // If the URL clearly points to a PDF (path ends in `.pdf`) AND a
+        // workspace directory was injected at construction time, route
+        // through DocumentPipelineTool + DocumentCache so the LLM gets
+        // searchable Markdown instead of raw bytes / "Unsupported content
+        // type" errors. This is the core of the user's "auto-convert
+        // every linked document" requirement.
+        if self.workspace_dir.is_some() && url_looks_like_pdf(&url) {
+            match self.fetch_pdf_url(&url).await {
+                Ok(markdown) => {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: self.truncate_response(&markdown),
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "web_fetch: PDF auto-convert failed for {url}, falling back to text: {e}"
+                    );
+                    // Fall through to the regular provider chain — many
+                    // servers return HTML pages with `.pdf` in the URL.
+                }
+            }
+        }
+
         let result = match self.provider.as_str() {
             "fast_html2md" | "nanohtml2text" => self.fetch_with_http_provider(&url).await,
             "firecrawl" => self.fetch_with_firecrawl(&url).await,
@@ -493,6 +675,74 @@ mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::tools::url_validation::{is_private_or_local_host, normalize_domain};
+
+    // ── PDF auto-conversion helpers ──
+
+    #[test]
+    fn url_looks_like_pdf_matches_path_extension() {
+        assert!(url_looks_like_pdf("https://example.com/report.pdf"));
+        assert!(url_looks_like_pdf("https://example.com/path/to/file.PDF"));
+        assert!(url_looks_like_pdf("https://example.com/doc.pdf?token=abc"));
+        assert!(url_looks_like_pdf("https://example.com/doc.pdf#page=3"));
+        assert!(!url_looks_like_pdf("https://example.com/index.html"));
+        assert!(!url_looks_like_pdf("https://example.com/"));
+        assert!(!url_looks_like_pdf("https://pdf.example.com/api"));
+    }
+
+    #[test]
+    fn pdf_filename_from_url_extracts_basename() {
+        assert_eq!(
+            pdf_filename_from_url("https://example.com/report.pdf"),
+            "report.pdf"
+        );
+        assert_eq!(
+            pdf_filename_from_url("https://example.com/path/to/year-2026.pdf"),
+            "year-2026.pdf"
+        );
+        assert_eq!(
+            pdf_filename_from_url("https://example.com/doc.pdf?token=abc"),
+            "doc.pdf"
+        );
+    }
+
+    #[test]
+    fn pdf_filename_from_url_falls_back_for_pathless_urls() {
+        assert_eq!(pdf_filename_from_url("https://example.com/"), "download.pdf");
+    }
+
+    #[test]
+    fn pdf_filename_from_url_appends_extension_if_missing() {
+        assert_eq!(
+            pdf_filename_from_url("https://example.com/report"),
+            "report.pdf"
+        );
+    }
+
+    #[test]
+    fn pdf_filename_from_url_sanitizes_special_chars() {
+        let f = pdf_filename_from_url("https://example.com/foo%20bar%20baz.pdf");
+        // % and spaces become underscores
+        assert!(f.ends_with(".pdf"));
+        assert!(!f.contains('%'));
+        assert!(!f.contains(' '));
+    }
+
+    #[test]
+    fn short_hex_hash_is_stable_and_16_chars() {
+        let h1 = short_hex_hash("https://example.com/a.pdf");
+        let h2 = short_hex_hash("https://example.com/a.pdf");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 16);
+        let h3 = short_hex_hash("https://example.com/b.pdf");
+        assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn with_workspace_dir_enables_pdf_path() {
+        let tool = test_tool(vec!["example.com"]).with_workspace_dir("/tmp/moa-test-ws");
+        assert!(tool.workspace_dir.is_some());
+    }
+
 
     fn test_tool(allowed_domains: Vec<&str>) -> WebFetchTool {
         test_tool_with_provider(allowed_domains, vec![], "fast_html2md", None, None)

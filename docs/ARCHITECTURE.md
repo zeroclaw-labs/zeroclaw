@@ -3463,6 +3463,118 @@ garbage and one was confirmed as a valid Cargo `bin` target:
 **Total swept**: 469 lines deleted, build still passes, all 70 dispatch
 tests still passing.
 
+### 15A.7 Document Auto-Conversion Cache (`src/services/document_cache.rs`)
+
+> **Status**: Active. Added 2026-04-11 to make every uploaded / linked /
+> web-fetched document searchable by the LLM without manual intervention.
+
+#### Why this exists
+
+Most files on a real user's computer are PDF / HWP / HWPX / DOC(X) /
+XLS(X) / PPT(X) — none of which an LLM can read directly. MoA already
+had `DocumentPipelineTool` (`src/tools/document_pipeline.rs`) that
+converts any of those formats into Markdown + HTML using:
+
+- bundled `pdf-extract` for digital PDFs (free, local)
+- the operator's Hancom DocsConverter server for HWP/Office (free)
+- Upstage Document Parser API for image PDFs (paid via 2.2× billing)
+
+But there was **no automatic trigger and no persistent cache** — every
+chat upload re-ran the pipeline, linked folders required the agent to
+manually call `document_process` for each file, and PDF URLs failed
+with "Unsupported content type" because `web_fetch` only handled HTML.
+
+#### What was added
+
+| File | Purpose |
+|---|---|
+| `src/services/mod.rs` | New `services/` namespace for orchestration code |
+| `src/services/document_cache.rs` | Idempotent on-disk cache: `convert_and_cache`, `lookup`, `store_precomputed`, `list_all` |
+| `src/tools/folder_index.rs` | LLM-callable tool: recursively converts every supported document inside a linked folder |
+| Modifications to `src/tools/web_fetch.rs` | PDF URL detection + auto-conversion via the cache |
+| Modifications to `src/gateway/api.rs` | `/api/document/process` now persists every upload to the cache and returns `cache_id` |
+| Modifications to `src/tools/mod.rs` | Factory wires `folder_index` and injects `workspace_dir` into `web_fetch` |
+
+**Total**: ~900 lines of new + modified code, **34 new unit tests** (11
+in document_cache, 6 in folder_index, 7 in web_fetch helpers, 10 in the
+hwpx_create tool added earlier).
+
+#### Storage layout
+
+```text
+{workspace_dir}/documents_cache/
+├── <16-hex source hash>/
+│   ├── <original_filename>.md      ← Markdown for the LLM
+│   ├── <original_filename>.html    ← Optional HTML (kept when non-empty)
+│   └── meta.json                   ← source path, mtime, size, engine, ts
+└── ...
+```
+
+`meta.json` tracks the source file's mtime + size at conversion time.
+Subsequent calls compare the live `stat()` against the recorded values
+and skip conversion when both match — same file → instant cache hit.
+
+For chat uploads, the upload bytes are first persisted to
+`{workspace}/uploads/<8-hex content hash>/<original_filename>` so two
+uploads of the same file produce the same cache key (no duplication).
+For web PDFs, the download lives at
+`{workspace}/web_downloads/<8-hex URL hash>/<derived_filename>.pdf`.
+
+Because every cached document lives **inside the workspace**, the
+existing `content_search` tool (ripgrep-backed) can search across all
+of them without any new indexing infrastructure.
+
+#### Trigger points
+
+1. **Chat upload** (`POST /api/document/process` →
+   `src/gateway/api.rs:1933`): after the converter runs, the handler
+   computes a content hash, persists the bytes to a stable upload path,
+   stores `(source_path, markdown, html, "chat-upload")` in the cache,
+   and returns `cache_id` + `cache_markdown_path` in the JSON response.
+2. **Folder linking** (`folder_index` LLM tool, `src/tools/folder_index.rs`):
+   the agent calls this immediately after `workspace_folder_link`. It
+   recursively walks the folder (default depth 4, max 50 files per call,
+   skips hidden / `node_modules` / `target`), classifies each file, and
+   runs the converter only on files that aren't already fresh in the
+   cache. Image PDFs default to `skip_image_pdfs = true` to avoid
+   surprise Upstage charges; the agent must explicitly opt in after
+   asking the user.
+3. **Web URL** (`web_fetch` tool, `src/tools/web_fetch.rs:609`): if the
+   URL path ends in `.pdf` and the workspace was injected at construction
+   time, the tool downloads the bytes (with PDF magic-byte sanity check),
+   routes through `DocumentPipelineTool`, persists via `DocumentCache`,
+   and returns Markdown to the agent. Non-PDF responses fall through to
+   the regular HTML provider chain unchanged.
+
+#### Idempotency rules
+
+- **Same file uploaded twice** → identical content hash → identical
+  upload path → cache hit, no re-conversion.
+- **Same folder indexed twice** → `convert_and_cache` per file checks
+  the cache first, only converts files added or modified since the
+  previous run.
+- **Same PDF URL fetched twice** → identical URL hash → identical
+  download path → cache hit, no second download.
+
+#### What this does NOT do (deliberate)
+
+- **No file watcher.** Adding `notify` (the standard Rust file watcher
+  crate) would pull in another dep tree just for "auto-detect new files
+  in linked folders". `folder_index` can be re-run cheaply (cache hits
+  are essentially free) so the user can re-index on demand. A real
+  watcher can be a follow-up PR if needed.
+- **No automatic OCR billing.** Image PDFs are skipped by default in
+  `folder_index` so the user is never surprised by Upstage charges. The
+  agent must explicitly pass `skip_image_pdfs: false` after disclosing
+  the cost — same consent flow as the existing `document_process` tool's
+  `classify_only` mode.
+- **No content de-duplication across cache entries.** Two different
+  files with byte-identical contents end up in two different cache
+  directories. Cheap to add later if it becomes a real problem.
+- **No native Rust HWPX writer.** HWPX creation still goes through the
+  bundled Python skill (`src/tools/hwpx_create.rs` + `hwpx_skill/`).
+  See §15A.6 reasoning.
+
 #### How to use the dispatch subsystem
 
 ```rust

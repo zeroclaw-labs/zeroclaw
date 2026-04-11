@@ -2012,13 +2012,96 @@ pub async fn handle_api_document_process(
                 // The tool output is a JSON string with html, markdown, doc_type, etc.
                 // Parse it and return the structured fields directly so the frontend
                 // can access result.html, result.markdown without an extra wrapper.
-                let parsed: serde_json::Value = serde_json::from_str(&result.output)
+                let mut parsed: serde_json::Value = serde_json::from_str(&result.output)
                     .unwrap_or_else(|_| {
                         serde_json::json!({
                             "markdown": result.output,
                             "html": "",
                         })
                     });
+
+                // ── Auto-cache the converted document ──
+                // Per user requirement: every uploaded document is
+                // immediately persisted in an LLM-friendly form so future
+                // chat turns and content_search can find it. The stable
+                // upload path is keyed by content hash so the same file
+                // uploaded twice does not duplicate the cache.
+                let workspace_dir = state.config.lock().workspace_dir.clone();
+                let markdown = parsed
+                    .get("markdown")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let html_owned = parsed
+                    .get("html")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                if !markdown.is_empty() {
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(&file_bytes);
+                    let digest = hasher.finalize();
+                    let mut hex = String::with_capacity(16);
+                    for byte in digest.iter().take(8) {
+                        hex.push_str(&format!("{byte:02x}"));
+                    }
+
+                    let upload_dir = workspace_dir.join("uploads").join(&hex);
+                    let stable_source = upload_dir.join(&original_filename);
+                    if let Err(e) = std::fs::create_dir_all(&upload_dir) {
+                        tracing::warn!(
+                            "document upload: failed to create stable upload dir {}: {e}",
+                            upload_dir.display()
+                        );
+                    } else if let Err(e) = std::fs::write(&stable_source, &file_bytes) {
+                        tracing::warn!(
+                            "document upload: failed to write stable source {}: {e}",
+                            stable_source.display()
+                        );
+                    } else {
+                        match crate::services::document_cache::DocumentCache::new(&workspace_dir) {
+                            Ok(cache) => {
+                                match cache
+                                    .store_precomputed(
+                                        &stable_source,
+                                        &markdown,
+                                        html_owned.as_deref(),
+                                        "chat-upload",
+                                    )
+                                    .await
+                                {
+                                    Ok(cached) => {
+                                        parsed["cache_id"] =
+                                            serde_json::Value::String(cached.id.clone());
+                                        parsed["cache_markdown_path"] = serde_json::Value::String(
+                                            cached.markdown_path.to_string_lossy().into_owned(),
+                                        );
+                                        if let Some(p) = cached.html_path.as_ref() {
+                                            parsed["cache_html_path"] = serde_json::Value::String(
+                                                p.to_string_lossy().into_owned(),
+                                            );
+                                        }
+                                        parsed["stable_source_path"] = serde_json::Value::String(
+                                            stable_source.to_string_lossy().into_owned(),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "document upload: cache store failed (continuing without cache): {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "document upload: cache init failed: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+
                 Json(parsed).into_response()
             } else {
                 (

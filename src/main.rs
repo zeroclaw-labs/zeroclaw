@@ -94,6 +94,7 @@ mod runtime;
 mod sandbox;
 mod security;
 mod service;
+mod services;
 mod skillforge;
 mod skills;
 mod storage;
