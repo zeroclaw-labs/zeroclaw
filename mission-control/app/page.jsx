@@ -5,9 +5,7 @@ import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import { ActivityPanel } from "@/components/activity-panel";
 
-const progressKinds = ["info", "update", "warning", "complete"];
-const artifactTypes = ["changed_file", "artifact"];
-const artifactStatuses = ["created", "updated", "deleted"];
+const POLL_MS = 2000;
 
 export default function Page() {
   const seed = useMutation(api.mission.seed);
@@ -25,28 +23,48 @@ export default function Page() {
   const upsertGlobalInstructions = useMutation(api.mission.upsertGlobalInstructions);
   const upsertFolderInstruction = useMutation(api.mission.upsertFolderInstruction);
   const createGoal = useMutation(api.mission.createGoal);
-  const createProgressEntry = useMutation(api.mission.createProgressEntry);
-  const createArtifact = useMutation(api.mission.createArtifact);
+
+  const [activeRunId, setActiveRunId] = useState("");
+  const [runState, setRunState] = useState(null);
+  const [runEvents, setRunEvents] = useState([]);
+  const [runResult, setRunResult] = useState(null);
 
   useEffect(() => {
     seed();
   }, [seed]);
 
-  const sortedProgress = useMemo(
-    () => [...dashboard.progress].sort((a, b) => b.createdAt - a.createdAt),
-    [dashboard.progress]
-  );
+  useEffect(() => {
+    if (!activeRunId) return;
 
-  const sortedArtifacts = useMemo(
-    () => [...dashboard.artifacts].sort((a, b) => b.createdAt - a.createdAt),
-    [dashboard.artifacts]
+    let cancelled = false;
+    const load = async () => {
+      const response = await fetch(`/api/runtime/runs/${activeRunId}`, { cache: "no-store" });
+      if (!response.ok) return;
+      const payload = await response.json();
+      if (cancelled) return;
+      setRunState(payload.state || null);
+      setRunEvents(payload.events || []);
+      setRunResult(payload.result || null);
+    };
+
+    load();
+    const timer = setInterval(load, POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [activeRunId]);
+
+  const sortedGoals = useMemo(
+    () => [...dashboard.goals].sort((a, b) => b.createdAt - a.createdAt),
+    [dashboard.goals]
   );
 
   return (
     <main className="page">
       <header className="hero">
         <h1>Mission Control</h1>
-        <p>Project Workspace-centered planning (Phase 1).</p>
+        <p>Phase 2 runtime bridge (live runtime-backed runs).</p>
       </header>
 
       <section className="panel" id="workspace">
@@ -60,39 +78,23 @@ export default function Page() {
       </section>
 
       <section className="panel" id="goal">
-        <h2>2) Enter goal</h2>
+        <h2>2) Enter goal and create real run</h2>
         {dashboard.activeWorkspace ? (
-          <GoalComposer workspaceId={dashboard.activeWorkspace._id} onCreate={createGoal} goals={dashboard.goals} />
+          <RunComposer
+            workspace={dashboard.activeWorkspace}
+            folderInstructions={dashboard.folderInstructions}
+            onCreateGoal={createGoal}
+            onRunCreated={setActiveRunId}
+            goals={sortedGoals}
+          />
         ) : (
           <p>Create a workspace first.</p>
         )}
       </section>
 
-      <section className="panel" id="progress">
-        <h2>3) Progress area</h2>
-        {dashboard.activeWorkspace ? (
-          <ProgressPanel
-            workspaceId={dashboard.activeWorkspace._id}
-            goals={dashboard.goals}
-            progress={sortedProgress}
-            onCreate={createProgressEntry}
-          />
-        ) : (
-          <p>Select a workspace to track progress.</p>
-        )}
-      </section>
-
-      <section className="panel" id="artifacts">
-        <h2>4) Changed files / artifacts area</h2>
-        {dashboard.activeWorkspace ? (
-          <ArtifactsPanel
-            workspaceId={dashboard.activeWorkspace._id}
-            artifacts={sortedArtifacts}
-            onCreate={createArtifact}
-          />
-        ) : (
-          <p>Select a workspace to track changed files and artifacts.</p>
-        )}
+      <section className="panel" id="runtime">
+        <h2>3) Live runtime status</h2>
+        <RunStatusPanel runId={activeRunId} state={runState} result={runResult} events={runEvents} />
       </section>
 
       {dashboard.activeWorkspace && (
@@ -160,26 +162,56 @@ function WorkspacePicker({ workspaces, activeWorkspace, onCreate, onSetActive })
   );
 }
 
-function GoalComposer({ workspaceId, onCreate, goals }) {
+function RunComposer({ workspace, folderInstructions, onCreateGoal, onRunCreated, goals }) {
   const [goal, setGoal] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
 
   const submit = async (event) => {
     event.preventDefault();
-    if (!goal.trim()) return;
-    await onCreate({ workspaceId, goal: goal.trim() });
-    setGoal("");
+    if (!goal.trim() || busy) return;
+
+    setBusy(true);
+    setError("");
+    try {
+      await onCreateGoal({ workspaceId: workspace._id, goal: goal.trim() });
+      const response = await fetch("/api/runtime/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          goal: goal.trim(),
+          workspacePath: workspace.rootPath,
+          globalInstructions: workspace.globalInstructions || "",
+          folderInstructions
+        })
+      });
+
+      if (!response.ok) {
+        const payload = await response.json();
+        throw new Error(payload.error || "Failed to create runtime run");
+      }
+
+      const payload = await response.json();
+      onRunCreated(payload.runId);
+      setGoal("");
+    } catch (runError) {
+      setError(runError.message);
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
     <div className="stack">
       <form className="composer" onSubmit={submit}>
         <textarea
-          placeholder="Describe the outcome you want in this workspace"
+          placeholder="Describe the real outcome you want in this workspace"
           value={goal}
           onChange={(e) => setGoal(e.target.value)}
         />
-        <button type="submit">Capture goal</button>
+        <button type="submit" disabled={busy}>{busy ? "Creating run..." : "Create runtime run"}</button>
       </form>
+      {error && <p className="muted">Error: {error}</p>}
       <div className="list">
         {goals.length === 0 && <p>No goals yet.</p>}
         {goals.map((item) => (
@@ -193,114 +225,70 @@ function GoalComposer({ workspaceId, onCreate, goals }) {
   );
 }
 
-function ProgressPanel({ workspaceId, goals, progress, onCreate }) {
-  const [form, setForm] = useState({ goalId: "", title: "", detail: "", kind: "update" });
-
-  const submit = async (event) => {
-    event.preventDefault();
-    if (!form.title.trim()) return;
-    await onCreate({
-      workspaceId,
-      goalId: form.goalId || undefined,
-      title: form.title.trim(),
-      detail: form.detail.trim() || undefined,
-      kind: form.kind
-    });
-    setForm({ goalId: "", title: "", detail: "", kind: "update" });
-  };
+function RunStatusPanel({ runId, state, events, result }) {
+  if (!runId) {
+    return <p>No run selected yet. Create a run to stream runtime-backed status.</p>;
+  }
 
   return (
     <div className="stack">
-      <form className="composer" onSubmit={submit}>
-        <select value={form.goalId} onChange={(e) => setForm({ ...form, goalId: e.target.value })}>
-          <option value="">No goal link</option>
-          {goals.map((goal) => (
-            <option key={goal._id} value={goal._id}>
-              {goal.goal}
-            </option>
-          ))}
-        </select>
-        <input placeholder="Progress title" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
-        <textarea placeholder="Progress detail" value={form.detail} onChange={(e) => setForm({ ...form, detail: e.target.value })} />
-        <select value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value })}>
-          {progressKinds.map((kind) => (
-            <option key={kind} value={kind}>
-              {kind}
-            </option>
-          ))}
-        </select>
-        <button type="submit">Log progress</button>
-      </form>
+      <article className="card">
+        <strong>Run ID: {runId}</strong>
+        <p className="muted">Status: {state?.status || "pending"}</p>
+        <p className="muted">Current step: {state?.current_step || "queued"}</p>
+        <p className="muted">Plan state: {state?.plan_state || "queued"}</p>
+      </article>
 
-      <div className="list">
-        {progress.length === 0 && <p>No progress yet.</p>}
-        {progress.map((entry) => (
-          <article key={entry._id} className="card">
-            <div className="row">
-              <strong>{entry.title}</strong>
-              <small className="badge">{entry.kind}</small>
-            </div>
-            {entry.detail && <p>{entry.detail}</p>}
-            <small className="muted">{new Date(entry.createdAt).toLocaleString()}</small>
-          </article>
-        ))}
-      </div>
-    </div>
-  );
-}
+      <article className="card">
+        <strong>Tool events</strong>
+        {state?.tool_events?.length ? (
+          <ul>
+            {state.tool_events.slice(-10).map((event, index) => (
+              <li key={`${event.tool}-${event.created_at}-${index}`}>
+                {event.tool} · {event.success === null || event.success === undefined ? "started" : event.success ? "ok" : "error"}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="muted">No tool events yet.</p>
+        )}
+      </article>
 
-function ArtifactsPanel({ workspaceId, artifacts, onCreate }) {
-  const [form, setForm] = useState({ path: "", artifactType: "changed_file", summary: "", status: "updated" });
+      <article className="card">
+        <strong>Changed files / artifacts</strong>
+        {state?.file_changes?.length ? (
+          <ul>
+            {state.file_changes.map((filePath) => (
+              <li key={filePath}>{filePath}</li>
+            ))}
+          </ul>
+        ) : (
+          <p className="muted">No changed files detected yet.</p>
+        )}
+      </article>
 
-  const submit = async (event) => {
-    event.preventDefault();
-    if (!form.path.trim()) return;
-    await onCreate({
-      workspaceId,
-      path: form.path.trim(),
-      artifactType: form.artifactType,
-      summary: form.summary.trim() || undefined,
-      status: form.status
-    });
-    setForm({ path: "", artifactType: "changed_file", summary: "", status: "updated" });
-  };
+      <article className="card">
+        <strong>Runtime events</strong>
+        {events.length ? (
+          <ul>
+            {events.slice(-20).map((event, index) => (
+              <li key={`${event.created_at}-${index}`}>
+                {event.created_at}: {event.event_type}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="muted">No runtime events yet.</p>
+        )}
+      </article>
 
-  return (
-    <div className="stack">
-      <form className="composer" onSubmit={submit}>
-        <input placeholder="File path or artifact path" value={form.path} onChange={(e) => setForm({ ...form, path: e.target.value })} />
-        <select value={form.artifactType} onChange={(e) => setForm({ ...form, artifactType: e.target.value })}>
-          {artifactTypes.map((value) => (
-            <option key={value} value={value}>
-              {value}
-            </option>
-          ))}
-        </select>
-        <select value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })}>
-          {artifactStatuses.map((value) => (
-            <option key={value} value={value}>
-              {value}
-            </option>
-          ))}
-        </select>
-        <input placeholder="Summary (optional)" value={form.summary} onChange={(e) => setForm({ ...form, summary: e.target.value })} />
-        <button type="submit">Log changed file/artifact</button>
-      </form>
-
-      <div className="list">
-        {artifacts.length === 0 && <p>No changed files/artifacts yet.</p>}
-        {artifacts.map((entry) => (
-          <article key={entry._id} className="card">
-            <div className="row">
-              <strong>{entry.path}</strong>
-              <small className="badge">{entry.status}</small>
-            </div>
-            <p className="muted">{entry.artifactType}</p>
-            {entry.summary && <p>{entry.summary}</p>}
-            <small className="muted">{new Date(entry.createdAt).toLocaleString()}</small>
-          </article>
-        ))}
-      </div>
+      {result && (
+        <article className="card">
+          <strong>Result</strong>
+          <p>Status: {result.status}</p>
+          <p>{result.summary}</p>
+        </article>
+      )}
     </div>
   );
 }
