@@ -77,11 +77,12 @@ export const dashboard = query({
         goals: [],
         progress: [],
         artifacts: [],
-        folderInstructions: []
+        folderInstructions: [],
+        deliverables: []
       };
     }
 
-    const [goals, progress, artifacts, folderInstructions] = await Promise.all([
+    const [goals, progress, artifacts, folderInstructions, deliverables] = await Promise.all([
       ctx.db
         .query("workspaceGoals")
         .withIndex("by_workspace", (q) => q.eq("workspaceId", activeWorkspace._id))
@@ -97,6 +98,10 @@ export const dashboard = query({
       ctx.db
         .query("folderInstructions")
         .withIndex("by_workspace", (q) => q.eq("workspaceId", activeWorkspace._id))
+        .collect(),
+      ctx.db
+        .query("workspaceDeliverables")
+        .withIndex("by_workspace", (q) => q.eq("workspaceId", activeWorkspace._id))
         .collect()
     ]);
 
@@ -106,7 +111,8 @@ export const dashboard = query({
       goals,
       progress,
       artifacts,
-      folderInstructions
+      folderInstructions,
+      deliverables
     };
   }
 });
@@ -326,6 +332,106 @@ export const createArtifact = mutation({
       entityId: String(id),
       action: "artifact.logged",
       summary: `you logged ${args.artifactType}: ${args.path}`
+    });
+
+    return id;
+  }
+});
+
+export const upsertRunDeliverable = mutation({
+  args: {
+    workspaceId: v.id("projectWorkspaces"),
+    runId: v.string(),
+    goalId: v.optional(v.id("workspaceGoals")),
+    goal: v.string(),
+    status: v.union(v.literal("completed"), v.literal("failed"), v.literal("running")),
+    summary: v.string(),
+    changedFiles: v.array(v.string()),
+    artifacts: v.array(
+      v.object({
+        path: v.string(),
+        artifactType: v.string(),
+        status: v.string()
+      })
+    ),
+    outputLocation: v.object({
+      resultsRoot: v.string(),
+      resultFile: v.string(),
+      statusFile: v.string(),
+      eventsFile: v.string(),
+      artifactsDir: v.optional(v.string())
+    }),
+    suggestedNextSteps: v.array(v.string()),
+    approvalHistory: v.array(
+      v.object({
+        createdAt: v.string(),
+        eventType: v.string(),
+        summary: v.string(),
+        status: v.optional(v.string())
+      })
+    )
+  },
+  handler: async (ctx, args) => {
+    const workspace = await ctx.db.get(args.workspaceId);
+    if (!workspace) {
+      throw new Error("Workspace not found");
+    }
+
+    if (args.goalId) {
+      const goal = await ctx.db.get(args.goalId);
+      if (!goal || goal.workspaceId !== args.workspaceId) {
+        throw new Error("Goal not found in workspace");
+      }
+      await ctx.db.patch(args.goalId, {
+        status: args.status === "failed" ? "blocked" : args.status === "completed" ? "done" : "in_progress",
+        updatedAt: Date.now()
+      });
+    }
+
+    const now = Date.now();
+    const existing = await ctx.db
+      .query("workspaceDeliverables")
+      .withIndex("by_run", (q) => q.eq("runId", args.runId))
+      .first();
+
+    const payload = {
+      workspaceId: args.workspaceId,
+      runId: args.runId,
+      goalId: args.goalId,
+      goal: args.goal,
+      status: args.status,
+      summary: args.summary,
+      changedFiles: args.changedFiles,
+      artifacts: args.artifacts,
+      outputLocation: args.outputLocation,
+      suggestedNextSteps: args.suggestedNextSteps,
+      approvalHistory: args.approvalHistory,
+      updatedAt: now
+    };
+
+    if (existing) {
+      await ctx.db.patch(existing._id, payload);
+      await writeActivity(ctx, {
+        actor: "you",
+        entityType: "deliverable",
+        entityId: String(existing._id),
+        action: "deliverable.updated",
+        summary: `you updated run deliverable for ${args.runId}`
+      });
+      return existing._id;
+    }
+
+    const id = await ctx.db.insert("workspaceDeliverables", {
+      ...payload,
+      createdAt: now
+    });
+
+    await writeActivity(ctx, {
+      actor: "you",
+      entityType: "deliverable",
+      entityId: String(id),
+      action: "deliverable.created",
+      summary: `you finalized deliverable for run ${args.runId}`
     });
 
     return id;

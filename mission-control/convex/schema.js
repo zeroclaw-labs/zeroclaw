@@ -6,7 +6,8 @@ const activityEntityType = v.union(
   v.literal("goal"),
   v.literal("progress"),
   v.literal("artifact"),
-  v.literal("instruction")
+  v.literal("instruction"),
+  v.literal("deliverable")
 );
 
 export default defineSchema({
@@ -45,6 +46,42 @@ export default defineSchema({
     status: v.union(v.literal("created"), v.literal("updated"), v.literal("deleted")),
     createdAt: v.number()
   }).index("by_workspace", ["workspaceId"]),
+  workspaceDeliverables: defineTable({
+    workspaceId: v.id("projectWorkspaces"),
+    runId: v.string(),
+    goalId: v.optional(v.id("workspaceGoals")),
+    goal: v.string(),
+    status: v.union(v.literal("completed"), v.literal("failed"), v.literal("running")),
+    summary: v.string(),
+    changedFiles: v.array(v.string()),
+    artifacts: v.array(
+      v.object({
+        path: v.string(),
+        artifactType: v.string(),
+        status: v.string()
+      })
+    ),
+    outputLocation: v.object({
+      resultsRoot: v.string(),
+      resultFile: v.string(),
+      statusFile: v.string(),
+      eventsFile: v.string(),
+      artifactsDir: v.optional(v.string())
+    }),
+    suggestedNextSteps: v.array(v.string()),
+    approvalHistory: v.array(
+      v.object({
+        createdAt: v.string(),
+        eventType: v.string(),
+        summary: v.string(),
+        status: v.optional(v.string())
+      })
+    ),
+    createdAt: v.number(),
+    updatedAt: v.number()
+  })
+    .index("by_workspace", ["workspaceId"])
+    .index("by_run", ["runId"]),
   folderInstructions: defineTable({
     workspaceId: v.id("projectWorkspaces"),
     folderPath: v.string(),
