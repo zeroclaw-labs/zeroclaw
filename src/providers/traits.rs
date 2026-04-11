@@ -92,6 +92,10 @@ impl ChatResponse {
 pub struct ChatRequest<'a> {
     pub messages: &'a [ChatMessage],
     pub tools: Option<&'a [ToolSpec]>,
+    /// Native extended thinking parameters. When `Some`, providers that
+    /// support extended thinking should send a dedicated thinking budget
+    /// in the API request and force `temperature = 1.0`.
+    pub thinking: Option<crate::agent::thinking::NativeThinkingParams>,
 }
 
 /// A tool result to feed back to the LLM.
@@ -269,6 +273,7 @@ pub struct ProviderCapabilityError {
 ///
 /// Describes what features a provider supports, enabling intelligent
 /// adaptation of tool calling modes and request formatting.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderCapabilities {
     /// Whether the provider supports native tool calling via API primitives.
@@ -283,6 +288,9 @@ pub struct ProviderCapabilities {
     /// Whether the provider supports prompt caching (Anthropic cache_control,
     /// OpenAI automatic prompt caching).
     pub prompt_caching: bool,
+    /// Whether the provider supports native extended thinking (Anthropic
+    /// `thinking` parameter with `budget_tokens`).
+    pub extended_thinking: bool,
 }
 
 /// Provider-specific tool payload formats.
@@ -578,6 +586,7 @@ mod tests {
                 native_tool_calling: true,
                 vision: true,
                 prompt_caching: false,
+                extended_thinking: false,
             }
         }
 
@@ -695,16 +704,19 @@ mod tests {
             native_tool_calling: true,
             vision: false,
             prompt_caching: false,
+            extended_thinking: false,
         };
         let caps2 = ProviderCapabilities {
             native_tool_calling: true,
             vision: false,
             prompt_caching: false,
+            extended_thinking: false,
         };
         let caps3 = ProviderCapabilities {
             native_tool_calling: false,
             vision: false,
             prompt_caching: false,
+            extended_thinking: false,
         };
 
         assert_eq!(caps1, caps2);
@@ -864,6 +876,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: Some(&tools),
+            thinking: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -881,6 +894,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: None,
+            thinking: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -981,6 +995,7 @@ mod tests {
                 ChatMessage::system("BASE_SYSTEM_PROMPT"),
             ],
             tools: Some(&tools),
+            thinking: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -1003,6 +1018,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::system("BASE"), ChatMessage::user("Hello")],
             tools: Some(&tools),
+            thinking: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -1025,6 +1041,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: Some(&tools),
+            thinking: None,
         };
 
         let err = provider.chat(request, "model", 0.7).await.unwrap_err();
@@ -1073,6 +1090,7 @@ mod tests {
             ChatRequest {
                 messages: &[ChatMessage::user("hi")],
                 tools: None,
+                thinking: None,
             },
             "model",
             0.0,

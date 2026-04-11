@@ -916,6 +916,7 @@ impl Agent {
                         } else {
                             None
                         },
+                        thinking: None,
                     },
                     &effective_model,
                     self.temperature,
@@ -1095,6 +1096,7 @@ impl Agent {
                     } else {
                         None
                     },
+                    thinking: None,
                 },
                 &effective_model,
                 self.temperature,
@@ -1181,6 +1183,7 @@ impl Agent {
                             } else {
                                 None
                             },
+                            thinking: None,
                         },
                         &effective_model,
                         self.temperature,

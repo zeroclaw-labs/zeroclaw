@@ -14,6 +14,8 @@
 //! 3. Agent config (`agent.thinking.default_level`)
 //! 4. Global default (`Medium`)
 
+use std::collections::HashMap;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use zeroclaw_macros::Configurable;
@@ -42,6 +44,31 @@ impl crate::config::HasPropKind for ThinkingLevel {
 }
 
 impl ThinkingLevel {
+    /// Returns the canonical lowercase name of this level.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+
+    /// Returns the default `budget_tokens` for native extended thinking at this level.
+    ///
+    /// Levels below `High` return `None` — they use prompt-based reasoning only.
+    /// `High` and `Max` return token budgets suitable for Anthropic's extended
+    /// thinking API.
+    pub fn default_budget_tokens(&self) -> Option<u32> {
+        match self {
+            Self::Off | Self::Minimal | Self::Low | Self::Medium => None,
+            Self::High => Some(10_000),
+            Self::Max => Some(50_000),
+        }
+    }
+
     /// Parse a thinking level from a string (case-insensitive).
     pub fn from_str_insensitive(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
@@ -63,14 +90,69 @@ pub struct ThinkingConfig {
     /// Default thinking level when no directive is present.
     #[serde(default)]
     pub default_level: ThinkingLevel,
+    /// Enable native extended thinking for providers that support it.
+    /// When `false` or when the provider lacks support, falls back to
+    /// prompt-based reasoning. Default: `true`.
+    #[serde(default = "default_true")]
+    pub native_thinking: bool,
+    /// Override the default `budget_tokens` per level. Keys are level names
+    /// (e.g. `"high"`, `"max"`). Values are token counts. Unspecified levels
+    /// use built-in defaults from `ThinkingLevel::default_budget_tokens()`.
+    #[serde(default)]
+    pub budget_tokens: HashMap<String, u32>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for ThinkingConfig {
     fn default() -> Self {
         Self {
             default_level: ThinkingLevel::Medium,
+            native_thinking: true,
+            budget_tokens: HashMap::new(),
         }
     }
+}
+
+impl ThinkingConfig {
+    /// Resolve the effective `budget_tokens` for a given level, checking
+    /// user overrides first, then falling back to the level's built-in default.
+    /// Log warnings for any unrecognized keys in the `budget_tokens` map.
+    /// Call once during config load to catch typos early.
+    pub fn warn_unknown_budget_keys(&self) {
+        const VALID_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "max"];
+        for key in self.budget_tokens.keys() {
+            if !VALID_LEVELS.contains(&key.as_str()) {
+                tracing::warn!(
+                    key = %key,
+                    "Unknown thinking level in budget_tokens config; \
+                     valid levels are: off, minimal, low, medium, high, max"
+                );
+            }
+        }
+    }
+
+    pub fn budget_tokens_for(&self, level: ThinkingLevel) -> Option<u32> {
+        if let Some(&override_val) = self.budget_tokens.get(level.as_str()) {
+            return Some(override_val);
+        }
+        level.default_budget_tokens()
+    }
+}
+
+/// Maximum allowed `budget_tokens` value. Prevents runaway token costs from
+/// misconfigured overrides. Anthropic's current ceiling is 128K for most
+/// models; we cap below that as a safety margin.
+pub const MAX_BUDGET_TOKENS: u32 = 128_000;
+
+/// Parameters for native extended thinking (Anthropic API).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeThinkingParams {
+    /// Token budget allocated for the model's internal reasoning chain.
+    /// Clamped to [`MAX_BUDGET_TOKENS`] during resolution.
+    pub budget_tokens: u32,
 }
 
 /// Parameters derived from a thinking level, applied to the LLM request.
@@ -82,6 +164,9 @@ pub struct ThinkingParams {
     pub max_tokens_adjustment: i64,
     /// Optional system prompt prefix injected before the existing system prompt.
     pub system_prompt_prefix: Option<String>,
+    /// Native extended thinking parameters, populated when the config enables
+    /// native thinking and the level has a `budget_tokens` value.
+    pub native_thinking: Option<NativeThinkingParams>,
 }
 
 /// Parse a `/think:<level>` directive from the start of a message.
@@ -109,6 +194,10 @@ pub fn parse_thinking_directive(message: &str) -> Option<(ThinkingLevel, String)
 }
 
 /// Convert a `ThinkingLevel` into concrete parameters for the LLM request.
+///
+/// This returns prompt-based parameters only. Call
+/// [`apply_thinking_level_with_config`] to also resolve native extended
+/// thinking parameters from the agent config.
 pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
     match level {
         ThinkingLevel::Off => ThinkingParams {
@@ -119,6 +208,7 @@ pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
                  unless explicitly asked. No preamble."
                     .into(),
             ),
+            native_thinking: None,
         },
         ThinkingLevel::Minimal => ThinkingParams {
             temperature_adjustment: -0.1,
@@ -128,16 +218,19 @@ pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
                  Prioritize speed over thoroughness."
                     .into(),
             ),
+            native_thinking: None,
         },
         ThinkingLevel::Low => ThinkingParams {
             temperature_adjustment: -0.05,
             max_tokens_adjustment: 0,
             system_prompt_prefix: Some("Keep reasoning light. Explain only when helpful.".into()),
+            native_thinking: None,
         },
         ThinkingLevel::Medium => ThinkingParams {
             temperature_adjustment: 0.0,
             max_tokens_adjustment: 0,
             system_prompt_prefix: None,
+            native_thinking: None,
         },
         ThinkingLevel::High => ThinkingParams {
             temperature_adjustment: 0.05,
@@ -147,6 +240,7 @@ pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
                  consider edge cases before answering."
                     .into(),
             ),
+            native_thinking: None,
         },
         ThinkingLevel::Max => ThinkingParams {
             temperature_adjustment: 0.1,
@@ -157,8 +251,40 @@ pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
                  and provide the most thorough analysis possible."
                     .into(),
             ),
+            native_thinking: None,
         },
     }
+}
+
+/// Convert a `ThinkingLevel` into parameters, resolving native extended
+/// thinking from the provided config.
+///
+/// When `config.native_thinking` is `true` and the level has a budget
+/// (either from a user override or the built-in default), the returned
+/// `ThinkingParams` will include `native_thinking` with the resolved
+/// `budget_tokens`. The caller should then check provider capabilities
+/// before forwarding native params to the API.
+pub fn apply_thinking_level_with_config(
+    level: ThinkingLevel,
+    config: &ThinkingConfig,
+) -> ThinkingParams {
+    let mut params = apply_thinking_level(level);
+    if config.native_thinking {
+        if let Some(budget) = config.budget_tokens_for(level) {
+            let clamped = budget.min(MAX_BUDGET_TOKENS);
+            if clamped < budget {
+                tracing::warn!(
+                    requested = budget,
+                    clamped = clamped,
+                    "budget_tokens exceeds maximum; clamping to {MAX_BUDGET_TOKENS}"
+                );
+            }
+            params.native_thinking = Some(NativeThinkingParams {
+                budget_tokens: clamped,
+            });
+        }
+    }
+    params
 }
 
 /// Resolve the effective thinking level using the priority hierarchy:
@@ -179,6 +305,46 @@ pub fn resolve_thinking_level(
 /// Clamp a temperature value to the valid range `[0.0, 2.0]`.
 pub fn clamp_temperature(temp: f64) -> f64 {
     temp.clamp(0.0, 2.0)
+}
+
+/// Result of resolving a thinking directive from a user message.
+pub struct ResolvedThinking {
+    /// The effective message with any `/think:` prefix stripped.
+    pub effective_message: String,
+    /// Resolved thinking parameters (prompt prefix, native thinking, etc.).
+    pub params: ThinkingParams,
+    /// Temperature after applying the thinking level adjustment and clamping.
+    pub effective_temperature: f64,
+}
+
+/// Parse a thinking directive from a message and resolve all thinking
+/// parameters in one step. Combines `parse_thinking_directive`,
+/// `resolve_thinking_level`, `apply_thinking_level_with_config`, and
+/// `clamp_temperature` into a single call.
+pub fn resolve_thinking_from_message(
+    message: &str,
+    config: &ThinkingConfig,
+    base_temperature: f64,
+) -> ResolvedThinking {
+    use std::sync::Once;
+    static VALIDATE_ONCE: Once = Once::new();
+    VALIDATE_ONCE.call_once(|| config.warn_unknown_budget_keys());
+
+    let (directive, effective_message) = match parse_thinking_directive(message) {
+        Some((level, remaining)) => {
+            tracing::info!(thinking_level = ?level, "Thinking directive parsed from message");
+            (Some(level), remaining)
+        }
+        None => (None, message.to_string()),
+    };
+    let level = resolve_thinking_level(directive, None, config);
+    let params = apply_thinking_level_with_config(level, config);
+    let effective_temperature = clamp_temperature(base_temperature + params.temperature_adjustment);
+    ResolvedThinking {
+        effective_message,
+        params,
+        effective_temperature,
+    }
 }
 
 #[cfg(test)]
@@ -357,6 +523,7 @@ mod tests {
     fn resolve_inline_directive_takes_priority() {
         let config = ThinkingConfig {
             default_level: ThinkingLevel::Low,
+            ..ThinkingConfig::default()
         };
         let result =
             resolve_thinking_level(Some(ThinkingLevel::Max), Some(ThinkingLevel::High), &config);
@@ -367,6 +534,7 @@ mod tests {
     fn resolve_session_override_takes_priority_over_config() {
         let config = ThinkingConfig {
             default_level: ThinkingLevel::Low,
+            ..ThinkingConfig::default()
         };
         let result = resolve_thinking_level(None, Some(ThinkingLevel::High), &config);
         assert_eq!(result, ThinkingLevel::High);
@@ -376,6 +544,7 @@ mod tests {
     fn resolve_falls_back_to_config_default() {
         let config = ThinkingConfig {
             default_level: ThinkingLevel::Minimal,
+            ..ThinkingConfig::default()
         };
         let result = resolve_thinking_level(None, None, &config);
         assert_eq!(result, ThinkingLevel::Minimal);
@@ -428,5 +597,145 @@ mod tests {
         let level = ThinkingLevel::High;
         let json = serde_json::to_string(&level).unwrap();
         assert_eq!(json, "\"high\"");
+    }
+
+    // ── Native thinking: budget defaults ────────────────────────
+
+    #[test]
+    fn default_budget_tokens_none_below_high() {
+        assert!(ThinkingLevel::Off.default_budget_tokens().is_none());
+        assert!(ThinkingLevel::Minimal.default_budget_tokens().is_none());
+        assert!(ThinkingLevel::Low.default_budget_tokens().is_none());
+        assert!(ThinkingLevel::Medium.default_budget_tokens().is_none());
+    }
+
+    #[test]
+    fn default_budget_tokens_high_and_max() {
+        assert_eq!(ThinkingLevel::High.default_budget_tokens(), Some(10_000));
+        assert_eq!(ThinkingLevel::Max.default_budget_tokens(), Some(50_000));
+    }
+
+    // ── Native thinking: config resolution ──────────────────────
+
+    #[test]
+    fn budget_tokens_for_uses_override() {
+        let mut overrides = HashMap::new();
+        overrides.insert("high".to_string(), 20_000);
+        let config = ThinkingConfig {
+            default_level: ThinkingLevel::Medium,
+            native_thinking: true,
+            budget_tokens: overrides,
+        };
+        assert_eq!(config.budget_tokens_for(ThinkingLevel::High), Some(20_000));
+        // Max falls back to built-in default (no override).
+        assert_eq!(config.budget_tokens_for(ThinkingLevel::Max), Some(50_000));
+    }
+
+    #[test]
+    fn budget_tokens_for_returns_none_for_low_levels() {
+        let config = ThinkingConfig::default();
+        assert!(config.budget_tokens_for(ThinkingLevel::Off).is_none());
+        assert!(config.budget_tokens_for(ThinkingLevel::Medium).is_none());
+    }
+
+    // ── Native thinking: apply_thinking_level_with_config ───────
+
+    #[test]
+    fn apply_with_config_populates_native_when_enabled() {
+        let config = ThinkingConfig {
+            native_thinking: true,
+            ..ThinkingConfig::default()
+        };
+        let params = apply_thinking_level_with_config(ThinkingLevel::High, &config);
+        let native = params.native_thinking.expect("should have native thinking");
+        assert_eq!(native.budget_tokens, 10_000);
+    }
+
+    #[test]
+    fn apply_with_config_none_when_disabled() {
+        let config = ThinkingConfig {
+            native_thinking: false,
+            ..ThinkingConfig::default()
+        };
+        let params = apply_thinking_level_with_config(ThinkingLevel::High, &config);
+        assert!(params.native_thinking.is_none());
+    }
+
+    #[test]
+    fn apply_with_config_none_for_medium_even_when_enabled() {
+        let config = ThinkingConfig {
+            native_thinking: true,
+            ..ThinkingConfig::default()
+        };
+        let params = apply_thinking_level_with_config(ThinkingLevel::Medium, &config);
+        assert!(params.native_thinking.is_none());
+    }
+
+    #[test]
+    fn apply_with_config_uses_budget_override() {
+        let mut overrides = HashMap::new();
+        overrides.insert("max".to_string(), 100_000);
+        let config = ThinkingConfig {
+            native_thinking: true,
+            budget_tokens: overrides,
+            ..ThinkingConfig::default()
+        };
+        let params = apply_thinking_level_with_config(ThinkingLevel::Max, &config);
+        let native = params.native_thinking.expect("should have native thinking");
+        assert_eq!(native.budget_tokens, 100_000);
+    }
+
+    // ── Native thinking: config serde ───────────────────────────
+
+    #[test]
+    fn thinking_config_native_thinking_defaults_to_true() {
+        let toml_str = "";
+        let config: ThinkingConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.native_thinking);
+        assert!(config.budget_tokens.is_empty());
+    }
+
+    #[test]
+    fn thinking_config_deserializes_native_thinking_false() {
+        let toml_str = r#"native_thinking = false"#;
+        let config: ThinkingConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.native_thinking);
+    }
+
+    #[test]
+    fn thinking_config_deserializes_budget_overrides() {
+        let toml_str = r#"
+default_level = "high"
+native_thinking = true
+
+[budget_tokens]
+high = 25000
+max = 80000
+"#;
+        let config: ThinkingConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.default_level, ThinkingLevel::High);
+        assert!(config.native_thinking);
+        assert_eq!(config.budget_tokens.get("high"), Some(&25000));
+        assert_eq!(config.budget_tokens.get("max"), Some(&80000));
+    }
+
+    // ── Backward compat: apply_thinking_level has no native ─────
+
+    #[test]
+    fn apply_thinking_level_never_sets_native() {
+        for level in [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Max,
+        ] {
+            let params = apply_thinking_level(level);
+            assert!(
+                params.native_thinking.is_none(),
+                "apply_thinking_level should not populate native_thinking for {level:?}"
+            );
+        }
     }
 }
