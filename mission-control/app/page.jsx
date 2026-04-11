@@ -1,32 +1,81 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { useMutation, useQuery } from "convex/react";
-import { api } from "@/convex/_generated/api";
 import { ActivityPanel } from "@/components/activity-panel";
 import { buildRunDeliverableInput } from "@/lib/deliverables";
 import { WORKFLOW_PRESETS, buildGoalFromPreset, getWorkflowPreset } from "@/lib/workflow-presets";
 
 const POLL_MS = 2000;
 
-export default function Page() {
-  const seed = useMutation(api.mission.seed);
-  const dashboard = useQuery(api.mission.dashboard, {}) || {
-    workspaces: [],
-    activeWorkspace: null,
-    goals: [],
-    progress: [],
-    artifacts: [],
-    folderInstructions: [],
-    deliverables: []
+
+const EMPTY_DASHBOARD = {
+  workspaces: [],
+  activeWorkspace: null,
+  goals: [],
+  progress: [],
+  artifacts: [],
+  folderInstructions: [],
+  deliverables: []
+};
+
+function useMissionControlData() {
+  const [dashboard, setDashboard] = useState(EMPTY_DASHBOARD);
+
+  const refresh = async () => {
+    const response = await fetch("/api/mission/dashboard", { cache: "no-store" });
+    if (!response.ok) return;
+    const payload = await response.json();
+    setDashboard(payload || EMPTY_DASHBOARD);
   };
 
-  const createWorkspace = useMutation(api.mission.createWorkspace);
-  const setActiveWorkspace = useMutation(api.mission.setActiveWorkspace);
-  const upsertGlobalInstructions = useMutation(api.mission.upsertGlobalInstructions);
-  const upsertFolderInstruction = useMutation(api.mission.upsertFolderInstruction);
-  const createGoal = useMutation(api.mission.createGoal);
-  const upsertRunDeliverable = useMutation(api.mission.upsertRunDeliverable);
+  useEffect(() => {
+    refresh();
+    const timer = setInterval(refresh, POLL_MS);
+    return () => clearInterval(timer);
+  }, []);
+
+  const seed = async () => {
+    await fetch("/api/mission/seed", { method: "POST" });
+    await refresh();
+  };
+
+  const command = async (action, args) => {
+    const response = await fetch("/api/mission/command", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, args })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "Mission Control command failed");
+    }
+    await refresh();
+    return payload.result;
+  };
+
+  return {
+    dashboard,
+    seed,
+    createWorkspace: (args) => command("createWorkspace", args),
+    setActiveWorkspace: (args) => command("setActiveWorkspace", args),
+    upsertGlobalInstructions: (args) => command("upsertGlobalInstructions", args),
+    upsertFolderInstruction: (args) => command("upsertFolderInstruction", args),
+    createGoal: (args) => command("createGoal", args),
+    upsertRunDeliverable: (args) => command("upsertRunDeliverable", args)
+  };
+}
+
+export default function Page() {
+  const {
+    dashboard,
+    createWorkspace,
+    setActiveWorkspace,
+    upsertGlobalInstructions,
+    upsertFolderInstruction,
+    createGoal,
+    upsertRunDeliverable,
+    seed
+  } = useMissionControlData();
 
   const [activeRun, setActiveRun] = useState(null);
   const [runState, setRunState] = useState(null);
@@ -50,7 +99,8 @@ export default function Page() {
 
   useEffect(() => {
     seed();
-  }, [seed]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (!activeRun?.runId) return;
