@@ -744,6 +744,9 @@ impl AnthropicProvider {
                                     tool_input_json.push_str(json);
                                 }
                             }
+                            // TODO: handle "thinking_delta" events for streaming
+                            // extended thinking content. Currently thinking blocks
+                            // are only captured in non-streaming parse_native_response().
                             _ => {}
                         }
                     }
