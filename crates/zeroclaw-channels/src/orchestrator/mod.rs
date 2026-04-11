@@ -4237,17 +4237,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     .line
                     .as_ref()
                     .context("LINE channel is not configured")?;
-                Ok(Arc::new(
-                    LineChannel::new(
-                        ln.channel_access_token.clone(),
-                        ln.channel_secret.clone(),
-                        ln.dm_policy.clone(),
-                        ln.group_policy.clone(),
-                        ln.allowed_users.clone(),
-                        ln.webhook_port,
-                    )
-                    .with_proxy_url(ln.proxy_url.clone()),
-                ))
+                Ok(Arc::new(LineChannel::from_config(ln)))
             }
             #[cfg(not(feature = "channel-line"))]
             {
@@ -4744,17 +4734,7 @@ fn collect_configured_channels(
         if ln.enabled {
             channels.push(ConfiguredChannel {
                 display_name: "LINE",
-                channel: Arc::new(
-                    LineChannel::new(
-                        ln.channel_access_token.clone(),
-                        ln.channel_secret.clone(),
-                        ln.dm_policy.clone(),
-                        ln.group_policy.clone(),
-                        ln.allowed_users.clone(),
-                        ln.webhook_port,
-                    )
-                    .with_proxy_url(ln.proxy_url.clone()),
-                ),
+                channel: Arc::new(LineChannel::from_config(ln)),
             });
         } else {
             tracing::info!("LINE channel configured but disabled (enabled = false)");

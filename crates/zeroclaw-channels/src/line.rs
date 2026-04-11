@@ -378,6 +378,22 @@ impl LineChannel {
         }
     }
 
+    /// Construct a `LineChannel` directly from a [`zeroclaw_config::schema::LineConfig`].
+    ///
+    /// Mirrors [`LarkChannel::from_config`] — keeps construction logic inside the
+    /// channel crate rather than duplicating it across orchestrator call sites.
+    pub fn from_config(config: &zeroclaw_config::schema::LineConfig) -> Self {
+        Self::new(
+            config.channel_access_token.clone(),
+            config.channel_secret.clone(),
+            config.dm_policy.clone(),
+            config.group_policy.clone(),
+            config.allowed_users.clone(),
+            config.webhook_port,
+        )
+        .with_proxy_url(config.proxy_url.clone())
+    }
+
     /// Override the proxy URL for outbound HTTP calls.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.client = zeroclaw_config::schema::build_channel_proxy_client(
