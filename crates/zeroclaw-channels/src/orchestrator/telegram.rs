@@ -598,6 +598,35 @@ impl TelegramChannel {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
     }
 
+    /// Register the bot's slash commands with Telegram via `setMyCommands`.
+    /// Called once at startup so that users see a command menu when pressing `/`.
+    async fn register_bot_commands(&self) {
+        let commands = serde_json::json!([
+            { "command": "new",    "description": "Start a new conversation session" },
+            { "command": "stop",   "description": "Cancel the current in-flight task" },
+            { "command": "model",  "description": "Show or switch the current model" },
+            { "command": "models", "description": "List available providers or switch provider" },
+            { "command": "config", "description": "Show current configuration" },
+        ]);
+
+        let url = self.api_url("setMyCommands");
+        let body = serde_json::json!({ "commands": commands });
+
+        match self.http_client().post(&url).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!("Telegram bot commands registered successfully");
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                tracing::warn!("Failed to register Telegram bot commands: {status} — {text}");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to register Telegram bot commands: {e}");
+            }
+        }
+    }
+
     /// Synthesize text to speech and send as a Telegram voice note (static version for spawned tasks).
     async fn synthesize_and_send_voice(
         api_base: &str,
@@ -2856,6 +2885,8 @@ impl Channel for TelegramChannel {
         }
 
         tracing::debug!("Startup probe succeeded; entering main long-poll loop.");
+
+        self.register_bot_commands().await;
 
         loop {
             if self.mention_only {
@@ -5118,5 +5149,64 @@ mod tests {
         let photo_content = "[IMAGE:/tmp/photo.jpg]".to_string();
         let content = format!("{attr}{photo_content}");
         assert_eq!(content, "[Forwarded from @bob] [IMAGE:/tmp/photo.jpg]");
+    }
+
+    #[tokio::test]
+    async fn register_bot_commands_sends_correct_payload() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let expected_body = serde_json::json!({
+            "commands": [
+                { "command": "new",    "description": "Start a new conversation session" },
+                { "command": "stop",   "description": "Cancel the current in-flight task" },
+                { "command": "model",  "description": "Show or switch the current model" },
+                { "command": "models", "description": "List available providers or switch provider" },
+                { "command": "config", "description": "Show current configuration" },
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .and(body_json(&expected_body))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+            .with_api_base(mock_server.uri());
+
+        ch.register_bot_commands().await;
+
+        // Mock expectation assert happens on MockServer drop
+    }
+
+    #[tokio::test]
+    async fn register_bot_commands_handles_failure_gracefully() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(
+                serde_json::json!({ "ok": false, "description": "Internal Server Error" }),
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+            .with_api_base(mock_server.uri());
+
+        // Should not panic — errors are logged, not propagated.
+        ch.register_bot_commands().await;
     }
 }
