@@ -610,31 +610,39 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
 /// Returns true if `command` contains an unquoted `>` that is NOT a safe
 /// stderr form (`2>/dev/null`, `2>&1`).
 fn contains_unsafe_output_redirect(command: &str) -> bool {
-    // Strip safe redirect-to-dev and fd-merge patterns, then check for remaining `>`.
-    // Order matters: longer patterns first to avoid partial matches.
-    let safe = command
-        .replace("> /dev/stdout", "")
-        .replace(">/dev/stdout", "")
-        .replace("> /dev/stderr", "")
-        .replace(">/dev/stderr", "")
-        .replace("> /dev/null", "")
-        .replace(">/dev/null", "")
-        .replace("> /dev/zero", "")
-        .replace(">/dev/zero", "")
-        .replace("2>&1", "")
-        .replace("1>&2", "");
+    // Strip safe redirect-to-dev patterns (with word boundary enforcement),
+    // then fd-merge patterns, then check for remaining `>`.
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    static SAFE_OUTPUT_RE: OnceLock<Regex> = OnceLock::new();
+    let re = SAFE_OUTPUT_RE.get_or_init(|| {
+        // Match >SPACE?/dev/{null,zero,stdout,stderr} followed by word boundary
+        // (end of string, space, semicolon, pipe, ampersand, newline, or close paren)
+        Regex::new(r"\d*>[ ]?/dev/(null|zero|stdout|stderr)(\b|$|[;\s|&)])").unwrap()
+    });
+
+    let safe = re.replace_all(command, "").to_string();
+    // Also strip fd-merge redirects (2>&1, 1>&2, >&N, etc.)
+    let safe = strip_fd_merge_redirects(&safe);
     contains_unquoted_char(&safe, '>')
 }
 
 /// Returns true if `command` contains an unquoted `<` that is NOT a heredoc (`<<`)
 /// or a safe input redirect from `/dev/*`.
 fn contains_unquoted_input_redirect(command: &str) -> bool {
-    // Strip here-strings (`<<<`) first, then heredocs (`<<`), then safe /dev/* sources.
-    let safe = command
-        .replace("<<<", "")
-        .replace("<<", "")
-        .replace("</dev/null", "")
-        .replace("</dev/zero", "");
+    // Strip here-strings (`<<<`) first, then heredocs (`<<`), then safe /dev/* sources
+    // with word boundary enforcement.
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    static SAFE_INPUT_RE: OnceLock<Regex> = OnceLock::new();
+    let re = SAFE_INPUT_RE.get_or_init(|| {
+        Regex::new(r"<[ ]?/dev/(null|zero)(\b|$|[;\s|&)])").unwrap()
+    });
+
+    let safe = command.replace("<<<", "").replace("<<", "");
+    let safe = re.replace_all(&safe, "").to_string();
     contains_unquoted_char(&safe, '<')
 }
 
@@ -2402,6 +2410,10 @@ mod tests {
         assert!(!p.is_command_allowed("ls >> /tmp/exfil.txt"));
         assert!(!p.is_command_allowed("cat < /etc/passwd"));
         assert!(!p.is_command_allowed("echo secret > output.txt"));
+        // Path-prefix bypass: /dev/null followed by extra path component
+        assert!(!p.is_command_allowed("echo secret>/dev/nullextra"));
+        assert!(!p.is_command_allowed("echo secret > /dev/null/../../etc/passwd"));
+        assert!(!p.is_command_allowed("echo secret>/dev/stderrfoo"));
     }
 
     #[test]
