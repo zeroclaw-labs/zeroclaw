@@ -395,7 +395,7 @@ Examples:
         channel_command: ChannelCommands,
     },
 
-    /// Browse 50+ integrations
+    /// Browse integrations
     Integrations {
         #[command(subcommand)]
         integration_command: IntegrationCommands,
