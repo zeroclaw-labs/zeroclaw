@@ -185,7 +185,11 @@ jobs:
             echo ""
             echo "| Check | Status |"
             echo "|---|---|"
-            echo "| crates.io dry-run | Passed |"
+            if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+              echo "| crates.io dry-run | Passed |"
+            else
+              echo "| crates.io dry-run | Skipped (PR) |"
+            fi
             echo "| Required secrets | Passed |"
             echo "| Downstream repo access | Passed |"
             echo "| Version consistency | Passed |"
