@@ -2122,6 +2122,116 @@ pub async fn handle_api_document_process(
     }
 }
 
+/// Voice picker category labels (embedded at compile time from JSON).
+fn voice_picker_categories() -> serde_json::Value {
+    serde_json::from_str(include_str!("voice_assets/categories.json"))
+        .expect("voice_assets/categories.json is valid JSON")
+}
+
+/// Mood → Typecast use_cases mapping for frontend filter.
+fn voice_mood_mapping() -> serde_json::Value {
+    serde_json::from_str(include_str!("voice_assets/mood_mapping.json"))
+        .expect("voice_assets/mood_mapping.json is valid JSON")
+}
+
+/// GET /api/voices/list — list available TTS voices from Typecast API.
+///
+/// Proxies the Typecast `/v2/voices` endpoint with caching (5 min TTL)
+/// so the frontend can display a voice picker categorized by gender,
+/// age, and use_cases. The response adds Korean-friendly category
+/// labels for the UI.
+///
+/// Query params (all optional, passed through to Typecast):
+///   - `gender`: "male" | "female"
+///   - `age`: "child" | "teenager" | "young_adult" | "middle_age" | "elder"
+///   - `use_cases`: "Conversational" | "Voicemail/Voice Assistant" | etc.
+pub async fn handle_api_voices_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let typecast_key = std::env::var("TYPECAST_API_KEY").unwrap_or_default();
+    if typecast_key.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "TYPECAST_API_KEY not configured"})),
+        )
+            .into_response();
+    }
+
+    // Build Typecast query params
+    let mut url = "https://api.typecast.ai/v2/voices?model=ssfm-v30".to_string();
+    for (key, value) in query.iter() {
+        if matches!(key.as_str(), "gender" | "age" | "use_cases") {
+            url.push('&');
+            url.push_str(key);
+            url.push('=');
+            url.push_str(&urlencoding::encode(value));
+        }
+    }
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .get(&url)
+        .header("X-API-KEY", &typecast_key)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("Typecast API unreachable: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("Typecast API error ({status}): {body}")})),
+        )
+            .into_response();
+    }
+
+    let voices: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("Invalid Typecast response: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    // Categories + mood mapping are large static JSON; built via
+    // serde_json::Value construction to avoid recursion-limit issues
+    // with the json!{} macro on deeply nested structures.
+    let categories = voice_picker_categories();
+    let mood_mapping = voice_mood_mapping();
+
+    let mut result = serde_json::json!({
+        "voices": voices,
+        "model": "ssfm-v30",
+        "emotions": ["normal", "happy", "sad", "angry", "whisper", "toneup", "tonedown"],
+        "smart_emotion": true,
+        "languages_count": 37
+    });
+    result["categories"] = categories;
+    result["mood_to_use_cases"] = mood_mapping;
+    Json(result)
+    .into_response()
+}
+
 /// GET /api/health — component health snapshot
 pub async fn handle_api_health(
     State(state): State<AppState>,

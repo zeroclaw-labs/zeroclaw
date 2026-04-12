@@ -1,0 +1,8 @@
+{
+  "warm": ["Conversational", "Voicemail/Voice Assistant", "Radio/Podcast"],
+  "professional": ["E-learning/Explainer", "Documentary", "Announcer", "News Reporter"],
+  "energetic": ["TikTok/Reels/Shorts", "Ads/Promotion", "Radio/Podcast"],
+  "serious": ["Documentary", "News Reporter", "Announcer"],
+  "soft": ["Audiobook/Storytelling", "Voicemail/Voice Assistant"],
+  "youthful": ["TikTok/Reels/Shorts", "Conversational", "Game", "Anime"]
+}

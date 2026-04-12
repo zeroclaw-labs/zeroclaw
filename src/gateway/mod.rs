@@ -1238,6 +1238,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .nest("/api/admin/dashboard", admin_api::admin_router())
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
+        .route("/api/voices/list", get(api::handle_api_voices_list))
         .route("/api/node-control", post(handle_node_control))
         // ── LLM proxy (hybrid architecture: keys stay on server) ──
         // Needs extended body limit — conversation history can exceed 64KB.
