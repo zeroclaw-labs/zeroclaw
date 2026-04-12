@@ -89,7 +89,17 @@ list_features() {
 
 version_gte() {
   # Returns 0 if $1 >= $2 (dot-separated version strings)
-  printf '%s\n%s' "$2" "$1" | sort -V -C
+  local a b
+  IFS='.' read -ra a <<< "$1"
+  IFS='.' read -ra b <<< "$2"
+  local i len=${#b[@]}
+  (( ${#a[@]} > len )) && len=${#a[@]}
+  for ((i=0; i<len; i++)); do
+    local av=${a[i]:-0} bv=${b[i]:-0}
+    (( 10#$av > 10#$bv )) && return 0
+    (( 10#$av < 10#$bv )) && return 1
+  done
+  return 0
 }
 
 # ── Detect user's shell ──────────────────────────────────────────
@@ -171,14 +181,29 @@ do_uninstall() {
 
   local config_dir="$PREFIX/.zeroclaw"
   if [[ -d "$config_dir" ]]; then
-    echo
-    read -rp "  Remove config and data ($config_dir)? [y/N] " confirm
-    if [[ "$confirm" =~ ^[Yy] ]]; then
-      rm -rf "$config_dir"
-      info "Removed $config_dir"
+    if [[ -t 0 ]]; then
+      echo
+      read -rp "  Remove config and data ($config_dir)? [y/N] " confirm
+      if [[ "$confirm" =~ ^[Yy] ]]; then
+        rm -rf "$config_dir"
+        info "Removed $config_dir"
+      else
+        info "Config preserved at $config_dir"
+      fi
     else
-      info "Config preserved at $config_dir"
+      info "Config preserved at $config_dir (non-interactive — use rm -rf to remove)"
     fi
+  fi
+
+  # Check if another zeroclaw still lurks in PATH
+  local other_bin
+  other_bin=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
+  if [[ -n "$other_bin" ]]; then
+    local other_version
+    other_version=$("$other_bin" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
+    echo
+    warn "Another zeroclaw found at $other_bin (v$other_version)"
+    warn "Remove it manually if you want a full uninstall"
   fi
 
   echo
@@ -211,6 +236,14 @@ while [[ $# -gt 0 ]]; do
     --skip-onboard)   SKIP_ONBOARD=true ;;
     --uninstall)      UNINSTALL=true ;;
     -h|--help)        usage; exit 0 ;;
+    -V|--version)
+      if [[ -f "Cargo.toml" ]]; then
+        parse_cargo_toml "Cargo.toml"
+        echo "install.sh for ZeroClaw v$VERSION"
+      else
+        echo "install.sh (version unknown — not in repo)"
+      fi
+      exit 0 ;;
     *) die "Unknown option: $1. Run: $0 --help" ;;
   esac
   shift
@@ -348,9 +381,11 @@ if [[ -n "$PATH_BIN" ]]; then
     warn "Existing install: $PATH_BIN (v$PATH_VERSION)"
   fi
   if [[ "$MINIMAL" == true && "$DRY_RUN" != true ]]; then
-    echo
-    read -rp "  --minimal will produce a reduced binary (no agent runtime by default). Continue? [Y/n] " confirm
-    [[ "$confirm" =~ ^[Nn] ]] && { echo "Aborted."; exit 0; }
+    if [[ -t 0 ]]; then
+      echo
+      read -rp "  --minimal will produce a reduced binary (no agent runtime by default). Continue? [Y/n] " confirm
+      [[ "$confirm" =~ ^[Nn] ]] && { echo "Aborted."; exit 0; }
+    fi
   fi
 fi
 
@@ -444,11 +479,11 @@ fi
 
 # ── Onboard ───────────────────────────────────────────────────────
 
-if [[ "$SKIP_ONBOARD" == false ]] && command -v zeroclaw >/dev/null 2>&1; then
+if [[ "$SKIP_ONBOARD" == false && -f "$BIN" ]]; then
   echo
   echo "$(bold "Running setup wizard...")"
   echo
-  zeroclaw onboard || warn "Onboard wizard exited with an error — run 'zeroclaw onboard' manually"
+  "$BIN" onboard || warn "Onboard wizard exited with an error — run 'zeroclaw onboard' manually"
 fi
 
 echo
