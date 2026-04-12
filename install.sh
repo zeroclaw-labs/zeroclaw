@@ -196,6 +196,11 @@ UNINSTALL=false
 DRY_RUN=false
 PREFIX="$HOME"
 
+# Support legacy env var
+if [[ -n "${ZEROCLAW_CARGO_FEATURES:-}" ]]; then
+  USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$ZEROCLAW_CARGO_FEATURES"
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --minimal)        MINIMAL=true ;;
