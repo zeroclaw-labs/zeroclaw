@@ -2,8 +2,6 @@
 
 ZeroClaw supports LINE via the Messaging API — receiving messages through an embedded webhook server and replying via the Reply API (with Push API fallback when the reply token has expired).
 
-**Last verified: April 12, 2026**
-
 ## Prerequisites
 
 1. A [LINE Developers Console](https://developers.line.biz) account.
