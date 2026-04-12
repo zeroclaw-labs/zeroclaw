@@ -3,10 +3,22 @@
 
 [advisories]
 ignore = [
-    # wasmtime vulns via extism 1.13.0 — no upstream fix; plugins feature-gated
+    # wasmtime vulns via extism — no upstream fix available; plugins feature-gated
     "RUSTSEC-2026-0006",  # wasmtime f64.copysign segfault on x86-64
     "RUSTSEC-2026-0020",  # WASI guest-controlled resource exhaustion
     "RUSTSEC-2026-0021",  # WASI http fields panic
+    # wasmtime 2026-04-09 batch — extism 1.21.0 pins wasmtime 41.x; no extism release with fix yet
+    "RUSTSEC-2026-0085",  # panic when lifting `flags` component value
+    "RUSTSEC-2026-0086",  # host data leakage with 64-bit tables and Winch
+    "RUSTSEC-2026-0087",  # f64x2.splat Cranelift x86-64 segfault
+    "RUSTSEC-2026-0088",  # data leakage between pooling allocator instances
+    "RUSTSEC-2026-0089",  # Winch table.fill host panic
+    "RUSTSEC-2026-0091",  # OOB write/crash transcoding component model strings
+    "RUSTSEC-2026-0092",  # UTF-16 transcoding panic
+    "RUSTSEC-2026-0093",  # heap OOB read in UTF-16 to latin1+utf16 transcoding
+    "RUSTSEC-2026-0094",  # Winch table.grow improperly masked return value
+    "RUSTSEC-2026-0095",  # Winch sandbox-escape (critical)
+    "RUSTSEC-2026-0096",  # aarch64 Cranelift sandbox-escape (critical)
     # instant crate unmaintained — transitive dep via nostr; no upstream fix
     "RUSTSEC-2024-0384",
     # rustls-webpki CRL matching — via rumqttc 0.24; no upstream fix (even 0.25.1 uses ^0.102.8)

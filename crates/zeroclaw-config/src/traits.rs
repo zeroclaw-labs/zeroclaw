@@ -3,7 +3,7 @@
 pub struct SecretFieldInfo {
     /// Full dotted name (e.g. `channels.matrix.access-token`)
     pub name: &'static str,
-    /// Category for grouping in `zeroclaw props list`
+    /// Category for grouping in `zeroclaw config list`
     pub category: &'static str,
     /// Whether this field currently has a non-empty value
     pub is_set: bool,
