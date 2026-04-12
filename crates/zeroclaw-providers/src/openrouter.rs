@@ -795,14 +795,23 @@ mod tests {
             request,
             "anthropic/claude-haiku-4-5",
             0.0,
-            crate::traits::StreamOptions { enabled: true, count_tokens: false },
+            crate::traits::StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
         );
 
-        let first = stream.next().await.expect("stream should yield at least one event");
+        let first = stream
+            .next()
+            .await
+            .expect("stream should yield at least one event");
         assert!(first.is_err(), "expected error without API key");
         let err = first.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("API key not set"), "error should mention API key: {msg}");
+        assert!(
+            msg.contains("API key not set"),
+            "error should mention API key: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -824,10 +833,16 @@ mod tests {
             request,
             "anthropic/claude-haiku-4-5",
             0.0,
-            crate::traits::StreamOptions { enabled: false, count_tokens: false },
+            crate::traits::StreamOptions {
+                enabled: false,
+                count_tokens: false,
+            },
         );
 
-        let first = stream.next().await.expect("stream should yield Final immediately");
+        let first = stream
+            .next()
+            .await
+            .expect("stream should yield Final immediately");
         assert!(matches!(first, Ok(StreamEvent::Final)));
     }
 
