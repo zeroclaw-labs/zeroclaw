@@ -1699,6 +1699,22 @@ impl OpenAiCompatibleProvider {
 
                     if let Some(id) = tool_call_id {
                         if assistant_tool_call_ids.contains(&id) {
+                            let (_, image_refs) = multimodal::parse_image_markers(&content_text);
+                            if allow_user_image_parts && !image_refs.is_empty() {
+                                native_messages.push(NativeMessage {
+                                    role: "user".to_string(),
+                                    content: Some(Self::to_message_content(
+                                        "user",
+                                        &format!("[Tool result]\n{}", content_text),
+                                        allow_user_image_parts,
+                                    )),
+                                    tool_call_id: None,
+                                    tool_calls: None,
+                                    reasoning_content: None,
+                                });
+                                continue;
+                            }
+
                             let content = Self::to_message_content(
                                 "tool",
                                 &content_text,
@@ -4896,7 +4912,7 @@ mod tests {
     // ── Regression: serialized wire format must contain image_url, not raw base64 ──
 
     #[test]
-    fn tool_result_with_image_serializes_as_content_parts_on_wire() {
+    fn tool_result_with_image_serializes_as_user_content_parts_on_wire() {
         // Build tool messages exactly as the agent loop does:
         // assistant with tool_calls, then tool with JSON-wrapped content
         let input = vec![
@@ -4910,6 +4926,11 @@ mod tests {
         ];
 
         let native = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+        assert_eq!(native.len(), 3);
+
+        let image_message = &native[2];
+        assert_eq!(image_message.role, "user");
+        assert!(image_message.tool_call_id.is_none());
 
         // Serialize to JSON — this is what goes on the wire to litellm
         let wire_json = serde_json::to_string(&native).unwrap();
@@ -4933,6 +4954,11 @@ mod tests {
             wire_json.contains(r#""url":"data:image/jpeg;base64,"#),
             "base64 data should be inside an image_url.url field"
         );
+
+        assert!(
+            !wire_json.contains(r#""role":"tool","content":[{"type":"text""#),
+            "image-bearing tool result should not remain a tool-role multipart message"
+        );
     }
 
     #[test]
@@ -4953,6 +4979,24 @@ mod tests {
             !wire_json.contains("[IMAGE:"),
             "orphan path wire JSON should not contain raw [IMAGE:] marker"
         );
+    }
+
+    #[test]
+    fn matched_tool_result_without_image_stays_tool_role() {
+        let input = vec![
+            ChatMessage::user("Run a check".to_string()),
+            ChatMessage::assistant(
+                r#"{"content":"Checking now","tool_calls":[{"id":"call_check","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(
+                r#"{"tool_call_id":"call_check","content":"Command completed successfully"}"#,
+            ),
+        ];
+
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+        assert_eq!(native.len(), 3);
+        assert_eq!(native[2].role, "tool");
+        assert_eq!(native[2].tool_call_id.as_deref(), Some("call_check"));
     }
 
     // ── Property: no message with [IMAGE:] should leak raw markers to wire ──

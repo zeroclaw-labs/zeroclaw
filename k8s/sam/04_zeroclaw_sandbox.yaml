@@ -88,7 +88,7 @@ spec:
             # Skills are mounted directly into the zeroclaw container, not here.
       containers:
         - name: zeroclaw
-          image: citizendaniel/zeroclaw-sam:v1.5.8
+          image: citizendaniel/zeroclaw-sam:v1.5.9
           imagePullPolicy: IfNotPresent
           command:
             - bash
@@ -256,7 +256,7 @@ spec:
               subPath: wiki-management.md
               readOnly: true
         - name: serena
-          image: citizendaniel/zeroclaw-sam:v1.5.8
+          image: citizendaniel/zeroclaw-sam:v1.5.9
           imagePullPolicy: IfNotPresent
           command:
             - sh
