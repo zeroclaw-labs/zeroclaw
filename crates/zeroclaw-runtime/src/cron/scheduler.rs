@@ -306,10 +306,13 @@ async fn run_agent_job(
     let prefixed_prompt = format!("{memory_context}[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
+    let mut cron_config = config.clone();
+    cron_config.memory.auto_save = false;
+
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
             Box::pin(crate::agent::run(
-                config.clone(),
+                cron_config,
                 Some(prefixed_prompt),
                 None,
                 model_override,
