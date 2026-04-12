@@ -214,6 +214,16 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: zeroclaw.exe
             ext: zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: zeroclaw
+            ext: tar.gz
+            musl: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact: zeroclaw
+            ext: tar.gz
+            cross: true
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -236,6 +246,16 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ${{ matrix.cross_compiler }}
 
+      - name: Install musl tools
+        if: matrix.musl
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@cross
+
       - name: Setup Android NDK
         if: matrix.ndk
         run: echo "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
@@ -246,7 +266,11 @@ jobs:
           if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
-          cargo build --release --locked --features "${{ env.RELEASE_CARGO_FEATURES }}" --target ${{ matrix.target }}
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked --features "${{ env.RELEASE_CARGO_FEATURES }}" --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --features "${{ env.RELEASE_CARGO_FEATURES }}" --target ${{ matrix.target }}
+          fi
 
       - name: Check binary size
         shell: bash
