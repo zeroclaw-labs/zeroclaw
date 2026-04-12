@@ -127,7 +127,7 @@ impl Tool for DiscordSearchTool {
                 for entry in &entries {
                     let score = entry
                         .score
-                        .map_or_else(String::new, |s| format!(" [{s:.0}%]"));
+                        .map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
                     let _ = writeln!(output, "- {}{score}", entry.content);
                 }
                 Ok(ToolResult {
