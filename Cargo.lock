@@ -12245,6 +12245,7 @@ dependencies = [
  "mail-parser",
  "mime_guess",
  "nanohtml2text",
+ "nostr-sdk",
  "parking_lot",
  "portable-atomic",
  "rand 0.10.0",
