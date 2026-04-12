@@ -1,8 +1,19 @@
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
+use parking_lot::Mutex;
 use sha2::Sha256;
+use std::collections::HashMap;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+
+/// Minimum interval between mid-stream draft edits per room (milliseconds).
+/// Nextcloud Talk has no documented hard rate-limit for message edits, but
+/// editing too frequently causes visible flicker and unnecessary API load.
+const DRAFT_UPDATE_INTERVAL_MS: u64 = 800;
+
+/// Maximum message length accepted by Nextcloud Talk (characters, not bytes).
+/// The OCS API rejects messages longer than 32 000 characters.
+const NC_MAX_MESSAGE_LENGTH: usize = 32_000;
 
 /// Nextcloud Talk channel in webhook mode.
 ///
@@ -14,6 +25,8 @@ pub struct NextcloudTalkChannel {
     bot_name: String,
     allowed_users: Vec<String>,
     client: reqwest::Client,
+    /// Tracks the last time a draft-edit was sent per room token, for rate-limiting.
+    last_draft_edit: Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl NextcloudTalkChannel {
@@ -42,6 +55,7 @@ impl NextcloudTalkChannel {
                 "channel.nextcloud_talk",
                 proxy_url.as_deref(),
             ),
+            last_draft_edit: Mutex::new(HashMap::new()),
         }
     }
 
@@ -395,6 +409,126 @@ impl NextcloudTalkChannel {
         tracing::error!("Nextcloud Talk send failed: {status} — {body}");
         anyhow::bail!("Nextcloud Talk API error: {status}");
     }
+
+    /// Send a message and return the numeric message ID assigned by Nextcloud Talk.
+    async fn send_to_room_with_id(
+        &self,
+        room_token: &str,
+        content: &str,
+    ) -> anyhow::Result<String> {
+        let encoded_room = urlencoding::encode(room_token);
+        let url = format!(
+            "{}/ocs/v2.php/apps/spreed/api/v1/chat/{}?format=json",
+            self.base_url, encoded_room
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.app_token)
+            .header("OCS-APIRequest", "true")
+            .header("Accept", "application/json")
+            .json(&serde_json::json!({ "message": content }))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            tracing::error!("Nextcloud Talk send_draft failed: {status} — {body}");
+            anyhow::bail!("Nextcloud Talk API error: {status}");
+        }
+
+        // Response: { "ocs": { "data": { "id": 42, ... } } }
+        let body: serde_json::Value = response.json().await?;
+        let message_id = body
+            .pointer("/ocs/data/id")
+            .and_then(|v| v.as_u64())
+            .map(|id| id.to_string())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Nextcloud Talk: missing message ID in send response")
+            })?;
+
+        Ok(message_id)
+    }
+
+    /// Edit an existing message via the Nextcloud Talk OCS API.
+    ///
+    /// `PUT /ocs/v2.php/apps/spreed/api/v1/chat/{token}/{messageId}`
+    async fn edit_message(
+        &self,
+        room_token: &str,
+        message_id: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        let encoded_room = urlencoding::encode(room_token);
+        let url = format!(
+            "{}/ocs/v2.php/apps/spreed/api/v1/chat/{}/{}?format=json",
+            self.base_url, encoded_room, message_id
+        );
+
+        let response = self
+            .client
+            .put(&url)
+            .bearer_auth(&self.app_token)
+            .header("OCS-APIRequest", "true")
+            .header("Accept", "application/json")
+            .json(&serde_json::json!({ "message": content }))
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            return Ok(());
+        }
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        tracing::warn!("Nextcloud Talk edit_message failed ({status}): {body}");
+        anyhow::bail!("Nextcloud Talk edit API error: {status}");
+    }
+
+    /// Delete a message via the Nextcloud Talk OCS API.
+    ///
+    /// `DELETE /ocs/v2.php/apps/spreed/api/v1/chat/{token}/{messageId}`
+    async fn delete_message(&self, room_token: &str, message_id: &str) -> anyhow::Result<()> {
+        let encoded_room = urlencoding::encode(room_token);
+        let url = format!(
+            "{}/ocs/v2.php/apps/spreed/api/v1/chat/{}/{}?format=json",
+            self.base_url, encoded_room, message_id
+        );
+
+        let response = self
+            .client
+            .delete(&url)
+            .bearer_auth(&self.app_token)
+            .header("OCS-APIRequest", "true")
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            return Ok(());
+        }
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        tracing::warn!("Nextcloud Talk delete_message failed ({status}): {body}");
+        anyhow::bail!("Nextcloud Talk delete API error: {status}");
+    }
+
+    /// Truncate text to the Nextcloud Talk character limit (UTF-8 char boundary safe).
+    fn truncate_to_nc_limit(text: &str) -> &str {
+        if text.chars().count() <= NC_MAX_MESSAGE_LENGTH {
+            return text;
+        }
+        // Find the byte offset of the NC_MAX_MESSAGE_LENGTH-th character boundary.
+        let end = text
+            .char_indices()
+            .nth(NC_MAX_MESSAGE_LENGTH)
+            .map(|(idx, _)| idx)
+            .unwrap_or(text.len());
+        &text[..end]
+    }
 }
 
 #[async_trait]
@@ -406,6 +540,110 @@ impl Channel for NextcloudTalkChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         self.send_to_room(&message.recipient, &message.content)
             .await
+    }
+
+    fn supports_draft_updates(&self) -> bool {
+        true
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        // Send a placeholder "..." message and track its ID for later edits.
+        let initial = if message.content.is_empty() {
+            "..."
+        } else {
+            &message.content
+        };
+        let initial = Self::truncate_to_nc_limit(initial);
+        match self.send_to_room_with_id(&message.recipient, initial).await {
+            Ok(id) => {
+                tracing::debug!(
+                    room = %message.recipient,
+                    message_id = %id,
+                    "Nextcloud Talk: draft message sent"
+                );
+                self.last_draft_edit
+                    .lock()
+                    .insert(message.recipient.clone(), std::time::Instant::now());
+                Ok(Some(id))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Nextcloud Talk: send_draft failed, falling back to final send: {e}"
+                );
+                Err(e)
+            }
+        }
+    }
+
+    async fn update_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        // Rate-limit mid-stream edits per room to avoid hammering the API.
+        {
+            let last_edits = self.last_draft_edit.lock();
+            if let Some(last_time) = last_edits.get(recipient) {
+                let elapsed = u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if elapsed < DRAFT_UPDATE_INTERVAL_MS {
+                    return Ok(());
+                }
+            }
+        }
+
+        let display_text = Self::truncate_to_nc_limit(text);
+
+        match self.edit_message(recipient, message_id, display_text).await {
+            Ok(()) => {
+                self.last_draft_edit
+                    .lock()
+                    .insert(recipient.to_string(), std::time::Instant::now());
+            }
+            Err(e) => {
+                // Non-fatal: log and continue. The final send will still deliver the
+                // complete response even if mid-stream edits fail.
+                tracing::debug!("Nextcloud Talk update_draft skipped: {e}");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let display_text = Self::truncate_to_nc_limit(text);
+
+        match self.edit_message(recipient, message_id, display_text).await {
+            Ok(()) => {
+                tracing::debug!(
+                    room = %recipient,
+                    message_id = %message_id,
+                    "Nextcloud Talk: draft finalized"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // Edit failed (e.g. message too old, permissions) — delete and re-send.
+                tracing::warn!(
+                    "Nextcloud Talk finalize_draft edit failed ({e}); attempting delete+resend"
+                );
+                let _ = self.delete_message(recipient, message_id).await;
+                self.send_to_room(recipient, display_text).await
+            }
+        }
+    }
+
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        if let Err(e) = self.delete_message(recipient, message_id).await {
+            tracing::debug!("Nextcloud Talk cancel_draft delete failed (non-fatal): {e}");
+        }
+        self.last_draft_edit.lock().remove(recipient);
+        Ok(())
     }
 
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -485,6 +723,58 @@ mod tests {
     fn nextcloud_talk_channel_name() {
         let channel = make_channel();
         assert_eq!(channel.name(), "nextcloud_talk");
+    }
+
+    #[test]
+    fn supports_draft_updates_returns_true() {
+        let channel = make_channel();
+        assert!(channel.supports_draft_updates());
+    }
+
+    #[test]
+    fn truncate_to_nc_limit_short_text_unchanged() {
+        let text = "hello";
+        assert_eq!(NextcloudTalkChannel::truncate_to_nc_limit(text), text);
+    }
+
+    #[test]
+    fn truncate_to_nc_limit_exact_limit_unchanged() {
+        let text = "a".repeat(NC_MAX_MESSAGE_LENGTH);
+        let result = NextcloudTalkChannel::truncate_to_nc_limit(&text);
+        assert_eq!(result.len(), NC_MAX_MESSAGE_LENGTH);
+    }
+
+    #[test]
+    fn truncate_to_nc_limit_over_limit_is_truncated() {
+        let text = "a".repeat(NC_MAX_MESSAGE_LENGTH + 100);
+        let result = NextcloudTalkChannel::truncate_to_nc_limit(&text);
+        assert_eq!(result.chars().count(), NC_MAX_MESSAGE_LENGTH);
+    }
+
+    #[test]
+    fn truncate_to_nc_limit_multibyte_safe() {
+        // Each emoji is 4 bytes but 1 char — must not split in the middle.
+        let text = "🦀".repeat(NC_MAX_MESSAGE_LENGTH + 10);
+        let result = NextcloudTalkChannel::truncate_to_nc_limit(&text);
+        assert_eq!(result.chars().count(), NC_MAX_MESSAGE_LENGTH);
+        // Must be valid UTF-8.
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_draft_rate_limit_short_circuits_network() {
+        // Record a very recent edit so the rate-limit fires.
+        let channel = make_channel();
+        channel
+            .last_draft_edit
+            .lock()
+            .insert("room-token-123".to_string(), std::time::Instant::now());
+
+        // update_draft should return Ok immediately without hitting the network.
+        let result = channel
+            .update_draft("room-token-123", "42", "some delta")
+            .await;
+        assert!(result.is_ok());
     }
 
     #[test]
