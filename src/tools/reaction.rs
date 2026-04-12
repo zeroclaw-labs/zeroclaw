@@ -6,8 +6,8 @@
 //! the pattern used by [`DelegateTool`] for its parent-tools handle.
 
 use super::traits::{Tool, ToolResult};
-use crate::require_str;
 use crate::channels::traits::Channel;
+use crate::require_str;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use async_trait::async_trait;

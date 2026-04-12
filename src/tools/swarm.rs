@@ -1,7 +1,7 @@
 use super::traits::{Tool, ToolResult};
-use crate::require_str;
 use crate::config::{DelegateAgentConfig, SwarmConfig, SwarmStrategy};
 use crate::providers::{self, Provider};
+use crate::require_str;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use async_trait::async_trait;

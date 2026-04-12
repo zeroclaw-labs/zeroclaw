@@ -1,10 +1,10 @@
 use super::traits::{Tool, ToolResult};
-use crate::require_str;
 use crate::agent::loop_::run_tool_call_loop;
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::{DelegateAgentConfig, DelegateToolConfig};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
+use crate::require_str;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
@@ -2547,7 +2547,10 @@ mod tests {
 
         let tool = DelegateTool::new(sample_agents(), None, test_security())
             .with_workspace_dir(workspace.clone());
-        let result = tool.execute(json!({"action": "check_result"})).await.unwrap();
+        let result = tool
+            .execute(json!({"action": "check_result"}))
+            .await
+            .unwrap();
 
         assert!(!result.success);
         assert!(result.error.is_some());

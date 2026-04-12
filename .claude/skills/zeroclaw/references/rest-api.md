@@ -307,12 +307,23 @@ List all scheduled jobs.
 ### POST /api/cron
 Add a new job.
 
-**Request Body:**
+**Request Body (shell job):**
 ```json
 {
   "name": "job-name",
-  "schedule": "0 9 * * *",
+  "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+  "job_type": "shell",
   "command": "command to run"
+}
+```
+
+**Request Body (agent job):**
+```json
+{
+  "name": "status-check",
+  "schedule": {"kind": "every", "every_ms": 3600000},
+  "job_type": "agent",
+  "prompt": "check system status"
 }
 ```
 
@@ -320,7 +331,7 @@ Add a new job.
 ```json
 {
   "status": "ok",
-  "job": {"id": "<uuid>", "name": "job-name", "command": "command to run", "enabled": true}
+  "job": {"id": "<uuid>", "name": "job-name", "schedule": {"kind": "cron", "expr": "0 9 * * *"}, "job_type": "shell", "command": "command to run", "enabled": true}
 }
 ```
 

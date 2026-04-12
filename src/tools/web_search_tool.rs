@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
-use crate::require_str;
 use super::web_search_provider_routing::{WebSearchProviderRoute, resolve_web_search_provider};
+use crate::require_str;
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;

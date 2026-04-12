@@ -1,7 +1,8 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolResult, enforce_security_policy};
 use crate::config::Config;
 use crate::cron::{
-    self, DeliveryConfig, JobType, Schedule, SessionTarget, deserialize_maybe_stringified,
+    self, DeliveryConfig, JobType, Schedule, SessionTarget, delivery_json_schema,
+    deserialize_maybe_stringified, format_schedule_error, schedule_json_schema,
 };
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -17,36 +18,6 @@ impl CronAddTool {
     pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
         Self { config, security }
     }
-
-    fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
-        if !self.security.can_act() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Security policy: read-only mode, cannot perform '{action}'"
-                )),
-            });
-        }
-
-        if self.security.is_rate_limited() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
-            });
-        }
-
-        if !self.security.record_action() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".to_string()),
-            });
-        }
-
-        None
-    }
 }
 
 #[async_trait]
@@ -56,11 +27,11 @@ impl Tool for CronAddTool {
     }
 
     fn description(&self) -> &str {
-        "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
-         Use job_type='agent' with a prompt to run the AI agent on schedule. \
-         To deliver output to a channel (Discord, Telegram, Slack, Mattermost, Matrix, QQ), set \
-         delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
-         This is the preferred tool for sending scheduled/delayed messages to users via channels."
+        "Create a scheduled cron job (shell or agent). \
+         Requires job_type and schedule. \
+         Shell example: schedule={\"kind\":\"cron\",\"expr\":\"0 9 * * 1-5\"}, job_type=\"shell\", command=\"echo hi\". \
+         Agent example: schedule={\"kind\":\"every\",\"every_ms\":3600000}, job_type=\"agent\", prompt=\"check status\". \
+         To deliver output to a channel, add delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<id>\"}."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -72,55 +43,19 @@ impl Tool for CronAddTool {
                     "type": "string",
                     "description": "Optional human-readable name for the job"
                 },
-                // NOTE: oneOf is correct for OpenAI-compatible APIs (including OpenRouter).
-                // Gemini does not support oneOf in tool schemas; if Gemini native tool calling
-                // is ever wired up, SchemaCleanr::clean_for_gemini must be applied before
-                // tool specs are sent. See src/tools/schema.rs.
-                "schedule": {
-                    "description": "When to run the job. Exactly one of three forms must be used.",
-                    "oneOf": [
-                        {
-                            "type": "object",
-                            "description": "Cron expression schedule (repeating). Example: {\"kind\":\"cron\",\"expr\":\"0 9 * * 1-5\",\"tz\":\"America/New_York\"}",
-                            "properties": {
-                                "kind": { "type": "string", "enum": ["cron"] },
-                                "expr": { "type": "string", "description": "Standard 5-field cron expression, e.g. '*/5 * * * *'" },
-                                "tz": { "type": "string", "description": "Optional IANA timezone name, e.g. 'America/New_York'. Defaults to UTC." }
-                            },
-                            "required": ["kind", "expr"]
-                        },
-                        {
-                            "type": "object",
-                            "description": "One-shot schedule at a specific datetime. Example: {\"kind\":\"at\",\"at\":\"2025-12-31T23:59:00-05:00\"}",
-                            "properties": {
-                                "kind": { "type": "string", "enum": ["at"] },
-                                "at": { "type": "string", "description": "ISO 8601 / RFC 3339 datetime, e.g. '2025-12-31T23:59:00-05:00' or '2025-12-31T23:59:00Z'. Timezone offsets are accepted and converted to UTC." }
-                            },
-                            "required": ["kind", "at"]
-                        },
-                        {
-                            "type": "object",
-                            "description": "Repeating interval schedule in milliseconds. Example: {\"kind\":\"every\",\"every_ms\":3600000} runs every hour.",
-                            "properties": {
-                                "kind": { "type": "string", "enum": ["every"] },
-                                "every_ms": { "type": "integer", "description": "Interval in milliseconds, e.g. 3600000 for every hour" }
-                            },
-                            "required": ["kind", "every_ms"]
-                        }
-                    ]
-                },
+                "schedule": schedule_json_schema(),
                 "job_type": {
                     "type": "string",
                     "enum": ["shell", "agent"],
-                    "description": "Type of job: 'shell' runs a command, 'agent' runs the AI agent with a prompt"
+                    "description": "Type of job: 'shell' runs a command (requires 'command'), 'agent' runs the AI agent (requires 'prompt')"
                 },
                 "command": {
                     "type": "string",
-                    "description": "Shell command to run (required when job_type is 'shell')"
+                    "description": "Shell command to run. Required when job_type='shell'."
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Agent prompt to run on schedule (required when job_type is 'agent')"
+                    "description": "Agent prompt to run on schedule. Required when job_type='agent'."
                 },
                 "session_target": {
                     "type": "string",
@@ -136,30 +71,7 @@ impl Tool for CronAddTool {
                     "items": { "type": "string" },
                     "description": "Optional allowlist of tool names for agent jobs. When omitted, all tools remain available."
                 },
-                "delivery": {
-                    "type": "object",
-                    "description": "Optional delivery config to send job output to a channel after each run. When provided, all three of mode, channel, and to are expected.",
-                    "properties": {
-                        "mode": {
-                            "type": "string",
-                            "enum": ["none", "announce"],
-                            "description": "'announce' sends output to the specified channel; 'none' disables delivery"
-                        },
-                        "channel": {
-                            "type": "string",
-                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq"],
-                            "description": "Channel type to deliver output to"
-                        },
-                        "to": {
-                            "type": "string",
-                            "description": "Destination ID: Discord channel ID, Telegram chat ID, Slack channel name, etc."
-                        },
-                        "best_effort": {
-                            "type": "boolean",
-                            "description": "If true, a delivery failure does not fail the job itself. Defaults to true."
-                        }
-                    }
-                },
+                "delivery": delivery_json_schema(),
                 "delete_after_run": {
                     "type": "boolean",
                     "description": "If true, the job is automatically deleted after its first successful run. Defaults to true for 'at' schedules."
@@ -170,7 +82,7 @@ impl Tool for CronAddTool {
                     "default": false
                 }
             },
-            "required": ["schedule"]
+            "required": ["schedule", "job_type"]
         })
     }
 
@@ -190,7 +102,7 @@ impl Tool for CronAddTool {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(format!("Invalid schedule: {e}")),
+                        error: Some(format_schedule_error(&e)),
                     });
                 }
             },
@@ -271,7 +183,7 @@ impl Tool for CronAddTool {
                     });
                 }
 
-                if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
+                if let Some(blocked) = enforce_security_policy(&self.security, "cron_add") {
                     return Ok(blocked);
                 }
 
@@ -334,7 +246,7 @@ impl Tool for CronAddTool {
                     None => None,
                 };
 
-                if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
+                if let Some(blocked) = enforce_security_policy(&self.security, "cron_add") {
                     return Ok(blocked);
                 }
 
@@ -751,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn schedule_schema_is_oneof_with_cron_at_every_variants() {
+    fn schedule_schema_is_flat_object_with_kind_discriminator() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cfg = Arc::new(Config {
             workspace_dir: tmp.path().join("workspace"),
@@ -765,55 +677,42 @@ mod tests {
         let tool = CronAddTool::new(cfg, security);
         let schema = tool.parameters_schema();
 
-        // Top-level: schedule is required
+        // Top-level: schedule and job_type are required
         let top_required = schema["required"].as_array().expect("top-level required");
         assert!(top_required.iter().any(|v| v == "schedule"));
+        assert!(top_required.iter().any(|v| v == "job_type"));
 
-        // schedule is a oneOf with exactly 3 variants: cron, at, every
-        let one_of = schema["properties"]["schedule"]["oneOf"]
+        // schedule is a flat object (no oneOf)
+        let sched = &schema["properties"]["schedule"];
+        assert!(
+            sched.get("oneOf").is_none(),
+            "schedule must NOT use oneOf (LLMs struggle with it)"
+        );
+        assert_eq!(sched["type"], "object");
+
+        // kind is required and has the three enum values
+        let sched_required = sched["required"].as_array().expect("schedule.required");
+        assert!(sched_required.iter().any(|v| v == "kind"));
+
+        let kind_enum = sched["properties"]["kind"]["enum"]
             .as_array()
-            .expect("schedule.oneOf must be an array");
-        assert_eq!(one_of.len(), 3, "expected cron, at, and every variants");
+            .expect("kind.enum");
+        let kinds: Vec<&str> = kind_enum.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(kinds, vec!["cron", "at", "every"]);
 
-        let kinds: Vec<&str> = one_of
-            .iter()
-            .filter_map(|v| v["properties"]["kind"]["enum"][0].as_str())
-            .collect();
-        assert!(kinds.contains(&"cron"), "missing cron variant");
-        assert!(kinds.contains(&"at"), "missing at variant");
-        assert!(kinds.contains(&"every"), "missing every variant");
-
-        // Each variant declares its required fields and every_ms is typed integer
-        for variant in one_of {
-            let kind = variant["properties"]["kind"]["enum"][0]
-                .as_str()
-                .expect("variant kind");
-            let req: Vec<&str> = variant["required"]
-                .as_array()
-                .unwrap_or_else(|| panic!("{kind} variant must have required"))
-                .iter()
-                .filter_map(|v| v.as_str())
-                .collect();
-            assert!(
-                req.contains(&"kind"),
-                "{kind} variant missing 'kind' in required"
-            );
-            match kind {
-                "cron" => assert!(req.contains(&"expr"), "cron variant missing 'expr'"),
-                "at" => assert!(req.contains(&"at"), "at variant missing 'at'"),
-                "every" => {
-                    assert!(
-                        req.contains(&"every_ms"),
-                        "every variant missing 'every_ms'"
-                    );
-                    assert_eq!(
-                        variant["properties"]["every_ms"]["type"].as_str(),
-                        Some("integer"),
-                        "every_ms must be typed as integer"
-                    );
-                }
-                _ => panic!("unexpected kind: {kind}"),
-            }
-        }
+        // All schedule fields are present
+        let props = sched["properties"]
+            .as_object()
+            .expect("schedule.properties");
+        assert!(props.contains_key("kind"));
+        assert!(props.contains_key("expr"));
+        assert!(props.contains_key("tz"));
+        assert!(props.contains_key("at"));
+        assert!(props.contains_key("every_ms"));
+        assert_eq!(
+            props["every_ms"]["type"].as_str(),
+            Some("integer"),
+            "every_ms must be typed as integer"
+        );
     }
 }

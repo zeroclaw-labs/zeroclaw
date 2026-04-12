@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
-use crate::require_str;
 use crate::config::GoogleWorkspaceAllowedOperation;
+use crate::require_str;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;

@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::sync::LazyLock;
 
 /// Try to deserialize a `serde_json::Value` as `T`.  If the value is a JSON
 /// string that looks like an object (i.e. the LLM double-serialized it), parse
@@ -25,6 +27,90 @@ pub fn deserialize_maybe_stringified<T: serde::de::DeserializeOwned>(
             Err(first_err)
         }
     }
+}
+
+static SCHEDULE_SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
+    json!({
+        "type": "object",
+        "description": "When to run. Set 'kind' plus the fields for that kind.\n\
+            kind='cron': set 'expr' (required), optionally 'tz'.\n\
+            kind='at': set 'at' (required).\n\
+            kind='every': set 'every_ms' (required).",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["cron", "at", "every"],
+                "description": "Schedule type: 'cron' for repeating cron expression, 'at' for one-shot datetime, 'every' for repeating interval"
+            },
+            "expr": {
+                "type": "string",
+                "description": "Standard 5-field cron expression, e.g. '*/5 * * * *' or '0 9 * * 1-5'. Required when kind='cron'."
+            },
+            "tz": {
+                "type": "string",
+                "description": "IANA timezone name, e.g. 'America/New_York'. Defaults to UTC. Only used when kind='cron'."
+            },
+            "at": {
+                "type": "string",
+                "description": "ISO 8601 / RFC 3339 datetime, e.g. '2025-12-31T23:59:00Z' or '2025-12-31T23:59:00-05:00'. Timezone offsets are accepted and converted to UTC. Required when kind='at'."
+            },
+            "every_ms": {
+                "type": "integer",
+                "description": "Interval in milliseconds. Common values: 60000 (1 min), 300000 (5 min), 3600000 (1 hour), 86400000 (1 day). Required when kind='every'."
+            }
+        },
+        "required": ["kind"]
+    })
+});
+
+static DELIVERY_SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
+    json!({
+        "type": "object",
+        "description": "Optional delivery config to send job output to a channel after each run.",
+        "properties": {
+            "mode": {
+                "type": "string",
+                "enum": ["none", "announce"],
+                "description": "'announce' sends output to the specified channel; 'none' disables delivery"
+            },
+            "channel": {
+                "type": "string",
+                "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq"],
+                "description": "Channel type to deliver output to"
+            },
+            "to": {
+                "type": "string",
+                "description": "Destination ID: Discord channel ID, Telegram chat ID, Slack channel name, etc."
+            },
+            "best_effort": {
+                "type": "boolean",
+                "description": "If true, a delivery failure does not fail the job itself. Defaults to true."
+            }
+        }
+    })
+});
+
+/// Flat-object JSON Schema for the `Schedule` type.
+///
+/// Uses a single object with a `kind` discriminator instead of `oneOf`,
+/// which is more reliable for LLM tool-calling across providers.
+pub fn schedule_json_schema() -> serde_json::Value {
+    SCHEDULE_SCHEMA.clone()
+}
+
+/// JSON Schema for the delivery config, shared by cron_add and cron_update.
+pub fn delivery_json_schema() -> serde_json::Value {
+    DELIVERY_SCHEMA.clone()
+}
+
+/// Format a human- and LLM-readable error for failed Schedule parsing.
+pub fn format_schedule_error(serde_err: &serde_json::Error) -> String {
+    format!(
+        "Invalid schedule: {serde_err}. Expected object with \"kind\" set to \"cron\", \"at\", or \"every\":\n\
+         - kind=\"cron\": requires \"expr\" (e.g. \"*/5 * * * *\"), optional \"tz\"\n\
+         - kind=\"at\": requires \"at\" (ISO 8601 datetime, e.g. \"2025-12-31T23:59:00Z\")\n\
+         - kind=\"every\": requires \"every_ms\" (interval in ms, e.g. 3600000 for 1 hour)"
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

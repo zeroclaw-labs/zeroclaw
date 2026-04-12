@@ -4,8 +4,8 @@
 //! capture, search, relate, suggest, expert_find, lessons_extract, graph_stats.
 
 use super::traits::{Tool, ToolResult};
-use crate::require_str;
 use crate::memory::knowledge_graph::{KnowledgeGraph, NodeType, Relation};
+use crate::require_str;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;

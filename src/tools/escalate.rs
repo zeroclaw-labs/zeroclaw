@@ -6,8 +6,8 @@
 //! Supports optional blocking mode to wait for a human response.
 
 use super::traits::{Tool, ToolResult};
-use crate::require_str;
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
+use crate::require_str;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use crate::tools::ask_user::ChannelMapHandle;

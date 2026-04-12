@@ -1044,9 +1044,9 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 /// This handles variations like "fileread" -> "file_read", "bash" -> "shell", etc.
 fn map_tool_name_alias(tool_name: &str) -> &str {
     match tool_name {
-        // Shell variations (including GLM aliases that map to shell)
+        // Shell variations (including GLM aliases and HTTP tools remapped to shell)
         "shell" | "bash" | "sh" | "exec" | "command" | "cmd" | "browser_open" | "browser"
-        | "web_search" => "shell",
+        | "web_search" | "http_request" | "http" | "fetch" | "curl" | "wget" => "shell",
         // Messaging variations
         "send_message" | "sendmessage" => "message_send",
         // File tool variations
@@ -1057,8 +1057,6 @@ fn map_tool_name_alias(tool_name: &str) -> &str {
         "memoryrecall" | "memory_recall" | "recall" | "memrecall" => "memory_recall",
         "memorystore" | "memory_store" | "store" | "memstore" => "memory_store",
         "memoryforget" | "memory_forget" | "forget" | "memforget" => "memory_forget",
-        // HTTP variations (remapped to shell since http_request tool was removed)
-        "http_request" | "http" | "fetch" | "curl" | "wget" => "shell",
         // Skill invocation variations
         "useskill" | "use_skill" | "skill" | "invoke_skill" => "use_skill",
         _ => tool_name,

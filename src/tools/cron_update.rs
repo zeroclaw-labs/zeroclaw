@@ -1,6 +1,8 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{Tool, ToolResult, enforce_security_policy};
 use crate::config::Config;
-use crate::cron::{self, CronJobPatch, deserialize_maybe_stringified};
+use crate::cron::{
+    self, CronJobPatch, delivery_json_schema, deserialize_maybe_stringified, schedule_json_schema,
+};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -14,36 +16,6 @@ pub struct CronUpdateTool {
 impl CronUpdateTool {
     pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
         Self { config, security }
-    }
-
-    fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
-        if !self.security.can_act() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Security policy: read-only mode, cannot perform '{action}'"
-                )),
-            });
-        }
-
-        if self.security.is_rate_limited() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
-            });
-        }
-
-        if !self.security.record_action() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".to_string()),
-            });
-        }
-
-        None
     }
 }
 
@@ -104,67 +76,8 @@ impl Tool for CronUpdateTool {
                             "type": "boolean",
                             "description": "If true, delete the job automatically after its first successful run"
                         },
-                        // NOTE: oneOf is correct for OpenAI-compatible APIs (including OpenRouter).
-                        // Gemini does not support oneOf in tool schemas; if Gemini native tool calling
-                        // is ever wired up, SchemaCleanr::clean_for_gemini must be applied before
-                        // tool specs are sent. See src/tools/schema.rs.
-                        "schedule": {
-                            "description": "New schedule for the job. Exactly one of three forms must be used.",
-                            "oneOf": [
-                                {
-                                    "type": "object",
-                                    "description": "Cron expression schedule (repeating). Example: {\"kind\":\"cron\",\"expr\":\"0 9 * * 1-5\",\"tz\":\"America/New_York\"}",
-                                    "properties": {
-                                        "kind": { "type": "string", "enum": ["cron"] },
-                                        "expr": { "type": "string", "description": "Standard 5-field cron expression, e.g. '*/5 * * * *'" },
-                                        "tz": { "type": "string", "description": "Optional IANA timezone name, e.g. 'America/New_York'. Defaults to UTC." }
-                                    },
-                                    "required": ["kind", "expr"]
-                                },
-                                {
-                                    "type": "object",
-                                    "description": "One-shot schedule at a specific UTC datetime. Example: {\"kind\":\"at\",\"at\":\"2025-12-31T23:59:00Z\"}",
-                                    "properties": {
-                                        "kind": { "type": "string", "enum": ["at"] },
-                                        "at": { "type": "string", "description": "ISO 8601 UTC datetime string, e.g. '2025-12-31T23:59:00Z'" }
-                                    },
-                                    "required": ["kind", "at"]
-                                },
-                                {
-                                    "type": "object",
-                                    "description": "Repeating interval schedule in milliseconds. Example: {\"kind\":\"every\",\"every_ms\":3600000} runs every hour.",
-                                    "properties": {
-                                        "kind": { "type": "string", "enum": ["every"] },
-                                        "every_ms": { "type": "integer", "description": "Interval in milliseconds, e.g. 3600000 for every hour" }
-                                    },
-                                    "required": ["kind", "every_ms"]
-                                }
-                            ]
-                        },
-                        "delivery": {
-                            "type": "object",
-                            "description": "Delivery config to send job output to a channel after each run. When provided, mode, channel, and to are all expected.",
-                            "properties": {
-                                "mode": {
-                                    "type": "string",
-                                    "enum": ["none", "announce"],
-                                    "description": "'announce' sends output to the specified channel; 'none' disables delivery"
-                                },
-                                "channel": {
-                                    "type": "string",
-                                    "enum": ["telegram", "discord", "slack", "mattermost", "matrix"],
-                                    "description": "Channel type to deliver output to"
-                                },
-                                "to": {
-                                    "type": "string",
-                                    "description": "Destination ID: Discord channel ID, Telegram chat ID, Slack channel name, etc."
-                                },
-                                "best_effort": {
-                                    "type": "boolean",
-                                    "description": "If true, a delivery failure does not fail the job itself. Defaults to true."
-                                }
-                            }
-                        }
+                        "schedule": schedule_json_schema(),
+                        "delivery": delivery_json_schema()
                     }
                 },
                 "approved": {
@@ -223,7 +136,7 @@ impl Tool for CronUpdateTool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        if let Some(blocked) = self.enforce_mutation_allowed("cron_update") {
+        if let Some(blocked) = enforce_security_policy(&self.security, "cron_update") {
             return Ok(blocked);
         }
 
@@ -415,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_schema_covers_all_cronjobpatch_fields_and_schedule_is_oneof() {
+    fn patch_schema_covers_all_cronjobpatch_fields_and_schedule_is_flat() {
         let tmp = TempDir::new().unwrap();
         let cfg = Arc::new(Config {
             workspace_dir: tmp.path().join("workspace"),
@@ -457,60 +370,40 @@ mod tests {
             );
         }
 
-        // patch.schedule is a oneOf with exactly 3 variants: cron, at, every
-        let one_of = schema["properties"]["patch"]["properties"]["schedule"]["oneOf"]
+        // patch.schedule is a flat object (no oneOf)
+        let sched = &schema["properties"]["patch"]["properties"]["schedule"];
+        assert!(sched.get("oneOf").is_none(), "schedule must NOT use oneOf");
+        assert_eq!(sched["type"], "object");
+
+        let kind_enum = sched["properties"]["kind"]["enum"]
             .as_array()
-            .expect("patch.schedule.oneOf must be an array");
-        assert_eq!(one_of.len(), 3, "expected cron, at, and every variants");
+            .expect("kind.enum");
+        let kinds: Vec<&str> = kind_enum.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(kinds, vec!["cron", "at", "every"]);
 
-        let kinds: Vec<&str> = one_of
-            .iter()
-            .filter_map(|v| v["properties"]["kind"]["enum"][0].as_str())
-            .collect();
-        assert!(kinds.contains(&"cron"), "missing cron variant");
-        assert!(kinds.contains(&"at"), "missing at variant");
-        assert!(kinds.contains(&"every"), "missing every variant");
-
-        // Each variant declares its required fields and every_ms is typed integer
-        for variant in one_of {
-            let kind = variant["properties"]["kind"]["enum"][0]
-                .as_str()
-                .expect("variant kind");
-            let req: Vec<&str> = variant["required"]
-                .as_array()
-                .unwrap_or_else(|| panic!("{kind} variant must have required"))
-                .iter()
-                .filter_map(|v| v.as_str())
-                .collect();
+        // All schedule fields present
+        let sched_props = sched["properties"]
+            .as_object()
+            .expect("schedule.properties");
+        for field in &["kind", "expr", "tz", "at", "every_ms"] {
             assert!(
-                req.contains(&"kind"),
-                "{kind} variant missing 'kind' in required"
+                sched_props.contains_key(*field),
+                "schedule missing: {field}"
             );
-            match kind {
-                "cron" => assert!(req.contains(&"expr"), "cron variant missing 'expr'"),
-                "at" => assert!(req.contains(&"at"), "at variant missing 'at'"),
-                "every" => {
-                    assert!(
-                        req.contains(&"every_ms"),
-                        "every variant missing 'every_ms'"
-                    );
-                    assert_eq!(
-                        variant["properties"]["every_ms"]["type"].as_str(),
-                        Some("integer"),
-                        "every_ms must be typed as integer"
-                    );
-                }
-                _ => panic!("unexpected schedule kind: {kind}"),
-            }
         }
+        assert_eq!(
+            sched_props["every_ms"]["type"].as_str(),
+            Some("integer"),
+            "every_ms must be typed as integer"
+        );
 
-        // patch.delivery.channel enum covers all supported channels
+        // patch.delivery.channel enum covers all supported channels including qq
         let channel_enum = schema["properties"]["patch"]["properties"]["delivery"]["properties"]
             ["channel"]["enum"]
             .as_array()
             .expect("patch.delivery.channel must have an enum");
         let channel_strs: Vec<&str> = channel_enum.iter().filter_map(|v| v.as_str()).collect();
-        for ch in &["telegram", "discord", "slack", "mattermost", "matrix"] {
+        for ch in &["telegram", "discord", "slack", "mattermost", "matrix", "qq"] {
             assert!(channel_strs.contains(ch), "delivery.channel missing: {ch}");
         }
     }
