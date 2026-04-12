@@ -42,7 +42,7 @@ This skill accepts a PR number, URL, or no argument (process the queue).
 |---|---|---|
 | 1. Triage | Read PR, comprehension summary, draft/assignee/path/CI checks | Draft → stop. High-risk path → skip. CI failing → block. |
 | 2. Gate Checks | Malicious scan, template, size, privacy, duplicates, quality, architecture, attribution, language | Any gate fail → block or close with comment. |
-| 3. Review | Risk-routed depth, code review with severity-tagged comments, regression analysis, security/perf assessment, docs, i18n, tests | Comment format: `[blocking]`/`[suggestion]`/`[question]` + what/why/action. |
+| 3. Review | Risk-routed depth, code review with severity-tagged comments, regression analysis, security/perf assessment, docs, i18n, tests | Comment format: `[blocking]`/`[suggestion]`/`[question]` + what/why/action. **Apply verification discipline rules R1–R5 (see `references/review-protocol.md` §3.8) before issuing any verdict.** |
 | 4. Final Review | Re-read for changes, handle new commits, issue verdict | Three outcomes: ready-to-merge, needs-author-action, needs-maintainer-review. |
 | 5. Report & Cleanup | Session report on PR, delete worktree | Every field filled. "Looks good" is not valid. |
 
@@ -51,9 +51,10 @@ This skill accepts a PR number, URL, or no argument (process the queue).
 1. **Create an isolated worktree** for each PR. Do not reuse worktrees. Clean up when finished.
 2. **Check draft status** at every phase boundary. If draft, stop and clean up.
 3. **Use `gh` CLI** for all GitHub operations (PR metadata, comments, labels, reviews, checks).
-4. **Use `cargo test`** (or `./dev/ci.sh test`) for validation.
-5. **Never merge.** Never push code to contributor branches. You are a reviewer.
-6. **Always thank contributors.** Always explain closures. Never close without a clear reason.
+4. **Run the full validation battery locally** — `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build`, `cargo test` — not `cargo check` or `cargo test --lib`. See `references/review-protocol.md` §3.7.
+5. **Execute the contributor's test plan** — every checkbox in the PR body's "## Test plan" section must be run or explicitly labeled `needs-manual` / `needs-credentials` / `platform-blocked`. See §3.8 R1.
+6. **Never merge.** Never push code to contributor branches. You are a reviewer.
+7. **Always thank contributors.** Always explain closures. Never close without a clear reason.
 
 ## Core Engineering Constraints
 
