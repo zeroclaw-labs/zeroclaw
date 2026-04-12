@@ -47,3 +47,13 @@ k8s/**/.tmp/
 
 # Nix
 result
+.tmp/docker-build-sam.log
+.tmp/docker-build-v136.log
+.tmp/docker-build-v137.log
+.tmp/docker-build.log
+.tmp/docker-push-sam.log
+.tmp/docker-push-v135.log
+.tmp/docker-push-v136.log
+.tmp/docker-push-v137.log
+.tmp/docker-push.log
+.codex

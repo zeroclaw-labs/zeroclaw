@@ -1,0 +1,55 @@
+# This file controls the behavior of Trunk: https://docs.trunk.io/cli
+# To learn more about the format of this file, see https://docs.trunk.io/reference/trunk-yaml
+version: 0.1
+cli:
+  version: 1.25.0
+# Trunk provides extensibility via plugins. (https://docs.trunk.io/plugins)
+plugins:
+  sources:
+    - id: trunk
+      ref: v1.7.6
+      uri: https://github.com/trunk-io/plugins
+# Many linters and tools depend on runtimes - configure them here. (https://docs.trunk.io/runtimes)
+runtimes:
+  enabled:
+    - go@1.21.0
+    - java@13.0.11
+    - node@22.16.0
+    - python@3.10.8
+    - rust@1.82.0
+# This is the section where you manage your linters. (https://docs.trunk.io/check/configuration)
+lint:
+  enabled:
+    - actionlint@1.7.12
+    - bandit@1.9.4
+    - black@26.3.1
+    - checkov@3.2.519
+    - clippy@1.65.0
+    - git-diff-check
+    - gitleaks@8.30.1
+    - gofmt@1.20.4
+    - golangci-lint2@2.11.4
+    - hadolint@2.14.0
+    - isort@8.0.1
+    - ktlint@1.8.0
+    - markdownlint@0.48.0
+    - markdownlint-cli2@0.22.0
+    - nixpkgs-fmt@1.3.0
+    - osv-scanner@2.3.5
+    - oxipng@10.1.0
+    - prettier@3.8.2
+    - ruff@0.15.10
+    - rustfmt@1.65.0
+    - shellcheck@0.11.0
+    - shfmt@3.6.0
+    - svgo@4.0.1
+    - taplo@0.10.0
+    - trufflehog@3.94.3
+    - yamllint@1.38.0
+actions:
+  disabled:
+    - trunk-announce
+    - trunk-check-pre-push
+    - trunk-fmt-pre-commit
+  enabled:
+    - trunk-upgrade-available
