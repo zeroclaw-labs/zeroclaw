@@ -593,12 +593,21 @@ For pre-built binaries, see [GitHub Releases](https://github.com/zeroclaw-labs/z
 
 Release assets are published for:
 
-- Linux: `x86_64`, `aarch64`, `armv7`
+- Linux (glibc): `x86_64`, `aarch64`, `armv7`
+- Linux (musl/Alpine): `x86_64`, `aarch64`
 - macOS: `x86_64`, `aarch64`
 - Windows: `x86_64`
 
 Download the latest assets from:
 <https://github.com/zeroclaw-labs/zeroclaw/releases/latest>
+
+Example (Alpine/musl):
+
+```bash
+curl -fsSLO https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-x86_64-unknown-linux-musl.tar.gz
+tar xzf zeroclaw-x86_64-unknown-linux-musl.tar.gz
+install -m 0755 zeroclaw "$HOME/.cargo/bin/zeroclaw"
+```
 
 ## Docs
 

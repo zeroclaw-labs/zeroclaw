@@ -227,6 +227,16 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: zeroclaw.exe
             ext: zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: zeroclaw
+            ext: tar.gz
+            musl: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact: zeroclaw
+            ext: tar.gz
+            cross: true
     continue-on-error: ${{ matrix.experimental || false }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -250,6 +260,16 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ${{ matrix.cross_compiler }}
 
+      - name: Install musl tools
+        if: matrix.musl
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@64e57c80700f98e60aa5ef0848d1d9cce31d5ea2 # cross
+
       - name: Setup Android NDK
         if: matrix.ndk
         run: echo "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
@@ -269,10 +289,14 @@ jobs:
           fi
           # Use matrix-level feature override if set, otherwise use global RELEASE_CARGO_FEATURES
           FEATURES="${{ matrix.cargo_features || env.RELEASE_CARGO_FEATURES }}"
+          BUILD_CMD="cargo"
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            BUILD_CMD="cross"
+          fi
           if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
-            cargo build --release --locked --no-default-features --features "agent-runtime,schema-export,${FEATURES}" --target ${{ matrix.target }}
+            $BUILD_CMD build --release --locked --no-default-features --features "agent-runtime,schema-export,${FEATURES}" --target ${{ matrix.target }}
           else
-            cargo build --release --locked --features "${FEATURES}" --target ${{ matrix.target }}
+            $BUILD_CMD build --release --locked --features "${FEATURES}" --target ${{ matrix.target }}
           fi
 
       - name: Check binary size
