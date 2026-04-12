@@ -11,16 +11,14 @@
 //!
 //! # Extension
 //!
-//! To add a new channel, implement [`Channel`] in a new submodule and wire it into
-//! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
+//! To add a new channel, implement [`Channel`] in a new top-level module in
+//! `zeroclaw-channels/src/`, declare it in `lib.rs` behind the appropriate feature
+//! gate, and wire it into [`start_channels`] here. See `AGENTS.md` §7.2 for the
+//! full change playbook.
 
 pub mod acp_server;
-#[cfg(feature = "channel-matrix")]
-pub mod matrix;
 pub mod media_pipeline;
 pub mod mqtt;
-#[cfg(feature = "channel-telegram")]
-pub mod telegram;
 
 // Channel types imported directly from source crates (no shim files)
 pub use crate::bluesky::BlueskyChannel;
@@ -36,6 +34,8 @@ pub use crate::imessage::IMessageChannel;
 pub use crate::irc::IrcChannel;
 #[cfg(feature = "channel-lark")]
 pub use crate::lark::LarkChannel;
+#[cfg(feature = "channel-line")]
+pub use crate::line::LineChannel;
 pub use crate::linq::LinqChannel;
 pub use crate::mattermost::MattermostChannel;
 pub use crate::mochat::MochatChannel;
@@ -61,12 +61,12 @@ pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
 pub use crate::link_enricher;
+#[cfg(feature = "channel-matrix")]
+pub use crate::matrix::MatrixChannel;
+#[cfg(feature = "channel-telegram")]
+pub use crate::telegram::TelegramChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use crate::whatsapp_web::WhatsAppWebChannel;
-#[cfg(feature = "channel-matrix")]
-pub use matrix::MatrixChannel;
-#[cfg(feature = "channel-telegram")]
-pub use telegram::TelegramChannel;
 pub use zeroclaw_infra::debounce::MessageDebouncer;
 pub use zeroclaw_infra::session_backend::SessionBackend;
 pub use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
@@ -461,7 +461,7 @@ fn is_stop_command(content: &str) -> bool {
 /// `<tool_call>`, `<toolcall>`, `<tool-call>`, `<tool>`, or `<invoke>`
 /// blocks that are internal protocol and must not be forwarded to end
 /// users on any channel.
-fn strip_tool_call_tags(message: &str) -> String {
+pub(crate) fn strip_tool_call_tags(message: &str) -> String {
     const TOOL_CALL_OPEN_TAGS: [&str; 7] = [
         "<function_calls>",
         "<function_call>",
@@ -4227,10 +4227,25 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .context("iMessage channel is not configured")?;
             Ok(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())))
         }
+        "line" => {
+            #[cfg(feature = "channel-line")]
+            {
+                let ln = config
+                    .channels_config
+                    .line
+                    .as_ref()
+                    .context("LINE channel is not configured")?;
+                Ok(Arc::new(LineChannel::from_config(ln)))
+            }
+            #[cfg(not(feature = "channel-line"))]
+            {
+                anyhow::bail!("LINE channel requires the `channel-line` feature");
+            }
+        }
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, discord_history, imessage"
+            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line"
         ),
     }
 }
@@ -4709,6 +4724,27 @@ fn collect_configured_channels(
     if config.channels_config.lark.is_some() || config.channels_config.feishu.is_some() {
         tracing::warn!(
             "Lark/Feishu channel is configured but this build was compiled without `channel-lark`; skipping Lark/Feishu health check."
+        );
+    }
+
+    #[cfg(feature = "channel-line")]
+    if let Some(ref ln) = config.channels_config.line {
+        if ln.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "LINE",
+                channel: Arc::new(
+                    LineChannel::from_config(ln).with_transcription(config.transcription.clone()),
+                ),
+            });
+        } else {
+            tracing::info!("LINE channel configured but disabled (enabled = false)");
+        }
+    }
+
+    #[cfg(not(feature = "channel-line"))]
+    if config.channels_config.line.is_some() {
+        tracing::warn!(
+            "LINE channel is configured but this build was compiled without `channel-line`; skipping LINE health check."
         );
     }
 

@@ -1,4 +1,8 @@
 pub use zeroclaw_channels::orchestrator::*;
+#[cfg(feature = "channel-matrix")]
+pub mod matrix;
+#[cfg(feature = "channel-telegram")]
+pub mod telegram;
 pub mod session_backend {
     pub use zeroclaw_infra::session_backend::*;
 }

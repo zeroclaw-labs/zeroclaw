@@ -6544,6 +6544,9 @@ pub struct ChannelsConfig {
     /// Lark channel configuration.
     #[nested]
     pub lark: Option<LarkConfig>,
+    /// LINE Messaging API channel configuration.
+    #[nested]
+    pub line: Option<LineConfig>,
     /// Feishu channel configuration.
     #[nested]
     pub feishu: Option<FeishuConfig>,
@@ -6793,6 +6796,7 @@ impl Default for ChannelsConfig {
             gmail_push: None,
             irc: None,
             lark: None,
+            line: None,
             feishu: None,
             dingtalk: None,
             wecom: None,
@@ -7755,6 +7759,95 @@ impl ChannelConfig for LarkConfig {
     }
     fn desc() -> &'static str {
         "Lark Bot"
+    }
+}
+
+/// DM (1:1 chat) access policy for the LINE channel.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum LineDmPolicy {
+    /// Respond to every DM regardless of who sent it.
+    Open,
+    /// Require a one-time `/bind <code>` handshake before responding (default).
+    /// ZeroClaw prints the bind code on startup; send it once to unlock access.
+    #[default]
+    Pairing,
+    /// Respond only to LINE user IDs listed in `allowed_users`.
+    Allowlist,
+}
+
+/// Group / multi-person chat policy for the LINE channel.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum LineGroupPolicy {
+    /// Respond to every message in group/room chats.
+    Open,
+    /// Respond only when the bot is @mentioned (default).
+    #[default]
+    Mention,
+    /// Ignore all messages in group/room chats.
+    Disabled,
+}
+
+/// LINE Messaging API channel configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.line"]
+pub struct LineConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Long-lived channel access token (from LINE Developers Console).
+    /// Used for both the Reply API and the Push API fallback.
+    /// Falls back to the `LINE_CHANNEL_ACCESS_TOKEN` environment variable if empty.
+    #[serde(default)]
+    #[secret]
+    pub channel_access_token: String,
+    /// Channel secret (from LINE Developers Console).
+    /// Used to verify the `X-Line-Signature` header on incoming webhooks.
+    /// Falls back to the `LINE_CHANNEL_SECRET` environment variable if empty.
+    #[serde(default)]
+    #[secret]
+    pub channel_secret: String,
+    /// DM (1:1 chat) access policy. Default: `pairing`.
+    ///
+    /// - `open`      — respond to everyone
+    /// - `pairing`   — require one-time `/bind <code>` handshake on first contact
+    /// - `allowlist` — respond only to user IDs listed in `allowed_users`
+    #[serde(default)]
+    pub dm_policy: LineDmPolicy,
+    /// Group / multi-person chat policy. Default: `mention`.
+    ///
+    /// - `open`     — respond to every message
+    /// - `mention`  — respond only when @mentioned
+    /// - `disabled` — ignore all group messages
+    #[serde(default)]
+    pub group_policy: LineGroupPolicy,
+    /// LINE user IDs that are allowed to interact with the bot.
+    /// Used when `dm_policy = allowlist`. `["*"]` accepts everyone.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// TCP port the embedded webhook server listens on. Default: `8443`.
+    #[serde(default = "default_line_webhook_port")]
+    pub webhook_port: u16,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+}
+
+fn default_line_webhook_port() -> u16 {
+    8443
+}
+
+impl ChannelConfig for LineConfig {
+    fn name() -> &'static str {
+        "LINE"
+    }
+    fn desc() -> &'static str {
+        "connect your LINE bot"
     }
 }
 
@@ -11002,6 +11095,8 @@ impl_enum_prop_kind!(
     StreamMode,
     WhatsAppWebMode,
     WhatsAppChatPolicy,
+    LineDmPolicy,
+    LineGroupPolicy,
     LarkReceiveMode,
     OtpMethod,
     SandboxBackend,
@@ -11508,6 +11603,7 @@ auto_save = true
                 gmail_push: None,
                 irc: None,
                 lark: None,
+                line: None,
                 feishu: None,
                 dingtalk: None,
                 wecom: None,
@@ -12563,6 +12659,7 @@ allowed_users = ["@ops:matrix.org"]
             gmail_push: None,
             irc: None,
             lark: None,
+            line: None,
             feishu: None,
             dingtalk: None,
             wecom: None,
@@ -12943,6 +13040,7 @@ channel_ids = ["C123", "D456"]
             gmail_push: None,
             irc: None,
             lark: None,
+            line: None,
             feishu: None,
             dingtalk: None,
             wecom: None,
@@ -14969,6 +15067,109 @@ default_model = "persisted-profile"
         assert!(parsed.allowed_users.is_empty());
         assert_eq!(parsed.receive_mode, LarkReceiveMode::Websocket);
         assert!(parsed.port.is_none());
+    }
+
+    // ── LINE ──────────────────────────────────────────────────
+
+    #[test]
+    async fn line_config_toml_roundtrip() {
+        // Full [channels.line] TOML block — covers every user-facing field.
+        //
+        // channel_access_token and channel_secret can be omitted here and
+        // supplied via LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET env vars
+        // instead; both fields default to "" when absent.
+        let toml = r#"
+[channels_config.line]
+enabled = true
+channel_access_token = "ChannelAccessToken=="
+channel_secret = "abc123secret"
+dm_policy = "pairing"
+group_policy = "mention"
+allowed_users = []
+webhook_port = 8443
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let ln = config.channels_config.line.as_ref().unwrap();
+        assert!(ln.enabled);
+        assert_eq!(ln.channel_access_token, "ChannelAccessToken==");
+        assert_eq!(ln.channel_secret, "abc123secret");
+        assert_eq!(ln.dm_policy, LineDmPolicy::Pairing);
+        assert_eq!(ln.group_policy, LineGroupPolicy::Mention);
+        assert_eq!(ln.webhook_port, 8443);
+        assert!(ln.proxy_url.is_none());
+    }
+
+    #[test]
+    async fn line_config_defaults() {
+        // Minimal config — only the required secret fields are provided.
+        // All optional fields should resolve to documented defaults.
+        let toml = r#"
+[channels_config.line]
+channel_access_token = "tok"
+channel_secret = "sec"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let ln = config.channels_config.line.as_ref().unwrap();
+        assert!(!ln.enabled, "enabled should default to false");
+        assert_eq!(
+            ln.dm_policy,
+            LineDmPolicy::Pairing,
+            "dm_policy default is pairing"
+        );
+        assert_eq!(
+            ln.group_policy,
+            LineGroupPolicy::Mention,
+            "group_policy default is mention"
+        );
+        assert_eq!(ln.webhook_port, 8443, "webhook_port default is 8443");
+        assert!(ln.allowed_users.is_empty());
+        assert!(ln.proxy_url.is_none());
+    }
+
+    #[test]
+    async fn line_config_allowlist_policy() {
+        // dm_policy = allowlist with an explicit user ID list.
+        let toml = r#"
+[channels_config.line]
+channel_access_token = "tok"
+channel_secret = "sec"
+dm_policy = "allowlist"
+allowed_users = ["Uabc123", "Udef456"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let ln = config.channels_config.line.as_ref().unwrap();
+        assert_eq!(ln.dm_policy, LineDmPolicy::Allowlist);
+        assert_eq!(ln.allowed_users, vec!["Uabc123", "Udef456"]);
+    }
+
+    #[test]
+    async fn line_config_open_policies() {
+        // dm_policy = open + group_policy = open — most permissive combination.
+        let toml = r#"
+[channels_config.line]
+channel_access_token = "tok"
+channel_secret = "sec"
+dm_policy = "open"
+group_policy = "open"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let ln = config.channels_config.line.as_ref().unwrap();
+        assert_eq!(ln.dm_policy, LineDmPolicy::Open);
+        assert_eq!(ln.group_policy, LineGroupPolicy::Open);
+    }
+
+    #[test]
+    async fn line_config_group_disabled() {
+        // group_policy = disabled — bot ignores all group/room messages.
+        let toml = r#"
+[channels_config.line]
+channel_access_token = "tok"
+channel_secret = "sec"
+group_policy = "disabled"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let ln = config.channels_config.line.as_ref().unwrap();
+        assert_eq!(ln.group_policy, LineGroupPolicy::Disabled);
     }
 
     #[test]
