@@ -15069,6 +15069,109 @@ default_model = "persisted-profile"
         assert!(parsed.port.is_none());
     }
 
+    // ── LINE ──────────────────────────────────────────────────
+
+    #[test]
+    async fn line_config_toml_roundtrip() {
+        // Full [channels.line] TOML block — covers every user-facing field.
+        //
+        // channel_access_token and channel_secret can be omitted here and
+        // supplied via LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET env vars
+        // instead; both fields default to "" when absent.
+        let toml = r#"
+[channels_config.line]
+enabled = true
+channel_access_token = "ChannelAccessToken=="
+channel_secret = "abc123secret"
+dm_policy = "pairing"
+group_policy = "mention"
+allowed_users = []
+webhook_port = 8443
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let ln = config.channels_config.line.as_ref().unwrap();
+        assert!(ln.enabled);
+        assert_eq!(ln.channel_access_token, "ChannelAccessToken==");
+        assert_eq!(ln.channel_secret, "abc123secret");
+        assert_eq!(ln.dm_policy, LineDmPolicy::Pairing);
+        assert_eq!(ln.group_policy, LineGroupPolicy::Mention);
+        assert_eq!(ln.webhook_port, 8443);
+        assert!(ln.proxy_url.is_none());
+    }
+
+    #[test]
+    async fn line_config_defaults() {
+        // Minimal config — only the required secret fields are provided.
+        // All optional fields should resolve to documented defaults.
+        let toml = r#"
+[channels_config.line]
+channel_access_token = "tok"
+channel_secret = "sec"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let ln = config.channels_config.line.as_ref().unwrap();
+        assert!(!ln.enabled, "enabled should default to false");
+        assert_eq!(
+            ln.dm_policy,
+            LineDmPolicy::Pairing,
+            "dm_policy default is pairing"
+        );
+        assert_eq!(
+            ln.group_policy,
+            LineGroupPolicy::Mention,
+            "group_policy default is mention"
+        );
+        assert_eq!(ln.webhook_port, 8443, "webhook_port default is 8443");
+        assert!(ln.allowed_users.is_empty());
+        assert!(ln.proxy_url.is_none());
+    }
+
+    #[test]
+    async fn line_config_allowlist_policy() {
+        // dm_policy = allowlist with an explicit user ID list.
+        let toml = r#"
+[channels_config.line]
+channel_access_token = "tok"
+channel_secret = "sec"
+dm_policy = "allowlist"
+allowed_users = ["Uabc123", "Udef456"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let ln = config.channels_config.line.as_ref().unwrap();
+        assert_eq!(ln.dm_policy, LineDmPolicy::Allowlist);
+        assert_eq!(ln.allowed_users, vec!["Uabc123", "Udef456"]);
+    }
+
+    #[test]
+    async fn line_config_open_policies() {
+        // dm_policy = open + group_policy = open — most permissive combination.
+        let toml = r#"
+[channels_config.line]
+channel_access_token = "tok"
+channel_secret = "sec"
+dm_policy = "open"
+group_policy = "open"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let ln = config.channels_config.line.as_ref().unwrap();
+        assert_eq!(ln.dm_policy, LineDmPolicy::Open);
+        assert_eq!(ln.group_policy, LineGroupPolicy::Open);
+    }
+
+    #[test]
+    async fn line_config_group_disabled() {
+        // group_policy = disabled — bot ignores all group/room messages.
+        let toml = r#"
+[channels_config.line]
+channel_access_token = "tok"
+channel_secret = "sec"
+group_policy = "disabled"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let ln = config.channels_config.line.as_ref().unwrap();
+        assert_eq!(ln.group_policy, LineGroupPolicy::Disabled);
+    }
+
     #[test]
     async fn nextcloud_talk_config_serde() {
         let nc = NextcloudTalkConfig {
