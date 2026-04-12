@@ -664,11 +664,22 @@ impl TelegramChannel {
 
             for skill in &skills {
                 let sanitized = sanitize_telegram_command_name(&skill.name);
-                if sanitized.is_empty() || used_names.contains(&sanitized) {
+                if sanitized.is_empty() {
+                    tracing::debug!(
+                        "Skipping skill '{}': name produces empty Telegram command",
+                        skill.name
+                    );
+                    continue;
+                }
+                if used_names.contains(&sanitized) {
+                    tracing::debug!(
+                        "Skipping skill '{}': command /{sanitized} conflicts with an existing command",
+                        skill.name
+                    );
                     continue;
                 }
                 let description = if skill.description.is_empty() {
-                    skill.name.clone()
+                    format!("Run the {name} skill", name = skill.name)
                 } else {
                     truncate_telegram_command_description(&skill.description)
                 };
@@ -681,7 +692,15 @@ impl TelegramChannel {
         }
 
         // Telegram allows at most 100 commands.
+        let total_before_cap = commands.len();
         commands.truncate(TELEGRAM_MAX_BOT_COMMANDS);
+        if total_before_cap > TELEGRAM_MAX_BOT_COMMANDS {
+            tracing::warn!(
+                "Telegram limits bots to {TELEGRAM_MAX_BOT_COMMANDS} commands; \
+                 {total_before_cap} configured, registering first {TELEGRAM_MAX_BOT_COMMANDS}. \
+                 Reduce installed skills to expose more commands."
+            );
+        }
 
         let url = self.api_url("setMyCommands");
         let body = serde_json::json!({ "commands": commands });
