@@ -36,6 +36,50 @@ enum IncomingAttachmentKind {
     Photo,
 }
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
+/// Telegram Bot API allows at most 100 commands via setMyCommands.
+const TELEGRAM_MAX_BOT_COMMANDS: usize = 100;
+/// Telegram command names: 1-32 lowercase a-z, 0-9, and underscore.
+const TELEGRAM_COMMAND_NAME_MAX_LEN: usize = 32;
+/// Telegram command descriptions are at most 256 characters.
+const TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN: usize = 256;
+
+/// Sanitize a skill name into a valid Telegram command name.
+/// Telegram commands must be 1-32 characters, lowercase a-z, 0-9, underscore only.
+fn sanitize_telegram_command_name(raw: &str) -> String {
+    let mut result = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_lowercase() || lower.is_ascii_digit() {
+            result.push(lower);
+        } else if !result.ends_with('_') {
+            // Replace non-alphanumeric with underscore, collapsing consecutive runs.
+            result.push('_');
+        }
+    }
+
+    let trimmed = result.trim_matches('_');
+    if trimmed.len() <= TELEGRAM_COMMAND_NAME_MAX_LEN {
+        trimmed.to_string()
+    } else {
+        trimmed[..TELEGRAM_COMMAND_NAME_MAX_LEN]
+            .trim_end_matches('_')
+            .to_string()
+    }
+}
+
+/// Truncate a description to Telegram's 256-character limit.
+fn truncate_telegram_command_description(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.len() <= TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN {
+        return trimmed.to_string();
+    }
+    let mut truncated: String = trimmed
+        .chars()
+        .take(TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN - 1)
+        .collect();
+    truncated.push('…');
+    truncated
+}
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
@@ -600,21 +644,54 @@ impl TelegramChannel {
 
     /// Register the bot's slash commands with Telegram via `setMyCommands`.
     /// Called once at startup so that users see a command menu when pressing `/`.
+    /// Includes both built-in runtime commands and user-installed skill commands.
     async fn register_bot_commands(&self) {
-        let commands = serde_json::json!([
-            { "command": "new",    "description": "Start a new conversation session" },
-            { "command": "stop",   "description": "Cancel the current in-flight task" },
-            { "command": "model",  "description": "Show or switch the current model" },
-            { "command": "models", "description": "List available providers or switch provider" },
-            { "command": "config", "description": "Show current configuration" },
-        ]);
+        let mut commands: Vec<serde_json::Value> = vec![
+            serde_json::json!({ "command": "new",    "description": "Start a new conversation session" }),
+            serde_json::json!({ "command": "stop",   "description": "Cancel the current in-flight task" }),
+            serde_json::json!({ "command": "model",  "description": "Show or switch the current model" }),
+            serde_json::json!({ "command": "models", "description": "List available providers or switch provider" }),
+            serde_json::json!({ "command": "config", "description": "Show current configuration" }),
+        ];
+
+        // Collect commands from installed skills.
+        if let Some(ref workspace_dir) = self.workspace_dir {
+            let skills = zeroclaw_runtime::skills::load_skills(workspace_dir);
+            let mut used_names: std::collections::HashSet<String> = commands
+                .iter()
+                .filter_map(|c| c.get("command").and_then(|v| v.as_str()).map(String::from))
+                .collect();
+
+            for skill in &skills {
+                let sanitized = sanitize_telegram_command_name(&skill.name);
+                if sanitized.is_empty() || used_names.contains(&sanitized) {
+                    continue;
+                }
+                let description = if skill.description.is_empty() {
+                    skill.name.clone()
+                } else {
+                    truncate_telegram_command_description(&skill.description)
+                };
+                used_names.insert(sanitized.clone());
+                commands.push(serde_json::json!({
+                    "command": sanitized,
+                    "description": description,
+                }));
+            }
+        }
+
+        // Telegram allows at most 100 commands.
+        commands.truncate(TELEGRAM_MAX_BOT_COMMANDS);
 
         let url = self.api_url("setMyCommands");
         let body = serde_json::json!({ "commands": commands });
 
         match self.http_client().post(&url).json(&body).send().await {
             Ok(resp) if resp.status().is_success() => {
-                tracing::info!("Telegram bot commands registered successfully");
+                tracing::info!(
+                    "Telegram bot commands registered successfully ({} commands)",
+                    commands.len()
+                );
             }
             Ok(resp) => {
                 let status = resp.status();
@@ -5208,5 +5285,102 @@ mod tests {
 
         // Should not panic — errors are logged, not propagated.
         ch.register_bot_commands().await;
+    }
+
+    #[test]
+    fn sanitize_telegram_command_name_basic() {
+        assert_eq!(sanitize_telegram_command_name("hello"), "hello");
+        assert_eq!(sanitize_telegram_command_name("Hello"), "hello");
+        assert_eq!(sanitize_telegram_command_name("my-skill"), "my_skill");
+        assert_eq!(sanitize_telegram_command_name("my skill"), "my_skill");
+        assert_eq!(
+            sanitize_telegram_command_name("My Cool Skill!"),
+            "my_cool_skill"
+        );
+    }
+
+    #[test]
+    fn sanitize_telegram_command_name_trims_underscores() {
+        assert_eq!(sanitize_telegram_command_name("_leading"), "leading");
+        assert_eq!(sanitize_telegram_command_name("trailing_"), "trailing");
+        assert_eq!(sanitize_telegram_command_name("__both__"), "both");
+    }
+
+    #[test]
+    fn sanitize_telegram_command_name_collapses_double_underscores() {
+        assert_eq!(sanitize_telegram_command_name("a--b"), "a_b");
+        assert_eq!(sanitize_telegram_command_name("a---b"), "a_b");
+    }
+
+    #[test]
+    fn sanitize_telegram_command_name_truncates_to_32_chars() {
+        let long = "a".repeat(50);
+        let result = sanitize_telegram_command_name(&long);
+        assert!(result.len() <= TELEGRAM_COMMAND_NAME_MAX_LEN);
+        assert_eq!(result.len(), 32);
+    }
+
+    #[test]
+    fn sanitize_telegram_command_name_empty_input() {
+        assert_eq!(sanitize_telegram_command_name(""), "");
+        assert_eq!(sanitize_telegram_command_name("---"), "");
+    }
+
+    #[test]
+    fn truncate_telegram_command_description_short() {
+        assert_eq!(
+            truncate_telegram_command_description("Short desc"),
+            "Short desc"
+        );
+    }
+
+    #[test]
+    fn truncate_telegram_command_description_at_limit() {
+        let exact = "a".repeat(TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN);
+        assert_eq!(truncate_telegram_command_description(&exact), exact);
+    }
+
+    #[test]
+    fn truncate_telegram_command_description_over_limit() {
+        let long = "a".repeat(TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN + 10);
+        let result = truncate_telegram_command_description(&long);
+        assert!(result.chars().count() <= TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN);
+        assert!(result.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn register_bot_commands_includes_skills() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_dir = workspace.path().join("skills").join("weather");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: weather\ndescription: Check the weather forecast\n---\n# Weather\n",
+        )
+        .unwrap();
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+            .with_api_base(mock_server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf());
+
+        ch.register_bot_commands().await;
+
+        // Verify the mock was called (expectations checked on drop).
+        // The request should contain 5 built-in + 1 skill command = 6 total.
     }
 }
