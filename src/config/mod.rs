@@ -18,7 +18,7 @@ pub use schema::{
     FreepikApiConfig, GatekeeperConfig, GatewayConfig, GoogleCalendarConfig, GroupReplyConfig,
     GroupReplyMode, HardwareConfig, HardwareTransport, HeartbeatConfig, HooksConfig,
     HttpRequestConfig, HttpRequestCredentialProfile, IMessageConfig, IdentityConfig,
-    KakaoCalendarConfig, LarkConfig, MatrixConfig, MediaApiConfig, MemoryConfig, ModelRouteConfig,
+    KakaoCalendarConfig, LarkConfig, LiveKitConfig, MatrixConfig, MediaApiConfig, MemoryConfig, ModelRouteConfig,
     MultimodalConfig, NextcloudTalkConfig, NonCliNaturalLanguageApprovalMode, ObservabilityConfig,
     OtpChallengeDelivery, OtpConfig, OtpMethod, OutboundLeakGuardAction, OutboundLeakGuardConfig,
     OutlookCalendarConfig, PeripheralBoardConfig, PeripheralsConfig, PerplexityFilterConfig,

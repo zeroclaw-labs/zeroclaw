@@ -460,6 +460,12 @@ pub struct Config {
     #[serde(default)]
     pub economic: EconomicConfig,
 
+    /// LiveKit Agents voice chat configuration (`[livekit]`).
+    /// Controls the LiveKit-based STT → LLM → TTS pipeline worker
+    /// for real-time voice conversations. See §6D in ARCHITECTURE.md.
+    #[serde(default)]
+    pub livekit: LiveKitConfig,
+
     /// Peripheral board configuration for hardware integration (`[peripherals]`).
     #[serde(default)]
     pub peripherals: PeripheralsConfig,
@@ -2615,6 +2621,55 @@ pub struct PeripheralBoardConfig {
     /// Baud rate for serial (default: 115200)
     #[serde(default = "default_peripheral_baud")]
     pub baud: u32,
+}
+
+// ── LiveKit Agents voice chat ────────────────────────────────────────
+
+/// LiveKit-based voice chat configuration for STT → LLM → TTS pipeline.
+///
+/// The pipeline and S2S Gemini Live workers run as separate Python
+/// processes (in `services/livekit-agents/`). The Rust backend does NOT
+/// run LiveKit code directly; it only reads this config to (a) know
+/// whether voice is enabled, (b) generate LiveKit JWT tokens for
+/// clients, and (c) manage credit billing. The actual voice processing
+/// is handled by the Python LiveKit Agents framework.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+pub struct LiveKitConfig {
+    /// Enable the LiveKit voice chat feature.
+    #[serde(default)]
+    pub enabled: bool,
+    /// LiveKit server WebSocket URL (e.g. `wss://my-project.livekit.cloud`).
+    #[serde(default)]
+    pub server_url: String,
+    /// LiveKit API key (for generating participant tokens).
+    #[serde(default)]
+    pub api_key: String,
+    /// LiveKit API secret.
+    #[serde(default)]
+    pub api_secret: String,
+    /// Default voice mode: "pipeline" (STT+LLM+TTS) or "s2s" (Gemini Live).
+    #[serde(default = "default_livekit_voice_mode")]
+    pub default_mode: String,
+    /// Deepgram API key (STT). Falls back to env `DEEPGRAM_API_KEY`.
+    #[serde(default)]
+    pub deepgram_api_key: Option<String>,
+    /// Cartesia API key (TTS). Falls back to env `CARTESIA_API_KEY`.
+    #[serde(default)]
+    pub cartesia_api_key: Option<String>,
+    /// Typecast API key (한국어 프리미엄 TTS). Falls back to env `TYPECAST_API_KEY`.
+    #[serde(default)]
+    pub typecast_api_key: Option<String>,
+    /// Credit multiplier for operator-key voice sessions (default 2.2).
+    #[serde(default = "default_voice_credit_multiplier")]
+    pub credit_multiplier: f64,
+}
+
+fn default_livekit_voice_mode() -> String {
+    "pipeline".into()
+}
+
+fn default_voice_credit_multiplier() -> f64 {
+    2.2
 }
 
 // ── MQTT subscriber (IoT event ingestion via src/dispatch/) ─────────
@@ -7659,6 +7714,7 @@ impl Default for Config {
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             economic: EconomicConfig::default(),
+            livekit: LiveKitConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             coordination: CoordinationConfig::default(),
@@ -11958,6 +12014,7 @@ ws_url = "ws://127.0.0.1:3002"
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             economic: EconomicConfig::default(),
+            livekit: LiveKitConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hooks: HooksConfig::default(),
@@ -12350,6 +12407,7 @@ tool_dispatcher = "xml"
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             economic: EconomicConfig::default(),
+            livekit: LiveKitConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hooks: HooksConfig::default(),

@@ -1,0 +1,21 @@
+# moa 음성 대화 서비스 — Python 패키지 요구사항
+# Python 3.11+ 권장
+
+# --- LiveKit 코어 ---
+livekit==0.18.*
+livekit-agents[cartesia,deepgram,silero,turn-detector]>=1.2.0
+
+# --- LLM 플러그인 (이용자가 선택한 것만 실제로 호출됨) ---
+livekit-plugins-google>=1.2.0       # Gemini LLM + Gemini Live S2S (default)
+livekit-plugins-anthropic>=1.2.0    # Claude Sonnet 4.6 / Haiku 4.5
+livekit-plugins-openai>=1.2.0       # GPT-4o / GPT-4o-mini (이용자 선택 시)
+
+# --- STT / TTS / VAD ---
+livekit-plugins-deepgram>=1.2.0     # Nova-3 STT
+livekit-plugins-cartesia>=1.2.0     # Sonic-3 TTS (다국어 기본)
+livekit-plugins-silero>=1.2.0       # VAD
+
+# --- 유틸 ---
+python-dotenv>=1.0.1
+httpx>=0.27.0                       # Typecast 커스텀 TTS 호출용
+aiohttp>=3.9.5                      # CLOVA Speech gRPC/HTTP 호출용
