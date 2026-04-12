@@ -179,6 +179,9 @@ crossterm = { version = "0.29", features = ["event-stream"], optional = true }
 # Hardware discovery (device path globbing)
 glob = { version = "0.3", optional = true }
 
+# Nostr key validation for wizard (behind channel-nostr feature)
+nostr-sdk = { version = "0.44", default-features = false, optional = true }
+
 # Binary discovery (init system detection)
 which = { version = "8.0", optional = true }
 
@@ -207,8 +210,7 @@ tower = { version = "0.5", default-features = false, features = ["util"], option
 tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 
-# Embed frontend assets into binary (web dashboard)
-rust-embed = { version = "8", optional = true }
+# rust-embed removed — web dashboard served from filesystem via gateway.web_dist_dir
 mime_guess = { version = "2", optional = true }
 
 # Use the blocking HTTP exporter client to avoid Tokio-reactor panics in
@@ -240,7 +242,7 @@ agent-runtime = [
     "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots",
     "dep:lettre", "dep:mail-parser", "dep:async-imap",
     "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tower-http", "dep:http-body-util",
-    "dep:rust-embed", "dep:mime_guess",
+    "dep:mime_guess",
     "gateway", "tui-onboarding",
     "channel-email", "channel-telegram", "channel-lark",
     "channel-discord", "channel-slack", "channel-signal",
@@ -262,7 +264,7 @@ schema-export = ["zeroclaw-config/schema-export"]
 channel-email = ["zeroclaw-channels/channel-email"]
 channel-telegram = ["zeroclaw-channels/channel-telegram"]
 channel-lark = ["zeroclaw-channels/channel-lark"]
-channel-nostr = ["zeroclaw-channels/channel-nostr"]
+channel-nostr = ["zeroclaw-channels/channel-nostr", "zeroclaw-runtime/channel-nostr", "dep:nostr-sdk"]
 channel-matrix = ["zeroclaw-channels/channel-matrix"]
 channel-discord = ["zeroclaw-channels/channel-discord"]
 channel-slack = ["zeroclaw-channels/channel-slack"]

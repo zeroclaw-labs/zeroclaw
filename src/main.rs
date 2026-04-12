@@ -460,6 +460,12 @@ Examples:
         skill_command: SkillCommands,
     },
 
+    /// Manage standard operating procedures (SOPs)
+    Sop {
+        #[command(subcommand)]
+        sop_command: SopCommands,
+    },
+
     /// Migrate data from other agent runtimes
     Migrate {
         #[command(subcommand)]
@@ -1062,8 +1068,10 @@ async fn main() -> Result<()> {
             return Ok(());
         }
 
+        let wizard_callbacks = build_wizard_callbacks();
+
         let config = if channels_only {
-            Box::pin(onboard::run_channels_repair_wizard()).await
+            Box::pin(onboard::run_channels_repair_wizard(wizard_callbacks)).await
         } else if quick || has_provider_flags {
             Box::pin(onboard::run_quick_setup(
                 api_key.as_deref(),
@@ -1074,7 +1082,7 @@ async fn main() -> Result<()> {
             ))
             .await
         } else if is_tty || env_interactive {
-            Box::pin(onboard::run_wizard(force)).await
+            Box::pin(onboard::run_wizard(force, wizard_callbacks)).await
         } else {
             Box::pin(onboard::run_quick_setup(
                 api_key.as_deref(),
@@ -1667,6 +1675,8 @@ async fn main() -> Result<()> {
 
         Commands::Skills { skill_command } => skills::handle_command(skill_command, &config),
 
+        Commands::Sop { sop_command } => sop::handle_command(sop_command, &config),
+
         Commands::Migrate { migrate_command } => {
             migration::handle_command(migrate_command, &config).await
         }
@@ -2036,6 +2046,223 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+    }
+}
+
+/// Build wizard callbacks that wire downstream crate functionality into the onboarding wizard.
+#[cfg(feature = "agent-runtime")]
+fn build_wizard_callbacks() -> onboard::WizardCallbacks {
+    onboard::WizardCallbacks {
+        #[cfg(feature = "hardware")]
+        hardware_setup: Some(Box::new(|| {
+            use console::style;
+            use dialoguer::{Confirm, Select};
+
+            println!(
+                "  {} {}",
+                style("ℹ").dim(),
+                style("ZeroClaw can talk to physical hardware (LEDs, sensors, motors).").dim()
+            );
+            println!(
+                "  {} {}",
+                style("ℹ").dim(),
+                style("Scanning for connected devices...").dim()
+            );
+            println!();
+
+            let devices = zeroclaw_hardware::discover_hardware();
+
+            if devices.is_empty() {
+                println!(
+                    "  {} {}",
+                    style("ℹ").dim(),
+                    style("No hardware devices detected on this system.").dim()
+                );
+                println!(
+                    "  {} {}",
+                    style("ℹ").dim(),
+                    style("You can enable hardware later in config.toml under [hardware].").dim()
+                );
+            } else {
+                println!(
+                    "  {} {} device(s) found:",
+                    style("✓").green().bold(),
+                    devices.len()
+                );
+                for device in &devices {
+                    let detail = device
+                        .detail
+                        .as_deref()
+                        .map(|d| format!(" ({d})"))
+                        .unwrap_or_default();
+                    let path = device
+                        .device_path
+                        .as_deref()
+                        .map(|p| format!(" → {p}"))
+                        .unwrap_or_default();
+                    println!(
+                        "    {} {}{}{} [{}]",
+                        style("›").cyan(),
+                        style(&device.name).green(),
+                        style(&detail).dim(),
+                        style(&path).dim(),
+                        style(device.transport.to_string()).cyan()
+                    );
+                }
+            }
+            println!();
+
+            let options = vec![
+                "🚀 Native — direct GPIO on this Linux board (Raspberry Pi, Orange Pi, etc.)",
+                "🔌 Tethered — control an Arduino/ESP32/Nucleo plugged into USB",
+                "🔬 Debug Probe — flash/read MCUs via SWD/JTAG (probe-rs)",
+                "☁️  Software Only — no hardware access (default)",
+            ];
+
+            let recommended = zeroclaw_hardware::recommended_wizard_default(&devices);
+
+            let choice = Select::new()
+                .with_prompt("  How should ZeroClaw interact with the physical world?")
+                .items(&options)
+                .default(recommended)
+                .interact()?;
+
+            let mut hw_config = zeroclaw_hardware::config_from_wizard_choice(choice, &devices);
+
+            use zeroclaw_config::schema::HardwareTransport;
+
+            // Serial: pick a port if multiple found
+            if hw_config.transport_mode() == HardwareTransport::Serial {
+                let serial_devices: Vec<&zeroclaw_hardware::DiscoveredDevice> = devices
+                    .iter()
+                    .filter(|d| d.transport == HardwareTransport::Serial)
+                    .collect();
+
+                if serial_devices.len() > 1 {
+                    let port_labels: Vec<String> = serial_devices
+                        .iter()
+                        .map(|d| {
+                            format!(
+                                "{} ({})",
+                                d.device_path.as_deref().unwrap_or("unknown"),
+                                d.name
+                            )
+                        })
+                        .collect();
+
+                    let port_idx = Select::new()
+                        .with_prompt("  Multiple serial devices found — select one")
+                        .items(&port_labels)
+                        .default(0)
+                        .interact()?;
+
+                    hw_config.serial_port = serial_devices[port_idx].device_path.clone();
+                } else if serial_devices.is_empty() {
+                    let manual_port: String = dialoguer::Input::new()
+                        .with_prompt("  Serial port path (e.g. /dev/ttyUSB0)")
+                        .default("/dev/ttyUSB0".into())
+                        .interact_text()?;
+                    hw_config.serial_port = Some(manual_port);
+                }
+
+                // Baud rate
+                let baud_options = vec![
+                    "115200 (default, recommended)",
+                    "9600 (legacy Arduino)",
+                    "57600",
+                    "230400",
+                    "Custom",
+                ];
+                let baud_idx = Select::new()
+                    .with_prompt("  Serial baud rate")
+                    .items(&baud_options)
+                    .default(0)
+                    .interact()?;
+
+                hw_config.baud_rate = match baud_idx {
+                    1 => 9600,
+                    2 => 57600,
+                    3 => 230_400,
+                    4 => {
+                        let custom: String = dialoguer::Input::new()
+                            .with_prompt("  Custom baud rate")
+                            .default("115200".into())
+                            .interact_text()?;
+                        custom.parse::<u32>().unwrap_or(115_200)
+                    }
+                    _ => 115_200,
+                };
+            }
+
+            // Probe: ask for target chip
+            if hw_config.transport_mode() == HardwareTransport::Probe
+                && hw_config.probe_target.is_none()
+            {
+                let target: String = dialoguer::Input::new()
+                    .with_prompt("  Target MCU chip (e.g. STM32F411CEUx, nRF52840_xxAA)")
+                    .default("STM32F411CEUx".into())
+                    .interact_text()?;
+                hw_config.probe_target = Some(target);
+            }
+
+            // Datasheet RAG
+            if hw_config.enabled {
+                let datasheets = Confirm::new()
+                    .with_prompt(
+                        "  Enable datasheet RAG? (index PDF schematics for AI pin lookups)",
+                    )
+                    .default(true)
+                    .interact()?;
+                hw_config.workspace_datasheets = datasheets;
+            }
+
+            // Summary
+            if hw_config.enabled {
+                let transport_label = match hw_config.transport_mode() {
+                    HardwareTransport::Native => "Native GPIO".to_string(),
+                    HardwareTransport::Serial => format!(
+                        "Serial → {} @ {} baud",
+                        hw_config.serial_port.as_deref().unwrap_or("?"),
+                        hw_config.baud_rate
+                    ),
+                    HardwareTransport::Probe => format!(
+                        "Probe (SWD/JTAG) → {}",
+                        hw_config.probe_target.as_deref().unwrap_or("?")
+                    ),
+                    HardwareTransport::None => "Software Only".to_string(),
+                };
+
+                println!(
+                    "  {} Hardware: {} | datasheets: {}",
+                    style("✓").green().bold(),
+                    style(&transport_label).green(),
+                    if hw_config.workspace_datasheets {
+                        style("on").green().to_string()
+                    } else {
+                        style("off").dim().to_string()
+                    }
+                );
+            } else {
+                println!(
+                    "  {} Hardware: {}",
+                    style("✓").green().bold(),
+                    style("disabled (software only)").dim()
+                );
+            }
+
+            Ok(hw_config)
+        })),
+        #[cfg(not(feature = "hardware"))]
+        hardware_setup: None,
+
+        #[cfg(feature = "channel-nostr")]
+        nostr_validate_key: Some(Box::new(|key: &str| {
+            let keys = nostr_sdk::Keys::parse(key)
+                .map_err(|e| anyhow::anyhow!("invalid nostr key: {e}"))?;
+            Ok(keys.public_key().to_hex())
+        })),
+
+        whatsapp_web_available: cfg!(feature = "whatsapp-web"),
     }
 }
 
