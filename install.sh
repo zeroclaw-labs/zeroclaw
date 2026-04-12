@@ -221,6 +221,7 @@ done
 export CARGO_HOME="${CARGO_HOME:-$PREFIX/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$PREFIX/.rustup}"
 INSTALL_DIR="${ZEROCLAW_INSTALL_DIR:-$PREFIX/.zeroclaw/src}"
+ORIGINAL_PATH="$PATH"
 export PATH="$CARGO_HOME/bin:$PATH"
 
 [[ "$UNINSTALL" == true ]] && do_uninstall
@@ -332,12 +333,20 @@ if [[ -n "$USER_FEATURES" ]]; then
   fi
 fi
 
-# ── Detect reinstall ─────────────────────────────────────────────
+# ── Detect existing installs ──────────────────────────────────────
 
-EXISTING_BIN="$CARGO_HOME/bin/zeroclaw"
-if [[ -f "$EXISTING_BIN" ]]; then
-  EXISTING=$("$EXISTING_BIN" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
-  warn "Existing install detected: v$EXISTING"
+# Check what's in the user's actual PATH (not our modified one)
+PATH_BIN=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
+if [[ -n "$PATH_BIN" ]]; then
+  PATH_VERSION=$("$PATH_BIN" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
+  TARGET_BIN="$CARGO_HOME/bin/zeroclaw"
+  if [[ "$PATH_BIN" != "$TARGET_BIN" ]]; then
+    warn "zeroclaw found at $PATH_BIN (v$PATH_VERSION)"
+    warn "This install targets $TARGET_BIN"
+    warn "The old binary will shadow the new one unless removed or PATH is reordered"
+  else
+    warn "Existing install: $PATH_BIN (v$PATH_VERSION)"
+  fi
   if [[ "$MINIMAL" == true && "$DRY_RUN" != true ]]; then
     echo
     read -rp "  --minimal will produce a reduced binary (no agent runtime by default). Continue? [Y/n] " confirm
@@ -389,8 +398,19 @@ cargo install --path . --locked --force "${CARGO_ARGS[@]}"
 BIN="$CARGO_HOME/bin/zeroclaw"
 if [[ -f "$BIN" ]]; then
   SIZE=$(du -h "$BIN" | awk '{print $1}')
+  NEW_VERSION=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || echo "$VERSION")
   echo
-  info "Installed: $BIN ($SIZE)"
+  info "Installed: $BIN (v$NEW_VERSION, $SIZE)"
+
+  # Check if something else shadows it in the user's actual PATH
+  ACTIVE_BIN=$(PATH="$ORIGINAL_PATH" command -v zeroclaw 2>/dev/null || true)
+  if [[ -n "$ACTIVE_BIN" && "$ACTIVE_BIN" != "$BIN" ]]; then
+    ACTIVE_VERSION=$("$ACTIVE_BIN" --version 2>/dev/null | awk '{print $NF}' || echo "unknown")
+    echo
+    warn "$(bold "WARNING:") zeroclaw in your PATH is $ACTIVE_BIN (v$ACTIVE_VERSION)"
+    warn "It will shadow the v$NEW_VERSION binary you just installed at $BIN"
+    warn "Fix: remove the old binary or put $CARGO_HOME/bin earlier in your PATH"
+  fi
 else
   warn "Binary not found at expected path: $BIN"
 fi
