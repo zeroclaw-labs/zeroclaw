@@ -499,6 +499,14 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
 
 /// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
 ///
+/// Strip fd-merge redirect patterns (`N>&M`, `N<&M`, `>&N`, `<&N`, `N>&-`, etc.)
+/// so their `&` doesn't get flagged as a background operator.
+fn strip_fd_merge_redirects(command: &str) -> String {
+    // Matches patterns like: 2>&1, 1>&2, >&2, <&0, 2<&-, >&-
+    let re = regex::Regex::new(r"\d*[><]&[\d-]").unwrap();
+    re.replace_all(command, "").to_string()
+}
+
 /// We treat any standalone `&` as unsafe in policy validation because it can
 /// chain hidden sub-commands and escape foreground timeout expectations.
 fn contains_unquoted_single_ampersand(command: &str) -> bool {
@@ -1102,8 +1110,9 @@ impl SecurityPolicy {
 
         // Block background command chaining (`&`), which can hide extra
         // sub-commands and outlive timeout expectations. Keep `&&` allowed.
-        // Strip `2>&1` first so its `&` isn't flagged as background chaining.
-        let ampersand_check = command.replace("2>&1", "").replace("1>&2", "");
+        // Strip fd-merge redirects (N>&M, N<&M) first so their `&` isn't
+        // flagged as background chaining.
+        let ampersand_check = strip_fd_merge_redirects(command);
         if contains_unquoted_single_ampersand(&ampersand_check) {
             return false;
         }
@@ -2430,6 +2439,11 @@ mod tests {
         assert!(p.is_command_allowed("find . 2>&1"));
         assert!(p.is_command_allowed("echo hello 1>&2"));
         assert!(p.is_command_allowed("ls 2>&1 > /dev/null"));
+        // Bare fd redirects (implicit fd number)
+        assert!(p.is_command_allowed("echo error >&2"));
+        assert!(p.is_command_allowed("cat <&0"));
+        assert!(p.is_command_allowed("exec >&-"));
+        assert!(p.is_command_allowed("exec 3>&-"));
     }
 
     #[test]
