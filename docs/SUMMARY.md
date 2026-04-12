@@ -115,5 +115,6 @@ Last refreshed: **February 28, 2026**.
 - [project/f1-3-agent-lifecycle-state-machine-rfi-2026-03-01.md](project/f1-3-agent-lifecycle-state-machine-rfi-2026-03-01.md)
 - [project/q0-3-stop-reason-state-machine-rfi-2026-03-01.md](project/q0-3-stop-reason-state-machine-rfi-2026-03-01.md)
 - [project/sam-screenshot-tool-image-rca-2026-04-10.md](project/sam-screenshot-tool-image-rca-2026-04-10.md)
+- [project/sam-screenshot-context-lifecycle-2026-04-11.md](project/sam-screenshot-context-lifecycle-2026-04-11.md)
 - [i18n-gap-backlog.md](i18n-gap-backlog.md)
 - [docs-inventory.md](docs-inventory.md)

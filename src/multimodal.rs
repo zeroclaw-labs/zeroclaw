@@ -104,6 +104,15 @@ pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
 }
 
+pub fn strip_image_markers_preserve_text(content: &str) -> String {
+    let (cleaned_text, _) = parse_image_markers(content);
+    cleaned_text.trim().to_string()
+}
+
+pub fn content_contains_image_markers(content: &str) -> bool {
+    !parse_image_markers(content).1.is_empty()
+}
+
 pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     if image_ref.starts_with("data:") {
         let comma_idx = image_ref.find(',')?;
@@ -657,6 +666,22 @@ mod tests {
 
         assert_eq!(cleaned, "hello [IMAGE:] world");
         assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn strip_image_markers_preserves_surrounding_text() {
+        let input = "Screenshot captured\n[IMAGE:data:image/jpeg;base64,abc]";
+        let output = strip_image_markers_preserve_text(input);
+
+        assert_eq!(output, "Screenshot captured");
+    }
+
+    #[test]
+    fn strip_image_markers_handles_multiple_images() {
+        let input = "Compare\n[IMAGE:data:image/png;base64,a]\n[IMAGE:data:image/jpeg;base64,b]";
+        let output = strip_image_markers_preserve_text(input);
+
+        assert_eq!(output, "Compare");
     }
 
     #[tokio::test]

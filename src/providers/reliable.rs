@@ -4,6 +4,7 @@ use super::traits::{
 use super::Provider;
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -202,6 +203,54 @@ fn compact_error_detail(err: &anyhow::Error) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn downgrade_image_tool_results_for_retry(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    messages
+        .iter()
+        .cloned()
+        .map(|mut message| {
+            if message.role != "tool" {
+                return message;
+            }
+
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&message.content) else {
+                return message;
+            };
+
+            let Some(content) = value.get("content").and_then(serde_json::Value::as_str) else {
+                return message;
+            };
+
+            if !crate::multimodal::content_contains_image_markers(content) {
+                return message;
+            }
+
+            let summary = crate::multimodal::strip_image_markers_preserve_text(content);
+            let downgraded = if summary.is_empty() {
+                "Image tool result omitted from retry payload after first vision attempt."
+                    .to_string()
+            } else {
+                format!(
+                    "{summary}\n\n[Image omitted from retry payload after first vision attempt]"
+                )
+            };
+            value["content"] = serde_json::Value::String(downgraded);
+            message.content = value.to_string();
+            message
+        })
+        .collect()
+}
+
+fn request_messages_for_attempt<'a>(
+    messages: &'a [ChatMessage],
+    attempt: u32,
+) -> Cow<'a, [ChatMessage]> {
+    if attempt == 0 {
+        Cow::Borrowed(messages)
+    } else {
+        Cow::Owned(downgrade_image_tool_results_for_retry(messages))
+    }
 }
 
 fn push_failure(
@@ -761,8 +810,10 @@ impl Provider for ReliableProvider {
                     let mut backoff_ms = self.base_backoff_ms;
 
                     for attempt in 0..=self.max_retries {
+                        let attempt_messages =
+                            request_messages_for_attempt(request.messages, attempt);
                         let req = ChatRequest {
-                            messages: request.messages,
+                            messages: attempt_messages.as_ref(),
                             tools: request.tools,
                             tool_choice: request.tool_choice.clone(),
                         };
@@ -952,6 +1003,7 @@ impl Provider for ReliableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
     use std::sync::Arc;
 
     struct MockProvider {
@@ -1014,6 +1066,48 @@ mod tests {
                 anyhow::bail!("500 model {} unavailable", model);
             }
             Ok(self.response.to_string())
+        }
+    }
+
+    struct ChatRecordingMock {
+        calls: Arc<AtomicUsize>,
+        seen_messages: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        fail_until_attempt: usize,
+    }
+
+    #[async_trait]
+    impl Provider for ChatRecordingMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in chat recording mock");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.seen_messages.lock().push(request.messages.to_vec());
+            if attempt <= self.fail_until_attempt {
+                anyhow::bail!("500 temporary failure");
+            }
+
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
+            })
         }
     }
 
@@ -1342,6 +1436,107 @@ mod tests {
         assert_eq!(result, "fallback ok");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reliable_provider_first_attempt_keeps_image_but_retry_downgrades_it() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen_messages = Arc::new(Mutex::new(Vec::new()));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(ChatRecordingMock {
+                    calls: Arc::clone(&calls),
+                    seen_messages: Arc::clone(&seen_messages),
+                    fail_until_attempt: 1,
+                }),
+            )],
+            1,
+            1,
+        );
+
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"call_ss","name":"screenshot_tool","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(
+                r#"{"tool_call_id":"call_ss","content":"Screenshot captured\n[IMAGE:data:image/jpeg;base64,abc]"}"#,
+            ),
+        ];
+
+        let result = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    tool_choice: None,
+                },
+                "test",
+                0.0,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.text_or_empty(), "ok");
+        let seen = seen_messages.lock();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen[0].iter().any(|msg| msg.role == "tool"
+                && msg.content.contains("[IMAGE:data:image/jpeg;base64,abc]")),
+            "first attempt must keep the raw screenshot payload"
+        );
+        assert!(
+            seen[1].iter().any(|msg| {
+                msg.role == "tool"
+                    && !msg.content.contains("[IMAGE:")
+                    && msg.content.contains("Screenshot captured")
+                    && msg
+                        .content
+                        .contains("Image omitted from retry payload after first vision attempt")
+            }),
+            "retry attempt must downgrade screenshot payload to text-only content"
+        );
+    }
+
+    #[tokio::test]
+    async fn reliable_provider_text_only_requests_are_unchanged_across_retries() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen_messages = Arc::new(Mutex::new(Vec::new()));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(ChatRecordingMock {
+                    calls: Arc::clone(&calls),
+                    seen_messages: Arc::clone(&seen_messages),
+                    fail_until_attempt: 1,
+                }),
+            )],
+            1,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("plain text request")];
+        let _ = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    tool_choice: None,
+                },
+                "test",
+                0.0,
+            )
+            .await
+            .unwrap();
+
+        let seen = seen_messages.lock();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].len(), messages.len());
+        assert_eq!(seen[1].len(), messages.len());
+        assert_eq!(seen[0][0].role, messages[0].role);
+        assert_eq!(seen[0][0].content, messages[0].content);
+        assert_eq!(seen[1][0].role, messages[0].role);
+        assert_eq!(seen[1][0].content, messages[0].content);
     }
 
     // ── New tests: model failover ──

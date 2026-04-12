@@ -10,6 +10,7 @@ Time-bound project status snapshots for planning documentation and operations wo
 - [f1-3-agent-lifecycle-state-machine-rfi-2026-03-01.md](f1-3-agent-lifecycle-state-machine-rfi-2026-03-01.md)
 - [q0-3-stop-reason-state-machine-rfi-2026-03-01.md](q0-3-stop-reason-state-machine-rfi-2026-03-01.md)
 - [sam-screenshot-tool-image-rca-2026-04-10.md](sam-screenshot-tool-image-rca-2026-04-10.md)
+- [sam-screenshot-context-lifecycle-2026-04-11.md](sam-screenshot-context-lifecycle-2026-04-11.md)
 
 ## Scope
 

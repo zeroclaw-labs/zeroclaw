@@ -113,6 +113,35 @@ fn should_treat_provider_as_vision_capable(provider_name: &str, provider: &dyn P
     normalized == "anthropic" || normalized.starts_with("anthropic-custom:")
 }
 
+fn downgrade_image_tool_results_for_history(history: &mut [ChatMessage]) {
+    for message in history.iter_mut() {
+        if message.role != "tool" {
+            continue;
+        }
+
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&message.content) else {
+            continue;
+        };
+
+        let Some(content) = value.get("content").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+
+        if !crate::multimodal::content_contains_image_markers(content) {
+            continue;
+        }
+
+        let summary = crate::multimodal::strip_image_markers_preserve_text(content);
+        let downgraded = if summary.is_empty() {
+            "Image tool result omitted from history after first vision turn.".to_string()
+        } else {
+            format!("{summary}\n\n[Image omitted from history after first vision turn]")
+        };
+        value["content"] = serde_json::Value::String(downgraded);
+        message.content = value.to_string();
+    }
+}
+
 /// Slash-command definitions for interactive-mode completion.
 /// Each entry: (trigger aliases, display label, description).
 const SLASH_COMMANDS: &[(&[&str], &str, &str)] = &[
@@ -1371,6 +1400,7 @@ pub async fn run_tool_call_loop(
         )
         .await?;
         let mut request_messages = prepared_messages.messages.clone();
+        downgrade_image_tool_results_for_history(history);
         if TOOL_LOOP_STRIP_PRIOR_REASONING
             .try_with(|v| *v)
             .unwrap_or(false)
@@ -4315,6 +4345,98 @@ mod tests {
         }
     }
 
+    struct ScreenshotTool;
+
+    #[async_trait]
+    impl Tool for ScreenshotTool {
+        fn name(&self) -> &str {
+            "screenshot_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Returns a screenshot-like tool result"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "Screenshot captured\n[IMAGE:data:image/jpeg;base64,abc]".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RequestCaptureProvider {
+        calls: Arc<std::sync::Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    #[async_trait]
+    impl Provider for RequestCaptureProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                vision: true,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in request capture tests");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let mut calls = self.calls.lock().expect("calls lock should be valid");
+            calls.push(request.messages.to_vec());
+
+            if calls.len() == 1 {
+                return Ok(ChatResponse {
+                    text: Some(String::new()),
+                    tool_calls: vec![ToolCall {
+                        id: "call_ss".to_string(),
+                        name: "screenshot_tool".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                    quota_metadata: None,
+                    stop_reason: None,
+                    raw_stop_reason: None,
+                });
+            }
+
+            Ok(ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+                stop_reason: None,
+                raw_stop_reason: None,
+            })
+        }
+    }
+
     struct DelayTool {
         name: String,
         delay_ms: u64,
@@ -4509,6 +4631,92 @@ mod tests {
         .expect("anthropic route should not fail on a false-negative vision capability probe");
 
         assert_eq!(result, "vision-ok");
+    }
+
+    #[test]
+    fn downgraded_history_preserves_tool_metadata_without_raw_image_payload() {
+        let mut history = vec![ChatMessage::tool(
+            r#"{"tool_call_id":"call_ss","content":"Screenshot captured\n[IMAGE:data:image/jpeg;base64,abc]"}"#,
+        )];
+
+        downgrade_image_tool_results_for_history(&mut history);
+
+        let value: serde_json::Value =
+            serde_json::from_str(&history[0].content).expect("tool history should stay json");
+        assert_eq!(value["tool_call_id"], "call_ss");
+        let content = value["content"]
+            .as_str()
+            .expect("downgraded content should be text");
+        assert!(content.contains("Screenshot captured"));
+        assert!(content.contains("Image omitted from history after first vision turn"));
+        assert!(!content.contains("[IMAGE:"));
+    }
+
+    #[tokio::test]
+    async fn image_tool_result_is_downgraded_after_immediate_request() {
+        let provider = RequestCaptureProvider::default();
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(ScreenshotTool)];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("inspect screenshot"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await
+        .expect("tool loop should complete");
+
+        assert_eq!(result, "done");
+
+        let calls = provider.calls.lock().expect("calls lock should be valid");
+        assert_eq!(
+            calls.len(),
+            2,
+            "provider should see tool request and follow-up"
+        );
+        let second_request = &calls[1];
+        assert!(
+            second_request.iter().any(|msg| {
+                msg.role == "tool"
+                    && msg.content.contains("\"tool_call_id\":\"call_ss\"")
+                    && msg.content.contains("[IMAGE:data:image/jpeg;base64,abc]")
+            }),
+            "immediate follow-up request should still carry raw screenshot payload"
+        );
+        drop(calls);
+
+        let tool_history = history
+            .iter()
+            .find(|msg| msg.role == "tool")
+            .expect("tool history should be present after execution");
+        assert!(
+            !tool_history.content.contains("[IMAGE:"),
+            "durable history should be downgraded after request assembly"
+        );
+        assert!(
+            tool_history
+                .content
+                .contains("Image omitted from history after first vision turn"),
+            "downgraded history should explain why image payload was removed"
+        );
     }
 
     #[tokio::test]

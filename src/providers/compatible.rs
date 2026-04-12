@@ -4999,6 +4999,29 @@ mod tests {
         assert_eq!(native[2].tool_call_id.as_deref(), Some("call_check"));
     }
 
+    #[test]
+    fn downgraded_tool_result_without_image_serializes_without_image_parts() {
+        let input = vec![
+            ChatMessage::user("Take a screenshot".to_string()),
+            ChatMessage::assistant(
+                r#"{"content":"Taking screenshot now","tool_calls":[{"id":"call_ss","name":"image_info","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(
+                r#"{"tool_call_id":"call_ss","content":"Screenshot captured\n\n[Image omitted from history after first vision turn]"}"#,
+            ),
+        ];
+
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+        assert_eq!(native.len(), 3);
+        assert_eq!(native[2].role, "tool");
+        assert_eq!(native[2].tool_call_id.as_deref(), Some("call_ss"));
+        assert!(matches!(native[2].content, Some(MessageContent::Text(_))));
+
+        let wire_json = serde_json::to_string(&native).unwrap();
+        assert!(!wire_json.contains("image_url"));
+        assert!(!wire_json.contains("[IMAGE:"));
+    }
+
     // ── Property: no message with [IMAGE:] should leak raw markers to wire ──
 
     #[test]
