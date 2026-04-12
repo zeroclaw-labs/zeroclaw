@@ -345,6 +345,8 @@ fn default_max_attachment_bytes() -> usize {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.email"]
 pub struct EmailConfig {
+    #[serde(default)]
+    pub enabled: bool,
     pub imap_host: String,
     #[serde(default = "default_imap_port")]
     pub imap_port: u16,
@@ -381,6 +383,7 @@ impl ChannelConfig for EmailConfig {
 impl Default for EmailConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             imap_host: String::new(),
             imap_port: default_imap_port(),
             imap_folder: default_imap_folder(),
@@ -508,6 +511,8 @@ fn default_max_call_duration() -> u64 {
 #[prefix = "channels.voice-call"]
 pub struct VoiceCallConfig {
     #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
     pub provider: VoiceProvider,
     pub account_id: String,
     pub auth_token: String,
@@ -529,6 +534,7 @@ pub struct VoiceCallConfig {
 impl Default for VoiceCallConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             provider: VoiceProvider::default(),
             account_id: String::new(),
             auth_token: String::new(),

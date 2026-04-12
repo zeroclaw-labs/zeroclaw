@@ -284,6 +284,10 @@ fn parse_client_ip(value: &str) -> Option<IpAddr> {
     value.parse::<IpAddr>().ok()
 }
 
+fn dirs_data_local() -> Option<std::path::PathBuf> {
+    directories::BaseDirs::new().map(|d| d.data_local_dir().to_path_buf())
+}
+
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
     if let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
         for candidate in xff.split(',') {
@@ -756,7 +760,7 @@ pub async fn run_gateway(
         .map(std::path::PathBuf::from)
         .or_else(|| {
             // Auto-detect: check common locations relative to the binary and CWD
-            let candidates = [
+            let mut candidates = vec![
                 // Relative to CWD (development: running from repo root)
                 std::path::PathBuf::from("web/dist"),
                 // Relative to binary (installed alongside binary)
@@ -766,7 +770,13 @@ pub async fn run_gateway(
                     .unwrap_or_default(),
                 // Docker / packaged layout
                 std::path::PathBuf::from("/zeroclaw-data/web/dist"),
+                // AUR / system package
+                std::path::PathBuf::from("/usr/share/zeroclawlabs/web/dist"),
             ];
+            // XDG data home (prebuilt binary installer)
+            if let Some(data_dir) = dirs_data_local() {
+                candidates.push(data_dir.join("zeroclaw/web/dist"));
+            }
             candidates
                 .into_iter()
                 .find(|p| !p.as_os_str().is_empty() && p.join("index.html").is_file())

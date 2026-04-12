@@ -428,6 +428,17 @@ install_prebuilt_binary() {
   install_dir="$HOME/.cargo/bin"
   mkdir -p "$install_dir"
   install -m 0755 "$extracted_bin" "$install_dir/zeroclaw"
+
+  # Install web dashboard assets if included in the archive
+  local web_dist_src
+  web_dist_src="$(find "$temp_dir" -type d -name dist -path '*/web/dist' | head -n 1 || true)"
+  if [[ -n "$web_dist_src" && -d "$web_dist_src" ]]; then
+    local data_dir="$HOME/.local/share/zeroclaw/web/dist"
+    mkdir -p "$data_dir"
+    cp -r "$web_dist_src"/* "$data_dir/"
+    step_ok "Web dashboard installed to $data_dir"
+  fi
+
   rm -rf "$temp_dir"
 
   step_ok "Installed pre-built binary to $install_dir/zeroclaw"
