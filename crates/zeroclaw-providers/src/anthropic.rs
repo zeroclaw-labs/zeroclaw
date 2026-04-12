@@ -1144,6 +1144,14 @@ impl Provider for AnthropicProvider {
         let (effective_temperature, thinking_config, effective_max_tokens) =
             self.resolve_thinking(request.thinking, temperature);
 
+        if thinking_config.is_some() {
+            tracing::warn!(
+                "Streaming with native thinking enabled: thinking_delta events \
+                 are not yet handled. Thinking blocks will be captured in \
+                 non-streaming fallback responses only."
+            );
+        }
+
         tracing::debug!(max_tokens = effective_max_tokens, model = %model, "Anthropic stream_chat request");
         let native_request = NativeChatRequest {
             model: model.to_string(),

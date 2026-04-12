@@ -167,13 +167,17 @@ pub struct ResolvedThinking {
     pub effective_temperature: f64,
 }
 
+/// Validate thinking config at startup. Call once during agent
+/// initialization to warn about unrecognized budget_tokens keys.
+pub fn validate_thinking_config(config: &ThinkingConfig) {
+    config.warn_unknown_budget_keys();
+}
+
 pub fn resolve_thinking_from_message(
     message: &str,
     config: &ThinkingConfig,
     base_temperature: f64,
 ) -> ResolvedThinking {
-    config.warn_unknown_budget_keys();
-
     let (directive, effective_message) = match parse_thinking_directive(message) {
         Some((level, remaining)) => {
             tracing::info!(thinking_level = ?level, "Thinking directive parsed from message");

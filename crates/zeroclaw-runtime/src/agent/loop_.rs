@@ -2122,6 +2122,9 @@ pub async fn run(
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
+    // Validate thinking config once at startup (not per-message).
+    crate::agent::thinking::validate_thinking_config(&config.agent.thinking);
+
     // ── Peripherals (merge peripheral tools into registry) ─
     if !peripheral_overrides.is_empty() {
         tracing::info!(
