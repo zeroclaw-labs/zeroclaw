@@ -190,8 +190,8 @@ function AuthPageInner() {
         setEmailHint(result.email_hint || '');
         setVerificationExpiresIn(300);
         setStep('email-verify');
-      } else if (result.session_token) {
-        setToken(result.session_token);
+      } else if (result.token) {
+        setToken(result.token);
         router.push(redirectTo);
       }
     } catch (err: unknown) {
