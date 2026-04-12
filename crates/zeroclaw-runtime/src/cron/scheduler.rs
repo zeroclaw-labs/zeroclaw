@@ -1,7 +1,7 @@
 use crate::cron::{
     CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs,
-    due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
-    sync_declarative_jobs, update_job,
+    due_jobs, get_job, next_run_for_schedule, record_last_run, record_run, remove_job,
+    reschedule_after_run, sync_declarative_jobs, update_job,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -152,6 +152,7 @@ async fn execute_job_with_retry(
         let (success, output) = match job.job_type {
             JobType::Shell => run_job_command(config, security, job).await,
             JobType::Agent => Box::pin(run_agent_job(config, security, job)).await,
+            JobType::Announce => (true, job.command.clone()),
         };
         last_output = output;
 
@@ -346,7 +347,8 @@ async fn persist_job_result(
 ) -> bool {
     let duration_ms = (finished_at - started_at).num_milliseconds();
 
-    if let Err(e) = deliver_if_configured(config, job, output).await {
+    let delivery_body = format_output_for_delivery(job, success, output);
+    if let Err(e) = deliver_if_configured(config, job, &delivery_body).await {
         if job.delivery.best_effort {
             tracing::warn!("Cron delivery failed (best_effort): {e}");
         } else {
@@ -399,7 +401,56 @@ async fn persist_job_result(
         tracing::warn!("Failed to persist scheduler run result: {e}");
     }
 
+    // Apply --count / --until bounds. A successful run decrements
+    // remaining_runs; if the updated next_run is past expires_until the job
+    // is removed. Failures do not decrement so a flaky run does not burn a
+    // count budget.
+    if success {
+        apply_bounds_after_run(config, &job.id);
+    }
+
     success
+}
+
+fn apply_bounds_after_run(config: &Config, job_id: &str) {
+    let current = match get_job(config, job_id) {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    let mut should_remove = false;
+    let mut new_remaining: Option<i64> = None;
+
+    if let Some(n) = current.remaining_runs {
+        let decremented = n - 1;
+        if decremented <= 0 {
+            should_remove = true;
+        } else {
+            new_remaining = Some(decremented);
+        }
+    }
+
+    if let Some(expiry) = current.expires_until
+        && current.next_run >= expiry
+    {
+        should_remove = true;
+    }
+
+    if should_remove {
+        if let Err(e) = remove_job(config, job_id) {
+            tracing::warn!("Failed to auto-remove bounded cron job {job_id}: {e}");
+        }
+    } else if let Some(n) = new_remaining
+        && let Err(e) = update_job(
+            config,
+            job_id,
+            CronJobPatch {
+                remaining_runs: Some(n),
+                ..CronJobPatch::default()
+            },
+        )
+    {
+        tracing::warn!("Failed to decrement remaining_runs for {job_id}: {e}");
+    }
 }
 
 fn is_one_shot_auto_delete(job: &CronJob) -> bool {
@@ -430,6 +481,42 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
             job.id
         );
     }
+}
+
+/// Strip the shell envelope (`status=... stdout: ... stderr: ...`) from
+/// shell-job output for cleaner channel delivery. On success, sends just
+/// stdout. On failure or when stderr is non-empty, preserves the full
+/// envelope so the recipient sees what went wrong. Agent jobs pass through
+/// unchanged.
+fn format_output_for_delivery(job: &CronJob, success: bool, output: &str) -> String {
+    if !matches!(job.job_type, JobType::Shell) {
+        // Agent and Announce outputs are already clean text.
+        return output.to_string();
+    }
+    let Some((stdout, stderr)) = parse_shell_envelope(output) else {
+        return output.to_string();
+    };
+    if success && stderr.is_empty() {
+        if stdout.is_empty() {
+            "(no output)".to_string()
+        } else {
+            stdout
+        }
+    } else {
+        output.to_string()
+    }
+}
+
+fn parse_shell_envelope(output: &str) -> Option<(String, String)> {
+    let rest = output.strip_prefix("status=")?;
+    let nl = rest.find('\n')?;
+    let after_status = &rest[nl + 1..];
+    let after_stdout = after_status.strip_prefix("stdout:\n")?;
+    let stderr_marker = "\nstderr:\n";
+    let stderr_idx = after_stdout.find(stderr_marker)?;
+    let stdout = after_stdout[..stderr_idx].to_string();
+    let stderr = after_stdout[stderr_idx + stderr_marker.len()..].to_string();
+    Some((stdout, stderr))
 }
 
 async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
@@ -655,6 +742,8 @@ mod tests {
             last_run: None,
             last_status: None,
             last_output: None,
+            remaining_runs: None,
+            expires_until: None,
         }
     }
 
@@ -668,6 +757,58 @@ mod tests {
             schedule,
             ..test_job("echo test")
         }
+    }
+
+    #[test]
+    fn format_output_for_delivery_strips_envelope_on_success() {
+        let job = test_job("echo hi");
+        let envelope = "status=exit status: 0\nstdout:\nhi\nstderr:\n";
+        assert_eq!(format_output_for_delivery(&job, true, envelope), "hi");
+    }
+
+    #[test]
+    fn format_output_for_delivery_preserves_envelope_on_failure() {
+        let job = test_job("false");
+        let envelope = "status=exit status: 1\nstdout:\n\nstderr:\noh no";
+        assert_eq!(format_output_for_delivery(&job, false, envelope), envelope);
+    }
+
+    #[test]
+    fn format_output_for_delivery_preserves_envelope_when_stderr_nonempty() {
+        let job = test_job("warn-and-exit-0");
+        let envelope = "status=exit status: 0\nstdout:\nhi\nstderr:\nwarning";
+        assert_eq!(format_output_for_delivery(&job, true, envelope), envelope);
+    }
+
+    #[test]
+    fn format_output_for_delivery_handles_empty_stdout() {
+        let job = test_job("true");
+        let envelope = "status=exit status: 0\nstdout:\n\nstderr:\n";
+        assert_eq!(
+            format_output_for_delivery(&job, true, envelope),
+            "(no output)"
+        );
+    }
+
+    #[test]
+    fn format_output_for_delivery_passes_through_agent_output() {
+        let job = CronJob {
+            job_type: JobType::Agent,
+            ..test_job("")
+        };
+        let agent_output = "agent response text";
+        assert_eq!(
+            format_output_for_delivery(&job, true, agent_output),
+            agent_output
+        );
+    }
+
+    #[test]
+    fn format_output_for_delivery_passes_through_unrecognized_format() {
+        let job = test_job("echo hi");
+        // Malformed envelope (e.g. security block message) is passed through.
+        let msg = "blocked by security policy: ...";
+        assert_eq!(format_output_for_delivery(&job, false, msg), msg);
     }
 
     #[test]

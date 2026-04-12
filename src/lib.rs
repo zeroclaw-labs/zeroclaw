@@ -351,6 +351,21 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// Announce job output to this channel (e.g. telegram, discord, slack)
+        #[arg(long = "channel")]
+        delivery_channel: Option<String>,
+        /// Target chat/recipient id for the channel (e.g. Telegram chat id)
+        #[arg(long = "to")]
+        delivery_to: Option<String>,
+        /// Fail the job if delivery fails (default: delivery errors are logged but not fatal)
+        #[arg(long = "no-best-effort")]
+        no_best_effort: bool,
+        /// Auto-remove the job after N successful runs
+        #[arg(long)]
+        count: Option<i64>,
+        /// Auto-remove the job when its next run would be at or after this RFC3339 timestamp
+        #[arg(long)]
+        until: Option<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -372,6 +387,15 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// Announce job output to this channel (e.g. telegram, discord, slack)
+        #[arg(long = "channel")]
+        delivery_channel: Option<String>,
+        /// Target chat/recipient id for the channel
+        #[arg(long = "to")]
+        delivery_to: Option<String>,
+        /// Fail the job if delivery fails
+        #[arg(long = "no-best-effort")]
+        no_best_effort: bool,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -393,6 +417,21 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// Announce job output to this channel (e.g. telegram, discord, slack)
+        #[arg(long = "channel")]
+        delivery_channel: Option<String>,
+        /// Target chat/recipient id for the channel
+        #[arg(long = "to")]
+        delivery_to: Option<String>,
+        /// Fail the job if delivery fails
+        #[arg(long = "no-best-effort")]
+        no_best_effort: bool,
+        /// Auto-remove the job after N successful runs
+        #[arg(long)]
+        count: Option<i64>,
+        /// Auto-remove the job when its next run would be at or after this RFC3339 timestamp
+        #[arg(long)]
+        until: Option<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -416,8 +455,67 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// Announce job output to this channel (e.g. telegram, discord, slack)
+        #[arg(long = "channel")]
+        delivery_channel: Option<String>,
+        /// Target chat/recipient id for the channel
+        #[arg(long = "to")]
+        delivery_to: Option<String>,
+        /// Fail the job if delivery fails
+        #[arg(long = "no-best-effort")]
+        no_best_effort: bool,
         /// Command (shell) or prompt (agent) to run
         command: String,
+    },
+    /// Schedule a plain-text announcement to a channel, no shell involved
+    #[command(long_about = "\
+Schedule a message to be delivered to a channel on a recurring or one-shot basis. \
+Unlike `cron add`, the message is sent verbatim — no shell quoting, no `echo` escape surprises, \
+no command allowlist check.
+
+Exactly one schedule flag is required: --cron, --every, --once, or --at.
+
+Delivery target is required via --channel and --to.
+
+Optional bounds: --count N stops after N successful deliveries; --until TS stops at that time.
+
+Examples:
+  zeroclaw cron announce 'Standup in 10 min' --once 50m --channel telegram --to 12345
+  zeroclaw cron announce 'Hourly heartbeat' --cron '0 * * * *' --channel telegram --to 12345 --count 24
+  zeroclaw cron announce 'Daily 9am digest' --every 86400000 --channel discord --to CHAN --until 2026-05-01T00:00:00Z")]
+    Announce {
+        /// Message body to deliver
+        message: String,
+        /// Cron expression (recurring)
+        #[arg(long, group = "schedule")]
+        cron: Option<String>,
+        /// Optional IANA timezone for --cron
+        #[arg(long)]
+        tz: Option<String>,
+        /// Interval in milliseconds (recurring)
+        #[arg(long, group = "schedule")]
+        every: Option<u64>,
+        /// One-shot delay (e.g. 30m, 2h, 1d)
+        #[arg(long, group = "schedule")]
+        once: Option<String>,
+        /// One-shot absolute RFC3339 timestamp
+        #[arg(long, group = "schedule")]
+        at: Option<String>,
+        /// Delivery channel (telegram, discord, slack, mattermost, matrix, signal, qq)
+        #[arg(long = "channel")]
+        delivery_channel: String,
+        /// Target chat/recipient id for the channel
+        #[arg(long = "to")]
+        delivery_to: String,
+        /// Fail the job if delivery fails
+        #[arg(long = "no-best-effort")]
+        no_best_effort: bool,
+        /// Auto-remove the job after N successful deliveries
+        #[arg(long)]
+        count: Option<i64>,
+        /// Auto-remove when next run would be at or after this RFC3339 timestamp
+        #[arg(long)]
+        until: Option<String>,
     },
     /// Remove a scheduled task
     Remove {
@@ -452,6 +550,15 @@ Examples:
         /// Replace the agent job allowlist with the specified tool names (repeatable)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// Announce job output to this channel (e.g. telegram, discord, slack)
+        #[arg(long = "channel")]
+        delivery_channel: Option<String>,
+        /// Target chat/recipient id for the channel
+        #[arg(long = "to")]
+        delivery_to: Option<String>,
+        /// Fail the job if delivery fails
+        #[arg(long = "no-best-effort")]
+        no_best_effort: bool,
     },
     /// Pause a scheduled task
     Pause {

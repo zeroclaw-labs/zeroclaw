@@ -33,6 +33,7 @@ pub enum JobType {
     #[default]
     Shell,
     Agent,
+    Announce,
 }
 
 impl From<JobType> for &'static str {
@@ -40,6 +41,7 @@ impl From<JobType> for &'static str {
         match value {
             JobType::Shell => "shell",
             JobType::Agent => "agent",
+            JobType::Announce => "announce",
         }
     }
 }
@@ -51,8 +53,9 @@ impl TryFrom<&str> for JobType {
         match value.to_lowercase().as_str() {
             "shell" => Ok(JobType::Shell),
             "agent" => Ok(JobType::Agent),
+            "announce" => Ok(JobType::Announce),
             _ => Err(format!(
-                "Invalid job type '{}'. Expected one of: 'shell', 'agent'",
+                "Invalid job type '{}'. Expected one of: 'shell', 'agent', 'announce'",
                 value
             )),
         }
@@ -158,6 +161,14 @@ pub struct CronJob {
     pub last_run: Option<DateTime<Utc>>,
     pub last_status: Option<String>,
     pub last_output: Option<String>,
+    /// If set, decrements after each successful run and the job is removed
+    /// when it reaches zero. `None` means the job runs indefinitely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_runs: Option<i64>,
+    /// If set, the job is removed when its next run would be at or after
+    /// this timestamp. `None` means no expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_until: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +194,8 @@ pub struct CronJobPatch {
     pub session_target: Option<SessionTarget>,
     pub delete_after_run: Option<bool>,
     pub allowed_tools: Option<Vec<String>>,
+    pub remaining_runs: Option<i64>,
+    pub expires_until: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]
