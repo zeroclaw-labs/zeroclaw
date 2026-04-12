@@ -12401,7 +12401,9 @@ default_temperature = 0.7
         config.save().await.unwrap();
 
         // Verify the saved file has the token encrypted
-        let contents = tokio::fs::read_to_string(dir.join("config.toml")).await.unwrap();
+        let contents = tokio::fs::read_to_string(dir.join("config.toml"))
+            .await
+            .unwrap();
         let on_disk: Config = toml::from_str(&contents).unwrap();
         let stored_token = &on_disk.channels_config.telegram.as_ref().unwrap().bot_token;
         assert!(
@@ -12418,7 +12420,12 @@ default_temperature = 0.7
         let mut reloaded: Config = toml::from_str(&contents).unwrap();
         reloaded.decrypt_secrets(&store).unwrap();
         assert_eq!(
-            reloaded.channels_config.telegram.as_ref().unwrap().bot_token,
+            reloaded
+                .channels_config
+                .telegram
+                .as_ref()
+                .unwrap()
+                .bot_token,
             "123456789:ABCdefGHIjklMNOpqrSTUvwxYZ"
         );
 

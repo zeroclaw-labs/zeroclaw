@@ -865,7 +865,6 @@ async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
     })
 }
 
-
 async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRuntimeDefaults> {
     let contents = tokio::fs::read_to_string(path)
         .await
