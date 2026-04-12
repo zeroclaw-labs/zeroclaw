@@ -775,7 +775,9 @@ pub async fn run_gateway(
     if let Some(ref dir) = web_dist_dir {
         tracing::info!("Web dashboard: serving from {}", dir.display());
     } else {
-        tracing::info!("Web dashboard: not available (set gateway.web_dist_dir or ZEROCLAW_WEB_DIST_DIR)");
+        tracing::info!(
+            "Web dashboard: not available (set gateway.web_dist_dir or ZEROCLAW_WEB_DIST_DIR)"
+        );
     }
 
     let pfx = path_prefix.unwrap_or("");
