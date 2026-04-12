@@ -11450,6 +11450,46 @@ This is an example JSON object for profile settings."#;
         }
     }
 
+    #[cfg(feature = "channel-voice-call")]
+    #[test]
+    fn build_channel_by_id_unconfigured_voice_call_returns_error() {
+        let config = Config::default();
+        match build_channel_by_id(&config, "voice-call") {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("not configured"),
+                    "expected 'not configured' in error, got: {err_msg}"
+                );
+            }
+            Ok(_) => panic!("should fail when voice-call is not configured"),
+        }
+    }
+
+    #[cfg(feature = "channel-voice-call")]
+    #[test]
+    fn build_channel_by_id_configured_voice_call_succeeds() {
+        let mut config = Config::default();
+        config.channels_config.voice_call =
+            Some(zeroclaw_config::scattered_types::VoiceCallConfig {
+                enabled: true,
+                provider: zeroclaw_config::scattered_types::VoiceProvider::Twilio,
+                account_id: "AC_TEST".to_string(),
+                auth_token: "test_token".to_string(),
+                from_number: "+15551234567".to_string(),
+                webhook_port: 8090,
+                require_outbound_approval: true,
+                transcription_logging: true,
+                tts_voice: None,
+                max_call_duration_secs: 3600,
+                webhook_base_url: None,
+            });
+        match build_channel_by_id(&config, "voice-call") {
+            Ok(channel) => assert_eq!(channel.name(), "voice_call"),
+            Err(e) => panic!("should succeed when voice-call is configured: {e}"),
+        }
+    }
+
     // ── is_stop_command tests ─────────────────────────────────────────────
 
     #[test]
