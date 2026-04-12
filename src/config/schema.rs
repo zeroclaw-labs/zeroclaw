@@ -9015,11 +9015,19 @@ impl Config {
                 // serialization round-trip.  This is computed once and cached.
                 static KNOWN_KEYS: OnceLock<Vec<String>> = OnceLock::new();
                 let known = KNOWN_KEYS.get_or_init(|| {
-                    toml::to_string(&Config::default())
+                    let mut keys: Vec<String> = toml::to_string(&Config::default())
                         .ok()
                         .and_then(|s| s.parse::<toml::Table>().ok())
                         .map(|t| t.keys().cloned().collect())
-                        .unwrap_or_default()
+                        .unwrap_or_default();
+                    // Fields that are None in Config::default() and therefore omitted
+                    // by the TOML serializer, but are still valid top-level keys.
+                    for extra in &["api_key", "api_url", "api_path", "provider_max_tokens"] {
+                        if !keys.contains(&extra.to_string()) {
+                            keys.push(extra.to_string());
+                        }
+                    }
+                    keys
                 });
                 for key in raw.keys() {
                     if !known.contains(key) {
