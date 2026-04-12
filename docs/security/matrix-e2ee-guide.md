@@ -103,6 +103,10 @@ curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
 
 - Check that returned `user_id` matches the bot account.
 - If `device_id` is missing, set `channels_config.matrix.device_id` manually.
+- To update the access token without re-running onboard:
+  ```bash
+  zeroclaw props set channels.matrix.access-token
+  ```
 
 ### D. E2EE-specific checks
 
@@ -241,16 +245,24 @@ When configuring the Matrix channel, the wizard prompts:
 E2EE recovery key (or Enter to skip): EsTj 3yST y93F SLpB jJsz ...
 ```
 
-Paste the recovery key. It will be stored in `config.toml` as `channels_config.matrix.recovery_key`.
+Paste the recovery key (input is masked). It will be encrypted and stored in `config.toml` as `channels_config.matrix.recovery_key`.
 
-Option B — edit `config.toml` directly:
+Option B — via the secret CLI (recommended for existing installs):
+
+```bash
+zeroclaw props set channels.matrix.recovery-key
+```
+
+Input is masked. The value is encrypted at rest immediately.
+
+Option C — edit `config.toml` directly:
 
 ```toml
 [channels_config.matrix]
 recovery_key = "EsTj 3yST y93F SLpB jJsz ..."
 ```
 
-If `secrets.encrypt = true` (the default), the value will be encrypted on next config save.
+If `secrets.encrypt = true` (the default), the value will be encrypted on next config save. Note: until a save is triggered, the value remains in plaintext. Using Option A or B is preferred.
 
 #### Step 3: Restart ZeroClaw
 
@@ -292,6 +304,7 @@ RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemo
 - Keep Matrix tokens out of logs and screenshots.
 - Start with permissive `allowed_users`, then tighten to explicit user IDs.
 - Prefer canonical room IDs in production to avoid alias drift.
+- **Threading behavior:** ZeroClaw always replies in a thread rooted at the user's original message. Each thread maintains its own isolated conversation context. The main room timeline is unaffected — threads do not share context with each other or with the room. In encrypted rooms, threading works identically — the SDK decrypts events transparently before thread context is evaluated.
 
 ---
 

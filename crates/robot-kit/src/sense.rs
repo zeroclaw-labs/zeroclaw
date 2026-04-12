@@ -104,12 +104,11 @@ impl SenseTool {
                 // Parse output (format: angle,distance per line)
                 let mut ranges = vec![999.0; 360];
                 for line in String::from_utf8_lossy(&out.stdout).lines() {
-                    if let Some((angle, dist)) = line.split_once(',') {
-                        if let (Ok(a), Ok(d)) = (angle.parse::<usize>(), dist.parse::<f64>()) {
-                            if a < 360 {
-                                ranges[a] = d;
-                            }
-                        }
+                    if let Some((angle, dist)) = line.split_once(',')
+                        && let (Ok(a), Ok(d)) = (angle.parse::<usize>(), dist.parse::<f64>())
+                        && a < 360
+                    {
+                        ranges[a] = d;
                     }
                 }
 

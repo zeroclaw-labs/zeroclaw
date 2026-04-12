@@ -1,0 +1,120 @@
+[package]
+name = "zeroclaw-channels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Channel implementations for messaging platform integrations."
+publish = false
+
+[dependencies]
+zeroclaw-api.workspace = true
+zeroclaw-infra.workspace = true
+zeroclaw-config = { workspace = true, default-features = true }
+zeroclaw-memory.workspace = true
+zeroclaw-providers.workspace = true
+zeroclaw-runtime.workspace = true
+zeroclaw-tools.workspace = true
+anyhow = "1.0"
+lru = "0.16"
+rumqttc = "0.24"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"] }
+async-imap = { version = "0.11", features = ["runtime-tokio"], default-features = false, optional = true }
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+directories = "6.0"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+hmac = "0.12"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"], optional = true }
+mail-parser = { version = "0.11.2", optional = true }
+matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown", "sqlite"] }
+nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "nip59"], optional = true }
+parking_lot = "0.12"
+portable-atomic = "1"
+prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
+regex = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "multipart", "stream"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pki-types = "1.14.0"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha2 = "0.10"
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "fs", "signal"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7", default-features = false }
+toml = "1.0"
+tracing = { version = "0.1", default-features = false }
+urlencoding = "2.1"
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+hex = "0.4"
+nanohtml2text = "0.2"
+rand = "0.10"
+webpki-roots = "1.0.6"
+tokio-socks = "0.5"
+
+# WhatsApp Web (optional)
+wa-rs = { version = "0.2", optional = true, default-features = false }
+wa-rs-core = { version = "0.2", optional = true, default-features = false }
+wa-rs-binary = { version = "0.2", optional = true, default-features = false }
+wa-rs-proto = { version = "0.2", optional = true, default-features = false }
+serde-big-array = { version = "0.5", optional = true }
+
+cpal = { version = "0.15", optional = true }
+wa-rs-ureq-http = { version = "0.2", optional = true }
+wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = false }
+qrcode = { version = "0.14", optional = true }
+shellexpand = "3.1"
+
+[features]
+default = [
+    "channel-discord", "channel-slack", "channel-signal", "channel-mattermost",
+    "channel-irc", "channel-imessage", "channel-dingtalk", "channel-qq",
+    "channel-bluesky", "channel-twitter", "channel-reddit", "channel-notion",
+    "channel-linq", "channel-wati", "channel-nextcloud", "channel-mochat",
+    "channel-wecom", "channel-clawdtalk", "channel-webhook",
+    "channel-whatsapp-cloud", "channel-voice-call",
+]
+# Channels with optional deps
+channel-email = ["dep:lettre", "dep:mail-parser", "dep:async-imap"]
+channel-telegram = ["dep:image"]
+channel-lark = ["dep:prost"]
+channel-line = []
+channel-nostr = ["dep:nostr-sdk", "zeroclaw-config/channel-nostr"]
+whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:serde-big-array", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:qrcode"]
+# Channels with no optional deps (cfg gate only)
+channel-discord = []
+channel-slack = []
+channel-signal = []
+channel-mattermost = []
+channel-irc = []
+channel-imessage = []
+channel-dingtalk = []
+channel-qq = []
+channel-bluesky = []
+channel-twitter = []
+channel-reddit = []
+channel-notion = []
+channel-linq = []
+channel-wati = []
+channel-nextcloud = []
+channel-mochat = []
+channel-wecom = []
+channel-clawdtalk = []
+channel-webhook = []
+channel-whatsapp-cloud = []
+channel-voice-call = []
+channel-acp-server = []
+channel-matrix = ["dep:matrix-sdk"]
+voice-wake = ["dep:cpal", "zeroclaw-config/voice-wake"]
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+tempfile = "3.26"
+toml = "1.0"
+wiremock = "0.6"
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
