@@ -24,15 +24,14 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
-tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"] }
+tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout", "fs"] }
 http-body-util = "0.1"
 
 # TLS
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
 
-# Embedded frontend assets
-rust-embed = "8"
+# Frontend asset MIME type detection (dashboard served from filesystem)
 mime_guess = "2"
 
 # Async runtime
