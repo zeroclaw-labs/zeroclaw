@@ -14,7 +14,6 @@ pub mod api_plugins;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 pub mod auth_rate_limit;
-pub mod canvas;
 pub mod nodes;
 pub mod session_queue;
 pub mod sse;
@@ -31,7 +30,6 @@ use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
 use crate::tools;
-use crate::tools::canvas::CanvasStore;
 use crate::tools::traits::ToolSpec;
 use anyhow::{Context, Result};
 use axum::{
@@ -335,8 +333,6 @@ pub struct AppState {
     pub device_registry: Option<Arc<api_pairing::DeviceRegistry>>,
     /// Pending pairing request store
     pub pending_pairings: Option<Arc<api_pairing::PairingStore>>,
-    /// Shared canvas store for Live Canvas (A2UI) system
-    pub canvas_store: CanvasStore,
     /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
     #[cfg(feature = "webauthn")]
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
@@ -406,17 +402,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.workspace_dir,
     ));
 
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-
-    let canvas_store = tools::CanvasStore::new();
-
     let (
         mut tools_registry_raw,
         delegate_handle_gw,
@@ -429,16 +414,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &security,
         runtime,
         Arc::clone(&mem),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
         &config.workspace_dir,
         &config.agents,
         config.api_key.as_deref(),
         &config,
-        Some(canvas_store.clone()),
     );
 
     // ── Wire MCP tools into the gateway tool registry (non-fatal) ───
@@ -679,7 +658,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         device_registry,
         pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
-        canvas_store,
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(crate::security::SecretStore::new(
@@ -771,18 +749,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route(
             "/api/devices/{id}/token/rotate",
             post(api_pairing::rotate_token),
-        )
-        // ── Live Canvas (A2UI) routes ──
-        .route("/api/canvas", get(canvas::handle_canvas_list))
-        .route(
-            "/api/canvas/{id}",
-            get(canvas::handle_canvas_get)
-                .post(canvas::handle_canvas_post)
-                .delete(canvas::handle_canvas_clear),
-        )
-        .route(
-            "/api/canvas/{id}/history",
-            get(canvas::handle_canvas_history),
         );
 
     // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
@@ -825,8 +791,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/events", get(sse::handle_sse_events))
         // ── WebSocket agent chat ──
         .route("/ws/chat", get(ws::handle_ws_chat))
-        // ── WebSocket canvas updates ──
-        .route("/ws/canvas/{id}", get(canvas::handle_ws_canvas))
         // ── WebSocket node discovery ──
         .route("/ws/nodes", get(nodes::handle_ws_nodes))
         // ── Static assets (web dashboard) ──
@@ -1568,7 +1532,6 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
-            canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -1628,7 +1591,6 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
-            canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -1996,7 +1958,6 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
-            canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2066,7 +2027,6 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
-            canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2148,7 +2108,6 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
-            canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2202,7 +2161,6 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
-            canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2261,7 +2219,6 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
-            canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };

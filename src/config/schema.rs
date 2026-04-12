@@ -19,10 +19,6 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "provider.openrouter",
     "channel.slack",
     "channel.telegram",
-    "tool.browser",
-    "tool.composio",
-    "tool.http_request",
-    "tool.pushover",
     "tool.web_search",
     "memory.embeddings",
     "tunnel.custom",
@@ -249,11 +245,6 @@ pub struct Config {
     ///   domains take precedence over allowed domains.
     /// - `task_timeout_secs` (`u64`, default `120`) — per-task timeout in seconds.
     ///
-    /// Compatibility: additive and disabled by default; existing configs remain valid when omitted.
-    /// Rollback/migration: remove `[browser_delegate]` or keep `enabled = false` to disable.
-    #[serde(default)]
-    pub browser_delegate: crate::tools::browser_delegate::BrowserDelegateConfig,
-
     /// HTTP request tool configuration (`[http_request]`).
     #[serde(default)]
     pub http_request: HttpRequestConfig,
@@ -3711,7 +3702,7 @@ impl ProxyConfig {
         for selector in self.normalized_services() {
             if !is_supported_proxy_service_selector(&selector) {
                 anyhow::bail!(
-                    "Unsupported proxy service selector '{selector}'. Use tool `proxy_config` action `list_services` for valid values"
+                    "Unsupported proxy service selector '{selector}'. See SUPPORTED_PROXY_SERVICE_KEYS for valid values"
                 );
             }
         }
@@ -7039,7 +7030,6 @@ impl Default for Config {
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
-            browser_delegate: crate::tools::browser_delegate::BrowserDelegateConfig::default(),
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             media_pipeline: MediaPipelineConfig::default(),
@@ -9736,7 +9726,6 @@ auto_save = true
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
-            browser_delegate: crate::tools::browser_delegate::BrowserDelegateConfig::default(),
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             media_pipeline: MediaPipelineConfig::default(),
@@ -10264,7 +10253,6 @@ default_temperature = 0.7
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
-            browser_delegate: crate::tools::browser_delegate::BrowserDelegateConfig::default(),
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             media_pipeline: MediaPipelineConfig::default(),
@@ -12068,7 +12056,7 @@ default_model = "persisted-profile"
         unsafe {
             std::env::set_var(
                 "ZEROCLAW_PROXY_SERVICES",
-                "provider.openai, tool.http_request",
+                "provider.openai, tool.web_search",
             );
         }
         // SAFETY: test-only, single-threaded test runner.
@@ -12083,7 +12071,7 @@ default_model = "persisted-profile"
             Some("http://127.0.0.1:7890")
         );
         assert!(config.proxy.should_apply_to_service("provider.openai"));
-        assert!(config.proxy.should_apply_to_service("tool.http_request"));
+        assert!(config.proxy.should_apply_to_service("tool.web_search"));
         assert!(!config.proxy.should_apply_to_service("provider.anthropic"));
 
         clear_proxy_env_test_vars();

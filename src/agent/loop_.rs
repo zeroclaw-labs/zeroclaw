@@ -1057,8 +1057,8 @@ fn map_tool_name_alias(tool_name: &str) -> &str {
         "memoryrecall" | "memory_recall" | "recall" | "memrecall" => "memory_recall",
         "memorystore" | "memory_store" | "store" | "memstore" => "memory_store",
         "memoryforget" | "memory_forget" | "forget" | "memforget" => "memory_forget",
-        // HTTP variations
-        "http_request" | "http" | "fetch" | "curl" | "wget" => "http_request",
+        // HTTP variations (remapped to shell since http_request tool was removed)
+        "http_request" | "http" | "fetch" | "curl" | "wget" => "shell",
         // Skill invocation variations
         "useskill" | "use_skill" | "skill" | "invoke_skill" => "use_skill",
         _ => tool_name,
@@ -1117,9 +1117,6 @@ fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Opt
                                 serde_json::json!({ "command": value })
                             }
                         }
-                        "http_request" => {
-                            serde_json::json!({"url": value, "method": "GET"})
-                        }
                         _ => serde_json::json!({ param_name: value }),
                     };
 
@@ -1156,7 +1153,7 @@ fn default_param_for_tool(tool: &str) -> &'static str {
         | "memoryforget" | "forget" | "memforget" | "web_search_tool" | "web_search"
         | "websearch" | "search" => "query",
         "memory_store" | "memorystore" | "store" | "memstore" => "content",
-        // HTTP and browser tools default to "url"
+        // HTTP and browser aliases (remapped to shell) default to "url"
         "http_request" | "http" | "fetch" | "curl" | "wget" | "browser_open" | "browser" => "url",
         _ => "input",
     }
@@ -1304,7 +1301,6 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
                     serde_json::json!({ "command": value_part })
                 }
             }
-            "http_request" => serde_json::json!({"url": value_part, "method": "GET"}),
             _ => serde_json::json!({ param: value_part }),
         };
         return Some(ParsedToolCall {
@@ -3448,14 +3444,6 @@ pub async fn run(
     tracing::info!(backend = mem.name(), "Memory initialized");
 
     // ── Tools (including memory tools) ────────────────────────────
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
     let (
         mut tools_registry,
         delegate_handle,
@@ -3468,16 +3456,10 @@ pub async fn run(
         &security,
         runtime,
         mem.clone(),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
         &config.workspace_dir,
         &config.agents,
         config.api_key.as_deref(),
         &config,
-        None,
     );
 
     // ── Capability-based tool access control ─────────────────────
@@ -4249,14 +4231,6 @@ pub async fn process_message(
         config.api_key.as_deref(),
     )?);
 
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
     let (
         mut tools_registry,
         delegate_handle_pm,
@@ -4269,16 +4243,10 @@ pub async fn process_message(
         &security,
         runtime,
         mem.clone(),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
         &config.workspace_dir,
         &config.agents,
         config.api_key.as_deref(),
         &config,
-        None,
     );
     // ── Wire MCP tools (non-fatal) — process_message path ────────
     // NOTE: Same ordering contract as the CLI path above — MCP tools must be
@@ -8171,9 +8139,8 @@ Final answer."#;
         let response = "http_request/url>https://api.example.com/data";
         let calls = parse_glm_style_tool_calls(response);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "http_request");
-        assert_eq!(calls[0].1["url"], "https://api.example.com/data");
-        assert_eq!(calls[0].1["method"], "GET");
+        // http_request is now remapped to shell
+        assert_eq!(calls[0].0, "shell");
     }
 
     #[test]
@@ -8608,7 +8575,7 @@ Let me check the result."#;
         assert_eq!(map_tool_name_alias("filelist"), "file_list");
         assert_eq!(map_tool_name_alias("memorystore"), "memory_store");
         assert_eq!(map_tool_name_alias("memoryforget"), "memory_forget");
-        assert_eq!(map_tool_name_alias("http"), "http_request");
+        assert_eq!(map_tool_name_alias("http"), "shell");
         assert_eq!(
             map_tool_name_alias("totally_unknown_tool"),
             "totally_unknown_tool"

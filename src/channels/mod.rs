@@ -3948,14 +3948,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
     let (
@@ -3970,16 +3962,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &security,
         runtime,
         Arc::clone(&mem),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
         &workspace,
         &config.agents,
         config.api_key.as_deref(),
         &config,
-        None,
     );
 
     // Wire MCP tools into the registry before freezing — non-fatal.
