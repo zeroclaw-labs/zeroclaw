@@ -10352,6 +10352,41 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    #[cfg(feature = "channel-email")]
+    #[test]
+    fn collect_configured_channels_skips_disabled_email() {
+        let mut config = Config::default();
+        config.channels_config.email = Some(zeroclaw_config::scattered_types::EmailConfig {
+            enabled: false,
+            ..Default::default()
+        });
+
+        let channels = collect_configured_channels(&config, "test");
+        assert!(
+            !channels.iter().any(|entry| entry.display_name == "Email"),
+            "disabled email should not be collected"
+        );
+    }
+
+    #[cfg(feature = "channel-voice-call")]
+    #[test]
+    fn collect_configured_channels_skips_disabled_voice_call() {
+        let mut config = Config::default();
+        config.channels_config.voice_call =
+            Some(zeroclaw_config::scattered_types::VoiceCallConfig {
+                enabled: false,
+                ..Default::default()
+            });
+
+        let channels = collect_configured_channels(&config, "test");
+        assert!(
+            !channels
+                .iter()
+                .any(|entry| entry.display_name == "Voice Call"),
+            "disabled voice-call should not be collected"
+        );
+    }
+
     struct AlwaysFailChannel {
         name: &'static str,
         calls: Arc<AtomicUsize>,
