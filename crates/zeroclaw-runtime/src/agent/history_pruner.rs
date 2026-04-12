@@ -132,6 +132,13 @@ pub(crate) fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> 
             i += 1;
         }
     }
+    if removed > 0 {
+        tracing::warn!(
+            count = removed,
+            "Removed {removed} orphaned tool message(s) from history — this indicates a prior \
+             tool_use/tool_result pairing inconsistency that was auto-healed"
+        );
+    }
     removed
 }
 

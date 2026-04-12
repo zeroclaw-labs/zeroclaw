@@ -57,4 +57,4 @@ lcov.info
 playground/
 
 # Temporary rustc output
-rust_out
+rust_outapps/tauri/gen/schemas/
