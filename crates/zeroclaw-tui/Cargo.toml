@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 zeroclaw-config = { workspace = true, default-features = true }
+zeroclaw-runtime = { workspace = true }
 anyhow = "1.0"
 crossterm = { version = "0.29", features = ["event-stream"] }
 ratatui = { version = "0.30", default-features = true }

@@ -20,6 +20,7 @@ use zeroclaw_config::schema::{
     MatrixConfig, MattermostConfig, NextcloudTalkConfig, SignalConfig, SlackConfig, StreamMode,
     TelegramConfig, WhatsAppChatPolicy, WhatsAppConfig, WhatsAppWebMode,
 };
+use zeroclaw_runtime::onboard::wizard::default_model_for_provider;
 
 use super::theme;
 use super::widgets::{
@@ -51,6 +52,7 @@ enum Screen {
     ProviderNotes,
     ModelConfigured,
     ModelSelect,
+    ModelCustomInput,
     ChannelStatus,
     HowChannelsWork,
     ChannelSelect,
@@ -231,6 +233,9 @@ const MODELS: &[&str] = &[
     "Custom model ID...",
 ];
 
+const AUTO_MODEL_OPTION: &str = "Auto (recommended)";
+const CUSTOM_MODEL_OPTION: &str = "Custom model ID...";
+
 const SEARCH_PROVIDERS: &[(&str, &str)] = &[
     ("Brave Search", "API key required"),
     ("SearxNG", "Self-hosted, key-free"),
@@ -296,6 +301,7 @@ struct App {
 
     // Model
     model_idx: usize,
+    custom_model_input: String,
 
     // Channel
     channel_idx: usize,
@@ -343,6 +349,7 @@ impl App {
             provider_scroll: 0,
             api_key_input: String::new(),
             model_idx: 0,
+            custom_model_input: String::new(),
             channel_idx: 0,
             channel_scroll: 0,
             search_provider_idx: 0,
@@ -551,8 +558,33 @@ impl App {
             .map_or(&[], |t| *t)
     }
 
-    fn selected_model(&self) -> &str {
-        MODELS.get(self.model_idx).map_or("auto", |m| m)
+    fn selected_model_option(&self) -> &str {
+        MODELS.get(self.model_idx).map_or(AUTO_MODEL_OPTION, |m| m)
+    }
+
+    fn resolved_model(&self) -> Option<String> {
+        match self.selected_model_option() {
+            AUTO_MODEL_OPTION => None,
+            CUSTOM_MODEL_OPTION => {
+                let custom_model = self.custom_model_input.trim();
+                if custom_model.is_empty() {
+                    Some(default_model_for_provider(self.selected_provider_id()))
+                } else {
+                    Some(custom_model.to_string())
+                }
+            }
+            model => Some(model.to_string()),
+        }
+    }
+
+    fn selected_model_summary(&self) -> String {
+        match self.selected_model_option() {
+            AUTO_MODEL_OPTION => AUTO_MODEL_OPTION.to_string(),
+            CUSTOM_MODEL_OPTION => self
+                .resolved_model()
+                .unwrap_or_else(|| AUTO_MODEL_OPTION.to_string()),
+            model => model.to_string(),
+        }
     }
 
     fn selected_channel(&self) -> &str {
@@ -644,7 +676,7 @@ pub async fn run_tui_onboarding() -> Result<()> {
                     app.selected_provider(),
                     app.selected_provider_id()
                 );
-                println!("     Model:      {}", app.selected_model());
+                println!("     Model:      {}", app.selected_model_summary());
                 println!("     Channel:    {}", app.selected_channel());
                 println!("     Web search: {}", app.selected_search_provider());
                 println!("     Skills:     {skill}");
@@ -722,12 +754,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
     }
 
     // ── Model ───────────────────────────────────────────────────────
-    let model = app.selected_model();
-    if model == "Auto (recommended)" {
-        config.default_model = None; // Let provider pick default
-    } else {
-        config.default_model = Some(model.to_string());
-    }
+    config.default_model = app.resolved_model();
 
     // ── Channel ─────────────────────────────────────────────────────
     // Create a stub config for the selected channel with placeholder
@@ -1009,10 +1036,9 @@ async fn push_config_to_docker(app: &App) {
         args.push(app.api_key_input.clone());
     }
 
-    let model = app.selected_model();
-    if model != "Auto (recommended)" {
+    if let Some(model) = app.resolved_model() {
         args.push("--model".to_string());
-        args.push(model.to_string());
+        args.push(model);
     }
 
     let _ = tokio::process::Command::new("docker")
@@ -1225,8 +1251,24 @@ fn handle_input(app: &mut App, key: KeyCode) {
             KeyCode::Down | KeyCode::Char('j') => {
                 nav_down(&mut app.model_idx, MODELS.len() - 1);
             }
-            KeyCode::Enter => app.screen = Screen::ChannelStatus,
+            KeyCode::Enter => {
+                app.screen = if app.selected_model_option() == CUSTOM_MODEL_OPTION {
+                    Screen::ModelCustomInput
+                } else {
+                    Screen::ChannelStatus
+                };
+            }
             KeyCode::Esc => app.screen = Screen::ModelConfigured,
+            _ => {}
+        },
+
+        Screen::ModelCustomInput => match key {
+            KeyCode::Char(c) => app.custom_model_input.push(c),
+            KeyCode::Backspace => {
+                app.custom_model_input.pop();
+            }
+            KeyCode::Enter => app.screen = Screen::ChannelStatus,
+            KeyCode::Esc => app.screen = Screen::ModelSelect,
             _ => {}
         },
 
@@ -1427,14 +1469,16 @@ fn render(frame: &mut Frame, app: &App) {
 
     // Footer (context-sensitive)
     let footer = match app.screen {
-        Screen::ApiKeyInput | Screen::WebSearchApiKey => Line::from(vec![
-            Span::styled(" Enter", theme::heading_style()),
-            Span::styled(" confirm  ", theme::dim_style()),
-            Span::styled("Esc", theme::heading_style()),
-            Span::styled(" back  ", theme::dim_style()),
-            Span::styled("Ctrl+C", theme::heading_style()),
-            Span::styled(" quit", theme::dim_style()),
-        ]),
+        Screen::ApiKeyInput | Screen::ModelCustomInput | Screen::WebSearchApiKey => {
+            Line::from(vec![
+                Span::styled(" Enter", theme::heading_style()),
+                Span::styled(" confirm  ", theme::dim_style()),
+                Span::styled("Esc", theme::heading_style()),
+                Span::styled(" back  ", theme::dim_style()),
+                Span::styled("Ctrl+C", theme::heading_style()),
+                Span::styled(" quit", theme::dim_style()),
+            ])
+        }
         Screen::Complete => Line::from(vec![
             Span::styled(" Enter/q", theme::heading_style()),
             Span::styled(" exit", theme::dim_style()),
@@ -1499,6 +1543,7 @@ fn render(frame: &mut Frame, app: &App) {
         Screen::ProviderNotes => render_provider_notes(frame, content, app),
         Screen::ModelConfigured => render_model_configured(frame, content, app),
         Screen::ModelSelect => render_model_select(frame, content, app),
+        Screen::ModelCustomInput => render_model_custom_input(frame, content, app),
         Screen::ChannelStatus => render_channel_status(frame, content),
         Screen::HowChannelsWork => render_how_channels_work(frame, content),
         Screen::ChannelSelect => render_channel_select(frame, content, app),
@@ -2208,6 +2253,50 @@ fn render_model_select(frame: &mut Frame, area: Rect, app: &App) {
         },
         layout[2],
     );
+}
+
+fn render_model_custom_input(frame: &mut Frame, area: Rect, app: &App) {
+    let default_model = default_model_for_provider(app.selected_provider_id());
+    let custom_model_label = format!("Custom model ID [{default_model}]");
+    let layout = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Length(5),
+        Constraint::Min(2),
+    ])
+    .split(area);
+
+    frame.render_widget(setup_title(), layout[0]);
+    frame.render_widget(
+        ConfirmedLine {
+            label: "Provider",
+            value: app.selected_provider(),
+        },
+        layout[1],
+    );
+    frame.render_widget(
+        InputPrompt {
+            label: custom_model_label.as_str(),
+            input: &app.custom_model_input,
+            masked: false,
+        },
+        layout[2],
+    );
+    frame.render_widget(
+        InfoPanel {
+            title: "Custom model",
+            lines: vec![
+                Line::from(""),
+                Line::from(format!(
+                    "  Type any provider model ID. Press Enter with an empty field to use {default_model}."
+                )),
+                Line::from(""),
+            ],
+        },
+        layout[3],
+    );
+    frame.render_widget(continue_hint(), layout[4]);
 }
 
 // ── Screen: Channel status ──────────────────────────────────────────
@@ -3079,7 +3168,7 @@ fn render_complete(frame: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("  Model:         ", theme::dim_style()),
-            Span::styled(app.selected_model(), theme::heading_style()),
+            Span::styled(app.selected_model_summary(), theme::heading_style()),
         ]),
         Line::from(vec![
             Span::styled("  Channel:       ", theme::dim_style()),
@@ -3157,6 +3246,7 @@ mod tests {
             provider_scroll: 0,
             api_key_input: String::new(),
             model_idx: 0,
+            custom_model_input: String::new(),
             channel_idx: 0,
             channel_scroll: 0,
             search_provider_idx: 0,
@@ -3275,6 +3365,60 @@ mod tests {
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
         assert_eq!(config.default_model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn save_model_custom_uses_manual_id() {
+        let mut app = test_app();
+        app.provider_tier_idx = 3; // Specialized
+        app.provider_idx = 8; // Qwen
+        app.model_idx = MODELS
+            .iter()
+            .position(|model| *model == CUSTOM_MODEL_OPTION)
+            .expect("custom model option should exist");
+        app.custom_model_input = "qwen-max-latest".to_string();
+
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert_eq!(config.default_model.as_deref(), Some("qwen-max-latest"));
+    }
+
+    #[test]
+    fn save_model_custom_defaults_to_provider_default_when_empty() {
+        let mut app = test_app();
+        app.provider_tier_idx = 3; // Specialized
+        app.provider_idx = 8; // Qwen
+        app.model_idx = MODELS
+            .iter()
+            .position(|model| *model == CUSTOM_MODEL_OPTION)
+            .expect("custom model option should exist");
+
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert_eq!(config.default_model.as_deref(), Some("qwen-plus"));
+    }
+
+    #[test]
+    fn model_select_custom_routes_to_manual_input_for_qwen() {
+        let mut app = test_app();
+        app.provider_tier_idx = 3; // Specialized
+        app.provider_idx = 8; // Qwen
+        app.screen = Screen::ModelSelect;
+        app.model_idx = MODELS
+            .iter()
+            .position(|model| *model == CUSTOM_MODEL_OPTION)
+            .expect("custom model option should exist");
+
+        handle_input(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::ModelCustomInput);
+
+        for ch in "qwen-max".chars() {
+            handle_input(&mut app, KeyCode::Char(ch));
+        }
+        handle_input(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.screen, Screen::ChannelStatus);
+        assert_eq!(app.resolved_model().as_deref(), Some("qwen-max"));
     }
 
     // ── Channel persistence ─────────────────────────────────────────

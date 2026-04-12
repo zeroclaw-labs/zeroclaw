@@ -869,8 +869,7 @@ fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
     )
 }
 
-/// Pick a sensible default model for the given provider.
-fn default_model_for_provider(provider: &str) -> String {
+pub fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "openai" => "gpt-5.2".into(),
