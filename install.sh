@@ -31,7 +31,7 @@ parse_cargo_toml() {
   MSRV=$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p && /^rust-version *=/{split($0,a,"\"");print a[2]}' "$toml")
   EDITION=$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p && /^edition *=/{split($0,a,"\"");print a[2]}' "$toml")
 
-  DEFAULT_FEATURES=$(awk '/^default *= *\[/,/\]/' "$toml" | grep '"' | sed 's/.*"\([^"]*\)".*/\1/' | paste -sd, -)
+  DEFAULT_FEATURES=$(awk '/^default *= *\[/,/\]/{if(match($0,/"([^"]+)"/,a))print a[1]}' "$toml" | paste -sd, -)
 
   ALL_FEATURES=$(awk '/^\[features\]/{p=1;next} /^\[/{p=0} p && /^[a-z][a-z0-9_-]* *=/{sub(/ *=.*/,"");print}' "$toml")
 }
@@ -60,21 +60,6 @@ list_features() {
   printf "    %s\n" "$DEFAULT_FEATURES"
   echo
 
-  channels="" observability="" platform="" other=""
-  echo "$ALL_FEATURES" | while IFS= read -r feat; do
-    case "$feat" in
-      default|ci-all) continue ;;
-      fantoccini|landlock|metrics) continue ;;
-      channel-*)       channels="${channels:+$channels, }$feat" ;;
-      observability-*) observability="${observability:+$observability, }$feat" ;;
-      hardware|peripheral-*|sandbox-*|browser-*|probe|rag-pdf|webauthn)
-                       platform="${platform:+$platform, }$feat" ;;
-      *)               other="${other:+$other, }$feat" ;;
-    esac
-    # Print at end of input (subshell, so we print inline)
-  done
-
-  # Re-do grouping outside subshell (while loop in sh creates subshell)
   channels="" observability="" platform="" other=""
   for feat in $ALL_FEATURES; do
     case "$feat" in
