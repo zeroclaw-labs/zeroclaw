@@ -5,15 +5,14 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-
-/// Minimum interval between mid-stream draft edits per room (milliseconds).
-/// Nextcloud Talk has no documented hard rate-limit for message edits, but
-/// editing too frequently causes visible flicker and unnecessary API load.
-const DRAFT_UPDATE_INTERVAL_MS: u64 = 800;
+use zeroclaw_config::schema::StreamMode;
 
 /// Maximum message length accepted by Nextcloud Talk (characters, not bytes).
 /// The OCS API rejects messages longer than 32 000 characters.
 const NC_MAX_MESSAGE_LENGTH: usize = 32_000;
+
+/// Default minimum interval between draft edits when not configured explicitly.
+const DEFAULT_DRAFT_UPDATE_INTERVAL_MS: u64 = 1000;
 
 /// Nextcloud Talk channel in webhook mode.
 ///
@@ -25,6 +24,10 @@ pub struct NextcloudTalkChannel {
     bot_name: String,
     allowed_users: Vec<String>,
     client: reqwest::Client,
+    /// Controls whether and how streaming draft updates are delivered.
+    stream_mode: StreamMode,
+    /// Minimum interval (ms) between mid-stream draft edits per room.
+    draft_update_interval_ms: u64,
     /// Tracks the last time a draft-edit was sent per room token, for rate-limiting.
     last_draft_edit: Mutex<HashMap<String, std::time::Instant>>,
 }
@@ -55,8 +58,20 @@ impl NextcloudTalkChannel {
                 "channel.nextcloud_talk",
                 proxy_url.as_deref(),
             ),
+            stream_mode: StreamMode::Off,
+            draft_update_interval_ms: DEFAULT_DRAFT_UPDATE_INTERVAL_MS,
             last_draft_edit: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Configure streaming draft-update behaviour.
+    ///
+    /// `mode` — `Off` disables draft updates entirely; `Partial` enables live edits.
+    /// `interval_ms` — minimum delay between consecutive OCS edit calls per room.
+    pub fn with_streaming(mut self, mode: StreamMode, interval_ms: u64) -> Self {
+        self.stream_mode = mode;
+        self.draft_update_interval_ms = interval_ms;
+        self
     }
 
     fn is_user_allowed(&self, actor_id: &str) -> bool {
@@ -543,10 +558,14 @@ impl Channel for NextcloudTalkChannel {
     }
 
     fn supports_draft_updates(&self) -> bool {
-        true
+        self.stream_mode != StreamMode::Off
     }
 
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        if self.stream_mode == StreamMode::Off {
+            return Ok(None);
+        }
+
         // Send a placeholder "..." message and track its ID for later edits.
         let initial = if message.content.is_empty() {
             "..."
@@ -586,7 +605,7 @@ impl Channel for NextcloudTalkChannel {
             let last_edits = self.last_draft_edit.lock();
             if let Some(last_time) = last_edits.get(recipient) {
                 let elapsed = u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
-                if elapsed < DRAFT_UPDATE_INTERVAL_MS {
+                if elapsed < self.draft_update_interval_ms {
                     return Ok(());
                 }
             }
@@ -726,8 +745,16 @@ mod tests {
     }
 
     #[test]
-    fn supports_draft_updates_returns_true() {
+    fn supports_draft_updates_off_by_default() {
+        // Default construction uses StreamMode::Off → draft updates disabled.
         let channel = make_channel();
+        assert!(!channel.supports_draft_updates());
+    }
+
+    #[test]
+    fn supports_draft_updates_true_when_partial() {
+        use zeroclaw_config::schema::StreamMode;
+        let channel = make_channel().with_streaming(StreamMode::Partial, 800);
         assert!(channel.supports_draft_updates());
     }
 
@@ -763,8 +790,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_draft_rate_limit_short_circuits_network() {
-        // Record a very recent edit so the rate-limit fires.
-        let channel = make_channel();
+        use zeroclaw_config::schema::StreamMode;
+        // Use a large interval (60 s) so the rate-limit always fires immediately.
+        let channel = make_channel().with_streaming(StreamMode::Partial, 60_000);
         channel
             .last_draft_edit
             .lock()
@@ -775,6 +803,18 @@ mod tests {
             .update_draft("room-token-123", "42", "some delta")
             .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn send_draft_returns_none_when_stream_mode_off() {
+        use zeroclaw_api::channel::SendMessage;
+        // Default mode is Off — send_draft must short-circuit.
+        let channel = make_channel();
+        let result = channel
+            .send_draft(&SendMessage::new("...", "room-token-123"))
+            .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 
     #[test]

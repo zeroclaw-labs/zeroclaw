@@ -7497,6 +7497,15 @@ pub struct NextcloudTalkConfig {
     /// If not set, defaults to an empty string (no self-message filtering by name).
     #[serde(default)]
     pub bot_name: Option<String>,
+    /// Streaming mode for progressive response delivery via message edits.
+    /// `off` (default) — send the complete response as a single message.
+    /// `partial` — update a draft message with every flush interval.
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+    /// Minimum interval (ms) between draft message edits to avoid rate-limiting
+    /// the Nextcloud Talk OCS API. Only used when `stream_mode = "partial"`.
+    #[serde(default = "default_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
 }
 
 impl ChannelConfig for NextcloudTalkConfig {

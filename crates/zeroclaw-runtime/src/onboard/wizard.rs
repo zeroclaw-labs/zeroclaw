@@ -5075,6 +5075,10 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     allowed_users,
                     proxy_url: existing_nc.and_then(|n| n.proxy_url.clone()),
                     bot_name: existing_nc.and_then(|n| n.bot_name.clone()),
+                    stream_mode: existing_nc.map(|n| n.stream_mode).unwrap_or_default(),
+                    draft_update_interval_ms: existing_nc
+                        .map(|n| n.draft_update_interval_ms)
+                        .unwrap_or(1000),
                 });
 
                 println!("  {} Nextcloud Talk configured", style("✅").green().bold());

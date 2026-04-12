@@ -4618,13 +4618,16 @@ fn collect_configured_channels(
         if nc.enabled {
             channels.push(ConfiguredChannel {
                 display_name: "Nextcloud Talk",
-                channel: Arc::new(NextcloudTalkChannel::new_with_proxy(
-                    nc.base_url.clone(),
-                    nc.app_token.clone(),
-                    nc.bot_name.clone().unwrap_or_default(),
-                    nc.allowed_users.clone(),
-                    nc.proxy_url.clone(),
-                )),
+                channel: Arc::new(
+                    NextcloudTalkChannel::new_with_proxy(
+                        nc.base_url.clone(),
+                        nc.app_token.clone(),
+                        nc.bot_name.clone().unwrap_or_default(),
+                        nc.allowed_users.clone(),
+                        nc.proxy_url.clone(),
+                    )
+                    .with_streaming(nc.stream_mode, nc.draft_update_interval_ms),
+                ),
             });
         } else {
             tracing::info!("Nextcloud Talk channel configured but disabled (enabled = false)");
