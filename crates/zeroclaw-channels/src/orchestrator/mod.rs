@@ -865,22 +865,6 @@ async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
     })
 }
 
-fn decrypt_optional_secret_for_runtime_reload(
-    store: &zeroclaw_runtime::security::SecretStore,
-    value: &mut Option<String>,
-    field_name: &str,
-) -> Result<()> {
-    if let Some(raw) = value.clone()
-        && zeroclaw_runtime::security::SecretStore::is_encrypted(&raw)
-    {
-        *value = Some(
-            store
-                .decrypt(&raw)
-                .with_context(|| format!("Failed to decrypt {field_name}"))?,
-        );
-    }
-    Ok(())
-}
 
 async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRuntimeDefaults> {
     let contents = tokio::fs::read_to_string(path)
@@ -893,29 +877,9 @@ async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRu
     if let Some(zeroclaw_dir) = path.parent() {
         let store =
             zeroclaw_runtime::security::SecretStore::new(zeroclaw_dir, parsed.secrets.encrypt);
-        decrypt_optional_secret_for_runtime_reload(&store, &mut parsed.api_key, "config.api_key")?;
-        // Decrypt TTS provider API keys for runtime reload
-        if let Some(ref mut openai) = parsed.tts.openai {
-            decrypt_optional_secret_for_runtime_reload(
-                &store,
-                &mut openai.api_key,
-                "config.tts.openai.api_key",
-            )?;
-        }
-        if let Some(ref mut elevenlabs) = parsed.tts.elevenlabs {
-            decrypt_optional_secret_for_runtime_reload(
-                &store,
-                &mut elevenlabs.api_key,
-                "config.tts.elevenlabs.api_key",
-            )?;
-        }
-        if let Some(ref mut google) = parsed.tts.google {
-            decrypt_optional_secret_for_runtime_reload(
-                &store,
-                &mut google.api_key,
-                "config.tts.google.api_key",
-            )?;
-        }
+        // Decrypt all #[secret]-annotated fields (api keys, tokens, channel credentials, etc.)
+        // via the macro-generated Configurable chain rather than manually listing each field.
+        parsed.decrypt_secrets(&store)?;
     }
 
     parsed.apply_env_overrides();

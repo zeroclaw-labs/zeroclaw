@@ -2784,6 +2784,18 @@ impl Channel for TelegramChannel {
             let _ = self.get_bot_username().await;
         }
 
+        // Guard: detect encrypted-but-not-decrypted token early so we fail fast with a
+        // clear message instead of looping forever on 401 errors from the Telegram API.
+        if self.bot_token.starts_with("enc2:") || self.bot_token.starts_with("enc:") {
+            anyhow::bail!(
+                "Telegram bot_token appears to still be encrypted (starts with '{}...'). \
+                 This usually means the secret key file (~/.zeroclaw/.secret_key) is missing \
+                 or the config was not decrypted before starting channels. \
+                 Re-run `zeroclaw onboard` or ensure the secret key file is present.",
+                &self.bot_token[..self.bot_token.find(':').unwrap_or(4) + 1]
+            );
+        }
+
         tracing::info!("Telegram channel listening for messages...");
 
         // Startup probe: claim the getUpdates slot before entering the long-poll loop.

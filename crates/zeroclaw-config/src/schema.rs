@@ -12378,6 +12378,54 @@ default_temperature = 0.7
     }
 
     #[tokio::test]
+    async fn config_save_encrypts_telegram_bot_token() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_telegram_encrypt_{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let mut config = Config {
+            workspace_dir: dir.join("workspace"),
+            config_path: dir.join("config.toml"),
+            ..Default::default()
+        };
+        config.secrets.encrypt = true;
+        config.channels_config.telegram = Some(TelegramConfig {
+            enabled: true,
+            bot_token: "123456789:ABCdefGHIjklMNOpqrSTUvwxYZ".into(),
+            allowed_users: vec!["testuser".into()],
+            ..Default::default()
+        });
+
+        config.save().await.unwrap();
+
+        // Verify the saved file has the token encrypted
+        let contents = tokio::fs::read_to_string(dir.join("config.toml")).await.unwrap();
+        let on_disk: Config = toml::from_str(&contents).unwrap();
+        let stored_token = &on_disk.channels_config.telegram.as_ref().unwrap().bot_token;
+        assert!(
+            crate::secrets::SecretStore::is_encrypted(stored_token),
+            "bot_token should be encrypted on disk, got: {stored_token}"
+        );
+
+        // Verify decryption restores the plaintext token
+        let store = crate::secrets::SecretStore::new(&dir, true);
+        let decrypted = store.decrypt(stored_token).unwrap();
+        assert_eq!(decrypted, "123456789:ABCdefGHIjklMNOpqrSTUvwxYZ");
+
+        // Verify Config::load_or_init equivalent: decrypt_secrets restores the token
+        let mut reloaded: Config = toml::from_str(&contents).unwrap();
+        reloaded.decrypt_secrets(&store).unwrap();
+        assert_eq!(
+            reloaded.channels_config.telegram.as_ref().unwrap().bot_token,
+            "123456789:ABCdefGHIjklMNOpqrSTUvwxYZ"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
     async fn config_save_atomic_cleanup() {
         let dir =
             std::env::temp_dir().join(format!("zeroclaw_test_config_{}", uuid::Uuid::new_v4()));
