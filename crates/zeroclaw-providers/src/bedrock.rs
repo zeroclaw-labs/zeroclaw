@@ -287,6 +287,34 @@ enum ContentBlock {
     ToolResult(ToolResultWrapper),
     CachePointBlock(CachePointWrapper),
     Image(ImageWrapper),
+    /// Thinking block for round-tripping extended thinking in conversation
+    /// history. Required when thinking is enabled and assistant messages
+    /// contain tool_use blocks.
+    #[serde(rename = "reasoningContent")]
+    ReasoningContent(ReasoningContentOutWrapper),
+}
+
+/// Outgoing reasoning content block for request messages.
+/// Serializes as `{"reasoningContent": {"reasoningText": {"text": "..."}}}`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReasoningContentOutWrapper {
+    reasoning_content: ReasoningContentOutBlock,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReasoningContentOutBlock {
+    reasoning_text: ReasoningTextOutField,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ReasoningTextOutField {
+    text: String,
+    /// Signature for integrity verification — round-tripped from the
+    /// original thinking block returned by the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -471,6 +499,7 @@ struct ReasoningContentWrapper {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ReasoningContentBlock {
     #[serde(default)]
     reasoning_text: Option<ReasoningTextField>,
@@ -480,6 +509,10 @@ struct ReasoningContentBlock {
 struct ReasoningTextField {
     #[serde(default)]
     text: Option<String>,
+    /// Signature for integrity verification — must be round-tripped
+    /// when sending thinking blocks back in conversation history.
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -876,6 +909,38 @@ impl BedrockProvider {
             .and_then(|v| serde_json::from_value::<Vec<ProviderToolCall>>(v.clone()).ok())?;
 
         let mut blocks = Vec::new();
+
+        // When extended thinking is enabled, assistant messages must start
+        // with reasoning content blocks (including signatures) before any
+        // tool_use blocks. The reasoning_content field stores JSON-encoded
+        // thinking blocks from the original response.
+        if let Some(reasoning) = value
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .filter(|r| !r.is_empty())
+        {
+            // reasoning_content may contain multiple JSON blocks joined by \n
+            for part in reasoning.split('\n') {
+                if let Ok(block) = serde_json::from_str::<serde_json::Value>(part) {
+                    let text = block
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let signature = block
+                        .get("signature")
+                        .and_then(|s| s.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
+                    blocks.push(ContentBlock::ReasoningContent(ReasoningContentOutWrapper {
+                        reasoning_content: ReasoningContentOutBlock {
+                            reasoning_text: ReasoningTextOutField { text, signature },
+                        },
+                    }));
+                }
+            }
+        }
+
         if let Some(text) = value
             .get("content")
             .and_then(serde_json::Value::as_str)
@@ -973,13 +1038,13 @@ impl BedrockProvider {
                         }
                     }
                     ResponseContentBlock::ReasoningContent(wrapper) => {
-                        if let Some(reasoning_text) = wrapper.reasoning_content.reasoning_text
-                            && let Some(text) = reasoning_text.text
-                        {
-                            let trimmed = text.trim().to_string();
-                            if !trimmed.is_empty() {
-                                thinking_parts.push(trimmed);
-                            }
+                        if let Some(reasoning_text) = wrapper.reasoning_content.reasoning_text {
+                            // Store as JSON with signature for round-tripping.
+                            let block = serde_json::json!({
+                                "text": reasoning_text.text.as_deref().unwrap_or(""),
+                                "signature": reasoning_text.signature.as_deref().unwrap_or(""),
+                            });
+                            thinking_parts.push(block.to_string());
                         }
                     }
                     ResponseContentBlock::ToolUse(wrapper) => {

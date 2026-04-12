@@ -119,6 +119,15 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    /// Thinking block for round-tripping extended thinking in conversation
+    /// history. Required when thinking is enabled and assistant messages
+    /// contain tool_use blocks.
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -189,6 +198,9 @@ struct NativeContentIn {
     text: Option<String>,
     #[serde(default)]
     thinking: Option<String>,
+    /// Signature for integrity verification of thinking blocks.
+    #[serde(default)]
+    signature: Option<String>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -291,7 +303,9 @@ impl AnthropicProvider {
                 | NativeContentOut::ToolResult { cache_control, .. } => {
                     *cache_control = Some(CacheControl::ephemeral());
                 }
-                NativeContentOut::ToolUse { .. } | NativeContentOut::Image { .. } => {}
+                NativeContentOut::ToolUse { .. }
+                | NativeContentOut::Image { .. }
+                | NativeContentOut::Thinking { .. } => {}
             }
         }
     }
@@ -326,6 +340,36 @@ impl AnthropicProvider {
             .and_then(|v| serde_json::from_value::<Vec<ProviderToolCall>>(v.clone()).ok())?;
 
         let mut blocks = Vec::new();
+
+        // When extended thinking is enabled, assistant messages must start
+        // with thinking blocks (including signatures) before any tool_use
+        // blocks. The reasoning_content field stores JSON-encoded thinking
+        // blocks from the original response.
+        if let Some(reasoning) = value
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .filter(|r| !r.is_empty())
+        {
+            for part in reasoning.split('\n') {
+                if let Ok(block) = serde_json::from_str::<serde_json::Value>(part) {
+                    let thinking = block
+                        .get("thinking")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let signature = block
+                        .get("signature")
+                        .and_then(|s| s.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
+                    blocks.push(NativeContentOut::Thinking {
+                        thinking,
+                        signature,
+                    });
+                }
+            }
+        }
+
         if let Some(text) = value
             .get("content")
             .and_then(serde_json::Value::as_str)
@@ -548,7 +592,12 @@ impl AnthropicProvider {
                     if let Some(thinking) = block.thinking.as_deref().or(block.text.as_deref()) {
                         let trimmed = thinking.trim();
                         if !trimmed.is_empty() {
-                            thinking_parts.push(trimmed.to_string());
+                            // Store as JSON with signature for round-tripping.
+                            let json_block = serde_json::json!({
+                                "thinking": trimmed,
+                                "signature": block.signature.as_deref().unwrap_or(""),
+                            });
+                            thinking_parts.push(json_block.to_string());
                         }
                     }
                 }
