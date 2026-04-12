@@ -901,6 +901,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking: None,
         };
 
         let mut stream = provider.stream_chat(
@@ -939,6 +940,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking: None,
         };
 
         let mut stream = provider.stream_chat(
