@@ -603,7 +603,9 @@ impl AnthropicProvider {
                     budget_tokens = params.budget_tokens,
                     "Native extended thinking enabled; forcing temperature=1.0"
                 );
-                let max_tokens = self.max_tokens.max(params.budget_tokens);
+                // API requires max_tokens > budget_tokens (strictly greater).
+                let min_required = params.budget_tokens + 1;
+                let max_tokens = self.max_tokens.max(min_required);
                 (
                     1.0,
                     Some(NativeThinkingConfig {
