@@ -129,6 +129,14 @@ export function Chat({
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [attachments, setAttachments] = useState<AttachmentFile[]>([]);
+  // ── Input queue ──
+  // Mirrors the Claude/Claude-Code pattern: while a response is streaming
+  // the user can keep typing follow-up questions; each Enter pushes onto
+  // this queue and is dispatched sequentially when the previous turn
+  // finishes. The textarea is NEVER blocked.
+  const [pendingQueue, setPendingQueue] = useState<
+    Array<{ text: string; files: AttachmentFile[]; id: string }>
+  >([]);
   const [docInfoDismissed, setDocInfoDismissed] = useState(false);
   const [ocrConsent, setOcrConsent] = useState<{
     show: boolean;
@@ -242,20 +250,19 @@ export function Chat({
     async (e?: FormEvent) => {
       e?.preventDefault();
       const trimmed = input.trim();
-      if ((!trimmed && attachments.length === 0) || isLoading) return;
+      if (!trimmed && attachments.length === 0) return;
 
-      // Check for large image PDF batch needing OCR consent
+      // Check for large image PDF batch needing OCR consent. Consent
+      // dialog must run BEFORE queueing so the user sees the credit
+      // estimate immediately, not after their other queued turns finish.
       const imagePdfs = attachments.filter(
         (a) => a.type === "text_pdf" && a.pageCount && a.pageCount >= 1,
       );
-      // Re-classify: estimate which are image PDFs (heuristic based on file size per page)
       const likelyImagePdfs = imagePdfs.filter((a) => {
         const bytesPerPage = a.file.size / (a.pageCount || 1);
-        return bytesPerPage > 50_000; // >50KB/page likely image PDF
+        return bytesPerPage > 50_000;
       });
-
       if (likelyImagePdfs.length > 0 && isLargeImagePdfBatch(likelyImagePdfs)) {
-        // Mark these as large image PDFs and show consent
         const updatedAttachments = attachments.map((a) => {
           if (likelyImagePdfs.some((ip) => ip.id === a.id)) {
             return { ...a, type: "image_pdf_large" as const, isImagePdf: true };
@@ -266,10 +273,44 @@ export function Chat({
         return;
       }
 
+      // ── Queue path: a previous turn is still streaming ──
+      // Push onto the queue, clear the textarea, and let the drain
+      // effect (below) dispatch it once the in-flight turn completes.
+      // The user is NEVER blocked from typing the next question.
+      if (isLoading) {
+        const queued = {
+          text: trimmed,
+          files: attachments,
+          id: `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        };
+        setPendingQueue((prev) => [...prev, queued]);
+        setInput("");
+        setAttachments([]);
+        if (textareaRef.current) {
+          textareaRef.current.style.height = "auto";
+        }
+        return;
+      }
+
       await doSend(trimmed, attachments);
     },
     [input, isLoading, attachments],
   );
+
+  // ── Queue drain ──
+  // When isLoading flips from true → false and the queue has items,
+  // pop the first one and send it. The effect re-runs after each
+  // doSend completes, so consecutive queued messages process in order.
+  useEffect(() => {
+    if (isLoading || pendingQueue.length === 0) return;
+    const [next, ...rest] = pendingQueue;
+    setPendingQueue(rest);
+    // Fire-and-forget; doSend manages its own loading state.
+    void doSend(next.text, next.files);
+    // doSend is omitted to avoid re-running on its identity change;
+    // its captured deps are stable enough for the queue lifecycle.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLoading, pendingQueue]);
 
   // ── STT: start listening (internal helper) ──
   const startListening = useCallback((lang: string) => {
@@ -474,8 +515,11 @@ export function Chat({
     setWorkspaceStatus(null);
   }, []);
 
+  // canSend no longer requires `!isLoading` — while a turn is streaming
+  // the user can still submit; the new input goes onto `pendingQueue`
+  // and is dispatched sequentially after the in-flight turn completes.
   const canSend =
-    (input.trim().length > 0 || attachments.length > 0) && !isLoading && isConnected;
+    (input.trim().length > 0 || attachments.length > 0) && isConnected;
 
   // Check if any attachments are document files (for info toast)
   const hasDocAttachments = attachments.some((a) => isDocumentFile(a.file));
@@ -693,6 +737,18 @@ export function Chat({
         {workspaceStatus && (
           <div className={`chat-workspace-status ${workspaceStatus.includes("Error") || workspaceStatus.includes("failed") ? "error" : "success"}`}>
             {workspaceStatus}
+          </div>
+        )}
+
+        {/* Queued-input indicator: visible when the user typed follow-up
+            questions while a previous turn is still streaming. Each
+            queued item is dispatched in order as soon as the in-flight
+            turn completes. */}
+        {pendingQueue.length > 0 && (
+          <div className="chat-queue-indicator" aria-live="polite">
+            {locale === "ko"
+              ? `${pendingQueue.length}개 메시지가 대기 중입니다 (현재 답변이 끝나면 순차 처리됩니다)`
+              : `${pendingQueue.length} message${pendingQueue.length === 1 ? "" : "s"} queued (will be processed in order after the current response)`}
           </div>
         )}
 

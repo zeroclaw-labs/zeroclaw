@@ -1736,6 +1736,25 @@ html, body {
   color: #f87171;
 }
 
+/* ── Queued-input indicator ──
+   Appears above the chat input when the user typed follow-up
+   questions while a previous turn is still streaming. Each queued
+   item dispatches in order as soon as the in-flight turn completes. */
+.chat-queue-indicator {
+  max-width: 768px;
+  margin: 0 auto 4px;
+  font-size: 0.72rem;
+  padding: 4px 10px;
+  border-radius: 8px;
+  background: rgba(74, 108, 247, 0.12);
+  color: #93b4ff;
+  border: 1px solid rgba(74, 108, 247, 0.3);
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ── Chat Attachment Button ── */
 
 .chat-attach-btn {
