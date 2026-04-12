@@ -238,7 +238,7 @@ if [[ "$LIST_FEATURES" == true ]]; then
   exit 0
 fi
 
-# ── Clone or update source ────────────────────────────────────────
+# ── Locate source ─────────────────────────────────────────────────
 
 echo
 echo "$(bold "ZeroClaw — source install")"
@@ -247,17 +247,21 @@ if [[ "$PREFIX" != "$HOME" ]]; then
 fi
 echo
 
-if [[ -d "$INSTALL_DIR/.git" ]]; then
+if [[ -f "Cargo.toml" ]] && grep -q "zeroclaw" "Cargo.toml" 2>/dev/null; then
+  # Already in the repo — build from here
+  INSTALL_DIR="$(pwd)"
+  info "Building from $(pwd)"
+elif [[ -d "$INSTALL_DIR/.git" ]]; then
   info "Updating source in $INSTALL_DIR"
-  git -C "$INSTALL_DIR" fetch origin master --quiet
-  git -C "$INSTALL_DIR" reset --hard origin/master --quiet
+  git -C "$INSTALL_DIR" pull --ff-only --quiet 2>/dev/null || \
+    git -C "$INSTALL_DIR" fetch origin master --quiet
+  cd "$INSTALL_DIR"
 else
   info "Cloning into $INSTALL_DIR"
   mkdir -p "$(dirname "$INSTALL_DIR")"
   git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"
+  cd "$INSTALL_DIR"
 fi
-
-cd "$INSTALL_DIR"
 
 # ── Parse Cargo.toml ──────────────────────────────────────────────
 
