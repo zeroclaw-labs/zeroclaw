@@ -50,6 +50,26 @@ const label = (cat: CategoryLabel | undefined, locale: string): string => {
   return (cat as any)[key] || cat.en || "";
 };
 
+// Infer native language from voice name pattern.
+// Typecast API doesn't provide a language field, but Korean-romanized
+// names (Soye, Sanghoon, Eunsol...) speak Korean natively, while
+// Western names (Hailey, Charlotte, Dylan...) speak English natively.
+const KOREAN_PREFIXES = [
+  "ae","bo","byeong","cha","chae","chan","da","do","dong","du","eu","ga","geo","gi","go","gu","gw",
+  "ha","hae","han","he","ho","hu","hw","hy","in","ja","je","ji","jin","jo","ju","jun",
+  "ku","kw","ky","la","mi","min","mo","moon","mu","my","na","no","ra","ro","sa","se",
+  "shi","si","so","su","sung","sy","vi","wo","ya","ye","yi","yo","yu",
+];
+
+function inferNativeLanguage(name: string): string {
+  const lower = name.toLowerCase().replace(/[^a-z]/g, "");
+  // Special Korean compound names
+  if (/^(mbti|lady|reporter|sportscaster|captain|classic)/.test(lower)) return "ko"; // Korean persona
+  // Check Korean romanization prefixes
+  if (KOREAN_PREFIXES.some(p => lower.startsWith(p))) return "ko";
+  return "en";
+}
+
 const VOICE_STORAGE_KEY = "moa_typecast_voice";
 
 export function saveSelectedVoice(voiceId: string, voiceName: string, gender: string) {
@@ -76,6 +96,7 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
   const [mood, setMood] = useState<string>("all");
   const [searchText, setSearchText] = useState("");
   const [expertise, setExpertise] = useState<string>("all");
+  const [nativeLang, setNativeLang] = useState<string>("all");
 
   // Fetch voices on mount
   useEffect(() => {
@@ -110,13 +131,16 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
     if (expertise !== "all") {
       voices = voices.filter(v => v.use_cases.includes(expertise));
     }
+    if (nativeLang !== "all") {
+      voices = voices.filter(v => inferNativeLanguage(v.voice_name) === nativeLang);
+    }
     if (searchText.trim()) {
       const q = searchText.toLowerCase();
       voices = voices.filter(v => v.voice_name.toLowerCase().includes(q));
     }
 
     return voices;
-  }, [data, gender, age, mood, expertise, searchText]);
+  }, [data, gender, age, mood, expertise, nativeLang, searchText]);
 
   const handleSelect = useCallback((voice: Voice) => {
     saveSelectedVoice(voice.voice_id, voice.voice_name, voice.gender);
@@ -235,6 +259,22 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
               ))}
             </div>
           </div>
+
+          {/* Native Language (주요 구사언어) */}
+          <div className="voice-picker-filter-row">
+            <span className="voice-picker-filter-label">{isKo ? "언어" : "Language"}</span>
+            <div className="voice-picker-pills">
+              <button className={nativeLang === "all" ? "active" : ""} onClick={() => setNativeLang("all")}>
+                {isKo ? "전체" : "All"}
+              </button>
+              <button className={nativeLang === "ko" ? "active" : ""} onClick={() => setNativeLang("ko")}>
+                🇰🇷 {isKo ? "한국어 네이티브" : "Korean Native"}
+              </button>
+              <button className={nativeLang === "en" ? "active" : ""} onClick={() => setNativeLang("en")}>
+                🇺🇸 {isKo ? "영어 네이티브" : "English Native"}
+              </button>
+            </div>
+          </div>
         </div>
 
         {/* Voice Grid */}
@@ -247,6 +287,8 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
               .slice(0, 2)
               .map(uc => label(cats.use_cases[uc], locale))
               .filter(Boolean);
+            const voiceLang = inferNativeLanguage(voice.voice_name);
+            const langFlag = voiceLang === "ko" ? "🇰🇷" : "🇺🇸";
 
             return (
               <div
@@ -260,7 +302,7 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
                 <div className="voice-card-info">
                   <div className="voice-card-name">{voice.voice_name}</div>
                   <div className="voice-card-meta">
-                    {genderLabel} · {ageLabel}
+                    {langFlag} {genderLabel} · {ageLabel}
                   </div>
                   <div className="voice-card-tags">
                     {useCaseLabels.map((tag, i) => (
