@@ -688,6 +688,7 @@ mod tests {
     #[test]
     fn email_config_custom() {
         let config = EmailConfig {
+            enabled: true,
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
             imap_folder: "Archive".to_string(),
@@ -711,6 +712,7 @@ mod tests {
     #[test]
     fn email_config_clone() {
         let config = EmailConfig {
+            enabled: true,
             imap_host: "imap.test.com".to_string(),
             imap_port: 993,
             imap_folder: "INBOX".to_string(),
@@ -959,6 +961,7 @@ mod tests {
     #[test]
     fn email_config_serialize_deserialize() {
         let config = EmailConfig {
+            enabled: true,
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
             imap_folder: "INBOX".to_string(),
@@ -1042,6 +1045,7 @@ mod tests {
     #[test]
     fn email_config_debug_output() {
         let config = EmailConfig {
+            enabled: true,
             imap_host: "imap.debug.com".to_string(),
             ..Default::default()
         };

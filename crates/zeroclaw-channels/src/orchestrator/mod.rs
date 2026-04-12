@@ -50,6 +50,7 @@ pub use crate::slack::SlackChannel;
 pub use crate::transcription;
 pub use crate::tts::{TtsManager, TtsProvider};
 pub use crate::twitter::TwitterChannel;
+#[cfg(feature = "channel-voice-call")]
 pub use crate::voice_call::VoiceCallChannel;
 #[cfg(feature = "voice-wake")]
 pub use crate::voice_wake::VoiceWakeChannel;
@@ -4242,10 +4243,25 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 anyhow::bail!("LINE channel requires the `channel-line` feature");
             }
         }
+        "voice-call" => {
+            #[cfg(feature = "channel-voice-call")]
+            {
+                let vc = config
+                    .channels_config
+                    .voice_call
+                    .as_ref()
+                    .context("Voice Call channel is not configured")?;
+                Ok(Arc::new(VoiceCallChannel::new(vc.clone())))
+            }
+            #[cfg(not(feature = "channel-voice-call"))]
+            {
+                anyhow::bail!("Voice Call channel requires the `channel-voice-call` feature");
+            }
+        }
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line"
+            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line, voice-call"
         ),
     }
 }
@@ -4633,10 +4649,14 @@ fn collect_configured_channels(
 
     #[cfg(feature = "channel-email")]
     if let Some(ref email_cfg) = config.channels_config.email {
-        channels.push(ConfiguredChannel {
-            display_name: "Email",
-            channel: Arc::new(EmailChannel::new(email_cfg.clone())),
-        });
+        if email_cfg.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "Email",
+                channel: Arc::new(EmailChannel::new(email_cfg.clone())),
+            });
+        } else {
+            tracing::info!("Email channel configured but disabled (enabled = false)");
+        }
     }
 
     #[cfg(feature = "channel-email")]
@@ -4892,6 +4912,18 @@ fn collect_configured_channels(
                 config.transcription.clone(),
             )),
         });
+    }
+
+    #[cfg(feature = "channel-voice-call")]
+    if let Some(ref vc) = config.channels_config.voice_call {
+        if vc.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "Voice Call",
+                channel: Arc::new(VoiceCallChannel::new(vc.clone())),
+            });
+        } else {
+            tracing::info!("Voice Call channel configured but disabled (enabled = false)");
+        }
     }
 
     if let Some(ref wh) = config.channels_config.webhook {
