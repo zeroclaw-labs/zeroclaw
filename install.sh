@@ -27,6 +27,7 @@ parse_cargo_toml() {
 
   VERSION=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\([^"]*\)"/\1/p}' "$toml")
   MSRV=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^rust-version *= *"\([^"]*\)"/\1/p}' "$toml")
+  EDITION=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^edition *= *"\([^"]*\)"/\1/p}' "$toml")
 
   # Default features (may span multiple lines)
   DEFAULT_FEATURES=$(sed -n '/^default *= *\[/,/\]/{s/.*"\([^"]*\)".*/\1/p}' "$toml" | paste -sd, -)
@@ -228,7 +229,7 @@ fi
 
 RUST_VERSION=$(rustc --version | awk '{print $2}')
 if ! version_gte "$RUST_VERSION" "$MSRV"; then
-  die "Rust $RUST_VERSION is too old. ZeroClaw requires $MSRV+ (edition 2024). Run: rustup update stable"
+  die "Rust $RUST_VERSION is too old. ZeroClaw requires $MSRV+ (edition $EDITION). Run: rustup update stable"
 fi
 info "Rust $RUST_VERSION (>= $MSRV)"
 
