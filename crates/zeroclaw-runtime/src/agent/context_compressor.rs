@@ -94,22 +94,30 @@ pub fn estimate_tokens(messages: &[ChatMessage]) -> usize {
 // ---------------------------------------------------------------------------
 
 const SUMMARIZER_SYSTEM: &str = "\
-You are a conversation compaction engine. Summarize the conversation segment below into concise context.
+You are a conversation compaction engine. Create a detailed summary that \
+captures enough context to continue development work without losing progress.
 
-PRESERVE exactly:
-- All identifiers (UUIDs, hashes, file paths, URLs, tokens, IPs)
-- Actions taken (tool calls, file operations, commands run)
-- Key information obtained (data, results, error messages)
-- Decisions made and user preferences expressed
-- Current task status and unresolved items
-- Constraints and requirements mentioned
+MUST PRESERVE (these are critical — omitting any of these is a failure):
+1. Active tasks and their CURRENT STATUS (in-progress, blocked, pending, completed)
+2. Batch operation progress (e.g., '5/17 items completed', 'step 3 of 7')
+3. The LAST thing the user requested and what was being done about it
+4. Decisions made and their RATIONALE (why, not just what)
+5. TODOs, open questions, and unresolved constraints
+6. Any commitments or follow-ups promised to the user
+7. All identifiers EXACTLY as they appear (UUIDs, hashes, file paths, URLs, tokens, IPs, version numbers)
+8. Files examined, modified, or created — and WHY each matters
+9. Errors encountered and their resolutions (or that they're still open)
+
+PRIORITIZE recent context over older history. The agent needs to know \
+what it WAS DOING, not just what was discussed.
 
 OMIT:
-- Verbose tool output (keep only key results)
-- Repeated greetings or filler
-- Redundant information already stated
+- Verbose tool output beyond key results
+- Greetings, filler, acknowledgements
+- Information already covered earlier in the summary
 
-Output concise bullet points. Be thorough but brief.";
+Output structured bullet points grouped by topic. Include direct quotes from \
+recent messages when they clarify task intent.";
 
 // ---------------------------------------------------------------------------
 // ContextCompressor
@@ -319,8 +327,11 @@ impl ContextCompressor {
         };
 
         let user_prompt = format!(
-            "Summarize the following conversation history ({message_count} messages) for context preservation. \
-             Keep it concise (max 20 bullet points).{identifier_note}\n\n{transcript}"
+            "Summarize the following conversation history ({message_count} messages). \
+             Focus on preserving enough context to continue the current task without \
+             re-reading the full history. Max 25 bullet points.{identifier_note}\n\n\
+             If there is an active task in progress, your FIRST bullet must state what \
+             that task is and where it left off.\n\n{transcript}"
         );
 
         // LLM summarization with safety timeout
