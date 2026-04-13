@@ -22,6 +22,10 @@ prepare() {
 
 build() {
   cd "${_reponame}-${pkgver}"
+
+  # Build web dashboard (served from filesystem at runtime)
+  cd web && npm ci && npm run build && cd ..
+
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   cargo build --frozen --release --profile dist --features channel-matrix,channel-lark
@@ -30,6 +34,11 @@ build() {
 package() {
   cd "${_reponame}-${pkgver}"
   install -Dm0755 -t "${pkgdir}/usr/bin/" "target/dist/zeroclaw"
+
+  # Install web dashboard assets (served from filesystem at runtime)
+  install -dm0755 "${pkgdir}/usr/share/${pkgname}/web/dist"
+  cp -r web/dist/* "${pkgdir}/usr/share/${pkgname}/web/dist/"
+
   install -Dm0644 LICENSE-MIT "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-MIT"
   install -Dm0644 LICENSE-APACHE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-APACHE"
 }

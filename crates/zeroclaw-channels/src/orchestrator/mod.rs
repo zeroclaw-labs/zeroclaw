@@ -50,6 +50,7 @@ pub use crate::slack::SlackChannel;
 pub use crate::transcription;
 pub use crate::tts::{TtsManager, TtsProvider};
 pub use crate::twitter::TwitterChannel;
+#[cfg(feature = "channel-voice-call")]
 pub use crate::voice_call::VoiceCallChannel;
 #[cfg(feature = "voice-wake")]
 pub use crate::voice_wake::VoiceWakeChannel;
@@ -4239,10 +4240,25 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 anyhow::bail!("LINE channel requires the `channel-line` feature");
             }
         }
+        "voice-call" => {
+            #[cfg(feature = "channel-voice-call")]
+            {
+                let vc = config
+                    .channels_config
+                    .voice_call
+                    .as_ref()
+                    .context("Voice Call channel is not configured")?;
+                Ok(Arc::new(VoiceCallChannel::new(vc.clone())))
+            }
+            #[cfg(not(feature = "channel-voice-call"))]
+            {
+                anyhow::bail!("Voice Call channel requires the `channel-voice-call` feature");
+            }
+        }
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line"
+            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line, voice-call"
         ),
     }
 }
@@ -4630,10 +4646,14 @@ fn collect_configured_channels(
 
     #[cfg(feature = "channel-email")]
     if let Some(ref email_cfg) = config.channels_config.email {
-        channels.push(ConfiguredChannel {
-            display_name: "Email",
-            channel: Arc::new(EmailChannel::new(email_cfg.clone())),
-        });
+        if email_cfg.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "Email",
+                channel: Arc::new(EmailChannel::new(email_cfg.clone())),
+            });
+        } else {
+            tracing::info!("Email channel configured but disabled (enabled = false)");
+        }
     }
 
     #[cfg(feature = "channel-email")]
@@ -4889,6 +4909,18 @@ fn collect_configured_channels(
                 config.transcription.clone(),
             )),
         });
+    }
+
+    #[cfg(feature = "channel-voice-call")]
+    if let Some(ref vc) = config.channels_config.voice_call {
+        if vc.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "Voice Call",
+                channel: Arc::new(VoiceCallChannel::new(vc.clone())),
+            });
+        } else {
+            tracing::info!("Voice Call channel configured but disabled (enabled = false)");
+        }
     }
 
     if let Some(ref wh) = config.channels_config.webhook {
@@ -10317,6 +10349,41 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    #[cfg(feature = "channel-email")]
+    #[test]
+    fn collect_configured_channels_skips_disabled_email() {
+        let mut config = Config::default();
+        config.channels_config.email = Some(zeroclaw_config::scattered_types::EmailConfig {
+            enabled: false,
+            ..Default::default()
+        });
+
+        let channels = collect_configured_channels(&config, "test");
+        assert!(
+            !channels.iter().any(|entry| entry.display_name == "Email"),
+            "disabled email should not be collected"
+        );
+    }
+
+    #[cfg(feature = "channel-voice-call")]
+    #[test]
+    fn collect_configured_channels_skips_disabled_voice_call() {
+        let mut config = Config::default();
+        config.channels_config.voice_call =
+            Some(zeroclaw_config::scattered_types::VoiceCallConfig {
+                enabled: false,
+                ..Default::default()
+            });
+
+        let channels = collect_configured_channels(&config, "test");
+        assert!(
+            !channels
+                .iter()
+                .any(|entry| entry.display_name == "Voice Call"),
+            "disabled voice-call should not be collected"
+        );
+    }
+
     struct AlwaysFailChannel {
         name: &'static str,
         calls: Arc<AtomicUsize>,
@@ -11412,6 +11479,46 @@ This is an example JSON object for profile settings."#;
         match build_channel_by_id(&config, "telegram") {
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
             Err(e) => panic!("should succeed when telegram is configured: {e}"),
+        }
+    }
+
+    #[cfg(feature = "channel-voice-call")]
+    #[test]
+    fn build_channel_by_id_unconfigured_voice_call_returns_error() {
+        let config = Config::default();
+        match build_channel_by_id(&config, "voice-call") {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("not configured"),
+                    "expected 'not configured' in error, got: {err_msg}"
+                );
+            }
+            Ok(_) => panic!("should fail when voice-call is not configured"),
+        }
+    }
+
+    #[cfg(feature = "channel-voice-call")]
+    #[test]
+    fn build_channel_by_id_configured_voice_call_succeeds() {
+        let mut config = Config::default();
+        config.channels_config.voice_call =
+            Some(zeroclaw_config::scattered_types::VoiceCallConfig {
+                enabled: true,
+                provider: zeroclaw_config::scattered_types::VoiceProvider::Twilio,
+                account_id: "AC_TEST".to_string(),
+                auth_token: "test_token".to_string(),
+                from_number: "+15551234567".to_string(),
+                webhook_port: 8090,
+                require_outbound_approval: true,
+                transcription_logging: true,
+                tts_voice: None,
+                max_call_duration_secs: 3600,
+                webhook_base_url: None,
+            });
+        match build_channel_by_id(&config, "voice-call") {
+            Ok(channel) => assert_eq!(channel.name(), "voice_call"),
+            Err(e) => panic!("should succeed when voice-call is configured: {e}"),
         }
     }
 
