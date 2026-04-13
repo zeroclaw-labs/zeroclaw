@@ -379,9 +379,25 @@ impl ContextCompressor {
             }
         }
 
-        // Splice: head + [SUMMARY] + tail
+        // Splice: head + [SUMMARY + post-compaction context] + tail
+        //
+        // P1a: Post-compaction context re-injection.
+        // After compression, the agent loses awareness of its operational state.
+        // We append a continuation prompt so it knows to pick up where it left off
+        // without asking the user to repeat themselves.
+        let post_compact_context = "\n\n\
+[POST-COMPACTION CONTEXT REFRESH]\n\
+The conversation above has been automatically compressed to stay within context limits.\n\
+The summary is a compressed representation — treat it as authoritative context.\n\n\
+IMPORTANT INSTRUCTIONS:\n\
+- Continue your current task from where you left off (check the summary for task status)\n\
+- Do NOT ask the user to repeat their request — the summary contains it\n\
+- Do NOT announce that compression happened — just continue working\n\
+- If the summary mentions files you were editing, re-read them if needed before making changes\n\
+- If the summary mentions an error you were debugging, continue the investigation";
+
         let summary_msg = ChatMessage::assistant(format!(
-            "[CONTEXT SUMMARY \u{2014} {message_count} earlier messages compressed]\n\n{summary}"
+            "[CONTEXT SUMMARY \u{2014} {message_count} earlier messages compressed]\n\n{summary}{post_compact_context}"
         ));
         history.splice(start..end, std::iter::once(summary_msg));
 
