@@ -502,8 +502,10 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
 /// Strip fd-merge redirect patterns (`N>&M`, `N<&M`, `>&N`, `<&N`, `N>&-`, etc.)
 /// so their `&` doesn't get flagged as a background operator.
 fn strip_fd_merge_redirects(command: &str) -> String {
+    use std::sync::OnceLock;
     // Matches patterns like: 2>&1, 1>&2, >&2, <&0, 2<&-, >&-
-    let re = regex::Regex::new(r"\d*[><]&[\d-]").unwrap();
+    static FD_MERGE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = FD_MERGE_RE.get_or_init(|| regex::Regex::new(r"\d*[><]&[\d-]").unwrap());
     re.replace_all(command, "").to_string()
 }
 
@@ -617,12 +619,15 @@ fn contains_unsafe_output_redirect(command: &str) -> bool {
 
     static SAFE_OUTPUT_RE: OnceLock<Regex> = OnceLock::new();
     let re = SAFE_OUTPUT_RE.get_or_init(|| {
-        // Match >SPACE?/dev/{null,zero,stdout,stderr} followed by word boundary
-        // (end of string, space, semicolon, pipe, ampersand, newline, or close paren)
-        Regex::new(r"\d*>[ ]?/dev/(null|zero|stdout|stderr)(\b|$|[;\s|&)])").unwrap()
+        // Match >SPACE?/dev/{null,zero,stdout,stderr} followed by whitespace,
+        // end-of-string, or a shell operator. A dot, slash, or any other
+        // non-operator character after the device name prevents the match —
+        // blocking bypasses like `2>/dev/stderr.log` or `>/dev/zero/path`.
+        // The terminator is captured and preserved in the replacement.
+        Regex::new(r"\d*>[ ]?/dev/(null|zero|stdout|stderr)(\s|[;&|)]|$)").unwrap()
     });
 
-    let safe = re.replace_all(command, "").to_string();
+    let safe = re.replace_all(command, "$2").to_string();
     // Also strip fd-merge redirects (2>&1, 1>&2, >&N, etc.)
     let safe = strip_fd_merge_redirects(&safe);
     contains_unquoted_char(&safe, '>')
@@ -637,12 +642,13 @@ fn contains_unquoted_input_redirect(command: &str) -> bool {
     use std::sync::OnceLock;
 
     static SAFE_INPUT_RE: OnceLock<Regex> = OnceLock::new();
-    let re = SAFE_INPUT_RE.get_or_init(|| {
-        Regex::new(r"<[ ]?/dev/(null|zero)(\b|$|[;\s|&)])").unwrap()
-    });
+    let re =
+        SAFE_INPUT_RE.get_or_init(|| Regex::new(r"<[ ]?/dev/(null|zero)(\s|[;&|)]|$)").unwrap());
 
     let safe = command.replace("<<<", "").replace("<<", "");
-    let safe = re.replace_all(&safe, "").to_string();
+    let safe = re.replace_all(&safe, "$2").to_string();
+    // Also strip fd-merge redirects (<&0, <&-, etc.) so they don't leave a bare `<`
+    let safe = strip_fd_merge_redirects(&safe);
     contains_unquoted_char(&safe, '<')
 }
 
@@ -2414,6 +2420,10 @@ mod tests {
         assert!(!p.is_command_allowed("echo secret>/dev/nullextra"));
         assert!(!p.is_command_allowed("echo secret > /dev/null/../../etc/passwd"));
         assert!(!p.is_command_allowed("echo secret>/dev/stderrfoo"));
+        // Word→non-word boundary bypasses
+        assert!(!p.is_command_allowed("ls 2>/dev/stderr.log"));
+        assert!(!p.is_command_allowed("cat>/dev/zero/path"));
+        assert!(!p.is_command_allowed("echo>/dev/stdout.bak"));
     }
 
     #[test]
@@ -2454,8 +2464,8 @@ mod tests {
         // Bare fd redirects (implicit fd number)
         assert!(p.is_command_allowed("echo error >&2"));
         assert!(p.is_command_allowed("cat <&0"));
-        assert!(p.is_command_allowed("exec >&-"));
-        assert!(p.is_command_allowed("exec 3>&-"));
+        assert!(p.is_command_allowed("echo >&-"));
+        assert!(p.is_command_allowed("echo 3>&-"));
     }
 
     #[test]
@@ -2477,6 +2487,11 @@ mod tests {
         assert!(contains_unquoted_input_redirect("cat < /etc/passwd"));
         assert!(!contains_unquoted_input_redirect("echo 'a<b'"));
         assert!(!contains_unquoted_input_redirect("cat</dev/null"));
+        // Input redirect word→non-word bypass (same fix as output redirects)
+        assert!(contains_unquoted_input_redirect("cat</dev/null.secret"));
+        assert!(contains_unquoted_input_redirect(
+            "cat </dev/zero/etc/passwd"
+        ));
         assert!(!contains_unsafe_output_redirect("cmd 2>/dev/null"));
         assert!(!contains_unsafe_output_redirect("cmd >/dev/null"));
         assert!(!contains_unsafe_output_redirect("cmd 1>/dev/null"));
@@ -2487,6 +2502,11 @@ mod tests {
         assert!(!contains_unsafe_output_redirect("echo > /dev/zero"));
         assert!(contains_unsafe_output_redirect("echo hi > file.txt"));
         assert!(!contains_unsafe_output_redirect("echo 'a>b'"));
+        // Word→non-word boundary bypasses: dot, slash, or other non-operator chars
+        // after a safe device name must NOT strip the redirect
+        assert!(contains_unsafe_output_redirect("ls 2>/dev/stderr.log"));
+        assert!(contains_unsafe_output_redirect("cat>/dev/zero/path"));
+        assert!(contains_unsafe_output_redirect("echo>/dev/stdout.bak"));
     }
 
     #[test]
