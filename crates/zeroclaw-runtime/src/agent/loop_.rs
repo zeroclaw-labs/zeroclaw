@@ -2676,6 +2676,54 @@ pub async fn run(
 
                         continue;
                     }
+
+                    // P0b: Context overflow / 504 recovery for channel mode.
+                    // Channel loop previously returned errors immediately,
+                    // unlike CLI mode which has compress_on_error recovery.
+                    #[cfg(feature = "one2x")]
+                    if zeroclaw_providers::reliable::is_context_window_exceeded(&e)
+                        || format!("{e}").contains("504")
+                        || format!("{e}").contains("Gateway Timeout")
+                    {
+                        tracing::warn!(
+                            "Channel loop: context overflow or 504 detected, attempting recovery via compaction"
+                        );
+                        let mut compressor =
+                            crate::agent::context_compressor::ContextCompressor::new(
+                                config.agent.context_compression.clone(),
+                                config.agent.max_context_tokens,
+                            )
+                            .with_memory(mem.clone());
+                        let error_msg = format!("{e}");
+                        match compressor
+                            .compress_on_error(
+                                &mut history,
+                                provider.as_ref(),
+                                &model_name,
+                                &error_msg,
+                            )
+                            .await
+                        {
+                            Ok(true) => {
+                                tracing::info!(
+                                    "Channel loop: context recovered via compaction, retrying"
+                                );
+                                continue;
+                            }
+                            Ok(false) => {
+                                tracing::warn!(
+                                    "Channel loop: compaction ran but couldn't reduce enough"
+                                );
+                            }
+                            Err(compress_err) => {
+                                tracing::warn!(
+                                    error = %compress_err,
+                                    "Channel loop: compaction itself failed"
+                                );
+                            }
+                        }
+                    }
+
                     return Err(e);
                 }
             }
