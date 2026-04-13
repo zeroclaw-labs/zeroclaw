@@ -91,11 +91,35 @@ Auth profile rotation (OAuth vs API keys) + failover: [Model failover](docs/refe
 
 Runtime: Rust stable toolchain. Single binary, no runtime dependencies.
 
+### cargo binstall (macOS/Linux/Windows)
+
+The fastest way to get the latest pre-built binary without building from source:
+
+```bash
+cargo binstall zeroclaw
+```
+
+If you don't have `cargo-binstall` yet, install it first:
+
+```bash
+cargo install cargo-binstall
+```
+
 ### Homebrew (macOS/Linuxbrew)
 
 ```bash
 brew install zeroclaw
 ```
+
+### Nix
+
+Run directly without installing:
+
+```bash
+nix run github:zeroclaw-labs/zeroclaw
+```
+
+Or add to your flake inputs for a reproducible development environment.
 
 ### One-click bootstrap
 
