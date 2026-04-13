@@ -42,7 +42,6 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use zeroclaw_tools::node_capabilities::RiskLevel;
 
 /// Maximum allowed nesting depth for `zeroclaw_tool_call` host function
 /// invocations.  This prevents infinite recursion when plugin A delegates to
@@ -107,10 +106,11 @@ impl ChannelRateLimiter {
         let timestamps = state.entry(key).or_default();
 
         // Prune expired entries
-        let cutoff = Instant::now() - self.window;
+        let now = Instant::now();
+        let cutoff = now.checked_sub(self.window).unwrap_or(now);
         timestamps.retain(|t| *t > cutoff);
 
-        if timestamps.len() as u32 >= self.max_per_window {
+        if u32::try_from(timestamps.len()).unwrap_or(u32::MAX) >= self.max_per_window {
             return Err(format!(
                 "Rate limit exceeded: plugin '{}' has exhausted its messaging budget for channel '{}'",
                 plugin_name, channel
@@ -161,7 +161,7 @@ impl CliRateLimiter {
         let cutoff = now.checked_sub(self.window).unwrap_or(now);
         timestamps.retain(|t| *t > cutoff);
 
-        if timestamps.len() as u32 >= limit_per_minute {
+        if u32::try_from(timestamps.len()).unwrap_or(u32::MAX) >= limit_per_minute {
             // Calculate time until oldest request expires
             if let Some(oldest) = timestamps.first() {
                 if let Some(expires_at) = oldest.checked_add(self.window) {
@@ -925,7 +925,7 @@ impl HostFunctionRegistry {
                     let err = HostFunctionError::new(format!(
                         "Maximum delegation depth exceeded ({current_depth}/{MAX_TOOL_CALL_DEPTH})"
                     ));
-                    let handle = plugin.memory_new(&err.to_json_bytes())?;
+                    let handle = plugin.memory_new(err.to_json_bytes())?;
                     outputs[0] = plugin.memory_to_val(handle);
                     return Ok(());
                 }
@@ -940,7 +940,7 @@ impl HostFunctionRegistry {
                         "[plugin:{}/zeroclaw_tool_call] tool '{}' is not in allowed_tools",
                         data.plugin_name, request.tool_name
                     ));
-                    let handle = plugin.memory_new(&err.to_json_bytes())?;
+                    let handle = plugin.memory_new(err.to_json_bytes())?;
                     outputs[0] = plugin.memory_to_val(handle);
                     return Ok(());
                 }
@@ -954,7 +954,7 @@ impl HostFunctionRegistry {
                             "[plugin:{}/zeroclaw_tool_call] tool '{}' not found in registry",
                             data.plugin_name, request.tool_name
                         ));
-                        let handle = plugin.memory_new(&err.to_json_bytes())?;
+                        let handle = plugin.memory_new(err.to_json_bytes())?;
                         outputs[0] = plugin.memory_to_val(handle);
                         return Ok(());
                     }
@@ -1042,7 +1042,7 @@ impl HostFunctionRegistry {
                         "[plugin:{}/zeroclaw_send_message] channel '{}' is not in allowed_channels",
                         data.plugin_name, request.channel
                     ));
-                    let handle = plugin.memory_new(&err.to_json_bytes())?;
+                    let handle = plugin.memory_new(err.to_json_bytes())?;
                     outputs[0] = plugin.memory_to_val(handle);
                     return Ok(());
                 }
@@ -1056,7 +1056,7 @@ impl HostFunctionRegistry {
                         "[plugin:{}/zeroclaw_send_message] {}",
                         data.plugin_name, rate_err
                     ));
-                    let handle = plugin.memory_new(&err.to_json_bytes())?;
+                    let handle = plugin.memory_new(err.to_json_bytes())?;
                     outputs[0] = plugin.memory_to_val(handle);
                     return Ok(());
                 }
@@ -1069,7 +1069,7 @@ impl HostFunctionRegistry {
                             "[plugin:{}/zeroclaw_send_message] channel '{}' not found",
                             data.plugin_name, request.channel
                         ));
-                        let handle = plugin.memory_new(&err.to_json_bytes())?;
+                        let handle = plugin.memory_new(err.to_json_bytes())?;
                         outputs[0] = plugin.memory_to_val(handle);
                         return Ok(());
                     }
@@ -1367,7 +1367,8 @@ impl HostFunctionRegistry {
                 let response = execute_cli_command(&data, &request);
 
                 // Calculate duration and log the CLI execution
-                let duration_ms = start_time.elapsed().as_millis() as u64;
+                let duration_ms =
+                    u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
                 let output_bytes = response.stdout.len() + response.stderr.len();
                 let audit_entry = CliAuditEntry::new(
                     &data.plugin_name,
@@ -1401,7 +1402,7 @@ impl HostFunctionRegistry {
     /// The function accepts no WASM-level parameters and returns no values.
     /// Input/output is transferred via Extism shared memory (the JSON ABI),
     /// not through WASM function parameters.
-    fn stub_host_fn(name: &str) -> Function {
+    fn _stub_host_fn(name: &str) -> Function {
         Function::new(
             name,
             [],             // no wasm-level params — data goes via shared memory
@@ -1520,7 +1521,7 @@ pub fn execute_cli_command(data: &CliExecData, request: &CliExecRequest) -> CliE
             .keys()
             .min()
             .and_then(|key| data.allowed_paths.get(key))
-            .map(|path| PathBuf::from(path))
+            .map(PathBuf::from)
     };
 
     // Step 5: Build the command with sanitized environment

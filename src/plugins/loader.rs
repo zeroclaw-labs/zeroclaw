@@ -190,12 +190,13 @@ fn home_dir() -> Option<PathBuf> {
 ///
 /// Paths are expanded (`~` → home dir) before comparison so that both
 /// `~/.ssh` in the forbidden list and `~/.ssh/keys` in allowed_paths match.
+#[allow(clippy::implicit_hasher)]
 pub fn validate_allowed_paths(
     plugin_name: &str,
     allowed_paths: &std::collections::HashMap<String, String>,
     forbidden_paths: &[String],
 ) -> Result<(), PluginError> {
-    for (_guest_path, host_path) in allowed_paths {
+    for host_path in allowed_paths.values() {
         let expanded = expand_user_path(host_path);
         for forbidden in forbidden_paths {
             let forbidden_expanded = expand_user_path(forbidden);
@@ -224,6 +225,7 @@ pub fn validate_allowed_paths(
 /// the logical (lexically cleaned) path is used instead. This allows plugins
 /// to declare paths they intend to create while still blocking symlink escapes
 /// for paths that already exist.
+#[allow(clippy::implicit_hasher)]
 pub fn validate_workspace_paths(
     plugin_name: &str,
     allowed_paths: &std::collections::HashMap<String, String>,
@@ -235,7 +237,7 @@ pub fn validate_workspace_paths(
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
 
-    for (_guest_path, host_path) in allowed_paths {
+    for host_path in allowed_paths.values() {
         let expanded = expand_user_path(host_path);
         let absolute = if expanded.is_relative() {
             workspace_root.join(&expanded)
@@ -399,9 +401,9 @@ impl<'a> PluginLoader<'a> {
     /// Resolve the plugins directory from config, expanding `~` to the user's home.
     fn plugins_dir(&self) -> PathBuf {
         let raw = &self.config.plugins.plugins_dir;
-        if raw.starts_with("~/") {
+        if let Some(rest) = raw.strip_prefix("~/") {
             if let Some(user_dirs) = directories::UserDirs::new() {
-                return user_dirs.home_dir().join(&raw[2..]);
+                return user_dirs.home_dir().join(rest);
             }
         }
         PathBuf::from(raw)

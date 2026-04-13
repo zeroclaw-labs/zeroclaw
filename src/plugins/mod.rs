@@ -14,6 +14,7 @@ pub fn is_sensitive_key(decl: &serde_json::Value) -> bool {
 }
 
 /// Resolve plugin configuration for Extism from ZeroClaw's `config.toml`.
+#[allow(clippy::implicit_hasher)]
 pub fn resolve_plugin_config(
     plugin_name: &str,
     manifest_config: &HashMap<String, serde_json::Value>,

@@ -92,6 +92,20 @@ pub enum PluginError {
         actual: String,
     },
 
+    #[error("download failed: {0}")]
+    DownloadFailed(String),
+
+    #[error("unsupported archive format: {0}")]
+    UnsupportedArchive(String),
+
+    #[error("archive extraction failed: {0}")]
+    ExtractionFailed(String),
+
+    #[error(
+        "manifest not found after extracting archive — expected manifest.toml in root or one subdirectory"
+    )]
+    ManifestNotFoundInArchive,
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

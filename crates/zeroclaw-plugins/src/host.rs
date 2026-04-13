@@ -348,11 +348,39 @@ impl PluginHost {
         Ok(())
     }
 
-    /// Install a plugin from a directory path.
+    /// Install a plugin from a local directory, local archive, or HTTP(S) URL.
+    ///
+    /// Supported sources:
+    /// - **Local directory** — path to a directory containing `manifest.toml`
+    /// - **Local archive** — path to a `.zip`, `.tar.gz`, `.tar.xz`, or `.tar.bz2` file
+    /// - **HTTP(S) URL** — URL to a downloadable archive in any of the above formats
+    ///
+    /// Remote plugins are downloaded, extracted, verified, and copied into the
+    /// plugins directory but are **not auto-enabled**. Use `enable_plugin()` after
+    /// reviewing the manifest and configuring any required keys.
     pub fn install(&mut self, source: &str) -> Result<(), PluginError> {
+        if crate::archive::is_url(source) {
+            self.install_from_url(source)
+        } else {
+            let source_path = PathBuf::from(source);
+            if source_path.is_file() && Self::looks_like_archive(source) {
+                self.install_from_local_archive(&source_path)
+            } else {
+                self.install_from_directory(source)
+            }
+        }
+    }
+
+    /// Install from a local directory path (original behaviour).
+    fn install_from_directory(&mut self, source: &str) -> Result<(), PluginError> {
         let source_path = PathBuf::from(source);
         let manifest_path = if source_path.is_dir() {
-            source_path.join("manifest.toml")
+            let m = source_path.join("manifest.toml");
+            if m.exists() {
+                m
+            } else {
+                source_path.join("plugin.toml")
+            }
         } else {
             source_path.clone()
         };
@@ -369,6 +397,65 @@ impl PluginHost {
             .parent()
             .ok_or_else(|| PluginError::InvalidManifest("no parent directory".into()))?;
 
+        self.install_from_source_dir(source_dir, &manifest_path, &manifest, true)
+    }
+
+    /// Install from a local archive file.
+    fn install_from_local_archive(&mut self, archive_path: &Path) -> Result<(), PluginError> {
+        let url_str = archive_path.to_string_lossy();
+        let format = crate::archive::ArchiveFormat::from_url(&url_str)?;
+
+        let extract_dir = tempfile::TempDir::new().map_err(|e| {
+            PluginError::ExtractionFailed(format!("failed to create temp dir: {e}"))
+        })?;
+
+        crate::archive::extract(archive_path, format, extract_dir.path())?;
+
+        let manifest_path = crate::archive::find_manifest(extract_dir.path())?;
+        let manifest = self.load_manifest(&manifest_path)?;
+        let source_dir = manifest_path
+            .parent()
+            .ok_or_else(|| PluginError::InvalidManifest("no parent directory".into()))?;
+
+        self.install_from_source_dir(source_dir, &manifest_path, &manifest, false)
+        // extract_dir cleaned up on drop
+    }
+
+    /// Install from an HTTP(S) URL pointing to a downloadable archive.
+    fn install_from_url(&mut self, url: &str) -> Result<(), PluginError> {
+        let (_extract_dir, plugin_dir) = crate::archive::download_and_extract(url)?;
+
+        let manifest_path = {
+            let m = plugin_dir.join("manifest.toml");
+            if m.exists() {
+                m
+            } else {
+                plugin_dir.join("plugin.toml")
+            }
+        };
+
+        if !manifest_path.exists() {
+            return Err(PluginError::ManifestNotFoundInArchive);
+        }
+
+        let manifest = self.load_manifest(&manifest_path)?;
+
+        self.install_from_source_dir(&plugin_dir, &manifest_path, &manifest, false)
+        // _extract_dir cleaned up on drop
+    }
+
+    /// Common installation logic: verify, copy to plugins dir, register.
+    ///
+    /// When `auto_enable` is true the plugin is immediately enabled (local
+    /// directory installs). Remote/archive installs set `enabled: false` so the
+    /// operator can review the manifest and configure required keys first.
+    fn install_from_source_dir(
+        &mut self,
+        source_dir: &Path,
+        manifest_path: &Path,
+        manifest: &super::PluginManifest,
+        auto_enable: bool,
+    ) -> Result<(), PluginError> {
         let wasm_source = source_dir.join(&manifest.wasm_path);
         if !wasm_source.exists() {
             return Err(PluginError::NotFound(format!(
@@ -378,22 +465,22 @@ impl PluginHost {
         }
 
         if self.loaded.contains_key(&manifest.name) {
-            return Err(PluginError::AlreadyLoaded(manifest.name));
+            return Err(PluginError::AlreadyLoaded(manifest.name.clone()));
         }
 
         // Verify plugin signature before installing
-        let manifest_toml = std::fs::read_to_string(&manifest_path)?;
+        let manifest_toml = std::fs::read_to_string(manifest_path)?;
         let verification =
-            self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)?;
+            self.verify_plugin_signature(&manifest.name, &manifest_toml, manifest)?;
 
         // Copy plugin to plugins directory
         let dest_dir = self.plugins_dir.join(&manifest.name);
         std::fs::create_dir_all(&dest_dir)?;
 
         // Copy manifest
-        std::fs::copy(&manifest_path, dest_dir.join("manifest.toml"))?;
+        std::fs::copy(manifest_path, dest_dir.join("manifest.toml"))?;
 
-        // Copy WASM file
+        // Copy WASM file (preserving any subdirectory structure)
         let wasm_dest = dest_dir.join(&manifest.wasm_path);
         if let Some(parent) = wasm_dest.parent() {
             std::fs::create_dir_all(parent)?;
@@ -411,15 +498,35 @@ impl PluginHost {
         self.loaded.insert(
             manifest.name.clone(),
             LoadedPlugin {
-                manifest,
+                manifest: manifest.clone(),
                 wasm_path: wasm_dest,
                 verification,
                 wasm_sha256,
-                enabled: true,
+                enabled: auto_enable,
             },
         );
 
+        if !auto_enable {
+            tracing::info!(
+                plugin = %manifest.name,
+                "plugin installed but NOT enabled — use `zeroclaw plugin enable {}` after configuration",
+                manifest.name
+            );
+        }
+
         Ok(())
+    }
+
+    /// Returns true if the path looks like a supported archive file.
+    fn looks_like_archive(path: &str) -> bool {
+        let lower = path.to_lowercase();
+        lower.ends_with(".zip")
+            || lower.ends_with(".tar.gz")
+            || lower.ends_with(".tgz")
+            || lower.ends_with(".tar.xz")
+            || lower.ends_with(".txz")
+            || lower.ends_with(".tar.bz2")
+            || lower.ends_with(".tbz2")
     }
 
     /// Remove a plugin by name.
