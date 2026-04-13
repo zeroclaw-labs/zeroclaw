@@ -493,8 +493,8 @@ pub struct ChannelsConfig {
 ```
 
 That's it. The `#[secret]` annotation automatically:
-- Includes the field in `zeroclaw props list --secrets`
-- Makes it settable via `zeroclaw props set channels.your-channel.bot-token`
+- Includes the field in `zeroclaw config list --secrets`
+- Makes it settable via `zeroclaw config set channels.your-channel.bot-token`
 - Encrypts it on config save and decrypts on load
 - Converts the field name from `snake_case` to `kebab-case` in the CLI
 

@@ -1,35 +1,42 @@
-//! Static file serving for the embedded web dashboard.
+//! Static file serving for the web dashboard.
 //!
-//! Uses `rust-embed` to bundle the `web/dist/` directory into the binary at compile time.
+//! Serves the compiled `web/dist/` directory from the filesystem at runtime.
+//! The directory path is configured via `gateway.web_dist_dir`.
 
 use axum::{
     extract::State,
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
-use rust_embed::Embed;
+use std::path::PathBuf;
 
 use super::AppState;
 
-#[derive(Embed)]
-#[folder = "../../web/dist/"]
-struct WebAssets;
-
 /// Serve static files from `/_app/*` path
-pub async fn handle_static(uri: Uri) -> Response {
+pub async fn handle_static(State(state): State<AppState>, uri: Uri) -> Response {
     let path = uri
         .path()
         .strip_prefix("/_app/")
         .unwrap_or(uri.path())
         .trim_start_matches('/');
 
-    serve_embedded_file(path)
+    serve_fs_file(state.web_dist_dir.as_ref(), path).await
 }
 
 /// SPA fallback: serve index.html for any non-API, non-static GET request.
 /// Injects `window.__ZEROCLAW_BASE__` so the frontend knows the path prefix.
 pub async fn handle_spa_fallback(State(state): State<AppState>) -> Response {
-    let Some(content) = WebAssets::get("index.html") else {
+    let Some(ref dist_dir) = state.web_dist_dir else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Web dashboard not available. Set gateway.web_dist_dir in your config \
+             and build the frontend with: cd web && npm ci && npm run build",
+        )
+            .into_response();
+    };
+
+    let index_path = dist_dir.join("index.html");
+    let Ok(bytes) = tokio::fs::read(&index_path).await else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Web dashboard not available. Build it with: cd web && npm ci && npm run build",
@@ -37,7 +44,7 @@ pub async fn handle_spa_fallback(State(state): State<AppState>) -> Response {
             .into_response();
     };
 
-    let html = String::from_utf8_lossy(&content.data);
+    let html = String::from_utf8_lossy(&bytes);
 
     // Inject path prefix for the SPA and rewrite asset paths in the HTML
     let html = if state.path_prefix.is_empty() {
@@ -63,9 +70,20 @@ pub async fn handle_spa_fallback(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-fn serve_embedded_file(path: &str) -> Response {
-    match WebAssets::get(path) {
-        Some(content) => {
+async fn serve_fs_file(dist_dir: Option<&PathBuf>, path: &str) -> Response {
+    let Some(dir) = dist_dir else {
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
+    };
+
+    // Sanitize: reject path traversal attempts
+    if path.contains("..") {
+        return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
+    }
+
+    let file_path = dir.join(path);
+
+    match tokio::fs::read(&file_path).await {
+        Ok(content) => {
             let mime = mime_guess::from_path(path)
                 .first_or_octet_stream()
                 .to_string();
@@ -85,10 +103,10 @@ fn serve_embedded_file(path: &str) -> Response {
                         },
                     ),
                 ],
-                content.data.to_vec(),
+                content,
             )
                 .into_response()
         }
-        None => (StatusCode::NOT_FOUND, "Not found").into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Not found").into_response(),
     }
 }

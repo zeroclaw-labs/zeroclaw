@@ -1,4 +1,4 @@
-//! Property helpers used by the `Configurable` derive macro and the `zeroclaw props` CLI.
+//! Property helpers used by the `Configurable` derive macro and the `zeroclaw config` CLI.
 
 use crate::traits::{PropFieldInfo, PropKind};
 
