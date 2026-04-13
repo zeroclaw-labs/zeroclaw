@@ -222,6 +222,45 @@ pub fn repair_full_tool_pairing(history: &mut Vec<ChatMessage>) {
 /// Prevents a single huge tool result from consuming >50% of the context window.
 /// Called unconditionally before every LLM request — not just on budget breach.
 /// Pattern from openclaw pre-LLM tool result guard.
+/// Micro-compact: clear old tool results that are unlikely to be relevant.
+/// Tool results older than `keep_recent` user turns are replaced with a
+/// short placeholder. This reduces context without needing an LLM call.
+/// Aligned with Claude Code's microCompact.ts time-based clearing.
+pub fn micro_compact_old_tool_results(history: &mut Vec<ChatMessage>) {
+    const KEEP_RECENT_TURNS: usize = 3;
+    const CLEARED_MSG: &str = "[Old tool result cleared — context compacted]";
+
+    let user_turn_indices: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "user")
+        .map(|(i, _)| i)
+        .collect();
+
+    if user_turn_indices.len() <= KEEP_RECENT_TURNS {
+        return;
+    }
+
+    let cutoff_idx = user_turn_indices[user_turn_indices.len() - KEEP_RECENT_TURNS];
+    let mut cleared = 0usize;
+
+    for msg in history[..cutoff_idx].iter_mut() {
+        if msg.role == "tool" && msg.content.len() > 200 && !msg.content.starts_with(CLEARED_MSG) {
+            msg.content = CLEARED_MSG.to_string();
+            cleared += 1;
+        }
+    }
+
+    if cleared > 0 {
+        tracing::debug!(
+            cleared,
+            cutoff_idx,
+            "micro_compact: cleared old tool results before turn {}",
+            cutoff_idx
+        );
+    }
+}
+
 pub fn limit_tool_result_sizes(history: &mut Vec<ChatMessage>) {
     const TAIL_CHARS: usize = 2_000;
 

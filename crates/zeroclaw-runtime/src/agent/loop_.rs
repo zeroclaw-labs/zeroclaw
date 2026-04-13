@@ -992,6 +992,7 @@ pub async fn run_tool_call_loop(
         #[cfg(feature = "one2x")]
         {
             crate::one2x::session_hygiene::repair_full_tool_pairing(history);
+            crate::one2x::session_hygiene::micro_compact_old_tool_results(history);
             crate::one2x::session_hygiene::limit_tool_result_sizes(history);
         }
 

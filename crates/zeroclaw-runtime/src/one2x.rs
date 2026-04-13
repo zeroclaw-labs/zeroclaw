@@ -94,26 +94,71 @@ pub mod session_hygiene {
         }
     }
 
+    pub fn micro_compact_old_tool_results(history: &mut Vec<ChatMessage>) {
+        const KEEP_RECENT_TURNS: usize = 3;
+        const CLEARED_MSG: &str = "[Old tool result cleared — context compacted]";
+
+        let user_turn_indices: Vec<usize> = history
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == "user")
+            .map(|(i, _)| i)
+            .collect();
+
+        if user_turn_indices.len() <= KEEP_RECENT_TURNS {
+            return;
+        }
+
+        let cutoff_idx = user_turn_indices[user_turn_indices.len() - KEEP_RECENT_TURNS];
+        let mut cleared = 0usize;
+
+        for msg in history[..cutoff_idx].iter_mut() {
+            if msg.role == "tool" && msg.content.len() > 200 && !msg.content.starts_with(CLEARED_MSG)
+            {
+                msg.content = CLEARED_MSG.to_string();
+                cleared += 1;
+            }
+        }
+
+        if cleared > 0 {
+            tracing::debug!(cleared, cutoff_idx, "micro_compact: cleared old tool results");
+        }
+    }
+
     pub fn limit_tool_result_sizes(history: &mut Vec<ChatMessage>) {
+        const TAIL_CHARS: usize = 2_000;
+
         let mut capped = 0usize;
         for msg in history.iter_mut() {
             if msg.role != "tool" || msg.content.len() <= MAX_TOOL_RESULT_PRE_LLM_CHARS {
                 continue;
             }
-            let mut end = MAX_TOOL_RESULT_PRE_LLM_CHARS;
-            while end > 0 && !msg.content.is_char_boundary(end) {
-                end -= 1;
+            let total = msg.content.len();
+            let head_budget = MAX_TOOL_RESULT_PRE_LLM_CHARS.saturating_sub(TAIL_CHARS);
+            let omitted = total - head_budget - TAIL_CHARS;
+
+            let mut head_end = head_budget;
+            while head_end > 0 && !msg.content.is_char_boundary(head_end) {
+                head_end -= 1;
             }
-            let omitted = msg.content.len() - end;
+            let mut tail_start = total.saturating_sub(TAIL_CHARS);
+            while tail_start < total && !msg.content.is_char_boundary(tail_start) {
+                tail_start += 1;
+            }
+
             msg.content = format!(
-                "{}... [{} chars truncated before LLM call]",
-                &msg.content[..end],
-                omitted
+                "{}\n\n... [{} chars omitted] ...\n\n{}",
+                &msg.content[..head_end],
+                omitted,
+                &msg.content[tail_start..]
             );
             capped += 1;
         }
         if capped > 0 {
-            tracing::debug!(capped, "limit_tool_result_sizes: capped oversized tool results");
+            tracing::debug!(
+                capped,
+                "limit_tool_result_sizes: capped oversized tool results (head+tail preserved)"
+            );
         }
     }
 }
