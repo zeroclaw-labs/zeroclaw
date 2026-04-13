@@ -1,0 +1,10 @@
+# Cargo Build Timing Log
+# Format: DATE | COMMAND | DURATION | RESULT | NOTES
+# ──────────────────────────────────────────────────────────────
+
+2026-04-01 | cargo check | 2m 22s | ok | abort + incremental persistence (8 files changed)
+2026-04-01 | cargo check | 8m 57s | ok | abort feature initial build (6 files changed)
+2026-04-01 | cargo test  | ~10m   | ok | 165 passed, 0 failed (abort feature only, before incremental persistence)
+2026-04-01 | cargo build --release | 62m 12s | ok | abort + incremental persistence (8 files changed)
+2026-04-13 | cargo check | 1m 12s | ok | session reset/delete tools (2 files, not registered by default)
+2026-04-13 | cargo test -p zeroclaw-tools | 5m 11s | ok | 1107 passed, 0 failed (session reset/delete tools)

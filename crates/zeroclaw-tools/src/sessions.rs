@@ -451,7 +451,9 @@ impl Tool for SessionDeleteTool {
             }),
             Ok(false) => Ok(ToolResult {
                 success: true,
-                output: format!("Session '{session_id}' not found (may have already been deleted)."),
+                output: format!(
+                    "Session '{session_id}' not found (may have already been deleted)."
+                ),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
@@ -793,10 +795,7 @@ mod tests {
     async fn reset_rejects_empty_session_id() {
         let (_tmp, backend) = test_backend();
         let tool = SessionResetTool::new(backend, test_security());
-        let result = tool
-            .execute(json!({"session_id": ""}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"session_id": ""})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("Invalid"));
     }
@@ -862,10 +861,7 @@ mod tests {
     async fn delete_rejects_empty_session_id() {
         let (_tmp, backend) = test_backend();
         let tool = SessionDeleteTool::new(backend, test_security());
-        let result = tool
-            .execute(json!({"session_id": "   "}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"session_id": "   "})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("Invalid"));
     }
