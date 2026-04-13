@@ -78,11 +78,32 @@ pub fn parse_context_limit_from_error(msg: &str) -> Option<usize> {
 /// Estimate token count for a message history using ~4 chars/token heuristic
 /// with a 1.2x safety margin.
 pub fn estimate_tokens(messages: &[ChatMessage]) -> usize {
+    estimate_tokens_with_anchor(messages, None)
+}
+
+/// Estimate tokens with optional usage anchor from the last LLM response.
+/// When anchor is provided (known_tokens for known_messages_count), we use
+/// the real count for those messages and only estimate the tail.
+/// This aligns with Claude Code's tokenCountWithEstimation pattern.
+pub fn estimate_tokens_with_anchor(
+    messages: &[ChatMessage],
+    anchor: Option<(usize, usize)>,
+) -> usize {
+    if let Some((known_tokens, known_count)) = anchor {
+        if known_count > 0 && known_count <= messages.len() {
+            let tail_start = known_count;
+            let tail_estimate: usize = messages[tail_start..]
+                .iter()
+                .map(|m| m.content.len().div_ceil(4) + 4)
+                .sum();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            return known_tokens + (tail_estimate as f64 * 1.2) as usize;
+        }
+    }
     let raw: usize = messages
         .iter()
         .map(|m| m.content.len().div_ceil(4) + 4)
         .sum();
-    // 1.2x safety margin to account for underestimation
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     {
         (raw as f64 * 1.2) as usize
@@ -134,6 +155,14 @@ Extract ONLY:
 - Critical errors and their resolutions
 
 Format as concise bullet points. Max 20 bullets.";
+
+/// Quality check prompt: verify the summary preserves enough to answer the latest user request.
+#[cfg(feature = "one2x")]
+const QUALITY_CHECK_SYSTEM: &str = "\
+You are a quality checker. Given a compression summary and the latest user message, \
+answer ONLY 'PASS' or 'FAIL'. Answer 'PASS' if the summary preserves enough context \
+to understand and respond to the latest user message. Answer 'FAIL' if critical context \
+needed to answer the user is missing from the summary.";
 
 // ---------------------------------------------------------------------------
 // ContextCompressor
@@ -423,6 +452,47 @@ impl ContextCompressor {
         };
 
         let summary = truncate_chars(&summary_raw, self.config.summary_max_chars);
+
+        // Quality check: verify latest user request survives compression.
+        #[cfg(feature = "one2x")]
+        {
+            let latest_user_msg = history
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+
+            if !latest_user_msg.is_empty() && latest_user_msg.len() > 20 {
+                let qc_prompt = format!(
+                    "Summary:\n{}\n\nLatest user message:\n{}",
+                    &summary, &latest_user_msg
+                );
+                match tokio::time::timeout(
+                    Duration::from_secs(15),
+                    provider.chat_with_system(
+                        Some(QUALITY_CHECK_SYSTEM),
+                        &qc_prompt,
+                        summary_model,
+                        0.0,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(resp)) if resp.trim().to_uppercase().contains("FAIL") => {
+                        tracing::warn!(
+                            "Compaction quality check FAILED — latest user request may not be preserved in summary"
+                        );
+                    }
+                    Ok(Ok(_)) => {
+                        tracing::debug!("Compaction quality check passed");
+                    }
+                    _ => {
+                        tracing::debug!("Quality check skipped (error/timeout)");
+                    }
+                }
+            }
+        }
 
         // Persist the compression summary to memory before discarding old messages.
         // This ensures facts from compressed turns remain retrievable via memory recall.
