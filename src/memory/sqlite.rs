@@ -724,6 +724,183 @@ impl SqliteMemory {
         }
         Ok(results)
     }
+
+    // ── v3.0 Multi-Query Expanded Recall (S3) ────────────────────
+
+    /// Recall with multi-query expansion: expand the query into variations,
+    /// search each independently, and fuse results via RRF.
+    ///
+    /// This is a higher-level entry point that wraps `Memory::recall()`.
+    /// If expansion is disabled or the provider call fails, falls back
+    /// to a single-query recall.
+    pub async fn recall_expanded(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        expander: &super::query_expand::QueryExpander,
+        expand_config: &super::query_expand::QueryExpandConfig,
+        provider: &dyn crate::providers::traits::Provider,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        use super::traits::Memory;
+
+        let queries = expander.expand(query, expand_config, provider).await;
+
+        if queries.len() <= 1 {
+            // No expansion occurred — use standard recall
+            return self.recall(query, limit, session_id).await;
+        }
+
+        // Multi-query RRF: search each variation, merge all results
+        let query_embedding_original = self.get_or_compute_embedding(query).await?;
+
+        let conn = self.conn.clone();
+        let queries_owned: Vec<String> = queries;
+        let sid = session_id.map(String::from);
+        let rrf_k = self.rrf_k;
+        let search_mode = self.search_mode;
+        let vector_weight = self.vector_weight;
+        let keyword_weight = self.keyword_weight;
+        let embedder = self.embedder.clone();
+
+        // Compute embeddings for expanded queries
+        let mut query_embeddings = Vec::new();
+        for q in &queries_owned {
+            match embedder.embed_one(q).await {
+                Ok(emb) if !emb.is_empty() => query_embeddings.push(Some(emb)),
+                _ => query_embeddings.push(query_embedding_original.clone()),
+            }
+        }
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            let session_ref = sid.as_deref();
+
+            // Collect ranked lists from all queries × {vec, fts}
+            let mut all_vec_results: Vec<(String, f32)> = Vec::new();
+            let mut all_fts_results: Vec<(String, f32)> = Vec::new();
+
+            for (i, q) in queries_owned.iter().enumerate() {
+                let fts = Self::fts5_search(&conn, q, limit * 2).unwrap_or_default();
+                all_fts_results.extend(fts);
+
+                if let Some(Some(ref emb)) = query_embeddings.get(i) {
+                    let vec_hits = Self::vector_search(&conn, emb, limit * 2, None, session_ref)
+                        .unwrap_or_default();
+                    all_vec_results.extend(vec_hits);
+                }
+            }
+
+            // Deduplicate by keeping the best score per id for each ranker
+            let dedup_vec = dedup_ranked_list(&all_vec_results);
+            let dedup_fts = dedup_ranked_list(&all_fts_results);
+
+            // Merge via configured strategy
+            let merged = if dedup_vec.is_empty() {
+                dedup_fts
+                    .iter()
+                    .map(|(id, score)| super::vector::ScoredResult {
+                        id: id.clone(),
+                        vector_score: None,
+                        keyword_score: Some(*score),
+                        final_score: *score,
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                match search_mode {
+                    SearchMode::Rrf => {
+                        super::vector::rrf_merge(&dedup_vec, &dedup_fts, rrf_k, limit)
+                    }
+                    SearchMode::Weighted => super::vector::hybrid_merge(
+                        &dedup_vec,
+                        &dedup_fts,
+                        vector_weight,
+                        keyword_weight,
+                        limit,
+                    ),
+                }
+            };
+
+            // Fetch full entries (same as recall())
+            let mut results = Vec::with_capacity(merged.len());
+            if !merged.is_empty() {
+                let placeholders: String = (1..=merged.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT id, key, content, category, created_at, session_id \
+                     FROM memories WHERE id IN ({placeholders})"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let id_params: Vec<Box<dyn rusqlite::types::ToSql>> = merged
+                    .iter()
+                    .map(|s| Box::new(s.id.clone()) as Box<dyn rusqlite::types::ToSql>)
+                    .collect();
+                let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                    id_params.iter().map(AsRef::as_ref).collect();
+                let rows = stmt.query_map(params_ref.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                })?;
+
+                let mut entry_map = std::collections::HashMap::new();
+                for row in rows {
+                    let (id, key, content, cat, ts, sid) = row?;
+                    entry_map.insert(id, (key, content, cat, ts, sid));
+                }
+
+                for scored in &merged {
+                    if let Some((key, content, cat, ts, sid)) = entry_map.remove(&scored.id) {
+                        let entry = MemoryEntry {
+                            id: scored.id.clone(),
+                            key,
+                            content,
+                            category: Self::str_to_category(&cat),
+                            timestamp: ts,
+                            session_id: sid,
+                            score: Some(f64::from(scored.final_score)),
+                            recall_count: 0,
+                            last_recalled: None,
+                        };
+                        if let Some(filter_sid) = session_ref {
+                            if entry.session_id.as_deref() != Some(filter_sid) {
+                                continue;
+                            }
+                        }
+                        results.push(entry);
+                    }
+                }
+            }
+
+            Ok(results)
+        })
+        .await?
+    }
+}
+
+/// Deduplicate a ranked list by keeping the highest score per id.
+fn dedup_ranked_list(items: &[(String, f32)]) -> Vec<(String, f32)> {
+    use std::collections::HashMap;
+    let mut best: HashMap<String, f32> = HashMap::new();
+    for (id, score) in items {
+        best.entry(id.clone())
+            .and_modify(|s| {
+                if *score > *s {
+                    *s = *score;
+                }
+            })
+            .or_insert(*score);
+    }
+    let mut result: Vec<(String, f32)> = best.into_iter().collect();
+    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    result
 }
 
 /// A timeline evidence entry (read from `memory_timeline`).

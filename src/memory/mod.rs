@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod chunk_semantic;
 pub mod chunker;
 pub mod cli;
 pub mod cortex;
@@ -12,6 +13,7 @@ pub mod none;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod qdrant;
+pub mod query_expand;
 pub mod response_cache;
 pub mod snapshot;
 pub mod sqlite;
