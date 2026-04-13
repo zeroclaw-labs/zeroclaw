@@ -98,7 +98,7 @@ Copy the `https://` URL ngrok provides (e.g. `https://abc123.ngrok.io`).
 ## 5. Start ZeroClaw
 
 ```bash
-./target/release/zeroclawlabs --config zeroclaw.toml
+./target/release/zeroclaw --config zeroclaw.toml
 ```
 
 Or via daemon mode:
