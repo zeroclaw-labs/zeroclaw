@@ -243,9 +243,9 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
     })
 }
 
-/// Delegate to the shared `strip_tool_call_tags` in the parent module.
+/// Delegate to the shared `strip_tool_call_tags` in the orchestrator module.
 fn strip_tool_call_tags(message: &str) -> String {
-    super::strip_tool_call_tags(message)
+    crate::orchestrator::strip_tool_call_tags(message)
 }
 
 fn find_matching_close(s: &str) -> Option<usize> {

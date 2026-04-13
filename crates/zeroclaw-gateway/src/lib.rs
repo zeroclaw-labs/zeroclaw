@@ -284,6 +284,10 @@ fn parse_client_ip(value: &str) -> Option<IpAddr> {
     value.parse::<IpAddr>().ok()
 }
 
+fn dirs_data_local() -> Option<std::path::PathBuf> {
+    directories::BaseDirs::new().map(|d| d.data_local_dir().to_path_buf())
+}
+
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
     if let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
         for candidate in xff.split(',') {
@@ -365,6 +369,8 @@ pub struct AppState {
     pub node_registry: Arc<nodes::NodeRegistry>,
     /// Path prefix for reverse-proxy deployments (empty string = no prefix)
     pub path_prefix: String,
+    /// Filesystem path to `web/dist/` for serving the dashboard (None = API-only)
+    pub web_dist_dir: Option<std::path::PathBuf>,
     /// Session backend for persisting gateway WS chat sessions
     pub session_backend: Option<Arc<dyn SessionBackend>>,
     /// Per-session actor queue for serializing concurrent turns
@@ -746,6 +752,44 @@ pub async fn run_gateway(
         }
     }
 
+    // Resolve web_dist_dir: explicit config → auto-detect common locations
+    let web_dist_dir: Option<std::path::PathBuf> = config
+        .gateway
+        .web_dist_dir
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            // Auto-detect: check common locations relative to the binary and CWD
+            let mut candidates = vec![
+                // Relative to CWD (development: running from repo root)
+                std::path::PathBuf::from("web/dist"),
+                // Relative to binary (installed alongside binary)
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.join("web/dist")))
+                    .unwrap_or_default(),
+                // Docker / packaged layout
+                std::path::PathBuf::from("/zeroclaw-data/web/dist"),
+                // AUR / system package
+                std::path::PathBuf::from("/usr/share/zeroclawlabs/web/dist"),
+            ];
+            // XDG data home (prebuilt binary installer)
+            if let Some(data_dir) = dirs_data_local() {
+                candidates.push(data_dir.join("zeroclaw/web/dist"));
+            }
+            candidates
+                .into_iter()
+                .find(|p| !p.as_os_str().is_empty() && p.join("index.html").is_file())
+        });
+
+    if let Some(ref dir) = web_dist_dir {
+        tracing::info!("Web dashboard: serving from {}", dir.display());
+    } else {
+        tracing::info!(
+            "Web dashboard: not available (set gateway.web_dist_dir or ZEROCLAW_WEB_DIST_DIR)"
+        );
+    }
+
     let pfx = path_prefix.unwrap_or("");
     println!("🦀 ZeroClaw Gateway listening on http://{display_addr}{pfx}");
     if let Some(ref url) = tunnel_url {
@@ -861,6 +905,7 @@ pub async fn run_gateway(
         device_registry,
         pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
+        web_dist_dir,
         canvas_store,
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
@@ -2353,6 +2398,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
+            web_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -2424,6 +2470,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
+            web_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -2821,6 +2868,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
+            web_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -2900,6 +2948,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
+            web_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -2991,6 +3040,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
+            web_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -3054,6 +3104,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
+            web_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -3122,6 +3173,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
+            web_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -3195,6 +3247,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
+            web_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,
@@ -3265,6 +3318,7 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
+            web_dist_dir: None,
             session_backend: None,
             session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
                 8, 30, 600,

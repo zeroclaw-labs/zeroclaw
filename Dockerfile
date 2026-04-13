@@ -51,7 +51,6 @@ RUN rm -rf src benches
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
 COPY src/ src/
 COPY benches/ benches/
-COPY --from=web-builder /web/dist web/dist
 COPY *.rs .
 RUN touch src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
@@ -85,6 +84,7 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
         'host = "[::]"' \
         'allow_public_bind = true' \
         'require_pairing = false' \
+        'web_dist_dir = "/zeroclaw-data/web/dist"' \
         '' \
         '[autonomy]' \
         'level = "supervised"' \
@@ -103,6 +103,7 @@ RUN apt-get update && apt-get install -y \
 
 COPY --from=builder /zeroclaw-data /zeroclaw-data
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
+COPY --from=web-builder /web/dist /zeroclaw-data/web/dist
 
 # Overwrite minimal config with DEV template (Ollama defaults)
 COPY dev/config.template.toml /zeroclaw-data/.zeroclaw/config.toml
@@ -135,6 +136,7 @@ FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc7564
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /zeroclaw-data /zeroclaw-data
+COPY --from=web-builder /web/dist /zeroclaw-data/web/dist
 
 # Environment setup
 # Ensure UTF-8 locale so CJK / multibyte input is handled correctly

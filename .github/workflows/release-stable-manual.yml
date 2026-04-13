@@ -284,14 +284,21 @@ jobs:
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }}
+          mkdir -p staging/web
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
+          cp -r web/dist staging/web/dist
+          cd staging
+          tar czf ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} web/dist
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
+        shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }}
+          mkdir -p staging/web
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
+          cp -r web/dist staging/web/dist
+          cd staging
+          7z a ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} web/dist
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
