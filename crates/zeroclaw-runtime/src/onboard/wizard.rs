@@ -169,13 +169,6 @@ fn default_local_url(port: u16, path: &str) -> Option<String> {
     default_local_host().map(|host| format!("http://{}:{}{}", host, port, path))
 }
 
-/// Builds a default URL, falling back to localhost if no container alias is available.
-/// Use this when a fallback is acceptable (e.g., for prompts with user override).
-fn default_local_url_or_localhost(port: u16, path: &str) -> String {
-    let host = default_local_host().unwrap_or("localhost");
-    format!("http://{}:{}{}", host, port, path)
-}
-
 /// Configuration for prompting a local provider endpoint URL.
 struct LocalProviderPromptConfig<'a> {
     /// Display name for the provider (e.g., "llama.cpp", "vLLM")
@@ -6297,6 +6290,12 @@ mod tests {
     use std::sync::OnceLock;
     use tempfile::TempDir;
     use tokio::sync::Mutex;
+
+    /// Builds a default URL, falling back to localhost if no container alias is available.
+    fn default_local_url_or_localhost(port: u16, path: &str) -> String {
+        let host = default_local_host().unwrap_or("localhost");
+        format!("http://{}:{}{}", host, port, path)
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
