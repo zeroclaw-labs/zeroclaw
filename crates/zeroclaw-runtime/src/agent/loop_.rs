@@ -2567,6 +2567,43 @@ pub async fn run(
             &effective_msg,
         );
 
+        // ── P0: Preemptive compaction before LLM call ─────────────────
+        // Estimate tokens BEFORE sending to LLM. If over half the
+        // max_context_tokens threshold, compact now to avoid 504 cascades.
+        #[cfg(feature = "one2x")]
+        {
+            let estimated = crate::agent::context_compressor::estimate_tokens(&history);
+            let threshold = config.agent.max_context_tokens / 2;
+            if estimated > threshold {
+                tracing::info!(
+                    estimated_tokens = estimated,
+                    threshold,
+                    "Preemptive compaction: estimated tokens exceed threshold before LLM call"
+                );
+                let compressor = crate::agent::context_compressor::ContextCompressor::new(
+                    config.agent.context_compression.clone(),
+                    config.agent.max_context_tokens,
+                )
+                .with_memory(mem.clone());
+                match compressor
+                    .compress_if_needed(&mut history, provider.as_ref(), &model_name)
+                    .await
+                {
+                    Ok(result) if result.compressed => {
+                        tracing::info!(
+                            before = result.tokens_before,
+                            after = result.tokens_after,
+                            "Preemptive compaction succeeded"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Preemptive compaction failed, proceeding anyway");
+                    }
+                }
+            }
+        }
+
         #[allow(unused_assignments)]
         let mut response = String::new();
         loop {
