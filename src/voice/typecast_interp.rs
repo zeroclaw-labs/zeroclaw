@@ -259,7 +259,7 @@ async fn typecast_tts_synthesize(
 /// Gemini model used for real-time interpretation translation.
 /// gemini-2.0-flash-lite is the fastest and cheapest option suitable
 /// for phrase-level interpretation where low latency matters.
-const GEMINI_TRANSLATE_MODEL: &str = "gemini-2.0-flash-lite";
+const GEMINI_TRANSLATE_MODEL: &str = "gemini-3.1-flash-lite-preview";
 
 /// Translate text using the Gemini REST API (generateContent).
 ///
