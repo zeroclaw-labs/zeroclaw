@@ -53,7 +53,7 @@ impl NetworkSecurityLevel {
 
     /// Returns `true` if audit logging should be forced for all plugin calls,
     /// even when audit is globally disabled.
-    pub fn requires_forced_audit(&self) -> bool {
+    pub fn requires_forced_audit(self) -> bool {
         matches!(self, Self::Strict | Self::Paranoid)
     }
 }
@@ -592,6 +592,7 @@ pub fn build_extism_manifest_with_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::PluginCapabilities;
     use std::collections::HashMap;
 
     /// Helper: build a minimal `PluginManifest` with sensible defaults.
