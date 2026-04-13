@@ -12213,7 +12213,6 @@ version = "0.6.9"
 dependencies = [
  "aardvark-sys",
  "anyhow",
- "async-imap",
  "async-trait",
  "axum",
  "base64 0.22.1",
@@ -12239,10 +12238,8 @@ dependencies = [
  "hyper-util",
  "image",
  "indicatif",
- "lettre",
  "libc",
  "lru",
- "mail-parser",
  "mime_guess",
  "nanohtml2text",
  "nostr-sdk",

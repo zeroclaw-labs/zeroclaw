@@ -197,11 +197,6 @@ rustls-pki-types = { version = "1.14.0", optional = true }
 tokio-rustls = { version = "0.26.4", optional = true }
 webpki-roots = { version = "1.0.6", optional = true }
 
-# email
-lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"], optional = true }
-mail-parser = { version = "0.11.2", optional = true }
-async-imap = { version = "0.11", features = ["runtime-tokio"], default-features = false, optional = true }
-
 # HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"], optional = true }
 hyper = { version = "1", features = ["http1", "server"], optional = true }
@@ -233,6 +228,7 @@ default = [
 
 # The full agent runtime — agent loop, channels, tools, gateway, TUI, all subsystems.
 # Without this, you get the kernel: config + providers + memory + CLI chat.
+# Heavy-dep channels (email, telegram, lark) are in channels-extended, not here.
 agent-runtime = [
     "dep:zeroclaw-runtime", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
     "dep:rusqlite",
@@ -240,11 +236,9 @@ agent-runtime = [
     "dep:ratatui", "dep:crossterm",
     "dep:tokio-tungstenite", "dep:tokio-socks", "dep:hostname",
     "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots",
-    "dep:lettre", "dep:mail-parser", "dep:async-imap",
     "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tower-http", "dep:http-body-util",
     "dep:mime_guess",
     "gateway", "tui-onboarding",
-    "channel-email", "channel-telegram", "channel-lark",
     "channel-discord", "channel-slack", "channel-signal",
     "channel-mattermost", "channel-irc", "channel-imessage",
     "channel-dingtalk", "channel-qq", "channel-bluesky",
@@ -253,6 +247,12 @@ agent-runtime = [
     "channel-mochat", "channel-wecom", "channel-clawdtalk",
     "channel-webhook", "channel-acp-server", "channel-whatsapp-cloud",
     "channel-voice-call",
+]
+
+# Channels that pull in heavy optional dependencies (image codecs, protobuf,
+# email stack). Enable individually or use this meta-feature.
+channels-extended = [
+    "channel-email", "channel-telegram", "channel-lark",
 ]
 
 # Major subsystems — each forwards to exactly ONE crate
@@ -312,7 +312,7 @@ metrics = ["observability-prometheus"]
 
 # CI meta-feature
 ci-all = [
-    "agent-runtime",
+    "agent-runtime", "channels-extended",
     "channel-nostr", "channel-matrix", "whatsapp-web",
     "observability-prometheus", "observability-otel",
     "hardware", "peripheral-rpi",
