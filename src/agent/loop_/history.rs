@@ -83,11 +83,55 @@ pub(super) fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     history.drain(start..trim_end);
 }
 
+/// Maximum characters retained per tool-result message when building the
+/// compaction transcript. A single large tool result should not crowd out all
+/// other messages, so we cap each one individually before joining.
+const COMPACTION_MAX_TOOL_RESULT_CHARS: usize = 2_000;
+
+/// Truncate a tool message while preserving the `{"tool_call_id": …, "content": …}`
+/// JSON envelope so that downstream consumers can still correlate the result with
+/// its originating call.
+///
+/// When `msg_content` is a JSON object that contains a `tool_call_id` key, only
+/// the inner `content` string is truncated; the surrounding envelope is kept
+/// intact and re-serialised. For any other content format the input is truncated
+/// directly with [`truncate_with_ellipsis`].
+///
+/// Passing `max_chars == 0` is treated as "no limit" and returns the input as-is.
+pub(crate) fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
+    if max_chars == 0 || msg_content.len() <= max_chars {
+        return msg_content.to_string();
+    }
+    if let Ok(mut obj) =
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(msg_content)
+    {
+        if obj.contains_key("tool_call_id") {
+            if let Some(serde_json::Value::String(inner)) = obj.get("content") {
+                let truncated = truncate_with_ellipsis(inner, max_chars);
+                obj.insert(
+                    "content".to_string(),
+                    serde_json::Value::String(truncated),
+                );
+                return serde_json::to_string(&obj)
+                    .unwrap_or_else(|_| msg_content.to_string());
+            }
+        }
+    }
+    truncate_with_ellipsis(msg_content, max_chars)
+}
+
 pub(crate) fn build_compaction_transcript(messages: &[ChatMessage]) -> String {
     let mut transcript = String::new();
     for msg in messages {
         let role = msg.role.to_uppercase();
-        let _ = writeln!(transcript, "{role}: {}", msg.content.trim());
+        // Cap individual tool results so one large result cannot crowd out all
+        // other messages in the compaction transcript.
+        let content = if msg.role == "tool" {
+            truncate_tool_message(msg.content.trim(), COMPACTION_MAX_TOOL_RESULT_CHARS)
+        } else {
+            msg.content.trim().to_string()
+        };
+        let _ = writeln!(transcript, "{role}: {}", content.trim());
     }
 
     if transcript.chars().count() > COMPACTION_MAX_SOURCE_CHARS {
@@ -977,5 +1021,73 @@ mod tests {
         let history: Vec<ChatMessage> = vec![];
         let result = checkpoint_conversation(&history, &provider, "test-model", &mem).await;
         assert!(result.contains("empty"));
+    }
+
+    // ── truncate_tool_message ────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_tool_message_no_op_when_short() {
+        let content = r#"{"tool_call_id":"call_1","content":"short result"}"#;
+        assert_eq!(truncate_tool_message(content, 200), content);
+    }
+
+    #[test]
+    fn truncate_tool_message_no_op_when_max_chars_zero() {
+        let content = r#"{"tool_call_id":"call_1","content":"short result"}"#;
+        assert_eq!(truncate_tool_message(content, 0), content);
+    }
+
+    #[test]
+    fn truncate_tool_message_preserves_envelope_and_truncates_content() {
+        let inner = "x".repeat(500);
+        let content = format!(r#"{{"tool_call_id":"call_1","content":"{inner}"}}"#);
+        let result = truncate_tool_message(&content, 50);
+        let parsed: serde_json::Value = serde_json::from_str(&result)
+            .expect("result should be valid JSON");
+        // envelope fields intact
+        assert_eq!(parsed["tool_call_id"], "call_1");
+        // inner content was truncated
+        let truncated_inner = parsed["content"].as_str().unwrap();
+        assert!(
+            truncated_inner.len() < inner.len(),
+            "content should be shorter after truncation"
+        );
+        assert!(
+            truncated_inner.ends_with("..."),
+            "truncated content should end with ellipsis"
+        );
+    }
+
+    #[test]
+    fn truncate_tool_message_plain_text_fallback() {
+        // No tool_call_id key — should fall back to plain truncation
+        let content = "a".repeat(200);
+        let result = truncate_tool_message(&content, 10);
+        assert!(result.len() < content.len());
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn build_compaction_transcript_caps_tool_result_per_message() {
+        let large_inner = "z".repeat(10_000);
+        let tool_msg = ChatMessage::tool(format!(
+            r#"{{"tool_call_id":"call_big","content":"{large_inner}"}}"#
+        ));
+        let messages = vec![
+            ChatMessage::user("do something"),
+            ChatMessage::assistant("ok"),
+            tool_msg,
+        ];
+        let transcript = build_compaction_transcript(&messages);
+        // The large tool result must not dominate — transcript stays manageable
+        assert!(
+            transcript.chars().count() < 4_000,
+            "transcript should be capped well below 10 000 chars"
+        );
+        // The tool_call_id should still be present in the transcript
+        assert!(
+            transcript.contains("call_big"),
+            "tool_call_id should survive truncation in transcript"
+        );
     }
 }
