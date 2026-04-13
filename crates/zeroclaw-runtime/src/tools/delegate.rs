@@ -650,6 +650,7 @@ impl DelegateTool {
         let parent_tools = Arc::clone(&self.parent_tools);
         let multimodal_config = self.multimodal_config.clone();
         let delegate_config = self.delegate_config.clone();
+        let skills_prompt_mode = self.skills_prompt_mode.clone();
         let workspace_dir = self.workspace_dir.clone();
         let child_token = self.cancellation_token.child_token();
         let task_id_clone = task_id.clone();
@@ -665,6 +666,7 @@ impl DelegateTool {
                 parent_tools,
                 multimodal_config,
                 delegate_config,
+                skills_prompt_mode,
                 workspace_dir: workspace_dir.clone(),
                 cancellation_token: child_token.clone(),
                 memory: None,
@@ -812,6 +814,7 @@ impl DelegateTool {
             let agent_name = agent_name.clone();
             let prompt = prompt.to_string();
             let args_clone = args.clone();
+            let skills_prompt_mode = self.skills_prompt_mode.clone();
 
             handles.push(tokio::spawn(async move {
                 let inner = DelegateTool {
@@ -825,6 +828,7 @@ impl DelegateTool {
                     delegate_config,
                     workspace_dir,
                     cancellation_token,
+                    skills_prompt_mode,
                     memory: None,
                 };
                 let result = Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)).await;
