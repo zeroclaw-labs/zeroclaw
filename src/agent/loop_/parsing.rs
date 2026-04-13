@@ -757,20 +757,29 @@ pub(super) fn parse_xml_attribute_tool_calls(response: &str) -> Vec<ParsedToolCa
 /// }}
 /// /TOOL_CALL
 /// ```
+/// Also handles the square bracket variant emitted by models like MiniMax 2.7:
+/// ```text
+/// [TOOL_CALL]{tool => "shell", args => {--command "echo hello"}}[/TOOL_CALL]
+/// ```
 pub(super) fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     let mut calls = Vec::new();
 
     // Regex to find TOOL_CALL blocks - handle double closing braces }}
-    static PERL_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)TOOL_CALL\s*\{(.+?)\}\}\s*/TOOL_CALL").unwrap());
+    // Matches both `TOOL_CALL { ... }} /TOOL_CALL` and `[TOOL_CALL]{ ... }}[/TOOL_CALL]`
+    static PERL_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)(?:\[TOOL_CALL\]|TOOL_CALL)\s*\{(.+?)\}\}\s*(?:\[/TOOL_CALL\]|/TOOL_CALL)")
+            .unwrap()
+    });
 
     // Regex to find tool => "name" in the content
     static TOOL_NAME_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r#"tool\s*=>\s*"([^"]+)""#).unwrap());
 
-    // Regex to find args => { ... } block
+    // Regex to find args => { ... } block.
+    // The closing brace is optional: in the square bracket variant [TOOL_CALL]{...}}[/TOOL_CALL]
+    // the outer regex may consume the inner closing brace, so the args content may run to end of string.
     static ARGS_BLOCK_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?s)args\s*=>\s*\{(.+?)\}").unwrap());
+        LazyLock::new(|| Regex::new(r"(?s)args\s*=>\s*\{(.+?)(?:\}|$)").unwrap());
 
     // Regex to find --key "value" pairs
     static ARGS_RE: LazyLock<Regex> =
@@ -1673,6 +1682,7 @@ pub(super) fn detect_tool_call_parse_issue(
         || trimmed.contains("```tool ") // Generic ```tool <name> pattern
         || trimmed.contains("\"tool_calls\"")
         || trimmed.contains("TOOL_CALL")
+        || trimmed.contains("[TOOL_CALL]")
         || trimmed.contains("<FunctionCall>");
 
     if looks_like_tool_payload {

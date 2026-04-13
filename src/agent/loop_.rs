@@ -6589,6 +6589,47 @@ Tail"#;
     }
 
     #[test]
+    fn parse_tool_calls_handles_square_bracket_tool_call_blocks() {
+        let response =
+            r#"[TOOL_CALL]{tool => "shell", args => {--command "echo hello"}}[/TOOL_CALL]"#;
+
+        let calls = parse_perl_style_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "echo hello"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_square_bracket_multiline() {
+        let response = r#"[TOOL_CALL]
+{tool => "file_read", args => {
+  --path "/tmp/test.txt"
+  --description "Read test file"
+}}
+[/TOOL_CALL]"#;
+
+        let calls = parse_perl_style_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(
+            calls[0].arguments.get("path").unwrap().as_str().unwrap(),
+            "/tmp/test.txt"
+        );
+        assert_eq!(
+            calls[0]
+                .arguments
+                .get("description")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "Read test file"
+        );
+    }
+
+    #[test]
     fn parse_tool_calls_recovers_unclosed_tool_call_with_json() {
         let response = r#"I will call the tool now.
 <tool_call>
