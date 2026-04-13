@@ -107,7 +107,7 @@ If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.fe
 | Telegram | polling | No |
 | Discord | gateway/websocket | No |
 | Slack | events API | No (token-based channel flow) |
-| Mattermost | polling | No |
+| Mattermost | websocket | No |
 | Matrix | sync API (supports E2EE) | No |
 | Signal | signal-cli HTTP bridge | No (local bridge endpoint) |
 | WhatsApp | webhook (Cloud API) or websocket (Web mode) | Cloud API: Yes (public HTTPS callback), Web mode: No |
@@ -208,9 +208,18 @@ Slack listen behavior:
 [channels_config.mattermost]
 url = "https://mm.example.com"
 bot_token = "mattermost-token"
-channel_id = "channel-id"          # required for listening
+# channel_id = "channel-id"       # optional: filter to a single channel
+# channel_id = "*"                # explicit wildcard (same as omitting)
+# omit channel_id to listen on all channels and DMs via WebSocket
 allowed_users = ["*"]
+mention_only = false               # optional: require @mention in groups (DMs always processed)
 ```
+
+Mattermost listen behavior:
+- Connects via WebSocket (`/api/v4/websocket`) for real-time event delivery.
+- `channel_id` omitted or `"*"`: listen across all accessible channels and DMs.
+- `channel_id = "specific-id"`: listen on all events but only process the specified channel.
+- `mention_only = true`: in group/public channels, only respond to @-mentions. DMs (`channel_type = "D"`) always receive responses regardless of this setting.
 
 ### 4.5 Matrix
 
@@ -519,7 +528,7 @@ rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|D
 | Telegram | `Telegram channel listening for messages...` | `Telegram: ignoring message from unauthorized user:` | `Telegram poll error:` / `Telegram parse error:` / `Telegram polling conflict (409):` |
 | Discord | `Discord: connected and identified` | `Discord: ignoring message from unauthorized user:` | `Discord: received Reconnect (op 7)` / `Discord: received Invalid Session (op 9)` |
 | Slack | `Slack channel listening on #` / `Slack channel_id not set (or '*'); listening across all accessible channels.` | `Slack: ignoring message from unauthorized user:` | `Slack poll error:` / `Slack parse error:` / `Slack channel discovery failed:` |
-| Mattermost | `Mattermost channel listening on` | `Mattermost: ignoring message from unauthorized user:` | `Mattermost poll error:` / `Mattermost parse error:` |
+| Mattermost | `Mattermost: connecting to WebSocket` / `Mattermost: connected and authenticated` | `Mattermost: ignoring message from unauthorized user:` | `Mattermost: websocket read error:` / `Mattermost: WS closed by server` |
 | Matrix | `Matrix channel listening on room` / `Matrix room ... is encrypted; E2EE decryption is enabled via matrix-sdk.` | `Matrix whoami failed; falling back to configured session hints for E2EE session restore:` / `Matrix whoami failed while resolving listener user_id; using configured user_id hint:` | `Matrix sync error: ... retrying...` |
 | Signal | `Signal channel listening via SSE on` | (allowlist checks are enforced by `allowed_from`) | `Signal SSE returned ...` / `Signal SSE connect error:` |
 | WhatsApp (channel) | `WhatsApp channel active (webhook mode).` / `WhatsApp Web connected successfully` | `WhatsApp: ignoring message from unauthorized number:` / `WhatsApp Web: message from ... not in allowed list` | `WhatsApp send failed:` / `WhatsApp Web stream error:` |
