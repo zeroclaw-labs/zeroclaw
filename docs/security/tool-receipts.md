@@ -103,13 +103,12 @@ The LLM may independently include a `Tool receipts:` block in its response text 
 
 ---
 
-## Limitations (Phase 1)
+## Current limitations
 
 - **Passive only**: Receipts are generated and logged but not validated against LLM responses. The system does not block responses with missing or invalid receipts.
 - **No persistent audit**: Receipts are in debug logs and conversation history but not stored in a queryable database.
 - **No cross-session verification**: Ephemeral keys mean receipts cannot be verified after the session ends.
-
-These are addressed in the Phase 2 roadmap (#4830).
+- **Config activation pending**: The `[agent.tool_receipts]` config section is not yet wired. Receipts are currently controlled programmatically via the `ReceiptGenerator` API. Config-driven activation is tracked as a follow-up.
 
 ---
 

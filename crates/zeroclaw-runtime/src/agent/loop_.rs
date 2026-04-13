@@ -796,6 +796,32 @@ fn maybe_inject_channel_delivery_defaults(
 //   • max_iterations is reached (runaway safety), or
 //   • the cancellation token fires (external abort).
 
+/// Append a receipt footer to the response text if any receipts were collected.
+///
+/// Format:
+/// ```text
+/// \n\n---\nTool receipts:\n  shell: zc-receipt-...\n  web_search: zc-receipt-...
+/// ```
+pub fn append_receipt_footer(
+    response: String,
+    collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
+) -> String {
+    let Some(store) = collected_receipts else {
+        return response;
+    };
+    let Ok(receipts) = store.lock() else {
+        return response;
+    };
+    if receipts.is_empty() {
+        return response;
+    }
+    let mut footer = format!("{response}\n\n---\nTool receipts:");
+    for entry in receipts.iter() {
+        footer.push_str(&format!("\n  {entry}"));
+    }
+    footer
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 #[allow(clippy::too_many_arguments)]
@@ -1405,7 +1431,7 @@ pub async fn run_tool_call_loop(
                     !response_streamed_live || display_text != response_text;
                 if !should_emit_post_hoc_chunks {
                     history.push(ChatMessage::assistant(response_text.clone()));
-                    return Ok(display_text);
+                    return Ok(append_receipt_footer(display_text, collected_receipts));
                 }
                 // Clear accumulated progress lines before streaming the final answer.
                 let _ = tx.send(DraftEvent::Clear).await;
@@ -1434,7 +1460,7 @@ pub async fn run_tool_call_loop(
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(display_text);
+            return Ok(append_receipt_footer(display_text, collected_receipts));
         }
 
         // Native tool-call providers can return assistant text separately from
@@ -1951,7 +1977,7 @@ pub async fn run_tool_call_loop(
             if text.is_empty() {
                 anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
             }
-            Ok(text)
+            Ok(append_receipt_footer(text, collected_receipts))
         }
         Err(e) => {
             tracing::warn!(error = %e, "Final summary LLM call failed, bailing");
@@ -7580,5 +7606,47 @@ Let me check the result."#;
         .expect("should succeed without cost scope");
 
         assert_eq!(result, "ok");
+    }
+
+    // ── append_receipt_footer tests ──────────────────────────────
+
+    #[test]
+    fn receipt_footer_empty_receipts_unchanged() {
+        let store = std::sync::Mutex::new(Vec::<String>::new());
+        let result = super::append_receipt_footer("Hello world".to_string(), Some(&store));
+        assert_eq!(result, "Hello world");
+    }
+
+    #[test]
+    fn receipt_footer_none_store_unchanged() {
+        let result = super::append_receipt_footer("Hello world".to_string(), None);
+        assert_eq!(result, "Hello world");
+    }
+
+    #[test]
+    fn receipt_footer_single_receipt() {
+        let store = std::sync::Mutex::new(vec![
+            "shell: zc-receipt-1234567890-abcdef".to_string(),
+        ]);
+        let result = super::append_receipt_footer("The date is Monday.".to_string(), Some(&store));
+        assert_eq!(
+            result,
+            "The date is Monday.\n\n---\nTool receipts:\n  shell: zc-receipt-1234567890-abcdef"
+        );
+    }
+
+    #[test]
+    fn receipt_footer_multiple_receipts() {
+        let store = std::sync::Mutex::new(vec![
+            "shell: zc-receipt-100-aaa".to_string(),
+            "web_search: zc-receipt-200-bbb".to_string(),
+            "file_read: zc-receipt-300-ccc".to_string(),
+        ]);
+        let result = super::append_receipt_footer("Done.".to_string(), Some(&store));
+        let expected = "Done.\n\n---\nTool receipts:\
+            \n  shell: zc-receipt-100-aaa\
+            \n  web_search: zc-receipt-200-bbb\
+            \n  file_read: zc-receipt-300-ccc";
+        assert_eq!(result, expected);
     }
 }
