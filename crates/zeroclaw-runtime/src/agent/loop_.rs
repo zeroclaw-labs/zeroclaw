@@ -1381,7 +1381,7 @@ pub async fn run_tool_call_loop(
             accumulated_display_text.push_str(&display_text);
 
             // If text wasn't streamed live, send it now via post-hoc chunking.
-            // When streamed live, the text is already in the ResponseStream.
+            // When streamed live, the channel already received the deltas.
             if let Some(ref tx) = on_delta
                 && !response_streamed_live
             {
