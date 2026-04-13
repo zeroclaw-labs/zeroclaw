@@ -123,7 +123,7 @@ fn remove_plugin_endpoint_requires_authentication() {
     //
     // The remove_plugin handler must call check_auth before processing
     // any plugin removal logic.
-    let source = include_str!("../../src/gateway/api_plugins.rs");
+    let source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     let fn_start = source
         .find("pub async fn remove_plugin")

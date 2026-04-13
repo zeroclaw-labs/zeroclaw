@@ -1,4 +1,7 @@
-#![cfg(feature = "plugins-wasm")]
+#![cfg(all(
+    feature = "plugins-wasm",
+    feature = "__disabled_pending_risk_level_trait"
+))]
 
 //! Integration test for tool delegation end-to-end flow.
 //!

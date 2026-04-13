@@ -13,7 +13,7 @@
 
 #[test]
 fn install_plugin_endpoint_exists() {
-    let source = include_str!("../../src/gateway/api_plugins.rs");
+    let source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     assert!(
         source.contains("pub async fn install_plugin"),
@@ -23,7 +23,7 @@ fn install_plugin_endpoint_exists() {
 
 #[test]
 fn install_plugin_handler_calls_check_auth() {
-    let source = include_str!("../../src/gateway/api_plugins.rs");
+    let source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     let fn_start = source
         .find("pub async fn install_plugin")
@@ -47,7 +47,7 @@ fn install_plugin_handler_calls_check_auth() {
 
 #[test]
 fn install_plugin_route_registered() {
-    let source = include_str!("../../src/gateway/mod.rs");
+    let source = include_str!("../../crates/zeroclaw-gateway/src/lib.rs");
 
     assert!(
         source.contains("install_plugin"),

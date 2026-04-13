@@ -17,7 +17,7 @@
 /// not implement its own install logic.
 #[test]
 fn install_endpoint_uses_plugin_host_install_method() {
-    let api_source = include_str!("../../src/gateway/api_plugins.rs");
+    let api_source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     // Find the install_plugin function
     let fn_start = api_source
@@ -45,7 +45,7 @@ fn install_endpoint_uses_plugin_host_install_method() {
 /// This test verifies the API creates a PluginHost instance.
 #[test]
 fn install_endpoint_creates_plugin_host() {
-    let api_source = include_str!("../../src/gateway/api_plugins.rs");
+    let api_source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     let fn_start = api_source
         .find("pub async fn install_plugin")
@@ -96,7 +96,7 @@ fn cli_install_uses_plugin_host_install() {
 /// Both implementations should use the same PluginHost type.
 #[test]
 fn both_use_same_plugin_host_type() {
-    let api_source = include_str!("../../src/gateway/api_plugins.rs");
+    let api_source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
     let main_source = include_str!("../../src/main.rs");
 
     // Both must reference the same PluginHost from crate::plugins::host

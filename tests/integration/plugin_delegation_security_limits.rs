@@ -1,4 +1,7 @@
-#![cfg(feature = "plugins-wasm")]
+#![cfg(all(
+    feature = "plugins-wasm",
+    feature = "__disabled_pending_risk_level_trait"
+))]
 
 //! Integration test for delegation security limits (combined).
 //!

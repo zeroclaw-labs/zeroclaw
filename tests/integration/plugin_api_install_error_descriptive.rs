@@ -14,7 +14,7 @@
 
 #[test]
 fn install_plugin_error_includes_error_field() {
-    let source = include_str!("../../src/gateway/api_plugins.rs");
+    let source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     // Find the install_plugin function's error handling
     let fn_start = source
@@ -37,7 +37,7 @@ fn install_plugin_error_includes_error_field() {
 
 #[test]
 fn install_plugin_error_returns_ok_false() {
-    let source = include_str!("../../src/gateway/api_plugins.rs");
+    let source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     let fn_start = source
         .find("pub async fn install_plugin")
@@ -55,7 +55,7 @@ fn install_plugin_error_returns_ok_false() {
 
 #[test]
 fn plugin_error_has_descriptive_messages() {
-    let source = include_str!("../../src/plugins/error.rs");
+    let source = include_str!("../../crates/zeroclaw-plugins/src/error.rs");
 
     // Verify PluginError uses thiserror for descriptive messages
     assert!(
@@ -89,7 +89,7 @@ fn plugin_error_has_descriptive_messages() {
 
 #[test]
 fn plugin_error_not_found_includes_path_info() {
-    let source = include_str!("../../src/plugins/host.rs");
+    let source = include_str!("../../crates/zeroclaw-plugins/src/host.rs");
 
     // Find install function error handling
     let fn_start = source
@@ -114,7 +114,7 @@ fn plugin_error_not_found_includes_path_info() {
 
 #[test]
 fn install_plugin_error_returns_bad_request_status() {
-    let source = include_str!("../../src/gateway/api_plugins.rs");
+    let source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     let fn_start = source
         .find("pub async fn install_plugin")

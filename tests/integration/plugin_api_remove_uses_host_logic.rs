@@ -17,7 +17,7 @@
 /// not implement its own removal logic.
 #[test]
 fn remove_endpoint_uses_plugin_host_remove_method() {
-    let api_source = include_str!("../../src/gateway/api_plugins.rs");
+    let api_source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     // Find the remove_plugin function
     let fn_start = api_source
@@ -45,7 +45,7 @@ fn remove_endpoint_uses_plugin_host_remove_method() {
 /// This test verifies the API creates a PluginHost instance.
 #[test]
 fn remove_endpoint_creates_plugin_host() {
-    let api_source = include_str!("../../src/gateway/api_plugins.rs");
+    let api_source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     let fn_start = api_source
         .find("pub async fn remove_plugin")
@@ -96,7 +96,7 @@ fn cli_remove_uses_plugin_host_remove() {
 /// Both implementations should use the same PluginHost type.
 #[test]
 fn both_remove_use_same_plugin_host_type() {
-    let api_source = include_str!("../../src/gateway/api_plugins.rs");
+    let api_source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
     let main_source = include_str!("../../src/main.rs");
 
     // Both must reference the same PluginHost from crate::plugins::host
@@ -119,7 +119,7 @@ fn both_remove_use_same_plugin_host_type() {
 /// Both CLI and API get this behavior by calling the same method.
 #[test]
 fn plugin_host_remove_is_shared_implementation() {
-    let host_source = include_str!("../../src/plugins/host.rs");
+    let host_source = include_str!("../../crates/zeroclaw-plugins/src/host.rs");
 
     // Verify the remove method exists and handles both in-memory and disk cleanup
     let remove_fn = host_source

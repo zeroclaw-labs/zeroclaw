@@ -60,7 +60,7 @@ fn auth_not_required_when_pairing_disabled() {
 
 #[test]
 fn list_plugins_handler_calls_check_auth() {
-    let source = include_str!("../../src/gateway/api_plugins.rs");
+    let source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     // Find the list_plugins function and verify it calls check_auth before
     // doing any work.
@@ -84,7 +84,7 @@ fn list_plugins_handler_calls_check_auth() {
 
 #[test]
 fn get_plugin_detail_handler_calls_check_auth() {
-    let source = include_str!("../../src/gateway/api_plugins.rs");
+    let source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     let fn_start = source
         .find("pub async fn get_plugin_detail")

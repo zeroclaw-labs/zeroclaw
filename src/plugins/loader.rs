@@ -612,7 +612,7 @@ mod tests {
             timeout_ms: 30_000,
             signature: None,
             publisher_key: None,
-            host_capabilities: Default::default(),
+            host_capabilities: PluginCapabilities::default(),
         }
     }
 
@@ -1092,7 +1092,7 @@ logs  = "/var/log/app"
             "error should name the plugin: {msg}"
         );
         assert!(
-            msg.contains("*"),
+            msg.contains('*'),
             "error should include the offending host: {msg}"
         );
         assert!(
@@ -1243,7 +1243,7 @@ logs  = "/var/log/app"
 
         // Second warning: *
         assert!(
-            captured[1].contains("*"),
+            captured[1].contains('*'),
             "second warning should mention '*': {}",
             captured[1]
         );
@@ -1305,7 +1305,7 @@ logs  = "/var/log/app"
             "error should name the plugin: {msg}"
         );
         assert!(
-            msg.contains("*"),
+            msg.contains('*'),
             "error should include the offending command: {msg}"
         );
         assert!(

@@ -47,7 +47,7 @@ fn install_auth_accepts_valid_token() {
 
 #[test]
 fn install_plugin_calls_check_auth_before_any_work() {
-    let source = include_str!("../../src/gateway/api_plugins.rs");
+    let source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     let fn_start = source
         .find("pub async fn install_plugin")
@@ -72,7 +72,7 @@ fn install_plugin_calls_check_auth_before_any_work() {
 
 #[test]
 fn install_plugin_returns_early_on_auth_failure() {
-    let source = include_str!("../../src/gateway/api_plugins.rs");
+    let source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     let fn_start = source
         .find("pub async fn install_plugin")
@@ -94,7 +94,7 @@ fn install_plugin_returns_early_on_auth_failure() {
 
 #[test]
 fn check_auth_returns_unauthorized_on_failure() {
-    let source = include_str!("../../src/gateway/api_plugins.rs");
+    let source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     let fn_start = source
         .find("fn check_auth")

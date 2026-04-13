@@ -25,7 +25,7 @@ fn setup_host() -> PluginHost {
 
 #[test]
 fn reload_plugins_endpoint_exists() {
-    let source = include_str!("../../src/gateway/api_plugins.rs");
+    let source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     assert!(
         source.contains("pub async fn reload_plugins"),
@@ -35,7 +35,7 @@ fn reload_plugins_endpoint_exists() {
 
 #[test]
 fn reload_plugins_handler_calls_check_auth() {
-    let source = include_str!("../../src/gateway/api_plugins.rs");
+    let source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     let fn_start = source
         .find("pub async fn reload_plugins")
@@ -57,7 +57,7 @@ fn reload_plugins_handler_calls_check_auth() {
 
 #[test]
 fn reload_plugins_handler_calls_host_reload() {
-    let source = include_str!("../../src/gateway/api_plugins.rs");
+    let source = include_str!("../../crates/zeroclaw-gateway/src/api_plugins.rs");
 
     let fn_start = source
         .find("pub async fn reload_plugins")
