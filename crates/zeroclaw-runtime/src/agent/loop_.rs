@@ -3329,11 +3329,7 @@ mod tests {
     use crate::agent::tool_execution::execute_one_tool;
     use tempfile::tempdir;
     use zeroclaw_providers::ChatMessage;
-    use zeroclaw_tool_call_parser::{
-        default_param_for_tool, extract_json_values, map_tool_name_alias, parse_arguments_value,
-        parse_glm_shortened_body, parse_glm_style_tool_calls, parse_tool_call_value,
-        parse_tool_calls_from_json_value,
-    };
+    use zeroclaw_tool_call_parser::parse_tool_calls;
 
     // ── truncate_tool_result tests ────────────────────────────────
 
@@ -6155,14 +6151,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_arguments_value_handles_null() {
-        // Recovery: null arguments are returned as-is (Value::Null)
-        let value = serde_json::json!(null);
-        let result = parse_arguments_value(Some(&value));
-        assert!(result.is_null());
-    }
-
-    #[test]
     fn parse_tool_calls_handles_empty_tool_calls_array() {
         // Recovery: Empty tool_calls array returns original response (no tool parsing)
         let response = r#"{"content": "Hello", "tool_calls": []}"#;
@@ -6187,23 +6175,6 @@ mod tests {
     fn detect_tool_call_parse_issue_ignores_normal_text() {
         let issue = detect_tool_call_parse_issue("Thanks, done.", &[]);
         assert!(issue.is_none());
-    }
-
-    #[test]
-    fn parse_tool_calls_handles_whitespace_only_name() {
-        // Recovery: Whitespace-only tool name should return None
-        let value = serde_json::json!({"function": {"name": "   ", "arguments": {}}});
-        let result = parse_tool_call_value(&value);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn parse_tool_calls_handles_empty_string_arguments() {
-        // Recovery: Empty string arguments should be handled
-        let value = serde_json::json!({"name": "test", "arguments": ""});
-        let result = parse_tool_call_value(&value);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().name, "test");
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -6246,56 +6217,9 @@ mod tests {
     // Recovery Tests - Arguments Parsing
     // ═══════════════════════════════════════════════════════════════════════
 
-    #[test]
-    fn parse_arguments_value_handles_invalid_json_string() {
-        // Recovery: Invalid JSON string should return empty object
-        let value = serde_json::Value::String("not valid json".to_string());
-        let result = parse_arguments_value(Some(&value));
-        assert!(result.is_object());
-        assert!(result.as_object().unwrap().is_empty());
-    }
-
-    #[test]
-    fn parse_arguments_value_handles_none() {
-        // Recovery: None arguments should return empty object
-        let result = parse_arguments_value(None);
-        assert!(result.is_object());
-        assert!(result.as_object().unwrap().is_empty());
-    }
-
     // ═══════════════════════════════════════════════════════════════════════
     // Recovery Tests - JSON Extraction
     // ═══════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn extract_json_values_handles_empty_string() {
-        // Recovery: Empty input should return empty vec
-        let result = extract_json_values("");
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn extract_json_values_handles_whitespace_only() {
-        // Recovery: Whitespace only should return empty vec
-        let result = extract_json_values("   \n\t  ");
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn extract_json_values_handles_multiple_objects() {
-        // Recovery: Multiple JSON objects should all be extracted
-        let input = r#"{"a": 1}{"b": 2}{"c": 3}"#;
-        let result = extract_json_values(input);
-        assert_eq!(result.len(), 3);
-    }
-
-    #[test]
-    fn extract_json_values_handles_arrays() {
-        // Recovery: JSON arrays should be extracted
-        let input = r#"[1, 2, 3]{"key": "value"}"#;
-        let result = extract_json_values(input);
-        assert_eq!(result.len(), 2);
-    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // Recovery Tests - Constants Validation
@@ -6315,179 +6239,6 @@ mod tests {
 
     // ═══════════════════════════════════════════════════════════════════════
     // Recovery Tests - Tool Call Value Parsing
-    // ═══════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn parse_tool_call_value_handles_missing_name_field() {
-        // Recovery: Missing name field should return None
-        let value = serde_json::json!({"function": {"arguments": {}}});
-        let result = parse_tool_call_value(&value);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn parse_tool_call_value_handles_top_level_name() {
-        // Recovery: Tool call with name at top level (non-OpenAI format)
-        let value = serde_json::json!({"name": "test_tool", "arguments": {}});
-        let result = parse_tool_call_value(&value);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().name, "test_tool");
-    }
-
-    #[test]
-    fn parse_tool_call_value_accepts_top_level_parameters_alias() {
-        let value = serde_json::json!({
-            "name": "schedule",
-            "parameters": {"action": "create", "message": "test"}
-        });
-        let result = parse_tool_call_value(&value).expect("tool call should parse");
-        assert_eq!(result.name, "schedule");
-        assert_eq!(
-            result.arguments.get("action").and_then(|v| v.as_str()),
-            Some("create")
-        );
-    }
-
-    #[test]
-    fn parse_tool_call_value_accepts_function_parameters_alias() {
-        let value = serde_json::json!({
-            "function": {
-                "name": "shell",
-                "parameters": {"command": "date"}
-            }
-        });
-        let result = parse_tool_call_value(&value).expect("tool call should parse");
-        assert_eq!(result.name, "shell");
-        assert_eq!(
-            result.arguments.get("command").and_then(|v| v.as_str()),
-            Some("date")
-        );
-    }
-
-    #[test]
-    fn parse_tool_call_value_preserves_tool_call_id_aliases() {
-        let value = serde_json::json!({
-            "call_id": "legacy_1",
-            "function": {
-                "name": "shell",
-                "arguments": {"command": "date"}
-            }
-        });
-        let result = parse_tool_call_value(&value).expect("tool call should parse");
-        assert_eq!(result.tool_call_id.as_deref(), Some("legacy_1"));
-    }
-
-    #[test]
-    fn parse_tool_calls_from_json_value_handles_empty_array() {
-        // Recovery: Empty tool_calls array should return empty vec
-        let value = serde_json::json!({"tool_calls": []});
-        let result = parse_tool_calls_from_json_value(&value);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn parse_tool_calls_from_json_value_handles_missing_tool_calls() {
-        // Recovery: Missing tool_calls field should fall through
-        let value = serde_json::json!({"name": "test", "arguments": {}});
-        let result = parse_tool_calls_from_json_value(&value);
-        assert_eq!(result.len(), 1);
-    }
-
-    #[test]
-    fn parse_tool_calls_from_json_value_handles_top_level_array() {
-        // Recovery: Top-level array of tool calls
-        let value = serde_json::json!([
-            {"name": "tool_a", "arguments": {}},
-            {"name": "tool_b", "arguments": {}}
-        ]);
-        let result = parse_tool_calls_from_json_value(&value);
-        assert_eq!(result.len(), 2);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // GLM-Style Tool Call Parsing
-    // ═══════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn parse_glm_style_browser_open_url() {
-        let response = "browser_open/url>https://example.com";
-        let calls = parse_glm_style_tool_calls(response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "shell");
-        assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
-        assert!(
-            calls[0].1["command"]
-                .as_str()
-                .unwrap()
-                .contains("example.com")
-        );
-    }
-
-    #[test]
-    fn parse_glm_style_shell_command() {
-        let response = "shell/command>ls -la";
-        let calls = parse_glm_style_tool_calls(response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "shell");
-        assert_eq!(calls[0].1["command"], "ls -la");
-    }
-
-    #[test]
-    fn parse_glm_style_http_request() {
-        let response = "http_request/url>https://api.example.com/data";
-        let calls = parse_glm_style_tool_calls(response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "http_request");
-        assert_eq!(calls[0].1["url"], "https://api.example.com/data");
-        assert_eq!(calls[0].1["method"], "GET");
-    }
-
-    #[test]
-    fn parse_glm_style_ignores_plain_url() {
-        // A bare URL should NOT be interpreted as a tool call — this was
-        // causing false positives when LLMs included URLs in normal text.
-        let response = "https://example.com/api";
-        let calls = parse_glm_style_tool_calls(response);
-        assert!(
-            calls.is_empty(),
-            "plain URL must not be parsed as tool call"
-        );
-    }
-
-    #[test]
-    fn parse_glm_style_json_args() {
-        let response = r#"shell/{"command": "echo hello"}"#;
-        let calls = parse_glm_style_tool_calls(response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "shell");
-        assert_eq!(calls[0].1["command"], "echo hello");
-    }
-
-    #[test]
-    fn parse_glm_style_multiple_calls() {
-        let response = r#"shell/command>ls
-browser_open/url>https://example.com"#;
-        let calls = parse_glm_style_tool_calls(response);
-        assert_eq!(calls.len(), 2);
-    }
-
-    #[test]
-    fn parse_glm_style_tool_call_integration() {
-        // Integration test: GLM format should be parsed in parse_tool_calls
-        let response = "Checking...\nbrowser_open/url>https://example.com\nDone";
-        let (text, calls) = parse_tool_calls(response);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "shell");
-        assert!(text.contains("Checking"));
-        assert!(text.contains("Done"));
-    }
-
-    #[test]
-    fn parse_glm_style_rejects_non_http_url_param() {
-        let response = "browser_open/url>javascript:alert(1)";
-        let calls = parse_glm_style_tool_calls(response);
-        assert!(calls.is_empty());
-    }
 
     #[test]
     fn parse_tool_calls_handles_unclosed_tool_call_tag() {
@@ -6852,85 +6603,6 @@ Let me check the result."#;
         assert_eq!(calls[0].arguments["command"], "uname -a");
         assert!(text.contains("Let me check that."));
         assert!(text.contains("Done."));
-    }
-
-    #[test]
-    fn parse_glm_shortened_body_url_to_curl() {
-        // URL values for shell should be wrapped in curl
-        let call = parse_glm_shortened_body("shell>https://example.com/api").unwrap();
-        assert_eq!(call.name, "shell");
-        let cmd = call.arguments["command"].as_str().unwrap();
-        assert!(cmd.contains("curl"));
-        assert!(cmd.contains("example.com"));
-    }
-
-    #[test]
-    fn parse_glm_shortened_body_browser_open_maps_to_shell_command() {
-        // browser_open aliases to shell, and shortened calls must still emit
-        // shell's canonical "command" argument.
-        let call = parse_glm_shortened_body("browser_open>https://example.com").unwrap();
-        assert_eq!(call.name, "shell");
-        let cmd = call.arguments["command"].as_str().unwrap();
-        assert!(cmd.contains("curl"));
-        assert!(cmd.contains("example.com"));
-    }
-
-    #[test]
-    fn parse_glm_shortened_body_memory_recall() {
-        // memory_recall>some query — default param is "query"
-        let call = parse_glm_shortened_body("memory_recall>recent meetings").unwrap();
-        assert_eq!(call.name, "memory_recall");
-        assert_eq!(call.arguments["query"], "recent meetings");
-    }
-
-    #[test]
-    fn parse_glm_shortened_body_function_style_alias_maps_to_message_send() {
-        let call =
-            parse_glm_shortened_body(r#"sendmessage(channel="alerts", message="hi")"#).unwrap();
-        assert_eq!(call.name, "message_send");
-        assert_eq!(call.arguments["channel"], "alerts");
-        assert_eq!(call.arguments["message"], "hi");
-    }
-
-    #[test]
-    fn map_tool_name_alias_direct_coverage() {
-        assert_eq!(map_tool_name_alias("bash"), "shell");
-        assert_eq!(map_tool_name_alias("filelist"), "file_list");
-        assert_eq!(map_tool_name_alias("memorystore"), "memory_store");
-        assert_eq!(map_tool_name_alias("memoryforget"), "memory_forget");
-        assert_eq!(map_tool_name_alias("http"), "http_request");
-        assert_eq!(
-            map_tool_name_alias("totally_unknown_tool"),
-            "totally_unknown_tool"
-        );
-    }
-
-    #[test]
-    fn default_param_for_tool_coverage() {
-        assert_eq!(default_param_for_tool("shell"), "command");
-        assert_eq!(default_param_for_tool("bash"), "command");
-        assert_eq!(default_param_for_tool("file_read"), "path");
-        assert_eq!(default_param_for_tool("memory_recall"), "query");
-        assert_eq!(default_param_for_tool("memory_store"), "content");
-        assert_eq!(default_param_for_tool("web_search_tool"), "query");
-        assert_eq!(default_param_for_tool("web_search"), "query");
-        assert_eq!(default_param_for_tool("search"), "query");
-        assert_eq!(default_param_for_tool("http_request"), "url");
-        assert_eq!(default_param_for_tool("browser_open"), "url");
-        assert_eq!(default_param_for_tool("unknown_tool"), "input");
-    }
-
-    #[test]
-    fn parse_glm_shortened_body_rejects_empty() {
-        assert!(parse_glm_shortened_body("").is_none());
-        assert!(parse_glm_shortened_body("   ").is_none());
-    }
-
-    #[test]
-    fn parse_glm_shortened_body_rejects_invalid_tool_name() {
-        // Tool names with special characters should be rejected
-        assert!(parse_glm_shortened_body("not-a-tool>value").is_none());
-        assert!(parse_glm_shortened_body("tool name>value").is_none());
     }
 
     // ═══════════════════════════════════════════════════════════════════════

@@ -19,7 +19,7 @@ pub struct ParsedToolCall {
     pub tool_call_id: Option<String>,
 }
 
-pub fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
+fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     match raw {
         Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s)
             .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
@@ -66,7 +66,7 @@ pub fn canonicalize_json_for_tool_signature(value: &serde_json::Value) -> serde_
     }
 }
 
-pub fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
+fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     if let Some(function) = value.get("function") {
         let tool_call_id = parse_tool_call_id(value, Some(function));
         let name = function
@@ -110,7 +110,7 @@ pub fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall
     })
 }
 
-pub fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedToolCall> {
+fn parse_tool_calls_from_json_value(value: &serde_json::Value) -> Vec<ParsedToolCall> {
     let mut calls = Vec::new();
 
     if let Some(tool_calls) = value.get("tool_calls").and_then(|v| v.as_array()) {
@@ -425,7 +425,7 @@ fn strip_leading_close_tags(mut input: &str) -> &str {
 /// content inside `<invoke>` tags where the LLM has explicitly indicated intent
 /// to make a tool call. Do NOT use this on raw user input or content that
 /// could contain prompt injection payloads.
-pub fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
+fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
     let mut values = Vec::new();
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -695,7 +695,7 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 /// Parse GLM-style tool calls from response text.
 /// Map tool name aliases from various LLM providers to ZeroClaw tool names.
 /// This handles variations like "fileread" -> "file_read", "bash" -> "shell", etc.
-pub fn map_tool_name_alias(tool_name: &str) -> &str {
+fn map_tool_name_alias(tool_name: &str) -> &str {
     match tool_name {
         // Shell variations (including GLM aliases that map to shell)
         "shell" | "bash" | "sh" | "exec" | "command" | "cmd" | "browser_open" | "browser"
@@ -729,7 +729,7 @@ fn build_curl_command(url: &str) -> Option<String> {
     Some(format!("curl -s '{}'", escaped))
 }
 
-pub fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Option<String>)> {
+fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value, Option<String>)> {
     let mut calls = Vec::new();
 
     for line in text.lines() {
@@ -795,7 +795,7 @@ pub fn parse_glm_style_tool_calls(text: &str) -> Vec<(String, serde_json::Value,
 /// When a model emits a shortened call like `shell>uname -a` (without an
 /// explicit `/param_name`), we need to infer which parameter the value maps
 /// to. This function encodes the mapping for known ZeroClaw tools.
-pub fn default_param_for_tool(tool: &str) -> &'static str {
+fn default_param_for_tool(tool: &str) -> &'static str {
     match tool {
         "shell" | "bash" | "sh" | "exec" | "command" | "cmd" => "command",
         // All file tools default to "path"
@@ -824,7 +824,7 @@ pub fn default_param_for_tool(tool: &str) -> &'static str {
 /// 3. **Attribute-style**: `tool_name key="value" [/]>` — XML-like attributes.
 ///
 /// Returns `None` if the body does not match any of these formats.
-pub fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
+fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
     let body = body.trim();
     if body.is_empty() {
         return None;
@@ -2647,5 +2647,127 @@ Let me check the result."#;
         let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Additional parser internals tests (moved from zeroclaw-runtime to keep
+    // functions crate-private per Beta-tier API stability policy)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_tool_call_value_handles_missing_name_field() {
+        let value = serde_json::json!({"function": {"arguments": {}}});
+        let result = parse_tool_call_value(&value);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_tool_call_value_handles_top_level_name() {
+        let value = serde_json::json!({"name": "test_tool", "arguments": {}});
+        let result = parse_tool_call_value(&value);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "test_tool");
+    }
+
+    #[test]
+    fn parse_tool_call_value_accepts_top_level_parameters_alias() {
+        let value = serde_json::json!({
+            "name": "schedule",
+            "parameters": {"action": "create", "message": "test"}
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "schedule");
+        assert_eq!(
+            result.arguments.get("action").and_then(|v| v.as_str()),
+            Some("create")
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_value_accepts_function_parameters_alias() {
+        let value = serde_json::json!({
+            "function": {
+                "name": "shell",
+                "parameters": {"command": "date"}
+            }
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "shell");
+        assert_eq!(
+            result.arguments.get("command").and_then(|v| v.as_str()),
+            Some("date")
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_value_preserves_tool_call_id_aliases() {
+        let value = serde_json::json!({
+            "call_id": "legacy_1",
+            "function": {
+                "name": "shell",
+                "arguments": {"command": "date"}
+            }
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.tool_call_id.as_deref(), Some("legacy_1"));
+    }
+
+    #[test]
+    fn extract_json_values_handles_empty_string() {
+        let result = extract_json_values("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn extract_json_values_handles_whitespace_only() {
+        let result = extract_json_values(
+            "   
+	  ",
+        );
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn extract_json_values_handles_multiple_objects() {
+        let input = r#"{"a": 1}{"b": 2}{"c": 3}"#;
+        let result = extract_json_values(input);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn extract_json_values_handles_arrays() {
+        let input = r#"[1, 2, 3]{"key": "value"}"#;
+        let result = extract_json_values(input);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn map_tool_name_alias_direct_coverage() {
+        assert_eq!(map_tool_name_alias("bash"), "shell");
+        assert_eq!(map_tool_name_alias("filelist"), "file_list");
+        assert_eq!(map_tool_name_alias("memorystore"), "memory_store");
+        assert_eq!(map_tool_name_alias("memoryforget"), "memory_forget");
+        assert_eq!(map_tool_name_alias("http"), "http_request");
+        assert_eq!(
+            map_tool_name_alias("totally_unknown_tool"),
+            "totally_unknown_tool"
+        );
+    }
+
+    #[test]
+    fn default_param_for_tool_coverage() {
+        assert_eq!(default_param_for_tool("shell"), "command");
+        assert_eq!(default_param_for_tool("bash"), "command");
+        assert_eq!(default_param_for_tool("file_read"), "path");
+        assert_eq!(default_param_for_tool("memory_recall"), "query");
+        assert_eq!(default_param_for_tool("memory_store"), "content");
+        assert_eq!(default_param_for_tool("web_search_tool"), "query");
+        assert_eq!(default_param_for_tool("web_search"), "query");
+        assert_eq!(default_param_for_tool("search"), "query");
+        assert_eq!(default_param_for_tool("http_request"), "url");
+        assert_eq!(default_param_for_tool("browser_open"), "url");
+        assert_eq!(default_param_for_tool("unknown_tool"), "input");
     }
 }
