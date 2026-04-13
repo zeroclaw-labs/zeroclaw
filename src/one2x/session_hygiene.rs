@@ -223,22 +223,36 @@ pub fn repair_full_tool_pairing(history: &mut Vec<ChatMessage>) {
 /// Called unconditionally before every LLM request — not just on budget breach.
 /// Pattern from openclaw pre-LLM tool result guard.
 pub fn limit_tool_result_sizes(history: &mut Vec<ChatMessage>) {
+    const TAIL_CHARS: usize = 2_000;
+
     let mut capped = 0usize;
     for msg in history.iter_mut() {
         if msg.role != "tool" || msg.content.len() <= MAX_TOOL_RESULT_PRE_LLM_CHARS {
             continue;
         }
-        // Try to cap cleanly at a char boundary
-        let mut end = MAX_TOOL_RESULT_PRE_LLM_CHARS;
-        while end > 0 && !msg.content.is_char_boundary(end) {
-            end -= 1;
+        let total = msg.content.len();
+        let head_budget = MAX_TOOL_RESULT_PRE_LLM_CHARS.saturating_sub(TAIL_CHARS);
+        let omitted = total - head_budget - TAIL_CHARS;
+
+        let mut head_end = head_budget;
+        while head_end > 0 && !msg.content.is_char_boundary(head_end) {
+            head_end -= 1;
         }
-        let omitted = msg.content.len() - end;
-        msg.content = format!("{}... [{} chars truncated before LLM call]", &msg.content[..end], omitted);
+        let mut tail_start = total.saturating_sub(TAIL_CHARS);
+        while tail_start < total && !msg.content.is_char_boundary(tail_start) {
+            tail_start += 1;
+        }
+
+        msg.content = format!(
+            "{}\n\n... [{} chars omitted] ...\n\n{}",
+            &msg.content[..head_end],
+            omitted,
+            &msg.content[tail_start..]
+        );
         capped += 1;
     }
     if capped > 0 {
-        tracing::debug!(capped, "limit_tool_result_sizes: capped oversized tool results");
+        tracing::debug!(capped, "limit_tool_result_sizes: capped oversized tool results (head+tail preserved)");
     }
 }
 
