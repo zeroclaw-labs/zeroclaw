@@ -34,7 +34,7 @@ pub use none::NoneMemory;
 pub use postgres::PostgresMemory;
 pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
-pub use sqlite::SqliteMemory;
+pub use sqlite::{SearchMode, SqliteMemory};
 pub use synced::SyncedMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
@@ -283,8 +283,10 @@ pub fn create_memory_with_storage_and_routes(
         let mem = SqliteMemory::with_options(
             workspace_dir,
             embedder,
+            sqlite::SearchMode::from_str_config(&config.search_mode),
             config.vector_weight as f32,
             config.keyword_weight as f32,
+            config.rrf_k as f32,
             config.embedding_cache_size,
             config.sqlite_open_timeout_secs,
             &config.sqlite_journal_mode,

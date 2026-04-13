@@ -25,12 +25,32 @@ const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
 /// - **Hybrid Merge**: weighted fusion of vector + keyword results
 /// - **Embedding Cache**: LRU-evicted cache to avoid redundant API calls
 /// - **Safe Reindex**: temp DB → seed → sync → atomic swap → rollback
+/// Hybrid search strategy for recall queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    /// Classic weighted fusion: `vector_weight * vec + keyword_weight * fts`
+    Weighted,
+    /// Reciprocal Rank Fusion — score-scale agnostic, fairer for BM25 + cosine mixing
+    Rrf,
+}
+
+impl SearchMode {
+    pub fn from_str_config(s: &str) -> Self {
+        match s {
+            "rrf" => Self::Rrf,
+            _ => Self::Weighted,
+        }
+    }
+}
+
 pub struct SqliteMemory {
     conn: Arc<Mutex<Connection>>,
     db_path: PathBuf,
     embedder: Arc<dyn EmbeddingProvider>,
+    search_mode: SearchMode,
     vector_weight: f32,
     keyword_weight: f32,
+    rrf_k: f32,
     cache_max: usize,
 }
 
@@ -39,8 +59,10 @@ impl SqliteMemory {
         Self::with_embedder(
             workspace_dir,
             Arc::new(super::embeddings::NoopEmbedding),
+            SearchMode::Weighted,
             0.7,
             0.3,
+            60.0,
             10_000,
             None,
         )
@@ -54,16 +76,20 @@ impl SqliteMemory {
     pub fn with_embedder(
         workspace_dir: &Path,
         embedder: Arc<dyn EmbeddingProvider>,
+        search_mode: SearchMode,
         vector_weight: f32,
         keyword_weight: f32,
+        rrf_k: f32,
         cache_max: usize,
         open_timeout_secs: Option<u64>,
     ) -> anyhow::Result<Self> {
         Self::with_options(
             workspace_dir,
             embedder,
+            search_mode,
             vector_weight,
             keyword_weight,
+            rrf_k,
             cache_max,
             open_timeout_secs,
             "wal",
@@ -77,8 +103,10 @@ impl SqliteMemory {
     pub fn with_options(
         workspace_dir: &Path,
         embedder: Arc<dyn EmbeddingProvider>,
+        search_mode: SearchMode,
         vector_weight: f32,
         keyword_weight: f32,
+        rrf_k: f32,
         cache_max: usize,
         open_timeout_secs: Option<u64>,
         journal_mode: &str,
@@ -121,8 +149,10 @@ impl SqliteMemory {
             conn: Arc::new(Mutex::new(conn)),
             db_path,
             embedder,
+            search_mode,
             vector_weight,
             keyword_weight,
+            rrf_k,
             cache_max,
         })
     }
@@ -531,6 +561,8 @@ impl Memory for SqliteMemory {
         let sid = session_id.map(String::from);
         let vector_weight = self.vector_weight;
         let keyword_weight = self.keyword_weight;
+        let search_mode = self.search_mode;
+        let rrf_k = self.rrf_k;
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
@@ -546,7 +578,7 @@ impl Memory for SqliteMemory {
                 Vec::new()
             };
 
-            // Hybrid merge
+            // Hybrid merge — branch on search_mode
             let merged = if vector_results.is_empty() {
                 keyword_results
                     .iter()
@@ -558,13 +590,21 @@ impl Memory for SqliteMemory {
                     })
                     .collect::<Vec<_>>()
             } else {
-                vector::hybrid_merge(
-                    &vector_results,
-                    &keyword_results,
-                    vector_weight,
-                    keyword_weight,
-                    limit,
-                )
+                match search_mode {
+                    SearchMode::Rrf => vector::rrf_merge(
+                        &vector_results,
+                        &keyword_results,
+                        rrf_k,
+                        limit,
+                    ),
+                    SearchMode::Weighted => vector::hybrid_merge(
+                        &vector_results,
+                        &keyword_results,
+                        vector_weight,
+                        keyword_weight,
+                        limit,
+                    ),
+                }
             };
 
             // Fetch full entries for merged results in a single query
@@ -1334,7 +1374,7 @@ mod tests {
     fn open_with_timeout_succeeds_when_fast() {
         let tmp = TempDir::new().unwrap();
         let embedder = Arc::new(super::super::embeddings::NoopEmbedding);
-        let mem = SqliteMemory::with_embedder(tmp.path(), embedder, 0.7, 0.3, 1000, Some(5));
+        let mem = SqliteMemory::with_embedder(tmp.path(), embedder, SearchMode::Weighted, 0.7, 0.3, 60.0, 1000, Some(5));
         assert!(
             mem.is_ok(),
             "open with 5s timeout should succeed on fast path"
@@ -1348,8 +1388,10 @@ mod tests {
         let mem = SqliteMemory::with_embedder(
             tmp.path(),
             Arc::new(super::super::embeddings::NoopEmbedding),
+            SearchMode::Weighted,
             0.7,
             0.3,
+            60.0,
             1000,
             Some(2),
         )
@@ -1372,7 +1414,7 @@ mod tests {
     fn with_embedder_noop() {
         let tmp = TempDir::new().unwrap();
         let embedder = Arc::new(super::super::embeddings::NoopEmbedding);
-        let mem = SqliteMemory::with_embedder(tmp.path(), embedder, 0.7, 0.3, 1000, None);
+        let mem = SqliteMemory::with_embedder(tmp.path(), embedder, SearchMode::Weighted, 0.7, 0.3, 60.0, 1000, None);
         assert!(mem.is_ok());
         assert_eq!(mem.unwrap().name(), "sqlite");
     }

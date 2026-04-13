@@ -4237,12 +4237,20 @@ pub struct MemoryConfig {
     /// Embedding vector dimensions
     #[serde(default = "default_embedding_dims")]
     pub embedding_dimensions: usize,
+    /// Hybrid search strategy: "weighted" (classic 0.7*vec + 0.3*fts) or "rrf" (Reciprocal Rank Fusion).
+    /// RRF is score-scale agnostic and fairer when mixing BM25 + cosine.
+    /// Default: "weighted" (switch to "rrf" after benchmark validation).
+    #[serde(default = "default_search_mode")]
+    pub search_mode: String,
     /// Weight for vector similarity in hybrid search (0.0–1.0)
     #[serde(default = "default_vector_weight")]
     pub vector_weight: f64,
     /// Weight for keyword BM25 in hybrid search (0.0–1.0)
     #[serde(default = "default_keyword_weight")]
     pub keyword_weight: f64,
+    /// RRF constant k (default: 60.0). Higher k reduces the influence of top ranks.
+    #[serde(default = "default_rrf_k")]
+    pub rrf_k: f64,
     /// Minimum hybrid score (0.0–1.0) for a memory to be included in context.
     /// Memories scoring below this threshold are dropped to prevent irrelevant
     /// context from bleeding into conversations. Default: 0.4
@@ -4327,6 +4335,12 @@ fn default_purge_after_days() -> u32 {
 fn default_conversation_retention_days() -> u32 {
     30
 }
+fn default_search_mode() -> String {
+    "weighted".into()
+}
+fn default_rrf_k() -> f64 {
+    60.0
+}
 fn default_embedding_model() -> String {
     "text-embedding-3-small".into()
 }
@@ -4364,11 +4378,13 @@ impl Default for MemoryConfig {
             archive_after_days: default_archive_after_days(),
             purge_after_days: default_purge_after_days(),
             conversation_retention_days: default_conversation_retention_days(),
+            search_mode: default_search_mode(),
             embedding_provider: default_embedding_provider(),
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
             vector_weight: default_vector_weight(),
             keyword_weight: default_keyword_weight(),
+            rrf_k: default_rrf_k(),
             min_relevance_score: default_min_relevance_score(),
             embedding_cache_size: default_cache_size(),
             chunk_max_tokens: default_chunk_size(),
