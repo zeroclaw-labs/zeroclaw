@@ -11,16 +11,14 @@
 //!
 //! # Extension
 //!
-//! To add a new channel, implement [`Channel`] in a new submodule and wire it into
-//! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
+//! To add a new channel, implement [`Channel`] in a new top-level module in
+//! `zeroclaw-channels/src/`, declare it in `lib.rs` behind the appropriate feature
+//! gate, and wire it into [`start_channels`] here. See `AGENTS.md` §7.2 for the
+//! full change playbook.
 
 pub mod acp_server;
-#[cfg(feature = "channel-matrix")]
-pub mod matrix;
 pub mod media_pipeline;
 pub mod mqtt;
-#[cfg(feature = "channel-telegram")]
-pub mod telegram;
 
 // Channel types imported directly from source crates (no shim files)
 pub use crate::bluesky::BlueskyChannel;
@@ -36,6 +34,8 @@ pub use crate::imessage::IMessageChannel;
 pub use crate::irc::IrcChannel;
 #[cfg(feature = "channel-lark")]
 pub use crate::lark::LarkChannel;
+#[cfg(feature = "channel-line")]
+pub use crate::line::LineChannel;
 pub use crate::linq::LinqChannel;
 pub use crate::mattermost::MattermostChannel;
 pub use crate::mochat::MochatChannel;
@@ -50,6 +50,7 @@ pub use crate::slack::SlackChannel;
 pub use crate::transcription;
 pub use crate::tts::{TtsManager, TtsProvider};
 pub use crate::twitter::TwitterChannel;
+#[cfg(feature = "channel-voice-call")]
 pub use crate::voice_call::VoiceCallChannel;
 #[cfg(feature = "voice-wake")]
 pub use crate::voice_wake::VoiceWakeChannel;
@@ -61,12 +62,12 @@ pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
 pub use crate::link_enricher;
+#[cfg(feature = "channel-matrix")]
+pub use crate::matrix::MatrixChannel;
+#[cfg(feature = "channel-telegram")]
+pub use crate::telegram::TelegramChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use crate::whatsapp_web::WhatsAppWebChannel;
-#[cfg(feature = "channel-matrix")]
-pub use matrix::MatrixChannel;
-#[cfg(feature = "channel-telegram")]
-pub use telegram::TelegramChannel;
 pub use zeroclaw_infra::debounce::MessageDebouncer;
 pub use zeroclaw_infra::session_backend::SessionBackend;
 pub use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
@@ -461,7 +462,7 @@ fn is_stop_command(content: &str) -> bool {
 /// `<tool_call>`, `<toolcall>`, `<tool-call>`, `<tool>`, or `<invoke>`
 /// blocks that are internal protocol and must not be forwarded to end
 /// users on any channel.
-fn strip_tool_call_tags(message: &str) -> String {
+pub(crate) fn strip_tool_call_tags(message: &str) -> String {
     const TOOL_CALL_OPEN_TAGS: [&str; 7] = [
         "<function_calls>",
         "<function_call>",
@@ -4227,10 +4228,40 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .context("iMessage channel is not configured")?;
             Ok(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())))
         }
+        "line" => {
+            #[cfg(feature = "channel-line")]
+            {
+                let ln = config
+                    .channels_config
+                    .line
+                    .as_ref()
+                    .context("LINE channel is not configured")?;
+                Ok(Arc::new(LineChannel::from_config(ln)))
+            }
+            #[cfg(not(feature = "channel-line"))]
+            {
+                anyhow::bail!("LINE channel requires the `channel-line` feature");
+            }
+        }
+        "voice-call" => {
+            #[cfg(feature = "channel-voice-call")]
+            {
+                let vc = config
+                    .channels_config
+                    .voice_call
+                    .as_ref()
+                    .context("Voice Call channel is not configured")?;
+                Ok(Arc::new(VoiceCallChannel::new(vc.clone())))
+            }
+            #[cfg(not(feature = "channel-voice-call"))]
+            {
+                anyhow::bail!("Voice Call channel requires the `channel-voice-call` feature");
+            }
+        }
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, discord_history, imessage"
+            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line, voice-call"
         ),
     }
 }
@@ -4619,10 +4650,14 @@ fn collect_configured_channels(
 
     #[cfg(feature = "channel-email")]
     if let Some(ref email_cfg) = config.channels_config.email {
-        channels.push(ConfiguredChannel {
-            display_name: "Email",
-            channel: Arc::new(EmailChannel::new(email_cfg.clone())),
-        });
+        if email_cfg.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "Email",
+                channel: Arc::new(EmailChannel::new(email_cfg.clone())),
+            });
+        } else {
+            tracing::info!("Email channel configured but disabled (enabled = false)");
+        }
     }
 
     #[cfg(feature = "channel-email")]
@@ -4710,6 +4745,27 @@ fn collect_configured_channels(
     if config.channels_config.lark.is_some() || config.channels_config.feishu.is_some() {
         tracing::warn!(
             "Lark/Feishu channel is configured but this build was compiled without `channel-lark`; skipping Lark/Feishu health check."
+        );
+    }
+
+    #[cfg(feature = "channel-line")]
+    if let Some(ref ln) = config.channels_config.line {
+        if ln.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "LINE",
+                channel: Arc::new(
+                    LineChannel::from_config(ln).with_transcription(config.transcription.clone()),
+                ),
+            });
+        } else {
+            tracing::info!("LINE channel configured but disabled (enabled = false)");
+        }
+    }
+
+    #[cfg(not(feature = "channel-line"))]
+    if config.channels_config.line.is_some() {
+        tracing::warn!(
+            "LINE channel is configured but this build was compiled without `channel-line`; skipping LINE health check."
         );
     }
 
@@ -4857,6 +4913,18 @@ fn collect_configured_channels(
                 config.transcription.clone(),
             )),
         });
+    }
+
+    #[cfg(feature = "channel-voice-call")]
+    if let Some(ref vc) = config.channels_config.voice_call {
+        if vc.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "Voice Call",
+                channel: Arc::new(VoiceCallChannel::new(vc.clone())),
+            });
+        } else {
+            tracing::info!("Voice Call channel configured but disabled (enabled = false)");
+        }
     }
 
     if let Some(ref wh) = config.channels_config.webhook {
@@ -10285,6 +10353,41 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    #[cfg(feature = "channel-email")]
+    #[test]
+    fn collect_configured_channels_skips_disabled_email() {
+        let mut config = Config::default();
+        config.channels_config.email = Some(zeroclaw_config::scattered_types::EmailConfig {
+            enabled: false,
+            ..Default::default()
+        });
+
+        let channels = collect_configured_channels(&config, "test");
+        assert!(
+            !channels.iter().any(|entry| entry.display_name == "Email"),
+            "disabled email should not be collected"
+        );
+    }
+
+    #[cfg(feature = "channel-voice-call")]
+    #[test]
+    fn collect_configured_channels_skips_disabled_voice_call() {
+        let mut config = Config::default();
+        config.channels_config.voice_call =
+            Some(zeroclaw_config::scattered_types::VoiceCallConfig {
+                enabled: false,
+                ..Default::default()
+            });
+
+        let channels = collect_configured_channels(&config, "test");
+        assert!(
+            !channels
+                .iter()
+                .any(|entry| entry.display_name == "Voice Call"),
+            "disabled voice-call should not be collected"
+        );
+    }
+
     struct AlwaysFailChannel {
         name: &'static str,
         calls: Arc<AtomicUsize>,
@@ -11380,6 +11483,46 @@ This is an example JSON object for profile settings."#;
         match build_channel_by_id(&config, "telegram") {
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
             Err(e) => panic!("should succeed when telegram is configured: {e}"),
+        }
+    }
+
+    #[cfg(feature = "channel-voice-call")]
+    #[test]
+    fn build_channel_by_id_unconfigured_voice_call_returns_error() {
+        let config = Config::default();
+        match build_channel_by_id(&config, "voice-call") {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("not configured"),
+                    "expected 'not configured' in error, got: {err_msg}"
+                );
+            }
+            Ok(_) => panic!("should fail when voice-call is not configured"),
+        }
+    }
+
+    #[cfg(feature = "channel-voice-call")]
+    #[test]
+    fn build_channel_by_id_configured_voice_call_succeeds() {
+        let mut config = Config::default();
+        config.channels_config.voice_call =
+            Some(zeroclaw_config::scattered_types::VoiceCallConfig {
+                enabled: true,
+                provider: zeroclaw_config::scattered_types::VoiceProvider::Twilio,
+                account_id: "AC_TEST".to_string(),
+                auth_token: "test_token".to_string(),
+                from_number: "+15551234567".to_string(),
+                webhook_port: 8090,
+                require_outbound_approval: true,
+                transcription_logging: true,
+                tts_voice: None,
+                max_call_duration_secs: 3600,
+                webhook_base_url: None,
+            });
+        match build_channel_by_id(&config, "voice-call") {
+            Ok(channel) => assert_eq!(channel.name(), "voice_call"),
+            Err(e) => panic!("should succeed when voice-call is configured: {e}"),
         }
     }
 

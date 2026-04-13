@@ -26,13 +26,13 @@ Core architecture is trait-driven and modular. Extend by implementing traits and
 
 Key extension points:
 
-- `src/providers/traits.rs` (`Provider`)
-- `src/channels/traits.rs` (`Channel`)
-- `src/tools/traits.rs` (`Tool`)
-- `src/memory/traits.rs` (`Memory`)
-- `src/observability/traits.rs` (`Observer`)
-- `src/runtime/traits.rs` (`RuntimeAdapter`)
-- `src/peripherals/traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
+- `crates/zeroclaw-api/src/provider.rs` (`Provider`)
+- `crates/zeroclaw-api/src/channel.rs` (`Channel`)
+- `crates/zeroclaw-api/src/tool.rs` (`Tool`)
+- `crates/zeroclaw-api/src/memory_traits.rs` (`Memory`)
+- `crates/zeroclaw-api/src/observability_traits.rs` (`Observer`)
+- `crates/zeroclaw-api/src/runtime_traits.rs` (`RuntimeAdapter`)
+- `crates/zeroclaw-api/src/peripherals_traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
 
 ## Stability Tiers
 
@@ -62,25 +62,30 @@ Tiers are promoted, never demoted, through deliberate team decision.
 ## Repository Map
 
 - `src/main.rs` — CLI entrypoint and command routing
-- `src/lib.rs` — module exports and shared command enums
-- `src/config/` — schema + config loading/merging
-- `src/agent/` — orchestration loop
-- `src/gateway/` — webhook/gateway server
-- `src/security/` — policy, pairing, secret store
-- `src/memory/` — markdown/sqlite memory backends + embeddings/vector merge
-- `src/providers/` — model providers and resilient wrapper
-- `src/channels/` — Telegram/Discord/Slack/etc channels
-- `src/tools/` — tool execution surface (shell, file, memory, browser)
-- `src/peripherals/` — hardware peripherals (STM32, RPi GPIO)
-- `src/runtime/` — runtime adapters (currently native)
+- `src/lib.rs` — module re-exports and CLI command enum definitions
+- `crates/zeroclaw-api/` — public trait definitions (Provider, Channel, Tool, Memory, Observer, Peripheral)
+- `crates/zeroclaw-config/` — schema, config loading/merging
+- `crates/zeroclaw-macros/` — Configurable derive macro
+- `crates/zeroclaw-providers/` — model providers and resilient wrapper
+- `crates/zeroclaw-channels/` — messaging platform integrations (30+ channels)
+- `crates/zeroclaw-channels/src/orchestrator/` — channel lifecycle, routing, media pipeline
+- `crates/zeroclaw-tools/` — tool execution surface (shell, file, memory, browser)
+- `crates/zeroclaw-runtime/` — agent loop, security, cron, SOP, skills, onboarding wizard, observability
+- `crates/zeroclaw-memory/` — memory backends (markdown, sqlite, embeddings, vector merge)
+- `crates/zeroclaw-infra/` — shared infrastructure (debounce, session, stall watchdog)
+- `crates/zeroclaw-gateway/` — webhook/gateway server (separate binary)
+- `crates/zeroclaw-hardware/` — USB discovery, peripherals, serial, GPIO
+- `crates/zeroclaw-tui/` — TUI onboarding wizard
+- `crates/zeroclaw-plugins/` — WASM plugin system
+- `crates/zeroclaw-tool-call-parser/` — tool call parsing
 - `docs/` — topic-based documentation (setup-guides, reference, ops, security, hardware, contributing, maintainers)
 - `.github/` — CI, templates, automation workflows
 
 ## Risk Tiers
 
 - **Low risk**: docs/chore/tests-only changes
-- **Medium risk**: most `src/**` behavior changes without boundary/security impact
-- **High risk**: `src/security/**`, `src/runtime/**`, `src/gateway/**`, `src/tools/**`, `.github/workflows/**`, access-control boundaries
+- **Medium risk**: most `crates/*/src/**` behavior changes without boundary/security impact
+- **High risk**: `crates/zeroclaw-runtime/src/**` (especially `src/security/`), `crates/zeroclaw-gateway/src/**`, `crates/zeroclaw-tools/src/**`, `.github/workflows/**`, access-control boundaries
 
 When uncertain, classify as higher risk.
 

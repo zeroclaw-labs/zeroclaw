@@ -517,6 +517,7 @@ mod tests {
 
     fn test_config() -> VoiceCallConfig {
         VoiceCallConfig {
+            enabled: true,
             provider: VoiceProvider::Twilio,
             account_id: "AC_TEST_ACCOUNT".into(),
             auth_token: "test_token".into(),

@@ -130,4 +130,5 @@ Return the resulting issue URL to the user.
 - **Use neutral project-scoped placeholders** per ZeroClaw's privacy contract.
 - **One concept per issue** — enforce the scope guard.
 - **Auto-detect, don't guess** — use real command output for environment fields.
+- **Quote observed output verbatim** — error messages, stack traces, warnings, and command output must be copy-pasted into the relevant fields (`Steps to reproduce`, `Observed behavior`, `Logs`) exactly as they appeared. Do not paraphrase. Do not summarize. The maintainer searching for this bug later will grep for the exact string; paraphrase breaks that search. If the output is long, include the head and tail with a `...` marker in the middle rather than rewriting it.
 - **Match GitHub's rendering** — use `### Field Label` sections so issues look consistent whether filed via web UI or this skill.
