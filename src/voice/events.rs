@@ -38,6 +38,9 @@ pub enum ClientMessage {
         /// Device identifier (for multi-device speaker separation).
         #[serde(rename = "deviceId")]
         device_id: String,
+        /// Voice/STT provider: "gemini", "openai", or "deepgram".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
         /// Optional domain specialization.
         #[serde(skip_serializing_if = "Option::is_none")]
         domain: Option<String>,
@@ -218,6 +221,7 @@ mod tests {
             target_lang: "en".into(),
             mode: InterpretationMode::Simultaneous,
             device_id: "device-a".into(),
+            provider: None,
             domain: None,
             formality: None,
         };

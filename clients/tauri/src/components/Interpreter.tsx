@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { t, type Locale } from "../lib/i18n";
 import { apiClient } from "../lib/api";
+import type { MicVAD as MicVADType } from "@ricky0123/vad-web";
 
 interface InterpreterProps {
   locale: Locale;
@@ -17,7 +18,7 @@ interface Transcript {
 }
 
 type ConnectionStatus = "idle" | "connecting" | "ready" | "listening" | "stopping" | "error";
-type VoiceProvider = "gemini" | "openai";
+type VoiceProvider = "gemini" | "openai" | "deepgram";
 
 // "auto" = auto-detect language from speech input
 const LANGUAGES = [
@@ -142,7 +143,7 @@ export function Interpreter({
 }: InterpreterProps) {
   void onBack; // available for future navigation
   const [status, setStatus] = useState<ConnectionStatus>("idle");
-  const [provider, setProvider] = useState<VoiceProvider>("gemini");
+  const [provider, setProvider] = useState<VoiceProvider>("deepgram");
   // Default: auto-detect source language, translate to English, bidirectional
   const [sourceLang, setSourceLang] = useState("auto");
   const [targetLang, setTargetLang] = useState("en");
@@ -163,9 +164,10 @@ export function Interpreter({
   const playbackCtxRef = useRef<AudioContext | null>(null);
   const micMutedRef = useRef(false); // mute mic while audio plays back
   const speakerModeRef = useRef(true); // ref mirror for use in callbacks
-  const activeProviderRef = useRef<VoiceProvider>("gemini");
+  const activeProviderRef = useRef<VoiceProvider>("deepgram");
   const inputSampleRateRef = useRef(16000); // from server ready message
   const transcriptEndRef = useRef<HTMLDivElement>(null);
+  const micVadRef = useRef<MicVADType | null>(null); // Silero VAD instance (Deepgram mode)
 
   // Keep ref in sync with state for use inside callbacks
   useEffect(() => { speakerModeRef.current = speakerMode; }, [speakerMode]);
@@ -272,59 +274,48 @@ export function Interpreter({
     setStatus("connecting");
     setTranscripts([]);
     sessionStartRef.current = Date.now();
-    addTranscript("system", `Connecting to server... (${apiClient.getServerUrl()})`);
+    activeProviderRef.current = provider;
+    addTranscript("system", `Connecting (${provider})... (${apiClient.getServerUrl()})`);
 
     try {
-      // 1. Create voice session via local MoA gateway
-      //    Voice interpretation runs locally — no Railway server involved.
-      //    Gemini Live API is called directly from the local agent.
       const serverUrl = apiClient.getServerUrl();
       const token = apiClient.getToken();
       if (!token) {
         throw new Error("Not authenticated — please log in first");
       }
 
-      const res = await fetch(`${serverUrl}/api/voice/sessions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          source_language: sourceLang,
-          target_language: targetLang,
-          bidirectional,
-          provider,
-        }),
-      });
+      const sessionId = crypto.randomUUID();
 
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({ error: "Failed to create session" }));
-        throw new Error(data.error || `Session creation failed (${res.status})`);
-      }
-
-      const session = await res.json();
-      const sessionId = session.session_id;
-      addTranscript("system", `Session created: ${sessionId}`);
-
-      // 2. Connect WebSocket (pass token as query param since WS can't use headers)
-      const wsUrl = serverUrl.replace(/^http/, "ws") + `/api/voice/interpret?session_id=${sessionId}&token=${token}`;
+      // Both Deepgram and Gemini use /ws/voice — the provider field in session_start
+      // tells the backend which STT engine to use.
+      const wsUrl = serverUrl.replace(/^http/, "ws") + `/ws/voice?token=${token}`;
       addTranscript("system", "Opening WebSocket...");
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
-
       ws.binaryType = "arraybuffer";
 
       ws.onopen = () => {
+        // Send session_start with provider selection
+        const startMsg = {
+          type: "session_start",
+          sessionId,
+          sourceLang: sourceLang === "auto" ? "ko" : sourceLang,
+          targetLang,
+          mode: bidirectional ? "bidirectional" : "simul",
+          deviceId: "tauri-app",
+          provider,
+        };
+        ws.send(JSON.stringify(startMsg));
         setStatus("ready");
-        addTranscript("system", "WebSocket connected — waiting for Gemini setup...");
+        const providerLabel = provider === "deepgram" ? "Deepgram + Silero VAD" : "Gemini 3.1 Flash Live";
+        addTranscript("system", `WebSocket connected — starting ${providerLabel}...`);
       };
 
       let audioChunksReceived = 0;
 
       ws.onmessage = (event) => {
         if (event.data instanceof ArrayBuffer) {
-          // Binary: translated audio PCM
+          // Binary: translated audio PCM (Gemini mode only)
           audioChunksReceived++;
           if (audioChunksReceived === 1) {
             addTranscript("system", `First audio response received (${event.data.byteLength} bytes)`);
@@ -335,14 +326,28 @@ export function Interpreter({
           try {
             const msg = JSON.parse(event.data);
             switch (msg.type) {
+              // ── Common events (both providers) ──
+              case "session_ready": {
+                setStatus("listening");
+                const vadMode = provider === "deepgram" ? "Silero VAD (client)" : provider === "openai" ? "semantic VAD (server)" : "RMS VAD (client)";
+                addTranscript("system", `Session ready — ${vadMode}, input 16kHz`);
+                if (provider === "deepgram") {
+                  startMicrophoneDeepgram();
+                } else {
+                  inputSampleRateRef.current = 16000;
+                  startMicrophone();
+                }
+                break;
+              }
+
+              // ── Gemini / general interpretation events ──
               case "ready": {
                 const serverProvider = msg.provider || "gemini";
                 const sampleRate = msg.input_sample_rate || 16000;
-                activeProviderRef.current = serverProvider;
+                activeProviderRef.current = serverProvider as VoiceProvider;
                 inputSampleRateRef.current = sampleRate;
                 setStatus("listening");
-                const vadMode = serverProvider === "openai" ? "semantic VAD (server)" : "RMS VAD (client)";
-                addTranscript("system", `${serverProvider === "openai" ? "OpenAI Realtime" : "Gemini Live"} ready — ${vadMode}, input ${sampleRate}Hz`);
+                addTranscript("system", `${serverProvider} ready — input ${sampleRate}Hz`);
                 startMicrophone();
                 break;
               }
@@ -352,18 +357,31 @@ export function Interpreter({
               case "output_transcript":
                 if (msg.text) addTranscript("output", msg.text, true);
                 break;
+
+              // ── Segmentation events (both providers) ──
+              case "partial_src":
+                if (msg.text) addTranscript("input", msg.text);
+                break;
+              case "commit_src":
+                if (msg.text) addTranscript("input", msg.text);
+                break;
+              case "partial_tgt":
+                if (msg.text) addTranscript("output", msg.text);
+                break;
+              case "commit_tgt":
+                if (msg.text) addTranscript("output", msg.text);
+                break;
+
               case "turn_complete":
-                addTranscript("system", "Turn complete");
+              case "session_ended":
+                addTranscript("system", msg.type === "session_ended" ? `Session ended (${msg.totalSegments || 0} segments)` : "Turn complete");
                 setStatus((prev) => {
                   if (prev === "stopping") {
-                    // Wait for ALL scheduled audio to finish before closing.
-                    // Audio chunks arrive in bursts and are scheduled sequentially
-                    // via nextPlayTimeRef, so remaining can be several seconds.
                     const ctx = playbackCtxRef.current;
                     const remaining = ctx
                       ? Math.max(0, (nextPlayTimeRef.current - ctx.currentTime) * 1000)
                       : 0;
-                    const delayMs = remaining + 1000; // +1s safety margin
+                    const delayMs = remaining + 1000;
                     addTranscript("system", `Drain: ${(remaining / 1000).toFixed(1)}s audio remaining — closing in ${(delayMs / 1000).toFixed(1)}s`);
                     setTimeout(() => endSession(), delayMs);
                     return prev;
@@ -373,7 +391,6 @@ export function Interpreter({
                 break;
               case "interrupted": {
                 addTranscript("system", "Interrupted — new speech detected");
-                // Cancel all scheduled audio by closing current playback context
                 const oldCtx = playbackCtxRef.current;
                 if (oldCtx) {
                   oldCtx.close();
@@ -388,6 +405,17 @@ export function Interpreter({
                 }
                 break;
               }
+
+              // ── Audio output (Gemini mode) ──
+              case "audio_out":
+                if (msg.pcm16le) {
+                  const binaryStr = atob(msg.pcm16le);
+                  const bytes = new Uint8Array(binaryStr.length);
+                  for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+                  playAudioChunk(bytes.buffer);
+                }
+                break;
+
               case "error":
                 addTranscript("system", `Error: ${msg.message}`);
                 setError(msg.message);
@@ -403,10 +431,9 @@ export function Interpreter({
       };
 
       ws.onerror = () => {
-        // Ignore errors during intentional close (stop button or draining)
         if (wsRef.current === null) return;
         setStatus((prev) => {
-          if (prev === "stopping") return prev; // ignore during drain
+          if (prev === "stopping") return prev;
           addTranscript("system", "WebSocket error");
           setError("WebSocket connection error");
           return "error";
@@ -415,8 +442,6 @@ export function Interpreter({
 
       ws.onclose = (event) => {
         addTranscript("system", `WebSocket closed (code: ${event.code}, reason: "${event.reason || "none"}", clean: ${event.wasClean})`);
-        addTranscript("system", `Stats: ${audioChunksReceived} audio chunks received`);
-        // Only reset if this ws is still the active one (avoid stale closure killing new session)
         if (wsRef.current === null || wsRef.current === ws) {
           setStatus((prev) => prev !== "idle" ? "idle" : prev);
         }
@@ -514,8 +539,89 @@ export function Interpreter({
     }
   }, [addTranscript, echoCancellation, autoGainControl, noiseSuppression]);
 
+  // ── Deepgram mode: Silero VAD microphone capture ──────────────
+  // Uses @ricky0123/vad-web (Silero VAD v5 ONNX model) for accurate
+  // speech detection. On speech end, sends the complete speech segment
+  // as PCM16 base64 to the backend via the voice WebSocket.
+  const startMicrophoneDeepgram = useCallback(async () => {
+    try {
+      addTranscript("system", "Loading Silero VAD model...");
+      const { MicVAD } = await import("@ricky0123/vad-web");
+
+      let chunkSeq = 0;
+      const vad = await MicVAD.new({
+        model: "v5",
+        baseAssetPath: "/vad/",
+        onnxWASMBasePath: "/",
+        startOnLoad: true,
+
+        onSpeechStart: () => {
+          addTranscript("system", "VAD: speech started");
+        },
+
+        onSpeechEnd: (audio: Float32Array) => {
+          // audio is Float32Array at 16kHz mono (-1 to 1)
+          const ws = wsRef.current;
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+          // Convert Float32 → PCM16LE
+          const pcm16 = new Int16Array(audio.length);
+          for (let i = 0; i < audio.length; i++) {
+            const s = Math.max(-1, Math.min(1, audio[i]));
+            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+          }
+
+          // Base64 encode
+          const bytes = new Uint8Array(pcm16.buffer);
+          let binary = "";
+          for (let i = 0; i < bytes.length; i++) {
+            binary += String.fromCharCode(bytes[i]);
+          }
+          const b64 = btoa(binary);
+
+          // Send as audio_chunk message
+          ws.send(JSON.stringify({
+            type: "audio_chunk",
+            sessionId: "",
+            seq: chunkSeq++,
+            ts: Date.now(),
+            pcm16le: b64,
+          }));
+
+          const durationMs = (audio.length / 16000 * 1000).toFixed(0);
+          addTranscript("system", `VAD: speech end — sent ${durationMs}ms audio (${pcm16.byteLength} bytes)`);
+        },
+
+        onVADMisfire: () => {
+          addTranscript("system", "VAD: misfire (speech too short)");
+        },
+      });
+
+      micVadRef.current = vad;
+      addTranscript("system", "Silero VAD active — listening with AI speech detection...");
+      setStatus("listening");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error("Silero VAD error:", e);
+      addTranscript("system", `Silero VAD error: ${msg}`);
+
+      if (msg.includes("NotAllowedError") || msg.includes("Permission denied")) {
+        setMicPermissionDenied(true);
+      } else {
+        setError(`Microphone error: ${msg}`);
+      }
+      setStatus("error");
+    }
+  }, [addTranscript]);
+
   // Stop microphone only — keep WS and playback alive for remaining translation
   const stopMicrophone = useCallback(() => {
+    // Cleanup Silero VAD (Deepgram mode)
+    if (micVadRef.current) {
+      micVadRef.current.destroy();
+      micVadRef.current = null;
+    }
+    // Cleanup AudioWorklet (Gemini mode)
     if (workletNodeRef.current) {
       workletNodeRef.current.disconnect();
       workletNodeRef.current = null;
@@ -715,8 +821,9 @@ export function Interpreter({
             className="provider-select"
             title={locale === "ko" ? "음성 AI 공급자 (본인 API 키 필요)" : "Voice AI provider (requires your own API key)"}
           >
-            <option value="gemini">🤖 Gemini</option>
-            <option value="openai">🧠 GPT</option>
+            <option value="deepgram">🎯 Deepgram + Silero VAD</option>
+            <option value="gemini">🤖 Gemini 3.1 Flash Live</option>
+            <option value="openai">🧠 GPT Realtime</option>
           </select>
 
           <button
@@ -736,8 +843,8 @@ export function Interpreter({
         {/* User API key notice */}
         <div className="api-key-notice">
           {locale === "ko"
-            ? "⚠️ 동시통역은 본인의 API 키가 필요합니다 (설정에서 입력)"
-            : "⚠️ Voice interpretation requires your own API key (enter in Settings)"}
+            ? `⚠️ ${provider === "deepgram" ? "Deepgram" : provider === "gemini" ? "Gemini" : "OpenAI"} API 키가 필요합니다 (설정에서 입력)`
+            : `⚠️ Requires your own ${provider === "deepgram" ? "Deepgram" : provider === "gemini" ? "Gemini" : "OpenAI"} API key (enter in Settings)`}
         </div>
       </div>
 

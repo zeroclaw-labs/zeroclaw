@@ -2,8 +2,8 @@
 # Python 3.11+ 권장
 
 # --- LiveKit 코어 ---
-livekit==0.18.*
-livekit-agents[cartesia,deepgram,silero,turn-detector]>=1.2.0
+livekit>=1.0.12,<2
+livekit-agents[deepgram,silero,turn-detector]>=1.2.0
 
 # --- LLM 플러그인 (이용자가 선택한 것만 실제로 호출됨) ---
 livekit-plugins-google>=1.2.0       # Gemini LLM + Gemini Live S2S (default)
@@ -12,7 +12,6 @@ livekit-plugins-openai>=1.2.0       # GPT-4o / GPT-4o-mini (이용자 선택 시
 
 # --- STT / TTS / VAD ---
 livekit-plugins-deepgram>=1.2.0     # Nova-3 STT
-livekit-plugins-cartesia>=1.2.0     # Sonic-3 TTS (다국어 기본)
 livekit-plugins-silero>=1.2.0       # VAD
 
 # --- 유틸 ---

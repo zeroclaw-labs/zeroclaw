@@ -2653,10 +2653,7 @@ pub struct LiveKitConfig {
     /// Deepgram API key (STT). Falls back to env `DEEPGRAM_API_KEY`.
     #[serde(default)]
     pub deepgram_api_key: Option<String>,
-    /// Cartesia API key (TTS). Falls back to env `CARTESIA_API_KEY`.
-    #[serde(default)]
-    pub cartesia_api_key: Option<String>,
-    /// Typecast API key (한국어 프리미엄 TTS). Falls back to env `TYPECAST_API_KEY`.
+    /// Typecast API key (TTS — sole TTS provider). Falls back to env `TYPECAST_API_KEY`.
     #[serde(default)]
     pub typecast_api_key: Option<String>,
     /// Credit multiplier for operator-key voice sessions (default 2.2).
@@ -16801,9 +16798,19 @@ pub struct VoiceConfig {
     /// OpenAI API key override (falls back to OPENAI_API_KEY env var).
     #[serde(default)]
     pub openai_api_key: Option<String>,
-    /// Default voice provider: "gemini" or "openai" (default: "gemini").
+    /// Deepgram API key for STT (falls back to DEEPGRAM_API_KEY env var).
+    #[serde(default)]
+    pub deepgram_api_key: Option<String>,
+    /// Deepgram model (default: "nova-3").
+    #[serde(default = "default_deepgram_model")]
+    pub deepgram_model: String,
+    /// Default voice provider: "gemini", "openai", or "deepgram" (default: "gemini").
     #[serde(default)]
     pub default_provider: Option<String>,
+    /// Default STT provider: "deepgram", "gemini", or "openai" (default: "deepgram").
+    /// Used for chat voice input and standalone speech-to-text.
+    #[serde(default = "default_stt_provider")]
+    pub stt_provider: String,
     /// VAD silence duration in ms (how long silence = end-of-speech).
     #[serde(default = "default_voice_silence_ms")]
     pub silence_duration_ms: u32,
@@ -16853,6 +16860,12 @@ fn default_voice_max_uncommitted_chars() -> usize {
 fn default_voice_silence_commit_ms() -> u64 {
     600
 }
+fn default_deepgram_model() -> String {
+    "nova-3".to_string()
+}
+fn default_stt_provider() -> String {
+    "deepgram".to_string()
+}
 
 impl Default for VoiceConfig {
     fn default() -> Self {
@@ -16863,7 +16876,10 @@ impl Default for VoiceConfig {
             default_target_language: default_voice_target_language(),
             gemini_api_key: None,
             openai_api_key: None,
+            deepgram_api_key: None,
+            deepgram_model: default_deepgram_model(),
             default_provider: None,
+            stt_provider: default_stt_provider(),
             silence_duration_ms: default_voice_silence_ms(),
             prefix_padding_ms: default_voice_prefix_padding_ms(),
             default_interp_mode: default_voice_interp_mode(),

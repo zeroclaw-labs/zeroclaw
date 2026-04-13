@@ -22,6 +22,9 @@
     "mobile:setup:ios": "bash scripts/mobile-setup.sh ios"
   },
   "dependencies": {
+    "@livekit/components-react": "^2.9.20",
+    "@livekit/components-styles": "^1.2.0",
+    "@ricky0123/vad-web": "^0.0.30",
     "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/plugin-dialog": "^2.0.1",
     "@tauri-apps/plugin-shell": "^2.0.1",
@@ -36,6 +39,8 @@
     "@tiptap/pm": "^3.20.1",
     "@tiptap/react": "^3.20.1",
     "@tiptap/starter-kit": "^3.20.1",
+    "livekit-client": "^2.18.1",
+    "onnxruntime-web": "^1.24.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "tiptap-markdown": "^0.9.0"

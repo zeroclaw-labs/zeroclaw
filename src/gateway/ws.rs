@@ -1452,8 +1452,44 @@ pub async fn handle_ws_voice(
 /// Server -> Client: {"type":"audio_out","sessionId":"...","seq":0,"pcm16le":"base64..."}
 /// Server -> Client: {"type":"session_ended","sessionId":"...","totalSegments":5}
 /// ```
+/// Unified session handle — wraps either Gemini-based or Deepgram-based session.
+///
+/// Both providers share the same `send_audio` / `event_rx` / `stop` interface,
+/// so this enum lets the voice WebSocket handler route to either without duplication.
+enum VoiceSessionHandle {
+    Gemini(crate::voice::simul_session::SimulSession),
+    Deepgram(crate::voice::deepgram_simul::DeepgramSimulSession),
+}
+
+impl VoiceSessionHandle {
+    async fn send_audio(&self, pcm_data: Vec<u8>) -> anyhow::Result<()> {
+        match self {
+            Self::Gemini(s) => s.send_audio(pcm_data).await,
+            Self::Deepgram(s) => s.send_audio(pcm_data).await,
+        }
+    }
+
+    fn event_rx(
+        &self,
+    ) -> std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::voice::events::ServerMessage>>>
+    {
+        match self {
+            Self::Gemini(s) => s.event_rx.clone(),
+            Self::Deepgram(s) => s.event_rx.clone(),
+        }
+    }
+
+    async fn stop(&self) {
+        match self {
+            Self::Gemini(s) => s.stop().await,
+            Self::Deepgram(s) => s.stop().await,
+        }
+    }
+}
+
 async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
     use crate::voice::{
+        deepgram_simul::{DeepgramSimulConfig, DeepgramSimulSession},
         events::{ClientMessage, ServerMessage},
         pipeline::{Domain, Formality, LanguageCode},
         simul::SegmentationConfig,
@@ -1468,7 +1504,7 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
     };
 
     // Active session handle — set when SessionStart is received
-    let mut active_session: Option<SimulSession> = None;
+    let mut active_session: Option<VoiceSessionHandle> = None;
     // Event relay task handle — cancelled when session stops
     let mut relay_handle: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -1502,6 +1538,7 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                 source_lang,
                 target_lang,
                 mode,
+                provider,
                 domain,
                 formality,
                 ..
@@ -1514,19 +1551,34 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                     handle.abort();
                 }
 
-                // Resolve API key
-                // Voice interpretation requires the USER's own API key.
-                // Operator keys are NOT used for voice — real-time streaming
-                // is too latency-sensitive for proxy, and too costly to subsidize.
-                let api_key = voice_config.gemini_api_key.clone().unwrap_or_default();
+                // Determine provider: explicit from client, or config default
+                let provider_str = provider
+                    .as_deref()
+                    .or(voice_config.default_provider.as_deref())
+                    .unwrap_or("gemini");
+                let use_deepgram = provider_str == "deepgram";
+
+                // Resolve API key based on provider
+                let api_key = if use_deepgram {
+                    voice_config
+                        .deepgram_api_key
+                        .clone()
+                        .or_else(|| std::env::var("DEEPGRAM_API_KEY").ok())
+                        .unwrap_or_default()
+                } else {
+                    voice_config.gemini_api_key.clone().unwrap_or_default()
+                };
+
                 if api_key.is_empty() {
+                    let key_name = if use_deepgram { "Deepgram" } else { "Gemini" };
                     let err = ServerMessage::Error {
                         session_id: session_id.clone(),
                         code: "NO_API_KEY".into(),
-                        message: "Voice interpretation requires your own API key. \
-                            Please enter your Gemini or OpenAI API key in Settings. \
-                            (Operator keys are not available for voice features)"
-                            .into(),
+                        message: format!(
+                            "Voice interpretation requires your own {key_name} API key. \
+                             Please enter it in Settings. \
+                             (Operator keys are not available for voice features)"
+                        ),
                     };
                     let _ = socket
                         .send(Message::Text(
@@ -1546,27 +1598,6 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                         .unwrap_or(LanguageCode::En)
                 });
 
-                // Parse optional domain/formality
-                let domain_val = domain
-                    .as_deref()
-                    .map(|d| match d {
-                        "business" => Domain::Business,
-                        "medical" => Domain::Medical,
-                        "legal" => Domain::Legal,
-                        "technical" => Domain::Technical,
-                        _ => Domain::General,
-                    })
-                    .unwrap_or(Domain::General);
-
-                let formality_val = formality
-                    .as_deref()
-                    .map(|f| match f {
-                        "formal" => Formality::Formal,
-                        "casual" => Formality::Casual,
-                        _ => Formality::Neutral,
-                    })
-                    .unwrap_or(Formality::Neutral);
-
                 let segmentation = SegmentationConfig {
                     min_commit_chars: voice_config.min_commit_chars,
                     max_uncommitted_chars: voice_config.max_uncommitted_chars,
@@ -1574,29 +1605,68 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                     ..SegmentationConfig::default()
                 };
 
-                let config = SimulSessionConfig {
-                    session_id: session_id.clone(),
-                    api_key,
-                    source_lang: src_lang,
-                    target_lang: tgt_lang,
-                    mode,
-                    domain: domain_val,
-                    formality: formality_val,
-                    segmentation,
-                };
-
                 tracing::info!(
                     session_id = %session_id,
                     source = src_lang.as_str(),
                     target = tgt_lang.as_str(),
+                    provider = provider_str,
                     mode = ?mode,
                     "Voice WebSocket: starting interpretation session"
                 );
 
-                match SimulSession::start(config).await {
+                // Start the session with the selected provider
+                let session_result: anyhow::Result<VoiceSessionHandle> = if use_deepgram {
+                    let dg_config = DeepgramSimulConfig {
+                        session_id: session_id.clone(),
+                        api_key,
+                        source_lang: src_lang,
+                        model: voice_config.deepgram_model.clone(),
+                        segmentation,
+                    };
+                    DeepgramSimulSession::start(dg_config)
+                        .await
+                        .map(VoiceSessionHandle::Deepgram)
+                } else {
+                    // Parse optional domain/formality (only for Gemini — full interpretation)
+                    let domain_val = domain
+                        .as_deref()
+                        .map(|d| match d {
+                            "business" => Domain::Business,
+                            "medical" => Domain::Medical,
+                            "legal" => Domain::Legal,
+                            "technical" => Domain::Technical,
+                            _ => Domain::General,
+                        })
+                        .unwrap_or(Domain::General);
+
+                    let formality_val = formality
+                        .as_deref()
+                        .map(|f| match f {
+                            "formal" => Formality::Formal,
+                            "casual" => Formality::Casual,
+                            _ => Formality::Neutral,
+                        })
+                        .unwrap_or(Formality::Neutral);
+
+                    let config = SimulSessionConfig {
+                        session_id: session_id.clone(),
+                        api_key,
+                        source_lang: src_lang,
+                        target_lang: tgt_lang,
+                        mode,
+                        domain: domain_val,
+                        formality: formality_val,
+                        segmentation,
+                    };
+                    SimulSession::start(config)
+                        .await
+                        .map(VoiceSessionHandle::Gemini)
+                };
+
+                match session_result {
                     Ok(session) => {
                         // Spawn event relay task: forward ServerMessages → WebSocket
-                        let event_rx = session.event_rx.clone();
+                        let event_rx = session.event_rx();
                         let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel::<String>(256);
 
                         let relay = tokio::spawn(async move {
@@ -1613,25 +1683,13 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
 
                         active_session = Some(session);
 
-                        // Forward relay events to websocket in the background.
-                        // We need a separate task to send relay messages while still
-                        // receiving from the socket. Use a split approach.
-                        // Actually we can't split axum::WebSocket easily, so we'll drain
-                        // the relay channel on each iteration + use try_recv.
-                        // The relay task buffers events; we drain them below.
-
                         // Drain any initial events (like session_ready) immediately
                         while let Ok(json) = ws_rx.try_recv() {
                             let _ = socket.send(Message::Text(json.into())).await;
                         }
 
-                        // We'll continue draining relay events in each loop iteration below.
-                        // Store the ws_rx for later use by wrapping it.
-                        // Unfortunately we can't easily store it across loop iterations
-                        // without restructuring. Let's restructure the loop.
-
                         // Break into the voice session event loop
-                        voice_session_loop(
+                        voice_session_loop_unified(
                             &mut socket,
                             active_session.as_ref().unwrap(),
                             &mut ws_rx,
@@ -1648,11 +1706,11 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                         return;
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "Failed to start voice session");
+                        tracing::error!(error = %e, provider = provider_str, "Failed to start voice session");
                         let err = ServerMessage::Error {
                             session_id,
                             code: "SESSION_START_FAILED".into(),
-                            message: format!("Failed to start session: {e}"),
+                            message: format!("Failed to start {provider_str} session: {e}"),
                         };
                         let _ = socket
                             .send(Message::Text(
@@ -1686,6 +1744,7 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
 
             ClientMessage::ActivitySignal { .. } => {
                 // Activity signals are informational; Gemini handles VAD internally.
+                // Deepgram uses server-side endpointing — no client signals needed.
             }
         }
     }
@@ -1699,13 +1758,13 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
     }
 }
 
-/// Inner loop for an active voice interpretation session.
+/// Inner loop for an active voice interpretation session (unified for all providers).
 ///
 /// Simultaneously drains relay events (ServerMessage → WebSocket) and receives
 /// new client messages (AudioChunk, SessionStop, etc.).
-async fn voice_session_loop(
+async fn voice_session_loop_unified(
     socket: &mut WebSocket,
-    session: &crate::voice::simul_session::SimulSession,
+    session: &VoiceSessionHandle,
     relay_rx: &mut tokio::sync::mpsc::Receiver<String>,
 ) {
     use crate::voice::events::{ClientMessage, ServerMessage};
@@ -1754,7 +1813,7 @@ async fn voice_session_loop(
                         return;
                     }
                     ClientMessage::ActivitySignal { .. } => {
-                        // Informational only
+                        // Informational only — Gemini uses client VAD, Deepgram uses server-side
                     }
                     ClientMessage::SessionStart { session_id, .. } => {
                         // Cannot start a new session from within an active one
@@ -1771,6 +1830,212 @@ async fn voice_session_loop(
             }
         }
     }
+}
+
+// ── Chat STT WebSocket (Deepgram voice input for chat) ──────────
+
+/// GET /ws/stt — WebSocket upgrade for Deepgram speech-to-text in chat.
+///
+/// Lightweight endpoint: client sends raw PCM16 audio (Binary frames),
+/// server streams back SttEvent JSON (partial/final transcripts).
+/// No interpretation or segmentation — just pure STT for voice typing.
+pub async fn handle_ws_stt(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let query_params = parse_ws_query_params(query.as_deref());
+
+    // Auth
+    if state.pairing.require_pairing() {
+        let token =
+            extract_ws_bearer_token(&headers, query_params.token.as_deref()).unwrap_or_default();
+        if !state.pairing.is_authenticated(&token) {
+            return (axum::http::StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        }
+    }
+
+    ws.on_upgrade(move |socket| handle_stt_socket(socket, state))
+        .into_response()
+}
+
+/// Chat STT WebSocket handler.
+///
+/// Protocol:
+/// ```text
+/// Client -> Server: Binary(PCM16LE 16kHz mono audio)
+/// Client -> Server: {"type":"start","language":"ko"}     (optional, configure session)
+/// Client -> Server: {"type":"finalize"}                   (flush buffered audio)
+/// Client -> Server: {"type":"stop"}                       (end session)
+/// Server -> Client: {"type":"stt_ready","request_id":"..."}
+/// Server -> Client: {"type":"stt_partial","text":"...","confidence":0.8}
+/// Server -> Client: {"type":"stt_final","text":"...","confidence":0.95,"speech_final":true}
+/// Server -> Client: {"type":"stt_speech_started","timestamp":1.5}
+/// Server -> Client: {"type":"stt_utterance_end","last_word_end":2.3}
+/// Server -> Client: {"type":"stt_closed"}
+/// ```
+async fn handle_stt_socket(mut socket: WebSocket, state: AppState) {
+    use crate::voice::deepgram_stt::{DeepgramConfig, DeepgramSttSession, SttEvent};
+
+    // Read config
+    let voice_config = {
+        let config_guard = state.config.lock();
+        config_guard.voice.clone()
+    };
+
+    // Resolve Deepgram API key
+    let api_key = voice_config
+        .deepgram_api_key
+        .clone()
+        .or_else(|| std::env::var("DEEPGRAM_API_KEY").ok())
+        .unwrap_or_default();
+
+    if api_key.is_empty() {
+        let err_json = serde_json::json!({
+            "type": "stt_error",
+            "message": "Deepgram API key not configured. Set it in voice.deepgram_api_key or DEEPGRAM_API_KEY env var."
+        });
+        let _ = socket
+            .send(Message::Text(err_json.to_string().into()))
+            .await;
+        return;
+    }
+
+    // Default config — can be overridden by a "start" message
+    let mut language = "multi".to_string();
+    let model = voice_config.deepgram_model.clone();
+
+    // Wait for optional "start" message or first audio
+    // Peek at first message to see if it's config or audio
+    let first_msg = match socket.recv().await {
+        Some(Ok(msg)) => msg,
+        _ => return,
+    };
+
+    let mut first_audio: Option<Vec<u8>> = None;
+
+    match &first_msg {
+        Message::Text(text) => {
+            // Parse start config
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
+                if val.get("type").and_then(|t| t.as_str()) == Some("start") {
+                    if let Some(lang) = val.get("language").and_then(|l| l.as_str()) {
+                        language = lang.to_string();
+                    }
+                }
+            }
+        }
+        Message::Binary(data) => {
+            // First message is audio — use defaults
+            first_audio = Some(data.to_vec());
+        }
+        Message::Close(_) => return,
+        _ => {}
+    }
+
+    // Connect to Deepgram
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let dg_config = DeepgramConfig {
+        api_key,
+        model,
+        language,
+        interim_results: true,
+        smart_format: true,
+        punctuate: true,
+        endpointing_ms: Some(300),
+        utterance_end_ms: Some(1000),
+        vad_events: true,
+        ..DeepgramConfig::default()
+    };
+
+    let dg_session = match DeepgramSttSession::connect(session_id.clone(), &dg_config).await {
+        Ok(s) => s,
+        Err(e) => {
+            let err_json = serde_json::json!({
+                "type": "stt_error",
+                "message": format!("Failed to connect to Deepgram: {e}")
+            });
+            let _ = socket
+                .send(Message::Text(err_json.to_string().into()))
+                .await;
+            return;
+        }
+    };
+
+    let dg_session = std::sync::Arc::new(dg_session);
+
+    // Send any buffered first audio
+    if let Some(audio) = first_audio {
+        let _ = dg_session.send_audio(audio).await;
+    }
+
+    // Spawn event relay: SttEvent → WebSocket JSON
+    let dg_for_relay = std::sync::Arc::clone(&dg_session);
+    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<String>(256);
+    tokio::spawn(async move {
+        loop {
+            match dg_for_relay.recv_event().await {
+                Some(event) => {
+                    if let Ok(json) = serde_json::to_string(&event) {
+                        if relay_tx.send(json).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Stop on session close
+                    if matches!(event, SttEvent::Closed) {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+    });
+
+    // Main loop: forward audio + relay events
+    loop {
+        tokio::select! {
+            Some(json) = relay_rx.recv() => {
+                if socket.send(Message::Text(json.into())).await.is_err() {
+                    break;
+                }
+            }
+
+            msg = socket.recv() => {
+                let Some(msg) = msg else { break };
+                match msg {
+                    Ok(Message::Binary(data)) => {
+                        if let Err(e) = dg_session.send_audio(data.to_vec()).await {
+                            tracing::warn!(error = %e, "Failed to send audio to Deepgram");
+                            break;
+                        }
+                    }
+                    Ok(Message::Text(text)) => {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                            match val.get("type").and_then(|t| t.as_str()) {
+                                Some("finalize") => {
+                                    let _ = dg_session.finalize().await;
+                                }
+                                Some("stop") => {
+                                    dg_session.close().await;
+                                    // Drain remaining events
+                                    while let Ok(json) = relay_rx.try_recv() {
+                                        let _ = socket.send(Message::Text(json.into())).await;
+                                    }
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    _ => continue,
+                }
+            }
+        }
+    }
+
+    dg_session.close().await;
 }
 
 #[cfg(test)]

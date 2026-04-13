@@ -928,7 +928,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     println!("  GET  /api/*     — REST API (bearer token required)");
     println!("  GET  /ws/chat   — WebSocket agent chat");
     if config.voice.enabled {
-        println!("  GET  /ws/voice  — WebSocket simultaneous interpretation");
+        println!("  GET  /ws/voice  — WebSocket simultaneous interpretation (Gemini/Deepgram)");
+        println!("  GET  /ws/stt    — WebSocket Deepgram STT (chat voice input)");
     }
     if config.auth.enabled {
         println!(
@@ -1239,6 +1240,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
         .route("/api/voices/list", get(api::handle_api_voices_list))
+        .route("/api/livekit/token", post(api::handle_api_livekit_token))
         .route("/api/node-control", post(handle_node_control))
         // ── LLM proxy (hybrid architecture: keys stay on server) ──
         // Needs extended body limit — conversation history can exceed 64KB.
@@ -1277,6 +1279,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/ws/chat", get(ws::handle_ws_chat))
         // ── WebSocket voice interpretation ──
         .route("/ws/voice", get(ws::handle_ws_voice))
+        // ── WebSocket Deepgram STT (chat voice input) ──
+        .route("/ws/stt", get(ws::handle_ws_stt))
         // ── User auth API (Tauri/web client) ──
         .route("/api/auth/register", post(auth_api::handle_auth_register))
         .route("/api/auth/login", post(auth_api::handle_auth_login))

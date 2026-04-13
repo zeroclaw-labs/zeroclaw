@@ -18,6 +18,8 @@
 //! - `simul_session` — session manager tying Live API + segmentation + events
 
 pub mod conference;
+pub mod deepgram_simul;
+pub mod deepgram_stt;
 pub mod events;
 pub mod gemini_live;
 pub mod openai_realtime;
@@ -55,6 +57,10 @@ pub use conference::{ConferenceConfig, ConferenceManager, ConferenceRoom, Confer
 pub use events::{ClientMessage, InterpretationMode, ServerMessage};
 #[allow(unused_imports)]
 pub use gemini_live::{ConnectionState, GeminiLiveSession, VadConfig, VadSensitivity};
+#[allow(unused_imports)]
+pub use deepgram_simul::{DeepgramSimulConfig, DeepgramSimulSession};
+#[allow(unused_imports)]
+pub use deepgram_stt::{DeepgramConfig, DeepgramSttSession, SttEvent};
 #[allow(unused_imports)]
 pub use openai_realtime::OpenAiRealtimeSession;
 #[allow(unused_imports)]

@@ -9,7 +9,7 @@ metadata 스키마 (클라이언트가 participant.metadata 로 전달):
 {
   "llm_provider": "google" | "anthropic" | "openai",   # 없거나 알 수 없으면 google
   "api_key": "sk-... 또는 AIza...",                    # 없으면 운영자 기본 키
-  "model": "gemini-3.1-flash",                         # 생략 가능 (provider별 default)
+  "model": "gemini-3.1-flash-lite-preview",                         # 생략 가능 (provider별 default)
   "temperature": 0.7,                                  # 생략 가능
   "language": "ko"                                     # STT 라우팅용. LLM엔 직접 안 쓰임
 }
@@ -39,7 +39,7 @@ logger = logging.getLogger("moa.llm_factory")
 DEFAULT_PROVIDER = "google"
 
 DEFAULT_MODELS = {
-    "google": "gemini-3.1-flash",          # moa 기본: Gemini 3.1 Flash (일반 LLM, Live API 아님)
+    "google": "gemini-3.1-flash-lite-preview",          # moa 기본: Gemini 3.1 Flash (일반 LLM, Live API 아님)
     "anthropic": "claude-sonnet-4-6",      # 법률 도메인 기본
     "openai": "gpt-4o",                    # 일반 대화 기본
 }

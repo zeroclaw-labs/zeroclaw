@@ -2134,6 +2134,115 @@ fn voice_mood_mapping() -> serde_json::Value {
         .expect("voice_assets/mood_mapping.json is valid JSON")
 }
 
+/// POST /api/livekit/token — generate a LiveKit access token for voice chat.
+///
+/// The client sends `{ "room": "room-name", "identity": "user-id" }` and
+/// receives a JWT that grants room join permission. The token is signed
+/// with LIVEKIT_API_SECRET using HS256.
+///
+/// LiveKit JWT claims:
+/// - `iss`: API key
+/// - `sub`: participant identity
+/// - `iat`/`nbf`/`exp`: timing
+/// - `video`: { roomJoin: true, room: "..." }
+/// - `metadata`: optional participant metadata (JSON string)
+pub async fn handle_api_livekit_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock();
+    let lk_config = &config.livekit;
+
+    if !lk_config.enabled {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "LiveKit voice chat is disabled"})),
+        )
+            .into_response();
+    }
+
+    let api_key = &lk_config.api_key;
+    let api_secret = &lk_config.api_secret;
+    let server_url = &lk_config.server_url;
+
+    if api_key.is_empty() || api_secret.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "LiveKit API credentials not configured"})),
+        )
+            .into_response();
+    }
+
+    let room = body
+        .get("room")
+        .and_then(|v| v.as_str())
+        .unwrap_or("moa-voice");
+    let identity = body
+        .get("identity")
+        .and_then(|v| v.as_str())
+        .unwrap_or("moa-user");
+    let metadata = body
+        .get("metadata")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Build JWT: header.payload.signature (HS256)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let exp = now + 3600; // 1 hour validity
+
+    let header = serde_json::json!({"alg": "HS256", "typ": "JWT"});
+    let claims = serde_json::json!({
+        "iss": api_key,
+        "sub": identity,
+        "iat": now,
+        "nbf": now,
+        "exp": exp,
+        "jti": uuid::Uuid::new_v4().to_string(),
+        "video": {
+            "roomJoin": true,
+            "room": room,
+            "canPublish": true,
+            "canSubscribe": true,
+            "canPublishData": true
+        },
+        "metadata": metadata,
+        "name": identity,
+    });
+
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header_b64 = b64.encode(serde_json::to_string(&header).unwrap_or_default());
+    let claims_b64 = b64.encode(serde_json::to_string(&claims).unwrap_or_default());
+    let signing_input = format!("{header_b64}.{claims_b64}");
+
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(api_secret.as_bytes()).expect("HMAC accepts any key size");
+    mac.update(signing_input.as_bytes());
+    let signature = b64.encode(mac.finalize().into_bytes());
+
+    let token = format!("{signing_input}.{signature}");
+
+    Json(serde_json::json!({
+        "token": token,
+        "url": server_url,
+        "room": room,
+        "identity": identity,
+    }))
+    .into_response()
+}
+
 /// GET /api/voices/list — list available TTS voices from Typecast API.
 ///
 /// Proxies the Typecast `/v2/voices` endpoint with caching (5 min TTL)

@@ -5,7 +5,11 @@ moa 음성 서비스 — STT → LLM → TTS 파이프라인 에이전트
 구성:
   - STT  : Deepgram Nova-3 (다국어, <300ms, $0.0077/분)
   - LLM  : 이용자 선택 (llm_factory). 미선택 시 Gemini 3.1 Flash
-  - TTS  : Cartesia Sonic-3 (기본) / Typecast (한국어 프리미엄)
+  - TTS  : Typecast (전용 TTS)
+
+모드 선택 (participant metadata의 voice_mode 필드):
+  - "pipeline" (모드A, 기본): Deepgram STT → Gemini 3.1 Flash Lite → Typecast TTS
+  - "s2s" (모드B): Gemini 3.1 Flash Live (올인원 S2S)
   - VAD  : Silero (무음 감지)
   - 턴테이킹 : LiveKit 내장 turn-detector 플러그인
 
@@ -31,7 +35,7 @@ from livekit.agents import (
     metrics,
     MetricsCollectedEvent,
 )
-from livekit.plugins import cartesia, deepgram, silero
+from livekit.plugins import deepgram, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 import llm_factory
@@ -72,29 +76,28 @@ def build_tts(language: str, tier: str):
     language : 'ko' / 'en' / 기타 ISO 코드
     tier     : 'free' / 'premium'
 
-    규칙:
-      - 한국어 + premium → Typecast (한국어 특화)
-      - 그 외            → Cartesia Sonic-3 (글로벌 기본)
+    Typecast가 유일한 TTS 프로바이더.
+    한국어는 ssfm-v30 모델, 그 외 언어도 Typecast 기본 음성 사용.
     """
-    if language == "ko" and tier == "premium" and os.getenv("TYPECAST_API_KEY"):
-        logger.info("TTS: Typecast ssfm-v30 (ko premium)")
-        return TypecastTTS(
-            voice_options=TypecastVoiceOptions(
-                voice_id=os.environ.get("TYPECAST_VOICE_ID_KO_FEMALE", ""),
-                model="ssfm-v30",
-                emotion_type="smart",  # AI auto-detects emotion from context
-                speed=1.0,
-            ),
-            language="kor",  # ISO 639-3 for Korean
-        )
+    # 언어별 ISO 639-3 매핑
+    lang_map = {
+        "ko": "kor", "en": "eng", "ja": "jpn", "zh": "zho",
+        "es": "spa", "fr": "fra", "de": "deu", "pt": "por",
+        "it": "ita", "ru": "rus", "ar": "ara", "th": "tha",
+        "vi": "vie", "id": "ind", "tr": "tur",
+    }
+    iso3 = lang_map.get(language, "kor")
 
-    logger.info("TTS: Cartesia Sonic-3 (default)")
-    return cartesia.TTS(
-        model="sonic-3",
-        voice=os.environ["CARTESIA_VOICE_ID_DEFAULT"],
-        language=language if language in {"ko", "en", "ja", "es", "fr", "de"} else "en",
-        speed="normal",
-        emotion=["positivity:high", "curiosity"],  # Cartesia 감정 태그
+    voice_id = os.environ.get("TYPECAST_VOICE_ID_KO_FEMALE", "")
+    logger.info("TTS: Typecast ssfm-v30 (language=%s, iso3=%s)", language, iso3)
+    return TypecastTTS(
+        voice_options=TypecastVoiceOptions(
+            voice_id=voice_id,
+            model="ssfm-v30",
+            emotion_type="smart",  # AI auto-detects emotion from context
+            speed=1.0,
+        ),
+        language=iso3,
     )
 
 
@@ -114,12 +117,12 @@ def build_stt(language: str):
         smart_format=True,
         punctuate=True,
         profanity_filter=False,
-        keywords=[
-            # 법률 도메인 고유명사 부스팅 (예시)
-            ("계약해지통지", 1.5),
-            ("내용증명", 1.5),
-            ("민사소송", 1.2),
-            ("지급명령", 1.2),
+        keyterm=[
+            # 법률 도메인 고유명사 부스팅 (Nova-3 keyterm prompting)
+            "계약해지통지",
+            "내용증명",
+            "민사소송",
+            "지급명령",
         ],
     )
 
@@ -137,33 +140,21 @@ class MoaAgent(Agent):
 # Entrypoint
 # ---------------------------------------------------------------------------
 
-async def entrypoint(ctx: JobContext) -> None:
-    await ctx.connect()
-
-    participant = await ctx.wait_for_participant()
-    logger.info("참가자 접속: %s", participant.identity)
-
-    # 1) 이용자 metadata 파싱
-    metadata_raw = participant.metadata
-    try:
-        meta = json.loads(metadata_raw) if metadata_raw else {}
-    except json.JSONDecodeError:
-        meta = {}
+async def _start_pipeline_mode(ctx: JobContext, participant, meta: dict) -> None:
+    """모드 A: Deepgram STT → Gemini 3.1 Flash Lite → Typecast TTS 파이프라인."""
     language = (meta.get("language") or "ko").lower()
     tier = (meta.get("tier") or "free").lower()
 
-    # 2) LLM 생성 (이용자 선택 → 없으면 운영자 기본 Gemini 3.1 Flash)
-    llm_instance, selection = llm_factory.build_from_metadata(metadata_raw)
+    # LLM (기본: gemini-3.1-flash-lite-preview)
+    llm_instance, selection = llm_factory.build_from_metadata(participant.metadata)
     logger.info(
-        "LLM 선택: %s / model=%s / 이용자 본인키=%s",
+        "모드 A (Pipeline) — LLM: %s/%s, 이용자키=%s",
         selection.provider, selection.model, selection.using_user_key,
     )
 
-    # 3) STT / TTS 생성
     stt_instance = build_stt(language)
     tts_instance = build_tts(language, tier)
 
-    # 4) 세션 조립
     session = AgentSession(
         stt=stt_instance,
         llm=llm_instance,
@@ -172,7 +163,7 @@ async def entrypoint(ctx: JobContext) -> None:
         turn_detection=MultilingualModel(),
     )
 
-    # 5) 메트릭 수집 (원가 추적·크레딧 차감에 활용)
+    # 메트릭 수집
     usage_collector = metrics.UsageCollector()
 
     @session.on("metrics_collected")
@@ -191,19 +182,82 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(log_usage_and_bill)
 
-    # 6) Start
     await session.start(
         agent=MoaAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(
-            noise_cancellation=None,   # LiveKit BVC 켜고 싶으면 여기에 설정
+            noise_cancellation=None,
         ),
     )
 
-    # 첫 인삿말
     await session.generate_reply(
         instructions="안녕하세요로 시작하는 자연스러운 첫 인삿말을 한 문장으로 건네세요."
     )
+
+
+async def _start_s2s_mode(ctx: JobContext, participant, meta: dict) -> None:
+    """모드 B: Gemini 3.1 Flash Live (S2S) — 올인원 음성 대화."""
+    from livekit.plugins import google
+
+    model_name = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview")
+    voice = os.getenv("GEMINI_LIVE_VOICE", "Puck")
+    api_key = os.environ.get("GOOGLE_API_KEY", "")
+
+    logger.info("모드 B (S2S) — model=%s, voice=%s", model_name, voice)
+
+    realtime_llm = google.beta.realtime.RealtimeModel(
+        model=model_name,
+        voice=voice,
+        temperature=0.7,
+        instructions=MOA_INSTRUCTIONS,
+        language=(meta.get("language") or "ko") + "-KR" if (meta.get("language") or "ko") == "ko" else "en-US",
+        modalities=["AUDIO"],
+    )
+
+    session = AgentSession(
+        llm=realtime_llm,
+        vad=silero.VAD.load(),
+    )
+
+    # S2S 세션에서도 메트릭 수집
+    usage_collector = metrics.UsageCollector()
+
+    @session.on("metrics_collected")
+    def _on_metrics(ev: MetricsCollectedEvent):
+        metrics.log_metrics(ev.metrics)
+        usage_collector.collect(ev.metrics)
+
+    ctx.add_shutdown_callback(lambda: logger.info("S2S 세션 종료"))
+
+    await session.start(
+        agent=MoaAgent(),
+        room=ctx.room,
+        room_input_options=RoomInputOptions(),
+    )
+
+    logger.info("S2S 세션 시작 완료")
+
+
+async def entrypoint(ctx: JobContext) -> None:
+    await ctx.connect()
+
+    participant = await ctx.wait_for_participant()
+    logger.info("참가자 접속: %s", participant.identity)
+
+    # metadata에서 voice_mode 확인: "pipeline" (모드A, 기본) 또는 "s2s" (모드B)
+    metadata_raw = participant.metadata
+    try:
+        meta = json.loads(metadata_raw) if metadata_raw else {}
+    except json.JSONDecodeError:
+        meta = {}
+
+    voice_mode = (meta.get("voice_mode") or "pipeline").lower()
+    logger.info("음성 모드: %s", voice_mode)
+
+    if voice_mode == "s2s":
+        await _start_s2s_mode(ctx, participant, meta)
+    else:
+        await _start_pipeline_mode(ctx, participant, meta)
 
 
 if __name__ == "__main__":
