@@ -91,6 +91,7 @@ pub(crate) mod tunnel;
 pub mod update;
 pub(crate) mod util;
 pub mod voice;
+pub mod workflow;
 
 pub use config::Config;
 
