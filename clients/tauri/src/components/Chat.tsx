@@ -14,6 +14,7 @@ import {
 } from "../lib/chat-attachments";
 import { apiClient } from "../lib/api";
 import VoicePicker, { loadSelectedVoice } from "./VoicePicker";
+import { LiveKitVoiceChat } from "./LiveKitVoiceChat";
 import { isTauri } from "../lib/tauri-bridge";
 
 // ---------------------------------------------------------------------------
@@ -159,6 +160,10 @@ export function Chat({
   const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
   // ── AI Voice Picker (Typecast) ──
   const [showVoicePicker, setShowVoicePicker] = useState(false);
+  // ── LiveKit AI Voice Chat ──
+  const [showLiveKitChat, setShowLiveKitChat] = useState(false);
+  // ── Voice Chat Mode: "pipeline" (Mode A) or "s2s" (Mode B) ──
+  const [voiceChatMode, setVoiceChatMode] = useState<"pipeline" | "s2s">("pipeline");
   const [selectedAiVoice, setSelectedAiVoice] = useState(() => loadSelectedVoice());
   const ttsSettingsRef = useRef(ttsSettings);
   useEffect(() => { ttsSettingsRef.current = ttsSettings; }, [ttsSettings]);
@@ -848,8 +853,20 @@ export function Chat({
           />
         )}
 
-        {/* Action buttons row: folder, github, microphone, voice picker */}
+        {/* Action buttons row: mode selector, folder, github, microphone, voice picker */}
         <div className="chat-action-buttons">
+          {/* Voice chat mode dropdown */}
+          <select
+            className="chat-action-btn"
+            value={voiceChatMode}
+            onChange={(e) => setVoiceChatMode(e.target.value as "pipeline" | "s2s")}
+            title={locale === "ko" ? "음성 채팅 모드 선택" : "Voice chat mode"}
+            style={{ cursor: "pointer", minWidth: "auto", paddingRight: "4px" }}
+          >
+            <option value="pipeline">{locale === "ko" ? "모드A: 파이프라인" : "Mode A: Pipeline"}</option>
+            <option value="s2s">{locale === "ko" ? "모드B: Gemini Live" : "Mode B: Gemini Live"}</option>
+          </select>
+
           <button
             type="button"
             className="chat-action-btn"
@@ -862,21 +879,25 @@ export function Chat({
             </svg>
             <span>{locale === "ko" ? "폴더 연결" : "Folder"}</span>
           </button>
-          <button
-            type="button"
-            className="chat-action-btn"
-            onClick={() => setShowVoicePicker(true)}
-            disabled={!isConnected}
-            title={locale === "ko" ? "비서 선택" : "Choose Assistant"}
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
-              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-              <line x1="12" y1="19" x2="12" y2="23" />
-              <line x1="8" y1="23" x2="16" y2="23" />
-            </svg>
-            <span>{selectedAiVoice ? selectedAiVoice.voiceName : (locale === "ko" ? "비서 선택" : "Assistant")}</span>
-          </button>
+
+          {/* 비서 선택: Mode A (Pipeline)에서만 표시 — Mode B는 Gemini 자체 음성 사용 */}
+          {voiceChatMode === "pipeline" && (
+            <button
+              type="button"
+              className="chat-action-btn"
+              onClick={() => setShowVoicePicker(true)}
+              disabled={!isConnected}
+              title={locale === "ko" ? "비서 선택 (Typecast 음성)" : "Choose Assistant (Typecast voice)"}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                <line x1="12" y1="19" x2="12" y2="23" />
+                <line x1="8" y1="23" x2="16" y2="23" />
+              </svg>
+              <span>{selectedAiVoice ? selectedAiVoice.voiceName : (locale === "ko" ? "비서 선택" : "Assistant")}</span>
+            </button>
+          )}
           <button
             type="button"
             className="chat-action-btn"
@@ -932,7 +953,33 @@ export function Chat({
             </svg>
             <span>{locale === "ko" ? "음성 설정" : "TTS"}</span>
           </button>
+          <button
+            type="button"
+            className="chat-action-btn"
+            onClick={() => setShowLiveKitChat(true)}
+            title={locale === "ko" ? "AI 음성 대화 (LiveKit)" : "AI Voice Chat (LiveKit)"}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+            </svg>
+            <span>{locale === "ko" ? "AI 대화" : "AI Chat"}</span>
+          </button>
         </div>
+
+        {/* LiveKit Voice Chat overlay */}
+        {showLiveKitChat && (
+          <div className="livekit-overlay" style={{
+            position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
+            background: "var(--bg-primary, #0f0f1a)",
+            zIndex: 1000,
+            overflow: "auto",
+          }}>
+            <LiveKitVoiceChat
+              locale={locale}
+              onClose={() => setShowLiveKitChat(false)}
+            />
+          </div>
+        )}
 
         {/* TTS Voice Settings Panel */}
         {showTtsSettings && (

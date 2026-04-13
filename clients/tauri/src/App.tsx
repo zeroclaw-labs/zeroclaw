@@ -638,10 +638,6 @@ function App() {
           setPage("interpreter");
           if (window.innerWidth <= 768) setSidebarOpen(false);
         }}
-        onOpenVoiceChat={() => {
-          setPage("voicechat");
-          if (window.innerWidth <= 768) setSidebarOpen(false);
-        }}
         onOpenDocument={() => {
           setPage("document");
           if (window.innerWidth <= 768) setSidebarOpen(false);
