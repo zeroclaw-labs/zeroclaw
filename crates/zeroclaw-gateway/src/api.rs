@@ -1658,6 +1658,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             path_prefix: String::new(),
+            web_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -1706,6 +1707,7 @@ mod tests {
             proxy_url: None,
         });
         cfg.channels_config.email = Some(zeroclaw_config::scattered_types::EmailConfig {
+            enabled: true,
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
             imap_folder: "INBOX".to_string(),
@@ -1847,6 +1849,7 @@ mod tests {
             proxy_url: None,
         });
         current.channels_config.email = Some(zeroclaw_config::scattered_types::EmailConfig {
+            enabled: true,
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
             imap_folder: "INBOX".to_string(),
