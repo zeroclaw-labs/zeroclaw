@@ -4300,7 +4300,8 @@ fn collect_configured_channels(
                     .with_transcription(config.transcription.clone())
                     .with_tts(config.tts.clone())
                     .with_workspace_dir(config.workspace_dir.clone())
-                    .with_proxy_url(tg.proxy_url.clone()),
+                    .with_proxy_url(tg.proxy_url.clone())
+                    .with_config(std::sync::Arc::new(config.clone())),
                 ),
             });
         } else {

@@ -384,6 +384,8 @@ pub struct TelegramChannel {
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    /// Full application config for determining available tool commands.
+    config: Option<std::sync::Arc<zeroclaw_config::schema::Config>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,6 +430,7 @@ impl TelegramChannel {
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
+            config: None,
         }
     }
 
@@ -440,6 +443,12 @@ impl TelegramChannel {
     /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
+        self
+    }
+
+    /// Store the application config for determining available tool commands.
+    pub fn with_config(mut self, config: std::sync::Arc<zeroclaw_config::schema::Config>) -> Self {
+        self.config = Some(config);
         self
     }
 
@@ -644,7 +653,8 @@ impl TelegramChannel {
 
     /// Register the bot's slash commands with Telegram via `setMyCommands`.
     /// Called once at startup so that users see a command menu when pressing `/`.
-    /// Includes both built-in runtime commands and user-installed skill commands.
+    /// Includes built-in runtime commands, user-installed skill commands, and
+    /// enabled tool commands from the configuration.
     async fn register_bot_commands(&self) {
         let mut commands: Vec<serde_json::Value> = vec![
             serde_json::json!({ "command": "new",    "description": "Start a new conversation session" }),
@@ -654,13 +664,14 @@ impl TelegramChannel {
             serde_json::json!({ "command": "config", "description": "Show current configuration" }),
         ];
 
+        let mut used_names: std::collections::HashSet<String> = commands
+            .iter()
+            .filter_map(|c| c.get("command").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+
         // Collect commands from installed skills.
         if let Some(ref workspace_dir) = self.workspace_dir {
             let skills = zeroclaw_runtime::skills::load_skills(workspace_dir);
-            let mut used_names: std::collections::HashSet<String> = commands
-                .iter()
-                .filter_map(|c| c.get("command").and_then(|v| v.as_str()).map(String::from))
-                .collect();
 
             for skill in &skills {
                 let sanitized = sanitize_telegram_command_name(&skill.name);
@@ -687,6 +698,23 @@ impl TelegramChannel {
                 commands.push(serde_json::json!({
                     "command": sanitized,
                     "description": description,
+                }));
+            }
+        }
+
+        // Collect commands from enabled tools.
+        if let Some(ref config) = self.config {
+            let tool_specs =
+                zeroclaw_runtime::tools::tool_command_specs_from_config(config.as_ref());
+            for (name, description) in tool_specs {
+                let sanitized = sanitize_telegram_command_name(name);
+                if sanitized.is_empty() || used_names.contains(&sanitized) {
+                    continue;
+                }
+                used_names.insert(sanitized.clone());
+                commands.push(serde_json::json!({
+                    "command": sanitized,
+                    "description": truncate_telegram_command_description(description),
                 }));
             }
         }
@@ -5401,5 +5429,67 @@ mod tests {
 
         // Verify the mock was called (expectations checked on drop).
         // The request should contain 5 built-in + 1 skill command = 6 total.
+    }
+
+    #[tokio::test]
+    async fn register_bot_commands_includes_tools_from_config() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Default config has many tools enabled (browser defaults off, etc.)
+        let config = zeroclaw_config::schema::Config::default();
+        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
+            .with_api_base(mock_server.uri())
+            .with_config(std::sync::Arc::new(config));
+
+        ch.register_bot_commands().await;
+
+        // Just verify the mock was called — tool count depends on default config.
+        // The 5 runtime commands + N tool commands should all be registered.
+    }
+
+    #[test]
+    fn tool_command_specs_from_default_config_includes_standard_tools() {
+        let config = zeroclaw_config::schema::Config::default();
+        let specs = zeroclaw_runtime::tools::tool_command_specs_from_config(&config);
+        // Default config always registers core tools
+        let names: Vec<&str> = specs.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"shell"));
+        assert!(names.contains(&"file_read"));
+        assert!(names.contains(&"memory_store"));
+        assert!(names.contains(&"calculator"));
+        assert!(names.contains(&"weather"));
+    }
+
+    #[test]
+    fn tool_command_specs_includes_browser_when_enabled() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.browser.enabled = true;
+        let specs = zeroclaw_runtime::tools::tool_command_specs_from_config(&config);
+        let names: Vec<&str> = specs.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"browser_open"));
+        assert!(names.contains(&"browser"));
+    }
+
+    #[test]
+    fn tool_command_specs_excludes_browser_when_disabled() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.browser.enabled = false;
+        let specs = zeroclaw_runtime::tools::tool_command_specs_from_config(&config);
+        let names: Vec<&str> = specs.iter().map(|(n, _)| *n).collect();
+        assert!(!names.contains(&"browser_open"));
+        assert!(!names.contains(&"browser"));
     }
 }
