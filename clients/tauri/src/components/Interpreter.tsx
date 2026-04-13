@@ -158,6 +158,7 @@ export function Interpreter({
   const [micPermissionDenied, setMicPermissionDenied] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const sessionIdRef = useRef<string>(""); // shared session ID for Deepgram audio_chunk
   const audioContextRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -285,6 +286,7 @@ export function Interpreter({
       }
 
       const sessionId = crypto.randomUUID();
+      sessionIdRef.current = sessionId;
 
       // Both Deepgram and Gemini use /ws/voice — the provider field in session_start
       // tells the backend which STT engine to use.
@@ -582,7 +584,7 @@ export function Interpreter({
           // Send as audio_chunk message
           ws.send(JSON.stringify({
             type: "audio_chunk",
-            sessionId: "",
+            sessionId: sessionIdRef.current,
             seq: chunkSeq++,
             ts: Date.now(),
             pcm16le: b64,

@@ -34,6 +34,7 @@ import { apiClient } from "../lib/api";
 interface LiveKitVoiceChatProps {
   locale: Locale;
   onClose: () => void;
+  initialMode?: "pipeline" | "s2s";
 }
 
 type VoiceChatStatus =
@@ -55,9 +56,9 @@ interface ChatTranscript {
 
 type VoiceMode = "pipeline" | "s2s";
 
-export function LiveKitVoiceChat({ locale, onClose }: LiveKitVoiceChatProps) {
+export function LiveKitVoiceChat({ locale, onClose, initialMode }: LiveKitVoiceChatProps) {
   const [status, setStatus] = useState<VoiceChatStatus>("idle");
-  const [voiceMode, setVoiceMode] = useState<VoiceMode>("pipeline");
+  const [voiceMode, setVoiceMode] = useState<VoiceMode>(initialMode || "pipeline");
   const [transcripts, setTranscripts] = useState<ChatTranscript[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isMuted, setIsMuted] = useState(false);
@@ -133,7 +134,7 @@ export function LiveKitVoiceChat({ locale, onClose }: LiveKitVoiceChatProps) {
           room: `moa-voice-${Date.now()}`,
           identity: `user-${Date.now()}`,
           metadata: JSON.stringify({
-            language: "ko",
+            language: locale === "ko" ? "ko" : "en",
             tier: "premium",
             voice_mode: voiceMode,
           }),
@@ -280,16 +281,20 @@ export function LiveKitVoiceChat({ locale, onClose }: LiveKitVoiceChatProps) {
       setError(msg);
       setStatus("error");
     }
-  }, [locale, addTranscript]);
+  }, [locale, voiceMode, addTranscript]);
 
   const disconnect = useCallback(() => {
     setStatus("disconnecting");
     const room = roomRef.current;
     if (room) {
+      // Clean up leaked audio elements
+      document.querySelectorAll('[id^="agent-audio-"]').forEach((el) => el.remove());
       room.disconnect();
       roomRef.current = null;
     }
-    setStatus("idle");
+    // Let RoomEvent.Disconnected handler set "idle" — don't race it.
+    // Fallback: if no room was connected, set idle directly.
+    if (!room) setStatus("idle");
   }, []);
 
   const toggleMute = useCallback(() => {

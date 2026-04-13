@@ -6,7 +6,6 @@ import { Login } from "./components/Login";
 import { SignUp } from "./components/SignUp";
 import { DeviceSelect } from "./components/DeviceSelect";
 import { Interpreter } from "./components/Interpreter";
-import { LiveKitVoiceChat } from "./components/LiveKitVoiceChat";
 import { SetupWizard } from "./components/SetupWizard";
 import { GatewayStatus } from "./components/GatewayStatus";
 import { LockScreen } from "./components/LockScreen";
@@ -31,7 +30,7 @@ import {
   type ChatMessage,
 } from "./lib/storage";
 
-type Page = "setup" | "login" | "signup" | "device_select" | "locked" | "chat" | "settings" | "interpreter" | "voicechat" | "document";
+type Page = "setup" | "login" | "signup" | "device_select" | "locked" | "chat" | "settings" | "interpreter" | "document";
 
 /** Inactivity auto-lock timeout in milliseconds (default: 5 minutes). */
 const AUTO_LOCK_TIMEOUT_MS = 5 * 60 * 1000;
@@ -669,11 +668,6 @@ function App() {
             onBack={() => setPage("chat")}
             onToggleSidebar={() => setSidebarOpen((p) => !p)}
             sidebarOpen={sidebarOpen}
-          />
-        ) : page === "voicechat" ? (
-          <LiveKitVoiceChat
-            locale={locale}
-            onClose={() => setPage("chat")}
           />
         ) : page === "document" ? (
           <DocumentEditor

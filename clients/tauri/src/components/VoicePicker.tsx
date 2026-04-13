@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { gatewayFetch } from "../lib/tauri-bridge";
+import { apiClient } from "../lib/api";
 
 // ── Types ──
 
@@ -150,7 +151,7 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
           return;
         }
         // Fallback: direct HTTP fetch (browser dev mode)
-        const directResp = await fetch("http://127.0.0.1:3000/api/voices/list");
+        const directResp = await fetch(`${apiClient.getServerUrl()}/api/voices/list`);
         if (directResp.ok) {
           const json = await directResp.json();
           setData(json);

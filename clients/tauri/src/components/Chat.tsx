@@ -404,6 +404,8 @@ export function Chat({
   // Toggle voice mode on/off
   const toggleVoiceMode = useCallback(() => {
     if (listening || voiceMode) {
+      // Clear silence auto-send timer to prevent stale fire
+      if (silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null; }
       isSpeakingRef.current = false;
       recognitionRef.current?.stop();
       window.speechSynthesis.cancel();
@@ -977,6 +979,7 @@ export function Chat({
             <LiveKitVoiceChat
               locale={locale}
               onClose={() => setShowLiveKitChat(false)}
+              initialMode={voiceChatMode}
             />
           </div>
         )}
