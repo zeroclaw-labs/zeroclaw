@@ -1,6 +1,135 @@
 #[allow(unused_imports)]
 pub use zeroclaw_runtime::sop::*;
 
+use anyhow::Result;
+
+pub fn handle_command(command: crate::SopCommands, config: &crate::config::Config) -> Result<()> {
+    let workspace_dir = &config.workspace_dir;
+    let default_mode = parse_execution_mode(&config.sop.default_execution_mode);
+    let sops = load_sops(workspace_dir, config.sop.sops_dir.as_deref(), default_mode);
+
+    match command {
+        crate::SopCommands::List => {
+            if sops.is_empty() {
+                println!("No SOPs found.");
+                println!();
+                println!("  Create one: mkdir -p <workspace>/sops/my-sop");
+                println!("              then add SOP.toml and SOP.md");
+            } else {
+                println!("Loaded SOPs ({}):", sops.len());
+                println!();
+                for sop in &sops {
+                    println!(
+                        "  {} v{} [{}] — {}",
+                        console::style(&sop.name).white().bold(),
+                        sop.version,
+                        sop.priority,
+                        sop.description,
+                    );
+                    println!(
+                        "    Mode: {}  Steps: {}  Triggers: {}",
+                        sop.execution_mode,
+                        sop.steps.len(),
+                        sop.triggers
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                }
+            }
+            println!();
+            Ok(())
+        }
+        crate::SopCommands::Validate { name } => {
+            let targets: Vec<_> = match &name {
+                Some(n) => sops.iter().filter(|s| s.name == *n).collect(),
+                None => sops.iter().collect(),
+            };
+
+            if targets.is_empty() {
+                if let Some(n) = &name {
+                    anyhow::bail!("SOP not found: {n}");
+                }
+                println!("No SOPs found to validate.");
+                return Ok(());
+            }
+
+            let mut any_warnings = false;
+            for sop in &targets {
+                let warnings = validate_sop(sop);
+                if warnings.is_empty() {
+                    println!("  ✅ {} — valid", sop.name);
+                } else {
+                    any_warnings = true;
+                    println!("  ⚠️  {} — {} warning(s):", sop.name, warnings.len());
+                    for w in &warnings {
+                        println!("       - {w}");
+                    }
+                }
+            }
+            if !any_warnings {
+                println!();
+                println!("All SOPs passed validation.");
+            }
+            Ok(())
+        }
+        crate::SopCommands::Show { name } => {
+            let sop = sops
+                .iter()
+                .find(|s| s.name == name)
+                .ok_or_else(|| anyhow::anyhow!("SOP not found: {name}"))?;
+
+            println!(
+                "{} v{}",
+                console::style(&sop.name).white().bold(),
+                sop.version
+            );
+            println!("  {}", sop.description);
+            println!();
+            println!("  Priority:       {}", sop.priority);
+            println!("  Execution mode: {}", sop.execution_mode);
+            println!("  Deterministic:  {}", sop.deterministic);
+            println!("  Cooldown:       {}s", sop.cooldown_secs);
+            println!("  Max concurrent: {}", sop.max_concurrent);
+            if let Some(loc) = &sop.location {
+                println!("  Location:       {}", loc.display());
+            }
+            println!();
+            println!("  Triggers:");
+            for trigger in &sop.triggers {
+                println!("    - {trigger}");
+            }
+
+            if !sop.steps.is_empty() {
+                println!();
+                println!("  Steps:");
+                for step in &sop.steps {
+                    let confirm = if step.requires_confirmation {
+                        " [confirmation required]"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "    {}. {}{}",
+                        step.number,
+                        console::style(&step.title).bold(),
+                        confirm,
+                    );
+                    if !step.body.is_empty() {
+                        println!("       {}", step.body);
+                    }
+                    if !step.suggested_tools.is_empty() {
+                        println!("       Tools: {}", step.suggested_tools.join(", "));
+                    }
+                }
+            }
+            println!();
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

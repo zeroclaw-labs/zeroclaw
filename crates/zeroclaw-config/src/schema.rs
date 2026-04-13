@@ -2265,6 +2265,14 @@ pub struct GatewayConfig {
     #[nested]
     pub pairing_dashboard: PairingDashboardConfig,
 
+    /// Path to the web dashboard `dist` directory.  When set, the gateway
+    /// serves the compiled frontend from the filesystem instead of requiring
+    /// it to be embedded in the binary.  Accepts absolute paths or paths
+    /// relative to the working directory.  When omitted the gateway runs in
+    /// API-only mode (no web dashboard) unless auto-detection finds it.
+    #[serde(default)]
+    pub web_dist_dir: Option<String>,
+
     /// TLS configuration for the gateway server (`[gateway.tls]`).
     #[serde(default)]
     #[nested]
@@ -2325,6 +2333,7 @@ impl Default for GatewayConfig {
             session_persistence: true,
             session_ttl_hours: 0,
             pairing_dashboard: PairingDashboardConfig::default(),
+            web_dist_dir: None,
             tls: None,
         }
     }
@@ -10635,6 +10644,14 @@ impl Config {
             self.gateway.require_pairing = val == "1" || val.eq_ignore_ascii_case("true");
         }
 
+        // Web dist dir: ZEROCLAW_WEB_DIST_DIR
+        if let Ok(path) = std::env::var("ZEROCLAW_WEB_DIST_DIR") {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                self.gateway.web_dist_dir = Some(trimmed.to_string());
+            }
+        }
+
         // Temperature: ZEROCLAW_TEMPERATURE
         if let Ok(temp_str) = std::env::var("ZEROCLAW_TEMPERATURE") {
             match temp_str.parse::<f64>() {
@@ -13151,6 +13168,7 @@ channel_ids = ["C123", "D456"]
             session_persistence: true,
             session_ttl_hours: 0,
             pairing_dashboard: PairingDashboardConfig::default(),
+            web_dist_dir: None,
             tls: None,
         };
         let toml_str = toml::to_string(&g).unwrap();

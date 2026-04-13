@@ -44,7 +44,28 @@ rustc --version 2>/dev/null
 
 Also review the changed files and commit messages to understand the nature of the change (bug fix, feature, refactor, docs, chore, etc.) and which subsystems are affected.
 
+### Step 1a: Run the Validation Battery (required before drafting)
+
+Before drafting the PR body, actually run the commands the PR template's "Validation Evidence" section asks for. Do not paraphrase results, do not write "tests pass" from memory, do not skip on the assumption that CI will catch it. The evidence section needs literal output from a real local run:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo build
+cargo test
+```
+
+For docs-only changes, replace the Rust battery with markdown lint and link-integrity checks per `AGENTS.md`, and if touching bootstrap scripts add `bash -n install.sh`.
+
+Capture the tail of each command's output. You will paste the relevant excerpts (last 5–10 lines, any failures, any warnings) into the PR body's Validation Evidence section. If a command fails, stop and fix the underlying issue before drafting the PR — do not draft a PR on a broken tree.
+
+If a command is intentionally skipped (e.g., platform-blocked), note it explicitly in the evidence with a one-line reason. "Skipped" without explanation is not acceptable.
+
+If the validation run emits any `WARN` / `ERROR` / `warning:` lines, investigate them the same way a reviewer would: confirm pre-existing on master with root cause, or flag as something to address before opening. Do not ship a PR whose own local validation surfaces warnings you cannot explain.
+
 ### Step 2: Pre-Fill the Template
+
+When populating the "Validation Evidence" section, paste the actual tail output of the commands from Step 1a — do not paraphrase. The reviewer will be looking for literal strings to diff against their own validation run.
 
 Using the parsed template structure and gathered context, draft a complete PR body:
 
@@ -165,7 +186,9 @@ When the user wants to sync the PR description after pushing new changes:
 
 2. Re-read the PR template. Analyze which sections are now stale based on the new changes — use the template's section names and field descriptions to identify what needs updating rather than relying on hardcoded assumptions.
 
-3. Present proposed updates section-by-section and confirm before applying.
+3. **If any of the new commits touch code (not pure docs)**, re-run the validation battery from Step 1a before updating the Validation Evidence section. Stale validation evidence is worse than no evidence — it misleads the reviewer.
+
+4. Present proposed updates section-by-section and confirm before applying.
 
 ### Step 6: Apply Updates
 
