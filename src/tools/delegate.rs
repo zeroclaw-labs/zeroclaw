@@ -73,6 +73,8 @@ pub struct DelegateTool {
     cancellation_token: CancellationToken,
     /// Optional memory instance for namespace isolation on delegate agents.
     memory: Option<Arc<dyn Memory>>,
+    /// Whether script files in skills are allowed (from root config).
+    allow_scripts: bool,
 }
 
 impl DelegateTool {
@@ -107,6 +109,7 @@ impl DelegateTool {
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
             memory: None,
+            allow_scripts: false,
         }
     }
 
@@ -147,6 +150,7 @@ impl DelegateTool {
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
             memory: None,
+            allow_scripts: false,
         }
     }
 
@@ -195,6 +199,12 @@ impl DelegateTool {
     /// Attach memory for namespace isolation on delegate agents.
     pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Set whether script files in skills are allowed.
+    pub fn with_allow_scripts(mut self, allow_scripts: bool) -> Self {
+        self.allow_scripts = allow_scripts;
         self
     }
 
@@ -1026,7 +1036,7 @@ impl DelegateTool {
             .filter(|s| !s.trim().is_empty())
             .map(|dir| workspace_dir.join(dir))
             .unwrap_or_else(|| crate::skills::skills_dir(workspace_dir));
-        let skills = crate::skills::load_skills_from_directory(&skills_dir, false);
+        let skills = crate::skills::load_skills_from_directory(&skills_dir, self.allow_scripts);
 
         // Determine shell policy instructions when the `shell` tool is in the
         // effective tool list.

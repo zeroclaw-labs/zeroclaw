@@ -496,6 +496,7 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
             root_config.skills.open_skills_enabled,
             root_config.skills.open_skills_dir.clone(),
+            root_config.skills.allow_scripts,
         )));
     }
 
@@ -924,7 +925,8 @@ pub fn all_tools_with_runtime(
         .with_multimodal_config(root_config.multimodal.clone())
         .with_delegate_config(root_config.delegate.clone())
         .with_workspace_dir(workspace_dir.to_path_buf())
-        .with_memory(memory.clone());
+        .with_memory(memory.clone())
+        .with_allow_scripts(root_config.skills.allow_scripts);
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };
