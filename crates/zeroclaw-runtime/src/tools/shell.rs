@@ -188,6 +188,11 @@ impl Tool for ShellTool {
             }
         }
 
+        #[cfg(feature = "one2x")]
+        if let Ok(sid) = std::env::var("ZEROCLAW_SESSION_ID") {
+            cmd.env("ZEROCLAW_SESSION_ID", &sid);
+        }
+
         let timeout_secs = self.timeout_secs;
         let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
 

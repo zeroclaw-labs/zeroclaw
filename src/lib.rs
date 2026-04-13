@@ -106,6 +106,8 @@ pub(crate) mod tunnel;
 #[cfg(feature = "agent-runtime")]
 pub mod verifiable_intent;
 
+#[cfg(feature = "one2x")]
+pub(crate) mod one2x;
 #[cfg(feature = "plugins-wasm")]
 pub mod plugins;
 

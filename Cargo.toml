@@ -298,6 +298,9 @@ channel-feishu = ["channel-lark"]
 whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
 voice-wake = ["zeroclaw-channels/voice-wake"]
 
+# One2X custom extensions
+one2x = ["zeroclaw-channels/one2x", "zeroclaw-runtime/one2x", "zeroclaw-gateway/one2x"]
+
 # Backends and platform flags — each forwards to ONE crate
 observability-prometheus = [
     "zeroclaw-runtime/observability-prometheus",

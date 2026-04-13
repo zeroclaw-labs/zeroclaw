@@ -24,6 +24,9 @@ pub mod static_files;
 pub mod tls;
 pub mod ws;
 
+#[cfg(feature = "one2x")]
+pub(crate) mod one2x;
+
 use anyhow::{Context, Result};
 use axum::{
     Router,
@@ -1051,6 +1054,10 @@ pub async fn run_gateway(
         "/api/plugins",
         get(api_plugins::plugin_routes::list_plugins),
     );
+
+    // ── One2X custom routes (agent SSE, web channel WS) ──
+    #[cfg(feature = "one2x")]
+    let inner = crate::one2x::extend_router(inner);
 
     let inner = inner
         // ── SSE event stream ──

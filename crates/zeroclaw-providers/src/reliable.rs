@@ -423,13 +423,23 @@ impl ReliableProvider {
     }
 
     /// Compute backoff duration, respecting Retry-After if present.
+    /// Adds ±25% jitter to prevent thundering-herd retries.
     fn compute_backoff(&self, base: u64, err: &anyhow::Error) -> u64 {
-        if let Some(retry_after) = parse_retry_after_ms(err) {
-            // Use Retry-After but cap at 30s to avoid indefinite waits
+        let raw = if let Some(retry_after) = parse_retry_after_ms(err) {
             retry_after.min(30_000).max(base)
         } else {
             base
+        };
+        let jitter_range = raw / 4;
+        if jitter_range == 0 {
+            return raw;
         }
+        let jitter = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64)
+            % (jitter_range * 2 + 1);
+        raw.saturating_sub(jitter_range).saturating_add(jitter)
     }
 }
 
@@ -1135,18 +1145,45 @@ impl Provider for ReliableProvider {
             let stream = provider.stream_chat(req, &current_model, temperature, options);
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
+            const STREAM_IDLE_TIMEOUT_SECS: u64 = 60;
+
             tokio::spawn(async move {
                 let mut stream = stream;
-                while let Some(event) = stream.next().await {
-                    if let Err(ref e) = event {
-                        tracing::warn!(
-                            provider = provider_clone,
-                            model = current_model,
-                            "Streaming error: {e}"
-                        );
-                    }
-                    if tx.send(event).await.is_err() {
-                        break;
+                loop {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS),
+                        stream.next(),
+                    )
+                    .await
+                    {
+                        Ok(Some(event)) => {
+                            if let Err(ref e) = event {
+                                tracing::warn!(
+                                    provider = provider_clone,
+                                    model = current_model,
+                                    "Streaming error: {e}"
+                                );
+                            }
+                            if tx.send(event).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            tracing::warn!(
+                                provider = provider_clone,
+                                model = current_model,
+                                timeout_secs = STREAM_IDLE_TIMEOUT_SECS,
+                                "Stream idle timeout — no token received"
+                            );
+                            let _ = tx
+                                .send(Err(super::traits::StreamError::Provider(format!(
+                                    "Stream idle timeout after {}s",
+                                    STREAM_IDLE_TIMEOUT_SECS
+                                ))))
+                                .await;
+                            break;
+                        }
                     }
                 }
             });

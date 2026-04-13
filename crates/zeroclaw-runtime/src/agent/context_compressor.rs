@@ -121,11 +121,13 @@ pub struct ContextCompressor {
     memory: Option<Arc<dyn Memory>>,
 }
 
+const MIN_CONTEXT_WINDOW_FLOOR: usize = 20_000;
+
 impl ContextCompressor {
     pub fn new(config: ContextCompressionConfig, context_window: usize) -> Self {
         Self {
             config,
-            context_window,
+            context_window: context_window.max(MIN_CONTEXT_WINDOW_FLOOR),
             memory: None,
         }
     }

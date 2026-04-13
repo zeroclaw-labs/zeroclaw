@@ -24,7 +24,7 @@ impl SessionStore {
     }
 
     /// Compute the file path for a session key, sanitizing for filesystem safety.
-    fn session_path(&self, session_key: &str) -> PathBuf {
+    pub fn session_path(&self, session_key: &str) -> PathBuf {
         let safe_key: String = session_key
             .chars()
             .map(|c| {

@@ -2635,6 +2635,16 @@ async fn process_channel_message(
     // Preserve user turn before the LLM call so interrupted requests keep context.
     append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
 
+    #[cfg(feature = "one2x")]
+    if let Some(optimized) = crate::one2x::agent_hooks::detect_fast_approval(&msg.content) {
+        tracing::debug!(
+            channel = %msg.channel,
+            original = %msg.content,
+            "Fast approval detected — injecting execution instruction"
+        );
+        msg.content = optimized.to_string();
+    }
+
     // Build history from per-sender conversation cache.
     let prior_turns_raw = if force_fresh_session {
         vec![ChatMessage::user(&msg.content)]
@@ -2766,6 +2776,9 @@ async fn process_channel_message(
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
 
+    #[cfg(feature = "one2x")]
+    crate::one2x::tool_pairing::repair_tool_pairing(&mut history);
+
     // ── Proactive context compression ────────────────────────────
     // Use the existing ContextCompressor to summarize older history
     // before the LLM call, preventing context-window-exceeded errors
@@ -2790,6 +2803,13 @@ async fn process_channel_message(
                     passes = result.passes_used,
                     "Proactive context compression applied before LLM call"
                 );
+                #[cfg(feature = "one2x")]
+                if let Some(ref store) = ctx.session_store {
+                    let path = store.session_path(&history_key);
+                    if let Err(e) = crate::one2x::session_hygiene::truncate_session_file(&path, history.len()) {
+                        tracing::debug!("Session truncation after compaction failed: {e}");
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!("Context compression failed, proceeding without: {e}");
@@ -3293,6 +3313,8 @@ async fn process_channel_message(
                 // assistant response that matches our delivered text.
                 let tool_messages: Vec<ChatMessage> = extract_current_turn_tool_messages(&history);
                 for tool_msg in tool_messages {
+                    #[cfg(feature = "one2x")]
+                    let tool_msg = crate::one2x::session_hygiene::trim_tool_result_for_session(&tool_msg);
                     append_sender_turn(ctx.as_ref(), &history_key, tool_msg);
                 }
             }
@@ -4963,6 +4985,18 @@ fn collect_configured_channels(
         }
     }
 
+    #[cfg(feature = "one2x")]
+    if config
+        .channels_config
+        .web
+        .as_ref()
+        .is_some_and(|w| w.enabled)
+    {
+        tracing::info!("One2X web channel enabled");
+        // WebChannel registration is handled via the root crate's one2x module
+        // which provides extend_channels() — the channel instance is created there.
+    }
+
     channels
 }
 
@@ -5596,6 +5630,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
             if msgs.is_empty() {
                 continue;
             }
+            #[cfg(feature = "one2x")]
+            crate::one2x::session_hygiene::repair_session_messages(&mut msgs);
             // Trim to MAX_CHANNEL_HISTORY turns (keep most recent).
             if msgs.len() > MAX_CHANNEL_HISTORY {
                 msgs.drain(..msgs.len() - MAX_CHANNEL_HISTORY);

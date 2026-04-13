@@ -19,8 +19,18 @@ use super::loop_::{ParsedToolCall, ToolLoopCancelled, scrub_credentials};
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /// Look up a tool by name in a slice of boxed `dyn Tool` values.
+///
+/// Tries exact match first; falls back to case-insensitive match to tolerate
+/// providers that return tool names in the wrong case.
 pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
-    tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
+    if let Some(t) = tools.iter().find(|t| t.name() == name) {
+        return Some(t.as_ref());
+    }
+    let name_lower = name.to_ascii_lowercase();
+    tools
+        .iter()
+        .find(|t| t.name().to_ascii_lowercase() == name_lower)
+        .map(|t| t.as_ref())
 }
 
 // ── Outcome ──────────────────────────────────────────────────────────────

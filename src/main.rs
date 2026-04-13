@@ -35,6 +35,9 @@
     unused_imports
 )]
 
+#[cfg(feature = "one2x")]
+mod one2x;
+
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::{Password, Select};

@@ -548,3 +548,22 @@ impl Default for VoiceCallConfig {
         }
     }
 }
+
+#[cfg(feature = "one2x")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels_config.web"]
+pub struct WebChannelConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[cfg(feature = "one2x")]
+impl super::traits::ChannelConfig for WebChannelConfig {
+    fn name() -> &'static str {
+        "Web"
+    }
+    fn desc() -> &'static str {
+        "WebSocket real-time channel"
+    }
+}

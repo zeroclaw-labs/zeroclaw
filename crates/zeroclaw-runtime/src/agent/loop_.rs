@@ -839,6 +839,9 @@ pub async fn run_tool_call_loop(
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
 
+    #[cfg(feature = "one2x")]
+    let mut planning_nudge_used = false;
+
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
@@ -986,6 +989,12 @@ pub async fn run_tool_call_loop(
                 (provider, provider_name, model)
             };
 
+        #[cfg(feature = "one2x")]
+        {
+            crate::one2x::session_hygiene::repair_full_tool_pairing(history);
+            crate::one2x::session_hygiene::limit_tool_result_sizes(history);
+        }
+
         let prepared_messages =
             multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
 
@@ -1132,6 +1141,11 @@ pub async fn run_tool_call_loop(
                 temperature,
             );
 
+            #[cfg(feature = "one2x")]
+            let step_max_retries = crate::one2x::agent_hooks::STEP_TIMEOUT_MAX_RETRIES;
+            #[cfg(not(feature = "one2x"))]
+            let step_max_retries: u32 = 0;
+
             match pacing.step_timeout_secs {
                 Some(step_secs) if step_secs > 0 => {
                     let step_timeout = Duration::from_secs(step_secs);
@@ -1141,6 +1155,42 @@ pub async fn run_tool_call_loop(
                             result = tokio::time::timeout(step_timeout, chat_future) => {
                                 match result {
                                     Ok(inner) => inner,
+                                    Err(_) if step_max_retries > 0 => {
+                                        tracing::warn!(
+                                            step_secs,
+                                            max_retries = step_max_retries,
+                                            "LLM step timed out — retrying with backoff"
+                                        );
+                                        let mut last_err = anyhow::anyhow!(
+                                            "LLM inference step timed out after {step_secs}s"
+                                        );
+                                        let mut succeeded = None;
+                                        for retry in 0..step_max_retries {
+                                            let backoff = Duration::from_secs(2u64 << retry);
+                                            tokio::time::sleep(backoff).await;
+                                            let retry_future = active_provider.chat(
+                                                ChatRequest {
+                                                    messages: &prepared_messages.messages,
+                                                    tools: request_tools,
+                                                },
+                                                active_model,
+                                                temperature,
+                                            );
+                                            match tokio::time::timeout(step_timeout, retry_future).await {
+                                                Ok(inner) => { succeeded = Some(inner); break; }
+                                                Err(_) => {
+                                                    last_err = anyhow::anyhow!(
+                                                        "LLM step retry {}/{} timed out after {step_secs}s",
+                                                        retry + 1, step_max_retries
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        match succeeded {
+                                            Some(r) => r,
+                                            None => Err(last_err),
+                                        }
+                                    }
                                     Err(_) => anyhow::bail!(
                                         "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
                                     ),
@@ -1419,6 +1469,13 @@ pub async fn run_tool_call_loop(
             }
 
             history.push(ChatMessage::assistant(response_text.clone()));
+            #[cfg(feature = "one2x")]
+            if !planning_nudge_used
+                && crate::one2x::agent_hooks::check_planning_without_execution(history)
+            {
+                planning_nudge_used = true;
+                continue;
+            }
             return Ok(accumulated_display_text);
         }
 

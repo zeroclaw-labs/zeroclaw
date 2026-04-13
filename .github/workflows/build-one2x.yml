@@ -1,0 +1,98 @@
+name: "One2X: Build & Deploy"
+
+on:
+  push:
+    branches: [one2x/custom-v5]
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "web/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile.debian"
+      - ".github/workflows/build-one2x.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g. v5.3.1). Auto-generated if empty."
+        required: false
+
+env:
+  ACR_EE_INSTANCE_ID: cri-e71dfjucxw8ipc7m
+  ACR_EE_REGION: ap-southeast-1
+  IMAGE_NAME: platform/zeroclaw
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute version tag
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            TAG="${{ github.event.inputs.version }}"
+          else
+            TAG="v5.6.0-$(echo ${{ github.sha }} | cut -c1-7)"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Image tag: ${TAG}"
+
+      - name: Login to ACR EE
+        uses: aliyun/acr-login@v1
+        with:
+          login-server: ${{ secrets.ACR_REGISTRY }}
+          region-id: ${{ env.ACR_EE_REGION }}
+          access-key-id: ${{ secrets.ALICLOUD_ACCESS_KEY }}
+          access-key-secret: ${{ secrets.ALICLOUD_SECRET_KEY }}
+          instance-id: ${{ env.ACR_EE_INSTANCE_ID }}
+
+      - name: Build and push
+        run: |
+          FULL_IMAGE="${{ secrets.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}"
+
+          DOCKER_BUILDKIT=1 docker build \
+            -f Dockerfile.ci \
+            -t "${FULL_IMAGE}" .
+
+          docker push "${FULL_IMAGE}"
+          echo "FULL_IMAGE=${FULL_IMAGE}" >> "$GITHUB_ENV"
+
+      - name: Update videoclaw-ops manifests
+        if: success()
+        env:
+          VIDEOCLAW_OPS_TOKEN: ${{ secrets.VIDEOCLAW_OPS_TOKEN }}
+        run: |
+          if [ -z "$VIDEOCLAW_OPS_TOKEN" ]; then
+            echo "::warning::VIDEOCLAW_OPS_TOKEN not set — skipping manifest update"
+            exit 0
+          fi
+
+          TAG="${{ steps.version.outputs.tag }}"
+
+          git clone --depth 1 \
+            "https://x-access-token:${VIDEOCLAW_OPS_TOKEN}@github.com/one2x-ai/videoclaw-ops.git" \
+            /tmp/videoclaw-ops
+          cd /tmp/videoclaw-ops
+
+          sed -i "s|value: \".*platform/zeroclaw:.*\"|value: \"${FULL_IMAGE}\"|g" \
+            apps/zeroclaw/dev/manifests.yaml
+          sed -i "s|image: .*platform/zeroclaw:.*|image: ${FULL_IMAGE}|g" \
+            apps/zeroclaw/dev/manifests.yaml
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "deploy: upgrade ZeroClaw to ${TAG} (auto)"
+            git pull --rebase
+            git push
+          fi
+
+          echo "### ZeroClaw ${TAG} deployed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image: \`${FULL_IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"

@@ -167,6 +167,23 @@ pub trait Memory: Send + Sync {
     /// Health check
     async fn health_check(&self) -> bool;
 
+    /// List memory entries whose key starts with `prefix`.
+    ///
+    /// Default implementation fetches all entries and filters in-memory.
+    /// Backends with efficient prefix queries should override.
+    async fn list_by_prefix(
+        &self,
+        prefix: &str,
+        limit: Option<usize>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let all = self.list(None, None).await?;
+        Ok(all
+            .into_iter()
+            .filter(|e| e.key.starts_with(prefix))
+            .take(limit.unwrap_or(usize::MAX))
+            .collect())
+    }
+
     /// Store a conversation trace as procedural memory.
     ///
     /// Backends that support procedural storage override this

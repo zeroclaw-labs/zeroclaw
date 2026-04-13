@@ -1000,6 +1000,49 @@ impl Memory for SqliteMemory {
             .unwrap_or(false)
     }
 
+    async fn list_by_prefix(
+        &self,
+        prefix: &str,
+        limit: Option<usize>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        const DEFAULT_LIST_BY_PREFIX_LIMIT: usize = 100;
+
+        let conn = self.conn.clone();
+        let like_pattern = format!("{prefix}%");
+        let row_limit = limit.unwrap_or(DEFAULT_LIST_BY_PREFIX_LIMIT);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by \
+                 FROM memories WHERE key LIKE ?1 ORDER BY created_at DESC LIMIT ?2",
+            )?;
+            #[allow(clippy::cast_possible_wrap)]
+            let limit_i64 = row_limit as i64;
+            let rows = stmt.query_map(params![like_pattern, limit_i64], |row| {
+                Ok(MemoryEntry {
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    content: row.get(2)?,
+                    category: Self::str_to_category(&row.get::<_, String>(3)?),
+                    timestamp: row.get(4)?,
+                    session_id: row.get(5)?,
+                    score: None,
+                    namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
+                    importance: row.get(7)?,
+                    superseded_by: row.get(8)?,
+                })
+            })?;
+
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+        .await?
+    }
+
     async fn export(&self, filter: &ExportFilter) -> anyhow::Result<Vec<MemoryEntry>> {
         let conn = self.conn.clone();
         let filter = filter.clone();

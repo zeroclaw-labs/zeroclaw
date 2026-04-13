@@ -6542,6 +6542,10 @@ pub struct ChannelsConfig {
     /// Voice call channel configuration (Twilio/Telnyx/Plivo).
     #[nested]
     pub voice_call: Option<crate::scattered_types::VoiceCallConfig>,
+    /// One2X WebSocket real-time channel configuration.
+    #[cfg(feature = "one2x")]
+    #[nested]
+    pub web: Option<crate::scattered_types::WebChannelConfig>,
     /// Voice wake word detection channel configuration.
     #[cfg(feature = "voice-wake")]
     #[nested]
@@ -6708,6 +6712,11 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.bluesky.as_ref())),
                 self.bluesky.is_some(),
             ),
+            #[cfg(feature = "one2x")]
+            (
+                Box::new(ConfigWrapper::new(self.web.as_ref())),
+                self.web.is_some(),
+            ),
             #[cfg(feature = "voice-wake")]
             (
                 Box::new(ConfigWrapper::new(self.voice_wake.as_ref())),
@@ -6772,6 +6781,8 @@ impl Default for ChannelsConfig {
             reddit: None,
             bluesky: None,
             voice_call: None,
+            #[cfg(feature = "one2x")]
+            web: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
@@ -11711,6 +11722,8 @@ auto_save = true
                 reddit: None,
                 bluesky: None,
                 voice_call: None,
+                #[cfg(feature = "one2x")]
+                web: None,
                 #[cfg(feature = "voice-wake")]
                 voice_wake: None,
                 mqtt: None,
@@ -12846,6 +12859,8 @@ allowed_rooms = ["!ops:matrix.org"]
             reddit: None,
             bluesky: None,
             voice_call: None,
+            #[cfg(feature = "one2x")]
+            web: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
@@ -13220,6 +13235,8 @@ bot_token = "xoxb-tok"
             reddit: None,
             bluesky: None,
             voice_call: None,
+            #[cfg(feature = "one2x")]
+            web: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,

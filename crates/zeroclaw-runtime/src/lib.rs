@@ -1,5 +1,8 @@
 //! Agent runtime — orchestration, security, observability, cron, SOP, skills, hardware, and more.
 
+#[cfg(feature = "one2x")]
+pub(crate) mod one2x;
+
 pub mod cli_input;
 pub mod i18n;
 pub mod identity;
