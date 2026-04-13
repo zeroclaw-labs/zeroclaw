@@ -969,7 +969,7 @@ pub fn all_tools_with_runtime(
 ///
 /// This function should be kept in sync with [`all_tools_with_runtime`].
 pub fn tool_command_specs_from_config(config: &Config) -> Vec<(&'static str, &'static str)> {
-    let mut specs: Vec<(&str, &str)> = vec![
+    let mut specs: Vec<(&'static str, &'static str)> = vec![
         // ── Always-registered tools ──────────────────────────────────────
         ("shell", "Execute a shell command"),
         ("file_read", "Read file contents"),
@@ -1466,5 +1466,40 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"read_skill"));
+    }
+
+    #[test]
+    fn tool_command_specs_covers_default_tools() {
+        let config = Config::default();
+        let specs = tool_command_specs_from_config(&config);
+        let spec_names: std::collections::HashSet<&str> =
+            specs.iter().map(|(name, _)| *name).collect();
+
+        // Verify the always-registered default tools are present.
+        let security = Arc::new(SecurityPolicy::default());
+        let default = default_tools(security);
+        for tool in &default {
+            assert!(
+                spec_names.contains(tool.name()),
+                "tool_command_specs_from_config() is missing default tool '{}'",
+                tool.name()
+            );
+        }
+    }
+
+    #[test]
+    fn tool_command_specs_respects_browser_flag() {
+        let mut config = Config::default();
+        config.browser.enabled = false;
+        let specs = tool_command_specs_from_config(&config);
+        let names: Vec<&str> = specs.iter().map(|(n, _)| *n).collect();
+        assert!(!names.contains(&"browser_open"));
+        assert!(!names.contains(&"browser"));
+
+        config.browser.enabled = true;
+        let specs = tool_command_specs_from_config(&config);
+        let names: Vec<&str> = specs.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"browser_open"));
+        assert!(names.contains(&"browser"));
     }
 }

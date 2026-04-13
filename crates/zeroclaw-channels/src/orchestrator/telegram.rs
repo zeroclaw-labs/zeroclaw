@@ -664,6 +664,7 @@ impl TelegramChannel {
             serde_json::json!({ "command": "config", "description": "Show current configuration" }),
         ];
 
+        // Track registered names to deduplicate across skills and tools.
         let mut used_names: std::collections::HashSet<String> = commands
             .iter()
             .filter_map(|c| c.get("command").and_then(|v| v.as_str()).map(String::from))
