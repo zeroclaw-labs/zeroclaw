@@ -316,6 +316,10 @@ export function Chat({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLoading, pendingQueue]);
 
+  // ── STT: silence auto-send timer ──
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const SILENCE_AUTO_SEND_MS = 2000; // 2초 침묵 시 자동 전송
+
   // ── STT: start listening (internal helper) ──
   const startListening = useCallback((lang: string) => {
     // Never start STT while TTS is still playing
@@ -324,10 +328,10 @@ export function Chat({
     const recognition = createSpeechRecognition(lang);
     if (!recognition) return;
     let finalTranscript = "";
+    let lastResultTime = 0;
+
     recognition.onresult = (event: { results: SpeechRecognitionResultList }) => {
       // ── Echo suppression: ignore all STT input while TTS is speaking ──
-      // Without this, the speaker output feeds back into the microphone,
-      // gets transcribed, and auto-sent as a new question → infinite loop.
       if (isSpeakingRef.current) return;
 
       let interim = "";
@@ -339,13 +343,34 @@ export function Chat({
         else interim += r[0].transcript;
       }
       setInput(finalTranscript + interim);
+      lastResultTime = Date.now();
+
+      // Reset silence timer on every speech result
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+
+      // Auto-send after 2s of silence (if there's text to send)
+      if (voiceModeRef.current) {
+        silenceTimerRef.current = setTimeout(() => {
+          if (!voiceModeRef.current || isSpeakingRef.current) return;
+          const textToSend = finalTranscript.trim();
+          if (textToSend && Date.now() - lastResultTime >= SILENCE_AUTO_SEND_MS - 100) {
+            setInput(textToSend);
+            setTimeout(() => {
+              const btn = document.querySelector("[data-voice-send]") as HTMLButtonElement | null;
+              btn?.click();
+            }, 50);
+          }
+        }, SILENCE_AUTO_SEND_MS);
+      }
     };
     recognition.onerror = (e: { error?: string }) => {
       if (e.error === "no-speech" || e.error === "aborted") return;
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
       setListening(false);
       setVoiceMode(false);
     };
     recognition.onend = () => {
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
       // Don't restart or auto-send while TTS is playing (echo suppression)
       if (isSpeakingRef.current) {
         setListening(false);

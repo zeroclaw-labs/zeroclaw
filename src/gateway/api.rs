@@ -2234,6 +2234,66 @@ pub async fn handle_api_livekit_token(
 
     let token = format!("{signing_input}.{signature}");
 
+    // Create room + dispatch agent via LiveKit Server API.
+    // Uses a short-lived admin token (separate from participant token).
+    let admin_claims = serde_json::json!({
+        "iss": api_key,
+        "sub": "moa-backend",
+        "iat": now,
+        "nbf": now,
+        "exp": now + 60,
+        "video": {
+            "roomCreate": true,
+            "roomAdmin": true,
+            "room": room,
+        },
+    });
+    let admin_claims_b64 = b64.encode(serde_json::to_string(&admin_claims).unwrap_or_default());
+    let admin_signing = format!("{header_b64}.{admin_claims_b64}");
+    let mut admin_mac =
+        Hmac::<Sha256>::new_from_slice(api_secret.as_bytes()).expect("HMAC accepts any key size");
+    admin_mac.update(admin_signing.as_bytes());
+    let admin_sig = b64.encode(admin_mac.finalize().into_bytes());
+    let admin_token = format!("{admin_signing}.{admin_sig}");
+
+    // Fire-and-forget: create room + dispatch agent
+    let lk_http_url = server_url
+        .replace("wss://", "https://")
+        .replace("ws://", "http://");
+    let room_str = room.to_string();
+    let metadata_clone = metadata.clone();
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+
+        // 1) Create room
+        let _ = client
+            .post(format!("{lk_http_url}/twirp/livekit.RoomService/CreateRoom"))
+            .header("Authorization", format!("Bearer {admin_token}"))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "name": room_str,
+                "empty_timeout": 300,
+            }))
+            .send()
+            .await;
+
+        // 2) Dispatch agent to room
+        let _ = client
+            .post(format!(
+                "{lk_http_url}/twirp/livekit.AgentDispatchService/CreateDispatch"
+            ))
+            .header("Authorization", format!("Bearer {admin_token}"))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "room": room_str,
+                "metadata": metadata_clone,
+            }))
+            .send()
+            .await;
+
+        tracing::info!(room = %room_str, "LiveKit room created + agent dispatched");
+    });
+
     Json(serde_json::json!({
         "token": token,
         "url": server_url,

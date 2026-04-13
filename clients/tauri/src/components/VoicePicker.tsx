@@ -138,17 +138,25 @@ export default function VoicePicker({ locale, onSelect, selectedVoiceId, onClose
   const [expertise, setExpertise] = useState<string>("all");
   const [nativeLang, setNativeLang] = useState<string>("all");
 
-  // Fetch voices on mount
+  // Fetch voices on mount (Tauri bridge → fallback to direct HTTP)
   useEffect(() => {
     (async () => {
       try {
+        // Try Tauri bridge first (desktop app)
         const resp = await gatewayFetch("/api/voices/list", "GET", {});
         if (resp && resp.status === 200) {
           const json = JSON.parse(resp.body);
           setData(json);
-        } else {
-          setError(locale.startsWith("ko") ? "음성 목록을 불러올 수 없습니다." : "Failed to load voices.");
+          return;
         }
+        // Fallback: direct HTTP fetch (browser dev mode)
+        const directResp = await fetch("http://127.0.0.1:3000/api/voices/list");
+        if (directResp.ok) {
+          const json = await directResp.json();
+          setData(json);
+          return;
+        }
+        setError(locale.startsWith("ko") ? "음성 목록을 불러올 수 없습니다." : "Failed to load voices.");
       } catch (e: any) {
         setError(e.message || "Network error");
       } finally {
