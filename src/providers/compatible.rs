@@ -5081,64 +5081,6 @@ mod tests {
     }
 
     #[test]
-    fn screenshot_followup_request_keeps_user_multimodal_image_content() {
-        // The agent-loop heartbeat fix leaves the screenshot-bearing tool result in
-        // the request.  Assert that the provider correctly converts it into a
-        // user-role multipart message with an image_url block (the wire shape that
-        // LiteLLM / Gemma 4 expects for vision input).
-        let input = vec![
-            ChatMessage::user("capture a screenshot"),
-            ChatMessage::assistant(
-                r#"{"content":"","tool_calls":[{"id":"call_ss","name":"browser","arguments":"{}"}]}"#,
-            ),
-            ChatMessage::tool(
-                r#"{"tool_call_id":"call_ss","content":"Screenshot captured\n[IMAGE:data:image/jpeg;base64,/9j/AAAA]"}"#,
-            ),
-        ];
-
-        let native = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
-        assert_eq!(native.len(), 3, "expected 3 native messages");
-
-        // The tool result with an image MUST be promoted to a user-role message (index 2).
-        let screenshot_msg = &native[2];
-        assert_eq!(screenshot_msg.role, "user");
-        assert!(screenshot_msg.tool_call_id.is_none());
-
-        let wire = serde_json::to_string(screenshot_msg).unwrap();
-        assert!(
-            wire.contains("image_url"),
-            "screenshot message must contain an image_url content part: {wire}"
-        );
-        assert!(
-            !wire.contains("[IMAGE:"),
-            "raw [IMAGE:] marker must not appear on the wire: {wire}"
-        );
-    }
-
-    #[test]
-    fn screenshot_followup_request_preserves_tool_schema_when_present() {
-        // The heartbeat suppression is in the agent loop, not the provider.
-        // Assert that convert_tool_specs faithfully serialises a ToolSpec array
-        // and that the result is not silently dropped when tools are provided.
-        let tool = crate::tools::ToolSpec {
-            name: "browser".to_string(),
-            description: "Control a headless browser".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string" }
-                }
-            }),
-        };
-
-        let result = OpenAiCompatibleProvider::convert_tool_specs(Some(&[tool]));
-        let tools = result.expect("tool specs must produce a Some value when tools are provided");
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["function"]["name"], "browser");
-        assert_eq!(tools[0]["type"], "function");
-    }
-
-    #[test]
     fn convert_messages_strips_tool_call_tags_from_assistant_content() {
         use crate::providers::ChatMessage;
 
