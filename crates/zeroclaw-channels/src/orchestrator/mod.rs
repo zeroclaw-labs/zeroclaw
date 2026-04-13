@@ -3991,6 +3991,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     mx.access_token.clone(),
                     mx.room_id.clone(),
                     mx.allowed_users.clone(),
+                    mx.mention_only,
                 )))
             }
             #[cfg(not(feature = "channel-matrix"))]
@@ -4471,6 +4472,7 @@ fn collect_configured_channels(
                         mx.device_id.clone(),
                         config.config_path.parent().map(|path| path.to_path_buf()),
                         mx.recovery_key.clone(),
+                        mx.mention_only,
                     )
                     .with_streaming(
                         mx.stream_mode,
