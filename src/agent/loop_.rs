@@ -464,32 +464,6 @@ fn should_inject_safety_heartbeat(counter: usize, interval: usize) -> bool {
     interval > 0 && counter > 0 && counter % interval == 0
 }
 
-/// Return `true` when `messages` contains a tool-role message whose JSON
-/// `content` field carries at least one `[IMAGE:]` marker.  This indicates
-/// the current loop iteration is the *immediate follow-up* to a screenshot
-/// tool call — the vision model has not yet seen the image pixels.
-///
-/// Injecting a safety-heartbeat user message in the same request produces a
-/// consecutive-user-message sequence that some OpenAI-compatible backends
-/// (e.g. Gemma 4 via LiteLLM) reject with `Invalid url value`.  The heartbeat
-/// is suppressed for this one request only; all subsequent iterations are
-/// unaffected.
-fn request_contains_screenshot_followup_turn(messages: &[ChatMessage]) -> bool {
-    messages.iter().any(|msg| {
-        if msg.role != "tool" {
-            return false;
-        }
-        // Tool content is JSON-wrapped: {"tool_call_id":"...", "content":"..."}
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content) {
-            if let Some(content) = value.get("content").and_then(|c| c.as_str()) {
-                return multimodal::content_contains_image_markers(content);
-            }
-        }
-        // Fallback: raw (non-JSON) tool content
-        multimodal::content_contains_image_markers(&msg.content)
-    })
-}
-
 fn should_emit_verbose_progress(mode: ProgressMode) -> bool {
     mode == ProgressMode::Verbose
 }
@@ -1441,15 +1415,8 @@ pub async fn run_tool_call_loop(
         }
 
         // ── Safety heartbeat: periodic security-constraint re-injection ──
-        // Suppressed when the current request already contains a screenshot-bearing
-        // tool result, because some backends reject consecutive user messages in
-        // multimodal requests (Gemma 4 via LiteLLM: "Invalid url value").
-        // The suppression is scoped to this one request; later iterations are
-        // unaffected because downgrade_image_tool_results_for_history will have
-        // already removed the image markers from the durable history by then.
-        let has_screenshot_followup = request_contains_screenshot_followup_turn(&request_messages);
         if let Some(ref hb) = heartbeat_config {
-            if should_inject_safety_heartbeat(iteration, hb.interval) && !has_screenshot_followup {
+            if should_inject_safety_heartbeat(iteration, hb.interval) {
                 let reminder = format!(
                     "[Safety Heartbeat — round {}/{}]\n{}",
                     iteration + 1,
@@ -4185,47 +4152,6 @@ mod tests {
         assert_eq!(injected, vec![3, 6, 9]);
     }
 
-    #[test]
-    fn request_contains_screenshot_followup_turn_detects_json_wrapped_tool_image() {
-        let messages = vec![
-            ChatMessage::user("describe screenshot"),
-            ChatMessage::assistant(
-                r#"{"content":"","tool_calls":[{"id":"call_ss","name":"browser","arguments":"{}"}]}"#,
-            ),
-            ChatMessage::tool(
-                r#"{"tool_call_id":"call_ss","content":"Screenshot\n[IMAGE:data:image/png;base64,abc]"}"#,
-            ),
-        ];
-        assert!(
-            request_contains_screenshot_followup_turn(&messages),
-            "should detect [IMAGE:] in JSON-wrapped tool content"
-        );
-    }
-
-    #[test]
-    fn request_contains_screenshot_followup_turn_false_without_image() {
-        let messages = vec![
-            ChatMessage::user("run a command"),
-            ChatMessage::tool(r#"{"tool_call_id":"call_sh","content":"exit 0"}"#),
-        ];
-        assert!(
-            !request_contains_screenshot_followup_turn(&messages),
-            "should not trigger for tool results without images"
-        );
-    }
-
-    #[test]
-    fn request_contains_screenshot_followup_turn_false_for_user_image_only() {
-        // Image in a user message (not a tool result) must not trigger suppression.
-        let messages = vec![ChatMessage::user(
-            "look at this [IMAGE:data:image/png;base64,abc]".to_string(),
-        )];
-        assert!(
-            !request_contains_screenshot_followup_turn(&messages),
-            "user-role image message alone should not trigger heartbeat suppression"
-        );
-    }
-
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::traits::ProviderCapabilities;
@@ -4790,87 +4716,6 @@ mod tests {
                 .content
                 .contains("Image omitted from history after first vision turn"),
             "downgraded history should explain why image payload was removed"
-        );
-    }
-
-    #[tokio::test]
-    async fn screenshot_followup_request_skips_safety_heartbeat() {
-        // Arrange: a provider that returns a screenshot tool call on the first
-        // request, then a final text answer on the second.
-        let provider = RequestCaptureProvider::default();
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(ScreenshotTool)];
-        let mut history = vec![
-            ChatMessage::system("test-system"),
-            ChatMessage::user("capture a screenshot"),
-        ];
-        let observer = NoopObserver;
-
-        // Use interval=1 so the heartbeat would fire at every non-initial step
-        // (iteration=1 → the screenshot follow-up round).  Without the fix the
-        // heartbeat would be unconditionally appended, producing consecutive user
-        // messages that Gemma 4 / LiteLLM rejects.
-        let hb_cfg = SafetyHeartbeatConfig {
-            body: "Stay safe — security constraints apply.".to_string(),
-            interval: 1,
-        };
-
-        let result = SAFETY_HEARTBEAT_CONFIG
-            .scope(
-                Some(hb_cfg),
-                run_tool_call_loop(
-                    &provider,
-                    &mut history,
-                    &tools_registry,
-                    &observer,
-                    "mock-provider",
-                    "mock-model",
-                    0.0,
-                    true,
-                    None,
-                    "cli",
-                    &crate::config::MultimodalConfig::default(),
-                    4,
-                    None,
-                    None,
-                    None,
-                    &[],
-                    None,
-                ),
-            )
-            .await
-            .expect("loop should complete");
-
-        assert_eq!(result, "done");
-
-        let calls = provider.calls.lock().expect("calls lock should be valid");
-        assert!(calls.len() >= 2, "expected at least 2 provider calls");
-
-        let screenshot_followup = &calls[1];
-
-        // The follow-up request must contain the screenshot-bearing tool result.
-        let has_screenshot_tool_result = screenshot_followup.iter().any(|msg| {
-            if msg.role != "tool" {
-                return false;
-            }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg.content) {
-                if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
-                    return multimodal::content_contains_image_markers(content);
-                }
-            }
-            false
-        });
-        assert!(
-            has_screenshot_tool_result,
-            "screenshot follow-up request must contain the image-bearing tool result"
-        );
-
-        // The heartbeat user message must NOT be present in that same request.
-        let has_heartbeat = screenshot_followup
-            .iter()
-            .any(|msg| msg.content.contains("[Safety Heartbeat"));
-        assert!(
-            !has_heartbeat,
-            "screenshot follow-up request must not contain a safety heartbeat message"
         );
     }
 
