@@ -1254,6 +1254,30 @@ impl SecurityPolicy {
                         || arg == "-c"
                 })
             }
+            "python" | "python3" => {
+                // -c executes arbitrary Python code, -m runs arbitrary modules
+                !args.iter().any(|arg| arg == "-c" || arg == "-m")
+            }
+            "node" => {
+                // -e / --eval evaluate arbitrary JS, --input-type enables code eval
+                !args.iter().any(|arg| {
+                    arg == "-e" || arg == "--eval" || arg == "--input-type"
+                })
+            }
+            "pip" | "pip3" => {
+                // install/download run arbitrary setup.py / pyproject.toml
+                !args.iter().any(|arg| arg == "install" || arg == "download")
+            }
+            "npm" => {
+                // exec/run/start execute arbitrary scripts or packages
+                !args.iter().any(|arg| {
+                    arg == "exec" || arg == "run" || arg == "start"
+                })
+            }
+            "cargo" => {
+                // install runs arbitrary build.rs, run executes project binaries
+                !args.iter().any(|arg| arg == "install" || arg == "run")
+            }
             _ => true,
         }
     }
@@ -2543,6 +2567,36 @@ mod tests {
         assert!(p.is_command_allowed("find . -name '*.txt'"));
         assert!(p.is_command_allowed("git status"));
         assert!(p.is_command_allowed("git add ."));
+    }
+
+    #[test]
+    fn interpreter_argument_injection_blocked() {
+        let p = default_policy();
+        // python/python3 -c executes arbitrary code
+        assert!(!p.is_command_allowed("python3 -c 'import os; os.system(\"id\")'"));
+        assert!(!p.is_command_allowed("python -c 'print(1)'"));
+        // python -m runs arbitrary modules
+        assert!(!p.is_command_allowed("python3 -m http.server"));
+        // node -e/--eval evaluates arbitrary JS
+        assert!(!p.is_command_allowed("node -e 'require(\"child_process\").execSync(\"id\")'"));
+        assert!(!p.is_command_allowed("node --eval 'process.exit(1)'"));
+        // pip install/download runs arbitrary setup.py
+        assert!(!p.is_command_allowed("pip install evil-package"));
+        assert!(!p.is_command_allowed("pip3 download malicious-package"));
+        // npm exec/run/start execute arbitrary scripts
+        assert!(!p.is_command_allowed("npm exec -- malicious-package"));
+        assert!(!p.is_command_allowed("npm run evil-script"));
+        assert!(!p.is_command_allowed("npm start"));
+        // cargo install/run executes arbitrary build.rs / binaries
+        assert!(!p.is_command_allowed("cargo install malicious-crate"));
+        assert!(!p.is_command_allowed("cargo run"));
+        // Legitimate uses should still work
+        assert!(p.is_command_allowed("python3 script.py"));
+        assert!(p.is_command_allowed("node server.js"));
+        assert!(p.is_command_allowed("pip list"));
+        assert!(p.is_command_allowed("npm ls"));
+        assert!(p.is_command_allowed("cargo build"));
+        assert!(p.is_command_allowed("cargo test"));
     }
 
     #[test]
