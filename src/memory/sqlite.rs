@@ -725,6 +725,31 @@ impl SqliteMemory {
         Ok(results)
     }
 
+    /// Get memory keys and their embeddings for duplicate detection (Dream Cycle).
+    /// Returns up to `limit` entries that have non-empty embeddings.
+    pub fn get_all_embeddings(&self, limit: usize) -> anyhow::Result<Vec<(String, Vec<f32>)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT key, embedding FROM memories WHERE embedding IS NOT NULL LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let key: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((key, blob))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            let (key, blob) = row?;
+            if !blob.is_empty() {
+                let embedding = super::vector::bytes_to_vec(&blob);
+                if !embedding.is_empty() {
+                    results.push((key, embedding));
+                }
+            }
+        }
+        Ok(results)
+    }
+
     // ── v3.0 Multi-Query Expanded Recall (S3) ────────────────────
 
     /// Recall with multi-query expansion: expand the query into variations,

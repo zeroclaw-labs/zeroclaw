@@ -3,6 +3,7 @@ pub mod chunk_semantic;
 pub mod chunker;
 pub mod cli;
 pub mod cortex;
+pub mod dream_cycle;
 pub mod embeddings;
 pub mod hot_cache;
 pub mod hybrid;
