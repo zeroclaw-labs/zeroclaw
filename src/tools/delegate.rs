@@ -605,6 +605,7 @@ impl DelegateTool {
                 None,
                 &[],
                 None,
+                false, // native_tool_calls_only: use text fallback for subagents
             ),
         )
         .await;

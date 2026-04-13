@@ -999,6 +999,7 @@ pub(crate) async fn agent_turn(
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
     injection_rx: Option<crate::channels::injection::InjectionReceiver>,
+    native_tool_calls_only: bool,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -1018,6 +1019,7 @@ pub(crate) async fn agent_turn(
         None,
         &[],
         injection_rx,
+        native_tool_calls_only,
     )
     .await
 }
@@ -1044,6 +1046,7 @@ pub(crate) async fn run_tool_call_loop_with_reply_target(
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
     progress_mode: ProgressMode,
+    native_tool_calls_only: bool,
 ) -> Result<String> {
     TOOL_LOOP_PROGRESS_MODE
         .scope(
@@ -1068,6 +1071,7 @@ pub(crate) async fn run_tool_call_loop_with_reply_target(
                     hooks,
                     excluded_tools,
                     None,
+                    native_tool_calls_only,
                 ),
             ),
         )
@@ -1100,6 +1104,7 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
     compaction_context: Option<ToolLoopCompactionContext>,
     loop_detection_config: Option<LoopDetectionConfig>,
     injection_rx: Option<crate::channels::injection::InjectionReceiver>,
+    native_tool_calls_only: bool,
 ) -> Result<String> {
     let reply_target = non_cli_approval_context
         .as_ref()
@@ -1140,6 +1145,7 @@ pub(crate) async fn run_tool_call_loop_with_non_cli_approval_context(
                                         hooks,
                                         excluded_tools,
                                         injection_rx,
+                                        native_tool_calls_only,
                                     ),
                                 ),
                             ),
@@ -1184,6 +1190,7 @@ pub async fn run_tool_call_loop(
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
     mut injection_rx: Option<crate::channels::injection::InjectionReceiver>,
+    native_tool_calls_only: bool,
 ) -> Result<String> {
     let non_cli_approval_context = TOOL_LOOP_NON_CLI_APPROVAL_CONTEXT
         .try_with(Clone::clone)
@@ -1862,7 +1869,7 @@ pub async fn run_tool_call_loop(
                 }
                 let mut parsed_text = String::new();
 
-                if invalid_native_tool_json_count == 0 && calls.is_empty() {
+                if invalid_native_tool_json_count == 0 && calls.is_empty() && !native_tool_calls_only {
                     let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
                     if !fallback_text.is_empty() {
                         parsed_text = fallback_text;
@@ -3175,6 +3182,7 @@ pub async fn run(
                                         effective_hooks,
                                         &[],
                                         None,
+                                        config.agent.native_tool_calls_only,
                                     ),
                                 ),
                             ),
@@ -3404,6 +3412,7 @@ pub async fn run(
                                             effective_hooks,
                                             &[],
                                             None,
+                                            config.agent.native_tool_calls_only,
                                         ),
                                     ),
                                 ),
@@ -3714,6 +3723,7 @@ pub async fn process_message_with_session(
                 &config.multimodal,
                 config.agent.max_tool_iterations,
                 None,
+                config.agent.native_tool_calls_only,
             ),
         ),
     )
@@ -3950,6 +3960,7 @@ pub async fn process_message_with_history(
                     &config.multimodal,
                     config.agent.max_tool_iterations,
                     injection_rx,
+                    config.agent.native_tool_calls_only,
                 ),
             ),
         ),
@@ -4554,6 +4565,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -4590,6 +4602,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("anthropic route should not fail on a false-negative vision capability probe");
@@ -4644,6 +4657,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("tool loop should complete");
@@ -4721,6 +4735,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4762,6 +4777,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -4889,6 +4905,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("parallel execution should complete");
@@ -4961,6 +4978,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("tool loop should complete with denied tool execution");
@@ -5018,6 +5036,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("tool loop should consume non-cli session grants");
@@ -5105,6 +5124,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("tool loop should continue after non-cli approval");
@@ -5164,6 +5184,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("tool loop should consume one-time allow-all token");
@@ -5220,6 +5241,7 @@ mod tests {
             None,
             &excluded_tools,
             None,
+            false,
         )
         .await
         .expect("tool loop should complete with blocked tool execution");
@@ -5285,6 +5307,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -5342,6 +5365,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -5402,6 +5426,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("loop should recover after one deferred-action reply");
@@ -5451,6 +5476,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect_err("second deferred response without tool call should hard-fail");
@@ -5537,6 +5563,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("truncated native arguments should trigger safe retry");
@@ -5636,6 +5663,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("invalid native args should force retry without text fallback execution");
@@ -5717,6 +5745,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("valid native tool calls must execute even when stop_reason is max_tokens");
@@ -5783,6 +5812,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("max-token continuation should complete");
@@ -5860,6 +5890,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("continuation should degrade to partial output");
@@ -5920,6 +5951,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("continuation should clamp oversized merge");
@@ -5980,6 +6012,7 @@ mod tests {
             Some(&hooks),
             &[],
             None,
+            false,
         )
         .await
         .expect("loop should complete");
@@ -7908,6 +7941,7 @@ Let me check the result."#;
             None,
             &[],
             Some(rx),
+            false,
         )
         .await
         .expect("tool loop with injection should complete");
@@ -8011,6 +8045,7 @@ Let me check the result."#;
             None,
             &[],
             Some(rx),
+            false,
         )
         .await
         .expect("tool loop with multiple injections should complete");
@@ -8082,6 +8117,7 @@ Let me check the result."#;
             None,
             &[],
             Some(rx),
+            false,
         )
         .await
         .expect("text-only response with injection should complete");
@@ -8147,6 +8183,7 @@ Let me check the result."#;
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("tool loop without injection should work fine");

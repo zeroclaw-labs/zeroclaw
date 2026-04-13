@@ -1213,6 +1213,13 @@ pub struct AgentConfig {
     /// set to `0` for explicit disable.
     #[serde(default = "default_safety_heartbeat_turn_interval")]
     pub safety_heartbeat_turn_interval: usize,
+    /// When `true`, only native/structured tool calls from the provider are
+    /// honoured.  Text-based fallback parsing (XML tags, markdown blocks, GLM
+    /// format) is skipped entirely.  This is useful for providers that reliably
+    /// emit structured tool calls and where text artefacts should be treated as
+    /// regular assistant output rather than tool invocations.  Default: `false`.
+    #[serde(default)]
+    pub native_tool_calls_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1324,6 +1331,7 @@ impl Default for AgentConfig {
             loop_detection_failure_streak: default_loop_detection_failure_streak(),
             safety_heartbeat_interval: default_safety_heartbeat_interval(),
             safety_heartbeat_turn_interval: default_safety_heartbeat_turn_interval(),
+            native_tool_calls_only: false,
         }
     }
 }
@@ -12964,6 +12972,11 @@ provider_api = "not-a-real-mode"
                     default_model: None,
                     api_key: None,
                     requires_openai_auth: false,
+                    azure_openai_resource: None,
+                    azure_openai_deployment: None,
+                    azure_openai_api_version: None,
+                    max_tokens: None,
+                    merge_system_into_user: false,
                 },
             )]),
             ..Config::default()
@@ -12994,6 +13007,11 @@ provider_api = "not-a-real-mode"
                     default_model: None,
                     api_key: None,
                     requires_openai_auth: true,
+                    azure_openai_resource: None,
+                    azure_openai_deployment: None,
+                    azure_openai_api_version: None,
+                    max_tokens: None,
+                    merge_system_into_user: false,
                 },
             )]),
             api_key: None,
@@ -13058,6 +13076,11 @@ provider_api = "not-a-real-mode"
                     default_model: None,
                     api_key: None,
                     requires_openai_auth: false,
+                    azure_openai_resource: None,
+                    azure_openai_deployment: None,
+                    azure_openai_api_version: None,
+                    max_tokens: None,
+                    merge_system_into_user: false,
                 },
             )]),
             ..Config::default()
@@ -13084,6 +13107,11 @@ provider_api = "not-a-real-mode"
                     default_model: None,
                     api_key: Some("profile-api-key".to_string()),
                     requires_openai_auth: false,
+                    azure_openai_resource: None,
+                    azure_openai_deployment: None,
+                    azure_openai_api_version: None,
+                    max_tokens: None,
+                    merge_system_into_user: false,
                 },
             )]),
             ..Config::default()
@@ -13108,6 +13136,11 @@ provider_api = "not-a-real-mode"
                     default_model: Some("qwen-max".to_string()),
                     api_key: None,
                     requires_openai_auth: false,
+                    azure_openai_resource: None,
+                    azure_openai_deployment: None,
+                    azure_openai_api_version: None,
+                    max_tokens: None,
+                    merge_system_into_user: false,
                 },
             )]),
             ..Config::default()

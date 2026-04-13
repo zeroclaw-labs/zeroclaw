@@ -158,6 +158,7 @@ async fn openai_codex_second_vision_support() -> Result<()> {
         custom_provider_supports_responses_fallback: None,
         max_tokens_override: None,
         model_support_vision: None,
+        merge_system_into_user: false,
     };
 
     let provider = zeroclaw::providers::create_provider_with_options("openai-codex", None, &opts)?;

@@ -586,6 +586,7 @@ async fn run_agentic_background(
             None,
             &[],
             None,
+            false, // native_tool_calls_only: use text fallback for subagents
         ),
     )
     .await;
