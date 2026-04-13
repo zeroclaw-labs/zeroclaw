@@ -7848,6 +7848,8 @@ mod tests {
             allowed_users: vec!["*".into()],
             proxy_url: None,
             bot_name: None,
+            stream_mode: zeroclaw_config::schema::StreamMode::default(),
+            draft_update_interval_ms: 1000,
         });
         assert!(has_launchable_channels(&channels));
 
