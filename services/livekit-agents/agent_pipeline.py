@@ -201,7 +201,7 @@ async def _start_s2s_mode(ctx: JobContext, participant, meta: dict) -> None:
 
     model_name = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview")
     voice = os.getenv("GEMINI_LIVE_VOICE", "Puck")
-    api_key = os.environ.get("GOOGLE_API_KEY", "")
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
 
     logger.info("모드 B (S2S) — model=%s, voice=%s", model_name, voice)
 
