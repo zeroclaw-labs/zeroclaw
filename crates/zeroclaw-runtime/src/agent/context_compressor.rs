@@ -119,6 +119,22 @@ OMIT:
 Output structured bullet points grouped by topic. Include direct quotes from \
 recent messages when they clarify task intent.";
 
+/// System prompt for pre-compaction key-facts extraction (F-14).
+#[cfg(feature = "one2x")]
+const KEY_FACTS_EXTRACTOR_SYSTEM: &str = "\
+You are a memory extraction engine. Before conversation history is compressed, \
+extract the most important persistent facts for future sessions.
+
+Extract ONLY:
+- Identifiers that must survive (UUIDs, tokens, hashes, keys, version numbers, file paths)
+- Decisions made and WHY they were made
+- Configuration values explicitly set by the user
+- Ongoing tasks and their current state
+- User preferences and constraints discovered in this session
+- Critical errors and their resolutions
+
+Format as concise bullet points. Max 20 bullets.";
+
 // ---------------------------------------------------------------------------
 // ContextCompressor
 // ---------------------------------------------------------------------------
@@ -154,6 +170,10 @@ impl ContextCompressor {
 
     /// Fast-path: trim oversized tool results in non-protected messages.
     /// Returns total characters saved. No LLM call needed.
+    pub fn fast_trim_tool_results_pub(&self, history: &mut [ChatMessage]) -> usize {
+        self.fast_trim_tool_results(history)
+    }
+
     fn fast_trim_tool_results(&self, history: &mut [ChatMessage]) -> usize {
         let max = self.config.tool_result_retrim_chars;
         if max == 0 {
@@ -236,6 +256,52 @@ impl ContextCompressor {
                     tokens_after: recheck,
                     passes_used: 0,
                 });
+            }
+        }
+
+        // Fix1: Pre-compaction key_facts extraction (F-14).
+        // Extract key facts to memory BEFORE compaction so they survive
+        // even if the summary loses detail.
+        #[cfg(feature = "one2x")]
+        if let Some(ref mem) = self.memory {
+            let n = history.len();
+            let start = self.config.protect_first_n.min(n);
+            let end = n.saturating_sub(self.config.protect_last_n);
+            if end > start {
+                let transcript = build_transcript(&history[start..end], 12_000);
+                if !transcript.is_empty() {
+                    let facts_prompt = format!(
+                        "Extract key persistent facts from this conversation ({} messages):\n\n{}",
+                        end - start, transcript
+                    );
+                    match tokio::time::timeout(
+                        Duration::from_secs(20),
+                        provider.chat_with_system(
+                            Some(KEY_FACTS_EXTRACTOR_SYSTEM),
+                            &facts_prompt,
+                            self.config.summary_model.as_deref().unwrap_or(model),
+                            0.1,
+                        ),
+                    ).await {
+                        Ok(Ok(facts)) if !facts.trim().is_empty() => {
+                            let date_key = format!(
+                                "key_facts_{}",
+                                chrono::Utc::now().format("%Y-%m-%d")
+                            );
+                            if let Err(e) = mem.store(
+                                &date_key, &facts,
+                                zeroclaw_memory::traits::MemoryCategory::Daily, None,
+                            ).await {
+                                tracing::debug!(error = %e, "Key-facts flush failed (non-fatal)");
+                            } else {
+                                tracing::info!(key = date_key, "Pre-compaction key facts flushed to memory");
+                            }
+                        }
+                        Ok(Err(e)) => tracing::debug!(error = %e, "Key-facts extraction failed (non-fatal)"),
+                        Err(_) => tracing::debug!("Key-facts extraction timed out (non-fatal)"),
+                        _ => {}
+                    }
+                }
             }
         }
 
@@ -385,19 +451,33 @@ impl ContextCompressor {
         // After compression, the agent loses awareness of its operational state.
         // We append a continuation prompt so it knows to pick up where it left off
         // without asking the user to repeat themselves.
-        let post_compact_context = "\n\n\
+        // Fix4: Post-compaction context re-injection.
+        // Try to read SOUL.md or identity sections to re-ground the agent.
+        let identity_refresh = {
+            let mut sections = String::new();
+            for path in &["SOUL.md", "AGENTS.md", ".zeroclaw/identity.md"] {
+                let full = std::path::Path::new("/zeroclaw-data/workspace").join(path);
+                if let Ok(content) = std::fs::read_to_string(&full) {
+                    let truncated = if content.len() > 2000 { &content[..2000] } else { &content };
+                    sections.push_str(&format!("\n[Re-injected from {}]\n{}\n", path, truncated));
+                    break;
+                }
+            }
+            sections
+        };
+
+        let post_compact_context = format!("\n\n\
 [POST-COMPACTION CONTEXT REFRESH]\n\
-The conversation above has been automatically compressed to stay within context limits.\n\
-The summary is a compressed representation — treat it as authoritative context.\n\n\
-IMPORTANT INSTRUCTIONS:\n\
-- Continue your current task from where you left off (check the summary for task status)\n\
-- Do NOT ask the user to repeat their request — the summary contains it\n\
-- Do NOT announce that compression happened — just continue working\n\
-- If the summary mentions files you were editing, re-read them if needed before making changes\n\
-- If the summary mentions an error you were debugging, continue the investigation";
+The conversation above has been automatically compressed.\n\n\
+INSTRUCTIONS:\n\
+- Continue your current task from where you left off\n\
+- Do NOT ask the user to repeat their request\n\
+- Do NOT announce that compression happened\n\
+- Re-read files mentioned in the summary before editing them\n\
+- If debugging, continue the investigation{identity_refresh}");
 
         let summary_msg = ChatMessage::assistant(format!(
-            "[CONTEXT SUMMARY \u{2014} {message_count} earlier messages compressed]\n\n{summary}{post_compact_context}"
+            "[CONTEXT SUMMARY \u{2014} {message_count} earlier messages compressed]\n\n{summary}\n{post_compact_context}"
         ));
         history.splice(start..end, std::iter::once(summary_msg));
 

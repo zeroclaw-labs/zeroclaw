@@ -993,7 +993,7 @@ pub async fn run_tool_call_loop(
         {
             crate::one2x::session_hygiene::repair_full_tool_pairing(history);
             crate::one2x::session_hygiene::micro_compact_old_tool_results(history);
-            crate::one2x::session_hygiene::limit_tool_result_sizes(history);
+            crate::one2x::session_hygiene::limit_tool_result_sizes_with_budget(history, context_token_budget);
         }
 
         let prepared_messages =
@@ -2568,38 +2568,52 @@ pub async fn run(
             &effective_msg,
         );
 
-        // ── P0: Preemptive compaction before LLM call ─────────────────
-        // Estimate tokens BEFORE sending to LLM. If over half the
-        // max_context_tokens threshold, compact now to avoid 504 cascades.
+        // ── Fix5: Preemptive compaction with routing ─────────────────
+        // Route: estimate tokens → try tool-only truncation first → full compact if needed.
         #[cfg(feature = "one2x")]
         {
             let estimated = crate::agent::context_compressor::estimate_tokens(&history);
-            let threshold = config.agent.max_context_tokens / 2;
-            if estimated > threshold {
-                tracing::info!(
-                    estimated_tokens = estimated,
-                    threshold,
-                    "Preemptive compaction: estimated tokens exceed threshold before LLM call"
-                );
-                let compressor = crate::agent::context_compressor::ContextCompressor::new(
-                    config.agent.context_compression.clone(),
-                    config.agent.max_context_tokens,
-                )
-                .with_memory(mem.clone());
-                match compressor
-                    .compress_if_needed(&mut history, provider.as_ref(), &model_name)
-                    .await
-                {
-                    Ok(result) if result.compressed => {
-                        tracing::info!(
-                            before = result.tokens_before,
-                            after = result.tokens_after,
-                            "Preemptive compaction succeeded"
-                        );
+            let soft_threshold = config.agent.max_context_tokens * 2 / 5;
+            let hard_threshold = config.agent.max_context_tokens / 2;
+
+            if estimated > soft_threshold {
+                if estimated <= hard_threshold {
+                    // Soft zone: tool truncation only (no LLM call)
+                    let compressor = crate::agent::context_compressor::ContextCompressor::new(
+                        config.agent.context_compression.clone(),
+                        config.agent.max_context_tokens,
+                    );
+                    let saved = compressor.fast_trim_tool_results_pub(&mut history);
+                    if saved > 0 {
+                        tracing::info!(saved, "Preemptive: tool-only truncation freed {} chars", saved);
                     }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Preemptive compaction failed, proceeding anyway");
+                } else {
+                    // Hard zone: full compaction
+                    tracing::info!(
+                        estimated_tokens = estimated,
+                        hard_threshold,
+                        "Preemptive: full compaction needed"
+                    );
+                    let compressor = crate::agent::context_compressor::ContextCompressor::new(
+                        config.agent.context_compression.clone(),
+                        config.agent.max_context_tokens,
+                    )
+                    .with_memory(mem.clone());
+                    match compressor
+                        .compress_if_needed(&mut history, provider.as_ref(), &model_name)
+                        .await
+                    {
+                        Ok(result) if result.compressed => {
+                            tracing::info!(
+                                before = result.tokens_before,
+                                after = result.tokens_after,
+                                "Preemptive compaction succeeded"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Preemptive compaction failed, proceeding anyway");
+                        }
                     }
                 }
             }
@@ -2607,6 +2621,8 @@ pub async fn run(
 
         #[allow(unused_assignments)]
         let mut response = String::new();
+        #[cfg(feature = "one2x")]
+        let mut overflow_recovery_attempts: u32 = 0;
         loop {
             match TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(
@@ -2678,50 +2694,44 @@ pub async fn run(
                         continue;
                     }
 
-                    // P0b: Context overflow / 504 recovery for channel mode.
-                    // Channel loop previously returned errors immediately,
-                    // unlike CLI mode which has compress_on_error recovery.
+                    // P0b + Fix2: Context overflow / 504 recovery with circuit breaker.
                     #[cfg(feature = "one2x")]
-                    if zeroclaw_providers::reliable::is_context_window_exceeded(&e)
-                        || format!("{e}").contains("504")
-                        || format!("{e}").contains("Gateway Timeout")
                     {
-                        tracing::warn!(
-                            "Channel loop: context overflow or 504 detected, attempting recovery via compaction"
-                        );
-                        let mut compressor =
-                            crate::agent::context_compressor::ContextCompressor::new(
-                                config.agent.context_compression.clone(),
-                                config.agent.max_context_tokens,
-                            )
-                            .with_memory(mem.clone());
-                        let error_msg = format!("{e}");
-                        match compressor
-                            .compress_on_error(
-                                &mut history,
-                                provider.as_ref(),
-                                &model_name,
-                                &error_msg,
-                            )
-                            .await
-                        {
-                            Ok(true) => {
-                                tracing::info!(
-                                    "Channel loop: context recovered via compaction, retrying"
-                                );
-                                continue;
+                        const MAX_OVERFLOW_RECOVERY_ATTEMPTS: u32 = 3;
+                        let err_str = format!("{e}");
+                        let is_overflow = zeroclaw_providers::reliable::is_context_window_exceeded(&e)
+                            || err_str.contains("504")
+                            || err_str.contains("Gateway Timeout");
+
+                        if is_overflow && overflow_recovery_attempts < MAX_OVERFLOW_RECOVERY_ATTEMPTS {
+                            overflow_recovery_attempts += 1;
+                            tracing::warn!(
+                                attempt = overflow_recovery_attempts,
+                                max = MAX_OVERFLOW_RECOVERY_ATTEMPTS,
+                                "Channel loop: overflow/504 detected, attempting recovery"
+                            );
+                            let mut compressor =
+                                crate::agent::context_compressor::ContextCompressor::new(
+                                    config.agent.context_compression.clone(),
+                                    config.agent.max_context_tokens,
+                                )
+                                .with_memory(mem.clone());
+                            match compressor
+                                .compress_on_error(&mut history, provider.as_ref(), &model_name, &err_str)
+                                .await
+                            {
+                                Ok(true) => {
+                                    tracing::info!("Channel loop: context recovered via compaction, retrying");
+                                    continue;
+                                }
+                                Ok(false) => tracing::warn!("Channel loop: compaction ran but couldn't reduce enough"),
+                                Err(ce) => tracing::warn!(error = %ce, "Channel loop: compaction itself failed"),
                             }
-                            Ok(false) => {
-                                tracing::warn!(
-                                    "Channel loop: compaction ran but couldn't reduce enough"
-                                );
-                            }
-                            Err(compress_err) => {
-                                tracing::warn!(
-                                    error = %compress_err,
-                                    "Channel loop: compaction itself failed"
-                                );
-                            }
+                        } else if is_overflow {
+                            tracing::error!(
+                                "Channel loop: circuit breaker — exhausted {} recovery attempts, giving up",
+                                MAX_OVERFLOW_RECOVERY_ATTEMPTS
+                            );
                         }
                     }
 

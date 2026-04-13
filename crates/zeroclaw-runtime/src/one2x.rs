@@ -5,6 +5,7 @@ pub mod session_hygiene {
     use zeroclaw_api::provider::ChatMessage;
 
     const MAX_TOOL_RESULT_PRE_LLM_CHARS: usize = 20_000;
+    const MAX_TOOL_RESULT_CONTEXT_SHARE: f64 = 0.30;
 
     pub fn repair_full_tool_pairing(history: &mut Vec<ChatMessage>) {
         let before = history.len();
@@ -125,16 +126,19 @@ pub mod session_hygiene {
         }
     }
 
-    pub fn limit_tool_result_sizes(history: &mut Vec<ChatMessage>) {
+    pub fn limit_tool_result_sizes_with_budget(history: &mut Vec<ChatMessage>, context_window: usize) {
         const TAIL_CHARS: usize = 2_000;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let dynamic_cap = ((context_window as f64 * MAX_TOOL_RESULT_CONTEXT_SHARE) as usize * 4)
+            .min(MAX_TOOL_RESULT_PRE_LLM_CHARS);
 
         let mut capped = 0usize;
         for msg in history.iter_mut() {
-            if msg.role != "tool" || msg.content.len() <= MAX_TOOL_RESULT_PRE_LLM_CHARS {
+            if msg.role != "tool" || msg.content.len() <= dynamic_cap {
                 continue;
             }
             let total = msg.content.len();
-            let head_budget = MAX_TOOL_RESULT_PRE_LLM_CHARS.saturating_sub(TAIL_CHARS);
+            let head_budget = dynamic_cap.saturating_sub(TAIL_CHARS);
             let omitted = total - head_budget - TAIL_CHARS;
 
             let mut head_end = head_budget;
