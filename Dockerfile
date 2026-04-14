@@ -23,21 +23,54 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
-# Include every workspace member: Cargo.lock is generated for the full workspace.
-# Previously we used sed to drop `crates/robot-kit`, which made the manifest disagree
-# with the lockfile and caused `cargo --locked` to fail (Cargo refused to rewrite the lock).
+# Copy all workspace crate Cargo.toml files so cargo can resolve the full
+# workspace dependency graph without needing their full source trees.
 COPY crates/robot-kit/ crates/robot-kit/
 COPY crates/aardvark-sys/ crates/aardvark-sys/
+COPY crates/zeroclaw-api/Cargo.toml crates/zeroclaw-api/Cargo.toml
+COPY crates/zeroclaw-infra/Cargo.toml crates/zeroclaw-infra/Cargo.toml
+COPY crates/zeroclaw-config/Cargo.toml crates/zeroclaw-config/Cargo.toml
+COPY crates/zeroclaw-providers/Cargo.toml crates/zeroclaw-providers/Cargo.toml
+COPY crates/zeroclaw-memory/Cargo.toml crates/zeroclaw-memory/Cargo.toml
+COPY crates/zeroclaw-channels/Cargo.toml crates/zeroclaw-channels/Cargo.toml
+COPY crates/zeroclaw-tools/Cargo.toml crates/zeroclaw-tools/Cargo.toml
+COPY crates/zeroclaw-runtime/Cargo.toml crates/zeroclaw-runtime/Cargo.toml
+COPY crates/zeroclaw-tui/Cargo.toml crates/zeroclaw-tui/Cargo.toml
+COPY crates/zeroclaw-plugins/Cargo.toml crates/zeroclaw-plugins/Cargo.toml
+COPY crates/zeroclaw-gateway/Cargo.toml crates/zeroclaw-gateway/Cargo.toml
+COPY crates/zeroclaw-hardware/Cargo.toml crates/zeroclaw-hardware/Cargo.toml
+COPY crates/zeroclaw-tool-call-parser/Cargo.toml crates/zeroclaw-tool-call-parser/Cargo.toml
+COPY crates/zeroclaw-macros/Cargo.toml crates/zeroclaw-macros/Cargo.toml
 # Include tauri workspace member manifest (desktop app, but needed for workspace resolution).
-# .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
-# Create dummy targets declared in Cargo.toml so manifest parsing succeeds.
+# Create dummy lib/main stubs for all workspace members so cargo can compile
+# and cache external dependencies without the real source.
 RUN mkdir -p src benches apps/tauri/src \
+    crates/zeroclaw-api/src \
+    crates/zeroclaw-infra/src \
+    crates/zeroclaw-config/src \
+    crates/zeroclaw-providers/src \
+    crates/zeroclaw-memory/src \
+    crates/zeroclaw-channels/src \
+    crates/zeroclaw-tools/src \
+    crates/zeroclaw-runtime/src \
+    crates/zeroclaw-tui/src \
+    crates/zeroclaw-plugins/src \
+    crates/zeroclaw-gateway/src \
+    crates/zeroclaw-hardware/src \
+    crates/zeroclaw-tool-call-parser/src \
+    crates/zeroclaw-macros/src \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
     && echo "fn main() {}" > benches/agent_benchmarks.rs \
     && echo "fn main() {}" > apps/tauri/src/main.rs \
-    && echo "fn main() {}" > apps/tauri/build.rs
+    && echo "fn main() {}" > apps/tauri/build.rs \
+    && for d in zeroclaw-api zeroclaw-infra zeroclaw-config zeroclaw-providers \
+                zeroclaw-memory zeroclaw-channels zeroclaw-tools zeroclaw-runtime \
+                zeroclaw-tui zeroclaw-plugins zeroclaw-gateway zeroclaw-hardware \
+                zeroclaw-tool-call-parser zeroclaw-macros; do \
+         echo "" > crates/$d/src/lib.rs; \
+       done
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
