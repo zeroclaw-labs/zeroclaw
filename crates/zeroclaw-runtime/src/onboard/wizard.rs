@@ -895,6 +895,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "sglang" | "vllm" | "osaurus" | "opencode-go" => "default".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
+        "manifest" => "manifest/auto".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
         "avian" => "deepseek/deepseek-v3.2".into(),
@@ -6931,6 +6932,7 @@ mod tests {
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("kimi-code"), "kimi-for-coding");
+        assert_eq!(default_model_for_provider("manifest"), "manifest/auto");
         assert_eq!(
             default_model_for_provider("bedrock"),
             "anthropic.claude-sonnet-4-5-20250929-v1:0"
