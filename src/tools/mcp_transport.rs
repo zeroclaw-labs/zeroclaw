@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::mcp_transport::*;
+pub use quantclaw_tools::mcp_transport::*;

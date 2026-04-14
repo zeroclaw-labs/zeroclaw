@@ -1,4 +1,4 @@
-# ZeroClaw 配置参考（面向运维人员）
+# QuantClaw 配置参考（面向运维人员）
 
 本文档是常见配置部分和默认值的高信息量参考。
 
@@ -6,17 +6,17 @@
 
 启动时的配置路径解析顺序：
 
-1. `ZEROCLAW_WORKSPACE` 覆盖（如果设置）
-2. 持久化的 `~/.zeroclaw/active_workspace.toml` 标记（如果存在）
-3. 默认 `~/.zeroclaw/config.toml`
+1. `QUANTCLAW_WORKSPACE` 覆盖（如果设置）
+2. 持久化的 `~/.quantclaw/active_workspace.toml` 标记（如果存在）
+3. 默认 `~/.quantclaw/config.toml`
 
-ZeroClaw 在启动时以 `INFO` 级别记录解析后的配置：
+QuantClaw 在启动时以 `INFO` 级别记录解析后的配置：
 
 - `Config loaded` 包含字段：`path`、`workspace`、`source`、`initialized`
 
 模式导出命令：
 
-- `zeroclaw config schema`（将 JSON Schema 草案 2020-12 打印到 stdout）
+- `quantclaw config schema`（将 JSON Schema 草案 2020-12 打印到 stdout）
 
 ## 核心键
 
@@ -32,7 +32,7 @@ ZeroClaw 在启动时以 `INFO` 级别记录解析后的配置：
 |---|---|---|
 | `backend` | `none` | 可观测性后端：`none`、`noop`、`log`、`prometheus`、`otel`、`opentelemetry` 或 `otlp` |
 | `otel_endpoint` | `http://localhost:4318` | 当后端为 `otel` 时使用的 OTLP HTTP 端点 |
-| `otel_service_name` | `zeroclaw` | 发送到 OTLP 收集器的服务名称 |
+| `otel_service_name` | `quantclaw` | 发送到 OTLP 收集器的服务名称 |
 | `runtime_trace_mode` | `none` | 运行时跟踪存储模式：`none`、`rolling` 或 `full` |
 | `runtime_trace_path` | `state/runtime-trace.jsonl` | 运行时跟踪 JSONL 路径（除非绝对路径，否则相对于工作区） |
 | `runtime_trace_max_entries` | `200` | 当 `runtime_trace_mode = \"rolling\"` 时保留的最大事件数 |
@@ -43,9 +43,9 @@ ZeroClaw 在启动时以 `INFO` 级别记录解析后的配置：
 - 别名值 `opentelemetry` 和 `otlp` 映射到同一个 OTel 后端。
 - 运行时跟踪旨在调试工具调用失败和格式错误的模型工具负载。它们可能包含模型输出文本，因此在共享主机上默认保持禁用。
 - 查询运行时跟踪：
-  - `zeroclaw doctor traces --limit 20`
-  - `zeroclaw doctor traces --event tool_call_result --contains \"error\"`
-  - `zeroclaw doctor traces --id <trace-id>`
+  - `quantclaw doctor traces --limit 20`
+  - `quantclaw doctor traces --event tool_call_result --contains \"error\"`
+  - `quantclaw doctor traces --id <trace-id>`
 
 示例：
 
@@ -53,7 +53,7 @@ ZeroClaw 在启动时以 `INFO` 级别记录解析后的配置：
 [observability]
 backend = \"otel\"
 otel_endpoint = \"http://localhost:4318\"
-otel_service_name = \"zeroclaw\"
+otel_service_name = \"quantclaw\"
 runtime_trace_mode = \"rolling\"
 runtime_trace_path = \"state/runtime-trace.jsonl\"
 runtime_trace_max_entries = 200
@@ -63,14 +63,14 @@ runtime_trace_max_entries = 200
 
 提供商选择也可以通过环境变量控制。优先级为：
 
-1. `ZEROCLAW_PROVIDER`（显式覆盖，非空时始终优先）
+1. `QUANTCLAW_PROVIDER`（显式覆盖，非空时始终优先）
 2. `PROVIDER`（旧版回退，仅当配置提供商未设置或仍为 `openrouter` 时应用）
 3. `config.toml` 中的 `default_provider`
 
 容器用户操作说明：
 
 - 如果你的 `config.toml` 设置了显式自定义提供商，如 `custom:https://.../v1`，则 Docker/容器环境中的默认 `PROVIDER=openrouter` 将不再替换它。
-- 当你有意让运行时环境覆盖非默认配置的提供商时，请使用 `ZEROCLAW_PROVIDER`。
+- 当你有意让运行时环境覆盖非默认配置的提供商时，请使用 `QUANTCLAW_PROVIDER`。
 
 ## `[agent]`
 
@@ -108,7 +108,7 @@ runtime_trace_max_entries = 200
 - 域模式支持通配符 `*`。
 - 类别预设在验证期间扩展为精选的域集。
 - 无效的域 glob 或未知类别在启动时快速失败。
-- 当 `enabled = true` 且不存在 OTP 密钥时，ZeroClaw 会生成一个并打印一次注册 URI。
+- 当 `enabled = true` 且不存在 OTP 密钥时，QuantClaw 会生成一个并打印一次注册 URI。
 
 示例：
 
@@ -128,14 +128,14 @@ gated_domain_categories = [\"banking\"]
 | 键 | 默认值 | 用途 |
 |---|---|---|
 | `enabled` | `false` | 启用紧急停止状态机和 CLI |
-| `state_file` | `~/.zeroclaw/estop-state.json` | 持久化 estop 状态路径 |
+| `state_file` | `~/.quantclaw/estop-state.json` | 持久化 estop 状态路径 |
 | `require_otp_to_resume` | `true` | 恢复操作前需要 OTP 验证 |
 
 注意事项：
 
 - Estop 状态被原子持久化并在启动时重新加载。
 - 损坏/不可读的 estop 状态回退到故障关闭 `kill_all`。
-- 使用 CLI 命令 `zeroclaw estop` 启动，`zeroclaw estop resume` 清除级别。
+- 使用 CLI 命令 `quantclaw estop` 启动，`quantclaw estop resume` 清除级别。
 
 ## `[agents.<name>]`
 
@@ -197,14 +197,14 @@ temperature = 0.2
 
 注意事项：
 
-- 安全优先默认：除非 `open_skills_enabled = true`，否则 ZeroClaw **不会**克隆或同步 `open-skills`。
+- 安全优先默认：除非 `open_skills_enabled = true`，否则 QuantClaw **不会**克隆或同步 `open-skills`。
 - 环境覆盖：
-  - `ZEROCLAW_OPEN_SKILLS_ENABLED` 接受 `1/0`、`true/false`、`yes/no`、`on/off`。
-  - `ZEROCLAW_OPEN_SKILLS_DIR` 非空时覆盖仓库路径。
-  - `ZEROCLAW_SKILLS_PROMPT_MODE` 接受 `full` 或 `compact`。
-- 启用标志的优先级：`ZEROCLAW_OPEN_SKILLS_ENABLED` → `config.toml` 中的 `skills.open_skills_enabled` → 默认 `false`。
+  - `QUANTCLAW_OPEN_SKILLS_ENABLED` 接受 `1/0`、`true/false`、`yes/no`、`on/off`。
+  - `QUANTCLAW_OPEN_SKILLS_DIR` 非空时覆盖仓库路径。
+  - `QUANTCLAW_SKILLS_PROMPT_MODE` 接受 `full` 或 `compact`。
+- 启用标志的优先级：`QUANTCLAW_OPEN_SKILLS_ENABLED` → `config.toml` 中的 `skills.open_skills_enabled` → 默认 `false`。
 - 建议在低上下文本地模型上使用 `prompt_injection_mode = \"compact\"`，以减少启动提示大小，同时按需保留技能文件可用。
-- 技能加载和 `zeroclaw skills install` 都会应用静态安全审计。包含符号链接、类脚本文件、高风险 shell  payload 片段或不安全 markdown 链接遍历的技能会被拒绝。
+- 技能加载和 `quantclaw skills install` 都会应用静态安全审计。包含符号链接、类脚本文件、高风险 shell  payload 片段或不安全 markdown 链接遍历的技能会被拒绝。
 
 ## `[composio]`
 
@@ -218,7 +218,7 @@ temperature = 0.2
 
 - 向后兼容性：旧版 `enable = true` 被接受为 `enabled = true` 的别名。
 - 如果 `enabled = false` 或缺少 `api_key`，则不会注册 `composio` 工具。
-- ZeroClaw 请求 Composio v3 工具时使用 `toolkit_versions=latest`，并使用 `version=\"latest\"` 执行工具，以避免过时的默认工具版本。
+- QuantClaw 请求 Composio v3 工具时使用 `toolkit_versions=latest`，并使用 `version=\"latest\"` 执行工具，以避免过时的默认工具版本。
 - 典型流程：调用 `connect`，完成浏览器 OAuth，然后为所需工具操作运行 `execute`。
 - 如果 Composio 返回缺少连接账户引用错误，请调用 `list_accounts`（可选带 `app`）并将返回的 `connected_account_id` 传递给 `execute`。
 
@@ -454,7 +454,7 @@ dimensions = 1536
 
 1. 保持提示稳定（`hint:reasoning`、`hint:semantic`）。
 2. 仅更新路由条目中的 `model = \"...new-version...\"`。
-3. 在重启/部署前使用 `zeroclaw doctor` 验证。
+3. 在重启/部署前使用 `quantclaw doctor` 验证。
 
 自然语言配置路径：
 
@@ -532,7 +532,7 @@ priority = 5
 - 发生超时时，用户会收到：`⚠️ Request timed out while waiting for the model. Please try again.`
 - 仅 Telegram 的中断行为由 `channels_config.telegram.interrupt_on_new_message` 控制（默认 `false`）。
   启用后，同一发送者在同一聊天中的较新消息会取消进行中的请求并保留被中断的用户上下文。
-- 当 `zeroclaw channel start` 运行时，`default_provider`、`default_model`、`default_temperature`、`api_key`、`api_url` 和 `reliability.*` 的更新会在下一条入站消息时从 `config.toml` 热应用。
+- 当 `quantclaw channel start` 运行时，`default_provider`、`default_model`、`default_temperature`、`api_key`、`api_url` 和 `reliability.*` 的更新会在下一条入站消息时从 `config.toml` 热应用。
 
 ### `[channels_config.nostr]`
 
@@ -591,7 +591,7 @@ WhatsApp Web 模式（原生客户端）：
 注意事项：
 
 - Webhook 端点是 `POST /linq`。
-- 设置时 `ZEROCLAW_LINQ_SIGNING_SECRET` 覆盖 `signing_secret`。
+- 设置时 `QUANTCLAW_LINQ_SIGNING_SECRET` 覆盖 `signing_secret`。
 - 签名使用 `X-Webhook-Signature` 和 `X-Webhook-Timestamp` 头；过期时间戳（>300秒）会被拒绝。
 - 完整配置示例请参见 [channels-reference.zh-CN.md](channels-reference.zh-CN.md)。
 
@@ -609,7 +609,7 @@ WhatsApp Web 模式（原生客户端）：
 注意事项：
 
 - Webhook 端点是 `POST /nextcloud-talk`。
-- 设置时 `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` 覆盖 `webhook_secret`。
+- 设置时 `QUANTCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` 覆盖 `webhook_secret`。
 - 安装和故障排除请参见 [nextcloud-talk-setup.zh-CN.md](../../setup-guides/nextcloud-talk-setup.zh-CN.md)。
 
 ## `[hardware]`
@@ -682,10 +682,10 @@ transport = \"native\"
 编辑配置后：
 
 ```bash
-zeroclaw status
-zeroclaw doctor
-zeroclaw channel doctor
-zeroclaw service restart
+quantclaw status
+quantclaw doctor
+quantclaw channel doctor
+quantclaw service restart
 ```
 
 ## 相关文档

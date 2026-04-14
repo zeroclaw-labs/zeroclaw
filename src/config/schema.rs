@@ -1,3 +1,3 @@
-//! Configuration schema — re-exported from `zeroclaw-config`.
+//! Configuration schema — re-exported from `quantclaw-config`.
 
-pub use zeroclaw_config::schema::*;
+pub use quantclaw_config::schema::*;

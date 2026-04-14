@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::google_workspace::*;
+pub use quantclaw_tools::google_workspace::*;

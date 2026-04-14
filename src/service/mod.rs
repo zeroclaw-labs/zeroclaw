@@ -1,4 +1,4 @@
-pub use zeroclaw_runtime::service::*;
+pub use quantclaw_runtime::service::*;
 
 use crate::config::Config;
 use anyhow::Result;

@@ -1,5 +1,5 @@
 #[allow(unused_imports)]
-pub use zeroclaw_runtime::onboard::*;
+pub use quantclaw_runtime::onboard::*;
 
 #[cfg(test)]
 mod tests {

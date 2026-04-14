@@ -1,1 +1,1 @@
-pub use zeroclaw_infra::stall_watchdog::*;
+pub use quantclaw_infra::stall_watchdog::*;

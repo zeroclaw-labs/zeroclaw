@@ -87,7 +87,7 @@ function loadMonoFont(font: string) {
 
 // ── Locale storage (was localeStorage.ts) ────────────────────────────────────
 
-export const LOCALE_STORAGE_KEY = 'zeroclaw-locale';
+export const LOCALE_STORAGE_KEY = 'quantclaw-locale';
 
 export function loadLocale(): string {
   return localStorage.getItem(LOCALE_STORAGE_KEY) ?? 'en';
@@ -99,7 +99,7 @@ export function saveLocale(locale: string) {
 
 // ── Theme storage (was themeStorage.ts) ──────────────────────────────────────
 
-const STORAGE_KEY = 'zeroclaw-theme';
+const STORAGE_KEY = 'quantclaw-theme';
 
 interface StoredTheme {
   theme: ThemeMode;

@@ -7,8 +7,8 @@
 //! message ordering, and recall behavior after re-initialization.
 
 use std::sync::Arc;
-use zeroclaw::memory::sqlite::SqliteMemory;
-use zeroclaw::memory::traits::{Memory, MemoryCategory};
+use quantclaw::memory::sqlite::SqliteMemory;
+use quantclaw::memory::traits::{Memory, MemoryCategory};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Deduplication: same key overwrites instead of duplicating (#430)

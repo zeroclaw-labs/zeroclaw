@@ -6,8 +6,8 @@
 //! Requires `ZAI_API_KEY` env var set (format: `id.secret`).
 //! Run: `ZAI_API_KEY=... cargo test live_zai -- --ignored --nocapture`
 
-use zeroclaw::providers::create_provider;
-use zeroclaw::providers::traits::ChatMessage;
+use quantclaw::providers::create_provider;
+use quantclaw::providers::traits::ChatMessage;
 
 /// Sends a simple chat request to Z.AI with JWT auth and verifies a 200 response.
 #[tokio::test]

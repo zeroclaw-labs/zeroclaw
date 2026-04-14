@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::voice_wake::*;
+pub use quantclaw_channels::voice_wake::*;

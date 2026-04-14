@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::git_operations::*;
+pub use quantclaw_tools::git_operations::*;

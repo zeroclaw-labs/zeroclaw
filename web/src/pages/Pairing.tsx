@@ -18,7 +18,7 @@ export default function Pairing() {
   const [pairingCode, setPairingCode] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const token = localStorage.getItem('zeroclaw_token') || '';
+  const token = localStorage.getItem('quantclaw_token') || '';
 
   const fetchDevices = useCallback(async () => {
     try {

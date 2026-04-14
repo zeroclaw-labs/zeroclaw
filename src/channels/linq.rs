@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::linq::*;
+pub use quantclaw_channels::linq::*;

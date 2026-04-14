@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::mattermost::*;
+pub use quantclaw_channels::mattermost::*;

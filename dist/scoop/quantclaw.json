@@ -1,0 +1,27 @@
+{
+    "version": "0.5.9",
+    "description": "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant.",
+    "homepage": "https://github.com/quant-speed/quantclaw",
+    "license": "MIT|Apache-2.0",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/quant-speed/quantclaw/releases/download/v0.5.9/quantclaw-x86_64-pc-windows-msvc.zip",
+            "hash": "",
+            "bin": "quantclaw.exe"
+        }
+    },
+    "checkver": {
+        "github": "https://github.com/quant-speed/quantclaw"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/quant-speed/quantclaw/releases/download/v$version/quantclaw-x86_64-pc-windows-msvc.zip"
+            }
+        },
+        "hash": {
+            "url": "https://github.com/quant-speed/quantclaw/releases/download/v$version/SHA256SUMS",
+            "regex": "([a-f0-9]{64})\\s+quantclaw-x86_64-pc-windows-msvc\\.zip"
+        }
+    }
+}

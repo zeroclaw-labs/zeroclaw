@@ -1,5 +1,5 @@
 #[allow(unused_imports)]
-pub use zeroclaw_runtime::heartbeat::*;
+pub use quantclaw_runtime::heartbeat::*;
 
 #[cfg(test)]
 mod tests {

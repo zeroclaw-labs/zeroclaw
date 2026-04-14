@@ -1,11 +1,11 @@
 # Z.AI GLM Setup
 
-ZeroClaw supports Z.AI's GLM models through OpenAI-compatible endpoints.
-This guide covers practical setup options that match current ZeroClaw provider behavior.
+QuantClaw supports Z.AI's GLM models through OpenAI-compatible endpoints.
+This guide covers practical setup options that match current QuantClaw provider behavior.
 
 ## Overview
 
-ZeroClaw supports these Z.AI aliases and endpoints out of the box:
+QuantClaw supports these Z.AI aliases and endpoints out of the box:
 
 | Alias | Endpoint | Notes |
 |-------|----------|-------|
@@ -19,14 +19,14 @@ If you need a custom base URL, see [`../contributing/custom-providers.md`](../co
 ### Quick Start
 
 ```bash
-zeroclaw onboard \
+quantclaw onboard \
   --provider "zai" \
   --api-key "YOUR_ZAI_API_KEY"
 ```
 
 ### Manual Configuration
 
-Edit `~/.zeroclaw/config.toml`:
+Edit `~/.quantclaw/config.toml`:
 
 ```toml
 api_key = "YOUR_ZAI_API_KEY"
@@ -73,14 +73,14 @@ Expected response:
 }
 ```
 
-### Test with ZeroClaw CLI
+### Test with QuantClaw CLI
 
 ```bash
 # Test agent directly
-echo "Hello" | zeroclaw agent
+echo "Hello" | quantclaw agent
 
 # Check status
-zeroclaw status
+quantclaw status
 ```
 
 ## Environment Variables
@@ -137,6 +137,6 @@ curl -s "https://api.z.ai/api/coding/paas/v4/models" \
 
 ## Related Documentation
 
-- [ZeroClaw README](../README.md)
+- [QuantClaw README](../README.md)
 - [Custom Provider Endpoints](../contributing/custom-providers.md)
 - [Contributing Guide](../../CONTRIBUTING.md)

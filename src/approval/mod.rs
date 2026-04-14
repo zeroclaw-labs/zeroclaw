@@ -1,5 +1,5 @@
 #[allow(unused_imports)]
-pub use zeroclaw_runtime::approval::*;
+pub use quantclaw_runtime::approval::*;
 
 #[cfg(test)]
 mod tests {

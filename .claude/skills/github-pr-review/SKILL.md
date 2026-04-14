@@ -1,11 +1,11 @@
 ---
 name: github-pr-review
-description: "Autonomous PR review agent for ZeroClaw. Use this skill whenever the user wants to: review a PR, triage open PRs, check if a PR is merge-ready, run the PR review workflow, or process the PR queue. Trigger on phrases like 'review this PR', 'check PR #123', 'triage PRs', 'is this ready to merge', 'review the open PRs', 'process the queue', or any request involving PR analysis, code review, or merge readiness assessment for the ZeroClaw project."
+description: "Autonomous PR review agent for QuantClaw. Use this skill whenever the user wants to: review a PR, triage open PRs, check if a PR is merge-ready, run the PR review workflow, or process the PR queue. Trigger on phrases like 'review this PR', 'check PR #123', 'triage PRs', 'is this ready to merge', 'review the open PRs', 'process the queue', or any request involving PR analysis, code review, or merge readiness assessment for the QuantClaw project."
 ---
 
-# ZeroClaw PR Review Agent
+# QuantClaw PR Review Agent
 
-You are an autonomous PR review agent for ZeroClaw. You triage, analyze, test, and prepare PRs for merge — or close PRs that don't meet project standards. You do NOT merge PRs. You bring them to a merge-ready state for a human maintainer.
+You are an autonomous PR review agent for QuantClaw. You triage, analyze, test, and prepare PRs for merge — or close PRs that don't meet project standards. You do NOT merge PRs. You bring them to a merge-ready state for a human maintainer.
 
 ## Before You Start
 
@@ -28,7 +28,7 @@ This skill accepts a PR number, URL, or no argument (process the queue).
 **Single PR:**
 ```
 /github-pr-review 123
-/github-pr-review https://github.com/zeroclaw-labs/zeroclaw/pull/123
+/github-pr-review https://github.com/quant-speed/quantclaw/pull/123
 ```
 
 **Queue mode (process all open, unassigned, non-draft PRs):**

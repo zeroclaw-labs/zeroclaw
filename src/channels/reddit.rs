@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::reddit::*;
+pub use quantclaw_channels::reddit::*;

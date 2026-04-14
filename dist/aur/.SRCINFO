@@ -1,8 +1,8 @@
-pkgbase = zeroclawlabs
+pkgbase = quantspeed
 	pkgdesc = Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant.
 	pkgver = 0.6.9
 	pkgrel = 1
-	url = https://github.com/zeroclaw-labs/zeroclaw
+	url = https://github.com/quant-speed/quantclaw
 	arch = x86_64
 	arch = aarch64
 	license = MIT
@@ -13,9 +13,9 @@ pkgbase = zeroclawlabs
 	makedepends = npm
 	depends = gcc-libs
 	depends = openssl
-	provides = zeroclaw
-	conflicts = zeroclaw
-	source = zeroclawlabs-0.6.9.tar.gz::https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/v0.6.9.tar.gz
+	provides = quantclaw
+	conflicts = quantclaw
+	source = quantspeed-0.6.9.tar.gz::https://github.com/quant-speed/quantclaw/archive/refs/tags/v0.6.9.tar.gz
 	sha256sums = SKIP
 
-pkgname = zeroclawlabs
+pkgname = quantspeed

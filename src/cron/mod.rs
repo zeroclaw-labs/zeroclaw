@@ -1,4 +1,4 @@
-pub use zeroclaw_runtime::cron::*;
+pub use quantclaw_runtime::cron::*;
 
 use crate::config::Config;
 use anyhow::{Result, bail};
@@ -10,7 +10,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             if jobs.is_empty() {
                 println!("No scheduled tasks yet.");
                 println!("\nUsage:");
-                println!("  zeroclaw cron add '0 9 * * *' 'agent -m \"Good morning!\"'");
+                println!("  quantclaw cron add '0 9 * * *' 'agent -m \"Good morning!\"'");
                 return Ok(());
             }
 

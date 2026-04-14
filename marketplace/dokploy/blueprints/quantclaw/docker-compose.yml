@@ -1,0 +1,16 @@
+version: "3.8"
+services:
+  quantclaw:
+    image: ghcr.io/quant-speed/quantclaw:0.6.9
+    restart: unless-stopped
+    environment:
+      - API_KEY=${API_KEY}
+      - PROVIDER=${PROVIDER:-openrouter}
+      - QUANTCLAW_ALLOW_PUBLIC_BIND=true
+      - QUANTCLAW_GATEWAY_PORT=42617
+    volumes:
+      - quantclaw-data:/quantclaw-data
+    expose:
+      - 42617
+volumes:
+  quantclaw-data: {}

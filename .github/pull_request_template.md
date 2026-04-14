@@ -62,7 +62,7 @@ cargo test
 
 - Data-hygiene status (`pass|needs-follow-up`):
 - Redaction/anonymization notes:
-- Neutral wording confirmation (use ZeroClaw/project-native labels if identity-like wording is needed):
+- Neutral wording confirmation (use QuantClaw/project-native labels if identity-like wording is needed):
 
 ## Compatibility / Migration
 

@@ -2,7 +2,7 @@ import type { SessionMessageRow } from '@/types/api';
 import { generateUUID } from '@/lib/uuid';
 
 const MAX_MESSAGES = 100;
-const PREFIX = 'zeroclaw_chat_history_v1:';
+const PREFIX = 'quantclaw_chat_history_v1:';
 
 export interface PersistedChatBubble {
   id: string;

@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::browser::*;
+pub use quantclaw_tools::browser::*;

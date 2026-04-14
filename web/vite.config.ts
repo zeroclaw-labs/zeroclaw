@@ -3,7 +3,7 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "path";
 
-const gatewayPort = process.env.ZEROCLAW_GATEWAY_PORT ?? "42617";
+const gatewayPort = process.env.QUANTCLAW_GATEWAY_PORT ?? "42617";
 const gatewayTarget = `http://127.0.0.1:${gatewayPort}`;
 
 export default defineConfig(({ command }) => ({

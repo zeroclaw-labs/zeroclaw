@@ -386,7 +386,7 @@ export default function AgentChat() {
             <div className="h-16 w-16 rounded-3xl flex items-center justify-center mb-4 animate-float" style={{ background: 'var(--pc-accent-glow)' }}>
               <Bot className="h-8 w-8" style={{ color: 'var(--pc-accent)' }} />
             </div>
-            <p className="text-lg font-semibold mb-1" style={{ color: 'var(--pc-text-primary)' }}>ZeroClaw Agent</p>
+            <p className="text-lg font-semibold mb-1" style={{ color: 'var(--pc-text-primary)' }}>QuantClaw Agent</p>
             <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>{t('agent.start_conversation')}</p>
           </div>
         )}

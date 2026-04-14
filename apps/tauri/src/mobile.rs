@@ -1,6 +1,6 @@
-//! Mobile entry point for ZeroClaw Desktop (iOS/Android).
+//! Mobile entry point for QuantClaw Desktop (iOS/Android).
 
 #[tauri::mobile_entry_point]
 fn main() {
-    zeroclaw_desktop::run();
+    quantclaw_desktop::run();
 }

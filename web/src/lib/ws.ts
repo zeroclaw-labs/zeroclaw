@@ -23,7 +23,7 @@ export interface WebSocketClientOptions {
 const DEFAULT_RECONNECT_DELAY = 1000;
 const MAX_RECONNECT_DELAY = 30000;
 
-export const SESSION_STORAGE_KEY = 'zeroclaw_session_id';
+export const SESSION_STORAGE_KEY = 'quantclaw_session_id';
 
 /** Return a stable session ID, persisted in sessionStorage across reconnects. */
 export function getOrCreateSessionId(): string {
@@ -79,7 +79,7 @@ export class WebSocketClient {
     params.set('session_id', sessionId);
     const url = `${this.baseUrl}${basePath}/ws/chat?${params.toString()}`;
 
-    const protocols: string[] = ['zeroclaw.v1'];
+    const protocols: string[] = ['quantclaw.v1'];
     if (token) protocols.push(`bearer.${token}`);
     this.ws = new WebSocket(url, protocols);
 

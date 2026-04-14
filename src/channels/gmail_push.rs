@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::gmail_push::*;
+pub use quantclaw_channels::gmail_push::*;

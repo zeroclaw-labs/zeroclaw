@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::matrix::*;
+pub use quantclaw_channels::matrix::*;

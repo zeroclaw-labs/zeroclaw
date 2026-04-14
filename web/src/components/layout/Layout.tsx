@@ -4,7 +4,7 @@ import Sidebar from '@/components/layout/Sidebar';
 import Header from '@/components/layout/Header';
 import { ErrorBoundary } from '@/App';
 
-const SIDEBAR_COLLAPSED_KEY = 'zeroclaw-sidebar-collapsed';
+const SIDEBAR_COLLAPSED_KEY = 'quantclaw-sidebar-collapsed';
 
 export default function Layout() {
   const { pathname } = useLocation();

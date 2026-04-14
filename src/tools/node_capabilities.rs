@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::node_capabilities::*;
+pub use quantclaw_tools::node_capabilities::*;

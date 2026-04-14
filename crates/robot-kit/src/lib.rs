@@ -1,6 +1,6 @@
-//! # ZeroClaw Robot Kit
+//! # QuantClaw Robot Kit
 //!
-//! A standalone robotics toolkit that integrates with ZeroClaw for AI-powered robots.
+//! A standalone robotics toolkit that integrates with QuantClaw for AI-powered robots.
 //!
 //! ## Features
 //!
@@ -16,13 +16,13 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────┐
-//! │  ZeroClaw AI Brain (or any controller)                  │
+//! │  QuantClaw AI Brain (or any controller)                  │
 //! │  "Move forward, find the ball, tell me what you see"    │
 //! └─────────────────────┬───────────────────────────────────┘
 //!                       │ Tool calls
 //!                       ▼
 //! ┌─────────────────────────────────────────────────────────┐
-//! │  zeroclaw-robot-kit                                     │
+//! │  quantclaw-robot-kit                                     │
 //! │  ┌─────────┐ ┌──────┐ ┌────────┐ ┌───────┐ ┌───────┐   │
 //! │  │ drive   │ │ look │ │ listen │ │ speak │ │ sense │   │
 //! │  └────┬────┘ └──┬───┘ └───┬────┘ └───┬───┘ └───┬───┘   │
@@ -46,7 +46,7 @@
 //! ## Quick Start
 //!
 //! ```rust,ignore
-//! use zeroclaw_robot_kit::{RobotConfig, DriveTool, SafetyMonitor, SafeDrive};
+//! use quantclaw_robot_kit::{RobotConfig, DriveTool, SafetyMonitor, SafeDrive};
 //! use std::sync::Arc;
 //!
 //! #[tokio::main]
@@ -72,8 +72,8 @@
 //!
 //! ## Standalone Usage
 //!
-//! This crate can be used independently of ZeroClaw. It defines its own
-//! `Tool` trait that is compatible with ZeroClaw's but doesn't require it.
+//! This crate can be used independently of QuantClaw. It defines its own
+//! `Tool` trait that is compatible with QuantClaw's but doesn't require it.
 //!
 //! ## Safety
 //!

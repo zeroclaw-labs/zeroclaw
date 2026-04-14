@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::claude_code::*;
+pub use quantclaw_tools::claude_code::*;

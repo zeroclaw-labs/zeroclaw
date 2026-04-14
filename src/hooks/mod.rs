@@ -1,1 +1,1 @@
-pub use zeroclaw_runtime::hooks::*;
+pub use quantclaw_runtime::hooks::*;

@@ -42,7 +42,7 @@ export default function Canvas() {
     }
 
     const token = getToken();
-    const protocols = token ? ['zeroclaw.v1', `bearer.${token}`] : ['zeroclaw.v1'];
+    const protocols = token ? ['quantclaw.v1', `bearer.${token}`] : ['quantclaw.v1'];
     const ws = new WebSocket(getWsUrl(id), protocols);
 
     ws.onopen = () => setConnected(true);

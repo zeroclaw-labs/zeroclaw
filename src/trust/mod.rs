@@ -1,2 +1,2 @@
 #[allow(unused_imports)]
-pub use zeroclaw_runtime::trust::*;
+pub use quantclaw_runtime::trust::*;

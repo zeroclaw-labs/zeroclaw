@@ -411,9 +411,9 @@ dependencies = [
 
 [[package]]
 name = "async-signal"
-version = "0.2.13"
+version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43c070bbf59cd3570b6b2dd54cd772527c7c3620fce8be898406dd3ed6adc64c"
+checksum = "52b5aaafa020cf5053a01f2a60e8ff5dccf550f0f77ec54a4e47285ac2bab485"
 dependencies = [
  "async-io",
  "async-lock",
@@ -1060,9 +1060,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.58"
+version = "1.2.60"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1e928d4b69e3077709075a938a05ffbedfa53a84c8f766efbf8220bb1ff60e1"
+checksum = "43c5703da9466b66a946814e1adf53ea2c90f10063b86290cc9eb67ce3478a20"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -1143,7 +1143,7 @@ checksum = "6f8d983286843e49675a4b7a2d174efe136dc93a18d69130dd18198a6c167601"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
- "rand_core 0.10.0",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -1256,9 +1256,9 @@ dependencies = [
 
 [[package]]
 name = "clap_complete"
-version = "4.6.0"
+version = "4.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19c9f1dde76b736e3681f28cec9d5a61299cbaae0fce80a68e43724ad56031eb"
+checksum = "3ff7a1dccbdd8b078c2bdebff47e404615151534d5043da397ec50286816f9cb"
 dependencies = [
  "clap",
 ]
@@ -1434,7 +1434,7 @@ dependencies = [
  "cookie 0.18.1",
  "document-features",
  "idna",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "log",
  "serde",
  "serde_derive",
@@ -2605,9 +2605,9 @@ dependencies = [
 
 [[package]]
 name = "fastrand"
-version = "2.3.0"
+version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
+checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "fdeflate"
@@ -3053,7 +3053,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi 6.0.0",
- "rand_core 0.10.0",
+ "rand_core 0.10.1",
  "wasip2",
  "wasip3",
 ]
@@ -3075,7 +3075,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 dependencies = [
  "fallible-iterator",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "stable_deref_trait",
 ]
 
@@ -3276,7 +3276,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "http 1.4.0",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "slab",
  "tokio",
  "tokio-util",
@@ -3336,12 +3336,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashbrown"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
+
+[[package]]
 name = "hashify"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd1246c0e5493286aeb2dde35b1f4eb9c4ce00e628641210a5e553fc001a1f26"
 dependencies = [
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -3595,17 +3601,16 @@ dependencies = [
 
 [[package]]
 name = "hyper-rustls"
-version = "0.27.7"
+version = "0.27.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3c93eb611681b207e1fe55d5a71ecf91572ec8a6705cdb6857f7d8d5242cf58"
+checksum = "c2b52f86d1d4bc0d6b4e6826d960b1b333217e07d36b882dca570a5e1c48895b"
 dependencies = [
  "http 1.4.0",
  "hyper",
  "hyper-util",
  "log",
- "rustls 0.23.37",
+ "rustls 0.23.38",
  "rustls-native-certs 0.8.3",
- "rustls-pki-types",
  "tokio",
  "tokio-rustls 0.26.4",
  "tower-service",
@@ -3704,7 +3709,7 @@ dependencies = [
  "displaydoc",
  "litemap 0.8.2",
  "tinystr 0.8.3",
- "writeable 0.6.2",
+ "writeable 0.6.3",
  "zerovec 0.11.6",
 ]
 
@@ -3785,7 +3790,7 @@ checksum = "139c4cf31c8b5f33d7e199446eff9c1e02decfc2f0eec2c8d71f65befa45b421"
 dependencies = [
  "displaydoc",
  "icu_locale_core",
- "writeable 0.6.2",
+ "writeable 0.6.3",
  "yoke 0.8.2",
  "zerofrom",
  "zerotrie",
@@ -3955,12 +3960,12 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.13.0"
+version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7714e70437a7dc3ac8eb7e6f8df75fd8eb422675fc7678aff7364301092b1017"
+checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.0",
  "serde",
  "serde_core",
 ]
@@ -4213,9 +4218,9 @@ dependencies = [
 
 [[package]]
 name = "js-sys"
-version = "0.3.94"
+version = "0.3.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e04e2ef80ce82e13552136fabeef8a5ed1f985a96805761cbb9a2c34e7664d9"
+checksum = "2964e92d1d9dc3364cae4d718d93f227e3abb088e747d92e0395bfdedf1c12ca"
 dependencies = [
  "cfg-if",
  "futures-util",
@@ -4313,7 +4318,7 @@ checksum = "02cb977175687f33fa4afa0c95c112b987ea1443e5a51c8f8ff27dc618270cc2"
 dependencies = [
  "cssparser 0.29.6",
  "html5ever 0.29.1",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "selectors 0.24.0",
 ]
 
@@ -4354,9 +4359,9 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "lettre"
-version = "0.11.20"
+version = "0.11.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "471816f3e24b85e820dee02cde962379ea1a669e5242f19c61bcbcffedf4c4fb"
+checksum = "dabda5859ee7c06b995b9d1165aa52c39110e079ef609db97178d86aeb051fa7"
 dependencies = [
  "base64 0.22.1",
  "email-encoding",
@@ -4368,7 +4373,7 @@ dependencies = [
  "nom 8.0.0",
  "percent-encoding",
  "quoted_printable",
- "rustls 0.23.37",
+ "rustls 0.23.38",
  "socket2",
  "tokio",
  "url",
@@ -4401,9 +4406,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.184"
+version = "0.2.185"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48f5d2a454e16a5ea0f4ced81bd44e4cfc7bd3a507b61887c99fd3538b28e4af"
+checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
 
 [[package]]
 name = "libloading"
@@ -4433,14 +4438,14 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libredox"
-version = "0.1.15"
+version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ddbf48fd451246b1f8c2610bd3b4ac0cc6e149d89832867093ab69a17194f08"
+checksum = "e02f3bb43d335493c96bf3fd3a321600bf6bd07ed34bc64118e9293bdffea46c"
 dependencies = [
  "bitflags 2.11.0",
  "libc",
  "plain",
- "redox_syscall 0.7.3",
+ "redox_syscall 0.7.4",
 ]
 
 [[package]]
@@ -4515,13 +4520,13 @@ dependencies = [
  "encoding_rs",
  "flate2",
  "getrandom 0.3.4",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "itoa",
  "log",
  "md-5",
  "nom 8.0.0",
  "nom_locate",
- "rand 0.9.2",
+ "rand 0.9.4",
  "rangemap",
  "sha2",
  "stringprep",
@@ -4768,7 +4773,7 @@ dependencies = [
  "gloo-timers",
  "http 1.4.0",
  "imbl",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "itertools 0.14.0",
  "js_int",
  "language-tags",
@@ -5167,9 +5172,9 @@ dependencies = [
 
 [[package]]
 name = "muda"
-version = "0.17.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01c1738382f66ed56b3b9c8119e794a2e23148ac8ea214eda86622d4cb9d415a"
+checksum = "7c9fec5a4e89860383d778d10563a605838f8f0b2f9303868937e5ff32e86177"
 dependencies = [
  "crossbeam-channel",
  "dpi",
@@ -5873,7 +5878,7 @@ dependencies = [
  "futures-util",
  "opentelemetry",
  "percent-encoding",
- "rand 0.9.2",
+ "rand 0.9.4",
  "thiserror 2.0.18",
 ]
 
@@ -6096,7 +6101,7 @@ checksum = "8701b58ea97060d5e5b155d383a69952a60943f0e6dfe30b04c287beb0b27455"
 dependencies = [
  "fixedbitset 0.5.7",
  "hashbrown 0.15.5",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
 ]
 
 [[package]]
@@ -6359,9 +6364,9 @@ dependencies = [
 
 [[package]]
 name = "pkg-config"
-version = "0.3.32"
+version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
+checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plain"
@@ -6376,7 +6381,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "740ebea15c5d1428f910cd1a5f52cebf8d25006245ed8ade92702f4943d91e07"
 dependencies = [
  "base64 0.22.1",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "quick-xml",
  "serde",
  "time",
@@ -6574,7 +6579,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "031bed1313b45d93dae4ca8f0fee098530c6632e4ebd9e2769d5a49cdef273d3"
 dependencies = [
  "base64 0.22.1",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "jep106",
  "serde",
  "serde_with",
@@ -6607,7 +6612,7 @@ version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
 dependencies = [
- "toml_edit 0.25.10+spec-1.1.0",
+ "toml_edit 0.25.11+spec-1.1.0",
 ]
 
 [[package]]
@@ -6810,6 +6815,583 @@ dependencies = [
 ]
 
 [[package]]
+name = "quantclaw-api"
+version = "0.6.9"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures-util",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "quantclaw-channels"
+version = "0.6.9"
+dependencies = [
+ "anyhow",
+ "async-imap",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "cpal",
+ "directories",
+ "futures-util",
+ "hex",
+ "hmac",
+ "image",
+ "lettre",
+ "lru",
+ "mail-parser",
+ "matrix-sdk",
+ "nanohtml2text",
+ "nostr-sdk",
+ "parking_lot",
+ "portable-atomic",
+ "prost 0.14.3",
+ "qrcode",
+ "quantclaw-api",
+ "quantclaw-config",
+ "quantclaw-infra",
+ "quantclaw-memory",
+ "quantclaw-providers",
+ "quantclaw-runtime",
+ "quantclaw-tools",
+ "rand 0.10.1",
+ "regex",
+ "reqwest 0.12.28",
+ "rumqttc",
+ "rusqlite",
+ "rustls 0.23.38",
+ "rustls-pki-types",
+ "serde",
+ "serde-big-array",
+ "serde_json",
+ "sha2",
+ "shellexpand",
+ "tempfile",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-socks",
+ "tokio-tungstenite 0.29.0",
+ "tokio-util",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "urlencoding",
+ "uuid",
+ "wa-rs",
+ "wa-rs-binary",
+ "wa-rs-core",
+ "wa-rs-proto",
+ "wa-rs-tokio-transport",
+ "wa-rs-ureq-http",
+ "webpki-roots 1.0.6",
+ "wiremock",
+]
+
+[[package]]
+name = "quantclaw-config"
+version = "0.6.9"
+dependencies = [
+ "anyhow",
+ "chacha20poly1305",
+ "chrono",
+ "directories",
+ "hex",
+ "hostname",
+ "parking_lot",
+ "quantclaw-api",
+ "quantclaw-macros",
+ "rand 0.10.1",
+ "regex",
+ "reqwest 0.12.28",
+ "rustls 0.23.38",
+ "rustls-pki-types",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shellexpand",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-socks",
+ "tokio-stream",
+ "tokio-tungstenite 0.29.0",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "webpki-roots 1.0.6",
+]
+
+[[package]]
+name = "quantclaw-desktop"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-shell",
+ "tauri-plugin-single-instance",
+ "tauri-plugin-store",
+ "tokio",
+]
+
+[[package]]
+name = "quantclaw-gateway"
+version = "0.6.9"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "directories",
+ "futures-util",
+ "hex",
+ "hmac",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "mime_guess",
+ "parking_lot",
+ "quantclaw-api",
+ "quantclaw-channels",
+ "quantclaw-config",
+ "quantclaw-hardware",
+ "quantclaw-infra",
+ "quantclaw-memory",
+ "quantclaw-plugins",
+ "quantclaw-providers",
+ "quantclaw-runtime",
+ "quantclaw-tools",
+ "rand 0.10.1",
+ "rcgen",
+ "rusqlite",
+ "rustls 0.23.38",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-stream",
+ "toml 1.1.2+spec-1.1.0",
+ "tower",
+ "tower-http",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "quantclaw-hardware"
+version = "0.6.9"
+dependencies = [
+ "aardvark-sys",
+ "anyhow",
+ "async-trait",
+ "directories",
+ "glob",
+ "nusb",
+ "portable-atomic",
+ "probe-rs",
+ "quantclaw-api",
+ "quantclaw-config",
+ "quantclaw-tools",
+ "reqwest 0.12.28",
+ "rppal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-serial",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "quantclaw-infra"
+version = "0.6.9"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "parking_lot",
+ "portable-atomic",
+ "quantclaw-api",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "quantclaw-macros"
+version = "0.6.9"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "quantclaw-memory"
+version = "0.6.9"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "parking_lot",
+ "quantclaw-api",
+ "quantclaw-config",
+ "regex",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "quantclaw-plugins"
+version = "0.6.9"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "quantclaw-api",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
+name = "quantclaw-providers"
+version = "0.6.9"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "chrono",
+ "directories",
+ "futures-util",
+ "hex",
+ "hmac",
+ "hyper",
+ "parking_lot",
+ "quantclaw-api",
+ "quantclaw-config",
+ "rand 0.10.1",
+ "regex",
+ "reqwest 0.12.28",
+ "ring",
+ "scopeguard",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "quantclaw-robot-kit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "directories",
+ "portable-atomic",
+ "reqwest 0.12.28",
+ "rppal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
+name = "quantclaw-runtime"
+version = "0.6.9"
+dependencies = [
+ "aardvark-sys",
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "chrono",
+ "chrono-tz",
+ "console",
+ "cron",
+ "dialoguer",
+ "directories",
+ "flate2",
+ "futures-util",
+ "glob",
+ "hex",
+ "hmac",
+ "hostname",
+ "image",
+ "indicatif",
+ "landlock",
+ "libc",
+ "lru",
+ "nanohtml2text",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "parking_lot",
+ "pdf-extract",
+ "portable-atomic",
+ "prometheus",
+ "quantclaw-api",
+ "quantclaw-config",
+ "quantclaw-infra",
+ "quantclaw-macros",
+ "quantclaw-memory",
+ "quantclaw-plugins",
+ "quantclaw-providers",
+ "quantclaw-tool-call-parser",
+ "quantclaw-tools",
+ "rand 0.10.1",
+ "rcgen",
+ "regex",
+ "reqwest 0.12.28",
+ "ring",
+ "rumqttc",
+ "rusqlite",
+ "rustls 0.23.38",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "schemars 1.2.1",
+ "scopeguard",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shellexpand",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-stream",
+ "tokio-tungstenite 0.29.0",
+ "tokio-util",
+ "toml 1.1.2+spec-1.1.0",
+ "tower",
+ "tower-http",
+ "tracing",
+ "urlencoding",
+ "uuid",
+ "webpki-roots 1.0.6",
+ "which",
+ "zip",
+]
+
+[[package]]
+name = "quantclaw-tool-call-parser"
+version = "0.6.9"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "quantclaw-tools"
+version = "0.6.9"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "directories",
+ "fantoccini",
+ "futures-util",
+ "glob",
+ "hex",
+ "nanohtml2text",
+ "parking_lot",
+ "pdf-extract",
+ "probe-rs",
+ "quantclaw-api",
+ "quantclaw-config",
+ "quantclaw-infra",
+ "quantclaw-memory",
+ "quantclaw-providers",
+ "regex",
+ "reqwest 0.12.28",
+ "scopeguard",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-test",
+ "tokio-tungstenite 0.29.0",
+ "tokio-util",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "urlencoding",
+ "uuid",
+ "which",
+ "wiremock",
+]
+
+[[package]]
+name = "quantclaw-tui"
+version = "0.6.9"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "libc",
+ "quantclaw-config",
+ "ratatui",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
+name = "quantspeed"
+version = "0.6.9"
+dependencies = [
+ "aardvark-sys",
+ "anyhow",
+ "async-imap",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "chrono",
+ "chrono-tz",
+ "clap",
+ "clap_complete",
+ "console",
+ "criterion",
+ "cron",
+ "crossterm",
+ "dialoguer",
+ "directories",
+ "flate2",
+ "futures-util",
+ "glob",
+ "hex",
+ "hmac",
+ "hostname",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "image",
+ "indicatif",
+ "lettre",
+ "libc",
+ "lru",
+ "mail-parser",
+ "mime_guess",
+ "nanohtml2text",
+ "nostr-sdk",
+ "parking_lot",
+ "portable-atomic",
+ "quantclaw-api",
+ "quantclaw-channels",
+ "quantclaw-config",
+ "quantclaw-gateway",
+ "quantclaw-hardware",
+ "quantclaw-infra",
+ "quantclaw-macros",
+ "quantclaw-memory",
+ "quantclaw-plugins",
+ "quantclaw-providers",
+ "quantclaw-runtime",
+ "quantclaw-tool-call-parser",
+ "quantclaw-tools",
+ "quantclaw-tui",
+ "rand 0.10.1",
+ "ratatui",
+ "rcgen",
+ "regex",
+ "reqwest 0.12.28",
+ "ring",
+ "rumqttc",
+ "rusqlite",
+ "rustls 0.23.38",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "schemars 1.2.1",
+ "scopeguard",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shellexpand",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-socks",
+ "tokio-stream",
+ "tokio-tungstenite 0.29.0",
+ "tokio-util",
+ "toml 1.1.2+spec-1.1.0",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "urlencoding",
+ "uuid",
+ "webpki-roots 1.0.6",
+ "which",
+ "wiremock",
+ "zip",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.38.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6830,7 +7412,7 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash",
- "rustls 0.23.37",
+ "rustls 0.23.38",
  "socket2",
  "thiserror 2.0.18",
  "tokio",
@@ -6847,10 +7429,10 @@ dependencies = [
  "bytes",
  "getrandom 0.3.4",
  "lru-slab",
- "rand 0.9.2",
+ "rand 0.9.4",
  "ring",
  "rustc-hash",
- "rustls 0.23.37",
+ "rustls 0.23.38",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.18",
@@ -6933,9 +7515,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.9.2"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6db2770f06117d490610c7488547d543617b21bfa07796d7a12f6f1bd53850d1"
+checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
 dependencies = [
  "rand_chacha 0.9.0",
  "rand_core 0.9.5",
@@ -6943,13 +7525,13 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc266eb313df6c5c09c1c7b1fbe2510961e5bcd3add930c1e31f7ed9da0feff8"
+checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
 dependencies = [
  "chacha20 0.10.0",
  "getrandom 0.4.2",
- "rand_core 0.10.0",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -7011,9 +7593,9 @@ dependencies = [
 
 [[package]]
 name = "rand_core"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c8d0fd677905edcbeedbf2edb6494d676f0e98d54d5cf9bda0b061cb8fb8aba"
+checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rand_hc"
@@ -7198,9 +7780,9 @@ dependencies = [
 
 [[package]]
 name = "redox_syscall"
-version = "0.7.3"
+version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ce70a74e890531977d37e532c34d45e9055d2409ed08ddba14529471ed0be16"
+checksum = "f450ad9c3b1da563fb6948a8e0fb0fb9269711c9c73d9ea1de5058c79c8d643a"
 dependencies = [
  "bitflags 2.11.0",
 ]
@@ -7289,7 +7871,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.37",
+ "rustls 0.23.38",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -7438,7 +8020,7 @@ dependencies = [
  "form_urlencoded",
  "getrandom 0.2.17",
  "http 1.4.0",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "js-sys",
  "js_int",
  "konst",
@@ -7467,7 +8049,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2dbdeccb62cb4ffe3282325de8ba28cbc0fdce7c78a3f11b7241fbfdb9cb9907"
 dependencies = [
  "as_variant",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "js_int",
  "js_option",
  "percent-encoding",
@@ -7637,16 +8219,16 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.37"
+version = "0.23.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "758025cb5fccfd3bc2fd74708fd4682be41d99e5dff73c377c0646c6012c73a4"
+checksum = "69f9466fb2c14ea04357e91413efb882e2a6d4a406e625449bc0a5d360d53a21"
 dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki 0.103.10",
+ "rustls-webpki 0.103.11",
  "subtle",
  "zeroize",
 ]
@@ -7708,9 +8290,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.10"
+version = "0.103.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df33b2b81ac578cabaf06b89b0631153a3f416b0a886e8a7a1707fb51abbd1ef"
+checksum = "20a6af516fea4b20eccceaf166e8aa666ac996208e8a644ce3ef5aa783bc7cd4"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -7966,9 +8548,9 @@ checksum = "b12e76d157a900eb52e81bc6e9f3069344290341720e9178cde2407113ac8d89"
 
 [[package]]
 name = "semver"
-version = "1.0.27"
+version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 dependencies = [
  "serde",
  "serde_core",
@@ -8064,7 +8646,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2f2d7ff8a2140333718bb329f5c40fc5f0865b84c426183ce14c97d2ab8154f"
 dependencies = [
  "form_urlencoded",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "itoa",
  "ryu",
  "serde_core",
@@ -8154,7 +8736,7 @@ dependencies = [
  "chrono",
  "hex",
  "indexmap 1.9.3",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "schemars 0.9.0",
  "schemars 1.2.1",
  "serde_core",
@@ -8181,7 +8763,7 @@ version = "0.9.34+deprecated"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
 dependencies = [
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "itoa",
  "ryu",
  "serde",
@@ -8893,9 +9475,9 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-single-instance"
-version = "2.4.0"
+version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc61e4822b8f74d68278e09161d3e3fdd1b14b9eb781e24edccaabf10c420e8c"
+checksum = "a33a5b7d78f0dec4406b003ea87c40bf928d801b6fd9323a556172c91d8712c1"
 dependencies = [
  "serde",
  "serde_json",
@@ -9247,9 +9829,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.50.0"
+version = "1.51.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27ad5e34374e03cfffefc301becb44e9dc3c17584f414349ebe29ed26661822d"
+checksum = "f66bf9585cda4b724d3e78ab34b73fb2bbaba9011b9bfdf69dc836382ea13b8c"
 dependencies = [
  "bytes",
  "libc",
@@ -9263,9 +9845,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-macros"
-version = "2.6.1"
+version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c55a2eff8b69ce66c84f85e1da1c233edc36ceb85a2058d11b0d6a3c7e7569c"
+checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9289,7 +9871,7 @@ version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
- "rustls 0.23.37",
+ "rustls 0.23.38",
  "tokio",
 ]
 
@@ -9350,7 +9932,7 @@ checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
 dependencies = [
  "futures-util",
  "log",
- "rustls 0.23.37",
+ "rustls 0.23.38",
  "rustls-pki-types",
  "tokio",
  "tokio-rustls 0.26.4",
@@ -9378,7 +9960,7 @@ checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
  "log",
- "rustls 0.23.37",
+ "rustls 0.23.38",
  "rustls-pki-types",
  "tokio",
  "tokio-rustls 0.26.4",
@@ -9411,7 +9993,7 @@ dependencies = [
  "futures-sink",
  "http 1.4.0",
  "httparse",
- "rand 0.10.0",
+ "rand 0.10.1",
  "ring",
  "rustls-pki-types",
  "simdutf8",
@@ -9438,7 +10020,7 @@ version = "0.9.12+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
 dependencies = [
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "serde_core",
  "serde_spanned 1.1.1",
  "toml_datetime 0.7.5+spec-1.1.0",
@@ -9453,7 +10035,7 @@ version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81f3d15e84cbcd896376e6730314d59fb5a87f31e4b038454184435cd57defee"
 dependencies = [
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "serde_core",
  "serde_spanned 1.1.1",
  "toml_datetime 1.1.1+spec-1.1.0",
@@ -9495,7 +10077,7 @@ version = "0.19.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b5bb770da30e5cbfde35a2d7b9b8a2c4b8ef89548a7a6aeab5c9a576e3e7421"
 dependencies = [
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "toml_datetime 0.6.3",
  "winnow 0.5.40",
 ]
@@ -9506,7 +10088,7 @@ version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "396e4d48bbb2b7554c944bde63101b5ae446cff6ec4a24227428f15eb72ef338"
 dependencies = [
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "serde",
  "serde_spanned 0.6.9",
  "toml_datetime 0.6.3",
@@ -9515,11 +10097,11 @@ dependencies = [
 
 [[package]]
 name = "toml_edit"
-version = "0.25.10+spec-1.1.0"
+version = "0.25.11+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a82418ca169e235e6c399a84e395ab6debeb3bc90edc959bf0f48647c6a32d1b"
+checksum = "0b59c4d22ed448339746c59b905d24568fcbb3ab65a500494f7b8c3e97739f2b"
 dependencies = [
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
  "winnow 1.0.1",
@@ -9734,8 +10316,8 @@ dependencies = [
  "http 1.4.0",
  "httparse",
  "log",
- "rand 0.9.2",
- "rustls 0.23.37",
+ "rand 0.9.4",
+ "rustls 0.23.38",
  "rustls-pki-types",
  "sha1",
  "thiserror 2.0.18",
@@ -9753,7 +10335,7 @@ dependencies = [
  "http 1.4.0",
  "httparse",
  "log",
- "rand 0.9.2",
+ "rand 0.9.4",
  "sha1",
  "thiserror 2.0.18",
  "utf-8",
@@ -9770,8 +10352,8 @@ dependencies = [
  "http 1.4.0",
  "httparse",
  "log",
- "rand 0.9.2",
- "rustls 0.23.37",
+ "rand 0.9.4",
+ "rustls 0.23.38",
  "rustls-pki-types",
  "sha1",
  "thiserror 2.0.18",
@@ -9832,9 +10414,9 @@ checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
 
 [[package]]
 name = "typewit"
-version = "1.15.0"
+version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06fee3a8df48c50c55ad646a4e03b00a370da6fe1850ebf467a8d0165dfcafae"
+checksum = "bc19094686c694eb41b3b99dcc2f2975d4b078512fa22ae6c63f7ca318bdcff7"
 dependencies = [
  "typewit_proc_macros",
 ]
@@ -9874,7 +10456,7 @@ version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
 dependencies = [
- "rand 0.9.2",
+ "rand 0.9.4",
  "web-time",
 ]
 
@@ -10040,7 +10622,7 @@ dependencies = [
  "cookie_store",
  "log",
  "percent-encoding",
- "rustls 0.23.37",
+ "rustls 0.23.38",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -10236,8 +10818,8 @@ dependencies = [
  "log",
  "moka",
  "prost 0.14.3",
- "rand 0.9.2",
- "rand_core 0.10.0",
+ "rand 0.9.4",
+ "rand_core 0.10.1",
  "scopeguard",
  "serde",
  "serde_json",
@@ -10308,8 +10890,8 @@ dependencies = [
  "pbkdf2",
  "prost 0.14.3",
  "protobuf",
- "rand 0.9.2",
- "rand_core 0.10.0",
+ "rand 0.9.4",
+ "rand_core 0.10.1",
  "serde",
  "serde-big-array",
  "serde_json",
@@ -10358,7 +10940,7 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "prost 0.14.3",
- "rand 0.9.2",
+ "rand 0.9.4",
  "serde",
  "sha1",
  "sha2",
@@ -10381,8 +10963,8 @@ dependencies = [
  "hkdf",
  "log",
  "prost 0.14.3",
- "rand 0.9.2",
- "rand_core 0.10.0",
+ "rand 0.9.4",
+ "rand_core 0.10.1",
  "sha2",
  "thiserror 2.0.18",
  "wa-rs-binary",
@@ -10414,7 +10996,7 @@ dependencies = [
  "futures-util",
  "http 1.4.0",
  "log",
- "rustls 0.23.37",
+ "rustls 0.23.38",
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-websockets",
@@ -10486,9 +11068,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.117"
+version = "0.2.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0551fc1bb415591e3372d0bc4780db7e587d84e2a7e79da121051c5c4b89d0b0"
+checksum = "0bf938a0bacb0469e83c1e148908bd7d5a6010354cf4fb73279b7447422e3a89"
 dependencies = [
  "cfg-if",
  "once_cell",
@@ -10499,9 +11081,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-futures"
-version = "0.4.67"
+version = "0.4.68"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03623de6905b7206edd0a75f69f747f134b7f0a2323392d664448bf2d3c5d87e"
+checksum = "f371d383f2fb139252e0bfac3b81b265689bf45b6874af544ffa4c975ac1ebf8"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -10509,9 +11091,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.117"
+version = "0.2.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fbdf9a35adf44786aecd5ff89b4563a90325f9da0923236f6104e603c7e86be"
+checksum = "eeff24f84126c0ec2db7a449f0c2ec963c6a49efe0698c4242929da037ca28ed"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -10519,9 +11101,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.117"
+version = "0.2.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dca9693ef2bab6d4e6707234500350d8dad079eb508dca05530c85dc3a529ff2"
+checksum = "9d08065faf983b2b80a79fd87d8254c409281cf7de75fc4b773019824196c904"
 dependencies = [
  "bumpalo",
  "proc-macro2",
@@ -10532,9 +11114,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.117"
+version = "0.2.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39129a682a6d2d841b6c429d0c51e5cb0ed1a03829d8b3d1e69a011e62cb3d3b"
+checksum = "5fd04d9e306f1907bd13c6361b5c6bfc7b3b3c095ed3f8a9246390f8dbdee129"
 dependencies = [
  "unicode-ident",
 ]
@@ -10556,7 +11138,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bb0e353e6a2fbdc176932bbaab493762eb1255a7900fe0fea1a2f96c296cc909"
 dependencies = [
  "anyhow",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "wasm-encoder",
  "wasmparser",
 ]
@@ -10613,15 +11195,15 @@ checksum = "47b807c72e1bac69382b3a6fb3dbe8ea4c0ed87ff5629b8685ae6b9a611028fe"
 dependencies = [
  "bitflags 2.11.0",
  "hashbrown 0.15.5",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "semver",
 ]
 
 [[package]]
 name = "web-sys"
-version = "0.3.94"
+version = "0.3.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd70027e39b12f0849461e08ffc50b9cd7688d942c1c8e3c7b22273236b4dd0a"
+checksum = "4f2dfbb17949fa2088e5d39408c48368947b86f7834484e87b73de55bc14d97d"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -11433,7 +12015,7 @@ checksum = "b7c566e0f4b284dd6561c786d9cb0142da491f46a9fbed79ea69cdad5db17f21"
 dependencies = [
  "anyhow",
  "heck 0.5.0",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "prettyplease",
  "syn 2.0.117",
  "wasm-metadata",
@@ -11464,7 +12046,7 @@ checksum = "9d66ea20e9553b30172b5e831994e35fbde2d165325bec84fc43dbf6f4eb9cb2"
 dependencies = [
  "anyhow",
  "bitflags 2.11.0",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "log",
  "serde",
  "serde_derive",
@@ -11483,7 +12065,7 @@ checksum = "ecc8ac4bc1dc3381b7f59c34f00b67e18f910c2c0f50015669dde7def656a736"
 dependencies = [
  "anyhow",
  "id-arena",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "log",
  "semver",
  "serde",
@@ -11501,9 +12083,9 @@ checksum = "1e9df38ee2d2c3c5948ea468a8406ff0db0b29ae1ffde1bcf20ef305bcc95c51"
 
 [[package]]
 name = "writeable"
-version = "0.6.2"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
+checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "wry"
@@ -11725,583 +12307,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zeroclaw-api"
-version = "0.6.9"
-dependencies = [
- "anyhow",
- "async-trait",
- "futures-util",
- "parking_lot",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "zeroclaw-channels"
-version = "0.6.9"
-dependencies = [
- "anyhow",
- "async-imap",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "chrono",
- "cpal",
- "directories",
- "futures-util",
- "hex",
- "hmac",
- "image",
- "lettre",
- "lru",
- "mail-parser",
- "matrix-sdk",
- "nanohtml2text",
- "nostr-sdk",
- "parking_lot",
- "portable-atomic",
- "prost 0.14.3",
- "qrcode",
- "rand 0.10.0",
- "regex",
- "reqwest 0.12.28",
- "rumqttc",
- "rusqlite",
- "rustls 0.23.37",
- "rustls-pki-types",
- "serde",
- "serde-big-array",
- "serde_json",
- "sha2",
- "shellexpand",
- "tempfile",
- "tokio",
- "tokio-rustls 0.26.4",
- "tokio-socks",
- "tokio-tungstenite 0.29.0",
- "tokio-util",
- "toml 1.1.2+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
- "urlencoding",
- "uuid",
- "wa-rs",
- "wa-rs-binary",
- "wa-rs-core",
- "wa-rs-proto",
- "wa-rs-tokio-transport",
- "wa-rs-ureq-http",
- "webpki-roots 1.0.6",
- "wiremock",
- "zeroclaw-api",
- "zeroclaw-config",
- "zeroclaw-infra",
- "zeroclaw-memory",
- "zeroclaw-providers",
- "zeroclaw-runtime",
- "zeroclaw-tools",
-]
-
-[[package]]
-name = "zeroclaw-config"
-version = "0.6.9"
-dependencies = [
- "anyhow",
- "chacha20poly1305",
- "chrono",
- "directories",
- "hex",
- "hostname",
- "parking_lot",
- "rand 0.10.0",
- "regex",
- "reqwest 0.12.28",
- "rustls 0.23.37",
- "rustls-pki-types",
- "schemars 1.2.1",
- "serde",
- "serde_json",
- "sha2",
- "shellexpand",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-rustls 0.26.4",
- "tokio-socks",
- "tokio-stream",
- "tokio-tungstenite 0.29.0",
- "toml 1.1.2+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "webpki-roots 1.0.6",
- "zeroclaw-api",
- "zeroclaw-macros",
-]
-
-[[package]]
-name = "zeroclaw-desktop"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-shell",
- "tauri-plugin-single-instance",
- "tauri-plugin-store",
- "tokio",
-]
-
-[[package]]
-name = "zeroclaw-gateway"
-version = "0.6.9"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "chrono",
- "directories",
- "futures-util",
- "hex",
- "hmac",
- "http-body-util",
- "hyper",
- "hyper-util",
- "mime_guess",
- "parking_lot",
- "rand 0.10.0",
- "rcgen",
- "rusqlite",
- "rustls 0.23.37",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-rustls 0.26.4",
- "tokio-stream",
- "toml 1.1.2+spec-1.1.0",
- "tower",
- "tower-http",
- "tracing",
- "uuid",
- "zeroclaw-api",
- "zeroclaw-channels",
- "zeroclaw-config",
- "zeroclaw-hardware",
- "zeroclaw-infra",
- "zeroclaw-memory",
- "zeroclaw-plugins",
- "zeroclaw-providers",
- "zeroclaw-runtime",
- "zeroclaw-tools",
-]
-
-[[package]]
-name = "zeroclaw-hardware"
-version = "0.6.9"
-dependencies = [
- "aardvark-sys",
- "anyhow",
- "async-trait",
- "directories",
- "glob",
- "nusb",
- "portable-atomic",
- "probe-rs",
- "reqwest 0.12.28",
- "rppal",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-serial",
- "toml 1.1.2+spec-1.1.0",
- "tracing",
- "uuid",
- "zeroclaw-api",
- "zeroclaw-config",
- "zeroclaw-tools",
-]
-
-[[package]]
-name = "zeroclaw-infra"
-version = "0.6.9"
-dependencies = [
- "anyhow",
- "chrono",
- "parking_lot",
- "portable-atomic",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "zeroclaw-api",
-]
-
-[[package]]
-name = "zeroclaw-macros"
-version = "0.6.9"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "zeroclaw-memory"
-version = "0.6.9"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "parking_lot",
- "regex",
- "reqwest 0.12.28",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
- "zeroclaw-api",
- "zeroclaw-config",
-]
-
-[[package]]
-name = "zeroclaw-plugins"
-version = "0.6.9"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "ring",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml 1.1.2+spec-1.1.0",
- "tracing",
- "zeroclaw-api",
-]
-
-[[package]]
-name = "zeroclaw-providers"
-version = "0.6.9"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "chacha20poly1305",
- "chrono",
- "directories",
- "futures-util",
- "hex",
- "hmac",
- "hyper",
- "parking_lot",
- "rand 0.10.0",
- "regex",
- "reqwest 0.12.28",
- "ring",
- "scopeguard",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "uuid",
- "zeroclaw-api",
- "zeroclaw-config",
-]
-
-[[package]]
-name = "zeroclaw-robot-kit"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "directories",
- "portable-atomic",
- "reqwest 0.12.28",
- "rppal",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "toml 1.1.2+spec-1.1.0",
- "tracing",
-]
-
-[[package]]
-name = "zeroclaw-runtime"
-version = "0.6.9"
-dependencies = [
- "aardvark-sys",
- "anyhow",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "chacha20poly1305",
- "chrono",
- "chrono-tz",
- "console",
- "cron",
- "dialoguer",
- "directories",
- "flate2",
- "futures-util",
- "glob",
- "hex",
- "hmac",
- "hostname",
- "image",
- "indicatif",
- "landlock",
- "libc",
- "lru",
- "nanohtml2text",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "parking_lot",
- "pdf-extract",
- "portable-atomic",
- "prometheus",
- "rand 0.10.0",
- "rcgen",
- "regex",
- "reqwest 0.12.28",
- "ring",
- "rumqttc",
- "rusqlite",
- "rustls 0.23.37",
- "rustls-pemfile",
- "rustls-pki-types",
- "schemars 1.2.1",
- "scopeguard",
- "serde",
- "serde_json",
- "sha2",
- "shellexpand",
- "tar",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-rustls 0.26.4",
- "tokio-stream",
- "tokio-tungstenite 0.29.0",
- "tokio-util",
- "toml 1.1.2+spec-1.1.0",
- "tower",
- "tower-http",
- "tracing",
- "urlencoding",
- "uuid",
- "webpki-roots 1.0.6",
- "which",
- "zeroclaw-api",
- "zeroclaw-config",
- "zeroclaw-infra",
- "zeroclaw-macros",
- "zeroclaw-memory",
- "zeroclaw-plugins",
- "zeroclaw-providers",
- "zeroclaw-tool-call-parser",
- "zeroclaw-tools",
- "zip",
-]
-
-[[package]]
-name = "zeroclaw-tool-call-parser"
-version = "0.6.9"
-dependencies = [
- "regex",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "zeroclaw-tools"
-version = "0.6.9"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "directories",
- "fantoccini",
- "futures-util",
- "glob",
- "hex",
- "nanohtml2text",
- "parking_lot",
- "pdf-extract",
- "probe-rs",
- "regex",
- "reqwest 0.12.28",
- "scopeguard",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-test",
- "tokio-tungstenite 0.29.0",
- "tokio-util",
- "toml 1.1.2+spec-1.1.0",
- "tracing",
- "urlencoding",
- "uuid",
- "which",
- "wiremock",
- "zeroclaw-api",
- "zeroclaw-config",
- "zeroclaw-infra",
- "zeroclaw-memory",
- "zeroclaw-providers",
-]
-
-[[package]]
-name = "zeroclaw-tui"
-version = "0.6.9"
-dependencies = [
- "anyhow",
- "crossterm",
- "libc",
- "ratatui",
- "reqwest 0.12.28",
- "serde_json",
- "tokio",
- "toml 1.1.2+spec-1.1.0",
- "zeroclaw-config",
-]
-
-[[package]]
-name = "zeroclawlabs"
-version = "0.6.9"
-dependencies = [
- "aardvark-sys",
- "anyhow",
- "async-imap",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "chacha20poly1305",
- "chrono",
- "chrono-tz",
- "clap",
- "clap_complete",
- "console",
- "criterion",
- "cron",
- "crossterm",
- "dialoguer",
- "directories",
- "flate2",
- "futures-util",
- "glob",
- "hex",
- "hmac",
- "hostname",
- "http-body-util",
- "hyper",
- "hyper-util",
- "image",
- "indicatif",
- "lettre",
- "libc",
- "lru",
- "mail-parser",
- "mime_guess",
- "nanohtml2text",
- "nostr-sdk",
- "parking_lot",
- "portable-atomic",
- "rand 0.10.0",
- "ratatui",
- "rcgen",
- "regex",
- "reqwest 0.12.28",
- "ring",
- "rumqttc",
- "rusqlite",
- "rustls 0.23.37",
- "rustls-pemfile",
- "rustls-pki-types",
- "schemars 1.2.1",
- "scopeguard",
- "serde",
- "serde_json",
- "sha2",
- "shellexpand",
- "tar",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-rustls 0.26.4",
- "tokio-socks",
- "tokio-stream",
- "tokio-tungstenite 0.29.0",
- "tokio-util",
- "toml 1.1.2+spec-1.1.0",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "urlencoding",
- "uuid",
- "webpki-roots 1.0.6",
- "which",
- "wiremock",
- "zeroclaw-api",
- "zeroclaw-channels",
- "zeroclaw-config",
- "zeroclaw-gateway",
- "zeroclaw-hardware",
- "zeroclaw-infra",
- "zeroclaw-macros",
- "zeroclaw-memory",
- "zeroclaw-plugins",
- "zeroclaw-providers",
- "zeroclaw-runtime",
- "zeroclaw-tool-call-parser",
- "zeroclaw-tools",
- "zeroclaw-tui",
- "zip",
-]
-
-[[package]]
 name = "zerocopy"
 version = "0.8.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12419,13 +12424,13 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "8.5.0"
+version = "8.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2726508a48f38dceb22b35ecbbd2430efe34ff05c62bd3285f965d7911b33464"
+checksum = "dcab981e19633ebcf0b001ddd37dd802996098bc1864f90b7c5d970ce76c1d59"
 dependencies = [
  "crc32fast",
  "flate2",
- "indexmap 2.13.0",
+ "indexmap 2.14.0",
  "memchr",
  "typed-path",
 ]

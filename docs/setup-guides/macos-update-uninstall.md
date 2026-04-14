@@ -1,20 +1,20 @@
 # macOS Update and Uninstall Guide
 
-This page documents supported update and uninstall procedures for ZeroClaw on macOS (OS X).
+This page documents supported update and uninstall procedures for QuantClaw on macOS (OS X).
 
 Last verified: **February 22, 2026**.
 
 ## 1) Check current install method
 
 ```bash
-which zeroclaw
-zeroclaw --version
+which quantclaw
+quantclaw --version
 ```
 
 Typical locations:
 
-- Homebrew: `/opt/homebrew/bin/zeroclaw` (Apple Silicon) or `/usr/local/bin/zeroclaw` (Intel)
-- Cargo/bootstrap/manual: `~/.cargo/bin/zeroclaw`
+- Homebrew: `/opt/homebrew/bin/quantclaw` (Apple Silicon) or `/usr/local/bin/quantclaw` (Intel)
+- Cargo/bootstrap/manual: `~/.cargo/bin/quantclaw`
 
 If both exist, your shell `PATH` order decides which one runs.
 
@@ -24,8 +24,8 @@ If both exist, your shell `PATH` order decides which one runs.
 
 ```bash
 brew update
-brew upgrade zeroclaw
-zeroclaw --version
+brew upgrade quantclaw
+quantclaw --version
 ```
 
 ### B) Clone + bootstrap install
@@ -35,7 +35,7 @@ From your local repository checkout:
 ```bash
 git pull --ff-only
 ./install.sh --skip-onboard
-zeroclaw --version
+quantclaw --version
 ```
 
 ### C) Manual prebuilt binary install
@@ -43,7 +43,7 @@ zeroclaw --version
 Re-run your download/install flow with the latest release asset, then verify:
 
 ```bash
-zeroclaw --version
+quantclaw --version
 ```
 
 ## 3) Uninstall on macOS
@@ -53,27 +53,27 @@ zeroclaw --version
 This prevents the daemon from continuing to run after binary removal.
 
 ```bash
-zeroclaw service stop || true
-zeroclaw service uninstall || true
+quantclaw service stop || true
+quantclaw service uninstall || true
 ```
 
 Service artifacts removed by `service uninstall`:
 
-- `~/Library/LaunchAgents/com.zeroclaw.daemon.plist`
+- `~/Library/LaunchAgents/com.quantclaw.daemon.plist`
 
 ### B) Remove the binary by install method
 
 Homebrew:
 
 ```bash
-brew uninstall zeroclaw
+brew uninstall quantclaw
 ```
 
-Cargo/bootstrap/manual (`~/.cargo/bin/zeroclaw`):
+Cargo/bootstrap/manual (`~/.cargo/bin/quantclaw`):
 
 ```bash
-cargo uninstall zeroclaw || true
-rm -f ~/.cargo/bin/zeroclaw
+cargo uninstall quantclaw || true
+rm -f ~/.cargo/bin/quantclaw
 ```
 
 ### C) Optional: remove local runtime data
@@ -81,20 +81,20 @@ rm -f ~/.cargo/bin/zeroclaw
 Only run this if you want a full cleanup of config, auth profiles, logs, and workspace state.
 
 ```bash
-rm -rf ~/.zeroclaw
+rm -rf ~/.quantclaw
 ```
 
 ## 4) Verify uninstall completed
 
 ```bash
-command -v zeroclaw || echo "zeroclaw binary not found"
-pgrep -fl zeroclaw || echo "No running zeroclaw process"
+command -v quantclaw || echo "quantclaw binary not found"
+pgrep -fl quantclaw || echo "No running quantclaw process"
 ```
 
 If `pgrep` still finds a process, stop it manually and re-check:
 
 ```bash
-pkill -f zeroclaw
+pkill -f quantclaw
 ```
 
 ## Related docs

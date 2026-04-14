@@ -435,7 +435,7 @@ export function SettingsModal({ open, onClose }: Props) {
                   className="rounded-xl border p-2 text-[13px]"
                   style={{ fontFamily: 'var(--pc-font-mono)', fontSize: 'var(--pc-font-size-mono)', color: 'var(--pc-text-primary)', borderColor: 'var(--pc-border)', background: 'var(--pc-bg-code)' }}
                 >
-                  const hello = 'ZeroClaw'; // typography preview
+                  const hello = 'QuantClaw'; // typography preview
                 </div>
               </div>
             </>

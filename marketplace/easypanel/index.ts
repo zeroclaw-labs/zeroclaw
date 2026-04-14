@@ -7,8 +7,8 @@ export function generate(input: Input): Output {
   const appEnv = [
     `API_KEY=${input.apiKey}`,
     `PROVIDER=${input.provider}`,
-    `ZEROCLAW_ALLOW_PUBLIC_BIND=true`,
-    `ZEROCLAW_GATEWAY_PORT=42617`,
+    `QUANTCLAW_ALLOW_PUBLIC_BIND=true`,
+    `QUANTCLAW_GATEWAY_PORT=42617`,
   ];
 
   services.push({
@@ -30,7 +30,7 @@ export function generate(input: Input): Output {
         {
           type: "volume",
           name: "data",
-          mountPath: "/zeroclaw-data",
+          mountPath: "/quantclaw-data",
         },
       ],
     },

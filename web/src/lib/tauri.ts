@@ -1,9 +1,9 @@
-// Tauri detection utilities for ZeroClaw Desktop.
+// Tauri detection utilities for QuantClaw Desktop.
 
 declare global {
   interface Window {
     __TAURI__?: unknown;
-    __ZEROCLAW_GATEWAY__?: string;
+    __QUANTCLAW_GATEWAY__?: string;
   }
 }
 
@@ -12,4 +12,4 @@ export const isTauri = (): boolean => '__TAURI__' in window;
 
 /** Gateway base URL when running inside Tauri (defaults to localhost). */
 export const tauriGatewayUrl = (): string =>
-  window.__ZEROCLAW_GATEWAY__ ?? 'http://127.0.0.1:42617';
+  window.__QUANTCLAW_GATEWAY__ ?? 'http://127.0.0.1:42617';

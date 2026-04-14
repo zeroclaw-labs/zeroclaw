@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::twitter::*;
+pub use quantclaw_channels::twitter::*;

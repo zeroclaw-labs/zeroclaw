@@ -19,7 +19,7 @@ env:
 jobs:
   detect-version-change:
     name: Detect Version Bump
-    if: github.repository == 'zeroclaw-labs/zeroclaw'
+    if: github.repository == 'quant-speed/quantclaw'
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.check.outputs.changed }}
@@ -74,7 +74,7 @@ jobs:
         run: |
           set -euo pipefail
           status=$(curl -s -o /dev/null -w "%{http_code}" \
-            "https://crates.io/api/v1/crates/zeroclawlabs/${VERSION}")
+            "https://crates.io/api/v1/crates/quantspeed/${VERSION}")
 
           if [[ "$status" == "200" ]]; then
             echo "Version ${VERSION} already exists on crates.io — skipping"
@@ -138,7 +138,7 @@ jobs:
           OUTPUT=$(cargo publish --locked --allow-dirty --no-verify 2>&1) && exit 0
           echo "$OUTPUT"
           if echo "$OUTPUT" | grep -q 'already exists'; then
-            echo "::notice::zeroclawlabs@${VERSION} already on crates.io — skipping"
+            echo "::notice::quantspeed@${VERSION} already on crates.io — skipping"
             exit 0
           fi
           exit 1
@@ -151,10 +151,10 @@ jobs:
           echo "Waiting for crates.io to index..."
           sleep 15
           status=$(curl -s -o /dev/null -w "%{http_code}" \
-            "https://crates.io/api/v1/crates/zeroclawlabs/${VERSION}")
+            "https://crates.io/api/v1/crates/quantspeed/${VERSION}")
           if [[ "$status" == "200" ]]; then
-            echo "zeroclawlabs v${VERSION} is live on crates.io"
-            echo "Install: cargo install zeroclawlabs"
+            echo "quantspeed v${VERSION} is live on crates.io"
+            echo "Install: cargo install quantspeed"
           else
-            echo "::warning::Version may still be indexing — check https://crates.io/crates/zeroclawlabs"
+            echo "::warning::Version may still be indexing — check https://crates.io/crates/quantspeed"
           fi

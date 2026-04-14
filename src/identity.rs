@@ -1,1 +1,1 @@
-pub use zeroclaw_runtime::identity::*;
+pub use quantclaw_runtime::identity::*;

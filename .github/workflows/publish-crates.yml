@@ -48,7 +48,7 @@ jobs:
     timeout-minutes: 30
     environment:
       name: crates-io
-      url: https://crates.io/crates/zeroclawlabs
+      url: https://crates.io/crates/quantspeed
     steps:
       - uses: actions/checkout@v4
 
@@ -105,7 +105,7 @@ jobs:
           OUTPUT=$(cargo publish --locked --allow-dirty --no-verify 2>&1) && exit 0
           echo "$OUTPUT"
           if echo "$OUTPUT" | grep -q 'already exists'; then
-            echo "::notice::zeroclawlabs@${VERSION} already on crates.io — skipping"
+            echo "::notice::quantspeed@${VERSION} already on crates.io — skipping"
             exit 0
           fi
           exit 1

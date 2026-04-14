@@ -4,7 +4,7 @@ git_tag_enable = true
 semver_check = false
 
 [[package]]
-name = "zeroclaw-api"
+name = "quantclaw-api"
 semver_check = true
 
 [[package]]

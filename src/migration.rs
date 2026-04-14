@@ -1,4 +1,4 @@
-pub use zeroclaw_runtime::migration::*;
+pub use quantclaw_runtime::migration::*;
 
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};

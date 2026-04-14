@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::voice_call::*;
+pub use quantclaw_channels::voice_call::*;

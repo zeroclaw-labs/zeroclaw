@@ -1,1 +1,1 @@
-pub use zeroclaw_plugins::*;
+pub use quantclaw_plugins::*;

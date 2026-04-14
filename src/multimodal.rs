@@ -1,2 +1,2 @@
 #[allow(unused_imports)]
-pub use zeroclaw_providers::multimodal::*;
+pub use quantclaw_providers::multimodal::*;

@@ -1,24 +1,12 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/docs/assets/zeroclaw-banner.png" alt="ZeroClaw" width="600" />
+  <img src="../../assets/quantclaw-banner.png" alt="QuantClaw" width="600" />
 </p>
 
-<h1 align="center">🦀 ZeroClaw — Szemelyes MI Asszisztens</h1>
+<h1 align="center">🦀 QuantClaw — Szemelyes MI Asszisztens</h1>
 
 <p align="center">
   <strong>Nulla terheles. Nulla kompromisszum. 100% Rust. 100% Agnosztikus.</strong><br>
   ⚡️ <strong>$10-os hardveren fut <5MB RAM-mal: Ez 99%-kal kevesebb memoria, mint az OpenClaw es 98%-kal olcsobb, mint egy Mac mini!</strong>
-</p>
-
-<p align="center">
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/actions/workflows/ci-run.yml"><img src="https://img.shields.io/github/actions/workflow/status/zeroclaw-labs/zeroclaw/ci-run.yml?branch=master&label=build" alt="Build Status" /></a>
-  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-edition%202024-orange?logo=rust" alt="Rust Edition 2024" /></a>
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/releases/latest"><img src="https://img.shields.io/badge/version-v0.6.9-blue" alt="Version v0.6.9" /></a>
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors"><img src="https://img.shields.io/github/contributors/zeroclaw-labs/zeroclaw?color=green" alt="Contributors" /></a>
-  <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
-  <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
-  <a href="https://discord.com/invite/wDshRVqRjx"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
-  <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
 </p>
 
 <p align="center">
@@ -60,21 +48,20 @@ A Harvard, MIT es Sundai.Club kozossegek diakjai es tagjai epitettek.
   <a href="../nb/README.md">🇳🇴 Norsk</a>
 </p>
 
-A ZeroClaw egy szemelyes MI asszisztens, amelyet a sajat eszkozeiden futtathatsz. Valaszol a mar hasznalt csatornaidon (WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Matrix, IRC, Email, Bluesky, Nostr, Mattermost, Nextcloud Talk, DingTalk, Lark, QQ, Reddit, LinkedIn, Twitter, MQTT, WeChat Work es meg tobb). Rendelkezik webes vezerlopulttal valos ideju iranyitashoz, es csatlakoztathat hardver periferiakhoz (ESP32, STM32, Arduino, Raspberry Pi). A Gateway csupan a vezerlesi sik — a termek maga az asszisztens.
+A QuantClaw egy szemelyes MI asszisztens, amelyet a sajat eszkozeiden futtathatsz. Valaszol a mar hasznalt csatornaidon (WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Matrix, IRC, Email, Bluesky, Nostr, Mattermost, Nextcloud Talk, DingTalk, Lark, QQ, Reddit, LinkedIn, Twitter, MQTT, WeChat Work es meg tobb). Rendelkezik webes vezerlopulttal valos ideju iranyitashoz, es csatlakoztathat hardver periferiakhoz (ESP32, STM32, Arduino, Raspberry Pi). A Gateway csupan a vezerlesi sik — a termek maga az asszisztens.
 
 Ha szemelyes, egyfelhasznalos asszisztenst szeretnel, ami lokalis, gyors es mindig elerheto, ez az.
 
 <p align="center">
-  <a href="https://zeroclawlabs.ai">Weboldal</a> ·
+  <a href="https://quantspeed.ai">Weboldal</a> ·
   <a href="docs/README.md">Dokumentacio</a> ·
   <a href="docs/architecture.md">Architektura</a> ·
   <a href="#gyors-inditas-tldr">Kezdes</a> ·
   <a href="#atallas-openclawrol">Atallas OpenClawrol</a> ·
   <a href="docs/ops/troubleshooting.md">Hibaelharitas</a> ·
-  <a href="https://discord.com/invite/wDshRVqRjx">Discord</a>
 </p>
 
-> **Ajanlott beallitas:** futtasd a `zeroclaw onboard` parancsot a terminalban. A ZeroClaw Onboard lepesrol lepesre vegigvezet a gateway, munkater, csatornak es szolgaltato beallitasan. Ez az ajanlott beallitasi ut, es mukodik macOS-en, Linuxon es Windowson (WSL2-n keresztul). Uj telepites? Kezdd itt: [Kezdes](#gyors-inditas-tldr)
+> **Ajanlott beallitas:** futtasd a `quantclaw onboard` parancsot a terminalban. A QuantClaw Onboard lepesrol lepesre vegigvezet a gateway, munkater, csatornak es szolgaltato beallitasan. Ez az ajanlott beallitasi ut, es mukodik macOS-en, Linuxon es Windowson (WSL2-n keresztul). Uj telepites? Kezdd itt: [Kezdes](#gyors-inditas-tldr)
 
 ### Elofizetes hitelesites (OAuth)
 
@@ -94,18 +81,18 @@ Futtato kornyezet: Rust stable toolchain. Egyetlen binaris, nincs futtatasi idej
 ### Homebrew (macOS/Linuxbrew)
 
 ```bash
-brew install zeroclaw
+brew install quantclaw
 ```
 
 ### Egy kattintasos telepites
 
 ```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/quant-speed/quantclaw.git
+cd quantclaw
 ./install.sh
 ```
 
-A `zeroclaw onboard` automatikusan lefut a telepites utan a munkater es szolgaltato konfiguralasakor.
+A `quantclaw onboard` automatikusan lefut a telepites utan a munkater es szolgaltato konfiguralasakor.
 
 ## Gyors inditas (TL;DR)
 
@@ -116,67 +103,67 @@ Teljes kezdo utmutato (hitelesites, parositas, csatornak): [Kezdes](docs/setup-g
 ./install.sh --api-key "sk-..." --provider openrouter
 
 # Gateway inditasa (webhook szerver + webes vezerlopult)
-zeroclaw gateway                # alapertelmezett: 127.0.0.1:42617
-zeroclaw gateway --port 0       # veletlenszeru port (biztonsagi szilarditas)
+quantclaw gateway                # alapertelmezett: 127.0.0.1:42617
+quantclaw gateway --port 0       # veletlenszeru port (biztonsagi szilarditas)
 
 # Beszelgess az asszisztenssel
-zeroclaw agent -m "Hello, ZeroClaw!"
+quantclaw agent -m "Hello, QuantClaw!"
 
 # Interaktiv mod
-zeroclaw agent
+quantclaw agent
 
 # Teljes autonom futtatas inditasa (gateway + csatornak + cron + hands)
-zeroclaw daemon
+quantclaw daemon
 
 # Allapot ellenorzes
-zeroclaw status
+quantclaw status
 
 # Diagnosztika futtatasa
-zeroclaw doctor
+quantclaw doctor
 ```
 
-Frissites? Futtasd a `zeroclaw doctor` parancsot a frissites utan.
+Frissites? Futtasd a `quantclaw doctor` parancsot a frissites utan.
 
 ### Forrasbol (fejlesztes)
 
 ```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/quant-speed/quantclaw.git
+cd quantclaw
 
 cargo build --release --locked
 cargo install --path . --force --locked
 
-zeroclaw onboard
+quantclaw onboard
 ```
 
 > **Fejlesztoi alternativa (globalis telepites nelkul):** a parancsokat prefixeld `cargo run --release --`-vel (pelda: `cargo run --release -- status`).
 
 ## Atallas OpenClawrol
 
-A ZeroClaw importalhatja az OpenClaw munkateret, memoriat es konfiguraciot:
+A QuantClaw importalhatja az OpenClaw munkateret, memoriat es konfiguraciot:
 
 ```bash
 # Elonezet az attelepitendo adatokrol (biztonsagos, csak olvasható)
-zeroclaw migrate openclaw --dry-run
+quantclaw migrate openclaw --dry-run
 
 # Migracio futtatasa
-zeroclaw migrate openclaw
+quantclaw migrate openclaw
 ```
 
-Ez migralja a memoriabejegyzeseket, munkater fajlokat es konfiguraciot a `~/.openclaw/` konyvtarbol a `~/.zeroclaw/` konyvtarba. A konfiguracio automatikusan JSON-bol TOML-ra konvertalodik.
+Ez migralja a memoriabejegyzeseket, munkater fajlokat es konfiguraciot a `~/.openclaw/` konyvtarbol a `~/.quantclaw/` konyvtarba. A konfiguracio automatikusan JSON-bol TOML-ra konvertalodik.
 
 ## Biztonsagi alapertelmezesek (DM hozzaferes)
 
-A ZeroClaw valos uzenetfeluletekkez csatlakozik. Kezeld a bejovo DM-eket nem megbizhato bemenetekkent.
+A QuantClaw valos uzenetfeluletekkez csatlakozik. Kezeld a bejovo DM-eket nem megbizhato bemenetekkent.
 
 Teljes biztonsagi utmutato: [SECURITY.md](SECURITY.md)
 
 Alapertelmezett viselkedes minden csatornan:
 
 - **DM parositas** (alapertelmezett): az ismeretlen feladok rovid parosito kodot kapnak, es a bot nem dolgozza fel az uzenetuket.
-- Jovahagy paranccsal: `zeroclaw pairing approve <channel> <code>` (ezutan a felado felkerul egy lokalis engedelyezesi listara).
+- Jovahagy paranccsal: `quantclaw pairing approve <channel> <code>` (ezutan a felado felkerul egy lokalis engedelyezesi listara).
 - A nyilvanos bejovo DM-ek kifejezett opt-in-t igenyelnek a `config.toml`-ban.
-- Futtasd a `zeroclaw doctor` parancsot a kockazatos vagy rosszul konfiguralt DM szabalyzatok feltarasahoz.
+- Futtasd a `quantclaw doctor` parancsot a kockazatos vagy rosszul konfiguralt DM szabalyzatok feltarasahoz.
 
 **Autonomia szintek:**
 
@@ -197,7 +184,7 @@ Hasznald ezt a tablat fontos ertesitesekhez (torekenyen kompatibilis valtozasok,
 
 | Datum (UTC) | Szint | Ertesites | Teendo |
 | ---------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2026-02-19 | _Kritikus_ | **Nem** allunk kapcsolatban az `openagen/zeroclaw`, `zeroclaw.org` vagy `zeroclaw.net` oldalakkal. A `zeroclaw.org` es `zeroclaw.net` domainek jelenleg az `openagen/zeroclaw` fork-ra mutatnak, es az a domain/tarolo megszemelyesiti a hivatalos weboldalunkat/projektunket. | Ne bizz meg az ezekbol a forrasokbol szarmazo informaciokban, binarisokban, adomanygyujtesekben vagy kozlemenyekben. Kizarolag [ezt a tarolot](https://github.com/zeroclaw-labs/zeroclaw) es az ellenorzott kozossegi media fiokjainkat hasznald. |
+| 2026-02-19 | _Kritikus_ | **Nem** allunk kapcsolatban az `openagen/quantclaw`, `quantclaw.org` vagy `quantclaw.net` oldalakkal. A `quantclaw.org` es `quantclaw.net` domainek jelenleg az `openagen/quantclaw` fork-ra mutatnak, es az a domain/tarolo megszemelyesiti a hivatalos weboldalunkat/projektunket. | Ne bizz meg az ezekbol a forrasokbol szarmazo informaciokban, binarisokban, adomanygyujtesekben vagy kozlemenyekben. Kizarolag [ezt a tarolot](https://github.com/quant-speed/quantclaw) es az ellenorzott kozossegi media fiokjainkat hasznald. |
 | 2026-02-19 | _Fontos_ | Az Anthropic frissitette a Hitelesitesi es Hitellevelek Hasznalara vonatkozo felteteleket 2026-02-19-en. A Claude Code OAuth tokenek (Free, Pro, Max) kizarolag a Claude Code es a Claude.ai szamara keszultek; az OAuth tokenek barmely mas termekben, eszkozben vagy szolgaltatasban valo hasznalata (beleertve az Agent SDK-t) nem megengedett es sertheti a Fogyasztoi Szolgaltatasi Felteteleket. | Kerlek ideiglenesen keruld a Claude Code OAuth integraciokat a potencialis veszteseg megelozese erdekeben. Eredeti kikotes: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use). |
 
 ## Fobb jellemzok
@@ -217,18 +204,18 @@ Hasznald ezt a tablat fontos ertesitesekhez (torekenyen kompatibilis valtozasok,
 - **Kepesseg platform** — beepitett, kozossegi es munkater kepessegek biztonsagi auditalassal.
 - **Tunnel tamogatas** — Cloudflare, Tailscale, ngrok, OpenVPN es egyedi tunnelek tavoli hozzafereshez.
 
-### Miert valasztjak a csapatok a ZeroClaw-t
+### Miert valasztjak a csapatok a QuantClaw-t
 
 - **Konnyu alapertelmezetten:** kis Rust binaris, gyors inditas, alacsony memoriahasznalat.
 - **Biztonsagos tervezessel:** parositas, szigoru sandboxing, kifejezett engedelyezesi listak, munkater hatarolás.
 - **Teljesen cserelheto:** az alaprendszerek trait-ek (providers, channels, tools, memory, tunnels).
 - **Nincs bezartsag:** OpenAI-kompatibilis szolgaltatoi tamogatas + csatlakoztatható egyedi vegpontok.
 
-## Benchmark pillanatkep (ZeroClaw vs OpenClaw, Reprodukalhato)
+## Benchmark pillanatkep (QuantClaw vs OpenClaw, Reprodukalhato)
 
 Lokalis gepi gyors benchmark (macOS arm64, 2026 feb.) normalizalva 0.8GHz edge hardverre.
 
-|                           | OpenClaw      | NanoBot        | PicoClaw        | ZeroClaw 🦀          |
+|                           | OpenClaw      | NanoBot        | PicoClaw        | QuantClaw 🦀          |
 | ------------------------- | ------------- | -------------- | --------------- | -------------------- |
 | **Nyelv**                 | TypeScript    | Python         | Go              | **Rust**             |
 | **RAM**                   | > 1GB         | > 100MB        | < 10MB          | **< 5MB**            |
@@ -236,20 +223,20 @@ Lokalis gepi gyors benchmark (macOS arm64, 2026 feb.) normalizalva 0.8GHz edge h
 | **Binaris meret**         | ~28MB (dist)  | N/A (Scripts)  | ~8MB            | **~8.8 MB**          |
 | **Koltseg**               | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **Barmilyen hardver $10** |
 
-> Megjegyzesek: A ZeroClaw eredmenyek release buildeken merve `/usr/bin/time -l` hasznalataval. Az OpenClaw Node.js futtatokornyezetet igenyel (tipikusan ~390MB memoria terheles), mig a NanoBot Python futtatokornyezetet. A PicoClaw es ZeroClaw statikus binarisok. A fenti RAM adatok futtatasi ideju memoriat mutatnak; a forditasi ideju kovetelmenyek magasabbak.
+> Megjegyzesek: A QuantClaw eredmenyek release buildeken merve `/usr/bin/time -l` hasznalataval. Az OpenClaw Node.js futtatokornyezetet igenyel (tipikusan ~390MB memoria terheles), mig a NanoBot Python futtatokornyezetet. A PicoClaw es QuantClaw statikus binarisok. A fenti RAM adatok futtatasi ideju memoriat mutatnak; a forditasi ideju kovetelmenyek magasabbak.
 
 <p align="center">
-  <img src="docs/assets/zeroclaw-comparison.jpeg" alt="ZeroClaw vs OpenClaw Comparison" width="800" />
+  <img src="docs/assets/quantclaw-comparison.jpeg" alt="QuantClaw vs OpenClaw Comparison" width="800" />
 </p>
 
 ### Reprodukalhato lokalis meres
 
 ```bash
 cargo build --release
-ls -lh target/release/zeroclaw
+ls -lh target/release/quantclaw
 
-/usr/bin/time -l target/release/zeroclaw --help
-/usr/bin/time -l target/release/zeroclaw status
+/usr/bin/time -l target/release/quantclaw --help
+/usr/bin/time -l target/release/quantclaw status
 ```
 
 ## Minden, amit eddig epitettunk
@@ -325,7 +312,7 @@ React 19 + Vite 6 + Tailwind CSS 4 webes vezerlopult, amelyet kozvetlenul a Gate
 
 ## Konfiguracio
 
-Minimalis `~/.zeroclaw/config.toml`:
+Minimalis `~/.quantclaw/config.toml`:
 
 ```toml
 default_provider = "anthropic"
@@ -393,35 +380,35 @@ Allitsd be a `runtime.kind = "docker"` erteket a szigoru sandboxinghoz vagy halo
 
 ## Elofizetes hitelesites (OpenAI Codex / Claude Code / Gemini)
 
-A ZeroClaw tamogatja az elofizetes-nativ hitelesitesi profilokat (tobb fiok, titkositva tarolva).
+A QuantClaw tamogatja az elofizetes-nativ hitelesitesi profilokat (tobb fiok, titkositva tarolva).
 
-- Tarolo fajl: `~/.zeroclaw/auth-profiles.json`
-- Titkositasi kulcs: `~/.zeroclaw/.secret_key`
+- Tarolo fajl: `~/.quantclaw/auth-profiles.json`
+- Titkositasi kulcs: `~/.quantclaw/.secret_key`
 - Profil azonosito formatum: `<provider>:<profile_name>` (pelda: `openai-codex:work`)
 
 ```bash
 # OpenAI Codex OAuth (ChatGPT subscription)
-zeroclaw auth login --provider openai-codex --device-code
+quantclaw auth login --provider openai-codex --device-code
 
 # Gemini OAuth
-zeroclaw auth login --provider gemini --profile default
+quantclaw auth login --provider gemini --profile default
 
 # Anthropic setup-token
-zeroclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
+quantclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
 
 # Check / refresh / switch profile
-zeroclaw auth status
-zeroclaw auth refresh --provider openai-codex --profile default
-zeroclaw auth use --provider openai-codex --profile work
+quantclaw auth status
+quantclaw auth refresh --provider openai-codex --profile default
+quantclaw auth use --provider openai-codex --profile work
 
 # Run the agent with subscription auth
-zeroclaw agent --provider openai-codex -m "hello"
-zeroclaw agent --provider anthropic -m "hello"
+quantclaw agent --provider openai-codex -m "hello"
+quantclaw agent --provider anthropic -m "hello"
 ```
 
 ## Agens munkater + kepessegek
 
-Munkater gyoker: `~/.zeroclaw/workspace/` (konfiguralhato a config-on keresztul).
+Munkater gyoker: `~/.quantclaw/workspace/` (konfiguralhato a config-on keresztul).
 
 Beinjektalt prompt fajlok:
 - `IDENTITY.md` — agens szemelyiseg es szerep
@@ -430,74 +417,74 @@ Beinjektalt prompt fajlok:
 - `AGENTS.md` — munkamenet konvenciok es inicializalasi szabalyok
 - `SOUL.md` — alapveto identitas es mukodesi elvek
 
-Kepessegek: `~/.zeroclaw/workspace/skills/<skill>/SKILL.md` vagy `SKILL.toml`.
+Kepessegek: `~/.quantclaw/workspace/skills/<skill>/SKILL.md` vagy `SKILL.toml`.
 
 ```bash
 # List installed skills
-zeroclaw skills list
+quantclaw skills list
 
 # Install from git
-zeroclaw skills install https://github.com/user/my-skill.git
+quantclaw skills install https://github.com/user/my-skill.git
 
 # Security audit before install
-zeroclaw skills audit https://github.com/user/my-skill.git
+quantclaw skills audit https://github.com/user/my-skill.git
 
 # Remove a skill
-zeroclaw skills remove my-skill
+quantclaw skills remove my-skill
 ```
 
 ## CLI parancsok
 
 ```bash
 # Munkater kezeles
-zeroclaw onboard              # Vezerelt beallitasi varazslo
-zeroclaw status               # Daemon/agent allapot megjelenites
-zeroclaw doctor               # Rendszer diagnosztika futtatasa
+quantclaw onboard              # Vezerelt beallitasi varazslo
+quantclaw status               # Daemon/agent allapot megjelenites
+quantclaw doctor               # Rendszer diagnosztika futtatasa
 
 # Gateway + daemon
-zeroclaw gateway              # Gateway szerver inditasa (127.0.0.1:42617)
-zeroclaw daemon               # Teljes autonom futtatas inditasa
+quantclaw gateway              # Gateway szerver inditasa (127.0.0.1:42617)
+quantclaw daemon               # Teljes autonom futtatas inditasa
 
 # Agens
-zeroclaw agent                # Interaktiv csevegesi mod
-zeroclaw agent -m "message"   # Egyszeri uzenet mod
+quantclaw agent                # Interaktiv csevegesi mod
+quantclaw agent -m "message"   # Egyszeri uzenet mod
 
 # Szolgaltatas kezeles
-zeroclaw service install      # Telepites OS szolgaltataskent (launchd/systemd)
-zeroclaw service start|stop|restart|status
+quantclaw service install      # Telepites OS szolgaltataskent (launchd/systemd)
+quantclaw service start|stop|restart|status
 
 # Csatornak
-zeroclaw channel list         # Konfiguralt csatornak listazasa
-zeroclaw channel doctor       # Csatorna egeszseg ellenorzes
-zeroclaw channel bind-telegram 123456789
+quantclaw channel list         # Konfiguralt csatornak listazasa
+quantclaw channel doctor       # Csatorna egeszseg ellenorzes
+quantclaw channel bind-telegram 123456789
 
 # Cron + utemezes
-zeroclaw cron list            # Utemezett feladatok listazasa
-zeroclaw cron add "*/5 * * * *" --prompt "Check system health"
-zeroclaw cron remove <id>
+quantclaw cron list            # Utemezett feladatok listazasa
+quantclaw cron add "*/5 * * * *" --prompt "Check system health"
+quantclaw cron remove <id>
 
 # Memoria
-zeroclaw memory list          # Memoriabejegyzesek listazasa
-zeroclaw memory get <key>     # Memoria lekerese
-zeroclaw memory stats         # Memoria statisztikak
+quantclaw memory list          # Memoriabejegyzesek listazasa
+quantclaw memory get <key>     # Memoria lekerese
+quantclaw memory stats         # Memoria statisztikak
 
 # Hitelesitesi profilok
-zeroclaw auth login --provider <name>
-zeroclaw auth status
-zeroclaw auth use --provider <name> --profile <profile>
+quantclaw auth login --provider <name>
+quantclaw auth status
+quantclaw auth use --provider <name> --profile <profile>
 
 # Hardver periferiak
-zeroclaw hardware discover    # Csatlakoztatott eszkozok keresese
-zeroclaw peripheral list      # Csatlakoztatott periferiak listazasa
-zeroclaw peripheral flash     # Firmware felirasa eszkozre
+quantclaw hardware discover    # Csatlakoztatott eszkozok keresese
+quantclaw peripheral list      # Csatlakoztatott periferiak listazasa
+quantclaw peripheral flash     # Firmware felirasa eszkozre
 
 # Migracio
-zeroclaw migrate openclaw --dry-run
-zeroclaw migrate openclaw
+quantclaw migrate openclaw --dry-run
+quantclaw migrate openclaw
 
 # Shell kiegeszitesek
-source <(zeroclaw completions bash)
-zeroclaw completions zsh > ~/.zfunc/_zeroclaw
+source <(quantclaw completions bash)
+quantclaw completions zsh > ~/.zfunc/_quantclaw
 ```
 
 Teljes parancs referencia: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
@@ -565,10 +552,10 @@ Teljes parancs referencia: [docs/reference/cli/commands-reference.md](docs/refer
 
 #### Egyvonalas telepito
 
-Vagy hagyd ki a fenti lepeseket es telepits mindent (rendszer fuggosegek, Rust, ZeroClaw) egyetlen paranccsal:
+Vagy hagyd ki a fenti lepeseket es telepits mindent (rendszer fuggosegek, Rust, QuantClaw) egyetlen paranccsal:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+curl -LsSf https://raw.githubusercontent.com/quant-speed/quantclaw/master/install.sh | bash
 ```
 
 #### Forditasi eroforrasigeny
@@ -611,7 +598,7 @@ Kiadas eszkozok az alabbi platformokra kerulnek kozetetelre:
 - Windows: `x86_64`
 
 Toltsd le a legujabb eszkozoket innen:
-<https://github.com/zeroclaw-labs/zeroclaw/releases/latest>
+<https://github.com/quant-speed/quantclaw/releases/latest>
 
 ## Dokumentacio
 
@@ -621,7 +608,7 @@ Hasznald ezeket, ha tuljutottal az onboarding folyamaton es melyebb referenciara
 - Olvasd el az [architektura attekintest](docs/architecture.md) a teljes rendszermodellhez.
 - Hasznald a [konfiguracios referenciat](docs/reference/api/config-reference.md), ha minden kulcsra es peldara szukseged van.
 - Futtasd a Gateway-t a konyv szerint az [uzemeltetesi kezikonyvvel](docs/ops/operations-runbook.md).
-- Kovesd a [ZeroClaw Onboard](#gyors-inditas-tldr) szolgaltatast a vezerelt beallitashoz.
+- Kovesd a [QuantClaw Onboard](#gyors-inditas-tldr) szolgaltatast a vezerelt beallitashoz.
 - Hibakeress a gyakori problemakat a [hibaelharitasi utmutatoval](docs/ops/troubleshooting.md).
 - Tekintsd at a [biztonsagi utmutatast](docs/security/README.md) mielott barmit is kiteszel.
 
@@ -653,14 +640,14 @@ Hasznald ezeket, ha tuljutottal az onboarding folyamaton es melyebb referenciara
 
 ## Icy Crab 🦀
 
-A ZeroClaw a smooth crab 🦀 szamara keszult, egy gyors es hatekony MI asszisztens. Epitette Argenis De La Rosa es a kozosseg.
+A QuantClaw a smooth crab 🦀 szamara keszult, egy gyors es hatekony MI asszisztens. Epitette Argenis De La Rosa es a kozosseg.
 
-- [zeroclawlabs.ai](https://zeroclawlabs.ai)
-- [@zeroclawlabs](https://x.com/zeroclawlabs)
+- [quantspeed.ai](https://quantspeed.ai)
+- [@quantspeed](https://x.com/quantspeed)
 
-## Tamogasd a ZeroClaw-t
+## Tamogasd a QuantClaw-t
 
-Ha a ZeroClaw segiti a munkadat es tamogatni szeretned a folyamatos fejlesztest, itt adomanyozhatsz:
+Ha a QuantClaw segiti a munkadat es tamogatni szeretned a folyamatos fejlesztest, itt adomanyozhatsz:
 
 <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
 
@@ -677,7 +664,7 @@ Nyiltan epitunk, mert a legjobb otletek mindenhonnan jonnek. Ha ezt olvasod, a r
 
 ## Hozzajarulas
 
-Uj vagy a ZeroClaw-ban? Keresd a [`good first issue`](https://github.com/zeroclaw-labs/zeroclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) cimkevel ellatott issue-kat — lasd a [Hozzajarulasi utmutatot](CONTRIBUTING.md#first-time-contributors) a kezdeshez. AI/vibe-coded PR-ok szivesen latottak! 🤖
+Uj vagy a QuantClaw-ban? Keresd a [`good first issue`](https://github.com/quant-speed/quantclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) cimkevel ellatott issue-kat — lasd a [Hozzajarulasi utmutatot](CONTRIBUTING.md#first-time-contributors) a kezdeshez. AI/vibe-coded PR-ok szivesen latottak! 🤖
 
 Lasd [CONTRIBUTING.md](CONTRIBUTING.md) es [CLA.md](docs/contributing/cla.md). Implementalj egy trait-et, kuuldj be egy PR-t:
 
@@ -689,26 +676,26 @@ Lasd [CONTRIBUTING.md](CONTRIBUTING.md) es [CLA.md](docs/contributing/cla.md). I
 - Uj `Memory` → `src/memory/`
 - Uj `Tunnel` → `src/tunnel/`
 - Uj `Peripheral` → `src/peripherals/`
-- Uj `Skill` → `~/.zeroclaw/workspace/skills/<name>/`
+- Uj `Skill` → `~/.quantclaw/workspace/skills/<name>/`
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 <!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ Hivatalos tarolo es megszemelyesitesi figyelmeztetes
 
-**Ez az egyetlen hivatalos ZeroClaw tarolo:**
+**Ez az egyetlen hivatalos QuantClaw tarolo:**
 
-> https://github.com/zeroclaw-labs/zeroclaw
+> https://github.com/quant-speed/quantclaw
 
-Barmely mas tarolo, szervezet, domain vagy csomag, amely azt allitja, hogy "ZeroClaw" vagy kapcsolatot sugall a ZeroClaw Labs-szal, **jogosulatlan es nem all kapcsolatban ezzel a projekttel**. Az ismert jogosulatlan forkok a [TRADEMARK.md](docs/maintainers/trademark.md) fajlban lesznek felsorolva.
+Barmely mas tarolo, szervezet, domain vagy csomag, amely azt allitja, hogy "QuantClaw" vagy kapcsolatot sugall a QuantClaw Labs-szal, **jogosulatlan es nem all kapcsolatban ezzel a projekttel**. Az ismert jogosulatlan forkok a [TRADEMARK.md](docs/maintainers/trademark.md) fajlban lesznek felsorolva.
 
-Ha megszemelyesitessel vagy vedjeggyel valo visszaelessel talalkozol, kerlek [nyiss egy issue-t](https://github.com/zeroclaw-labs/zeroclaw/issues).
+Ha megszemelyesitessel vagy vedjeggyel valo visszaelessel talalkozol, kerlek [nyiss egy issue-t](https://github.com/quant-speed/quantclaw/issues).
 
 ---
 
 ## Licenc
 
-A ZeroClaw kettos licenccel rendelkezik a maximalis nyitottsag es hozzajaruloi vedelem erdekeben:
+A QuantClaw kettos licenccel rendelkezik a maximalis nyitottsag es hozzajaruloi vedelem erdekeben:
 
 | Licenc | Felhasznalasi eset |
 |---|---|
@@ -719,7 +706,7 @@ Barmely licencet valaszthatod. **A hozzajarulok automatikusan mindketto alatt jo
 
 ### Vedjegy
 
-A **ZeroClaw** nev es logo a ZeroClaw Labs vedjegyei. Ez a licenc nem ad engedelyt arra, hogy tamogatast vagy kapcsolatot sugalljanak. Lasd [TRADEMARK.md](docs/maintainers/trademark.md) a megengedett es tiltott hasznalati modokert.
+A **QuantClaw** nev es logo a QuantClaw Labs vedjegyei. Ez a licenc nem ad engedelyt arra, hogy tamogatast vagy kapcsolatot sugalljanak. Lasd [TRADEMARK.md](docs/maintainers/trademark.md) a megengedett es tiltott hasznalati modokert.
 
 ### Hozzajaruloi vedelmek
 
@@ -730,12 +717,12 @@ A **ZeroClaw** nev es logo a ZeroClaw Labs vedjegyei. Ez a licenc nem ad engedel
 
 ---
 
-**ZeroClaw** — Nulla terheles. Nulla kompromisszum. Telepites barhova. Csere barmire. 🦀
+**QuantClaw** — Nulla terheles. Nulla kompromisszum. Telepites barhova. Csere barmire. 🦀
 
 ## Hozzajarulok
 
-<a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=zeroclaw-labs/zeroclaw" alt="ZeroClaw contributors" />
+<a href="https://github.com/quant-speed/quantclaw/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=quant-speed/quantclaw" alt="QuantClaw contributors" />
 </a>
 
 Ez a lista a GitHub hozzajaruloi grafikonjabol keszul es automatikusan frissul.
@@ -743,11 +730,11 @@ Ez a lista a GitHub hozzajaruloi grafikonjabol keszul es automatikusan frissul.
 ## Csillag tortenelem
 
 <p align="center">
-  <a href="https://www.star-history.com/#zeroclaw-labs/zeroclaw&type=date&legend=top-left">
+  <a href="https://www.star-history.com/#quant-speed/quantclaw&type=date&legend=top-left">
     <picture>
-     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&theme=dark&legend=top-left" />
-     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
-     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
+     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=quant-speed/quantclaw&type=date&theme=dark&legend=top-left" />
+     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=quant-speed/quantclaw&type=date&legend=top-left" />
+     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=quant-speed/quantclaw&type=date&legend=top-left" />
     </picture>
   </a>
 </p>

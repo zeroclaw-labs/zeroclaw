@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::project_intel::*;
+pub use quantclaw_tools::project_intel::*;

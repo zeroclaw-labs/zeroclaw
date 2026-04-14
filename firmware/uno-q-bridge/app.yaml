@@ -1,5 +1,5 @@
-name: ZeroClaw Bridge
-description: "GPIO bridge for ZeroClaw — exposes digitalWrite/digitalRead via socket for agent control"
+name: QuantClaw Bridge
+description: "GPIO bridge for QuantClaw — exposes digitalWrite/digitalRead via socket for agent control"
 icon: 🦀
 version: "1.0.0"
 

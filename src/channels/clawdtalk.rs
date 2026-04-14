@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::clawdtalk::*;
+pub use quantclaw_channels::clawdtalk::*;

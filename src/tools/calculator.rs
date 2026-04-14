@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::calculator::*;
+pub use quantclaw_tools::calculator::*;

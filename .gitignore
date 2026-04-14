@@ -32,7 +32,7 @@ venv/
 *.pem
 credentials.json
 .worktrees/
-.zeroclaw/*
+.quantclaw/*
 
 # Skill eval workspaces (test outputs, transcripts, grading)
 .claude/skills/*-workspace/

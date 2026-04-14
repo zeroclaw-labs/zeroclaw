@@ -1,1 +1,1 @@
-pub use zeroclaw_config::workspace::*;
+pub use quantclaw_config::workspace::*;

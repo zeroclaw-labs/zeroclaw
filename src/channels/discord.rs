@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::discord::*;
+pub use quantclaw_channels::discord::*;

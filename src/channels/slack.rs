@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::slack::*;
+pub use quantclaw_channels::slack::*;

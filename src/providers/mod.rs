@@ -1,6 +1,6 @@
-//! Provider subsystem — re-exported from `zeroclaw-providers`.
+//! Provider subsystem — re-exported from `quantclaw-providers`.
 
-pub use zeroclaw_providers::*;
+pub use quantclaw_providers::*;
 
 // Keep traits.rs as a file module so its #[cfg(test)] block compiles.
 #[path = "traits.rs"]

@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::report_templates::*;
+pub use quantclaw_tools::report_templates::*;

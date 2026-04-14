@@ -85,7 +85,7 @@ Check the `size:*` label.
 Scan the diff for violations of `docs/contributing/pr-discipline.md`:
 - Real names, personal emails, phone numbers, addresses
 - Access tokens, API keys, credentials, private URLs
-- Test fixtures or examples using identity-specific language instead of project-scoped placeholders (`user_a`, `test_user`, `zeroclaw_user`, etc.)
+- Test fixtures or examples using identity-specific language instead of project-scoped placeholders (`user_a`, `test_user`, `quantclaw_user`, etc.)
 
 **IF** violations found → Comment with specific locations and required fixes. Do not proceed to deep review.
 
@@ -251,7 +251,7 @@ These rules codify reviewer failure modes observed in prior sessions. They are n
 
 - **Fires during:** §3.2, §3.7.
 - **Prevents:** Rename stubs that only fire on the happy path, leaving muscle-memory users with raw framework errors instead of a friendly "this command moved" message.
-- **Failure mode it addresses:** Reviewer verifies `zeroclaw props list` produces the deprecation error, concludes the stub works, and never tries `zeroclaw props get` (no positional) — missing that clap rejects with a raw arg-missing error before the handler can fire.
+- **Failure mode it addresses:** Reviewer verifies `quantclaw props list` produces the deprecation error, concludes the stub works, and never tries `quantclaw props get` (no positional) — missing that clap rejects with a raw arg-missing error before the handler can fire.
 
 **R5 — Grep locale files before flagging i18n parity gaps.** Before issuing a finding that a PR breaks locale parity, grep the relevant locale files in `docs/i18n/**` for the identifier or section being changed. If the identifier does not exist in that locale, the gap is pre-existing drift and is not this PR's responsibility.
 - **Fires during:** §3.6.

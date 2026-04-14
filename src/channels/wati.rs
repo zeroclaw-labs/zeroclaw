@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::wati::*;
+pub use quantclaw_channels::wati::*;

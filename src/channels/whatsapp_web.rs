@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::whatsapp_web::*;
+pub use quantclaw_channels::whatsapp_web::*;

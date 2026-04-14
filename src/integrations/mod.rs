@@ -1,5 +1,5 @@
 #[allow(unused_imports)]
-pub use zeroclaw_runtime::integrations::*;
+pub use quantclaw_runtime::integrations::*;
 
 use crate::config::Config;
 use anyhow::Result;

@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::linkedin::*;
+pub use quantclaw_tools::linkedin::*;

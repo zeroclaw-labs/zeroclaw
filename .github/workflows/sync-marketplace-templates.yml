@@ -34,7 +34,7 @@ jobs:
       - name: Checkout Coolify fork
         uses: actions/checkout@v4
         with:
-          repository: zeroclaw-labs/coolify
+          repository: quant-speed/coolify
           token: ${{ secrets.MARKETPLACE_PAT }}
           ref: next
           path: coolify
@@ -44,24 +44,24 @@ jobs:
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          cat > templates/compose/zeroclaw.yaml << 'TEMPLATE'
-          # documentation: https://github.com/zeroclaw-labs/zeroclaw
+          cat > templates/compose/quantclaw.yaml << 'TEMPLATE'
+          # documentation: https://github.com/quant-speed/quantclaw
           # slogan: Fast, small, fully autonomous AI personal assistant infrastructure — deploy anywhere, swap anything
           # tags: ai, agent, assistant, self-hosted, llm, chatbot, rust
-          # logo: svgs/zeroclaw.png
+          # logo: svgs/quantclaw.png
           # port: 42617
 
           services:
-            zeroclaw:
-              image: ghcr.io/zeroclaw-labs/zeroclaw:latest
+            quantclaw:
+              image: ghcr.io/quant-speed/quantclaw:latest
               restart: unless-stopped
               environment:
                 - API_KEY=${SERVICE_PASSWORD_APIKEY:-}
                 - PROVIDER=${PROVIDER:-openrouter}
-                - ZEROCLAW_ALLOW_PUBLIC_BIND=true
-                - ZEROCLAW_GATEWAY_PORT=42617
+                - QUANTCLAW_ALLOW_PUBLIC_BIND=true
+                - QUANTCLAW_GATEWAY_PORT=42617
               volumes:
-                - zeroclaw-data:/zeroclaw-data
+                - quantclaw-data:/quantclaw-data
               ports:
                 - "42617:42617"
               deploy:
@@ -73,22 +73,22 @@ jobs:
                     cpus: "0.5"
                     memory: 32M
               healthcheck:
-                test: ["CMD", "zeroclaw", "status", "--format=exit-code"]
+                test: ["CMD", "quantclaw", "status", "--format=exit-code"]
                 interval: 60s
                 timeout: 10s
                 retries: 3
                 start_period: 10s
 
           volumes:
-            zeroclaw-data:
+            quantclaw-data:
           TEMPLATE
 
       - name: Copy logo if missing
         working-directory: coolify
         run: |
-          if [ ! -f svgs/zeroclaw.png ]; then
-            curl -fsSL -o svgs/zeroclaw.png \
-              "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/.github/assets/zeroclaw-logo.png"
+          if [ ! -f svgs/quantclaw.png ]; then
+            curl -fsSL -o svgs/quantclaw.png \
+              "https://raw.githubusercontent.com/quant-speed/quantclaw/master/.github/assets/quantclaw-logo.png"
           fi
 
       - name: Create PR
@@ -97,35 +97,35 @@ jobs:
           GH_TOKEN: ${{ secrets.MARKETPLACE_PAT }}
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          BRANCH="zeroclaw/update-v${VERSION}"
+          BRANCH="quantclaw/update-v${VERSION}"
           git checkout -b "$BRANCH"
           git add -A
           git diff --cached --quiet && echo "No changes" && exit 0
 
-          git config user.name "ZeroClaw Bot"
-          git config user.email "bot@zeroclaw.com"
-          git commit -m "feat: add/update ZeroClaw service template (v${VERSION})"
+          git config user.name "QuantClaw Bot"
+          git config user.email "bot@quantclaw.com"
+          git commit -m "feat: add/update QuantClaw service template (v${VERSION})"
           git push -u origin "$BRANCH"
 
           gh pr create \
             --repo coollabsio/coolify \
             --base next \
-            --title "feat: add ZeroClaw service template (v${VERSION})" \
+            --title "feat: add QuantClaw service template (v${VERSION})" \
             --body "$(cat <<'EOF'
           ## Summary
-          - Adds/updates the ZeroClaw one-click service template
-          - Image: `ghcr.io/zeroclaw-labs/zeroclaw:latest`
-          - ZeroClaw is a fast, small, fully autonomous AI personal assistant (100% Rust)
+          - Adds/updates the QuantClaw one-click service template
+          - Image: `ghcr.io/quant-speed/quantclaw:latest`
+          - QuantClaw is a fast, small, fully autonomous AI personal assistant (100% Rust)
           - Multi-arch: linux/amd64 + linux/arm64
 
           ## Testing
           - Deployed via Docker Compose Empty option
-          - Health check passes: `zeroclaw status --format=exit-code`
+          - Health check passes: `quantclaw status --format=exit-code`
           - Gateway accessible on port 42617
 
           ## Links
-          - https://github.com/zeroclaw-labs/zeroclaw
-          - https://github.com/orgs/zeroclaw-labs/packages/container/package/zeroclaw
+          - https://github.com/quant-speed/quantclaw
+          - https://github.com/orgs/quant-speed/packages/container/package/quantclaw
           EOF
           )"
 
@@ -144,7 +144,7 @@ jobs:
       - name: Checkout Dokploy templates fork
         uses: actions/checkout@v4
         with:
-          repository: zeroclaw-labs/dokploy
+          repository: quant-speed/dokploy
           token: ${{ secrets.MARKETPLACE_PAT }}
           ref: main
           path: templates
@@ -154,30 +154,30 @@ jobs:
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          mkdir -p blueprints/zeroclaw
+          mkdir -p blueprints/quantclaw
 
           # docker-compose.yml — pin to exact version (Dokploy requirement)
-          cat > blueprints/zeroclaw/docker-compose.yml << COMPOSE
+          cat > blueprints/quantclaw/docker-compose.yml << COMPOSE
           version: "3.8"
           services:
-            zeroclaw:
-              image: ghcr.io/zeroclaw-labs/zeroclaw:${VERSION}
+            quantclaw:
+              image: ghcr.io/quant-speed/quantclaw:${VERSION}
               restart: unless-stopped
               environment:
                 - API_KEY=\${API_KEY}
                 - PROVIDER=\${PROVIDER:-openrouter}
-                - ZEROCLAW_ALLOW_PUBLIC_BIND=true
-                - ZEROCLAW_GATEWAY_PORT=42617
+                - QUANTCLAW_ALLOW_PUBLIC_BIND=true
+                - QUANTCLAW_GATEWAY_PORT=42617
               volumes:
-                - zeroclaw-data:/zeroclaw-data
+                - quantclaw-data:/quantclaw-data
               expose:
                 - 42617
           volumes:
-            zeroclaw-data: {}
+            quantclaw-data: {}
           COMPOSE
 
           # template.toml
-          cat > blueprints/zeroclaw/template.toml << 'TOML'
+          cat > blueprints/quantclaw/template.toml << 'TOML'
           [variables]
           main_domain = "${domain}"
           api_key = "${password:64}"
@@ -186,20 +186,20 @@ jobs:
           env = [
             "API_KEY=${api_key}",
             "PROVIDER=openrouter",
-            "ZEROCLAW_ALLOW_PUBLIC_BIND=true",
-            "ZEROCLAW_GATEWAY_PORT=42617"
+            "QUANTCLAW_ALLOW_PUBLIC_BIND=true",
+            "QUANTCLAW_GATEWAY_PORT=42617"
           ]
 
           [[config.domains]]
-          serviceName = "zeroclaw"
+          serviceName = "quantclaw"
           port = 42617
           host = "${main_domain}"
           TOML
 
           # Copy logo if missing
-          if [ ! -f blueprints/zeroclaw/zeroclaw.png ]; then
-            curl -fsSL -o blueprints/zeroclaw/zeroclaw.png \
-              "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/.github/assets/zeroclaw-logo.png"
+          if [ ! -f blueprints/quantclaw/quantclaw.png ]; then
+            curl -fsSL -o blueprints/quantclaw/quantclaw.png \
+              "https://raw.githubusercontent.com/quant-speed/quantclaw/master/.github/assets/quantclaw-logo.png"
           fi
 
       - name: Update meta.json
@@ -209,24 +209,24 @@ jobs:
         run: |
           ENTRY=$(cat <<JSON
           {
-            "id": "zeroclaw",
-            "name": "ZeroClaw",
+            "id": "quantclaw",
+            "name": "QuantClaw",
             "version": "${VERSION}",
             "description": "Fast, small, and fully autonomous AI personal assistant infrastructure. Deploy anywhere, swap anything. 100% Rust.",
-            "logo": "zeroclaw.png",
+            "logo": "quantclaw.png",
             "links": {
-              "github": "https://github.com/zeroclaw-labs/zeroclaw",
-              "website": "https://zeroclaw.com/",
-              "docs": "https://github.com/zeroclaw-labs/zeroclaw#readme"
+              "github": "https://github.com/quant-speed/quantclaw",
+              "website": "https://quantclaw.com/",
+              "docs": "https://github.com/quant-speed/quantclaw#readme"
             },
             "tags": ["ai", "self-hosted"]
           }
           JSON
           )
 
-          if jq -e '.[] | select(.id == "zeroclaw")' meta.json > /dev/null 2>&1; then
+          if jq -e '.[] | select(.id == "quantclaw")' meta.json > /dev/null 2>&1; then
             jq --argjson entry "$ENTRY" '
-              [.[] | if .id == "zeroclaw" then $entry else . end] | sort_by(.id)
+              [.[] | if .id == "quantclaw" then $entry else . end] | sort_by(.id)
             ' meta.json > meta.tmp && mv meta.tmp meta.json
           else
             jq --argjson entry "$ENTRY" '. + [$entry] | sort_by(.id)' meta.json > meta.tmp && mv meta.tmp meta.json
@@ -245,25 +245,25 @@ jobs:
           GH_TOKEN: ${{ secrets.MARKETPLACE_PAT }}
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          BRANCH="zeroclaw/update-v${VERSION}"
+          BRANCH="quantclaw/update-v${VERSION}"
           git checkout -b "$BRANCH"
           git add -A
           git diff --cached --quiet && echo "No changes" && exit 0
 
-          git config user.name "ZeroClaw Bot"
-          git config user.email "bot@zeroclaw.com"
-          git commit -m "feat: add/update ZeroClaw template (v${VERSION})"
+          git config user.name "QuantClaw Bot"
+          git config user.email "bot@quantclaw.com"
+          git commit -m "feat: add/update QuantClaw template (v${VERSION})"
           git push -u origin "$BRANCH"
 
           gh pr create \
             --repo Dokploy/templates \
             --base main \
-            --title "feat: add/update ZeroClaw template (v${VERSION})" \
+            --title "feat: add/update QuantClaw template (v${VERSION})" \
             --body "$(cat <<'EOF'
           ## Summary
-          - Adds/updates ZeroClaw template to v${VERSION}
-          - Image: `ghcr.io/zeroclaw-labs/zeroclaw:${VERSION}`
-          - ZeroClaw is a fast, small, fully autonomous AI personal assistant (100% Rust)
+          - Adds/updates QuantClaw template to v${VERSION}
+          - Image: `ghcr.io/quant-speed/quantclaw:${VERSION}`
+          - QuantClaw is a fast, small, fully autonomous AI personal assistant (100% Rust)
           - Multi-arch: linux/amd64 + linux/arm64
 
           ## Checklist
@@ -277,8 +277,8 @@ jobs:
           - Health check passes
 
           ## Links
-          - https://github.com/zeroclaw-labs/zeroclaw
-          - https://github.com/orgs/zeroclaw-labs/packages/container/package/zeroclaw
+          - https://github.com/quant-speed/quantclaw
+          - https://github.com/orgs/quant-speed/packages/container/package/quantclaw
           EOF
           )"
 
@@ -297,7 +297,7 @@ jobs:
       - name: Checkout EasyPanel templates fork
         uses: actions/checkout@v4
         with:
-          repository: zeroclaw-labs/easypanel
+          repository: quant-speed/easypanel
           token: ${{ secrets.MARKETPLACE_PAT }}
           ref: main
           path: easypanel
@@ -307,19 +307,19 @@ jobs:
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          mkdir -p templates/zeroclaw/assets
+          mkdir -p templates/quantclaw/assets
 
           # Copy logo if missing
-          if [ ! -f templates/zeroclaw/assets/logo.png ]; then
-            curl -fsSL -o templates/zeroclaw/assets/logo.png \
-              "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/.github/assets/zeroclaw-logo.png"
+          if [ ! -f templates/quantclaw/assets/logo.png ]; then
+            curl -fsSL -o templates/quantclaw/assets/logo.png \
+              "https://raw.githubusercontent.com/quant-speed/quantclaw/master/.github/assets/quantclaw-logo.png"
           fi
 
           # meta.yaml — update version and changelog
-          cat > templates/zeroclaw/meta.yaml << META
-          name: ZeroClaw
+          cat > templates/quantclaw/meta.yaml << META
+          name: QuantClaw
           description: |
-            ZeroClaw is a fast, small, and fully autonomous AI personal assistant
+            QuantClaw is a fast, small, and fully autonomous AI personal assistant
             infrastructure built in 100% Rust. Deploy anywhere, swap anything.
             Connect any LLM provider (OpenRouter, OpenAI, Anthropic, Ollama) and
             interact via a built-in web dashboard, REST API, or WebSocket gateway.
@@ -328,7 +328,7 @@ jobs:
             autonomous tool use.
 
           instructions: |
-            After deployment, access the ZeroClaw gateway at the assigned domain
+            After deployment, access the QuantClaw gateway at the assigned domain
             on port 42617. Set your LLM provider API key in the environment
             variables. The default provider is OpenRouter — get a key at
             https://openrouter.ai/keys. You can switch to OpenAI, Anthropic,
@@ -340,11 +340,11 @@ jobs:
 
           links:
             - label: Website
-              url: https://zeroclaw.com
+              url: https://quantclaw.com
             - label: Documentation
-              url: https://github.com/zeroclaw-labs/zeroclaw#readme
+              url: https://github.com/quant-speed/quantclaw#readme
             - label: Github
-              url: https://github.com/zeroclaw-labs/zeroclaw
+              url: https://github.com/quant-speed/quantclaw
 
           contributors:
             - name: theonlyhennygod
@@ -361,11 +361,11 @@ jobs:
               appServiceName:
                 type: string
                 title: App Service Name
-                default: zeroclaw
+                default: quantclaw
               appServiceImage:
                 type: string
                 title: App Service Image
-                default: ghcr.io/zeroclaw-labs/zeroclaw:${VERSION}
+                default: ghcr.io/quant-speed/quantclaw:${VERSION}
               apiKey:
                 type: string
                 title: LLM Provider API Key
@@ -420,7 +420,7 @@ jobs:
           META
 
           # index.ts — update default image version
-          cat > templates/zeroclaw/index.ts << 'TYPESCRIPT'
+          cat > templates/quantclaw/index.ts << 'TYPESCRIPT'
           import { Output, Services } from "~templates-utils";
           import { Input } from "./meta";
 
@@ -430,8 +430,8 @@ jobs:
             const appEnv = [
               `API_KEY=${input.apiKey}`,
               `PROVIDER=${input.provider}`,
-              `ZEROCLAW_ALLOW_PUBLIC_BIND=true`,
-              `ZEROCLAW_GATEWAY_PORT=42617`,
+              `QUANTCLAW_ALLOW_PUBLIC_BIND=true`,
+              `QUANTCLAW_GATEWAY_PORT=42617`,
             ];
 
             services.push({
@@ -453,7 +453,7 @@ jobs:
                   {
                     type: "volume",
                     name: "data",
-                    mountPath: "/zeroclaw-data",
+                    mountPath: "/quantclaw-data",
                   },
                 ],
               },
@@ -478,32 +478,32 @@ jobs:
           GH_TOKEN: ${{ secrets.MARKETPLACE_PAT }}
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          BRANCH="zeroclaw/update-v${VERSION}"
+          BRANCH="quantclaw/update-v${VERSION}"
           git checkout -b "$BRANCH"
           git add -A
           git diff --cached --quiet && echo "No changes" && exit 0
 
-          git config user.name "ZeroClaw Bot"
-          git config user.email "bot@zeroclaw.com"
-          git commit -m "feat: add/update ZeroClaw template (v${VERSION})"
+          git config user.name "QuantClaw Bot"
+          git config user.email "bot@quantclaw.com"
+          git commit -m "feat: add/update QuantClaw template (v${VERSION})"
           git push -u origin "$BRANCH"
 
           gh pr create \
             --repo easypanel-io/templates \
             --base main \
-            --title "feat: add/update ZeroClaw template (v${VERSION})" \
+            --title "feat: add/update QuantClaw template (v${VERSION})" \
             --body "$(cat <<'EOF'
           ## Summary
-          - Adds/updates ZeroClaw template to v${VERSION}
-          - Image: `ghcr.io/zeroclaw-labs/zeroclaw:${VERSION}`
-          - ZeroClaw is a fast, small, fully autonomous AI personal assistant (100% Rust)
+          - Adds/updates QuantClaw template to v${VERSION}
+          - Image: `ghcr.io/quant-speed/quantclaw:${VERSION}`
+          - QuantClaw is a fast, small, fully autonomous AI personal assistant (100% Rust)
           - Multi-arch: linux/amd64 + linux/arm64
 
           ## PR Checklist
           - [x] Logo: high quality PNG, square
           - [x] meta.yaml: static pinned version, all links, instructions included
           - [x] index.ts: no unused variables, no hardcoded secrets, volumes included
-          - [x] Uses official GHCR image from zeroclaw-labs org
+          - [x] Uses official GHCR image from quant-speed org
           - [x] Tested via templates playground
 
           ## Testing
@@ -512,7 +512,7 @@ jobs:
           - Health check passes
 
           ## Links
-          - https://github.com/zeroclaw-labs/zeroclaw
-          - https://github.com/orgs/zeroclaw-labs/packages/container/package/zeroclaw
+          - https://github.com/quant-speed/quantclaw
+          - https://github.com/orgs/quant-speed/packages/container/package/quantclaw
           EOF
           )"

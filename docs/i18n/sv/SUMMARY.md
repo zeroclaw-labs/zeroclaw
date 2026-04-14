@@ -1,4 +1,4 @@
-# ZeroClaw Dokumentationssammanfattning (Enhetlig Innehållsförteckning)
+# QuantClaw Dokumentationssammanfattning (Enhetlig Innehållsförteckning)
 
 Denna fil utgör den kanoniska innehållsförteckningen för dokumentationssystemet.
 

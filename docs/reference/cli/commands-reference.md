@@ -1,6 +1,6 @@
-# ZeroClaw Commands Reference
+# QuantClaw Commands Reference
 
-This reference is derived from the current CLI surface (`zeroclaw --help`).
+This reference is derived from the current CLI surface (`quantclaw --help`).
 
 Last verified: **March 26, 2026**.
 
@@ -33,13 +33,13 @@ Last verified: **March 26, 2026**.
 
 ### `onboard`
 
-- `zeroclaw onboard`
-- `zeroclaw onboard --channels-only`
-- `zeroclaw onboard --force`
-- `zeroclaw onboard --reinit`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
-- `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none> --force`
+- `quantclaw onboard`
+- `quantclaw onboard --channels-only`
+- `quantclaw onboard --force`
+- `quantclaw onboard --reinit`
+- `quantclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
+- `quantclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
+- `quantclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none> --force`
 
 `onboard` safety behavior:
 
@@ -47,15 +47,15 @@ Last verified: **March 26, 2026**.
   - Full onboarding (overwrite `config.toml`)
   - Provider-only update (update provider/model/API key while preserving existing channels, tunnel, memory, hooks, and other settings)
 - In non-interactive environments, existing `config.toml` causes a safe refusal unless `--force` is passed.
-- Use `zeroclaw onboard --channels-only` when you only need to rotate channel tokens/allowlists.
-- Use `zeroclaw onboard --reinit` to start fresh. This backs up your existing config directory with a timestamp suffix and creates a new configuration from scratch.
+- Use `quantclaw onboard --channels-only` when you only need to rotate channel tokens/allowlists.
+- Use `quantclaw onboard --reinit` to start fresh. This backs up your existing config directory with a timestamp suffix and creates a new configuration from scratch.
 
 ### `agent`
 
-- `zeroclaw agent`
-- `zeroclaw agent -m "Hello"`
-- `zeroclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
-- `zeroclaw agent --peripheral <board:path>`
+- `quantclaw agent`
+- `quantclaw agent -m "Hello"`
+- `quantclaw agent --provider <ID> --model <MODEL> --temperature <0.0-2.0>`
+- `quantclaw agent --peripheral <board:path>`
 
 Tip:
 
@@ -63,9 +63,9 @@ Tip:
 
 ### `acp`
 
-- `zeroclaw acp`
-- `zeroclaw acp --max-sessions <N>`
-- `zeroclaw acp --session-timeout <SECONDS>`
+- `quantclaw acp`
+- `quantclaw acp --max-sessions <N>`
+- `quantclaw acp --session-timeout <SECONDS>`
 
 Start the ACP (Agent Control Protocol) server for IDE and tool integration.
 
@@ -77,21 +77,21 @@ Start the ACP (Agent Control Protocol) server for IDE and tool integration.
 
 ### `gateway` / `daemon`
 
-- `zeroclaw gateway [--host <HOST>] [--port <PORT>]`
-- `zeroclaw daemon [--host <HOST>] [--port <PORT>]`
+- `quantclaw gateway [--host <HOST>] [--port <PORT>]`
+- `quantclaw daemon [--host <HOST>] [--port <PORT>]`
 
 ### `estop`
 
-- `zeroclaw estop` (engage `kill-all`)
-- `zeroclaw estop --level network-kill`
-- `zeroclaw estop --level domain-block --domain "*.chase.com" [--domain "*.paypal.com"]`
-- `zeroclaw estop --level tool-freeze --tool shell [--tool browser]`
-- `zeroclaw estop status`
-- `zeroclaw estop resume`
-- `zeroclaw estop resume --network`
-- `zeroclaw estop resume --domain "*.chase.com"`
-- `zeroclaw estop resume --tool shell`
-- `zeroclaw estop resume --otp <123456>`
+- `quantclaw estop` (engage `kill-all`)
+- `quantclaw estop --level network-kill`
+- `quantclaw estop --level domain-block --domain "*.chase.com" [--domain "*.paypal.com"]`
+- `quantclaw estop --level tool-freeze --tool shell [--tool browser]`
+- `quantclaw estop status`
+- `quantclaw estop resume`
+- `quantclaw estop resume --network`
+- `quantclaw estop resume --domain "*.chase.com"`
+- `quantclaw estop resume --tool shell`
+- `quantclaw estop resume --otp <123456>`
 
 Notes:
 
@@ -101,23 +101,23 @@ Notes:
 
 ### `service`
 
-- `zeroclaw service install`
-- `zeroclaw service start`
-- `zeroclaw service stop`
-- `zeroclaw service restart`
-- `zeroclaw service status`
-- `zeroclaw service uninstall`
+- `quantclaw service install`
+- `quantclaw service start`
+- `quantclaw service stop`
+- `quantclaw service restart`
+- `quantclaw service status`
+- `quantclaw service uninstall`
 
 ### `cron`
 
-- `zeroclaw cron list`
-- `zeroclaw cron add <expr> [--tz <IANA_TZ>] <command>`
-- `zeroclaw cron add-at <rfc3339_timestamp> <command>`
-- `zeroclaw cron add-every <every_ms> <command>`
-- `zeroclaw cron once <delay> <command>`
-- `zeroclaw cron remove <id>`
-- `zeroclaw cron pause <id>`
-- `zeroclaw cron resume <id>`
+- `quantclaw cron list`
+- `quantclaw cron add <expr> [--tz <IANA_TZ>] <command>`
+- `quantclaw cron add-at <rfc3339_timestamp> <command>`
+- `quantclaw cron add-every <every_ms> <command>`
+- `quantclaw cron once <delay> <command>`
+- `quantclaw cron remove <id>`
+- `quantclaw cron pause <id>`
+- `quantclaw cron resume <id>`
 
 Notes:
 
@@ -126,29 +126,29 @@ Notes:
 
 ### `models`
 
-- `zeroclaw models refresh`
-- `zeroclaw models refresh --provider <ID>`
-- `zeroclaw models refresh --force`
+- `quantclaw models refresh`
+- `quantclaw models refresh --provider <ID>`
+- `quantclaw models refresh --force`
 
 `models refresh` currently supports live catalog refresh for provider IDs: `openrouter`, `openai`, `anthropic`, `groq`, `mistral`, `deepseek`, `xai`, `together-ai`, `gemini`, `ollama`, `llamacpp`, `sglang`, `vllm`, `astrai`, `venice`, `fireworks`, `cohere`, `moonshot`, `glm`, `zai`, `qwen`, and `nvidia`.
 
 ### `doctor`
 
-- `zeroclaw doctor`
-- `zeroclaw doctor models [--provider <ID>] [--use-cache]`
-- `zeroclaw doctor traces [--limit <N>] [--event <TYPE>] [--contains <TEXT>]`
-- `zeroclaw doctor traces --id <TRACE_ID>`
+- `quantclaw doctor`
+- `quantclaw doctor models [--provider <ID>] [--use-cache]`
+- `quantclaw doctor traces [--limit <N>] [--event <TYPE>] [--contains <TEXT>]`
+- `quantclaw doctor traces --id <TRACE_ID>`
 
 `doctor traces` reads runtime tool/model diagnostics from `observability.runtime_trace_path`.
 
 ### `channel`
 
-- `zeroclaw channel list`
-- `zeroclaw channel start`
-- `zeroclaw channel doctor`
-- `zeroclaw channel bind-telegram <IDENTITY>`
-- `zeroclaw channel add <type> <json>`
-- `zeroclaw channel remove <name>`
+- `quantclaw channel list`
+- `quantclaw channel start`
+- `quantclaw channel doctor`
+- `quantclaw channel bind-telegram <IDENTITY>`
+- `quantclaw channel add <type> <json>`
+- `quantclaw channel remove <name>`
 
 Runtime in-chat commands (Telegram/Discord while channel server is running):
 
@@ -169,14 +169,14 @@ Channel runtime also watches `config.toml` and hot-applies updates to:
 
 ### `integrations`
 
-- `zeroclaw integrations info <name>`
+- `quantclaw integrations info <name>`
 
 ### `skills`
 
-- `zeroclaw skills list`
-- `zeroclaw skills audit <source_or_name>`
-- `zeroclaw skills install <source>`
-- `zeroclaw skills remove <name>`
+- `quantclaw skills list`
+- `quantclaw skills audit <source_or_name>`
+- `quantclaw skills install <source>`
+- `quantclaw skills remove <name>`
 
 `<source>` accepts git remotes (`https://...`, `http://...`, `ssh://...`, and `git@host:owner/repo.git`) or a local filesystem path.
 
@@ -192,20 +192,20 @@ Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injec
 
 ### `migrate`
 
-- `zeroclaw migrate openclaw [--source <path>] [--dry-run]`
+- `quantclaw migrate openclaw [--source <path>] [--dry-run]`
 
 ### `config`
 
-- `zeroclaw config list` — list all properties with current values
-- `zeroclaw config list --secrets` — list only secret (encrypted) fields
-- `zeroclaw config list --filter channels.matrix` — filter by path prefix
-- `zeroclaw config get <path>` — get a single property value (secrets show set/unset status)
-- `zeroclaw config set <path> <value>` — set a property value
-- `zeroclaw config set <path>` — secret fields prompt for masked input; enum fields offer interactive selection
-- `zeroclaw config set --no-interactive <path> <value>` — scripted mode, no prompts
-- `zeroclaw config init <section>` — create an unconfigured section with defaults (`enabled=false`)
-- `zeroclaw config init` — initialize all unconfigured sections
-- `zeroclaw config schema` — print JSON Schema (draft 2020-12) to stdout
+- `quantclaw config list` — list all properties with current values
+- `quantclaw config list --secrets` — list only secret (encrypted) fields
+- `quantclaw config list --filter channels.matrix` — filter by path prefix
+- `quantclaw config get <path>` — get a single property value (secrets show set/unset status)
+- `quantclaw config set <path> <value>` — set a property value
+- `quantclaw config set <path>` — secret fields prompt for masked input; enum fields offer interactive selection
+- `quantclaw config set --no-interactive <path> <value>` — scripted mode, no prompts
+- `quantclaw config init <section>` — create an unconfigured section with defaults (`enabled=false`)
+- `quantclaw config init` — initialize all unconfigured sections
+- `quantclaw config schema` — print JSON Schema (draft 2020-12) to stdout
 
 Secret fields (API keys, tokens, passwords) are automatically detected via `#[secret]`
 annotations. When setting a secret, input is masked regardless of whether a value is
@@ -214,35 +214,35 @@ provided on the command line.
 Enum fields (e.g. `stream-mode`, `search-mode`) offer interactive selection via arrow
 keys when the value is omitted. Provide the value directly to skip the prompt.
 
-Shell tab-completion for property paths is included in `zeroclaw completions <shell>`.
+Shell tab-completion for property paths is included in `quantclaw completions <shell>`.
 
 ### `completions`
 
-- `zeroclaw completions bash`
-- `zeroclaw completions fish`
-- `zeroclaw completions zsh`
-- `zeroclaw completions powershell`
-- `zeroclaw completions elvish`
+- `quantclaw completions bash`
+- `quantclaw completions fish`
+- `quantclaw completions zsh`
+- `quantclaw completions powershell`
+- `quantclaw completions elvish`
 
 `completions` is stdout-only by design so scripts can be sourced directly without log/warning contamination.
 
 ### `hardware`
 
-- `zeroclaw hardware discover`
-- `zeroclaw hardware introspect <path>`
-- `zeroclaw hardware info [--chip <chip_name>]`
+- `quantclaw hardware discover`
+- `quantclaw hardware introspect <path>`
+- `quantclaw hardware info [--chip <chip_name>]`
 
 ### `peripheral`
 
-- `zeroclaw peripheral list`
-- `zeroclaw peripheral add <board> <path>`
-- `zeroclaw peripheral flash [--port <serial_port>]`
-- `zeroclaw peripheral setup-uno-q [--host <ip_or_host>]`
-- `zeroclaw peripheral flash-nucleo`
+- `quantclaw peripheral list`
+- `quantclaw peripheral add <board> <path>`
+- `quantclaw peripheral flash [--port <serial_port>]`
+- `quantclaw peripheral setup-uno-q [--host <ip_or_host>]`
+- `quantclaw peripheral flash-nucleo`
 
 ### `props` (deprecated)
 
-`zeroclaw props` has been renamed to `zeroclaw config`. Replace `props` with `config` in your commands.
+`quantclaw props` has been renamed to `quantclaw config`. Replace `props` with `config` in your commands.
 
 #### Adding new config fields
 
@@ -255,6 +255,6 @@ New enum types require a one-line `HasPropKind` impl. See `CONTRIBUTING.md` for 
 To verify docs against your current binary quickly:
 
 ```bash
-zeroclaw --help
-zeroclaw <command> --help
+quantclaw --help
+quantclaw <command> --help
 ```

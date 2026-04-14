@@ -1,4 +1,4 @@
-# ZeroClaw i18n Docs Index
+# QuantClaw i18n Docs Index
 
 Localized documentation trees live here and under `docs/`.
 

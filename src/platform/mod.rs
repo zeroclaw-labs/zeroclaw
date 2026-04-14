@@ -1,4 +1,4 @@
-pub use zeroclaw_runtime::platform::*;
+pub use quantclaw_runtime::platform::*;
 
 #[cfg(test)]
 mod tests {

@@ -1,24 +1,12 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/docs/assets/zeroclaw-banner.png" alt="ZeroClaw" width="600" />
+  <img src="../../assets/quantclaw-banner.png" alt="QuantClaw" width="600" />
 </p>
 
-<h1 align="center">🦀 ZeroClaw — Personlig AI-assistent</h1>
+<h1 align="center">🦀 QuantClaw — Personlig AI-assistent</h1>
 
 <p align="center">
   <strong>Null overhead. Null kompromiss. 100% Rust. 100% Agnostisk.</strong><br>
   ⚡️ <strong>Kjorer pa $10 maskinvare med <5MB RAM: Det er 99% mindre minne enn OpenClaw og 98% billigere enn en Mac mini!</strong>
-</p>
-
-<p align="center">
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/actions/workflows/ci-run.yml"><img src="https://img.shields.io/github/actions/workflow/status/zeroclaw-labs/zeroclaw/ci-run.yml?branch=master&label=build" alt="Build Status" /></a>
-  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-edition%202024-orange?logo=rust" alt="Rust Edition 2024" /></a>
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/releases/latest"><img src="https://img.shields.io/badge/version-v0.6.9-blue" alt="Version v0.6.9" /></a>
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors"><img src="https://img.shields.io/github/contributors/zeroclaw-labs/zeroclaw?color=green" alt="Contributors" /></a>
-  <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
-  <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
-  <a href="https://discord.com/invite/wDshRVqRjx"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
-  <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
 </p>
 
 <p align="center">
@@ -60,21 +48,20 @@ Bygget av studenter og medlemmer av Harvard-, MIT- og Sundai.Club-miljoene.
   <a href="../nb/README.md">🇳🇴 Norsk</a>
 </p>
 
-ZeroClaw er en personlig AI-assistent du kjorer pa dine egne enheter. Den svarer deg pa kanalene du allerede bruker (WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Matrix, IRC, Email, Bluesky, Nostr, Mattermost, Nextcloud Talk, DingTalk, Lark, QQ, Reddit, LinkedIn, Twitter, MQTT, WeChat Work og flere). Den har et nettbasert dashbord for sanntidskontroll og kan kobles til maskinvareperiferiutstyr (ESP32, STM32, Arduino, Raspberry Pi). Gateway er bare kontrollplanet — produktet er assistenten.
+QuantClaw er en personlig AI-assistent du kjorer pa dine egne enheter. Den svarer deg pa kanalene du allerede bruker (WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Matrix, IRC, Email, Bluesky, Nostr, Mattermost, Nextcloud Talk, DingTalk, Lark, QQ, Reddit, LinkedIn, Twitter, MQTT, WeChat Work og flere). Den har et nettbasert dashbord for sanntidskontroll og kan kobles til maskinvareperiferiutstyr (ESP32, STM32, Arduino, Raspberry Pi). Gateway er bare kontrollplanet — produktet er assistenten.
 
 Hvis du onsker en personlig, enkeltbruker-assistent som foler seg lokal, rask og alltid tilgjengelig, er dette den.
 
 <p align="center">
-  <a href="https://zeroclawlabs.ai">Nettsted</a> ·
+  <a href="https://quantspeed.ai">Nettsted</a> ·
   <a href="docs/README.md">Dokumentasjon</a> ·
   <a href="docs/architecture.md">Arkitektur</a> ·
   <a href="#hurtigstart">Kom i gang</a> ·
   <a href="#migrering-fra-openclaw">Migrering fra OpenClaw</a> ·
   <a href="docs/ops/troubleshooting.md">Feilsoking</a> ·
-  <a href="https://discord.com/invite/wDshRVqRjx">Discord</a>
 </p>
 
-> **Anbefalt oppsett:** kjor `zeroclaw onboard` i terminalen din. ZeroClaw Onboard guider deg steg for steg gjennom oppsett av gateway, arbeidsomrade, kanaler og leverandor. Det er den anbefalte oppsettsveien og fungerer pa macOS, Linux og Windows (via WSL2). Ny installasjon? Start her: [Kom i gang](#hurtigstart)
+> **Anbefalt oppsett:** kjor `quantclaw onboard` i terminalen din. QuantClaw Onboard guider deg steg for steg gjennom oppsett av gateway, arbeidsomrade, kanaler og leverandor. Det er den anbefalte oppsettsveien og fungerer pa macOS, Linux og Windows (via WSL2). Ny installasjon? Start her: [Kom i gang](#hurtigstart)
 
 ### Abonnementsautentisering (OAuth)
 
@@ -94,18 +81,18 @@ Kjoretidemiljo: Rust stabil verktoyskjede. Enkel binarfil, ingen kjoretidesavhen
 ### Homebrew (macOS/Linuxbrew)
 
 ```bash
-brew install zeroclaw
+brew install quantclaw
 ```
 
 ### Ett-klikks oppstart
 
 ```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/quant-speed/quantclaw.git
+cd quantclaw
 ./install.sh
 ```
 
-`zeroclaw onboard` kjorer automatisk etter installasjon for a konfigurere arbeidsomradet og leverandoren din.
+`quantclaw onboard` kjorer automatisk etter installasjon for a konfigurere arbeidsomradet og leverandoren din.
 
 ## Hurtigstart (TL;DR)
 
@@ -116,67 +103,67 @@ Full nybegynnerguide (autentisering, paring, kanaler): [Kom i gang](docs/setup-g
 ./install.sh --api-key "sk-..." --provider openrouter
 
 # Start gateway (webhook-server + nettbasert dashbord)
-zeroclaw gateway                # standard: 127.0.0.1:42617
-zeroclaw gateway --port 0       # tilfeldig port (sikkerhetsskarmet)
+quantclaw gateway                # standard: 127.0.0.1:42617
+quantclaw gateway --port 0       # tilfeldig port (sikkerhetsskarmet)
 
 # Snakk med assistenten
-zeroclaw agent -m "Hello, ZeroClaw!"
+quantclaw agent -m "Hello, QuantClaw!"
 
 # Interaktiv modus
-zeroclaw agent
+quantclaw agent
 
 # Start full autonom kjoretidemiljo (gateway + kanaler + cron + hands)
-zeroclaw daemon
+quantclaw daemon
 
 # Sjekk status
-zeroclaw status
+quantclaw status
 
 # Kjor diagnostikk
-zeroclaw doctor
+quantclaw doctor
 ```
 
-Oppgraderer? Kjor `zeroclaw doctor` etter oppdatering.
+Oppgraderer? Kjor `quantclaw doctor` etter oppdatering.
 
 ### Fra kildekode (utvikling)
 
 ```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/quant-speed/quantclaw.git
+cd quantclaw
 
 cargo build --release --locked
 cargo install --path . --force --locked
 
-zeroclaw onboard
+quantclaw onboard
 ```
 
 > **Utvikler-fallback (ingen global installasjon):** prefiks kommandoer med `cargo run --release --` (eksempel: `cargo run --release -- status`).
 
 ## Migrering fra OpenClaw
 
-ZeroClaw kan importere ditt OpenClaw-arbeidsomrade, minne og konfigurasjon:
+QuantClaw kan importere ditt OpenClaw-arbeidsomrade, minne og konfigurasjon:
 
 ```bash
 # Forhandsvis hva som vil bli migrert (trygt, skrivebeskyttet)
-zeroclaw migrate openclaw --dry-run
+quantclaw migrate openclaw --dry-run
 
 # Kjor migreringen
-zeroclaw migrate openclaw
+quantclaw migrate openclaw
 ```
 
-Dette migrerer minneoppforinger, arbeidsomradefiler og konfigurasjon fra `~/.openclaw/` til `~/.zeroclaw/`. Konfigurasjon konverteres automatisk fra JSON til TOML.
+Dette migrerer minneoppforinger, arbeidsomradefiler og konfigurasjon fra `~/.openclaw/` til `~/.quantclaw/`. Konfigurasjon konverteres automatisk fra JSON til TOML.
 
 ## Sikkerhetsstandarder (DM-tilgang)
 
-ZeroClaw kobler til ekte meldingsflater. Behandle innkommende DM-er som upalitelig inndata.
+QuantClaw kobler til ekte meldingsflater. Behandle innkommende DM-er som upalitelig inndata.
 
 Full sikkerhetsguide: [SECURITY.md](SECURITY.md)
 
 Standardoppforsel pa alle kanaler:
 
 - **DM-paring** (standard): ukjente avsendere mottar en kort paringskode og boten behandler ikke meldingen deres.
-- Godkjenn med: `zeroclaw pairing approve <channel> <code>` (deretter legges avsenderen til en lokal tillatelesliste).
+- Godkjenn med: `quantclaw pairing approve <channel> <code>` (deretter legges avsenderen til en lokal tillatelesliste).
 - Offentlige innkommende DM-er krever en eksplisitt opt-in i `config.toml`.
-- Kjor `zeroclaw doctor` for a avdekke risikable eller feilkonfigurerte DM-policyer.
+- Kjor `quantclaw doctor` for a avdekke risikable eller feilkonfigurerte DM-policyer.
 
 **Autonominiva:**
 
@@ -197,7 +184,7 @@ Bruk denne tavlen for viktige meldinger (brytende endringer, sikkerhetsrad, vedl
 
 | Dato (UTC) | Niva | Merknad | Handling |
 | ---------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2026-02-19 | _Kritisk_ | Vi er **ikke tilknyttet** `openagen/zeroclaw`, `zeroclaw.org` eller `zeroclaw.net`. Domenene `zeroclaw.org` og `zeroclaw.net` peker for oyeblikket til `openagen/zeroclaw`-forken, og dette domenet/repositoriet utgir seg for a vaere vart offisielle nettsted/prosjekt. | Ikke stol pa informasjon, binarfiler, innsamlinger eller kunngoringer fra disse kildene. Bruk kun [dette repositoriet](https://github.com/zeroclaw-labs/zeroclaw) og vare verifiserte sosiale kontoer. |
+| 2026-02-19 | _Kritisk_ | Vi er **ikke tilknyttet** `openagen/quantclaw`, `quantclaw.org` eller `quantclaw.net`. Domenene `quantclaw.org` og `quantclaw.net` peker for oyeblikket til `openagen/quantclaw`-forken, og dette domenet/repositoriet utgir seg for a vaere vart offisielle nettsted/prosjekt. | Ikke stol pa informasjon, binarfiler, innsamlinger eller kunngoringer fra disse kildene. Bruk kun [dette repositoriet](https://github.com/quant-speed/quantclaw) og vare verifiserte sosiale kontoer. |
 | 2026-02-19 | _Viktig_ | Anthropic oppdaterte vilkarene for autentisering og legitimasjonsbruk 2026-02-19. Claude Code OAuth-tokens (Free, Pro, Max) er utelukkende ment for Claude Code og Claude.ai; bruk av OAuth-tokens fra Claude Free/Pro/Max i andre produkter, verktoy eller tjenester (inkludert Agent SDK) er ikke tillatt og kan bryte forbruksvilkarene. | Vennligst unnga Claude Code OAuth-integrasjoner midlertidig for a forhindre potensielt tap. Opprinnelig klausul: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use). |
 
 ## Hoydepunkter
@@ -217,18 +204,18 @@ Bruk denne tavlen for viktige meldinger (brytende endringer, sikkerhetsrad, vedl
 - **Ferdighetsplattform** — medfoldgende, fellesskaps- og arbeidsomrade-ferdigheter med sikkerhetsgransking.
 - **Tunnelstotte** — Cloudflare, Tailscale, ngrok, OpenVPN og egendefinerte tunneler for fjerntilgang.
 
-### Hvorfor team velger ZeroClaw
+### Hvorfor team velger QuantClaw
 
 - **Slank som standard:** liten Rust-binarfil, rask oppstart, lavt minneforbruk.
 - **Sikker fra grunnen:** paring, streng sandkassing, eksplisitte tillateleslister, arbeidsomradeomfang.
 - **Fullt byttbart:** kjernesystemer er traits (leverandorer, kanaler, verktoy, minne, tunneler).
 - **Ingen innlasing:** OpenAI-kompatibel leverandorstotte + pluggbare egendefinerte endepunkter.
 
-## Ytelsessammenligning (ZeroClaw vs OpenClaw, reproduserbar)
+## Ytelsessammenligning (QuantClaw vs OpenClaw, reproduserbar)
 
 Lokal maskin hurtigtest (macOS arm64, feb 2026) normalisert for 0.8GHz kantmaskinvare.
 
-|                           | OpenClaw      | NanoBot        | PicoClaw        | ZeroClaw 🦀          |
+|                           | OpenClaw      | NanoBot        | PicoClaw        | QuantClaw 🦀          |
 | ------------------------- | ------------- | -------------- | --------------- | -------------------- |
 | **Sprak**                 | TypeScript    | Python         | Go              | **Rust**             |
 | **RAM**                   | > 1GB         | > 100MB        | < 10MB          | **< 5MB**            |
@@ -236,20 +223,20 @@ Lokal maskin hurtigtest (macOS arm64, feb 2026) normalisert for 0.8GHz kantmaski
 | **Binarstorrelse**        | ~28MB (dist)  | N/A (Skript)   | ~8MB            | **~8.8 MB**          |
 | **Kostnad**               | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **Enhver maskinvare $10** |
 
-> Merknader: ZeroClaw-resultater er malt pa release-bygg med `/usr/bin/time -l`. OpenClaw krever Node.js-kjoretidemiljo (typisk ~390MB ekstra minneoverhead), mens NanoBot krever Python-kjoretidemiljo. PicoClaw og ZeroClaw er statiske binarfiler. RAM-tallene ovenfor er kjoretidesminne; byggetidskompileringskrav er hoyere.
+> Merknader: QuantClaw-resultater er malt pa release-bygg med `/usr/bin/time -l`. OpenClaw krever Node.js-kjoretidemiljo (typisk ~390MB ekstra minneoverhead), mens NanoBot krever Python-kjoretidemiljo. PicoClaw og QuantClaw er statiske binarfiler. RAM-tallene ovenfor er kjoretidesminne; byggetidskompileringskrav er hoyere.
 
 <p align="center">
-  <img src="docs/assets/zeroclaw-comparison.jpeg" alt="ZeroClaw vs OpenClaw-sammenligning" width="800" />
+  <img src="docs/assets/quantclaw-comparison.jpeg" alt="QuantClaw vs OpenClaw-sammenligning" width="800" />
 </p>
 
 ### Reproduserbar lokal maling
 
 ```bash
 cargo build --release
-ls -lh target/release/zeroclaw
+ls -lh target/release/quantclaw
 
-/usr/bin/time -l target/release/zeroclaw --help
-/usr/bin/time -l target/release/zeroclaw status
+/usr/bin/time -l target/release/quantclaw --help
+/usr/bin/time -l target/release/quantclaw status
 ```
 
 ## Alt vi har bygget sa langt
@@ -325,7 +312,7 @@ React 19 + Vite 6 + Tailwind CSS 4 nettbasert dashbord servert direkte fra Gatew
 
 ## Konfigurasjon
 
-Minimal `~/.zeroclaw/config.toml`:
+Minimal `~/.quantclaw/config.toml`:
 
 ```toml
 default_provider = "anthropic"
@@ -393,35 +380,35 @@ Sett `runtime.kind = "docker"` for streng sandkassing eller nettverksisolasjon.
 
 ## Abonnementsautentisering (OpenAI Codex / Claude Code / Gemini)
 
-ZeroClaw stotter abonnements-native autentiseringsprofiler (multi-konto, kryptert i hvile).
+QuantClaw stotter abonnements-native autentiseringsprofiler (multi-konto, kryptert i hvile).
 
-- Lagringsfil: `~/.zeroclaw/auth-profiles.json`
-- Krypteringsnokkel: `~/.zeroclaw/.secret_key`
+- Lagringsfil: `~/.quantclaw/auth-profiles.json`
+- Krypteringsnokkel: `~/.quantclaw/.secret_key`
 - Profil-ID-format: `<provider>:<profile_name>` (eksempel: `openai-codex:work`)
 
 ```bash
 # OpenAI Codex OAuth (ChatGPT-abonnement)
-zeroclaw auth login --provider openai-codex --device-code
+quantclaw auth login --provider openai-codex --device-code
 
 # Gemini OAuth
-zeroclaw auth login --provider gemini --profile default
+quantclaw auth login --provider gemini --profile default
 
 # Anthropic setup-token
-zeroclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
+quantclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
 
 # Sjekk / oppdater / bytt profil
-zeroclaw auth status
-zeroclaw auth refresh --provider openai-codex --profile default
-zeroclaw auth use --provider openai-codex --profile work
+quantclaw auth status
+quantclaw auth refresh --provider openai-codex --profile default
+quantclaw auth use --provider openai-codex --profile work
 
 # Kjor agenten med abonnementsautentisering
-zeroclaw agent --provider openai-codex -m "hello"
-zeroclaw agent --provider anthropic -m "hello"
+quantclaw agent --provider openai-codex -m "hello"
+quantclaw agent --provider anthropic -m "hello"
 ```
 
 ## Agentarbeidsomrade + ferdigheter
 
-Arbeidsomraderot: `~/.zeroclaw/workspace/` (konfigurerbar via konfigurasjon).
+Arbeidsomraderot: `~/.quantclaw/workspace/` (konfigurerbar via konfigurasjon).
 
 Injiserte prompt-filer:
 - `IDENTITY.md` — agentpersonlighet og rolle
@@ -430,74 +417,74 @@ Injiserte prompt-filer:
 - `AGENTS.md` — sesjonskonvensjoner og initialiseringsregler
 - `SOUL.md` — kjerneidentitet og driftsprinsipper
 
-Ferdigheter: `~/.zeroclaw/workspace/skills/<skill>/SKILL.md` eller `SKILL.toml`.
+Ferdigheter: `~/.quantclaw/workspace/skills/<skill>/SKILL.md` eller `SKILL.toml`.
 
 ```bash
 # List installerte ferdigheter
-zeroclaw skills list
+quantclaw skills list
 
 # Installer fra git
-zeroclaw skills install https://github.com/user/my-skill.git
+quantclaw skills install https://github.com/user/my-skill.git
 
 # Sikkerhetsgransking for installasjon
-zeroclaw skills audit https://github.com/user/my-skill.git
+quantclaw skills audit https://github.com/user/my-skill.git
 
 # Fjern en ferdighet
-zeroclaw skills remove my-skill
+quantclaw skills remove my-skill
 ```
 
 ## CLI-kommandoer
 
 ```bash
 # Arbeidsomradeadministrasjon
-zeroclaw onboard              # Veiledet oppsettveiviser
-zeroclaw status               # Vis daemon/agentstatus
-zeroclaw doctor               # Kjor systemdiagnostikk
+quantclaw onboard              # Veiledet oppsettveiviser
+quantclaw status               # Vis daemon/agentstatus
+quantclaw doctor               # Kjor systemdiagnostikk
 
 # Gateway + daemon
-zeroclaw gateway              # Start gateway-server (127.0.0.1:42617)
-zeroclaw daemon               # Start full autonom kjoretidemiljo
+quantclaw gateway              # Start gateway-server (127.0.0.1:42617)
+quantclaw daemon               # Start full autonom kjoretidemiljo
 
 # Agent
-zeroclaw agent                # Interaktiv chatmodus
-zeroclaw agent -m "melding"   # Enkeltmeldingsmodus
+quantclaw agent                # Interaktiv chatmodus
+quantclaw agent -m "melding"   # Enkeltmeldingsmodus
 
 # Tjenesteadministrasjon
-zeroclaw service install      # Installer som OS-tjeneste (launchd/systemd)
-zeroclaw service start|stop|restart|status
+quantclaw service install      # Installer som OS-tjeneste (launchd/systemd)
+quantclaw service start|stop|restart|status
 
 # Kanaler
-zeroclaw channel list         # List konfigurerte kanaler
-zeroclaw channel doctor       # Sjekk kanalhelse
-zeroclaw channel bind-telegram 123456789
+quantclaw channel list         # List konfigurerte kanaler
+quantclaw channel doctor       # Sjekk kanalhelse
+quantclaw channel bind-telegram 123456789
 
 # Cron + planlegging
-zeroclaw cron list            # List planlagte jobber
-zeroclaw cron add "*/5 * * * *" --prompt "Sjekk systemhelse"
-zeroclaw cron remove <id>
+quantclaw cron list            # List planlagte jobber
+quantclaw cron add "*/5 * * * *" --prompt "Sjekk systemhelse"
+quantclaw cron remove <id>
 
 # Minne
-zeroclaw memory list          # List minneoppforinger
-zeroclaw memory get <key>     # Hent et minne
-zeroclaw memory stats         # Minnestatistikk
+quantclaw memory list          # List minneoppforinger
+quantclaw memory get <key>     # Hent et minne
+quantclaw memory stats         # Minnestatistikk
 
 # Autentiseringsprofiler
-zeroclaw auth login --provider <navn>
-zeroclaw auth status
-zeroclaw auth use --provider <navn> --profile <profil>
+quantclaw auth login --provider <navn>
+quantclaw auth status
+quantclaw auth use --provider <navn> --profile <profil>
 
 # Maskinvareperiferiutstyr
-zeroclaw hardware discover    # Sok etter tilkoblede enheter
-zeroclaw peripheral list      # List tilkoblede periferienheter
-zeroclaw peripheral flash     # Flash firmware til enhet
+quantclaw hardware discover    # Sok etter tilkoblede enheter
+quantclaw peripheral list      # List tilkoblede periferienheter
+quantclaw peripheral flash     # Flash firmware til enhet
 
 # Migrering
-zeroclaw migrate openclaw --dry-run
-zeroclaw migrate openclaw
+quantclaw migrate openclaw --dry-run
+quantclaw migrate openclaw
 
 # Shell-fullforinger
-source <(zeroclaw completions bash)
-zeroclaw completions zsh > ~/.zfunc/_zeroclaw
+source <(quantclaw completions bash)
+quantclaw completions zsh > ~/.zfunc/_quantclaw
 ```
 
 Full kommandoreferanse: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
@@ -565,10 +552,10 @@ Full kommandoreferanse: [docs/reference/cli/commands-reference.md](docs/referenc
 
 #### En-linje installasjon
 
-Eller hopp over stegene ovenfor og installer alt (systemavhengigheter, Rust, ZeroClaw) med en enkelt kommando:
+Eller hopp over stegene ovenfor og installer alt (systemavhengigheter, Rust, QuantClaw) med en enkelt kommando:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+curl -LsSf https://raw.githubusercontent.com/quant-speed/quantclaw/master/install.sh | bash
 ```
 
 #### Kompileringsressurskrav
@@ -611,7 +598,7 @@ Utgivelsesfiler publiseres for:
 - Windows: `x86_64`
 
 Last ned de nyeste filene fra:
-<https://github.com/zeroclaw-labs/zeroclaw/releases/latest>
+<https://github.com/quant-speed/quantclaw/releases/latest>
 
 ## Dokumentasjon
 
@@ -621,7 +608,7 @@ Bruk disse nar du er forbi onboarding-flyten og onsker dypere referanse.
 - Les [arkitekturoversikten](docs/architecture.md) for den fullstendige systemmodellen.
 - Bruk [konfigurasjonsreferansen](docs/reference/api/config-reference.md) nar du trenger hver nokkel og eksempel.
 - Kjor Gateway etter boken med [driftshandboken](docs/ops/operations-runbook.md).
-- Folg [ZeroClaw Onboard](#hurtigstart) for et veiledet oppsett.
+- Folg [QuantClaw Onboard](#hurtigstart) for et veiledet oppsett.
 - Feilsok vanlige problemer med [feilsokingsguiden](docs/ops/troubleshooting.md).
 - Gjennga [sikkerhetsveiledning](docs/security/README.md) for du eksponerer noe.
 
@@ -653,14 +640,14 @@ Bruk disse nar du er forbi onboarding-flyten og onsker dypere referanse.
 
 ## Icy Crab 🦀
 
-ZeroClaw ble bygget for den smidige krabben 🦀, en rask og effektiv AI-assistent. Bygget av Argenis De La Rosa og fellesskapet.
+QuantClaw ble bygget for den smidige krabben 🦀, en rask og effektiv AI-assistent. Bygget av Argenis De La Rosa og fellesskapet.
 
-- [zeroclawlabs.ai](https://zeroclawlabs.ai)
-- [@zeroclawlabs](https://x.com/zeroclawlabs)
+- [quantspeed.ai](https://quantspeed.ai)
+- [@quantspeed](https://x.com/quantspeed)
 
-## Stott ZeroClaw
+## Stott QuantClaw
 
-Hvis ZeroClaw hjelper arbeidet ditt og du onsker a stotte pagaende utvikling, kan du donere her:
+Hvis QuantClaw hjelper arbeidet ditt og du onsker a stotte pagaende utvikling, kan du donere her:
 
 <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
 
@@ -677,7 +664,7 @@ Vi bygger i det apne fordi de beste ideene kommer fra overalt. Hvis du leser det
 
 ## Bidra
 
-Ny til ZeroClaw? Se etter issues merket [`good first issue`](https://github.com/zeroclaw-labs/zeroclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) — se var [Bidragsguide](CONTRIBUTING.md#first-time-contributors) for hvordan du kommer i gang. AI/vibe-kodede PR-er er velkomne! 🤖
+Ny til QuantClaw? Se etter issues merket [`good first issue`](https://github.com/quant-speed/quantclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) — se var [Bidragsguide](CONTRIBUTING.md#first-time-contributors) for hvordan du kommer i gang. AI/vibe-kodede PR-er er velkomne! 🤖
 
 Se [CONTRIBUTING.md](CONTRIBUTING.md) og [CLA.md](docs/contributing/cla.md). Implementer et trait, send inn en PR:
 
@@ -689,26 +676,26 @@ Se [CONTRIBUTING.md](CONTRIBUTING.md) og [CLA.md](docs/contributing/cla.md). Imp
 - Nytt `Memory` -> `src/memory/`
 - Ny `Tunnel` -> `src/tunnel/`
 - Ny `Peripheral` -> `src/peripherals/`
-- Ny `Skill` -> `~/.zeroclaw/workspace/skills/<name>/`
+- Ny `Skill` -> `~/.quantclaw/workspace/skills/<name>/`
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 <!-- END:RECENT_CONTRIBUTORS -->
 
 ## Offisielt repository og etterligningsadvarsel
 
-**Dette er det eneste offisielle ZeroClaw-repositoriet:**
+**Dette er det eneste offisielle QuantClaw-repositoriet:**
 
-> https://github.com/zeroclaw-labs/zeroclaw
+> https://github.com/quant-speed/quantclaw
 
-Ethvert annet repository, organisasjon, domene eller pakke som hevder a vaere "ZeroClaw" eller antyder tilknytning til ZeroClaw Labs er **uautorisert og ikke tilknyttet dette prosjektet**. Kjente uautoriserte forker vil bli listet i [TRADEMARK.md](docs/maintainers/trademark.md).
+Ethvert annet repository, organisasjon, domene eller pakke som hevder a vaere "QuantClaw" eller antyder tilknytning til QuantClaw Labs er **uautorisert og ikke tilknyttet dette prosjektet**. Kjente uautoriserte forker vil bli listet i [TRADEMARK.md](docs/maintainers/trademark.md).
 
-Hvis du stoter pa etterligning eller varemerkemisbruk, vennligst [opprett en issue](https://github.com/zeroclaw-labs/zeroclaw/issues).
+Hvis du stoter pa etterligning eller varemerkemisbruk, vennligst [opprett en issue](https://github.com/quant-speed/quantclaw/issues).
 
 ---
 
 ## Lisens
 
-ZeroClaw er dobbelt-lisensiert for maksimal apenhet og bidragsyterbeskyttelse:
+QuantClaw er dobbelt-lisensiert for maksimal apenhet og bidragsyterbeskyttelse:
 
 | Lisens | Bruksomrade |
 |---|---|
@@ -719,7 +706,7 @@ Du kan velge begge lisenser. **Bidragsytere gir automatisk rettigheter under beg
 
 ### Varemerke
 
-**ZeroClaw**-navnet og logoen er varemerker for ZeroClaw Labs. Denne lisensen gir ikke tillatelse til a bruke dem for a antyde stotte eller tilknytning. Se [TRADEMARK.md](docs/maintainers/trademark.md) for tillatt og forbudt bruk.
+**QuantClaw**-navnet og logoen er varemerker for QuantClaw Labs. Denne lisensen gir ikke tillatelse til a bruke dem for a antyde stotte eller tilknytning. Se [TRADEMARK.md](docs/maintainers/trademark.md) for tillatt og forbudt bruk.
 
 ### Bidragsyterbeskyttelse
 
@@ -730,12 +717,12 @@ Du kan velge begge lisenser. **Bidragsytere gir automatisk rettigheter under beg
 
 ---
 
-**ZeroClaw** — Null overhead. Null kompromiss. Distribuer overalt. Bytt hva som helst. 🦀
+**QuantClaw** — Null overhead. Null kompromiss. Distribuer overalt. Bytt hva som helst. 🦀
 
 ## Bidragsytere
 
-<a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=zeroclaw-labs/zeroclaw" alt="ZeroClaw-bidragsytere" />
+<a href="https://github.com/quant-speed/quantclaw/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=quant-speed/quantclaw" alt="QuantClaw-bidragsytere" />
 </a>
 
 Denne listen genereres fra GitHub-bidragsytergrafen og oppdateres automatisk.
@@ -743,11 +730,11 @@ Denne listen genereres fra GitHub-bidragsytergrafen og oppdateres automatisk.
 ## Stjernehistorikk
 
 <p align="center">
-  <a href="https://www.star-history.com/#zeroclaw-labs/zeroclaw&type=date&legend=top-left">
+  <a href="https://www.star-history.com/#quant-speed/quantclaw&type=date&legend=top-left">
     <picture>
-     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&theme=dark&legend=top-left" />
-     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
-     <img alt="Stjernehistorikk-diagram" src="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
+     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=quant-speed/quantclaw&type=date&theme=dark&legend=top-left" />
+     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=quant-speed/quantclaw&type=date&legend=top-left" />
+     <img alt="Stjernehistorikk-diagram" src="https://api.star-history.com/svg?repos=quant-speed/quantclaw&type=date&legend=top-left" />
     </picture>
   </a>
 </p>

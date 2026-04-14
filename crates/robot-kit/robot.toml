@@ -1,5 +1,5 @@
-# ZeroClaw Robot Kit Configuration
-# Copy to ~/.zeroclaw/robot.toml
+# QuantClaw Robot Kit Configuration
+# Copy to ~/.quantclaw/robot.toml
 
 # =============================================================================
 # DRIVE SYSTEM

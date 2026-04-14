@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::signal::*;
+pub use quantclaw_channels::signal::*;

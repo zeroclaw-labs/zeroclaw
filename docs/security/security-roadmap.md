@@ -1,4 +1,4 @@
-# ZeroClaw Security Improvement Roadmap
+# QuantClaw Security Improvement Roadmap
 
 > ⚠️ **Status: Proposal / Roadmap**
 >
@@ -7,7 +7,7 @@
 
 ## Current State: Strong Foundation
 
-ZeroClaw already has **excellent application-layer security**:
+QuantClaw already has **excellent application-layer security**:
 
 ✅ Command allowlist (not blocklist)
 ✅ Path traversal protection
@@ -29,9 +29,9 @@ ZeroClaw already has **excellent application-layer security**:
 
 ---
 
-## Comparison: ZeroClaw vs PicoClaw vs Production Grade
+## Comparison: QuantClaw vs PicoClaw vs Production Grade
 
-| Feature | PicoClaw | ZeroClaw Now | ZeroClaw + Roadmap | Production Target |
+| Feature | PicoClaw | QuantClaw Now | QuantClaw + Roadmap | Production Target |
 |---------|----------|--------------|-------------------|-------------------|
 | **Binary Size** | ~8MB | **3.4MB** ✅ | 3.5-4MB | < 5MB |
 | **RAM Usage** | < 10MB | **< 5MB** ✅ | < 10MB | < 20MB |
@@ -94,7 +94,7 @@ ZeroClaw already has **excellent application-layer security**:
 | Certificate pinning for channels | 2 days | Medium |
 | Signed config verification | 2 days | Medium |
 | SIEM-compatible audit export | 2 days | Medium |
-| Security self-test (`zeroclaw audit --check`) | 1 day | Low |
+| Security self-test (`quantclaw audit --check`) | 1 day | Low |
 
 **Deliverables**:
 - Optional Docker-based execution isolation
@@ -126,7 +126,7 @@ max_subprocesses = 10
 # Audit logging
 [security.audit]
 enabled = true
-log_path = "~/.config/zeroclaw/audit.log"
+log_path = "~/.config/quantclaw/audit.log"
 sign_events = true
 max_size_mb = 100
 
@@ -146,18 +146,18 @@ max_actions_per_hour = 20
 
 ```bash
 # Security status check
-zeroclaw security --check
+quantclaw security --check
 # → ✓ Sandbox: Firejail active
 # → ✓ Audit logging enabled (42 events today)
 # → → Resource limits: 512MB mem, 50% CPU
 
 # Audit log queries
-zeroclaw audit --user @alice --since 24h
-zeroclaw audit --risk high --violations-only
-zeroclaw audit --verify-signatures
+quantclaw audit --user @alice --since 24h
+quantclaw audit --risk high --violations-only
+quantclaw audit --verify-signatures
 
 # Sandbox test
-zeroclaw sandbox --test
+quantclaw sandbox --test
 # → Testing isolation...
 #   ✓ Cannot read /etc/passwd
 #   ✓ Cannot access ~/.ssh
@@ -168,18 +168,18 @@ zeroclaw sandbox --test
 
 ## Summary
 
-**ZeroClaw is already more secure than PicoClaw** with:
+**QuantClaw is already more secure than PicoClaw** with:
 - 50% smaller binary (3.4MB vs 8MB)
 - 50% less RAM (< 5MB vs < 10MB)
 - 100x faster startup (< 10ms vs < 1s)
 - Comprehensive security policy engine
 - Extensive test coverage
 
-**By implementing this roadmap**, ZeroClaw becomes:
+**By implementing this roadmap**, QuantClaw becomes:
 - Production-grade with OS-level sandboxing
 - Resource-aware with memory/CPU guards
 - Audit-ready with tamper-evident logging
 - Enterprise-ready with configurable security levels
 
 **Estimated effort**: 4-7 weeks for full implementation
-**Value**: Transforms ZeroClaw from "safe for testing" to "safe for production"
+**Value**: Transforms QuantClaw from "safe for testing" to "safe for production"

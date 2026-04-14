@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::proxy_config::*;
+pub use quantclaw_tools::proxy_config::*;

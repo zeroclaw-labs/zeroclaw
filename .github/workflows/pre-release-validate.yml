@@ -122,10 +122,10 @@ jobs:
           }
 
           echo "=== Downstream Repository Access ==="
-          check_repo_access "zeroclaw-labs/zeroclaw-website"
-          check_repo_access "zeroclaw-labs/dokploy"
-          check_repo_access "zeroclaw-labs/easypanel"
-          check_repo_access "zeroclaw-labs/coolify"
+          check_repo_access "quant-speed/quantclaw-website"
+          check_repo_access "quant-speed/dokploy"
+          check_repo_access "quant-speed/easypanel"
+          check_repo_access "quant-speed/coolify"
 
           echo ""
           echo "=== Homebrew Fork Access ==="

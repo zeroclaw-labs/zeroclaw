@@ -1,6 +1,6 @@
 # Cấu hình Provider Tùy chỉnh
 
-ZeroClaw hỗ trợ endpoint API tùy chỉnh cho cả provider tương thích OpenAI lẫn Anthropic.
+QuantClaw hỗ trợ endpoint API tùy chỉnh cho cả provider tương thích OpenAI lẫn Anthropic.
 
 ## Các loại Provider
 
@@ -28,7 +28,7 @@ default_model = "your-model-name"
 
 ### File Config
 
-Chỉnh sửa `~/.zeroclaw/config.toml`:
+Chỉnh sửa `~/.quantclaw/config.toml`:
 
 ```toml
 api_key = "your-api-key"
@@ -42,8 +42,8 @@ Với provider `custom:` và `anthropic-custom:`, dùng biến môi trường ch
 
 ```bash
 export API_KEY="your-api-key"
-# hoặc: export ZEROCLAW_API_KEY="your-api-key"
-zeroclaw agent
+# hoặc: export QUANTCLAW_API_KEY="your-api-key"
+quantclaw agent
 ```
 
 ## Kiểm tra cấu hình
@@ -52,10 +52,10 @@ Xác minh endpoint tùy chỉnh của bạn:
 
 ```bash
 # Chế độ tương tác
-zeroclaw agent
+quantclaw agent
 
 # Kiểm tra tin nhắn đơn
-zeroclaw agent -m "test message"
+quantclaw agent -m "test message"
 ```
 
 ## Xử lý sự cố

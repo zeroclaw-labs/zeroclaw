@@ -20,7 +20,7 @@ const DEFAULT_RECONNECT_DELAY = 1000;
 const MAX_RECONNECT_DELAY = 30000;
 
 /**
- * SSE client that connects to the ZeroClaw event stream.
+ * SSE client that connects to the QuantClaw event stream.
  *
  * Because the native EventSource API does not support custom headers, we use
  * the fetch API with a ReadableStream to consume the text/event-stream

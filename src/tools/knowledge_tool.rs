@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::knowledge_tool::*;
+pub use quantclaw_tools::knowledge_tool::*;

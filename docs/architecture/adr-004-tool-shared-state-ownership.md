@@ -4,11 +4,11 @@
 
 **Date:** 2026-03-22
 
-**Issue:** [#4057](https://github.com/zeroclaw/zeroclaw/issues/4057)
+**Issue:** [#4057](https://github.com/quantclaw/quantclaw/issues/4057)
 
 ## Context
 
-ZeroClaw tools execute in a multi-client environment where a single daemon
+QuantClaw tools execute in a multi-client environment where a single daemon
 process serves requests from multiple connected clients simultaneously. Several
 tools already maintain long-lived shared state:
 

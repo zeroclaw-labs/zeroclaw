@@ -1,24 +1,12 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/docs/assets/zeroclaw-banner.png" alt="ZeroClaw" width="600" />
+  <img src="../../assets/quantclaw-banner.png" alt="QuantClaw" width="600" />
 </p>
 
-<h1 align="center">🦀 ZeroClaw — Kişisel AI Asistanı</h1>
+<h1 align="center">🦀 QuantClaw — Kişisel AI Asistanı</h1>
 
 <p align="center">
   <strong>Sıfır ek yük. Sıfır uzlaşma. %100 Rust. %100 Agnostik.</strong><br>
   ⚡️ <strong>$10'lık donanımda <5MB RAM ile çalışır: OpenClaw'dan %99 daha az bellek ve Mac mini'den %98 daha ucuz!</strong>
-</p>
-
-<p align="center">
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/actions/workflows/ci-run.yml"><img src="https://img.shields.io/github/actions/workflow/status/zeroclaw-labs/zeroclaw/ci-run.yml?branch=master&label=build" alt="Build Status" /></a>
-  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-edition%202024-orange?logo=rust" alt="Rust Edition 2024" /></a>
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/releases/latest"><img src="https://img.shields.io/badge/version-v0.6.9-blue" alt="Version v0.6.9" /></a>
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors"><img src="https://img.shields.io/github/contributors/zeroclaw-labs/zeroclaw?color=green" alt="Contributors" /></a>
-  <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
-  <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
-  <a href="https://discord.com/invite/wDshRVqRjx"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
-  <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
 </p>
 
 <p align="center">
@@ -60,21 +48,20 @@ Harvard, MIT ve Sundai.Club topluluklarının öğrencileri ve üyeleri tarafın
   <a href="../nb/README.md">🇳🇴 Norsk</a>
 </p>
 
-ZeroClaw, kendi cihazlarınızda çalıştırdığınız kişisel bir AI asistanıdır. Zaten kullandığınız kanallarda size yanıt verir (WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Matrix, IRC, Email, Bluesky, Nostr, Mattermost, Nextcloud Talk, DingTalk, Lark, QQ, Reddit, LinkedIn, Twitter, MQTT, WeChat Work ve daha fazlası). Gerçek zamanlı kontrol için bir web paneli bulunur ve donanım çevre birimlerine bağlanabilir (ESP32, STM32, Arduino, Raspberry Pi). Gateway sadece kontrol düzlemidir — ürün asistanın kendisidir.
+QuantClaw, kendi cihazlarınızda çalıştırdığınız kişisel bir AI asistanıdır. Zaten kullandığınız kanallarda size yanıt verir (WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Matrix, IRC, Email, Bluesky, Nostr, Mattermost, Nextcloud Talk, DingTalk, Lark, QQ, Reddit, LinkedIn, Twitter, MQTT, WeChat Work ve daha fazlası). Gerçek zamanlı kontrol için bir web paneli bulunur ve donanım çevre birimlerine bağlanabilir (ESP32, STM32, Arduino, Raspberry Pi). Gateway sadece kontrol düzlemidir — ürün asistanın kendisidir.
 
 Yerel, hızlı ve her zaman açık hissettiren kişisel, tek kullanıcılı bir asistan istiyorsanız, işte bu.
 
 <p align="center">
-  <a href="https://zeroclawlabs.ai">Web sitesi</a> ·
+  <a href="https://quantspeed.ai">Web sitesi</a> ·
   <a href="docs/README.md">Belgeler</a> ·
   <a href="docs/architecture.md">Mimari</a> ·
   <a href="#hızlı-başlangıç">Başlarken</a> ·
   <a href="#openclawdan-geçiş">OpenClaw'dan Geçiş</a> ·
   <a href="docs/ops/troubleshooting.md">Sorun Giderme</a> ·
-  <a href="https://discord.com/invite/wDshRVqRjx">Discord</a>
 </p>
 
-> **Önerilen kurulum:** terminalinizde `zeroclaw onboard` komutunu çalıştırın. ZeroClaw Onboard, gateway, workspace, kanallar ve sağlayıcı kurulumunda sizi adım adım yönlendirir. Önerilen kurulum yoludur ve macOS, Linux ve Windows'ta (WSL2 ile) çalışır. Yeni kurulum mu? Buradan başlayın: [Başlarken](#hızlı-başlangıç)
+> **Önerilen kurulum:** terminalinizde `quantclaw onboard` komutunu çalıştırın. QuantClaw Onboard, gateway, workspace, kanallar ve sağlayıcı kurulumunda sizi adım adım yönlendirir. Önerilen kurulum yoludur ve macOS, Linux ve Windows'ta (WSL2 ile) çalışır. Yeni kurulum mu? Buradan başlayın: [Başlarken](#hızlı-başlangıç)
 
 ### Abonelik Kimlik Doğrulama (OAuth)
 
@@ -94,18 +81,18 @@ Yetkilendirme profili rotasyonu (OAuth vs API anahtarları) + failover: [Model f
 ### Homebrew (macOS/Linuxbrew)
 
 ```bash
-brew install zeroclaw
+brew install quantclaw
 ```
 
 ### Tek tıkla kurulum
 
 ```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/quant-speed/quantclaw.git
+cd quantclaw
 ./install.sh
 ```
 
-`zeroclaw onboard` kurulumdan sonra workspace ve sağlayıcınızı yapılandırmak için otomatik olarak çalışır.
+`quantclaw onboard` kurulumdan sonra workspace ve sağlayıcınızı yapılandırmak için otomatik olarak çalışır.
 
 ## Hızlı başlangıç (TL;DR)
 
@@ -116,67 +103,67 @@ Tam başlangıç kılavuzu (kimlik doğrulama, eşleştirme, kanallar): [Başlar
 ./install.sh --api-key "sk-..." --provider openrouter
 
 # Gateway'i başlatın (webhook sunucusu + web paneli)
-zeroclaw gateway                # varsayılan: 127.0.0.1:42617
-zeroclaw gateway --port 0       # rastgele port (güvenlik güçlendirilmiş)
+quantclaw gateway                # varsayılan: 127.0.0.1:42617
+quantclaw gateway --port 0       # rastgele port (güvenlik güçlendirilmiş)
 
 # Asistanla konuşun
-zeroclaw agent -m "Hello, ZeroClaw!"
+quantclaw agent -m "Hello, QuantClaw!"
 
 # Etkileşimli mod
-zeroclaw agent
+quantclaw agent
 
 # Tam otonom çalışma zamanını başlatın (gateway + kanallar + cron + hands)
-zeroclaw daemon
+quantclaw daemon
 
 # Durumu kontrol edin
-zeroclaw status
+quantclaw status
 
 # Tanılama çalıştırın
-zeroclaw doctor
+quantclaw doctor
 ```
 
-Güncelleme mi yapıyorsunuz? Güncellemeden sonra `zeroclaw doctor` çalıştırın.
+Güncelleme mi yapıyorsunuz? Güncellemeden sonra `quantclaw doctor` çalıştırın.
 
 ### Kaynaktan (geliştirme)
 
 ```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/quant-speed/quantclaw.git
+cd quantclaw
 
 cargo build --release --locked
 cargo install --path . --force --locked
 
-zeroclaw onboard
+quantclaw onboard
 ```
 
 > **Geliştirici fallback (global kurulum yok):** komutların başına `cargo run --release --` ekleyin (örnek: `cargo run --release -- status`).
 
 ## OpenClaw'dan Geçiş
 
-ZeroClaw, OpenClaw workspace'inizi, belleğinizi ve yapılandırmanızı içe aktarabilir:
+QuantClaw, OpenClaw workspace'inizi, belleğinizi ve yapılandırmanızı içe aktarabilir:
 
 ```bash
 # Nelerin taşınacağını önizleyin (güvenli, salt okunur)
-zeroclaw migrate openclaw --dry-run
+quantclaw migrate openclaw --dry-run
 
 # Geçişi çalıştırın
-zeroclaw migrate openclaw
+quantclaw migrate openclaw
 ```
 
-Bu, bellek girişlerinizi, workspace dosyalarınızı ve yapılandırmanızı `~/.openclaw/` dizininden `~/.zeroclaw/` dizinine taşır. Yapılandırma otomatik olarak JSON'dan TOML'a dönüştürülür.
+Bu, bellek girişlerinizi, workspace dosyalarınızı ve yapılandırmanızı `~/.openclaw/` dizininden `~/.quantclaw/` dizinine taşır. Yapılandırma otomatik olarak JSON'dan TOML'a dönüştürülür.
 
 ## Güvenlik varsayılanları (DM erişimi)
 
-ZeroClaw gerçek mesajlaşma platformlarına bağlanır. Gelen DM'leri güvenilmeyen girdi olarak değerlendirin.
+QuantClaw gerçek mesajlaşma platformlarına bağlanır. Gelen DM'leri güvenilmeyen girdi olarak değerlendirin.
 
 Tam güvenlik kılavuzu: [SECURITY.md](SECURITY.md)
 
 Tüm kanallarda varsayılan davranış:
 
 - **DM eşleştirme** (varsayılan): bilinmeyen gönderenler kısa bir eşleştirme kodu alır ve bot mesajlarını işlemez.
-- Şununla onaylayın: `zeroclaw pairing approve <channel> <code>` (ardından gönderen yerel izin listesine eklenir).
+- Şununla onaylayın: `quantclaw pairing approve <channel> <code>` (ardından gönderen yerel izin listesine eklenir).
 - Genel gelen DM'ler, `config.toml`'da açık bir opt-in gerektirir.
-- Riskli veya yanlış yapılandırılmış DM politikalarını tespit etmek için `zeroclaw doctor` çalıştırın.
+- Riskli veya yanlış yapılandırılmış DM politikalarını tespit etmek için `quantclaw doctor` çalıştırın.
 
 **Otonomi seviyeleri:**
 
@@ -197,7 +184,7 @@ Bu panoyu önemli bildirimler (breaking change'ler, güvenlik tavsiyeleri, bakı
 
 | Tarih (UTC) | Seviye       | Bildirim                                                                                                                                                                                                                                                                                                                                                 | Eylem                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | ---------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2026-02-19 | _Kritik_  | `openagen/zeroclaw`, `zeroclaw.org` veya `zeroclaw.net` ile **bağlantılı değiliz**. `zeroclaw.org` ve `zeroclaw.net` alan adları şu anda `openagen/zeroclaw` fork'una yönlendirmektedir ve bu alan adı/depo, resmi web sitemizi/projemizi taklit etmektedir.                                                                                       | Bu kaynaklardan gelen bilgilere, ikili dosyalara, bağış toplama faaliyetlerine veya duyurulara güvenmeyin. Yalnızca [bu depoyu](https://github.com/zeroclaw-labs/zeroclaw) ve doğrulanmış sosyal hesaplarımızı kullanın.                                                                                                                                                                                                                                                                                                                                                                       |
+| 2026-02-19 | _Kritik_  | `openagen/quantclaw`, `quantclaw.org` veya `quantclaw.net` ile **bağlantılı değiliz**. `quantclaw.org` ve `quantclaw.net` alan adları şu anda `openagen/quantclaw` fork'una yönlendirmektedir ve bu alan adı/depo, resmi web sitemizi/projemizi taklit etmektedir.                                                                                       | Bu kaynaklardan gelen bilgilere, ikili dosyalara, bağış toplama faaliyetlerine veya duyurulara güvenmeyin. Yalnızca [bu depoyu](https://github.com/quant-speed/quantclaw) ve doğrulanmış sosyal hesaplarımızı kullanın.                                                                                                                                                                                                                                                                                                                                                                       |
 | 2026-02-19 | _Önemli_ | Anthropic, Kimlik Doğrulama ve Kimlik Bilgisi Kullanımı koşullarını 2026-02-19'da güncelledi. Claude Code OAuth token'ları (Free, Pro, Max) yalnızca Claude Code ve Claude.ai için tasarlanmıştır; Claude Free/Pro/Max'tan OAuth token'larını başka herhangi bir üründe, araçta veya hizmette (Agent SDK dahil) kullanmak izin verilmez ve Tüketici Hizmet Koşullarını ihlal edebilir. | Olası kayıpları önlemek için lütfen Claude Code OAuth entegrasyonlarından geçici olarak kaçının. Orijinal madde: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).                                                                                                                                                                                                                                                                                                                                                    |
 
 ## Öne Çıkanlar
@@ -217,18 +204,18 @@ Bu panoyu önemli bildirimler (breaking change'ler, güvenlik tavsiyeleri, bakı
 - **Yetenek platformu** — güvenlik denetimi ile yerleşik, topluluk ve workspace yetenekleri.
 - **Tünel desteği** — uzaktan erişim için Cloudflare, Tailscale, ngrok, OpenVPN ve özel tüneller.
 
-### Ekipler neden ZeroClaw'u tercih ediyor
+### Ekipler neden QuantClaw'u tercih ediyor
 
 - **Varsayılan olarak hafif:** küçük Rust ikili dosyası, hızlı başlatma, düşük bellek ayak izi.
 - **Tasarımdan güvenli:** eşleştirme, sıkı sandboxing, açık izin listeleri, workspace kapsamlandırma.
 - **Tamamen değiştirilebilir:** temel sistemler trait'lerdir (sağlayıcılar, kanallar, araçlar, bellek, tüneller).
 - **Satıcı bağımlılığı yok:** OpenAI uyumlu sağlayıcı desteği + takılabilir özel endpoint'ler.
 
-## Benchmark Özeti (ZeroClaw vs OpenClaw, Tekrarlanabilir)
+## Benchmark Özeti (QuantClaw vs OpenClaw, Tekrarlanabilir)
 
 Yerel makine hızlı benchmark'ı (macOS arm64, Şubat 2026) 0.8GHz edge donanımı için normalleştirilmiş.
 
-|                           | OpenClaw      | NanoBot        | PicoClaw        | ZeroClaw 🦀          |
+|                           | OpenClaw      | NanoBot        | PicoClaw        | QuantClaw 🦀          |
 | ------------------------- | ------------- | -------------- | --------------- | -------------------- |
 | **Dil**                   | TypeScript    | Python         | Go              | **Rust**             |
 | **RAM**                   | > 1GB         | > 100MB        | < 10MB          | **< 5MB**            |
@@ -236,20 +223,20 @@ Yerel makine hızlı benchmark'ı (macOS arm64, Şubat 2026) 0.8GHz edge donanı
 | **İkili Boyut**           | ~28MB (dist)  | N/A (Script'ler) | ~8MB          | **~8.8 MB**          |
 | **Maliyet**               | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **Herhangi bir donanım $10** |
 
-> Notlar: ZeroClaw sonuçları, `/usr/bin/time -l` kullanılarak release derlemelerinde ölçülmüştür. OpenClaw, Node.js çalışma zamanı gerektirir (tipik olarak ~390MB ek bellek yükü), NanoBot ise Python çalışma zamanı gerektirir. PicoClaw ve ZeroClaw statik ikili dosyalardır. Yukarıdaki RAM rakamları çalışma zamanı belleğidir; derleme gereksinimleri daha yüksektir.
+> Notlar: QuantClaw sonuçları, `/usr/bin/time -l` kullanılarak release derlemelerinde ölçülmüştür. OpenClaw, Node.js çalışma zamanı gerektirir (tipik olarak ~390MB ek bellek yükü), NanoBot ise Python çalışma zamanı gerektirir. PicoClaw ve QuantClaw statik ikili dosyalardır. Yukarıdaki RAM rakamları çalışma zamanı belleğidir; derleme gereksinimleri daha yüksektir.
 
 <p align="center">
-  <img src="docs/assets/zeroclaw-comparison.jpeg" alt="ZeroClaw vs OpenClaw Comparison" width="800" />
+  <img src="docs/assets/quantclaw-comparison.jpeg" alt="QuantClaw vs OpenClaw Comparison" width="800" />
 </p>
 
 ### Tekrarlanabilir yerel ölçüm
 
 ```bash
 cargo build --release
-ls -lh target/release/zeroclaw
+ls -lh target/release/quantclaw
 
-/usr/bin/time -l target/release/zeroclaw --help
-/usr/bin/time -l target/release/zeroclaw status
+/usr/bin/time -l target/release/quantclaw --help
+/usr/bin/time -l target/release/quantclaw status
 ```
 
 ## Şimdiye kadar inşa ettiğimiz her şey
@@ -325,7 +312,7 @@ Gateway'den doğrudan sunulan React 19 + Vite 6 + Tailwind CSS 4 web paneli:
 
 ## Yapılandırma
 
-Minimal `~/.zeroclaw/config.toml`:
+Minimal `~/.quantclaw/config.toml`:
 
 ```toml
 default_provider = "anthropic"
@@ -393,35 +380,35 @@ Sıkı sandboxing veya ağ izolasyonu için `runtime.kind = "docker"` ayarlayın
 
 ## Abonelik Kimlik Doğrulama (OpenAI Codex / Claude Code / Gemini)
 
-ZeroClaw, yerel abonelik yetkilendirme profillerini destekler (çoklu hesap, durağan halde şifreli).
+QuantClaw, yerel abonelik yetkilendirme profillerini destekler (çoklu hesap, durağan halde şifreli).
 
-- Depolama dosyası: `~/.zeroclaw/auth-profiles.json`
-- Şifreleme anahtarı: `~/.zeroclaw/.secret_key`
+- Depolama dosyası: `~/.quantclaw/auth-profiles.json`
+- Şifreleme anahtarı: `~/.quantclaw/.secret_key`
 - Profil ID formatı: `<provider>:<profile_name>` (örnek: `openai-codex:work`)
 
 ```bash
 # OpenAI Codex OAuth (ChatGPT aboneliği)
-zeroclaw auth login --provider openai-codex --device-code
+quantclaw auth login --provider openai-codex --device-code
 
 # Gemini OAuth
-zeroclaw auth login --provider gemini --profile default
+quantclaw auth login --provider gemini --profile default
 
 # Anthropic setup-token
-zeroclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
+quantclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
 
 # Kontrol / yenileme / profil değiştirme
-zeroclaw auth status
-zeroclaw auth refresh --provider openai-codex --profile default
-zeroclaw auth use --provider openai-codex --profile work
+quantclaw auth status
+quantclaw auth refresh --provider openai-codex --profile default
+quantclaw auth use --provider openai-codex --profile work
 
 # Ajanı abonelik auth ile çalıştırma
-zeroclaw agent --provider openai-codex -m "hello"
-zeroclaw agent --provider anthropic -m "hello"
+quantclaw agent --provider openai-codex -m "hello"
+quantclaw agent --provider anthropic -m "hello"
 ```
 
 ## Ajan workspace + yetenekler
 
-Workspace kök dizini: `~/.zeroclaw/workspace/` (config ile yapılandırılabilir).
+Workspace kök dizini: `~/.quantclaw/workspace/` (config ile yapılandırılabilir).
 
 Enjekte edilen prompt dosyaları:
 - `IDENTITY.md` — ajan kişiliği ve rolü
@@ -430,74 +417,74 @@ Enjekte edilen prompt dosyaları:
 - `AGENTS.md` — oturum kuralları ve başlatma kuralları
 - `SOUL.md` — temel kimlik ve çalışma prensipleri
 
-Yetenekler: `~/.zeroclaw/workspace/skills/<skill>/SKILL.md` veya `SKILL.toml`.
+Yetenekler: `~/.quantclaw/workspace/skills/<skill>/SKILL.md` veya `SKILL.toml`.
 
 ```bash
 # Yüklü yetenekleri listele
-zeroclaw skills list
+quantclaw skills list
 
 # Git'ten yükle
-zeroclaw skills install https://github.com/user/my-skill.git
+quantclaw skills install https://github.com/user/my-skill.git
 
 # Yüklemeden önce güvenlik denetimi
-zeroclaw skills audit https://github.com/user/my-skill.git
+quantclaw skills audit https://github.com/user/my-skill.git
 
 # Bir yeteneği kaldır
-zeroclaw skills remove my-skill
+quantclaw skills remove my-skill
 ```
 
 ## CLI komutları
 
 ```bash
 # Workspace yönetimi
-zeroclaw onboard              # Rehberli kurulum sihirbazı
-zeroclaw status               # Daemon/ajan durumunu göster
-zeroclaw doctor               # Sistem tanılaması çalıştır
+quantclaw onboard              # Rehberli kurulum sihirbazı
+quantclaw status               # Daemon/ajan durumunu göster
+quantclaw doctor               # Sistem tanılaması çalıştır
 
 # Gateway + daemon
-zeroclaw gateway              # Gateway sunucusunu başlat (127.0.0.1:42617)
-zeroclaw daemon               # Tam otonom çalışma zamanını başlat
+quantclaw gateway              # Gateway sunucusunu başlat (127.0.0.1:42617)
+quantclaw daemon               # Tam otonom çalışma zamanını başlat
 
 # Ajan
-zeroclaw agent                # Etkileşimli sohbet modu
-zeroclaw agent -m "message"   # Tek mesaj modu
+quantclaw agent                # Etkileşimli sohbet modu
+quantclaw agent -m "message"   # Tek mesaj modu
 
 # Hizmet yönetimi
-zeroclaw service install      # OS hizmeti olarak yükle (launchd/systemd)
-zeroclaw service start|stop|restart|status
+quantclaw service install      # OS hizmeti olarak yükle (launchd/systemd)
+quantclaw service start|stop|restart|status
 
 # Kanallar
-zeroclaw channel list         # Yapılandırılmış kanalları listele
-zeroclaw channel doctor       # Kanal sağlığını kontrol et
-zeroclaw channel bind-telegram 123456789
+quantclaw channel list         # Yapılandırılmış kanalları listele
+quantclaw channel doctor       # Kanal sağlığını kontrol et
+quantclaw channel bind-telegram 123456789
 
 # Cron + zamanlama
-zeroclaw cron list            # Zamanlanmış görevleri listele
-zeroclaw cron add "*/5 * * * *" --prompt "Check system health"
-zeroclaw cron remove <id>
+quantclaw cron list            # Zamanlanmış görevleri listele
+quantclaw cron add "*/5 * * * *" --prompt "Check system health"
+quantclaw cron remove <id>
 
 # Bellek
-zeroclaw memory list          # Bellek girişlerini listele
-zeroclaw memory get <key>     # Bir bellek al
-zeroclaw memory stats         # Bellek istatistikleri
+quantclaw memory list          # Bellek girişlerini listele
+quantclaw memory get <key>     # Bir bellek al
+quantclaw memory stats         # Bellek istatistikleri
 
 # Yetkilendirme profilleri
-zeroclaw auth login --provider <name>
-zeroclaw auth status
-zeroclaw auth use --provider <name> --profile <profile>
+quantclaw auth login --provider <name>
+quantclaw auth status
+quantclaw auth use --provider <name> --profile <profile>
 
 # Donanım çevre birimleri
-zeroclaw hardware discover    # Bağlı cihazları tara
-zeroclaw peripheral list      # Bağlı çevre birimlerini listele
-zeroclaw peripheral flash     # Cihaza firmware yükle
+quantclaw hardware discover    # Bağlı cihazları tara
+quantclaw peripheral list      # Bağlı çevre birimlerini listele
+quantclaw peripheral flash     # Cihaza firmware yükle
 
 # Geçiş
-zeroclaw migrate openclaw --dry-run
-zeroclaw migrate openclaw
+quantclaw migrate openclaw --dry-run
+quantclaw migrate openclaw
 
 # Kabuk tamamlama
-source <(zeroclaw completions bash)
-zeroclaw completions zsh > ~/.zfunc/_zeroclaw
+source <(quantclaw completions bash)
+quantclaw completions zsh > ~/.zfunc/_quantclaw
 ```
 
 Tam komut referansı: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
@@ -565,10 +552,10 @@ Tam komut referansı: [docs/reference/cli/commands-reference.md](docs/reference/
 
 #### Tek satır yükleyici
 
-Veya yukarıdaki adımları atlayın ve her şeyi (sistem bağımlılıkları, Rust, ZeroClaw) tek komutla yükleyin:
+Veya yukarıdaki adımları atlayın ve her şeyi (sistem bağımlılıkları, Rust, QuantClaw) tek komutla yükleyin:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+curl -LsSf https://raw.githubusercontent.com/quant-speed/quantclaw/master/install.sh | bash
 ```
 
 #### Derleme kaynak gereksinimleri
@@ -611,7 +598,7 @@ Sürüm varlıkları şunlar için yayınlanır:
 - Windows: `x86_64`
 
 En son varlıkları şuradan indirin:
-<https://github.com/zeroclaw-labs/zeroclaw/releases/latest>
+<https://github.com/quant-speed/quantclaw/releases/latest>
 
 ## Belgeler
 
@@ -621,7 +608,7 @@ Onboarding akışını geçtikten sonra daha derin referans istediğinizde bunla
 - Tam sistem modeli için [mimari genel bakış](docs/architecture.md) okuyun.
 - Her anahtar ve örneğe ihtiyacınız olduğunda [yapılandırma referansı](docs/reference/api/config-reference.md) kullanın.
 - [İşletim el kitabı](docs/ops/operations-runbook.md) ile Gateway'i kitabına göre çalıştırın.
-- Rehberli kurulum için [ZeroClaw Onboard](#hızlı-başlangıç) takip edin.
+- Rehberli kurulum için [QuantClaw Onboard](#hızlı-başlangıç) takip edin.
 - Yaygın hataları [sorun giderme kılavuzu](docs/ops/troubleshooting.md) ile ayıklayın.
 - Herhangi bir şeyi açığa çıkarmadan önce [güvenlik rehberliği](docs/security/README.md) gözden geçirin.
 
@@ -653,14 +640,14 @@ Onboarding akışını geçtikten sonra daha derin referans istediğinizde bunla
 
 ## Icy Crab 🦀
 
-ZeroClaw, smooth crab 🦀 için inşa edildi — hızlı ve verimli bir AI asistanı. Argenis De La Rosa ve topluluk tarafından geliştirildi.
+QuantClaw, smooth crab 🦀 için inşa edildi — hızlı ve verimli bir AI asistanı. Argenis De La Rosa ve topluluk tarafından geliştirildi.
 
-- [zeroclawlabs.ai](https://zeroclawlabs.ai)
-- [@zeroclawlabs](https://x.com/zeroclawlabs)
+- [quantspeed.ai](https://quantspeed.ai)
+- [@quantspeed](https://x.com/quantspeed)
 
-## ZeroClaw'u Destekleyin
+## QuantClaw'u Destekleyin
 
-ZeroClaw işinize yarıyorsa ve süregelen geliştirmeyi desteklemek istiyorsanız, buradan bağış yapabilirsiniz:
+QuantClaw işinize yarıyorsa ve süregelen geliştirmeyi desteklemek istiyorsanız, buradan bağış yapabilirsiniz:
 
 <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
 
@@ -677,7 +664,7 @@ En iyi fikirler her yerden geldiği için açıkta inşa ediyoruz. Bunu okuyorsa
 
 ## Katkıda Bulunma
 
-ZeroClaw'da yeni misiniz? [`good first issue`](https://github.com/zeroclaw-labs/zeroclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) etiketli issue'ları arayın — nasıl başlayacağınızı öğrenmek için [Katkıda Bulunma Rehberi](CONTRIBUTING.md#first-time-contributors)mize bakın. AI/vibe-coded PR'lar hoş geldiniz! 🤖
+QuantClaw'da yeni misiniz? [`good first issue`](https://github.com/quant-speed/quantclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) etiketli issue'ları arayın — nasıl başlayacağınızı öğrenmek için [Katkıda Bulunma Rehberi](CONTRIBUTING.md#first-time-contributors)mize bakın. AI/vibe-coded PR'lar hoş geldiniz! 🤖
 
 [CONTRIBUTING.md](CONTRIBUTING.md) ve [CLA.md](docs/contributing/cla.md)'ye bakın. Bir trait uygulayın, PR gönderin:
 
@@ -689,26 +676,26 @@ ZeroClaw'da yeni misiniz? [`good first issue`](https://github.com/zeroclaw-labs/
 - Yeni `Memory` → `src/memory/`
 - Yeni `Tunnel` → `src/tunnel/`
 - Yeni `Peripheral` → `src/peripherals/`
-- Yeni `Skill` → `~/.zeroclaw/workspace/skills/<name>/`
+- Yeni `Skill` → `~/.quantclaw/workspace/skills/<name>/`
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 <!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ Resmi Depo ve Kimlik Taklidi Uyarısı
 
-**Bu, tek resmi ZeroClaw deposudur:**
+**Bu, tek resmi QuantClaw deposudur:**
 
-> https://github.com/zeroclaw-labs/zeroclaw
+> https://github.com/quant-speed/quantclaw
 
-"ZeroClaw" olduğunu iddia eden veya ZeroClaw Labs ile bağlantı ima eden başka herhangi bir depo, organizasyon, alan adı veya paket **yetkisiz olup bu projeyle bağlantılı değildir**. Bilinen yetkisiz fork'lar [TRADEMARK.md](docs/maintainers/trademark.md)'de listelenecektir.
+"QuantClaw" olduğunu iddia eden veya QuantClaw Labs ile bağlantı ima eden başka herhangi bir depo, organizasyon, alan adı veya paket **yetkisiz olup bu projeyle bağlantılı değildir**. Bilinen yetkisiz fork'lar [TRADEMARK.md](docs/maintainers/trademark.md)'de listelenecektir.
 
-Kimlik taklidi veya ticari marka kötüye kullanımıyla karşılaşırsanız, lütfen [bir issue açın](https://github.com/zeroclaw-labs/zeroclaw/issues).
+Kimlik taklidi veya ticari marka kötüye kullanımıyla karşılaşırsanız, lütfen [bir issue açın](https://github.com/quant-speed/quantclaw/issues).
 
 ---
 
 ## Lisans
 
-ZeroClaw, maksimum açıklık ve katkıda bulunan koruması için çift lisanslıdır:
+QuantClaw, maksimum açıklık ve katkıda bulunan koruması için çift lisanslıdır:
 
 | Lisans | Kullanım senaryosu |
 |--------|-------------------|
@@ -719,7 +706,7 @@ Her iki lisanstan birini seçebilirsiniz. **Katkıda bulunanlar her ikisi altın
 
 ### Ticari Marka
 
-**ZeroClaw** adı ve logosu, ZeroClaw Labs'ın ticari markalarıdır. Bu lisans, onay veya bağlantı ima etmek için bunları kullanma izni vermez. İzin verilen ve yasaklanan kullanımlar için [TRADEMARK.md](docs/maintainers/trademark.md)'ye bakın.
+**QuantClaw** adı ve logosu, QuantClaw Labs'ın ticari markalarıdır. Bu lisans, onay veya bağlantı ima etmek için bunları kullanma izni vermez. İzin verilen ve yasaklanan kullanımlar için [TRADEMARK.md](docs/maintainers/trademark.md)'ye bakın.
 
 ### Katkıda Bulunan Korumaları
 
@@ -730,12 +717,12 @@ Her iki lisanstan birini seçebilirsiniz. **Katkıda bulunanlar her ikisi altın
 
 ---
 
-**ZeroClaw** — Sıfır ek yük. Sıfır uzlaşma. Her yere dağıtın. Her şeyi değiştirin. 🦀
+**QuantClaw** — Sıfır ek yük. Sıfır uzlaşma. Her yere dağıtın. Her şeyi değiştirin. 🦀
 
 ## Katkıda Bulunanlar
 
-<a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=zeroclaw-labs/zeroclaw" alt="ZeroClaw contributors" />
+<a href="https://github.com/quant-speed/quantclaw/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=quant-speed/quantclaw" alt="QuantClaw contributors" />
 </a>
 
 Bu liste GitHub katkıda bulunanlar grafiğinden oluşturulur ve otomatik olarak güncellenir.
@@ -743,11 +730,11 @@ Bu liste GitHub katkıda bulunanlar grafiğinden oluşturulur ve otomatik olarak
 ## Yıldız Geçmişi
 
 <p align="center">
-  <a href="https://www.star-history.com/#zeroclaw-labs/zeroclaw&type=date&legend=top-left">
+  <a href="https://www.star-history.com/#quant-speed/quantclaw&type=date&legend=top-left">
     <picture>
-     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&theme=dark&legend=top-left" />
-     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
-     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
+     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=quant-speed/quantclaw&type=date&theme=dark&legend=top-left" />
+     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=quant-speed/quantclaw&type=date&legend=top-left" />
+     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=quant-speed/quantclaw&type=date&legend=top-left" />
     </picture>
   </a>
 </p>

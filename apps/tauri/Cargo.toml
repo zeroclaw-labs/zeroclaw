@@ -1,8 +1,8 @@
 [package]
-name = "zeroclaw-desktop"
+name = "quantclaw-desktop"
 version = "0.1.0"
 edition = "2024"
-description = "ZeroClaw Desktop — Tauri-powered system tray app"
+description = "QuantClaw Desktop — Tauri-powered system tray app"
 publish = false
 
 [build-dependencies]

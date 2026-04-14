@@ -1,6 +1,6 @@
 # Nextcloud Talk Setup
 
-This guide covers native Nextcloud Talk integration for ZeroClaw.
+This guide covers native Nextcloud Talk integration for QuantClaw.
 
 ## 1. What this integration does
 
@@ -10,7 +10,7 @@ This guide covers native Nextcloud Talk integration for ZeroClaw.
 
 ## 2. Configuration
 
-Add this section in `~/.zeroclaw/config.toml`:
+Add this section in `~/.quantclaw/config.toml`:
 
 ```toml
 [channels_config.nextcloud_talk]
@@ -18,9 +18,9 @@ base_url = "https://cloud.example.com"
 app_token = "nextcloud-talk-app-token"
 webhook_secret = "optional-webhook-secret"
 allowed_users = ["*"]
-# bot_name is the Nextcloud Talk display name of the bot (e.g. "zeroclaw").
+# bot_name is the Nextcloud Talk display name of the bot (e.g. "quantclaw").
 # Used to ignore the bot's own messages and prevent feedback loops.
-# bot_name = "zeroclaw"
+# bot_name = "quantclaw"
 ```
 
 Field reference:
@@ -33,16 +33,16 @@ Field reference:
 
 Environment override:
 
-- `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides `webhook_secret` when set.
+- `QUANTCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides `webhook_secret` when set.
 
 ## 3. Gateway endpoint
 
 Run the daemon or gateway and expose the webhook endpoint:
 
 ```bash
-zeroclaw daemon
+quantclaw daemon
 # or
-zeroclaw gateway --host 127.0.0.1 --port 3000
+quantclaw gateway --host 127.0.0.1 --port 3000
 ```
 
 Configure your Nextcloud Talk bot webhook URL to:
@@ -51,7 +51,7 @@ Configure your Nextcloud Talk bot webhook URL to:
 
 ## 4. Signature verification contract
 
-When `webhook_secret` is configured, ZeroClaw verifies:
+When `webhook_secret` is configured, QuantClaw verifies:
 
 - header `X-Nextcloud-Talk-Random`
 - header `X-Nextcloud-Talk-Signature`
@@ -64,15 +64,15 @@ If verification fails, the gateway returns `401 Unauthorized`.
 
 ## 5. Message routing behavior
 
-- ZeroClaw ignores bot-originated webhook events (`actorType = bots`).
-- ZeroClaw ignores non-message/system events.
+- QuantClaw ignores bot-originated webhook events (`actorType = bots`).
+- QuantClaw ignores non-message/system events.
 - Reply routing uses the Talk room token from the webhook payload.
 
 ## 6. Quick validation checklist
 
 1. Set `allowed_users = ["*"]` for first-time validation.
 2. Send a test message in the target Talk room.
-3. Confirm ZeroClaw receives and replies in the same room.
+3. Confirm QuantClaw receives and replies in the same room.
 4. Tighten `allowed_users` to explicit actor IDs.
 
 ## 7. Troubleshooting

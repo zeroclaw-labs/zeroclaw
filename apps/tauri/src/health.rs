@@ -1,4 +1,4 @@
-//! Background health polling for the ZeroClaw gateway.
+//! Background health polling for the QuantClaw gateway.
 
 use crate::gateway_client::GatewayClient;
 use crate::state::SharedState;
@@ -32,7 +32,7 @@ pub fn spawn_health_poller<R: Runtime>(app: AppHandle<R>, state: SharedState) {
                 let _ = tray.set_tooltip(Some(icon::tooltip_for_state(connected, agent_status)));
             }
 
-            let _ = app.emit("zeroclaw://status-changed", healthy);
+            let _ = app.emit("quantclaw://status-changed", healthy);
 
             tokio::time::sleep(POLL_INTERVAL).await;
         }

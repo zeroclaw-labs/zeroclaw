@@ -1,1 +1,1 @@
-pub use zeroclaw_runtime::agent::*;
+pub use quantclaw_runtime::agent::*;

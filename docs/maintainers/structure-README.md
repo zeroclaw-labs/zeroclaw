@@ -1,4 +1,4 @@
-# ZeroClaw Docs Structure Map
+# QuantClaw Docs Structure Map
 
 This page defines the documentation structure across three axes:
 

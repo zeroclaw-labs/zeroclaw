@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::bluesky::*;
+pub use quantclaw_channels::bluesky::*;

@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::opencode_cli::*;
+pub use quantclaw_tools::opencode_cli::*;

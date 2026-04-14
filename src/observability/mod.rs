@@ -1,5 +1,5 @@
 #[allow(unused_imports)]
-pub use zeroclaw_runtime::observability::*;
+pub use quantclaw_runtime::observability::*;
 
 #[cfg(test)]
 mod tests {

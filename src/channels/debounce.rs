@@ -1,1 +1,1 @@
-pub use zeroclaw_infra::debounce::*;
+pub use quantclaw_infra::debounce::*;

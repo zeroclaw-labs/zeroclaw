@@ -1,28 +1,12 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/docs/assets/zeroclaw-banner.png" alt="ZeroClaw" width="600" />
+  <img src="docs/assets/quantclaw-banner.png" alt="QuantClaw" width="600" />
 </p>
 
-<h1 align="center">🦀 ZeroClaw — Personal AI Assistant</h1>
+<h1 align="center">🦀 QuantClaw — Personal AI Assistant</h1>
 
 <p align="center">
   <strong>Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.</strong><br>
   ⚡️ <strong>Runs on $10 hardware with <5MB RAM: That's 99% less memory than OpenClaw and 98% cheaper than a Mac mini!</strong>
-</p>
-
-<p align="center">
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/actions/workflows/ci-run.yml"><img src="https://img.shields.io/github/actions/workflow/status/zeroclaw-labs/zeroclaw/ci-run.yml?branch=master&label=build" alt="Build Status" /></a>
-  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-edition%202024-orange?logo=rust" alt="Rust Edition 2024" /></a>
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/releases/latest"><img src="https://img.shields.io/badge/version-v0.6.9-blue" alt="Version v0.6.9" /></a>
-  <a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors"><img src="https://img.shields.io/github/contributors/zeroclaw-labs/zeroclaw?color=green" alt="Contributors" /></a>
-  <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
-  <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
-  <a href="https://discord.com/invite/wDshRVqRjx"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
-  <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
-</p>
-
-<p align="center">
-Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 </p>
 
 <p align="center">
@@ -60,21 +44,20 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
   <a href="docs/i18n/nb/README.md">🇳🇴 Norsk</a>
 </p>
 
-ZeroClaw is a personal AI assistant you run on your own devices. It answers you on the channels you already use (WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Matrix, IRC, Email, Bluesky, Nostr, Mattermost, Nextcloud Talk, DingTalk, Lark, QQ, Reddit, LinkedIn, Twitter, MQTT, WeChat Work, and more). It has a web dashboard for real-time control and can connect to hardware peripherals (ESP32, STM32, Arduino, Raspberry Pi). The Gateway is just the control plane — the product is the assistant.
+QuantClaw is a personal AI assistant you run on your own devices. It answers you on the channels you already use (WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Matrix, IRC, Email, Bluesky, Nostr, Mattermost, Nextcloud Talk, DingTalk, Lark, QQ, Reddit, LinkedIn, Twitter, MQTT, WeChat Work, and more). It has a web dashboard for real-time control and can connect to hardware peripherals (ESP32, STM32, Arduino, Raspberry Pi). The Gateway is just the control plane — the product is the assistant.
 
 If you want a personal, single-user assistant that feels local, fast, and always-on, this is it.
 
 <p align="center">
-  <a href="https://zeroclawlabs.ai">Website</a> ·
+  <a href="https://quantspeed.ai">Website</a> ·
   <a href="docs/README.md">Docs</a> ·
   <a href="docs/architecture.md">Architecture</a> ·
   <a href="#quick-start">Getting Started</a> ·
   <a href="#migrating-from-openclaw">Migrating from OpenClaw</a> ·
   <a href="docs/ops/troubleshooting.md">Troubleshoot</a> ·
-  <a href="https://discord.com/invite/wDshRVqRjx">Discord</a>
 </p>
 
-> **Preferred setup:** run `zeroclaw onboard` in your terminal. ZeroClaw Onboard guides you step by step through setting up the gateway, workspace, channels, and provider. It is the recommended setup path and works on macOS, Linux, and Windows (via WSL2). New install? Start here: [Getting started](#quick-start)
+> **Preferred setup:** run `quantclaw onboard` in your terminal. QuantClaw Onboard guides you step by step through setting up the gateway, workspace, channels, and provider. It is the recommended setup path and works on macOS, Linux, and Windows (via WSL2). New install? Start here: [Getting started](#quick-start)
 
 ### Subscription Auth (OAuth)
 
@@ -94,18 +77,18 @@ Runtime: Rust stable toolchain. Single binary, no runtime dependencies.
 ### Homebrew (macOS/Linuxbrew)
 
 ```bash
-brew install zeroclaw
+brew install quantclaw
 ```
 
 ### One-click bootstrap
 
 ```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/quant-speed/quantclaw.git
+cd quantclaw
 ./install.sh
 ```
 
-`zeroclaw onboard` runs automatically after install to configure your workspace and provider.
+`quantclaw onboard` runs automatically after install to configure your workspace and provider.
 
 ## Quick start (TL;DR)
 
@@ -116,67 +99,67 @@ Full beginner guide (auth, pairing, channels): [Getting started](docs/setup-guid
 ./install.sh
 
 # Start the gateway (webhook server + web dashboard)
-zeroclaw gateway                # default: 127.0.0.1:42617
-zeroclaw gateway --port 0       # random port (security hardened)
+quantclaw gateway                # default: 127.0.0.1:42617
+quantclaw gateway --port 0       # random port (security hardened)
 
 # Talk to the assistant
-zeroclaw agent -m "Hello, ZeroClaw!"
+quantclaw agent -m "Hello, QuantClaw!"
 
 # Interactive mode
-zeroclaw agent
+quantclaw agent
 
 # Start full autonomous runtime (gateway + channels + cron + hands)
-zeroclaw daemon
+quantclaw daemon
 
 # Check status
-zeroclaw status
+quantclaw status
 
 # Run diagnostics
-zeroclaw doctor
+quantclaw doctor
 ```
 
-Upgrading? Run `zeroclaw doctor` after updating.
+Upgrading? Run `quantclaw doctor` after updating.
 
 ### From source (development)
 
 ```bash
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+git clone https://github.com/quant-speed/quantclaw.git
+cd quantclaw
 
 cargo build --release --locked
 cargo install --path . --force --locked
 
-zeroclaw onboard
+quantclaw onboard
 ```
 
 > **Dev fallback (no global install):** prefix commands with `cargo run --release --` (example: `cargo run --release -- status`).
 
 ## Migrating from OpenClaw
 
-ZeroClaw can import your OpenClaw workspace, memory, and configuration:
+QuantClaw can import your OpenClaw workspace, memory, and configuration:
 
 ```bash
 # Preview what will be migrated (safe, read-only)
-zeroclaw migrate openclaw --dry-run
+quantclaw migrate openclaw --dry-run
 
 # Run the migration
-zeroclaw migrate openclaw
+quantclaw migrate openclaw
 ```
 
-This migrates your memory entries, workspace files, and configuration from `~/.openclaw/` to `~/.zeroclaw/`. Config is converted from JSON to TOML automatically.
+This migrates your memory entries, workspace files, and configuration from `~/.openclaw/` to `~/.quantclaw/`. Config is converted from JSON to TOML automatically.
 
 ## Security defaults (DM access)
 
-ZeroClaw connects to real messaging surfaces. Treat inbound DMs as untrusted input.
+QuantClaw connects to real messaging surfaces. Treat inbound DMs as untrusted input.
 
 Full security guide: [SECURITY.md](SECURITY.md)
 
 Default behavior on all channels:
 
 - **DM pairing** (default): unknown senders receive a short pairing code and the bot does not process their message.
-- Approve with: `zeroclaw pairing approve <channel> <code>` (then the sender is added to a local allowlist).
+- Approve with: `quantclaw pairing approve <channel> <code>` (then the sender is added to a local allowlist).
 - Public inbound DMs require an explicit opt-in in `config.toml`.
-- Run `zeroclaw doctor` to surface risky or misconfigured DM policies.
+- Run `quantclaw doctor` to surface risky or misconfigured DM policies.
 
 **Autonomy levels:**
 
@@ -197,8 +180,8 @@ Use this board for important notices (breaking changes, security advisories, mai
 
 | Date (UTC) | Level       | Notice                                                                                                                                                                                                                                                                                                                                                 | Action                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | ---------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2026-02-19 | _Critical_  | We are **not affiliated** with `openagen/zeroclaw`, `zeroclaw.org` or `zeroclaw.net`. The `zeroclaw.org` and `zeroclaw.net` domains currently points to the `openagen/zeroclaw` fork, and that domain/repository are impersonating our official website/project.                                                                                       | Do not trust information, binaries, fundraising, or announcements from those sources. Use only [this repository](https://github.com/zeroclaw-labs/zeroclaw) and our verified social accounts.                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| 2026-02-21 | _Important_ | Our official website is now live: [zeroclawlabs.ai](https://zeroclawlabs.ai). Thanks for your patience while we prepared the launch. We are still seeing impersonation attempts, so do **not** join any investment or fundraising activity claiming the ZeroClaw name unless it is published through our official channels.                            | Use [this repository](https://github.com/zeroclaw-labs/zeroclaw) as the single source of truth. Follow [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Facebook (Group)](https://www.facebook.com/groups/zeroclawlabs), and [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/) for official updates. |
+| 2026-02-19 | _Critical_  | We are **not affiliated** with `openagen/quantclaw`, `quantclaw.org` or `quantclaw.net`. The `quantclaw.org` and `quantclaw.net` domains currently points to the `openagen/quantclaw` fork, and that domain/repository are impersonating our official website/project.                                                                                       | Do not trust information, binaries, fundraising, or announcements from those sources. Use only [this repository](https://github.com/quant-speed/quantclaw) and our verified social accounts.                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| 2026-02-21 | _Important_ | Our official website is now live: [quantspeed.ai](https://quantspeed.ai). Thanks for your patience while we prepared the launch. We are still seeing impersonation attempts, so do **not** join any investment or fundraising activity claiming the QuantClaw name unless it is published through our official channels.                            | Use [this repository](https://github.com/quant-speed/quantclaw) as the single source of truth. Follow [X (@quantspeed)](https://x.com/quantspeed?s=21), [Facebook (Group)](https://www.facebook.com/groups/quantspeed), and [Reddit (r/quantspeed)](https://www.reddit.com/r/quantspeed/) for official updates. |
 | 2026-02-19 | _Important_ | Anthropic updated the Authentication and Credential Use terms on 2026-02-19. Claude Code OAuth tokens (Free, Pro, Max) are intended exclusively for Claude Code and Claude.ai; using OAuth tokens from Claude Free/Pro/Max in any other product, tool, or service (including Agent SDK) is not permitted and may violate the Consumer Terms of Service. | Please temporarily avoid Claude Code OAuth integrations to prevent potential loss. Original clause: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).                                                                                                                                                                                                                                                                                                                                                                                    |
 
 ## Highlights
@@ -218,18 +201,18 @@ Use this board for important notices (breaking changes, security advisories, mai
 - **Skills platform** — bundled, community, and workspace skills with security auditing.
 - **Tunnel support** — Cloudflare, Tailscale, ngrok, OpenVPN, and custom tunnels for remote access.
 
-### Why teams pick ZeroClaw
+### Why teams pick QuantClaw
 
 - **Lean by default:** small Rust binary, fast startup, low memory footprint.
 - **Secure by design:** pairing, strict sandboxing, explicit allowlists, workspace scoping.
 - **Fully swappable:** core systems are traits (providers, channels, tools, memory, tunnels).
 - **No lock-in:** OpenAI-compatible provider support + pluggable custom endpoints.
 
-## Benchmark Snapshot (ZeroClaw vs OpenClaw, Reproducible)
+## Benchmark Snapshot (QuantClaw vs OpenClaw, Reproducible)
 
 Local machine quick benchmark (macOS arm64, Feb 2026) normalized for 0.8GHz edge hardware.
 
-|                           | OpenClaw      | NanoBot        | PicoClaw        | ZeroClaw 🦀          |
+|                           | OpenClaw      | NanoBot        | PicoClaw        | QuantClaw 🦀          |
 | ------------------------- | ------------- | -------------- | --------------- | -------------------- |
 | **Language**              | TypeScript    | Python         | Go              | **Rust**             |
 | **RAM**                   | > 1GB         | > 100MB        | < 10MB          | **< 5MB**            |
@@ -237,20 +220,20 @@ Local machine quick benchmark (macOS arm64, Feb 2026) normalized for 0.8GHz edge
 | **Binary Size**           | ~28MB (dist)  | N/A (Scripts)  | ~8MB            | **~8.8 MB**          |
 | **Cost**                  | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **Any hardware $10** |
 
-> Notes: ZeroClaw results are measured on release builds using `/usr/bin/time -l`. OpenClaw requires Node.js runtime (typically ~390MB additional memory overhead), while NanoBot requires Python runtime. PicoClaw and ZeroClaw are static binaries. The RAM figures above are runtime memory; build-time compilation requirements are higher.
+> Notes: QuantClaw results are measured on release builds using `/usr/bin/time -l`. OpenClaw requires Node.js runtime (typically ~390MB additional memory overhead), while NanoBot requires Python runtime. PicoClaw and QuantClaw are static binaries. The RAM figures above are runtime memory; build-time compilation requirements are higher.
 
 <p align="center">
-  <img src="docs/assets/zeroclaw-comparison.jpeg" alt="ZeroClaw vs OpenClaw Comparison" width="800" />
+  <img src="docs/assets/quantclaw-comparison.jpeg" alt="QuantClaw vs OpenClaw Comparison" width="800" />
 </p>
 
 ### Reproducible local measurement
 
 ```bash
 cargo build --release
-ls -lh target/release/zeroclaw
+ls -lh target/release/quantclaw
 
-/usr/bin/time -l target/release/zeroclaw --help
-/usr/bin/time -l target/release/zeroclaw status
+/usr/bin/time -l target/release/quantclaw --help
+/usr/bin/time -l target/release/quantclaw status
 ```
 
 ## Everything we built so far
@@ -326,7 +309,7 @@ React 19 + Vite 6 + Tailwind CSS 4 web dashboard served directly from the Gatewa
 
 ## Configuration
 
-Minimal `~/.zeroclaw/config.toml`:
+Minimal `~/.quantclaw/config.toml`:
 
 ```toml
 default_provider = "anthropic"
@@ -394,35 +377,35 @@ Set `runtime.kind = "docker"` for strict sandboxing or network isolation.
 
 ## Subscription Auth (OpenAI Codex / Claude Code / Gemini)
 
-ZeroClaw supports subscription-native auth profiles (multi-account, encrypted at rest).
+QuantClaw supports subscription-native auth profiles (multi-account, encrypted at rest).
 
-- Store file: `~/.zeroclaw/auth-profiles.json`
-- Encryption key: `~/.zeroclaw/.secret_key`
+- Store file: `~/.quantclaw/auth-profiles.json`
+- Encryption key: `~/.quantclaw/.secret_key`
 - Profile id format: `<provider>:<profile_name>` (example: `openai-codex:work`)
 
 ```bash
 # OpenAI Codex OAuth (ChatGPT subscription)
-zeroclaw auth login --provider openai-codex --device-code
+quantclaw auth login --provider openai-codex --device-code
 
 # Gemini OAuth
-zeroclaw auth login --provider gemini --profile default
+quantclaw auth login --provider gemini --profile default
 
 # Anthropic setup-token
-zeroclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
+quantclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
 
 # Check / refresh / switch profile
-zeroclaw auth status
-zeroclaw auth refresh --provider openai-codex --profile default
-zeroclaw auth use --provider openai-codex --profile work
+quantclaw auth status
+quantclaw auth refresh --provider openai-codex --profile default
+quantclaw auth use --provider openai-codex --profile work
 
 # Run the agent with subscription auth
-zeroclaw agent --provider openai-codex -m "hello"
-zeroclaw agent --provider anthropic -m "hello"
+quantclaw agent --provider openai-codex -m "hello"
+quantclaw agent --provider anthropic -m "hello"
 ```
 
 ## Agent workspace + skills
 
-Workspace root: `~/.zeroclaw/workspace/` (configurable via config).
+Workspace root: `~/.quantclaw/workspace/` (configurable via config).
 
 Injected prompt files:
 - `IDENTITY.md` — agent personality and role
@@ -431,74 +414,74 @@ Injected prompt files:
 - `AGENTS.md` — session conventions and initialization rules
 - `SOUL.md` — core identity and operating principles
 
-Skills: `~/.zeroclaw/workspace/skills/<skill>/SKILL.md` or `SKILL.toml`.
+Skills: `~/.quantclaw/workspace/skills/<skill>/SKILL.md` or `SKILL.toml`.
 
 ```bash
 # List installed skills
-zeroclaw skills list
+quantclaw skills list
 
 # Install from git
-zeroclaw skills install https://github.com/user/my-skill.git
+quantclaw skills install https://github.com/user/my-skill.git
 
 # Security audit before install
-zeroclaw skills audit https://github.com/user/my-skill.git
+quantclaw skills audit https://github.com/user/my-skill.git
 
 # Remove a skill
-zeroclaw skills remove my-skill
+quantclaw skills remove my-skill
 ```
 
 ## CLI commands
 
 ```bash
 # Workspace management
-zeroclaw onboard              # Guided setup wizard
-zeroclaw status               # Show daemon/agent status
-zeroclaw doctor               # Run system diagnostics
+quantclaw onboard              # Guided setup wizard
+quantclaw status               # Show daemon/agent status
+quantclaw doctor               # Run system diagnostics
 
 # Gateway + daemon
-zeroclaw gateway              # Start gateway server (127.0.0.1:42617)
-zeroclaw daemon               # Start full autonomous runtime
+quantclaw gateway              # Start gateway server (127.0.0.1:42617)
+quantclaw daemon               # Start full autonomous runtime
 
 # Agent
-zeroclaw agent                # Interactive chat mode
-zeroclaw agent -m "message"   # Single message mode
+quantclaw agent                # Interactive chat mode
+quantclaw agent -m "message"   # Single message mode
 
 # Service management
-zeroclaw service install      # Install as OS service (launchd/systemd)
-zeroclaw service start|stop|restart|status
+quantclaw service install      # Install as OS service (launchd/systemd)
+quantclaw service start|stop|restart|status
 
 # Channels
-zeroclaw channel list         # List configured channels
-zeroclaw channel doctor       # Check channel health
-zeroclaw channel bind-telegram 123456789
+quantclaw channel list         # List configured channels
+quantclaw channel doctor       # Check channel health
+quantclaw channel bind-telegram 123456789
 
 # Cron + scheduling
-zeroclaw cron list            # List scheduled jobs
-zeroclaw cron add "*/5 * * * *" --prompt "Check system health"
-zeroclaw cron remove <id>
+quantclaw cron list            # List scheduled jobs
+quantclaw cron add "*/5 * * * *" --prompt "Check system health"
+quantclaw cron remove <id>
 
 # Memory
-zeroclaw memory list          # List memory entries
-zeroclaw memory get <key>     # Retrieve a memory
-zeroclaw memory stats         # Memory statistics
+quantclaw memory list          # List memory entries
+quantclaw memory get <key>     # Retrieve a memory
+quantclaw memory stats         # Memory statistics
 
 # Auth profiles
-zeroclaw auth login --provider <name>
-zeroclaw auth status
-zeroclaw auth use --provider <name> --profile <profile>
+quantclaw auth login --provider <name>
+quantclaw auth status
+quantclaw auth use --provider <name> --profile <profile>
 
 # Hardware peripherals
-zeroclaw hardware discover    # Scan for connected devices
-zeroclaw peripheral list      # List connected peripherals
-zeroclaw peripheral flash     # Flash firmware to device
+quantclaw hardware discover    # Scan for connected devices
+quantclaw peripheral list      # List connected peripherals
+quantclaw peripheral flash     # Flash firmware to device
 
 # Migration
-zeroclaw migrate openclaw --dry-run
-zeroclaw migrate openclaw
+quantclaw migrate openclaw --dry-run
+quantclaw migrate openclaw
 
 # Shell completions
-source <(zeroclaw completions bash)
-zeroclaw completions zsh > ~/.zfunc/_zeroclaw
+source <(quantclaw completions bash)
+quantclaw completions zsh > ~/.zfunc/_quantclaw
 ```
 
 Full commands reference: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
@@ -564,10 +547,10 @@ Full commands reference: [docs/reference/cli/commands-reference.md](docs/referen
 
 #### One-Line Installer
 
-Or skip the steps above and install everything (Rust, ZeroClaw) in a single command:
+Or skip the steps above and install everything (Rust, QuantClaw) in a single command:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+curl -LsSf https://raw.githubusercontent.com/quant-speed/quantclaw/master/install.sh | bash
 ```
 
 #### Build profiles
@@ -579,7 +562,7 @@ curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 ./install.sh --list-features                          # see all available features
 ```
 
-For pre-built binaries, see [GitHub Releases](https://github.com/zeroclaw-labs/zeroclaw/releases/latest).
+For pre-built binaries, see [GitHub Releases](https://github.com/quant-speed/quantclaw/releases/latest).
 
 #### Optional
 
@@ -598,7 +581,7 @@ Release assets are published for:
 - Windows: `x86_64`
 
 Download the latest assets from:
-<https://github.com/zeroclaw-labs/zeroclaw/releases/latest>
+<https://github.com/quant-speed/quantclaw/releases/latest>
 
 ## Docs
 
@@ -608,7 +591,7 @@ Use these when you're past the onboarding flow and want the deeper reference.
 - Read the [architecture overview](docs/architecture.md) for the full system model.
 - Use the [configuration reference](docs/reference/api/config-reference.md) when you need every key and example.
 - Run the Gateway by the book with the [operational runbook](docs/ops/operations-runbook.md).
-- Follow [ZeroClaw Onboard](#quick-start) for a guided setup.
+- Follow [QuantClaw Onboard](#quick-start) for a guided setup.
 - Debug common failures with the [troubleshooting guide](docs/ops/troubleshooting.md).
 - Review [security guidance](docs/security/README.md) before exposing anything.
 
@@ -640,14 +623,14 @@ Use these when you're past the onboarding flow and want the deeper reference.
 
 ## Icy Crab 🦀
 
-ZeroClaw was built for the smooth crab 🦀, a fast and efficient AI assistant. Built by Argenis De La Rosa and the community.
+QuantClaw was built for the smooth crab 🦀, a fast and efficient AI assistant. Built by Argenis De La Rosa and the community.
 
-- [zeroclawlabs.ai](https://zeroclawlabs.ai)
-- [@zeroclawlabs](https://x.com/zeroclawlabs)
+- [quantspeed.ai](https://quantspeed.ai)
+- [@quantspeed](https://x.com/quantspeed)
 
-## Support ZeroClaw
+## Support QuantClaw
 
-If ZeroClaw helps your work and you want to support ongoing development, you can donate here:
+If QuantClaw helps your work and you want to support ongoing development, you can donate here:
 
 <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
 
@@ -664,7 +647,7 @@ We're building in the open because the best ideas come from everywhere. If you'r
 
 ## Contributing
 
-New to ZeroClaw? Look for issues labeled [`good first issue`](https://github.com/zeroclaw-labs/zeroclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) — see our [Contributing Guide](CONTRIBUTING.md#first-time-contributors) for how to get started. AI/vibe-coded PRs welcome! 🤖
+New to QuantClaw? Look for issues labeled [`good first issue`](https://github.com/quant-speed/quantclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) — see our [Contributing Guide](CONTRIBUTING.md#first-time-contributors) for how to get started. AI/vibe-coded PRs welcome! 🤖
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](docs/contributing/cla.md). Implement a trait, submit a PR:
 
@@ -676,26 +659,26 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](docs/contributing/cla.md). I
 - New `Memory` → `src/memory/`
 - New `Tunnel` → `src/tunnel/`
 - New `Peripheral` → `src/peripherals/`
-- New `Skill` → `~/.zeroclaw/workspace/skills/<name>/`
+- New `Skill` → `~/.quantclaw/workspace/skills/<name>/`
 
 <!-- BEGIN:RECENT_CONTRIBUTORS -->
 <!-- END:RECENT_CONTRIBUTORS -->
 
 ## ⚠️ Official Repository & Impersonation Warning
 
-**This is the only official ZeroClaw repository:**
+**This is the only official QuantClaw repository:**
 
-> https://github.com/zeroclaw-labs/zeroclaw
+> https://github.com/quant-speed/quantclaw
 
-Any other repository, organization, domain, or package claiming to be "ZeroClaw" or implying affiliation with ZeroClaw Labs is **unauthorized and not affiliated with this project**. Known unauthorized forks will be listed in [TRADEMARK.md](docs/maintainers/trademark.md).
+Any other repository, organization, domain, or package claiming to be "QuantClaw" or implying affiliation with QuantClaw Labs is **unauthorized and not affiliated with this project**. Known unauthorized forks will be listed in [TRADEMARK.md](docs/maintainers/trademark.md).
 
-If you encounter impersonation or trademark misuse, please [open an issue](https://github.com/zeroclaw-labs/zeroclaw/issues).
+If you encounter impersonation or trademark misuse, please [open an issue](https://github.com/quant-speed/quantclaw/issues).
 
 ---
 
 ## License
 
-ZeroClaw is dual-licensed for maximum openness and contributor protection:
+QuantClaw is dual-licensed for maximum openness and contributor protection:
 
 | License | Use case |
 |---|---|
@@ -706,7 +689,7 @@ You may choose either license. **Contributors automatically grant rights under b
 
 ### Trademark
 
-The **ZeroClaw** name and logo are trademarks of ZeroClaw Labs. This license does not grant permission to use them to imply endorsement or affiliation. See [TRADEMARK.md](docs/maintainers/trademark.md) for permitted and prohibited uses.
+The **QuantClaw** name and logo are trademarks of QuantClaw Labs. This license does not grant permission to use them to imply endorsement or affiliation. See [TRADEMARK.md](docs/maintainers/trademark.md) for permitted and prohibited uses.
 
 ### Contributor Protections
 
@@ -717,12 +700,12 @@ The **ZeroClaw** name and logo are trademarks of ZeroClaw Labs. This license doe
 
 ---
 
-**ZeroClaw** — Zero overhead. Zero compromise. Deploy anywhere. Swap anything. 🦀
+**QuantClaw** — Zero overhead. Zero compromise. Deploy anywhere. Swap anything. 🦀
 
 ## Contributors
 
-<a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=zeroclaw-labs/zeroclaw" alt="ZeroClaw contributors" />
+<a href="https://github.com/quant-speed/quantclaw/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=quant-speed/quantclaw" alt="QuantClaw contributors" />
 </a>
 
 This list is generated from the GitHub contributors graph and updates automatically.
@@ -730,11 +713,11 @@ This list is generated from the GitHub contributors graph and updates automatica
 ## Star History
 
 <p align="center">
-  <a href="https://www.star-history.com/#zeroclaw-labs/zeroclaw&type=date&legend=top-left">
+  <a href="https://www.star-history.com/#quant-speed/quantclaw&type=date&legend=top-left">
     <picture>
-     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&theme=dark&legend=top-left" />
-     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
-     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
+     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=quant-speed/quantclaw&type=date&theme=dark&legend=top-left" />
+     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=quant-speed/quantclaw&type=date&legend=top-left" />
+     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=quant-speed/quantclaw&type=date&legend=top-left" />
     </picture>
   </a>
 </p>

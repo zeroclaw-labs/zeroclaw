@@ -1,11 +1,11 @@
 # Thiết lập Z.AI GLM
 
-ZeroClaw hỗ trợ các model GLM của Z.AI thông qua các endpoint tương thích OpenAI.
-Hướng dẫn cấu hình thực tế theo provider hiện tại của ZeroClaw.
+QuantClaw hỗ trợ các model GLM của Z.AI thông qua các endpoint tương thích OpenAI.
+Hướng dẫn cấu hình thực tế theo provider hiện tại của QuantClaw.
 
 ## Tổng quan
 
-ZeroClaw hỗ trợ sẵn các alias và endpoint Z.AI sau đây:
+QuantClaw hỗ trợ sẵn các alias và endpoint Z.AI sau đây:
 
 | Alias | Endpoint | Ghi chú |
 |-------|----------|---------|
@@ -19,14 +19,14 @@ Nếu bạn cần base URL tùy chỉnh, xem `docs/custom-providers.md`.
 ### Bắt đầu nhanh
 
 ```bash
-zeroclaw onboard \
+quantclaw onboard \
   --provider "zai" \
   --api-key "YOUR_ZAI_API_KEY"
 ```
 
 ### Cấu hình thủ công
 
-Chỉnh sửa `~/.zeroclaw/config.toml`:
+Chỉnh sửa `~/.quantclaw/config.toml`:
 
 ```toml
 api_key = "YOUR_ZAI_API_KEY"
@@ -73,14 +73,14 @@ Phản hồi mong đợi:
 }
 ```
 
-### Kiểm tra bằng ZeroClaw CLI
+### Kiểm tra bằng QuantClaw CLI
 
 ```bash
 # Test agent directly
-echo "Hello" | zeroclaw agent
+echo "Hello" | quantclaw agent
 
 # Check status
-zeroclaw status
+quantclaw status
 ```
 
 ## Biến môi trường
@@ -137,6 +137,6 @@ curl -s "https://api.z.ai/api/coding/paas/v4/models" \
 
 ## Tài liệu liên quan
 
-- [ZeroClaw README](README.md)
+- [QuantClaw README](README.md)
 - [Custom Provider Endpoints](./custom-providers.md)
 - [Contributing Guide](../../CONTRIBUTING.md)

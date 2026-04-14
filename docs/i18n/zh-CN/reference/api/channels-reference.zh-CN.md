@@ -1,6 +1,6 @@
 # 渠道参考文档
 
-本文档是 ZeroClaw 渠道配置的权威参考。
+本文档是 QuantClaw 渠道配置的权威参考。
 
 对于加密 Matrix 房间，还请阅读专用操作手册：
 - [Matrix E2EE（端到端加密）指南](../../security/matrix-e2ee-guide.zh-CN.md)
@@ -22,13 +22,13 @@
 3. **令牌/账户不匹配**：令牌有效但属于另一个 Matrix 账户。
 4. **E2EE 设备身份缺口**：`whoami` 不返回 `device_id` 且配置未提供该值。
 5. **密钥共享/信任缺口**：房间密钥未共享给机器人设备，因此加密事件无法解密。
-6. **运行时状态陈旧**：配置已更改但 `zeroclaw daemon` 未重启。
+6. **运行时状态陈旧**：配置已更改但 `quantclaw daemon` 未重启。
 
 ---
 
 ## 1. 配置命名空间
 
-所有渠道设置都位于 `~/.zeroclaw/config.toml` 的 `channels_config` 下。
+所有渠道设置都位于 `~/.quantclaw/config.toml` 的 `channels_config` 下。
 
 ```toml
 [channels_config]
@@ -39,7 +39,7 @@ cli = true
 
 ## 聊天内运行时模型切换（Telegram / Discord）
 
-运行 `zeroclaw channel start`（或守护进程模式）时，Telegram 和 Discord 现在支持发送者范围的运行时切换：
+运行 `quantclaw channel start`（或守护进程模式）时，Telegram 和 Discord 现在支持发送者范围的运行时切换：
 
 - `/models` — 显示可用提供商和当前选择
 - `/models <provider>` — 为当前发送者会话切换提供商
@@ -51,12 +51,12 @@ cli = true
 
 - 切换提供商或模型仅清除该发送者的内存中对话历史，以避免跨模型上下文污染。
 - `/new` 清除发送者的对话历史，但不改变提供商或模型选择。
-- 模型缓存预览来自 `zeroclaw models refresh --provider <ID>`。
+- 模型缓存预览来自 `quantclaw models refresh --provider <ID>`。
 - 这些是运行时聊天命令，不是 CLI 子命令。
 
 ## 入站图像标记协议
 
-ZeroClaw 通过内联消息标记支持多模态输入：
+QuantClaw 通过内联消息标记支持多模态输入：
 
 - 语法：``[IMAGE:<source>]``
 - `<source>` 可以是：
@@ -95,7 +95,7 @@ cargo check --features hardware,channel-matrix
 cargo check --features hardware,channel-lark
 ```
 
-如果存在 `[channels_config.matrix]`、`[channels_config.lark]` 或 `[channels_config.feishu]`，但对应的功能未编译进去，`zeroclaw channel list`、`zeroclaw channel doctor` 和 `zeroclaw channel start` 会报告该渠道在此构建中被故意跳过。
+如果存在 `[channels_config.matrix]`、`[channels_config.lark]` 或 `[channels_config.feishu]`，但对应的功能未编译进去，`quantclaw channel list`、`quantclaw channel doctor` 和 `quantclaw channel start` 会报告该渠道在此构建中被故意跳过。
 
 ---
 
@@ -205,7 +205,7 @@ allowed_users = [\"*\"]
 [channels_config.matrix]
 homeserver = \"https://matrix.example.com\"
 access_token = \"syt_...\"
-user_id = \"@zeroclaw:matrix.example.com\"   # 可选，推荐用于 E2EE
+user_id = \"@quantclaw:matrix.example.com\"   # 可选，推荐用于 E2EE
 device_id = \"DEVICEID123\"                  # 可选，推荐用于 E2EE
 room_id = \"!room:matrix.example.com\"       # 或房间别名（#ops:matrix.example.com）
 allowed_users = [\"*\"]
@@ -227,7 +227,7 @@ ignore_stories = true
 
 ### 4.7 WhatsApp
 
-ZeroClaw 支持两个 WhatsApp 后端：
+QuantClaw 支持两个 WhatsApp 后端：
 
 - **云 API 模式**（`phone_number_id` + `access_token` + `verify_token`）
 - **WhatsApp 网页模式**（`session_path`，需要构建标志 `--features whatsapp-web`）
@@ -247,7 +247,7 @@ WhatsApp 网页模式：
 
 ```toml
 [channels_config.whatsapp]
-session_path = \"~/.zeroclaw/state/whatsapp-web/session.db\"
+session_path = \"~/.quantclaw/state/whatsapp-web/session.db\"
 pair_phone = \"15551234567\"         # 可选; 省略使用二维码流程
 pair_code = \"\"                     # 可选自定义配对码
 allowed_numbers = [\"*\"]
@@ -294,9 +294,9 @@ allowed_senders = [\"*\"]
 [channels_config.irc]
 server = \"irc.libera.chat\"
 port = 6697
-nickname = \"zeroclaw-bot\"
-username = \"zeroclaw\"              # 可选
-channels = [\"#zeroclaw\"]
+nickname = \"quantclaw-bot\"
+username = \"quantclaw\"              # 可选
+channels = [\"#quantclaw\"]
 allowed_users = [\"*\"]
 server_password = \"\"                # 可选
 nickserv_password = \"\"              # 可选
@@ -353,7 +353,7 @@ Nostr 同时支持 NIP-04（传统加密私信）和 NIP-17（礼物包装私有
 引导式设置支持：
 
 ```bash
-zeroclaw onboard
+quantclaw onboard
 ```
 
 向导现在包含专用的 **Lark** 和 **Feishu** 步骤，包括：
@@ -401,7 +401,7 @@ allowed_users = [\"*\"]
 - 入站 webhook 端点：`POST /nextcloud-talk`。
 - 签名验证使用 `X-Nextcloud-Talk-Random` 和 `X-Nextcloud-Talk-Signature`。
 - 如果设置了 `webhook_secret`，无效签名会被拒绝并返回 `401`。
-- `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` 会覆盖配置中的密钥。
+- `QUANTCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` 会覆盖配置中的密钥。
 - 完整操作手册请参见 [nextcloud-talk-setup.md](../../setup-guides/nextcloud-talk-setup.zh-CN.md)。
 
 ### 4.16 Linq
@@ -420,7 +420,7 @@ allowed_senders = [\"*\"]
 - 入站 webhook 端点：`POST /linq`。
 - 签名验证使用 `X-Webhook-Signature`（HMAC-SHA256）和 `X-Webhook-Timestamp`。
 - 如果设置了 `signing_secret`，无效或过期（>300秒）的签名会被拒绝。
-- `ZEROCLAW_LINQ_SIGNING_SECRET` 会覆盖配置中的密钥。
+- `QUANTCLAW_LINQ_SIGNING_SECRET` 会覆盖配置中的密钥。
 - `allowed_senders` 使用 E.164 电话号码格式（例如 `+1234567890`）。
 
 ### 4.17 iMessage
@@ -438,8 +438,8 @@ allowed_contacts = [\"*\"]
 2. 运行：
 
 ```bash
-zeroclaw onboard --channels-only
-zeroclaw daemon
+quantclaw onboard --channels-only
+quantclaw daemon
 ```
 
 3. 从预期的发送者发送消息。
@@ -458,7 +458,7 @@ zeroclaw daemon
 4. 确认传输模式假设：
    - 轮询/websocket 渠道不需要公共入站 HTTP
    - webhook 渠道需要可访问的 HTTPS 回调
-5. 配置更改后重启 `zeroclaw daemon`。
+5. 配置更改后重启 `quantclaw daemon`。
 
 专门针对 Matrix 加密房间，请使用：
 - [Matrix E2EE 指南](../../security/matrix-e2ee-guide.zh-CN.md)
@@ -472,13 +472,13 @@ zeroclaw daemon
 ### 7.1 推荐捕获命令
 
 ```bash
-RUST_LOG=info zeroclaw daemon 2>&1 | tee /tmp/zeroclaw.log
+RUST_LOG=info quantclaw daemon 2>&1 | tee /tmp/quantclaw.log
 ```
 
 然后过滤渠道/网关事件：
 
 ```bash
-rg -n \"Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Nostr|Webhook|Channel\" /tmp/zeroclaw.log
+rg -n \"Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|DingTalk|QQ|iMessage|Nostr|Webhook|Channel\" /tmp/quantclaw.log
 ```
 
 ### 7.2 关键词表

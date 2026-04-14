@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::gemini_cli::*;
+pub use quantclaw_tools::gemini_cli::*;

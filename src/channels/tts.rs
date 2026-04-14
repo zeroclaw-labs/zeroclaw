@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::tts::*;
+pub use quantclaw_channels::tts::*;

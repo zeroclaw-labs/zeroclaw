@@ -1,6 +1,6 @@
-# ZeroClaw i18n Coverage and Structure
+# QuantClaw i18n Coverage and Structure
 
-This document defines the localization structure for ZeroClaw docs and tracks current coverage.
+This document defines the localization structure for QuantClaw docs and tracks current coverage.
 
 Last refreshed: **February 21, 2026**.
 

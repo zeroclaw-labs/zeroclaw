@@ -318,7 +318,7 @@ export default function Cron() {
               Catch up missed jobs on startup
             </span>
             <p className="text-xs mt-0.5" style={{ color: 'var(--pc-text-muted)' }}>
-              Run all overdue jobs when ZeroClaw starts after downtime
+              Run all overdue jobs when QuantClaw starts after downtime
             </p>
           </div>
           <button

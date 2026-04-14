@@ -1,1 +1,1 @@
-pub use zeroclaw_channels::nextcloud_talk::*;
+pub use quantclaw_channels::nextcloud_talk::*;

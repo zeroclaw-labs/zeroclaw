@@ -1,1 +1,1 @@
-pub use zeroclaw_tools::cli_discovery::*;
+pub use quantclaw_tools::cli_discovery::*;
