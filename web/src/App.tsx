@@ -1,6 +1,7 @@
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { useState, useEffect, createContext, useContext, Component, type ReactNode, type ErrorInfo } from 'react';
 import { ThemeProvider } from './contexts/ThemeContext';
+import { AgentProvider } from './contexts/AgentContext';
 import Layout from './components/layout/Layout';
 import Dashboard from './pages/Dashboard';
 import AgentChat from './pages/AgentChat';
@@ -225,23 +226,25 @@ function AppContent() {
   return (
     <DraftContext.Provider value={draftStore}>
       <LocaleContext.Provider value={{ locale, setAppLocale }}>
-        <Routes>
-          <Route element={<Layout />}>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/agent" element={<AgentChat />} />
-            <Route path="/tools" element={<Tools />} />
-            <Route path="/cron" element={<Cron />} />
-            <Route path="/integrations" element={<Integrations />} />
-            <Route path="/memory" element={<Memory />} />
-            <Route path="/config" element={<Config />} />
-            <Route path="/cost" element={<Cost />} />
-            <Route path="/logs" element={<Logs />} />
-            <Route path="/doctor" element={<Doctor />} />
-            <Route path="/pairing" element={<Pairing />} />
-            <Route path="/canvas" element={<Canvas />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Route>
-        </Routes>
+        <AgentProvider>
+          <Routes>
+            <Route element={<Layout />}>
+              <Route path="/" element={<Dashboard />} />
+              <Route path="/agent" element={<AgentChat />} />
+              <Route path="/tools" element={<Tools />} />
+              <Route path="/cron" element={<Cron />} />
+              <Route path="/integrations" element={<Integrations />} />
+              <Route path="/memory" element={<Memory />} />
+              <Route path="/config" element={<Config />} />
+              <Route path="/cost" element={<Cost />} />
+              <Route path="/logs" element={<Logs />} />
+              <Route path="/doctor" element={<Doctor />} />
+              <Route path="/pairing" element={<Pairing />} />
+              <Route path="/canvas" element={<Canvas />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Route>
+          </Routes>
+        </AgentProvider>
       </LocaleContext.Provider>
     </DraftContext.Provider>
   );
