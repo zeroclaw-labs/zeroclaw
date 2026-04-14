@@ -978,13 +978,75 @@ impl SecurityPolicy {
     // before any risk or autonomy logic runs.
 
     /// Validate full command execution policy (allowlist + risk gate).
+    /// Return a human-readable reason why `is_command_allowed` would reject
+    /// the command. Used to give the LLM actionable feedback instead of a
+    /// generic "not allowed" message.
+    fn command_denial_reason(&self, command: &str) -> String {
+        if self.autonomy == AutonomyLevel::ReadOnly {
+            return "shell execution is disabled in read-only mode".into();
+        }
+        if command.contains('`') {
+            return "backtick subshell operators are not allowed".into();
+        }
+        if contains_unquoted_shell_variable_expansion(command) {
+            return "shell variable expansion ($VAR) is not allowed".into();
+        }
+        if command.contains("<(") || command.contains(">(") {
+            return "process substitution operators are not allowed".into();
+        }
+        if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
+            return "unsafe shell redirections are not allowed".into();
+        }
+        if command
+            .split_whitespace()
+            .any(|w| w == "tee" || w.ends_with("/tee"))
+        {
+            return "tee command is not allowed (can write to arbitrary files)".into();
+        }
+        if contains_unquoted_single_ampersand(command) {
+            return "background command chaining (&) is not allowed".into();
+        }
+        // Check each sub-command against the allowlist
+        let segments = split_unquoted_segments(command);
+        for segment in &segments {
+            let cmd_part = skip_env_assignments(segment);
+            let mut words = cmd_part.split_whitespace();
+            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
+                &raw_executable[..idx]
+            } else {
+                raw_executable
+            };
+            let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
+            let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
+            if base_cmd.is_empty() {
+                continue;
+            }
+            if !self
+                .allowed_commands
+                .iter()
+                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
+            {
+                return format!("command '{base_cmd}' is not in the allowed commands list");
+            }
+            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+            if !self.is_args_safe(base_cmd, &args) {
+                return format!(
+                    "command '{base_cmd}' has dangerous arguments (e.g. -exec, config)"
+                );
+            }
+        }
+        "command not allowed by security policy".into()
+    }
+
     pub fn validate_command_execution(
         &self,
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
         if !self.is_command_allowed(command) {
-            return Err(format!("Command not allowed by security policy: {command}"));
+            let reason = self.command_denial_reason(command);
+            return Err(format!("Command not allowed: {reason}"));
         }
 
         let risk = self.command_risk_level(command);

@@ -122,7 +122,12 @@ impl Tool for SkillShellTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(reason),
+                    error: Some(format!(
+                        "{reason}. \
+                         HINT: This skill command was blocked by security policy. \
+                         Check that the command does not contain disallowed operators \
+                         or forbidden paths. Do NOT retry the same blocked command."
+                    )),
                 });
             }
         }

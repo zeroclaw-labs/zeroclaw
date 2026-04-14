@@ -151,7 +151,12 @@ impl Tool for ShellTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(reason),
+                    error: Some(format!(
+                        "{reason}. \
+                         HINT: If you have a registered callable tool (e.g. a skill tool) \
+                         that can accomplish this task, invoke it directly by name instead \
+                         of using the shell. Do NOT retry the same blocked command."
+                    )),
                 });
             }
         }
