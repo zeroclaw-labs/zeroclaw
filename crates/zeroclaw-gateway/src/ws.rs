@@ -5,6 +5,9 @@
 //! Protocol:
 //! ```text
 //! Server -> Client: {"type":"session_start","session_id":"...","name":"...","resumed":true,"message_count":42}
+//! Client -> Server: {"type":"connect","session_id":"...","timezone":"Asia/Shanghai"}   (optional handshake)
+//! Server -> Client: {"type":"connected","message":"Connection established","session_id":"..."}
+//! Server -> Client: {"type":"session","session_id":"..."}   (alias for connected, for legacy clients)
 //! Client -> Server: {"type":"message","content":"Hello"}
 //! Server -> Client: {"type":"chunk","content":"Hi! "}
 //! Server -> Client: {"type":"tool_call","name":"shell","args":{...}}
@@ -28,14 +31,16 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Optional connection parameters sent as the first WebSocket message.
 ///
-/// If the first message after upgrade is `{"type":"connect",...}`, these
-/// parameters are extracted and an acknowledgement is sent back. Old clients
-/// that send `{"type":"message",...}` as the first frame still work — the
-/// message is processed normally (backward-compatible).
+/// Accepted types:
+/// - `{"type":"connect",...}` — current handshake format
+/// - `{"type":"init",...}` — legacy format (deprecated, still accepted for backward compat)
+///
+/// Old clients that send `{"type":"message",...}` as the first frame still work —
+/// the message is processed normally (backward-compatible).
 #[derive(Debug, Deserialize)]
 struct ConnectParams {
     #[serde(rename = "type")]
@@ -49,6 +54,9 @@ struct ConnectParams {
     /// Client capabilities
     #[serde(default)]
     capabilities: Vec<String>,
+    /// Client timezone (e.g. "Asia/Shanghai"). Used for time-aware agent responses.
+    #[serde(default)]
+    timezone: Option<String>,
 }
 
 /// The sub-protocol we support for the chat WebSocket.
@@ -236,24 +244,46 @@ async fn handle_socket(
         match first {
             Ok(Message::Text(text)) => {
                 if let Ok(cp) = serde_json::from_str::<ConnectParams>(&text) {
-                    if cp.msg_type == "connect" {
+                    if cp.msg_type == "connect" || cp.msg_type == "init" {
+                        if cp.msg_type == "init" {
+                            warn!(
+                                "Received deprecated 'init' handshake from client; \
+                                 please migrate to {{\"type\":\"connect\",...}}"
+                            );
+                        }
                         debug!(
                             session_id = ?cp.session_id,
                             device_name = ?cp.device_name,
                             capabilities = ?cp.capabilities,
+                            timezone = ?cp.timezone,
                             "WebSocket connect params received"
                         );
                         // Override session_id if provided in connect params
                         if let Some(sid) = &cp.session_id {
                             agent.set_memory_session_id(Some(sid.clone()));
                         }
+                        // Log timezone for observability. Per-session timezone injection
+                        // into the agent system prompt is tracked as a future improvement.
+                        if let Some(tz) = &cp.timezone {
+                            debug!(timezone = %tz, "Client timezone received");
+                        }
+                        // Send "connected" ack (current format)
                         let ack = serde_json::json!({
                             "type": "connected",
-                            "message": "Connection established"
+                            "message": "Connection established",
+                            "session_id": session_id,
                         });
                         let _ = sender.send(Message::Text(ack.to_string().into())).await;
+                        // Also send legacy "session" ack so older server-side clients
+                        // (e.g. videoclaw-server BackendWsService) can set ready=true
+                        // without needing to be updated simultaneously.
+                        let session_ack = serde_json::json!({
+                            "type": "session",
+                            "session_id": session_id,
+                        });
+                        let _ = sender.send(Message::Text(session_ack.to_string().into())).await;
                     } else {
-                        // Not a connect message — fall through to normal processing
+                        // Not a connect/init message — fall through to normal processing
                         first_msg_fallback = Some(text.to_string());
                     }
                 } else {
