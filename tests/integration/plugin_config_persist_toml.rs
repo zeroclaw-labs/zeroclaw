@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Integration test: Config changes persist to config.toml via API.
 //!
 //! Verifies the acceptance criterion for US-ZCL-21:

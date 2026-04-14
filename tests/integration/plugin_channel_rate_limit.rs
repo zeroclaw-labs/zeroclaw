@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Integration test: per-plugin per-channel rate limiting enforced.
 //!
 //! Task US-ZCL-25-4: Verify acceptance criterion for story US-ZCL-25:

@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Integration test: timeout enforcement kills tool_infinite_loop.
 //!
 //! Loads `bad_actor_plugin.wasm` with a short `timeout_ms`, calls

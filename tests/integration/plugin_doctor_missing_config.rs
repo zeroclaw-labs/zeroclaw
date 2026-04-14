@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify acceptance criterion: plugin doctor **reports missing config values
 //! with key names and plugin names**.
 

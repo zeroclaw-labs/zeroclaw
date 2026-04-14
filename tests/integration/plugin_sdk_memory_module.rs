@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify that the zeroclaw-plugin-sdk memory module wraps store, recall, and
 //! forget host functions.
 //!

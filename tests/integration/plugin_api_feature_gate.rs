@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Integration test: Plugin API endpoints are feature-gated behind `plugins-wasm`.
 //!
 //! Verifies the acceptance criterion for US-ZCL-18:

@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify acceptance criterion: `zeroclaw plugin doctor` checks **all** installed
 //! plugins — not just the first one, not just successfully-loaded ones.
 

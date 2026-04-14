@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify acceptance criterion for US-ZCL-47:
 //! Hint text references the exact command: `zeroclaw plugin doctor`.
 //!

@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify acceptance criterion for US-ZCL-46:
 //! Response format is backwards-compatible (additive only).
 //!

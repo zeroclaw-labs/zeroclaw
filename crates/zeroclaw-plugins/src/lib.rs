@@ -3,7 +3,6 @@
 //! Plugins are WebAssembly modules loaded via Extism that can extend
 //! ZeroClaw with custom tools and channels. Enable with `--features plugins-wasm`.
 
-pub mod archive;
 pub mod capabilities;
 pub mod error;
 pub mod host;

@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify that the zeroclaw-plugin-sdk context module wraps session,
 //! user_identity, and agent_config host functions.
 //!

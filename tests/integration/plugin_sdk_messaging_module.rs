@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify that the zeroclaw-plugin-sdk messaging module wraps send_message and
 //! get_channels host functions.
 //!

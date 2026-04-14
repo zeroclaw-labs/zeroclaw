@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify that each test plugin crate contains the required files:
 //! Cargo.toml, src/lib.rs, and plugin.toml.
 

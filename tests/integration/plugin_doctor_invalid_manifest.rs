@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify acceptance criterion: plugin doctor **reports invalid manifests with
 //! parse errors**.
 

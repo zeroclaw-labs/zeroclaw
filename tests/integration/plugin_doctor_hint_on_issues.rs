@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify acceptance criterion for US-ZCL-47:
 //! Hint line appears only when plugin issues exist (warn or error).
 //!

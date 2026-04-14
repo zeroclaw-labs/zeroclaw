@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Integration test: HTTP requests to non-allowed hosts are blocked by Extism.
 //!
 //! Loads `bad_actor_plugin.wasm` WITHOUT granting network access, calls

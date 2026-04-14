@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Integration test: tool_http_get fetches from an allowed host.
 //!
 //! Loads `multi_tool_plugin.wasm` with allowed hosts `["httpbin.org", "example.com"]`,

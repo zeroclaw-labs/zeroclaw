@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify that `PluginHost::reload()` re-scans the plugins directory and
 //! re-instantiates all discovered plugins (acceptance criterion for US-ZCL-11).
 

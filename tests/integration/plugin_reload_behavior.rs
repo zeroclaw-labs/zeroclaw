@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Full reload-cycle integration test for US-ZCL-11-7:
 //!
 //! 1. Start with plugin A, reload after adding plugin B — verify both loaded.

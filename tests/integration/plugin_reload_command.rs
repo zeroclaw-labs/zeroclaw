@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify that `zeroclaw plugin reload` command exists and is feature-gated
 //! behind `plugins-wasm`.
 

@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify acceptance criterion for US-ZCL-11:
 //! "Removed plugins are unloaded on reload"
 //!

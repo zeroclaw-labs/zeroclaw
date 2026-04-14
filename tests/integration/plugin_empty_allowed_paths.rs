@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Integration test: empty allowed_paths means no filesystem access.
 //!
 //! Loads `multi_tool_plugin.wasm` WITHOUT any allowed_path mappings, calls

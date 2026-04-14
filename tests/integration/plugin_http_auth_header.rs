@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Integration test: tool_http_get_auth passes Authorization header from config values.
 //!
 //! Loads `multi_tool_plugin.wasm` with config `{api_key: "test-secret-token"}` and

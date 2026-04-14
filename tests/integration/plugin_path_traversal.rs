@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Security test: path traversal outside allowed_paths is denied.
 //!
 //! Verifies that the WASI sandbox blocks attempts to escape the mounted

@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify acceptance criterion for US-ZCL-45:
 //! `zeroclaw doctor` output includes a **Plugin Health** section.
 //!

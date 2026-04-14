@@ -114,9 +114,10 @@ nanohtml2text = "0.2"
 
 rumqttc = "0.24"
 
-# Tarball extraction for binary updates
+# Tarball/archive extraction for binary updates and plugin install
 flate2 = "1"
 tar = "0.4"
+xz2 = "0.1"
 
 # Progress bars (update pipeline)
 indicatif = "0.18"

@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Integration test for call-depth tracking on tool delegation.
 //!
 //! Task US-ZCL-24-3: Verify acceptance criterion for story US-ZCL-24:

@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify acceptance criterion for US-ZCL-11:
 //! "New plugins added after startup are discovered on reload"
 //!

@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify that the zeroclaw-plugin-sdk tools module wraps the tool_call host
 //! function.
 //!

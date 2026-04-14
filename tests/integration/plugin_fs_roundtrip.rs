@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Integration test: filesystem plugin reads from mounted input path and writes
 //! to mounted output path.
 //!

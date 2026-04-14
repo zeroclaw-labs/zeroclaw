@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Integration test: HTTP test plugin fetches from an allowed host.
 //!
 //! Loads `http_plugin.wasm` with `allowed_hosts = ["example.com"]`,

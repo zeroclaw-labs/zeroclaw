@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify acceptance criterion for US-ZCL-46:
 //! Summary entry shows loaded/failed/disabled counts.
 //!

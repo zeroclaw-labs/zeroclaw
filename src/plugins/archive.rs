@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 
-use crate::error::PluginError;
+use crate::plugins::error::PluginError;
 
 /// Supported archive formats, detected from the URL file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +47,18 @@ impl ArchiveFormat {
 /// Returns `true` if the source string looks like an HTTP(S) URL.
 pub fn is_url(source: &str) -> bool {
     source.starts_with("http://") || source.starts_with("https://")
+}
+
+/// Returns `true` if the path looks like a supported archive file.
+pub fn is_archive(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.ends_with(".zip")
+        || lower.ends_with(".tar.gz")
+        || lower.ends_with(".tgz")
+        || lower.ends_with(".tar.xz")
+        || lower.ends_with(".txz")
+        || lower.ends_with(".tar.bz2")
+        || lower.ends_with(".tbz2")
 }
 
 /// Download a URL to a temporary file, returning the path and detected archive format.

@@ -9,25 +9,20 @@ publish = false
 [dependencies]
 zeroclaw-api.workspace = true
 anyhow = "1.0"
-extism = "1.20"
 async-trait = "0.1"
 base64 = "0.22"
-flate2 = "1"
+extism = "1.20"
 glob = "0.3"
 hex = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "stream"] }
 ring = "0.17"
 sha2 = "0.10"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
-tar = "0.4"
 tempfile = "3.26"
 thiserror = "2.0"
 tokio = { version = "1.50", default-features = false, features = ["sync", "macros"] }
 toml = "1.0"
 tracing = { version = "0.1", default-features = false }
-xz2 = "0.1"
-zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
 
 [dev-dependencies]
 tokio = { version = "1.50", features = ["rt", "macros"] }

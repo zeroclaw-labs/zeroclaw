@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify that an example plugin using the SDK compiles and works end-to-end.
 //!
 //! Acceptance criterion for US-ZCL-27:

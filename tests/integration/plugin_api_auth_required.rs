@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Integration test: All plugin API endpoints require authentication.
 //!
 //! Verifies the acceptance criterion for US-ZCL-18:

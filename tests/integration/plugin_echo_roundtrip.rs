@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Integration test: echo plugin JSON round-trip.
 //!
 //! Loads `echo_plugin.wasm` from the checked-in artifacts, calls `tool_echo`

@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify that the zeroclaw-plugin-sdk crate exists with Cargo.toml and typed modules.
 //!
 //! Acceptance criterion for US-ZCL-27:

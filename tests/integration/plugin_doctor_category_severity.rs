@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify acceptance criterion for US-ZCL-46:
 //! Plugin results use category: plugins with ok/warn/error severity.
 //!

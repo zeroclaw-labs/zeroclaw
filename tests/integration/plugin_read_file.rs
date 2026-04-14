@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Integration test: tool_read_file reads from an allowed path.
 //!
 //! Loads `multi_tool_plugin.wasm` with `allowed_paths` mapping the

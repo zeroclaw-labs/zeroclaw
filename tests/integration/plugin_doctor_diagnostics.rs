@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify that the doctor diagnostic engine has runtime unit tests covering
 //! the four key scenarios: missing config key, missing WASM file, invalid
 //! manifest TOML, and all-pass for a valid plugin — all using temp directories

@@ -1,5 +1,6 @@
 pub use zeroclaw_plugins::*;
 
+pub mod archive;
 pub mod host_functions;
 pub mod loader;
 

@@ -1,3 +1,4 @@
+#![cfg(feature = "plugins-wasm")]
 //! Verify acceptance criterion for US-ZCL-45:
 //!
 //! > Does not duplicate full plugin doctor output — summary only
