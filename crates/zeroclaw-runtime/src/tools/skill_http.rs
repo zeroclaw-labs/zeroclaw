@@ -25,11 +25,16 @@ pub struct SkillHttpTool {
 impl SkillHttpTool {
     /// Create a new skill HTTP tool.
     ///
-    /// The tool name is prefixed with the skill name (`skill_name.tool_name`)
+    /// The tool name is prefixed with the skill name (`skill_name__tool_name`)
     /// to prevent collisions with built-in tools.
+    ///
+    /// Both names are sanitized: hyphens and dots replaced with underscores to
+    /// satisfy the `[a-zA-Z0-9_]+` constraint required by Bedrock and other providers.
     pub fn new(skill_name: &str, tool: &crate::skills::SkillTool) -> Self {
+        let safe_skill = skill_name.replace('-', "_").replace('.', "_");
+        let safe_tool = tool.name.replace('-', "_").replace('.', "_");
         Self {
-            tool_name: format!("{}.{}", skill_name, tool.name),
+            tool_name: format!("{}__{}", safe_skill, safe_tool),
             tool_description: tool.description.clone(),
             url_template: tool.command.clone(),
             args: tool.args.clone(),
@@ -173,7 +178,7 @@ mod tests {
     #[test]
     fn skill_http_tool_name_is_prefixed() {
         let tool = SkillHttpTool::new("weather_skill", &sample_http_tool());
-        assert_eq!(tool.name(), "weather_skill.get_weather");
+        assert_eq!(tool.name(), "weather_skill__get_weather");
     }
 
     #[test]
@@ -203,7 +208,7 @@ mod tests {
     fn skill_http_tool_spec_roundtrip() {
         let tool = SkillHttpTool::new("weather_skill", &sample_http_tool());
         let spec = tool.spec();
-        assert_eq!(spec.name, "weather_skill.get_weather");
+        assert_eq!(spec.name, "weather_skill__get_weather");
         assert_eq!(spec.description, "Fetch weather for a city");
         assert_eq!(spec.parameters["type"], "object");
     }
