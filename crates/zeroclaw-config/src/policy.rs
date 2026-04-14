@@ -499,12 +499,21 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
 
 /// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
 ///
+/// Strip fd-merge redirect patterns (`N>&M`, `N<&M`, `>&N`, `<&N`, `N>&-`, etc.)
+/// so their `&` doesn't get flagged as a background operator.
+fn strip_fd_merge_redirects(command: &str) -> String {
+    use std::sync::OnceLock;
+    // Matches patterns like: 2>&1, 1>&2, >&2, <&0, 2<&-, >&-
+    static FD_MERGE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = FD_MERGE_RE.get_or_init(|| regex::Regex::new(r"\d*[><]&[\d-]").unwrap());
+    re.replace_all(command, "").to_string()
+}
+
 /// We treat any standalone `&` as unsafe in policy validation because it can
 /// chain hidden sub-commands and escape foreground timeout expectations.
 fn contains_unquoted_single_ampersand(command: &str) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
-    let mut prev = ' ';
     let mut chars = command.chars().peekable();
 
     while let Some(ch) = chars.next() {
@@ -517,12 +526,10 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
             QuoteState::Double => {
                 if escaped {
                     escaped = false;
-                    prev = ch;
                     continue;
                 }
                 if ch == '\\' {
                     escaped = true;
-                    prev = ch;
                     continue;
                 }
                 if ch == '"' {
@@ -532,37 +539,24 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
             QuoteState::None => {
                 if escaped {
                     escaped = false;
-                    prev = ch;
                     continue;
                 }
                 if ch == '\\' {
                     escaped = true;
-                    prev = ch;
                     continue;
                 }
                 match ch {
                     '\'' => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
                     '&' => {
-                        // `&&` is a logical-AND separator, not a background op.
-                        if chars.next_if_eq(&'&').is_some() {
-                            prev = '&';
-                            continue;
+                        if chars.next_if_eq(&'&').is_none() {
+                            return true;
                         }
-                        // `>&N` and `<&N` are fd redirects, not background ops.
-                        if (prev == '>' || prev == '<')
-                            || chars.peek().is_some_and(|c| c.is_ascii_digit())
-                        {
-                            prev = ch;
-                            continue;
-                        }
-                        return true;
                     }
                     _ => {}
                 }
             }
         }
-        prev = ch;
     }
 
     false
@@ -613,6 +607,49 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
     }
 
     false
+}
+
+/// Returns true if `command` contains an unquoted `>` that is NOT a safe
+/// stderr form (`2>/dev/null`, `2>&1`).
+fn contains_unsafe_output_redirect(command: &str) -> bool {
+    // Strip safe redirect-to-dev patterns (with word boundary enforcement),
+    // then fd-merge patterns, then check for remaining `>`.
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    static SAFE_OUTPUT_RE: OnceLock<Regex> = OnceLock::new();
+    let re = SAFE_OUTPUT_RE.get_or_init(|| {
+        // Match >SPACE?/dev/{null,zero,stdout,stderr} followed by whitespace,
+        // end-of-string, or a shell operator. A dot, slash, or any other
+        // non-operator character after the device name prevents the match —
+        // blocking bypasses like `2>/dev/stderr.log` or `>/dev/zero/path`.
+        // The terminator is captured and preserved in the replacement.
+        Regex::new(r"\d*>[ ]?/dev/(null|zero|stdout|stderr)(\s|[;&|)]|$)").unwrap()
+    });
+
+    let safe = re.replace_all(command, "$2").to_string();
+    // Also strip fd-merge redirects (2>&1, 1>&2, >&N, etc.)
+    let safe = strip_fd_merge_redirects(&safe);
+    contains_unquoted_char(&safe, '>')
+}
+
+/// Returns true if `command` contains an unquoted `<` that is NOT a heredoc (`<<`)
+/// or a safe input redirect from `/dev/*`.
+fn contains_unquoted_input_redirect(command: &str) -> bool {
+    // Strip here-strings (`<<<`) first, then heredocs (`<<`), then safe /dev/* sources
+    // with word boundary enforcement.
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    static SAFE_INPUT_RE: OnceLock<Regex> = OnceLock::new();
+    let re =
+        SAFE_INPUT_RE.get_or_init(|| Regex::new(r"<[ ]?/dev/(null|zero)(\s|[;&|)]|$)").unwrap());
+
+    let safe = command.replace("<<<", "").replace("<<", "");
+    let safe = re.replace_all(&safe, "$2").to_string();
+    // Also strip fd-merge redirects (<&0, <&-, etc.) so they don't leave a bare `<`
+    let safe = strip_fd_merge_redirects(&safe);
+    contains_unquoted_char(&safe, '<')
 }
 
 /// Detect unquoted shell variable expansions like `$HOME`, `$1`, `$?`.
@@ -721,69 +758,18 @@ fn attached_short_option_value(token: &str) -> Option<&str> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-/// Extract the file target from a redirection token, returning `None` for
-/// fd-only redirects (e.g. `2>&1`) and standalone operators (e.g. `>`).
 fn redirection_target(token: &str) -> Option<&str> {
-    match parse_redirection(token) {
-        RedirectionParse::Target(t) => Some(t),
-        _ => None,
-    }
-}
-
-/// Result of parsing a redirection token.
-enum RedirectionParse<'a> {
-    /// Token contains a redirect operator with an inline target, e.g. `>/dev/null`.
-    Target(&'a str),
-    /// Token is a pure file-descriptor redirect like `2>&1` — always safe.
-    FdOnly,
-    /// Token is a bare redirect operator (e.g. `>`, `>>`, `<`) — the target is the next token.
-    NeedsNextToken,
-    /// Token contains no redirection.
-    None,
-}
-
-fn parse_redirection(token: &str) -> RedirectionParse<'_> {
-    let Some(marker_idx) = token.find(['<', '>']) else {
-        return RedirectionParse::None;
-    };
+    let marker_idx = token.find(['<', '>'])?;
     let mut rest = &token[marker_idx + 1..];
     rest = rest.trim_start_matches(['<', '>']);
-
-    // Check for fd redirect: `&` followed by only digits (e.g. `2>&1`, `>&2`).
-    if let Some(after_amp) = rest.strip_prefix('&') {
-        let after_digits = after_amp.trim_start_matches(|c: char| c.is_ascii_digit());
-        if after_digits.is_empty() {
-            return RedirectionParse::FdOnly;
-        }
-    }
-
-    // Strip leading digits (fd number before operator, e.g. the `2` in `2>/dev/null`).
+    rest = rest.trim_start_matches('&');
     rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
     let trimmed = rest.trim();
     if trimmed.is_empty() {
-        RedirectionParse::NeedsNextToken
+        None
     } else {
-        RedirectionParse::Target(trimmed)
+        Some(trimmed)
     }
-}
-
-/// Check if a redirection target is safe (standard /dev/* targets or file descriptors).
-///
-/// Safe targets include:
-/// - `/dev/null` — discards output
-/// - `/dev/stdout` — redirects to standard output
-/// - `/dev/stderr` — redirects to standard error
-/// - `/dev/zero` — infinite zero bytes source
-///
-/// File descriptor forms like `2>&1` are handled separately via `redirection_target()`,
-/// which strips the ampersand prefix before calling this function. This function
-/// validates the actual target path/name.
-fn safe_redirect_target(target: &str) -> bool {
-    let target = target.trim();
-    matches!(
-        target,
-        "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/zero"
-    )
 }
 
 /// Extract the basename from a command path, handling both Unix (`/`) and
@@ -1116,55 +1102,15 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Allow safe shell redirections (`<`, `>`, `>>`) to /dev/* targets.
-        // Block unsafe redirections to arbitrary paths that could bypass path checks.
-        // Ignore quoted literals, e.g. `echo "a>b"` and `echo "a<b"`.
-        if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
-            // Check if all redirections target safe destinations
-            for segment in split_unquoted_segments(command) {
-                let cmd_part = skip_env_assignments(&segment);
-                let words: Vec<&str> = cmd_part.split_whitespace().collect();
-
-                let mut i = 0;
-                // Skip the executable (first word)
-                if !words.is_empty() {
-                    // Check inline redirections on executable itself, e.g., `cat</dev/null`
-                    match parse_redirection(strip_wrapping_quotes(words[0])) {
-                        RedirectionParse::Target(target) => {
-                            if !safe_redirect_target(target) {
-                                return false;
-                            }
-                        }
-                        RedirectionParse::NeedsNextToken => {
-                            // Bare redirect as executable is invalid, block it
-                            return false;
-                        }
-                        RedirectionParse::FdOnly | RedirectionParse::None => {}
-                    }
-                    i = 1;
-                }
-
-                // Check redirections in remaining arguments
-                while i < words.len() {
-                    match parse_redirection(words[i]) {
-                        RedirectionParse::Target(target) => {
-                            if !safe_redirect_target(target) {
-                                return false;
-                            }
-                        }
-                        RedirectionParse::NeedsNextToken => {
-                            // Standalone redirect operator — next token is the target
-                            i += 1;
-                            let target = words.get(i).map(|w| w.trim()).unwrap_or("");
-                            if !safe_redirect_target(target) {
-                                return false;
-                            }
-                        }
-                        RedirectionParse::FdOnly | RedirectionParse::None => {}
-                    }
-                    i += 1;
-                }
-            }
+        // Block shell redirections that target files. Allow safe forms:
+        //   - `2>/dev/null`, `>/dev/null`, `1>/dev/null` (output suppression)
+        //   - `2>&1`, `1>&2` (fd merging)
+        //   - `<<` heredocs, `<<<` here-strings (input literals)
+        if contains_unsafe_output_redirect(command) {
+            return false;
+        }
+        if contains_unquoted_input_redirect(command) {
+            return false;
         }
 
         // Block `tee` — it can write to arbitrary files, bypassing the
@@ -1178,7 +1124,10 @@ impl SecurityPolicy {
 
         // Block background command chaining (`&`), which can hide extra
         // sub-commands and outlive timeout expectations. Keep `&&` allowed.
-        if contains_unquoted_single_ampersand(command) {
+        // Strip fd-merge redirects (N>&M, N<&M) first so their `&` isn't
+        // flagged as background chaining.
+        let ampersand_check = strip_fd_merge_redirects(command);
+        if contains_unquoted_single_ampersand(&ampersand_check) {
             return false;
         }
 
@@ -2465,20 +2414,24 @@ mod tests {
         let p = default_policy();
         assert!(!p.is_command_allowed("echo secret > /etc/crontab"));
         assert!(!p.is_command_allowed("ls >> /tmp/exfil.txt"));
-        assert!(!p.is_command_allowed("cat </etc/passwd"));
-        assert!(!p.is_command_allowed("cat</etc/passwd"));
+        assert!(!p.is_command_allowed("cat < /etc/passwd"));
+        assert!(!p.is_command_allowed("echo secret > output.txt"));
+        // Path-prefix bypass: /dev/null followed by extra path component
+        assert!(!p.is_command_allowed("echo secret>/dev/nullextra"));
+        assert!(!p.is_command_allowed("echo secret > /dev/null/../../etc/passwd"));
+        assert!(!p.is_command_allowed("echo secret>/dev/stderrfoo"));
+        // Word→non-word boundary bypasses
+        assert!(!p.is_command_allowed("ls 2>/dev/stderr.log"));
+        assert!(!p.is_command_allowed("cat>/dev/zero/path"));
+        assert!(!p.is_command_allowed("echo>/dev/stdout.bak"));
     }
 
     #[test]
     fn safe_redirect_to_dev_null_allowed() {
         let p = default_policy();
-        // stdout to /dev/null
         assert!(p.is_command_allowed("echo secret > /dev/null"));
-        // stderr to /dev/null
         assert!(p.is_command_allowed("ls 2> /dev/null"));
-        // both stdout and stderr to /dev/null
         assert!(p.is_command_allowed("find . 2>&1 > /dev/null"));
-        // inline redirection form
         assert!(p.is_command_allowed("cat</dev/null"));
     }
 
@@ -2505,12 +2458,55 @@ mod tests {
     #[test]
     fn safe_file_descriptor_redirect_allowed() {
         let p = default_policy();
-        // stderr to stdout
         assert!(p.is_command_allowed("find . 2>&1"));
-        // stdout to stderr
         assert!(p.is_command_allowed("echo hello 1>&2"));
-        // combined with safe target
         assert!(p.is_command_allowed("ls 2>&1 > /dev/null"));
+        // Bare fd redirects (implicit fd number)
+        assert!(p.is_command_allowed("echo error >&2"));
+        assert!(p.is_command_allowed("cat <&0"));
+        assert!(p.is_command_allowed("echo >&-"));
+        assert!(p.is_command_allowed("echo 3>&-"));
+    }
+
+    #[test]
+    fn heredoc_and_herestring_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("cat << 'EOF'"));
+        assert!(p.is_command_allowed("cat <<EOF"));
+        assert!(p.is_command_allowed("cat <<< 'hello'"));
+        // Input redirects from files still blocked
+        assert!(!p.is_command_allowed("cat < /etc/passwd"));
+        // Output redirects to files still blocked
+        assert!(!p.is_command_allowed("echo secret > output.txt"));
+    }
+
+    #[test]
+    fn redirect_helper_unit_tests() {
+        assert!(!contains_unquoted_input_redirect("cat << 'EOF'"));
+        assert!(!contains_unquoted_input_redirect("cat <<< 'hello'"));
+        assert!(contains_unquoted_input_redirect("cat < /etc/passwd"));
+        assert!(!contains_unquoted_input_redirect("echo 'a<b'"));
+        assert!(!contains_unquoted_input_redirect("cat</dev/null"));
+        // Input redirect word→non-word bypass (same fix as output redirects)
+        assert!(contains_unquoted_input_redirect("cat</dev/null.secret"));
+        assert!(contains_unquoted_input_redirect(
+            "cat </dev/zero/etc/passwd"
+        ));
+        assert!(!contains_unsafe_output_redirect("cmd 2>/dev/null"));
+        assert!(!contains_unsafe_output_redirect("cmd >/dev/null"));
+        assert!(!contains_unsafe_output_redirect("cmd 1>/dev/null"));
+        assert!(!contains_unsafe_output_redirect("cmd 2>&1"));
+        assert!(!contains_unsafe_output_redirect("cmd 1>&2"));
+        assert!(!contains_unsafe_output_redirect("echo > /dev/stdout"));
+        assert!(!contains_unsafe_output_redirect("echo > /dev/stderr"));
+        assert!(!contains_unsafe_output_redirect("echo > /dev/zero"));
+        assert!(contains_unsafe_output_redirect("echo hi > file.txt"));
+        assert!(!contains_unsafe_output_redirect("echo 'a>b'"));
+        // Word→non-word boundary bypasses: dot, slash, or other non-operator chars
+        // after a safe device name must NOT strip the redirect
+        assert!(contains_unsafe_output_redirect("ls 2>/dev/stderr.log"));
+        assert!(contains_unsafe_output_redirect("cat>/dev/zero/path"));
+        assert!(contains_unsafe_output_redirect("echo>/dev/stdout.bak"));
     }
 
     #[test]
