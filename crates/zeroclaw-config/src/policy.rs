@@ -1176,7 +1176,16 @@ impl SecurityPolicy {
         })
     }
 
-    /// Check for dangerous arguments that allow sub-command execution.
+    /// Check for dangerous arguments that allow sub-command execution or
+    /// fetch+execute untrusted external code.
+    ///
+    /// Local workspace operations (cargo build, npm test, python script.py)
+    /// are NOT blocked — the user trusts their own project.
+    ///
+    /// References:
+    /// - ZeptoClaw GHSA-5wp8-q9mx-8jx8 (CVSS 9.8): same vulnerability class
+    /// - OpenClaw strictInlineEval: blocks python -c, node -e, etc.
+    /// - OWASP OS Command Injection Defense Cheat Sheet
     fn is_args_safe(&self, base: &str, args: &[String]) -> bool {
         let base = base.to_ascii_lowercase();
         match base.as_str() {
@@ -1194,6 +1203,49 @@ impl SecurityPolicy {
                         || arg.starts_with("alias.")
                         || arg == "-c"
                 })
+            }
+            "python" | "python3" => {
+                // -c executes arbitrary code from argument string
+                // -m runs any installed module as a script — broad block is intentional:
+                //   -m http.server opens a local exfil vector
+                //   -m pip install double-covers the pip arm
+                //   -m pytest, -m mypy, -m venv are blocked as collateral;
+                //   narrowing to a curated module list is a future option
+                // starts_with covers glued form: python3 -c'code' (one whitespace token)
+                // Ref: https://docs.python.org/3/using/cmdline.html
+                !args
+                    .iter()
+                    .any(|arg| arg.starts_with("-c") || arg.starts_with("-m"))
+            }
+            "node" => {
+                // -e/--eval evaluates argument as JavaScript
+                // -p/--print same as --eval but prints the result
+                // starts_with covers glued form: node -e'code' (one whitespace token)
+                // Ref: https://nodejs.org/api/cli.html
+                !args.iter().any(|arg| {
+                    arg.starts_with("-e")
+                        || arg.starts_with("--eval")
+                        || arg.starts_with("-p")
+                        || arg.starts_with("--print")
+                })
+            }
+            "pip" | "pip3" => {
+                // install/download fetch external packages; setup.py runs arbitrary code
+                // Ref: https://blog.phylum.io/python-package-installation-attacks/
+                !args.iter().any(|arg| arg == "install" || arg == "download")
+            }
+            "npm" => {
+                // exec can fetch+run remote packages (npx behavior)
+                // install fetches external packages; lifecycle scripts run arbitrary code
+                // Ref: https://cheatsheetseries.owasp.org/cheatsheets/NPM_Security_Cheat_Sheet.html
+                !args.iter().any(|arg| {
+                    arg == "exec" || arg == "install" || arg == "i" || arg == "add" || arg == "ci"
+                })
+            }
+            "cargo" => {
+                // install fetches+builds external crate; build.rs executes arbitrary code
+                // Ref: https://shnatsel.medium.com/do-not-run-any-cargo-commands-on-untrusted-projects
+                !args.iter().any(|arg| arg == "install")
             }
             _ => true,
         }
@@ -2424,6 +2476,70 @@ mod tests {
         assert!(!p.is_command_allowed("ls 2>/dev/stderr.log"));
         assert!(!p.is_command_allowed("cat>/dev/zero/path"));
         assert!(!p.is_command_allowed("echo>/dev/stdout.bak"));
+    }
+
+    // ── Interpreter argument injection (#5698) ────────────────────
+
+    #[test]
+    fn interpreter_inline_eval_blocked() {
+        let p = default_policy();
+        // python: -c executes code string, -m runs arbitrary module
+        assert!(!p.is_command_allowed("python3 -c 'import os; os.system(\"id\")'"));
+        assert!(!p.is_command_allowed("python -c '__import__(\"os\").system(\"id\")'"));
+        assert!(!p.is_command_allowed("python3 -m http.server"));
+        assert!(!p.is_command_allowed("python3 -m pip install evil"));
+        // Broad -m block: these are intentional collateral
+        assert!(!p.is_command_allowed("python3 -m pytest"));
+        assert!(!p.is_command_allowed("python3 -m mypy src/"));
+        assert!(!p.is_command_allowed("python3 -m venv .venv"));
+        // Glued form: -mhttp.server is one token
+        assert!(!p.is_command_allowed("python3 -mhttp.server"));
+        // node: -e/--eval evaluates JS, -p/--print evaluates and prints
+        assert!(!p.is_command_allowed("node -e 'require(\"child_process\").execSync(\"id\")'"));
+        assert!(!p.is_command_allowed("node --eval 'process.exit(1)'"));
+        assert!(!p.is_command_allowed("node --eval=process.exit(1)"));
+        assert!(!p.is_command_allowed("node -p '1+1'"));
+        assert!(!p.is_command_allowed("node --print 'process.env'"));
+        assert!(!p.is_command_allowed("node --print=process.env"));
+        // Glued form bypass: -c'code' is one whitespace token
+        assert!(!p.is_command_allowed("python3 -c'import os'"));
+        assert!(!p.is_command_allowed("node -e'process.exit()'"));
+        // Flag with other args before it
+        assert!(!p.is_command_allowed("python3 -W ignore -c 'import os'"));
+    }
+
+    #[test]
+    fn package_manager_install_blocked() {
+        let p = default_policy();
+        // pip: install/download fetch external packages and run setup.py
+        assert!(!p.is_command_allowed("pip install evil-package"));
+        assert!(!p.is_command_allowed("pip3 install evil-package"));
+        assert!(!p.is_command_allowed("pip download evil-package"));
+        // npm: exec fetches remote, install runs lifecycle scripts
+        assert!(!p.is_command_allowed("npm exec -- malicious-pkg"));
+        assert!(!p.is_command_allowed("npm install malicious-pkg"));
+        assert!(!p.is_command_allowed("npm i malicious-pkg"));
+        assert!(!p.is_command_allowed("npm add malicious-pkg"));
+        assert!(!p.is_command_allowed("npm ci"));
+        // cargo: install fetches+builds external crate (build.rs runs arbitrary code)
+        assert!(!p.is_command_allowed("cargo install malicious-crate"));
+    }
+
+    #[test]
+    fn safe_interpreter_usage_allowed() {
+        let p = default_policy();
+        // Running local files is safe — user trusts their workspace
+        assert!(p.is_command_allowed("python3 script.py"));
+        assert!(p.is_command_allowed("node app.js"));
+        // Read-only / local workspace operations
+        assert!(p.is_command_allowed("pip list"));
+        assert!(p.is_command_allowed("pip freeze"));
+        assert!(p.is_command_allowed("pip show requests"));
+        assert!(p.is_command_allowed("npm test"));
+        assert!(p.is_command_allowed("npm list"));
+        assert!(p.is_command_allowed("cargo build"));
+        assert!(p.is_command_allowed("cargo test"));
+        assert!(p.is_command_allowed("cargo run"));
     }
 
     #[test]
