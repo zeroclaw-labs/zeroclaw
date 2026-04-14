@@ -1,7 +1,8 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
-use opentelemetry::{KeyValue, global};
+use opentelemetry::{Context, KeyValue, global};
+use std::sync::Mutex;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -30,6 +31,10 @@ pub struct OtelObserver {
     hand_runs: Counter<u64>,
     hand_duration: Histogram<f64>,
     hand_findings: Counter<u64>,
+
+    /// Active agent invocation context — stores the root span so child spans
+    /// (llm.call, tool.call) can establish parent-child relationships.
+    active_agent_context: Mutex<Option<Context>>,
 }
 
 impl OtelObserver {
@@ -190,6 +195,7 @@ impl OtelObserver {
             hand_runs,
             hand_duration,
             hand_findings,
+            active_agent_context: Mutex::new(None),
         })
     }
 }
@@ -207,6 +213,18 @@ impl Observer for OtelObserver {
                         KeyValue::new("model", model.clone()),
                     ],
                 );
+                // Create root span for this agent invocation so child spans
+                // (llm.call, tool.call) can be parented under it.
+                let span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("agent.invocation")
+                        .with_kind(SpanKind::Internal)
+                        .with_attributes(vec![
+                            KeyValue::new("provider", provider.clone()),
+                            KeyValue::new("model", model.clone()),
+                        ]),
+                );
+                let cx = Context::current_with_span(span);
+                *self.active_agent_context.lock().unwrap() = Some(cx);
             }
             ObserverEvent::LlmRequest { .. }
             | ObserverEvent::ToolCallStart { .. }
@@ -219,8 +237,8 @@ impl Observer for OtelObserver {
                 duration,
                 success,
                 error_message: _,
-                input_tokens: _,
-                output_tokens: _,
+                input_tokens,
+                output_tokens,
             } => {
                 let secs = duration.as_secs_f64();
                 let attrs = [
@@ -231,20 +249,43 @@ impl Observer for OtelObserver {
                 self.llm_calls.add(1, &attrs);
                 self.llm_duration.record(secs, &attrs);
 
-                // Create a completed span for visibility in trace backends.
+                // Build span attributes including token usage when available.
+                let mut span_attrs = vec![
+                    KeyValue::new("provider", provider.clone()),
+                    KeyValue::new("model", model.clone()),
+                    KeyValue::new("success", *success),
+                    KeyValue::new("duration_s", secs),
+                ];
+                if let Some(in_tok) = input_tokens {
+                    span_attrs.push(KeyValue::new(
+                        "gen_ai.usage.input_tokens",
+                        *in_tok as i64,
+                    ));
+                }
+                if let Some(out_tok) = output_tokens {
+                    span_attrs.push(KeyValue::new(
+                        "gen_ai.usage.output_tokens",
+                        *out_tok as i64,
+                    ));
+                }
+                if let (Some(in_tok), Some(out_tok)) = (input_tokens, output_tokens) {
+                    span_attrs.push(KeyValue::new(
+                        "gen_ai.usage.total_tokens",
+                        (*in_tok + *out_tok) as i64,
+                    ));
+                }
+
+                // Create child span under the active agent invocation, if any.
                 let start_time = SystemTime::now()
                     .checked_sub(*duration)
                     .unwrap_or(SystemTime::now());
+                let guard = self.active_agent_context.lock().unwrap();
+                let _cx_guard = guard.as_ref().map(|cx| cx.attach());
                 let mut span = tracer.build(
                     opentelemetry::trace::SpanBuilder::from_name("llm.call")
                         .with_kind(SpanKind::Internal)
                         .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("provider", provider.clone()),
-                            KeyValue::new("model", model.clone()),
-                            KeyValue::new("success", *success),
-                            KeyValue::new("duration_s", secs),
-                        ]),
+                        .with_attributes(span_attrs),
                 );
                 if *success {
                     span.set_status(Status::Ok);
@@ -261,28 +302,26 @@ impl Observer for OtelObserver {
                 cost_usd,
             } => {
                 let secs = duration.as_secs_f64();
-                let start_time = SystemTime::now()
-                    .checked_sub(*duration)
-                    .unwrap_or(SystemTime::now());
 
-                // Create a completed span with correct timing
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("agent.invocation")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("provider", provider.clone()),
-                            KeyValue::new("model", model.clone()),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
-                if let Some(t) = tokens_used {
-                    span.set_attribute(KeyValue::new("tokens_used", *t as i64));
+                // End the root agent.invocation span started in AgentStart.
+                {
+                    let mut guard = self.active_agent_context.lock().unwrap();
+                    if let Some(cx) = guard.take() {
+                        if let Some(span) = cx.span() {
+                            if let Some(t) = tokens_used {
+                                span.set_attribute(KeyValue::new("tokens_used", *t as i64));
+                            }
+                            if let Some(c) = cost_usd {
+                                span.set_attribute(KeyValue::new("cost_usd", *c));
+                            }
+                            span.set_attribute(KeyValue::new(
+                                "duration_s",
+                                duration.as_secs_f64(),
+                            ));
+                            span.end();
+                        }
+                    }
                 }
-                if let Some(c) = cost_usd {
-                    span.set_attribute(KeyValue::new("cost_usd", *c));
-                }
-                span.end();
 
                 self.agent_duration.record(
                     secs,
@@ -310,6 +349,9 @@ impl Observer for OtelObserver {
                     Status::error("")
                 };
 
+                // Create child span under the active agent invocation, if any.
+                let guard = self.active_agent_context.lock().unwrap();
+                let _cx_guard = guard.as_ref().map(|cx| cx.attach());
                 let mut span = tracer.build(
                     opentelemetry::trace::SpanBuilder::from_name("tool.call")
                         .with_kind(SpanKind::Internal)
@@ -344,7 +386,9 @@ impl Observer for OtelObserver {
                 self.heartbeat_ticks.add(1, &[]);
             }
             ObserverEvent::Error { component, message } => {
-                // Create an error span for visibility in trace backends
+                // Create error span as child of the active agent invocation, if any.
+                let guard = self.active_agent_context.lock().unwrap();
+                let _cx_guard = guard.as_ref().map(|cx| cx.attach());
                 let mut span = tracer.build(
                     opentelemetry::trace::SpanBuilder::from_name("error")
                         .with_kind(SpanKind::Internal)
@@ -688,6 +732,168 @@ mod tests {
         assert!(
             result.is_ok(),
             "observer creation must succeed even with unreachable endpoint"
+        );
+    }
+
+    // ── Span parent-child relationship tests ────────────────────
+
+    #[test]
+    fn active_agent_context_set_on_start_cleared_on_end() {
+        let obs = test_observer();
+        // Before AgentStart: no active context
+        assert!(
+            obs.active_agent_context.lock().unwrap().is_none(),
+            "active context should be None before AgentStart"
+        );
+
+        obs.record_event(&ObserverEvent::AgentStart {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+        });
+        // After AgentStart: active context exists
+        assert!(
+            obs.active_agent_context.lock().unwrap().is_some(),
+            "active context should be Some after AgentStart"
+        );
+
+        obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(100),
+            tokens_used: None,
+            cost_usd: None,
+        });
+        // After AgentEnd: active context cleared
+        assert!(
+            obs.active_agent_context.lock().unwrap().is_none(),
+            "active context should be None after AgentEnd"
+        );
+    }
+
+    #[test]
+    fn child_events_without_agent_start_do_not_panic() {
+        // Verify backward compatibility: events without AgentStart still work
+        let obs = test_observer();
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(250),
+            success: true,
+            error_message: None,
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+        });
+        obs.record_event(&ObserverEvent::ToolCall {
+            tool: "shell".into(),
+            duration: Duration::from_millis(10),
+            success: true,
+        });
+        obs.record_event(&ObserverEvent::Error {
+            component: "provider".into(),
+            message: "timeout".into(),
+        });
+    }
+
+    #[test]
+    fn full_agent_lifecycle_with_parenting() {
+        let obs = test_observer();
+        // Simulate a complete agent invocation lifecycle
+        obs.record_event(&ObserverEvent::AgentStart {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+        });
+        obs.record_event(&ObserverEvent::LlmRequest {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            messages_count: 3,
+        });
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(250),
+            success: true,
+            error_message: None,
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+        });
+        obs.record_event(&ObserverEvent::ToolCallStart {
+            tool: "shell".into(),
+            arguments: None,
+        });
+        obs.record_event(&ObserverEvent::ToolCall {
+            tool: "shell".into(),
+            duration: Duration::from_millis(10),
+            success: true,
+        });
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(300),
+            success: true,
+            error_message: None,
+            input_tokens: Some(200),
+            output_tokens: Some(80),
+        });
+        obs.record_event(&ObserverEvent::Error {
+            component: "provider".into(),
+            message: "retryable timeout".into(),
+        });
+        obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(800),
+            tokens_used: Some(430),
+            cost_usd: Some(0.003),
+        });
+        // After full lifecycle: active context is cleared
+        assert!(
+            obs.active_agent_context.lock().unwrap().is_none(),
+            "active context should be cleared after AgentEnd"
+        );
+    }
+
+    #[test]
+    fn agent_end_without_start_does_not_panic() {
+        // Edge case: AgentEnd arrives without a preceding AgentStart
+        let obs = test_observer();
+        obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "openrouter".into(),
+            model: "claude-sonnet".into(),
+            duration: Duration::from_millis(100),
+            tokens_used: None,
+            cost_usd: None,
+        });
+    }
+
+    #[test]
+    fn consecutive_agent_invocations() {
+        // Multiple agent invocations in sequence
+        let obs = test_observer();
+        for i in 0..3 {
+            obs.record_event(&ObserverEvent::AgentStart {
+                provider: "openrouter".into(),
+                model: format!("model-{i}"),
+            });
+            obs.record_event(&ObserverEvent::LlmResponse {
+                provider: "openrouter".into(),
+                model: format!("model-{i}"),
+                duration: Duration::from_millis(100),
+                success: true,
+                error_message: None,
+                input_tokens: Some(50),
+                output_tokens: Some(25),
+            });
+            obs.record_event(&ObserverEvent::AgentEnd {
+                provider: "openrouter".into(),
+                model: format!("model-{i}"),
+                duration: Duration::from_millis(200),
+                tokens_used: Some(75),
+                cost_usd: None,
+            });
+        }
+        assert!(
+            obs.active_agent_context.lock().unwrap().is_none(),
+            "active context should be cleared after all invocations"
         );
     }
 }
