@@ -989,15 +989,6 @@ impl SecurityPolicy {
 
         let risk = self.command_risk_level(command);
 
-        // When the operator has set `allowed_commands = ["*"]` AND explicitly
-        // disabled `block_high_risk_commands`, they have opted out of all
-        // command-level restrictions.  Short-circuit: skip the risk and
-        // autonomy gates entirely.  See #4485.
-        let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
-        if has_wildcard && !self.block_high_risk_commands {
-            return Ok(risk);
-        }
-
         if risk == CommandRiskLevel::High {
             if self.block_high_risk_commands && !self.is_command_explicitly_allowed(command) {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
@@ -1087,6 +1078,15 @@ impl SecurityPolicy {
     pub fn is_command_allowed(&self, command: &str) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
             return false;
+        }
+
+        // When the operator has explicitly opted out of all command-level
+        // restrictions (wildcard + no high-risk blocking), skip the
+        // subshell/expansion guard entirely. This allows backticks,
+        // $(), heredocs, etc. in trusted environments.
+        let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
+        if has_wildcard && !self.block_high_risk_commands {
+            return true;
         }
 
         // Block subshell/expansion operators — these allow hiding arbitrary
