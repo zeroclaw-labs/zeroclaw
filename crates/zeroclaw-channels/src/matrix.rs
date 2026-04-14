@@ -277,6 +277,19 @@ impl MatrixChannel {
         body.contains(bot_user_id)
     }
 
+    /// Determine whether a message should be filtered (dropped) by the mention gate.
+    /// Returns `true` if the message should be dropped, `false` if it should pass through.
+    ///
+    /// Text messages require an @-mention of the bot. Media messages (image, file,
+    /// audio, video) pass through because they have no text body to check and the
+    /// sender is already validated by allowed_users.
+    fn should_filter_by_mention(is_text_message: bool, body: &str, bot_user_id: &str) -> bool {
+        if !is_text_message {
+            return false;
+        }
+        !Self::body_contains_mention(body, bot_user_id)
+    }
+
     /// Strip the bot's user ID mention from the message body.
     fn strip_mention(body: &str, bot_user_id: &str) -> String {
         body.replace(bot_user_id, "").trim().to_string()
@@ -1066,16 +1079,22 @@ impl Channel for MatrixChannel {
 
                 // Mention gate: in group rooms, require @-mention when mention_only is enabled.
                 // DMs (rooms with ≤2 joined members) bypass this gate.
+                // Media messages (image, file, audio, video) pass through because they
+                // have no text body to check for mentions.
                 if mention_only
                     && !MatrixChannel::is_dm_room(room.joined_members_count())
                 {
                     let bot_id_str = my_user_id.as_str();
+                    let is_text_message = matches!(
+                        &event.content.msgtype,
+                        MessageType::Text(_) | MessageType::Notice(_)
+                    );
                     let body_text = match &event.content.msgtype {
                         MessageType::Text(c) => c.body.as_str(),
                         MessageType::Notice(c) => c.body.as_str(),
                         _ => "",
                     };
-                    if !MatrixChannel::body_contains_mention(body_text, bot_id_str) {
+                    if MatrixChannel::should_filter_by_mention(is_text_message, body_text, bot_id_str) {
                         tracing::debug!(
                             "Matrix: ignoring message (mention_only enabled, no mention of {})",
                             bot_id_str
@@ -2489,5 +2508,45 @@ mod tests {
     fn is_dm_room_group() {
         assert!(!MatrixChannel::is_dm_room(3));
         assert!(!MatrixChannel::is_dm_room(50));
+    }
+
+    #[test]
+    fn mention_gate_allows_media_in_group_room() {
+        // Media messages (image, file, audio, video) have no text body.
+        // They should pass through the mention gate in group rooms
+        // because the sender is already validated by allowed_users.
+        assert!(!MatrixChannel::should_filter_by_mention(
+            false, // not a text message (media)
+            "",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn mention_gate_filters_empty_text_message() {
+        // An empty text message with no mention should still be filtered
+        assert!(MatrixChannel::should_filter_by_mention(
+            true,
+            "",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn mention_gate_filters_text_without_mention() {
+        assert!(MatrixChannel::should_filter_by_mention(
+            true,
+            "hello world",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn mention_gate_passes_text_with_mention() {
+        assert!(!MatrixChannel::should_filter_by_mention(
+            true,
+            "hey @bot:matrix.org what's up",
+            "@bot:matrix.org"
+        ));
     }
 }
