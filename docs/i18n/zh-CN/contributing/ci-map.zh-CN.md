@@ -13,7 +13,7 @@
 - `.github/workflows/ci-run.yml`（`CI`）
     - 目的：Rust 验证（`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets -- -D clippy::correctness`、变更 Rust 行的严格增量代码检查门控、`test`、发布构建冒烟测试）+ 文档变更时的质量检查（`markdownlint` 仅阻塞变更行上的问题；链接检查仅扫描变更行上添加的链接）
     - 附加行为：对于影响 Rust 代码的 PR 和推送，`CI Required Gate` 要求 `lint` + `test` + `build` 全部通过（无 PR 专属构建绕过）
-    - 附加行为：变更 `.github/workflows/**` 的 PR 要求至少一名 `WORKFLOW_OWNER_LOGINS` 中的用户批准（仓库变量 fallback：`theonlyhennygod,JordanTheJet,SimianAstronaut7`）
+    - 附加行为：变更 `.github/workflows/**` 的 PR 要求至少一名 `WORKFLOW_OWNER_LOGINS` 中的用户批准（仓库变量 fallback：`theonlyhennygod,JordanTheJet`）
     - 附加行为：代码检查门控在 `test`/`build` 之前运行；当 PR 上的代码检查/文档门控失败时，CI 会发布带有失败门控名称和本地修复命令的可操作反馈评论
     - 合并门控：`CI Required Gate`
 - `.github/workflows/workflow-sanity.yml`（`Workflow Sanity`）
