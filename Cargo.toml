@@ -227,7 +227,6 @@ libc = "0.2"
 [features]
 default = [
     "agent-runtime",
-    "observability-prometheus",
     "schema-export",
 ]
 
@@ -237,13 +236,12 @@ agent-runtime = [
     "dep:zeroclaw-runtime", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
     "dep:rusqlite",
     "dep:ring", "dep:lru", "dep:chrono-tz", "dep:cron", "dep:glob", "dep:which",
-    "dep:ratatui", "dep:crossterm",
     "dep:tokio-tungstenite", "dep:tokio-socks", "dep:hostname",
     "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots",
     "dep:lettre", "dep:mail-parser", "dep:async-imap",
     "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tower-http", "dep:http-body-util",
     "dep:mime_guess",
-    "gateway", "tui-onboarding",
+    "gateway",
     "channel-email", "channel-telegram", "channel-lark",
     "channel-discord", "channel-slack", "channel-signal",
     "channel-mattermost", "channel-irc", "channel-imessage",
@@ -312,7 +310,7 @@ metrics = ["observability-prometheus"]
 
 # CI meta-feature
 ci-all = [
-    "agent-runtime",
+    "agent-runtime", "tui-onboarding",
     "channel-nostr", "channel-matrix", "whatsapp-web",
     "observability-prometheus", "observability-otel",
     "hardware", "peripheral-rpi",

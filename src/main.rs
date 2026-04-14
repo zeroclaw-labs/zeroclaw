@@ -3311,6 +3311,12 @@ async fn run_tui_if_enabled() -> anyhow::Result<()> {
     Box::pin(tui::run_tui_onboarding()).await
 }
 
+#[cfg(not(feature = "tui-onboarding"))]
+#[allow(clippy::unused_async)]
+async fn run_tui_if_enabled() -> anyhow::Result<()> {
+    anyhow::bail!("TUI onboarding feature is not enabled. Rebuild with --features tui-onboarding")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3563,10 +3569,4 @@ mod tests {
 
         assert!((final_temperature - 0.7).abs() < f64::EPSILON);
     }
-}
-
-#[cfg(not(feature = "tui-onboarding"))]
-#[allow(clippy::unused_async)]
-async fn run_tui_if_enabled() -> anyhow::Result<()> {
-    anyhow::bail!("TUI onboarding feature is not enabled. Rebuild with --features tui-onboarding")
 }

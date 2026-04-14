@@ -87,7 +87,7 @@ libc = "0.2"
 pdf-extract = { version = "0.10", optional = true }
 
 [features]
-default = ["observability-prometheus", "schema-export"]
+default = ["schema-export"]
 observability-prometheus = ["dep:prometheus"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 sandbox-landlock = ["dep:landlock"]
