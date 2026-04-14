@@ -860,10 +860,15 @@ impl BedrockProvider {
         for call in tool_calls {
             let input = serde_json::from_str::<serde_json::Value>(&call.arguments)
                 .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+            // Sanitize tool name: Bedrock requires [a-zA-Z0-9_-]+.
+            // Dots and other characters from legacy session history or old naming
+            // schemes are replaced with underscores at the replay boundary so that
+            // persisted sessions never cause a 400 ValidationException.
+            let safe_name = call.name.replace('.', "_");
             blocks.push(ContentBlock::ToolUse(ToolUseWrapper {
                 tool_use: ToolUseBlock {
                     tool_use_id: call.id,
-                    name: call.name,
+                    name: safe_name,
                     input,
                 },
             }));

@@ -326,9 +326,13 @@ impl AnthropicProvider {
         for call in tool_calls {
             let input = serde_json::from_str::<serde_json::Value>(&call.arguments)
                 .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+            // Sanitize tool name: dots and other legacy-format characters from
+            // persisted session history are replaced with underscores so that
+            // old sessions never cause API validation errors at replay time.
+            let safe_name = call.name.replace('.', "_");
             blocks.push(NativeContentOut::ToolUse {
                 id: call.id,
-                name: call.name,
+                name: safe_name,
                 input,
                 cache_control: None,
             });

@@ -833,15 +833,20 @@ pub fn skills_to_prompt_with_mode(
             if !registered.is_empty() {
                 let _ = writeln!(
                     prompt,
-                    "    <callable_tools hint=\"These are registered as callable tool specs. Invoke them directly by name ({{}}.{{}}) instead of using shell.\">"
+                    "    <callable_tools hint=\"These are registered as callable tool specs. Invoke them directly by their exact name instead of using shell.\">"
                 );
                 for tool in &registered {
                     let _ = writeln!(prompt, "      <tool>");
+                    // Use the same sanitized name as the registered tool spec:
+                    // hyphens and dots replaced with underscores, skill and tool
+                    // joined with double underscore (e.g. medeo_video__medeo_video).
+                    let safe_skill = skill.name.replace('-', "_").replace('.', "_");
+                    let safe_tool = tool.name.replace('-', "_").replace('.', "_");
                     write_xml_text_element(
                         &mut prompt,
                         8,
                         "name",
-                        &format!("{}.{}", skill.name, tool.name),
+                        &format!("{}__{}", safe_skill, safe_tool),
                     );
                     write_xml_text_element(&mut prompt, 8, "description", &tool.description);
                     let _ = writeln!(prompt, "      </tool>");
