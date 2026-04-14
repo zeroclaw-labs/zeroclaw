@@ -8,6 +8,7 @@ pub struct ReadSkillTool {
     workspace_dir: PathBuf,
     open_skills_enabled: bool,
     open_skills_dir: Option<String>,
+    allow_scripts: bool,
 }
 
 impl ReadSkillTool {
@@ -15,11 +16,13 @@ impl ReadSkillTool {
         workspace_dir: PathBuf,
         open_skills_enabled: bool,
         open_skills_dir: Option<String>,
+        allow_scripts: bool,
     ) -> Self {
         Self {
             workspace_dir,
             open_skills_enabled,
             open_skills_dir,
+            allow_scripts,
         }
     }
 }
@@ -59,6 +62,7 @@ impl Tool for ReadSkillTool {
             &self.workspace_dir,
             self.open_skills_enabled,
             self.open_skills_dir.as_deref(),
+            self.allow_scripts,
         );
 
         let Some(skill) = skills
@@ -118,7 +122,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_tool(tmp: &TempDir) -> ReadSkillTool {
-        ReadSkillTool::new(tmp.path().join("workspace"), false, None)
+        ReadSkillTool::new(tmp.path().join("workspace"), false, None, false)
     }
 
     #[tokio::test]
