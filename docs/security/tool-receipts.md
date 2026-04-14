@@ -30,7 +30,7 @@ Both options default to `false` — no behavioral change for existing users.
    receipt = HMAC-SHA256(key, tool_name | args | result | timestamp)
    ```
 3. The receipt is appended to the tool result as `[receipt: zc-receipt-{timestamp}-{hash}]` before the result is returned to the LLM.
-4. The system prompt instructs the LLM to preserve receipts verbatim when referencing tool results.
+4. *(Planned — not yet implemented)* The system prompt will instruct the LLM to preserve receipts verbatim when referencing tool results. This is tracked alongside config activation in the follow-up.
 
 ### Receipt format
 
@@ -86,7 +86,7 @@ Tool receipts:
 
 ### Inline in LLM responses
 
-The system prompt instructs the LLM to echo receipts when referencing tool results. These appear inline in the response. The leak detector is configured to NOT redact `zc-receipt-` tokens.
+*(Planned — not yet implemented)* The system prompt will instruct the LLM to echo receipts when referencing tool results. The leak detector is already configured to NOT redact `zc-receipt-` tokens in preparation for this.
 
 ### LLM-echoed receipt blocks
 
@@ -105,10 +105,10 @@ The LLM may independently include a `Tool receipts:` block in its response text 
 
 ## Current limitations
 
+- **Config activation pending**: The `[agent.tool_receipts]` config section is not yet wired. Setting these keys currently has no effect. Receipts are controlled programmatically via the `ReceiptGenerator` API. Config-driven activation and system-prompt injection are tracked as a follow-up.
 - **Passive only**: Receipts are generated and logged but not validated against LLM responses. The system does not block responses with missing or invalid receipts.
 - **No persistent audit**: Receipts are in debug logs and conversation history but not stored in a queryable database.
 - **No cross-session verification**: Ephemeral keys mean receipts cannot be verified after the session ends.
-- **Config activation pending**: The `[agent.tool_receipts]` config section is not yet wired. Receipts are currently controlled programmatically via the `ReceiptGenerator` API. Config-driven activation is tracked as a follow-up.
 
 ---
 
