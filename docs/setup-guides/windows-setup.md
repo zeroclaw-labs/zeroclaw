@@ -62,15 +62,17 @@ ZeroClaw uses Cargo feature flags to control which integrations are compiled in:
 
 | Feature | Description | Default? |
 |---------|-------------|----------|
-| `channel-lark` | Lark/Feishu messaging | Yes |
-| `channel-nostr` | Nostr protocol | Yes |
+| `agent-runtime` | Full agent loop, channels, tools, security | Yes |
 | `observability-prometheus` | Prometheus metrics | Yes |
-| `skill-creation` | Auto skill creation | Yes |
+| `schema-export` | JSON Schema generation for config | Yes |
 | `channel-matrix` | Matrix protocol | No |
+| `channel-lark` | Lark/Feishu messaging | No |
+| `channel-nostr` | Nostr protocol | No |
 | `browser-native` | Headless browser | No |
 | `hardware` | USB device support | No |
 | `rag-pdf` | PDF extraction for RAG | No |
 | `observability-otel` | OpenTelemetry | No |
+| `plugins-wasm` | WASM plugin system | No |
 
 To build with specific features:
 

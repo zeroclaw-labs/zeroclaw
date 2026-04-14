@@ -2873,14 +2873,11 @@ async fn process_channel_message(
             let reply_target = msg.reply_target.clone();
             let draft_id = draft_id_ref.to_string();
             Some(tokio::spawn(async move {
-                use zeroclaw_runtime::agent::loop_::DraftEvent;
+                use zeroclaw_runtime::agent::loop_::StreamDelta;
                 let mut accumulated = String::new();
                 while let Some(event) = rx.recv().await {
                     match event {
-                        DraftEvent::Clear => {
-                            accumulated.clear();
-                        }
-                        DraftEvent::Progress(text) => {
+                        StreamDelta::Status(text) => {
                             let visible = strip_think_tags_inline(&text);
                             if let Err(e) = channel
                                 .update_draft_progress(&reply_target, &draft_id, &visible)
@@ -2889,7 +2886,7 @@ async fn process_channel_message(
                                 tracing::debug!("Draft progress update failed: {e}");
                             }
                         }
-                        DraftEvent::Content(text) => {
+                        StreamDelta::Text(text) => {
                             accumulated.push_str(&text);
                             let visible = strip_think_tags_inline(&accumulated);
                             if let Err(e) = channel
@@ -3991,6 +3988,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     mx.access_token.clone(),
                     mx.room_id.clone(),
                     mx.allowed_users.clone(),
+                    mx.mention_only,
                 )))
             }
             #[cfg(not(feature = "channel-matrix"))]
@@ -4471,6 +4469,7 @@ fn collect_configured_channels(
                         mx.device_id.clone(),
                         config.config_path.parent().map(|path| path.to_path_buf()),
                         mx.recovery_key.clone(),
+                        mx.mention_only,
                     )
                     .with_streaming(
                         mx.stream_mode,
@@ -10349,6 +10348,41 @@ This is an example JSON object for profile settings."#;
             channels
                 .iter()
                 .any(|entry| entry.channel.name() == "mattermost")
+        );
+    }
+
+    #[cfg(feature = "channel-email")]
+    #[test]
+    fn collect_configured_channels_skips_disabled_email() {
+        let mut config = Config::default();
+        config.channels_config.email = Some(zeroclaw_config::scattered_types::EmailConfig {
+            enabled: false,
+            ..Default::default()
+        });
+
+        let channels = collect_configured_channels(&config, "test");
+        assert!(
+            !channels.iter().any(|entry| entry.display_name == "Email"),
+            "disabled email should not be collected"
+        );
+    }
+
+    #[cfg(feature = "channel-voice-call")]
+    #[test]
+    fn collect_configured_channels_skips_disabled_voice_call() {
+        let mut config = Config::default();
+        config.channels_config.voice_call =
+            Some(zeroclaw_config::scattered_types::VoiceCallConfig {
+                enabled: false,
+                ..Default::default()
+            });
+
+        let channels = collect_configured_channels(&config, "test");
+        assert!(
+            !channels
+                .iter()
+                .any(|entry| entry.display_name == "Voice Call"),
+            "disabled voice-call should not be collected"
         );
     }
 
