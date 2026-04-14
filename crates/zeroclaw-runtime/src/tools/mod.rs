@@ -23,6 +23,7 @@ pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
 pub mod file_read;
+pub mod model_spawn;
 pub mod model_switch;
 pub mod read_skill;
 pub mod schedule;
@@ -121,6 +122,7 @@ pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
 pub use file_read::FileReadTool;
+pub use model_spawn::ModelSpawnTool;
 pub use model_switch::ModelSwitchTool;
 pub use read_skill::ReadSkillTool;
 pub use schedule::ScheduleTool;
@@ -408,6 +410,17 @@ pub fn all_tools_with_runtime(
             root_config.default_temperature,
             root_config.api_key.clone(),
             llm_task_runtime_options,
+        )));
+    }
+
+    // model_spawn — live session model switching and ephemeral spawns
+    {
+        let spawn_runtime_options =
+            zeroclaw_providers::provider_runtime_options_from_config(root_config);
+        tool_arcs.push(Arc::new(ModelSpawnTool::new(
+            security.clone(),
+            root_config.api_key.clone(),
+            spawn_runtime_options,
         )));
     }
 
