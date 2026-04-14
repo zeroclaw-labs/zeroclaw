@@ -10,7 +10,7 @@ use matrix_sdk::{
         events::reaction::ReactionEventContent,
         events::receipt::ReceiptThread,
         events::relation::{Annotation, Thread},
-        events::room::{EncryptedFile, MediaSource},
+        events::room::MediaSource,
         events::room::member::StrippedRoomMemberEvent,
         events::room::message::{
             MessageType, OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata,
@@ -2530,7 +2530,7 @@ mod tests {
 
     // ── extract_media_info tests ────────────────────────────────────
 
-    fn make_encrypted_file() -> EncryptedFile {
+    fn make_encrypted_file() -> matrix_sdk::ruma::events::room::EncryptedFile {
         serde_json::from_value(serde_json::json!({
             "url": "mxc://matrix.org/encrypted123",
             "key": {
