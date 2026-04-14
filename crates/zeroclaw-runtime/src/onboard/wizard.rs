@@ -1,4 +1,5 @@
 use crate::cli_input::Input;
+// TODO: hardware wizard code moved to zeroclaw-hardware; wire via callback
 use anyhow::{Context, Result, bail};
 use console::style;
 use dialoguer::{Confirm, Select};
@@ -19,7 +20,8 @@ use zeroclaw_config::schema::{
     SignalConfig, StreamMode, WhatsAppConfig,
 };
 use zeroclaw_config::schema::{HardwareConfig, HardwareTransport};
-#[cfg(feature = "channel-nostr")]
+// TODO: nostr onboarding disabled until zeroclaw-channels provides it
+#[cfg(any())]
 use zeroclaw_config::schema::{NostrConfig, default_nostr_relays};
 use zeroclaw_memory::{
     default_memory_backend_key, memory_backend_profile, selectable_memory_backends,
@@ -29,35 +31,6 @@ use zeroclaw_providers::{
     is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_zai_alias,
     is_zai_cn_alias,
 };
-
-// ── Wizard callbacks for cross-crate functionality ─────────────
-
-/// Callback type for Nostr key validation: accepts a key string, returns public key hex.
-#[cfg(feature = "channel-nostr")]
-pub type NostrKeyValidator = Box<dyn Fn(&str) -> Result<String>>;
-
-/// Callbacks injected by the binary crate to wire wizard sections whose
-/// implementations live in downstream crates (zeroclaw-hardware, zeroclaw-channels).
-///
-/// NOTE: Transitional bridge — see RFC #5574 Phase 2 D4. This struct will be
-/// replaced when `zeroclaw onboard` integrates with `PluginRegistry::install`.
-#[derive(Default)]
-pub struct WizardCallbacks {
-    /// Full interactive hardware setup flow. When `Some`, the wizard runs
-    /// hardware discovery and configuration; when `None`, hardware is skipped
-    /// and `HardwareConfig::default()` is used.
-    pub hardware_setup: Option<Box<dyn Fn() -> Result<HardwareConfig>>>,
-
-    /// Validate a Nostr private key string (hex or nsec) and return the
-    /// public key hex on success. Requires `nostr-sdk` which lives in
-    /// `zeroclaw-channels`.
-    #[cfg(feature = "channel-nostr")]
-    pub nostr_validate_key: Option<NostrKeyValidator>,
-
-    /// Whether the `whatsapp-web` feature is compiled in. When `true`, the
-    /// wizard shows the WhatsApp Web option without a missing-feature warning.
-    pub whatsapp_web_available: bool,
-}
 
 // ── Project context collected during wizard ──────────────────────
 
@@ -105,7 +78,7 @@ enum InteractiveOnboardingMode {
     UpdateProviderOnly,
 }
 
-pub async fn run_wizard(force: bool, callbacks: WizardCallbacks) -> Result<Config> {
+pub async fn run_wizard(force: bool) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
 
     println!(
@@ -133,7 +106,7 @@ pub async fn run_wizard(force: bool, callbacks: WizardCallbacks) -> Result<Confi
     let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir).await?;
 
     print_step(3, 9, "Channels (How You Talk to ZeroClaw)");
-    let channels_config = setup_channels(None, &callbacks)?;
+    let channels_config = setup_channels(None)?;
 
     print_step(4, 9, "Tunnel (Expose to Internet)");
     let tunnel_config = setup_tunnel()?;
@@ -142,11 +115,7 @@ pub async fn run_wizard(force: bool, callbacks: WizardCallbacks) -> Result<Confi
     let (composio_config, secrets_config) = setup_tool_mode()?;
 
     print_step(6, 9, "Hardware (Physical World)");
-    let hardware_config = if let Some(ref hw_setup) = callbacks.hardware_setup {
-        hw_setup()?
-    } else {
-        HardwareConfig::default()
-    };
+    let hardware_config = setup_hardware()?;
 
     print_step(7, 9, "Memory Configuration");
     let memory_config = setup_memory()?;
@@ -296,7 +265,7 @@ pub async fn run_wizard(force: bool, callbacks: WizardCallbacks) -> Result<Confi
 }
 
 /// Interactive repair flow: rerun channel setup only without redoing full onboarding.
-pub async fn run_channels_repair_wizard(callbacks: WizardCallbacks) -> Result<Config> {
+pub async fn run_channels_repair_wizard() -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
     println!(
         "  {}",
@@ -309,7 +278,7 @@ pub async fn run_channels_repair_wizard(callbacks: WizardCallbacks) -> Result<Co
     let mut config = Box::pin(Config::load_or_init()).await?;
 
     print_step(1, 1, "Channels (How You Talk to ZeroClaw)");
-    config.channels_config = setup_channels(Some(config.channels_config.clone()), &callbacks)?;
+    config.channels_config = setup_channels(Some(config.channels_config.clone()))?;
     config.save().await?;
     persist_workspace_selection(&config.config_path).await?;
 
@@ -3233,6 +3202,198 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
     Ok((composio_config, secrets_config))
 }
 
+// ── Step 6: Hardware (Physical World) ───────────────────────────
+
+// TODO: hardware wizard moved to zeroclaw-hardware; wire via callback in follow-up PR
+#[cfg(any())]
+fn setup_hardware() -> Result<HardwareConfig> {
+    print_bullet("ZeroClaw can talk to physical hardware (LEDs, sensors, motors).");
+    print_bullet("Scanning for connected devices...");
+    println!();
+
+    // ── Auto-discovery ──
+    let devices = hardware::discover_hardware();
+
+    if devices.is_empty() {
+        println!(
+            "  {} {}",
+            style("ℹ").dim(),
+            style("No hardware devices detected on this system.").dim()
+        );
+        println!(
+            "  {} {}",
+            style("ℹ").dim(),
+            style("You can enable hardware later in config.toml under [hardware].").dim()
+        );
+    } else {
+        println!(
+            "  {} {} device(s) found:",
+            style("✓").green().bold(),
+            devices.len()
+        );
+        for device in &devices {
+            let detail = device
+                .detail
+                .as_deref()
+                .map(|d| format!(" ({d})"))
+                .unwrap_or_default();
+            let path = device
+                .device_path
+                .as_deref()
+                .map(|p| format!(" → {p}"))
+                .unwrap_or_default();
+            println!(
+                "    {} {}{}{} [{}]",
+                style("›").cyan(),
+                style(&device.name).green(),
+                style(&detail).dim(),
+                style(&path).dim(),
+                style(device.transport.to_string()).cyan()
+            );
+        }
+    }
+    println!();
+
+    let options = vec![
+        "🚀 Native — direct GPIO on this Linux board (Raspberry Pi, Orange Pi, etc.)",
+        "🔌 Tethered — control an Arduino/ESP32/Nucleo plugged into USB",
+        "🔬 Debug Probe — flash/read MCUs via SWD/JTAG (probe-rs)",
+        "☁️  Software Only — no hardware access (default)",
+    ];
+
+    let recommended = hardware::recommended_wizard_default(&devices);
+
+    let choice = Select::new()
+        .with_prompt("  How should ZeroClaw interact with the physical world?")
+        .items(&options)
+        .default(recommended)
+        .interact()?;
+
+    let mut hw_config = hardware::config_from_wizard_choice(choice, &devices);
+
+    // ── Serial: pick a port if multiple found ──
+    if hw_config.transport_mode() == HardwareTransport::Serial {
+        let serial_devices: Vec<&hardware::DiscoveredDevice> = devices
+            .iter()
+            .filter(|d| d.transport == HardwareTransport::Serial)
+            .collect();
+
+        if serial_devices.len() > 1 {
+            let port_labels: Vec<String> = serial_devices
+                .iter()
+                .map(|d| {
+                    format!(
+                        "{} ({})",
+                        d.device_path.as_deref().unwrap_or("unknown"),
+                        d.name
+                    )
+                })
+                .collect();
+
+            let port_idx = Select::new()
+                .with_prompt("  Multiple serial devices found — select one")
+                .items(&port_labels)
+                .default(0)
+                .interact()?;
+
+            hw_config.serial_port = serial_devices[port_idx].device_path.clone();
+        } else if serial_devices.is_empty() {
+            // User chose serial but no device discovered — ask for manual path
+            let manual_port: String = Input::new()
+                .with_prompt("  Serial port path (e.g. /dev/ttyUSB0)")
+                .default("/dev/ttyUSB0")
+                .interact_text()?;
+            hw_config.serial_port = Some(manual_port);
+        }
+
+        // Baud rate
+        let baud_options = vec![
+            "115200 (default, recommended)",
+            "9600 (legacy Arduino)",
+            "57600",
+            "230400",
+            "Custom",
+        ];
+        let baud_idx = Select::new()
+            .with_prompt("  Serial baud rate")
+            .items(&baud_options)
+            .default(0)
+            .interact()?;
+
+        hw_config.baud_rate = match baud_idx {
+            1 => 9600,
+            2 => 57600,
+            3 => 230_400,
+            4 => {
+                let custom: String = Input::new()
+                    .with_prompt("  Custom baud rate")
+                    .default("115200")
+                    .interact_text()?;
+                custom.parse::<u32>().unwrap_or(115_200)
+            }
+            _ => 115_200,
+        };
+    }
+
+    // ── Probe: ask for target chip ──
+    if hw_config.transport_mode() == HardwareTransport::Probe && hw_config.probe_target.is_none() {
+        let target: String = Input::new()
+            .with_prompt("  Target MCU chip (e.g. STM32F411CEUx, nRF52840_xxAA)")
+            .default("STM32F411CEUx")
+            .interact_text()?;
+        hw_config.probe_target = Some(target);
+    }
+
+    // ── Datasheet RAG ──
+    if hw_config.enabled {
+        let datasheets = Confirm::new()
+            .with_prompt("  Enable datasheet RAG? (index PDF schematics for AI pin lookups)")
+            .default(true)
+            .interact()?;
+        hw_config.workspace_datasheets = datasheets;
+    }
+
+    // ── Summary ──
+    if hw_config.enabled {
+        let transport_label = match hw_config.transport_mode() {
+            HardwareTransport::Native => "Native GPIO".to_string(),
+            HardwareTransport::Serial => format!(
+                "Serial → {} @ {} baud",
+                hw_config.serial_port.as_deref().unwrap_or("?"),
+                hw_config.baud_rate
+            ),
+            HardwareTransport::Probe => format!(
+                "Probe (SWD/JTAG) → {}",
+                hw_config.probe_target.as_deref().unwrap_or("?")
+            ),
+            HardwareTransport::None => "Software Only".to_string(),
+        };
+
+        println!(
+            "  {} Hardware: {} | datasheets: {}",
+            style("✓").green().bold(),
+            style(&transport_label).green(),
+            if hw_config.workspace_datasheets {
+                style("on").green().to_string()
+            } else {
+                style("off").dim().to_string()
+            }
+        );
+    } else {
+        println!(
+            "  {} Hardware: {}",
+            style("✓").green().bold(),
+            style("disabled (software only)").dim()
+        );
+    }
+
+    Ok(hw_config)
+}
+
+fn setup_hardware() -> Result<HardwareConfig> {
+    Ok(HardwareConfig::default())
+}
+
 // ── Step 6: Project Context ─────────────────────────────────────
 
 fn setup_project_context() -> Result<ProjectContext> {
@@ -3389,7 +3550,8 @@ enum ChannelMenuChoice {
     QqOfficial,
     Lark,
     Feishu,
-    #[cfg(feature = "channel-nostr")]
+    // TODO: nostr onboarding disabled until zeroclaw-channels provides it
+    #[cfg(any())]
     Nostr,
     Done,
 }
@@ -3410,7 +3572,8 @@ const CHANNEL_MENU_CHOICES: &[ChannelMenuChoice] = &[
     ChannelMenuChoice::QqOfficial,
     ChannelMenuChoice::Lark,
     ChannelMenuChoice::Feishu,
-    #[cfg(feature = "channel-nostr")]
+    // TODO: nostr onboarding disabled until zeroclaw-channels provides it
+    #[cfg(any())]
     ChannelMenuChoice::Nostr,
     ChannelMenuChoice::Done,
 ];
@@ -3420,10 +3583,7 @@ fn channel_menu_choices() -> &'static [ChannelMenuChoice] {
 }
 
 #[allow(clippy::too_many_lines)]
-fn setup_channels(
-    existing: Option<ChannelsConfig>,
-    callbacks: &WizardCallbacks,
-) -> Result<ChannelsConfig> {
+fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
     print_bullet("Channels let you talk to ZeroClaw from anywhere.");
     print_bullet("CLI is always available. Connect more channels now.");
     println!();
@@ -3557,7 +3717,8 @@ fn setup_channels(
                         "— Feishu Bot"
                     }
                 ),
-                #[cfg(feature = "channel-nostr")]
+                // TODO: nostr onboarding disabled until zeroclaw-channels provides it
+                #[cfg(any())]
                 ChannelMenuChoice::Nostr => format!(
                     "Nostr {}",
                     if config.nostr.is_some() {
@@ -4362,7 +4523,10 @@ fn setup_channels(
                     .interact()?;
 
                 if mode_idx == 0 {
-                    if !callbacks.whatsapp_web_available {
+                    // Compile-time check: warn early if the feature is not enabled.
+                    // TODO: whatsapp-web feature moved to zeroclaw-channels
+                    #[cfg(any())]
+                    {
                         println!();
                         println!(
                             "  {} {}",
@@ -4911,6 +5075,10 @@ fn setup_channels(
                     allowed_users,
                     proxy_url: existing_nc.and_then(|n| n.proxy_url.clone()),
                     bot_name: existing_nc.and_then(|n| n.bot_name.clone()),
+                    stream_mode: existing_nc.map(|n| n.stream_mode).unwrap_or_default(),
+                    draft_update_interval_ms: existing_nc
+                        .map(|n| n.draft_update_interval_ms)
+                        .unwrap_or(1000),
                 });
 
                 println!("  {} Nextcloud Talk configured", style("✅").green().bold());
@@ -5270,7 +5438,8 @@ fn setup_channels(
                     proxy_url: existing_lk.and_then(|l| l.proxy_url.clone()),
                 });
             }
-            #[cfg(feature = "channel-nostr")]
+            // TODO: nostr onboarding disabled until zeroclaw-channels provides it
+            #[cfg(any())]
             ChannelMenuChoice::Nostr => {
                 // ── Nostr ──
                 println!();
@@ -5292,30 +5461,22 @@ fn setup_channels(
                     continue;
                 }
 
-                // Validate the key via callback (requires nostr-sdk in zeroclaw-channels)
-                if let Some(ref validate) = callbacks.nostr_validate_key {
-                    match validate(private_key.trim()) {
-                        Ok(pubkey_hex) => {
-                            println!(
-                                "  {} Key valid — public key: {}",
-                                style("✅").green().bold(),
-                                style(&pubkey_hex).cyan()
-                            );
-                        }
-                        Err(_) => {
-                            println!(
-                                "  {} Invalid private key — check format and try again",
-                                style("❌").red().bold()
-                            );
-                            continue;
-                        }
+                // Validate the key immediately
+                match nostr_sdk::Keys::parse(private_key.trim()) {
+                    Ok(keys) => {
+                        println!(
+                            "  {} Key valid — public key: {}",
+                            style("✅").green().bold(),
+                            style(keys.public_key().to_hex()).cyan()
+                        );
                     }
-                } else {
-                    println!(
-                        "  {} Key validation unavailable in this build — skipping",
-                        style("⚠").yellow().bold()
-                    );
-                    continue;
+                    Err(_) => {
+                        println!(
+                            "  {} Invalid private key — check format and try again",
+                            style("❌").red().bold()
+                        );
+                        continue;
+                    }
                 }
 
                 let default_relays = default_nostr_relays().join(",");
@@ -7687,6 +7848,8 @@ mod tests {
             allowed_users: vec!["*".into()],
             proxy_url: None,
             bot_name: None,
+            stream_mode: zeroclaw_config::schema::StreamMode::default(),
+            draft_update_interval_ms: 1000,
         });
         assert!(has_launchable_channels(&channels));
 
