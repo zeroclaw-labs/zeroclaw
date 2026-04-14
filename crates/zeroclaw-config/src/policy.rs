@@ -2688,6 +2688,59 @@ mod tests {
     }
 
     #[test]
+    fn pythonpath_prefix_with_python3_in_allowlist() {
+        // PYTHONPATH=path python3 script.py is the idiomatic POSIX env-var
+        // prefix form that LLMs produce for Python skill invocations.
+        // The policy must recognise python3 as the actual executable (not
+        // PYTHONPATH=... as the command name) and allow it when python3 is
+        // in the allowlist.
+        let p = SecurityPolicy {
+            allowed_commands: vec![
+                "python3".into(),
+                "ls".into(),
+            ],
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            p.is_command_allowed(
+                "PYTHONPATH=/home/pi/investorclaw python3 /home/pi/investorclaw/commands/fetch.py"
+            ),
+            "PYTHONPATH=... python3 ... must be allowed when python3 is in the allowlist"
+        );
+    }
+
+    #[test]
+    fn pythonpath_prefix_without_python3_in_allowlist() {
+        // When python3 is absent from allowed_commands (as in the default
+        // rpi-config.toml before this fix), the command must be blocked.
+        // The error must mention the blocked command, not PYTHONPATH=... as
+        // if it were the executable.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["ls".into(), "echo".into()],
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            !p.is_command_allowed(
+                "PYTHONPATH=/home/pi/investorclaw python3 /home/pi/investorclaw/commands/fetch.py"
+            ),
+            "PYTHONPATH=... python3 ... must be blocked when python3 is not in the allowlist"
+        );
+        // validate_command_execution must surface a useful error message
+        let err = p
+            .validate_command_execution(
+                "PYTHONPATH=/home/pi/investorclaw python3 /home/pi/investorclaw/commands/fetch.py",
+                true,
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("not allowed"),
+            "error should say 'not allowed', got: {err}"
+        );
+    }
+
+    #[test]
     fn forbidden_path_argument_detects_absolute_path() {
         let p = default_policy();
         assert_eq!(

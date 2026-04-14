@@ -1,11 +1,16 @@
 //! Auto-detection of available security features
 
 use crate::security::traits::Sandbox;
+use std::path::Path;
 use std::sync::Arc;
 use zeroclaw_config::schema::{SandboxBackend, SecurityConfig};
 
-/// Create a sandbox based on auto-detection or explicit config
-pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
+/// Create a sandbox based on auto-detection or explicit config.
+///
+/// `workspace_dir` is forwarded to the Docker sandbox so it can bind-mount
+/// the workspace into the container.  Pass `None` when the workspace path is
+/// not yet known (e.g. in unit tests).
+pub fn create_sandbox(config: &SecurityConfig, workspace_dir: Option<&Path>) -> Arc<dyn Sandbox> {
     let backend = &config.sandbox.backend;
 
     // If explicitly disabled, return noop
@@ -58,7 +63,12 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Docker => {
-            if let Ok(sandbox) = super::docker::DockerSandbox::new() {
+            let result = if let Some(ws) = workspace_dir {
+                super::docker::DockerSandbox::new_with_workspace(ws.to_path_buf())
+            } else {
+                super::docker::DockerSandbox::new()
+            };
+            if let Ok(sandbox) = result {
                 return Arc::new(sandbox);
             }
             tracing::warn!("Docker requested but not available, falling back to application-layer");
@@ -78,13 +88,13 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
         }
         SandboxBackend::Auto | SandboxBackend::None => {
             // Auto-detect best available
-            detect_best_sandbox()
+            detect_best_sandbox(workspace_dir)
         }
     }
 }
 
 /// Auto-detect the best available sandbox
-fn detect_best_sandbox() -> Arc<dyn Sandbox> {
+fn detect_best_sandbox(workspace_dir: Option<&Path>) -> Arc<dyn Sandbox> {
     #[cfg(target_os = "linux")]
     {
         // Try Landlock first (native, no dependencies)
@@ -122,7 +132,12 @@ fn detect_best_sandbox() -> Arc<dyn Sandbox> {
     }
 
     // Docker is heavy but works everywhere if docker is installed
-    if let Ok(sandbox) = super::docker::DockerSandbox::probe() {
+    let docker_result = if let Some(ws) = workspace_dir {
+        super::docker::DockerSandbox::new_with_workspace(ws.to_path_buf())
+    } else {
+        super::docker::DockerSandbox::probe()
+    };
+    if let Ok(sandbox) = docker_result {
         tracing::info!("Docker sandbox enabled");
         return Arc::new(sandbox);
     }
@@ -139,7 +154,7 @@ mod tests {
 
     #[test]
     fn detect_best_sandbox_returns_something() {
-        let sandbox = detect_best_sandbox();
+        let sandbox = detect_best_sandbox(None);
         // Should always return at least NoopSandbox
         assert!(sandbox.is_available());
     }
@@ -154,7 +169,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let sandbox = create_sandbox(&config);
+        let sandbox = create_sandbox(&config, None);
         assert_eq!(sandbox.name(), "none");
     }
 
@@ -168,7 +183,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let sandbox = create_sandbox(&config);
+        let sandbox = create_sandbox(&config, None);
         // Should return some sandbox (at least NoopSandbox)
         assert!(sandbox.is_available());
     }
