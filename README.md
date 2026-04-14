@@ -447,6 +447,12 @@ zeroclaw skills audit https://github.com/user/my-skill.git
 zeroclaw skills remove my-skill
 ```
 
+**Community skills** ([SKILL.md](https://agentskills.io) standard):
+
+| Skill | Description |
+|-------|-------------|
+| [mmx-cli](https://github.com/MiniMax-AI/cli) | Generate text, images, video, speech, and music via MiniMax AI |
+
 ## CLI commands
 
 ```bash
