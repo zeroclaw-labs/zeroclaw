@@ -1,19 +1,43 @@
 [workspace]
-members = [".", "crates/robot-kit", "crates/aardvark-sys", "apps/tauri"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri"]
 resolver = "2"
+
+[workspace.package]
+version = "0.6.9"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zeroclaw-labs/zeroclaw"
+rust-version = "1.87"
+
+[workspace.dependencies]
+zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.6.9" }
+zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.6.9" }
+zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.6.9", default-features = false }
+zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.6.9" }
+zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.6.9" }
+zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.6.9", default-features = false }
+zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.6.9" }
+zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.6.9", default-features = false }
+zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.6.9" }
+zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.6.9" }
+zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.6.9" }
+zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.6.9" }
+zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.6.9" }
+zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.6.9" }
+aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 
 [package]
 name = "zeroclawlabs"
-version = "0.6.8"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 authors = ["theonlyhennygod"]
-license = "MIT OR Apache-2.0"
+license.workspace = true
 description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
-repository = "https://github.com/zeroclaw-labs/zeroclaw"
+repository.workspace = true
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
-rust-version = "1.87"
+rust-version.workspace = true
 include = [
   "/src/**/*",
   "/build.rs",
@@ -34,6 +58,21 @@ name = "zeroclaw"
 path = "src/lib.rs"
 
 [dependencies]
+# Internal workspace crates — versions and paths declared once in [workspace.dependencies]
+zeroclaw-api.workspace = true
+zeroclaw-infra.workspace = true
+zeroclaw-config.workspace = true
+zeroclaw-providers.workspace = true
+zeroclaw-memory.workspace = true
+zeroclaw-channels = { workspace = true, optional = true }
+zeroclaw-tools = { workspace = true, optional = true }
+zeroclaw-runtime = { workspace = true, optional = true }
+zeroclaw-tui = { workspace = true, optional = true }
+zeroclaw-plugins = { workspace = true, optional = true }
+zeroclaw-gateway = { workspace = true, optional = true }
+zeroclaw-hardware = { workspace = true, optional = true }
+zeroclaw-tool-call-parser.workspace = true
+zeroclaw-macros.workspace = true
 # CLI - minimal and fast
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
@@ -45,9 +84,6 @@ tokio-stream = { version = "0.1.18", default-features = false, features = ["fs",
 
 # HTTP client - minimal features
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
-
-# Matrix client + E2EE decryption
-matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown", "sqlite"] }
 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
@@ -65,9 +101,6 @@ schemars = "1.2"
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 
-# Observability - Prometheus metrics (optional; requires AtomicU64, unavailable on 32-bit)
-prometheus = { version = "0.14", default-features = false, optional = true }
-
 # Base64 encoding (screenshots, image data)
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
@@ -78,10 +111,6 @@ urlencoding = "2.1"
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"
 
-# Optional Rust-native browser automation backend
-fantoccini = { version = "0.22.1", optional = true, default-features = false, features = ["rustls-tls"] }
-
-# MQTT client for IoT / SOP event fan-in
 rumqttc = "0.24"
 
 # Tarball extraction for binary updates
@@ -94,7 +123,6 @@ indicatif = "0.18"
 # Temp files (update pipeline rollback)
 tempfile = "3.26"
 
-
 # Zip extraction for ClawhHub / OpenClaw registry installers
 zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
 
@@ -103,7 +131,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 
 # Aardvark I2C/SPI/GPIO USB adapter (Total Phase) — stub when SDK absent
-aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
+aardvark-sys.workspace = true
 
 # UUID generation
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
@@ -122,9 +150,6 @@ rand = "0.10"
 # Portable atomic fallbacks for targets without native 64-bit atomics
 portable-atomic = "1"
 
-# serde-big-array for wa-rs storage (large array serialization)
-serde-big-array = { version = "0.5", optional = true }
-
 # Fast mutexes that don't poison on panic
 parking_lot = "0.12"
 
@@ -132,166 +157,168 @@ parking_lot = "0.12"
 async-trait = "0.1"
 
 # HMAC-SHA256 (Zhipu/GLM JWT auth)
-ring = "0.17"
-
-# Protobuf encode/decode (Lark WS frame codec, WhatsApp storage)
-prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
+ring = { version = "0.17", optional = true }
 
 # LRU cache for bounded sender state
-lru = "0.16"
+lru = { version = "0.16", optional = true }
 
-# Memory / persistence
-rusqlite = { version = "0.37", features = ["bundled"] }
+# Memory / persistence (migration.rs, behind agent-runtime)
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
-chrono-tz = "0.10"
-cron = "0.15"
+chrono-tz = { version = "0.10", optional = true }
+cron = { version = "0.15", optional = true }
 
-# Interactive CLI prompts
+# Interactive CLI prompts (memory CLI uses dialoguer unconditionally)
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 console = "0.16"
 
 # TUI onboarding (ratatui + crossterm)
-ratatui = { version = "0.30", default-features = true }
-crossterm = { version = "0.29", features = ["event-stream"] }
+ratatui = { version = "0.30", default-features = true, optional = true }
+crossterm = { version = "0.29", features = ["event-stream"], optional = true }
 
 # Hardware discovery (device path globbing)
-glob = "0.3"
+glob = { version = "0.3", optional = true }
+
+# Nostr key validation for wizard (behind channel-nostr feature)
+nostr-sdk = { version = "0.44", default-features = false, optional = true }
 
 # Binary discovery (init system detection)
-which = "8.0"
+which = { version = "8.0", optional = true }
 
 # WebSocket client channels (Discord/Lark/DingTalk/Nostr)
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
-tokio-socks = "0.5"
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"], optional = true }
+tokio-socks = { version = "0.5", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
-nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "nip59"], optional = true }
 regex = "1.10"
-hostname = "0.4.2"
-rustls = "0.23"
-rustls-pemfile = "2"
-rustls-pki-types = "1.14.0"
-tokio-rustls = "0.26.4"
-webpki-roots = "1.0.6"
+hostname = { version = "0.4.2", optional = true }
+rustls = { version = "0.23", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+rustls-pki-types = { version = "1.14.0", optional = true }
+tokio-rustls = { version = "0.26.4", optional = true }
+webpki-roots = { version = "1.0.6", optional = true }
 
 # email
-lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
-mail-parser = "0.11.2"
-async-imap = { version = "0.11",features = ["runtime-tokio"], default-features = false }
+lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"], optional = true }
+mail-parser = { version = "0.11.2", optional = true }
+async-imap = { version = "0.11", features = ["runtime-tokio"], default-features = false, optional = true }
 
 # HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"] }
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful"] }
-tower = { version = "0.5", default-features = false, features = ["util"] }
-tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"] }
-http-body-util = "0.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"], optional = true }
+hyper = { version = "1", features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful"], optional = true }
+tower = { version = "0.5", default-features = false, features = ["util"], optional = true }
+tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"], optional = true }
+http-body-util = { version = "0.1", optional = true }
 
-# Embed frontend assets into binary (web dashboard)
-rust-embed = "8"
-mime_guess = "2"
+# rust-embed removed — web dashboard served from filesystem via gateway.web_dist_dir
+mime_guess = { version = "2", optional = true }
 
-# OpenTelemetry — OTLP trace + metrics export.
 # Use the blocking HTTP exporter client to avoid Tokio-reactor panics in
-# OpenTelemetry background batch threads when ZeroClaw emits spans/metrics from
 # non-Tokio contexts.
-opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
 
-# Serial port for peripheral communication (STM32, etc.)
-tokio-serial = { version = "5", default-features = false, optional = true }
-
-# USB device enumeration (hardware discovery) — only on platforms nusb supports
 # (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
-[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
-nusb = { version = "0.2", default-features = false, optional = true }
 
-# probe-rs for STM32/Nucleo memory read (Phase B)
-probe-rs = { version = "0.31", optional = true }
-
-# PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
-pdf-extract = { version = "0.10", optional = true }
-
-# WASM plugin runtime (extism)
-extism = { version = "1.20", optional = true }
-
-# Cross-platform audio capture for voice wake word detection (optional, enable with --features voice-wake)
-cpal = { version = "0.15", optional = true }
-
-# Terminal QR rendering for WhatsApp Web pairing flow.
-qrcode = { version = "0.14", optional = true }
-
-# WhatsApp Web client (wa-rs) — optional, enable with --features whatsapp-web
 # Uses wa-rs for Bot and Client, wa-rs-core for storage traits, custom rusqlite backend avoids Diesel conflict.
-wa-rs = { version = "0.2", optional = true, default-features = false }
-wa-rs-core = { version = "0.2", optional = true, default-features = false }
-wa-rs-binary = { version = "0.2", optional = true, default-features = false }
-wa-rs-proto = { version = "0.2", optional = true, default-features = false }
-wa-rs-ureq-http = { version = "0.2", optional = true }
-wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = false }
-
-# Raspberry Pi GPIO / Landlock (Linux only) — target-specific to avoid compile failure on macOS
-[target.'cfg(target_os = "linux")'.dependencies]
-rppal = { version = "0.22", optional = true }
-landlock = { version = "0.4", optional = true }
 
 # Unix-specific dependencies (for root check, etc.)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [features]
-default = ["observability-prometheus", "skill-creation"]
-channel-nostr = ["dep:nostr-sdk"]
-hardware = ["nusb", "tokio-serial"]
-channel-matrix = ["dep:matrix-sdk"]
-channel-lark = ["dep:prost"]
-channel-feishu = ["channel-lark"]  # Alias for Feishu users (Lark and Feishu are the same platform)
-observability-prometheus = ["dep:prometheus"]
-observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
-peripheral-rpi = ["rppal"]
-# Browser backend feature alias used by cfg(feature = "browser-native")
-browser-native = ["dep:fantoccini"]
-# Backward-compatible alias for older invocations
-fantoccini = ["browser-native"]
-# Sandbox feature aliases used by cfg(feature = "sandbox-*")
-sandbox-landlock = ["dep:landlock"]
-sandbox-bubblewrap = []
-# Backward-compatible alias for older invocations
-landlock = ["sandbox-landlock"]
-# Prometheus metrics observer (requires 64-bit atomics; disable on 32-bit targets)
-metrics = ["observability-prometheus"]
-# probe = probe-rs for Nucleo memory read (adds ~50 deps; optional)
-probe = ["dep:probe-rs"]
-# rag-pdf = PDF ingestion for datasheet RAG
-rag-pdf = ["dep:pdf-extract"]
-# skill-creation = Autonomous skill creation from successful multi-step tasks
-skill-creation = []
-# whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
-whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
-# voice-wake = Voice wake word detection via microphone (cpal)
-voice-wake = ["dep:cpal"]
-# WASM plugin system (extism-based)
-plugins-wasm = ["dep:extism"]
-# WebAuthn / FIDO2 hardware key authentication
-webauthn = []
-# Meta-feature for CI: all features except those requiring system C libraries
-# not available on standard CI runners (e.g., voice-wake needs libasound2-dev).
-ci-all = [
-    "channel-nostr",
-    "hardware",
-    "channel-matrix",
-    "channel-lark",
+default = [
+    "agent-runtime",
     "observability-prometheus",
-    "observability-otel",
-    "peripheral-rpi",
-    "browser-native",
-    "sandbox-landlock",
-    "sandbox-bubblewrap",
-    "probe",
-    "rag-pdf",
-    "skill-creation",
-    "whatsapp-web",
-    "plugins-wasm",
+    "schema-export",
+]
+
+# The full agent runtime — agent loop, channels, tools, gateway, TUI, all subsystems.
+# Without this, you get the kernel: config + providers + memory + CLI chat.
+agent-runtime = [
+    "dep:zeroclaw-runtime", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
+    "dep:rusqlite",
+    "dep:ring", "dep:lru", "dep:chrono-tz", "dep:cron", "dep:glob", "dep:which",
+    "dep:ratatui", "dep:crossterm",
+    "dep:tokio-tungstenite", "dep:tokio-socks", "dep:hostname",
+    "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots",
+    "dep:lettre", "dep:mail-parser", "dep:async-imap",
+    "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tower-http", "dep:http-body-util",
+    "dep:mime_guess",
+    "gateway", "tui-onboarding",
+    "channel-email", "channel-telegram", "channel-lark",
+    "channel-discord", "channel-slack", "channel-signal",
+    "channel-mattermost", "channel-irc", "channel-imessage",
+    "channel-dingtalk", "channel-qq", "channel-bluesky",
+    "channel-twitter", "channel-reddit", "channel-notion",
+    "channel-linq", "channel-wati", "channel-nextcloud",
+    "channel-mochat", "channel-wecom", "channel-clawdtalk",
+    "channel-webhook", "channel-acp-server", "channel-whatsapp-cloud",
+    "channel-voice-call",
+]
+
+# Major subsystems — each forwards to exactly ONE crate
+gateway = ["dep:zeroclaw-gateway"]
+tui-onboarding = ["dep:zeroclaw-tui"]
+schema-export = ["zeroclaw-config/schema-export"]
+
+# Channels — each forwards directly to zeroclaw-channels (1 hop)
+channel-email = ["zeroclaw-channels/channel-email"]
+channel-telegram = ["zeroclaw-channels/channel-telegram"]
+channel-lark = ["zeroclaw-channels/channel-lark"]
+channel-nostr = ["zeroclaw-channels/channel-nostr", "zeroclaw-runtime/channel-nostr", "dep:nostr-sdk"]
+channel-matrix = ["zeroclaw-channels/channel-matrix"]
+channel-discord = ["zeroclaw-channels/channel-discord"]
+channel-slack = ["zeroclaw-channels/channel-slack"]
+channel-signal = ["zeroclaw-channels/channel-signal"]
+channel-mattermost = ["zeroclaw-channels/channel-mattermost"]
+channel-irc = ["zeroclaw-channels/channel-irc"]
+channel-imessage = ["zeroclaw-channels/channel-imessage"]
+channel-dingtalk = ["zeroclaw-channels/channel-dingtalk"]
+channel-qq = ["zeroclaw-channels/channel-qq"]
+channel-bluesky = ["zeroclaw-channels/channel-bluesky"]
+channel-twitter = ["zeroclaw-channels/channel-twitter"]
+channel-reddit = ["zeroclaw-channels/channel-reddit"]
+channel-notion = ["zeroclaw-channels/channel-notion"]
+channel-linq = ["zeroclaw-channels/channel-linq"]
+channel-wati = ["zeroclaw-channels/channel-wati"]
+channel-nextcloud = ["zeroclaw-channels/channel-nextcloud"]
+channel-mochat = ["zeroclaw-channels/channel-mochat"]
+channel-wecom = ["zeroclaw-channels/channel-wecom"]
+channel-clawdtalk = ["zeroclaw-channels/channel-clawdtalk"]
+channel-webhook = ["zeroclaw-channels/channel-webhook"]
+channel-acp-server = ["zeroclaw-channels/channel-acp-server"]
+channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
+channel-voice-call = ["zeroclaw-channels/channel-voice-call"]
+channel-feishu = ["channel-lark"]
+whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
+voice-wake = ["zeroclaw-channels/voice-wake"]
+
+# Backends and platform flags — each forwards to ONE crate
+observability-prometheus = ["zeroclaw-runtime/observability-prometheus"]
+observability-otel = ["zeroclaw-runtime/observability-otel"]
+hardware = ["dep:zeroclaw-hardware", "zeroclaw-hardware/hardware"]
+peripheral-rpi = ["dep:zeroclaw-hardware", "zeroclaw-hardware/peripheral-rpi"]
+sandbox-landlock = ["zeroclaw-runtime/sandbox-landlock"]
+sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
+browser-native = ["zeroclaw-tools/browser-native"]
+plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-runtime/plugins-wasm"]
+probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
+rag-pdf = ["zeroclaw-tools/rag-pdf"]
+webauthn = ["zeroclaw-runtime/webauthn"]
+
+# Backward-compatible aliases
+fantoccini = ["browser-native"]
+landlock = ["sandbox-landlock"]
+metrics = ["observability-prometheus"]
+
+# CI meta-feature
+ci-all = [
+    "agent-runtime",
+    "channel-nostr", "channel-matrix", "whatsapp-web",
+    "observability-prometheus", "observability-otel",
+    "hardware", "peripheral-rpi",
+    "sandbox-landlock", "sandbox-bubblewrap",
+    "browser-native", "plugins-wasm", "probe", "rag-pdf",
+    "webauthn",
 ]
 
 [profile.dev]

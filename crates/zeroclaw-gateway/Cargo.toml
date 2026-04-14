@@ -1,0 +1,78 @@
+[package]
+name = "zeroclaw-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HTTP/WebSocket gateway for ZeroClaw — REST API, web dashboard, webhooks."
+publish = false
+
+[dependencies]
+# Internal workspace crates
+zeroclaw-api.workspace = true
+zeroclaw-config.workspace = true
+zeroclaw-infra.workspace = true
+zeroclaw-memory.workspace = true
+zeroclaw-providers.workspace = true
+zeroclaw-channels = { workspace = true, default-features = true, features = ["channel-email", "channel-telegram"] }
+zeroclaw-runtime.workspace = true
+zeroclaw-tools.workspace = true
+zeroclaw-hardware.workspace = true
+zeroclaw-plugins = { workspace = true, optional = true }
+
+# HTTP server
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout", "fs"] }
+http-body-util = "0.1"
+
+# TLS
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
+
+# Frontend asset MIME type detection (dashboard served from filesystem)
+mime_guess = "2"
+
+# Async runtime
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "signal"] }
+tokio-stream = { version = "0.1.18", default-features = false, features = ["sync"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+
+# Serialization
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+
+# Error handling
+anyhow = "1.0"
+async-trait = "0.1"
+directories = "6.0"
+
+# Crypto
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
+# Database (session queue)
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# Misc
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+parking_lot = "0.12"
+toml = "1.0"
+tracing = { version = "0.1", default-features = false }
+rustls-pemfile = "2"
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+
+[dev-dependencies]
+rand = "0.10"
+rcgen = "0.13"
+tempfile = "3.26"
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+
+[features]
+default = []
+plugins-wasm = ["dep:zeroclaw-plugins"]
+webauthn = ["zeroclaw-runtime/webauthn"]
+observability-prometheus = ["zeroclaw-runtime/observability-prometheus"]
+channel-nostr = ["zeroclaw-channels/channel-nostr"]

@@ -112,10 +112,10 @@ pub fn run() {
             let app_handle = app.handle().clone();
             let pair_state = shared.clone();
             tauri::async_runtime::spawn(async move {
-                if let Some(token) = auto_pair(&pair_state).await {
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        inject_token_into_webview(&window, &token);
-                    }
+                if let Some(token) = auto_pair(&pair_state).await
+                    && let Some(window) = app_handle.get_webview_window("main")
+                {
+                    inject_token_into_webview(&window, &token);
                 }
             });
 

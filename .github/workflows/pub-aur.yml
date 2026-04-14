@@ -112,7 +112,7 @@ jobs:
           srcinfo_file="$(mktemp)"
           sed -e "s/pkgver = .*/pkgver = ${VERSION}/" \
               -e "s/sha256sums = .*/sha256sums = ${TARBALL_SHA}/" \
-              -e "s|zeroclaw-[0-9.]*.tar.gz|zeroclaw-${VERSION}.tar.gz|g" \
+              -e "s|zeroclawlabs-[0-9.]*.tar.gz|zeroclawlabs-${VERSION}.tar.gz|g" \
               -e "s|/v[0-9.]*\.tar\.gz|/v${VERSION}.tar.gz|g" \
               dist/aur/.SRCINFO > "$srcinfo_file"
 
@@ -160,7 +160,7 @@ jobs:
           fi
 
           tmp_dir="$(mktemp -d)"
-          git clone ssh://aur@aur.archlinux.org/zeroclaw.git "$tmp_dir/aur"
+          git clone ssh://aur@aur.archlinux.org/zeroclawlabs.git "$tmp_dir/aur"
 
           cp "$PKGBUILD_FILE" "$tmp_dir/aur/PKGBUILD"
           cp "$SRCINFO_FILE" "$tmp_dir/aur/.SRCINFO"
@@ -169,7 +169,8 @@ jobs:
           git config user.name "zeroclaw-bot"
           git config user.email "bot@zeroclaw.dev"
           git add PKGBUILD .SRCINFO
-          git commit -m "zeroclaw ${VERSION}"
+          git diff --cached --quiet && { echo "No changes to push."; exit 0; }
+          git commit -m "zeroclawlabs ${VERSION}"
           git push origin HEAD
 
           echo "AUR package updated to ${VERSION}"
