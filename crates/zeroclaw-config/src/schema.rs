@@ -5440,6 +5440,15 @@ pub struct ObservabilityConfig {
     #[serde(default)]
     pub otel_service_name: Option<String>,
 
+    /// Optional HTTP headers sent with every OTLP export request (e.g. authorization).
+    /// Specified as key-value pairs in TOML:
+    /// ```toml
+    /// [observability.otel_headers]
+    /// Authorization = "Bearer sk-..."
+    /// ```
+    #[serde(default)]
+    pub otel_headers: Option<std::collections::HashMap<String, String>>,
+
     /// Runtime trace storage mode: "none" | "rolling" | "full".
     /// Controls whether model replies and tool-call diagnostics are persisted.
     #[serde(default = "default_runtime_trace_mode")]
@@ -5460,6 +5469,7 @@ impl Default for ObservabilityConfig {
             backend: "none".into(),
             otel_endpoint: None,
             otel_service_name: None,
+            otel_headers: None,
             runtime_trace_mode: default_runtime_trace_mode(),
             runtime_trace_path: default_runtime_trace_path(),
             runtime_trace_max_entries: default_runtime_trace_max_entries(),
