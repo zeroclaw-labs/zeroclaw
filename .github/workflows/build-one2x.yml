@@ -2,7 +2,7 @@ name: "One2X: Build & Deploy"
 
 on:
   push:
-    branches: [one2x/custom-v5]
+    branches: [one2x/custom-v5, one2x/custom-v6]
     paths:
       - "src/**"
       - "crates/**"
@@ -38,7 +38,7 @@ jobs:
           if [ -n "${{ github.event.inputs.version }}" ]; then
             TAG="${{ github.event.inputs.version }}"
           else
-            TAG="v5.6.0-$(echo ${{ github.sha }} | cut -c1-7)"
+            TAG="v6.3.0-$(echo ${{ github.sha }} | cut -c1-7)"
           fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Image tag: ${TAG}"
