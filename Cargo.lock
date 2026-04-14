@@ -11760,6 +11760,7 @@ dependencies = [
  "lru",
  "mail-parser",
  "matrix-sdk",
+ "mime_guess",
  "nanohtml2text",
  "nostr-sdk",
  "parking_lot",

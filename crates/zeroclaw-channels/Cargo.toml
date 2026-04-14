@@ -29,6 +29,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 lettre = { version = "0.11.19", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"], optional = true }
 mail-parser = { version = "0.11.2", optional = true }
 matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown", "sqlite"] }
+mime_guess = { version = "2", optional = true }
 nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "nip59"], optional = true }
 parking_lot = "0.12"
 portable-atomic = "1"
@@ -107,7 +108,7 @@ channel-webhook = []
 channel-whatsapp-cloud = []
 channel-voice-call = []
 channel-acp-server = []
-channel-matrix = ["dep:matrix-sdk"]
+channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
 voice-wake = ["dep:cpal", "zeroclaw-config/voice-wake"]
 
 [dev-dependencies]

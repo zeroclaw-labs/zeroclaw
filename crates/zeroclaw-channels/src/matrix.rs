@@ -14,7 +14,7 @@ use matrix_sdk::{
         events::room::member::StrippedRoomMemberEvent,
         events::room::message::{
             MessageType, OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata,
-            RoomMessageEventContent,
+            ReplyWithinThread, RoomMessageEventContent,
         },
     },
 };
@@ -905,18 +905,46 @@ impl Channel for MatrixChannel {
             tracing::warn!("Matrix failed to stop typing notification: {error}");
         }
 
-        let mut content = RoomMessageEventContent::text_markdown(&message.content);
+        let (cleaned_text, attachments) = crate::util::parse_attachment_markers(&message.content);
 
-        if let Some(ref thread_ts) = message.thread_ts
-            && let Ok(thread_root) = thread_ts.parse::<OwnedEventId>()
-        {
-            content.relates_to = Some(Relation::Thread(Thread::plain(
-                thread_root.clone(),
-                thread_root,
-            )));
+        if !cleaned_text.trim().is_empty() {
+            let mut content = RoomMessageEventContent::text_markdown(&cleaned_text);
+            if let Some(ref thread_ts) = message.thread_ts
+                && let Ok(thread_root) = thread_ts.parse::<OwnedEventId>()
+            {
+                content.relates_to = Some(Relation::Thread(Thread::plain(
+                    thread_root.clone(),
+                    thread_root,
+                )));
+            }
+            room.send(content).await?;
         }
 
-        room.send(content).await?;
+        for (_kind, target) in &attachments {
+            let path = std::path::Path::new(target.as_str());
+            if let Ok(data) = tokio::fs::read(path).await {
+                let mime = mime_guess::from_path(path).first_or_octet_stream();
+                let name = path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy();
+                let mut attachment_config = matrix_sdk::attachment::AttachmentConfig::new();
+                if let Some(ref thread_ts) = message.thread_ts
+                    && let Ok(event_id) = thread_ts.parse::<OwnedEventId>()
+                {
+                    attachment_config =
+                        attachment_config.reply(Some(matrix_sdk::room::reply::Reply {
+                            event_id,
+                            enforce_thread: matrix_sdk::room::reply::EnforceThread::Threaded(
+                                ReplyWithinThread::Yes,
+                            ),
+                        }));
+                }
+                let _ = room
+                    .send_attachment(&*name, &mime, data, attachment_config)
+                    .await;
+            }
+        }
 
         // Voice reply: generate TTS audio and send as m.audio when voice_mode is active
         if self.voice_mode.load(Ordering::Relaxed) {
@@ -2551,8 +2579,8 @@ mod tests {
 
     #[test]
     fn extract_media_info_plain_image_returns_source() {
-        use matrix_sdk::ruma::owned_mxc_uri;
         use matrix_sdk::ruma::events::room::message::ImageMessageEventContent;
+        use matrix_sdk::ruma::owned_mxc_uri;
 
         let content = ImageMessageEventContent::plain(
             "photo.jpg".to_string(),
@@ -2570,14 +2598,15 @@ mod tests {
     fn extract_media_info_encrypted_image_returns_source() {
         use matrix_sdk::ruma::events::room::message::ImageMessageEventContent;
 
-        let content = ImageMessageEventContent::encrypted(
-            "9637.jpg".to_string(),
-            make_encrypted_file(),
-        );
+        let content =
+            ImageMessageEventContent::encrypted("9637.jpg".to_string(), make_encrypted_file());
         let msgtype = MessageType::Image(content);
         let (body, media) = MatrixChannel::extract_media_info(&msgtype);
         assert_eq!(body, "[IMAGE:9637.jpg]");
-        assert!(media.is_some(), "encrypted image must return Some media source — not None");
+        assert!(
+            media.is_some(),
+            "encrypted image must return Some media source — not None"
+        );
         let (_, filename) = media.unwrap();
         assert_eq!(filename, "9637.jpg");
     }
