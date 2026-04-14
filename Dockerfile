@@ -91,8 +91,14 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
     rm -rf target/release/.fingerprint/zeroclawlabs-* \
+           target/release/.fingerprint/zeroclaw_* \
+           target/release/.fingerprint/zeroclaw-* \
            target/release/deps/zeroclawlabs-* \
-           target/release/incremental/zeroclawlabs-* && \
+           target/release/deps/zeroclaw_* \
+           target/release/deps/zeroclaw-* \
+           target/release/incremental/zeroclawlabs-* \
+           target/release/incremental/zeroclaw_* \
+           target/release/incremental/zeroclaw-* && \
     if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
       cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
     else \
