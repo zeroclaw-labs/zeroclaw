@@ -1,6 +1,6 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
-use opentelemetry::trace::{Span, SpanBuilder, SpanKind, Status, Tracer};
+use opentelemetry::trace::{Span, SpanBuilder, SpanKind, Status, TraceContextExt, Tracer};
 use opentelemetry::{Context, KeyValue, global};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -40,7 +40,6 @@ pub struct OtelObserver {
     // instance. Concurrent invocations on the same observer will
     // overwrite the context — a follow-up change to the Observer trait
     // (adding session_id to events) would be needed for full concurrency.
-
     /// Context holding the active `agent.invocation` root span.
     agent_context: Mutex<Option<Context>>,
     /// Messages count from the last `LlmRequest`, pending attachment to
@@ -252,16 +251,18 @@ impl Observer for OtelObserver {
             } => {
                 let secs = duration.as_secs_f64();
 
+                // Clear any stale pending state from incomplete LlmRequest
+                // or ToolCallStart events (e.g. timeout before response).
+                self.pending_messages_count.lock().take();
+                self.pending_tool_args.lock().take();
+
                 // Finalize and end the root span created at AgentStart.
                 let cx = self.agent_context.lock().take();
                 if let Some(cx) = cx {
                     let span = cx.span();
                     span.set_attribute(KeyValue::new("duration_s", secs));
                     if let Some(t) = tokens_used {
-                        span.set_attribute(KeyValue::new(
-                            "gen_ai.usage.total_tokens",
-                            *t as i64,
-                        ));
+                        span.set_attribute(KeyValue::new("gen_ai.usage.total_tokens", *t as i64));
                     }
                     if let Some(c) = cost_usd {
                         span.set_attribute(KeyValue::new("cost_usd", *c));
@@ -282,9 +283,7 @@ impl Observer for OtelObserver {
             }
 
             // ── LLM calls: child spans with token attributes ────
-            ObserverEvent::LlmRequest {
-                messages_count, ..
-            } => {
+            ObserverEvent::LlmRequest { messages_count, .. } => {
                 *self.pending_messages_count.lock() = Some(*messages_count);
             }
             ObserverEvent::LlmResponse {
@@ -321,10 +320,7 @@ impl Observer for OtelObserver {
                     attrs.push(KeyValue::new("gen_ai.usage.output_tokens", *t as i64));
                 }
                 if let (Some(i), Some(o)) = (input_tokens, output_tokens) {
-                    attrs.push(KeyValue::new(
-                        "gen_ai.usage.total_tokens",
-                        (*i + *o) as i64,
-                    ));
+                    attrs.push(KeyValue::new("gen_ai.usage.total_tokens", (*i + *o) as i64));
                 }
                 if let Some(msg) = error_message {
                     attrs.push(KeyValue::new("error.message", msg.clone()));
@@ -346,9 +342,10 @@ impl Observer for OtelObserver {
                 if *success {
                     span.set_status(Status::Ok);
                 } else {
-                    span.set_status(Status::error(
-                        error_message.as_deref().unwrap_or("LLM call failed"),
-                    ));
+                    let err_msg = error_message
+                        .clone()
+                        .unwrap_or_else(|| "LLM call failed".to_string());
+                    span.set_status(Status::error(err_msg));
                 }
                 span.end();
             }
@@ -411,10 +408,15 @@ impl Observer for OtelObserver {
                     .record(secs, &[KeyValue::new("tool", tool.clone())]);
             }
 
-            // ── Lightweight events (metrics only) ───────────────
+            // ── Lightweight events (metrics only, no spans) ────
             ObserverEvent::TurnComplete
             | ObserverEvent::CacheHit { .. }
-            | ObserverEvent::CacheMiss { .. } => {}
+            | ObserverEvent::CacheMiss { .. }
+            | ObserverEvent::HandStarted { .. }
+            | ObserverEvent::DeploymentStarted { .. }
+            | ObserverEvent::DeploymentCompleted { .. }
+            | ObserverEvent::DeploymentFailed { .. }
+            | ObserverEvent::RecoveryCompleted { .. } => {}
             ObserverEvent::ChannelMessage { channel, direction } => {
                 self.channel_messages.add(
                     1,
@@ -450,7 +452,6 @@ impl Observer for OtelObserver {
             }
 
             // ── Hand runs: child spans ──────────────────────────
-            ObserverEvent::HandStarted { .. } => {}
             ObserverEvent::HandCompleted {
                 hand_name,
                 duration_ms,
@@ -526,15 +527,8 @@ impl Observer for OtelObserver {
                 self.hand_runs.add(1, &attrs);
                 self.hand_duration
                     .record(secs, &[KeyValue::new("hand", hand_name.clone())]);
-            }
-
-            // ── DORA deployment events (not yet wired) ──────────
-            ObserverEvent::DeploymentStarted { .. }
-            | ObserverEvent::DeploymentCompleted { .. }
-            | ObserverEvent::DeploymentFailed { .. }
-            | ObserverEvent::RecoveryCompleted { .. } => {
-                // DORA deployment events: OTel pass-through not yet implemented.
-            }
+            } // Note: HandStarted, Deployment*, and RecoveryCompleted are
+              // handled above in the no-op arm (no spans emitted yet).
         }
     }
 
