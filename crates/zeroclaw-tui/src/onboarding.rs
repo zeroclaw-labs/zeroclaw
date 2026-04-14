@@ -851,7 +851,8 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
             }
         }
         "Matrix" => {
-            if config.channels_config.matrix.is_none() {
+            let existing_mx = config.channels_config.matrix.as_ref();
+            if existing_mx.is_none() {
                 config.channels_config.matrix = Some(MatrixConfig {
                     enabled: true,
                     homeserver: String::from("https://matrix.org"),
@@ -865,7 +866,9 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     stream_mode: StreamMode::default(),
                     draft_update_interval_ms: 500,
                     multi_message_delay_ms: 800,
-                    recovery_key: None,
+                    mention_only: existing_mx.map(|m| m.mention_only).unwrap_or(false),
+                    recovery_key: existing_mx.and_then(|m| m.recovery_key.clone()),
+                    password: existing_mx.and_then(|m| m.password.clone()),
                 });
             }
         }

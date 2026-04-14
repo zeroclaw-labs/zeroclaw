@@ -960,11 +960,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO
+    // Initialize logging - respects RUST_LOG env var, defaults to INFO.
+    // matrix_sdk crates are suppressed to warn because they are extremely
+    // noisy at info level. To restore SDK-level output for Matrix debugging:
+    //   RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info
     let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn")
+        }))
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
