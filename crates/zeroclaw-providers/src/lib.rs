@@ -83,6 +83,7 @@ const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 const QIANFAN_BASE_URL: &str = "https://qianfan.baidubce.com/v2";
 const VERCEL_AI_GATEWAY_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
+const MANIFEST_BASE_URL: &str = "http://localhost:3001/v1";
 
 pub fn is_minimax_intl_alias(name: &str) -> bool {
     matches!(
@@ -96,6 +97,10 @@ pub fn is_minimax_intl_alias(name: &str) -> bool {
             | "minimax-oauth-global"
             | "minimax-portal-global"
     )
+}
+
+pub fn is_manifest_alias(name: &str) -> bool {
+    matches!(name, "manifest" | "manifest-router" | "mnfst")
 }
 
 pub fn is_minimax_cn_alias(name: &str) -> bool {
@@ -925,6 +930,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "novita" => vec!["NOVITA_API_KEY"],
         "perplexity" => vec!["PERPLEXITY_API_KEY"],
         "cohere" => vec!["COHERE_API_KEY"],
+        "manifest" | "mnfst" | "manifest-router" => vec!["MANIFEST_API_KEY", "MNFST_API_KEY"],
         name if is_moonshot_alias(name) => vec!["MOONSHOT_API_KEY"],
         "kimi-code" | "kimi_coding" | "kimi_for_coding" => {
             vec!["KIMI_CODE_API_KEY", "MOONSHOT_API_KEY"]
@@ -1386,6 +1392,19 @@ fn create_provider_with_url_and_options(
         }
 
         // ── Extended ecosystem (community favorites) ─────────
+        "manifest" | "mnfst" | "manifest-router" => {
+            let base_url = api_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(MANIFEST_BASE_URL);
+            Ok(compat(OpenAiCompatibleProvider::new_with_vision(
+                "Manifest",
+                base_url,
+                key,
+                AuthStyle::Bearer,
+                true,
+            )))
+        }
         "groq" => Ok(compat(OpenAiCompatibleProvider::new(
             "Groq",
             "https://api.groq.com/openai/v1",
@@ -1982,6 +2001,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             display_name: "Telnyx",
             aliases: &[],
             local: false,
+        },
+        ProviderInfo {
+            name: "manifest",
+            display_name: "Manifest",
+            aliases: &["manifest-router", "mnfst"],
+            local: true,
         },
         ProviderInfo {
             name: "azure_openai",
