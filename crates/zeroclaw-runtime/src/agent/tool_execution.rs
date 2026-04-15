@@ -27,9 +27,19 @@ pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn T
         return Some(t.as_ref());
     }
     let name_lower = name.to_ascii_lowercase();
-    tools
+    if let Some(t) = tools
         .iter()
         .find(|t| t.name().to_ascii_lowercase() == name_lower)
+    {
+        return Some(t.as_ref());
+    }
+    // LLMs sometimes preserve hyphens from skill names even though the tool
+    // registry normalizes them to underscores. Canonicalize both sides so
+    // e.g. "medeo-video__medeo_video" matches "medeo_video__medeo_video".
+    let canonical = name_lower.replace('-', "_");
+    tools
+        .iter()
+        .find(|t| t.name().to_ascii_lowercase().replace('-', "_") == canonical)
         .map(|t| t.as_ref())
 }
 
