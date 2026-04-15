@@ -1583,7 +1583,10 @@ impl OpenAiCompatibleProvider {
     /// - **assistant messages with `tool_calls`** are converted to plain
     ///   text by extracting only the `content` field (or dropped when the
     ///   content is empty).
-    fn strip_native_tool_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    fn strip_native_tool_messages(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        if self.native_tool_calling {
+            return messages.into();
+        }
         messages
             .iter()
             .filter_map(|msg| {
@@ -1849,11 +1852,7 @@ impl Provider for OpenAiCompatibleProvider {
             messages.to_vec()
         };
         // Strip native tool constructs for non-native-tool providers (#5743).
-        let effective_messages = if self.native_tool_calling {
-            effective_messages
-        } else {
-            Self::strip_native_tool_messages(&effective_messages)
-        };
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
         let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
@@ -2065,12 +2064,7 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             request.messages.to_vec()
         };
-        // Strip native tool constructs for non-native-tool providers (#5743).
-        let effective_messages = if self.native_tool_calling {
-            effective_messages
-        } else {
-            Self::strip_native_tool_messages(&effective_messages)
-        };
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages_for_native(&effective_messages, !merge),
@@ -2208,12 +2202,7 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             request.messages.to_vec()
         };
-        // Strip native tool constructs for non-native-tool providers (#5743).
-        let effective_messages = if self.native_tool_calling {
-            effective_messages
-        } else {
-            Self::strip_native_tool_messages(&effective_messages)
-        };
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
 
         let tools = Self::convert_tool_specs(request.tools);
         let payload = if has_tools {
@@ -3314,7 +3303,13 @@ mod tests {
             ChatMessage::assistant("Here are the results about cats"),
             ChatMessage::user("thanks"),
         ];
-        let stripped = OpenAiCompatibleProvider::strip_native_tool_messages(&messages);
+        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "MiniMax",
+            "https://api.minimax.chat/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let stripped = p.strip_native_tool_messages(&messages);
         assert_eq!(stripped.len(), 5);
         assert_eq!(stripped[0].role, "system");
         assert_eq!(stripped[1].role, "user");
@@ -3322,7 +3317,10 @@ mod tests {
         // Assistant with tool_calls → plain text with only content
         assert_eq!(stripped[2].role, "assistant");
         assert_eq!(stripped[2].content, "I'll search");
-        assert!(!stripped[2].content.contains("tool_calls"), "tool_calls structure must be stripped");
+        assert!(
+            !stripped[2].content.contains("tool_calls"),
+            "tool_calls structure must be stripped"
+        );
         // tool message → dropped
         assert_eq!(stripped[3].role, "assistant");
         assert_eq!(stripped[3].content, "Here are the results about cats");
@@ -3340,7 +3338,13 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"tc1","content":"ok"}"#),
             ChatMessage::assistant("Done"),
         ];
-        let stripped = OpenAiCompatibleProvider::strip_native_tool_messages(&messages);
+        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "MiniMax",
+            "https://api.minimax.chat/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let stripped = p.strip_native_tool_messages(&messages);
         // assistant with empty content + tool_calls → dropped; tool → dropped
         assert_eq!(stripped.len(), 3);
         assert_eq!(stripped[0].role, "system");
@@ -3357,7 +3361,13 @@ mod tests {
             ChatMessage::assistant("hi there"),
             ChatMessage::user("bye"),
         ];
-        let stripped = OpenAiCompatibleProvider::strip_native_tool_messages(&messages);
+        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "MiniMax",
+            "https://api.minimax.chat/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let stripped = p.strip_native_tool_messages(&messages);
         assert_eq!(stripped.len(), 4);
         for (orig, result) in messages.iter().zip(stripped.iter()) {
             assert_eq!(orig.role, result.role);
