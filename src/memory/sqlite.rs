@@ -231,8 +231,10 @@ impl SqliteMemory {
             -- waste space and slow inserts.
 
             -- FTS5 full-text search (BM25 scoring)
+            -- trigram tokenizer (not unicode61) for Korean morphology.
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-                key, content, content=memories, content_rowid=rowid
+                key, content, content=memories, content_rowid=rowid,
+                tokenize='trigram'
             );
 
             -- FTS5 triggers: keep in sync with memories table

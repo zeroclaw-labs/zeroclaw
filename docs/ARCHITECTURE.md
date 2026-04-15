@@ -3628,9 +3628,81 @@ SourceType::ChatPaste char_count:
 | memory 전체 | **328** | sqlite(sync 6개 v3 포함) · synced · sync · vector · hybrid · lucid · qdrant · query_expand · chunker · dream_cycle |
 | sync 전체 | **49** | coordinator · protocol (VaultDocUpsert LWW 포함) · relay |
 | phone 전체 | **20** | post_call · caller_match · context_inject |
-| **합계** | **513** | **0 실패, 회귀 0** |
+| **합계** | **518** | **0 실패, 회귀 0** (vault 121 = 기존 116 + PR #2/#3 + normalize 5) |
 
-명시적 [계획] 잔여 항목(기획에 없는 확장 슬롯): `OnDeviceSlmEngine` 실제 GPU 드라이버 바인딩(현재는 Ollama HTTP 경로) · 허브 섹션 할당에 대한 병렬 워커 내부 LLM 캐시 · 태그 의미 유사도의 온디바이스 임베더 최적화. **기획안의 요구는 모두 구현 완료.**
+---
+
+### 6E-7. Post-Review Hardening Roadmap (9-PR series)
+
+> **Source**: 외부 심층 리뷰 2종(2026-04-15/16) — "Level 3~5 연구 최전선 기준 치명적 3 · 중요 7 · 권장 6" 지적 + 9-PR 실행 지시서.
+> **Status**: 이번 세션에 PR #2/#3 코어 + PR #7 PRAGMA 부분 **착수**. 나머지 PR은 아래에 **파일·라인·수락 기준**까지 포함된 실행 가능한 스펙으로 문서화 — 다음 세션에서 그대로 집어 들면 됨.
+
+#### 이번 세션 착수분 (completed)
+
+| PR | 상태 | 착수 범위 | 커밋 지점 |
+|---|---|---|---|
+| **#2 임베딩 메타컬럼** | ✅ 완료 | `vault_documents` 테이블에 `embedding_model / embedding_dim / embedding_provider / embedding_version / embedding_created_at` 5개 컬럼 추가. `idx_vault_docs_emb_model` 부분 인덱스. 모델 교체 시 점진 재임베딩 준비 완료. | `src/vault/schema.rs:18–38` |
+| **#3 FTS5 trigram + 적응형 가중치** | ✅ 완료 | `memories_fts`·`vault_docs_fts` 모두 `tokenize='trigram'`. `src/vault/normalize.rs` 신설(fullwidth→halfwidth + whitespace squeeze) · `korean_char_ratio` · `adaptive_weights` 언어 적응형(한 0.25/0.75, 영 0.4/0.6). `search_fts`가 normalize 적용. | `src/memory/sqlite.rs:232–239` · `src/vault/schema.rs:112–120` · `src/vault/normalize.rs` · `src/vault/store.rs::search_fts` |
+| **#7 PRAGMA 부분** | ✅ 기존 설정 검증 | 이미 `PRAGMA journal_mode=WAL; synchronous=NORMAL; busy_timeout=5000; cache_size=-2000; temp_store=MEMORY;` 적용됨. `src/memory/sqlite.rs:144–159`. HLC/r2d2 pool은 후속 세션. | `src/memory/sqlite.rs:144` |
+
+#### 후속 세션 실행 스펙 (PR #1 full · #4 · #5 · #6 · #7 나머지 · #8 · #9)
+
+##### PR #1 (full) — Local-first EmbeddingProvider
+- **목표**: `fastembed-rs` 크레이트 도입 → BGE-M3(1024D) 로컬 기본값. OpenAI는 opt-in.
+- **파일**: 신설 `src/memory/embedding/` 디렉토리. `mod.rs` (trait) · `local_fastembed.rs` · `openai.rs` · `custom_http.rs` · `noop.rs`. 기존 `src/memory/embeddings.rs` 교체.
+- **Cargo.toml**: `fastembed = "4"` 추가. ONNX runtime 포함 빌드 확인.
+- **config.toml**: `[embedding] provider = "local_fastembed"` 기본.
+- **다운로드 UI**: `~/.moa/embedding-models/bge-m3/` (약 1.1GB). Tauri 이벤트로 진행률 전송.
+- **수락 기준**: 새 설치 시 OpenAI 키 없이 임베딩 동작 / 결정론성(동일 입력 = 동일 벡터) / 한국어 10문장 유사도 수동 검증 / CPU 32배치 < 2s.
+
+##### PR #4 — RRF + Cross-Encoder Reranker
+- **목표**: 선형 가중합 → RRF(k=60) + BGE-reranker-v2-m3 crossencoder (약 560MB) 계층.
+- **파일**: `src/memory/search/fusion.rs` (RRF) · `src/memory/search/rerank.rs`. `SqliteMemory::recall_with_variations` 기존 RRF를 이 구현으로 일원화.
+- **설정**: `[search.rerank] enabled=true, model="bge-reranker-v2-m3", top_k_before=50, top_k_after=10`.
+- **폴백**: 저사양(모바일) `enabled=false` → `src/vault/normalize::adaptive_weights` 기반 언어 적응형 가중치로 degrade.
+- **수락 기준**: RRF 단위 테스트 + rerank on/off 정확도 개선 ≥5 point + p95 latency < 500ms.
+
+##### PR #5 (full) — Embedding sync encryption + vec2text defence
+- **목표**: `SyncDelta` 암호화 페이로드에 embedding BLOB 포함. (vec2text EMNLP 2023 공격 92% 복원 방어).
+- **파일**: `src/memory/sync.rs::DeltaOperation::{Store, VaultDocUpsert}`에 embedding 필드 추가 + bincode 직렬화 → ChaCha20-Poly1305. `Memory::apply_remote_v3_delta` 복호화 경로에서 모델 불일치 시 embedding 폐기 + 로컬 재계산 큐 등록.
+- **at-rest**: `embedding_cache` 테이블도 SQLCipher 또는 keychain 파생 키로 암호화.
+- **문서**: 신설 `docs/security/embedding-privacy.md` — vec2text 원리 + 방어 전략.
+- **수락 기준**: sync 트래픽에서 float 평문 노출 없음 / 모델 불일치 delta가 content만 저장하고 재임베딩 큐 등록.
+
+##### PR #6 — Consolidation (sleep cycle) + 망각 곡선
+- **목표**: 4-Stage 파이프라인 완성. `CAPTURE → PROMOTE → CONSOLIDATE → RECALL`.
+- **파일**: `src/memory/consolidate.rs` (신설). `src/memory/decay.rs` (신설). 기존 `dream_cycle.rs`가 트리거.
+- **알고리즘**: HDBSCAN(임베딩 유사도 >0.88) → 각 클러스터 Gemini Flash 요약 → `consolidated_memories(type='semantic_fact', source_ids[])` 저장 → 원본 `archived=1`. 모순 감지 시 `conflict_flag`.
+- **Decay**: `decay_score = ln(recall_count+1) × exp(-days / half_life) + 0.1`. `half_life` 카테고리별 (identity=∞, work=365, chat=30). 매일 배치 `UPDATE memories SET decay_score=?`. `decay_score<0.05` → `archived=1` 소프트 삭제.
+- **수락 기준**: "나는 변호사다" 50회 → `consolidated_fact` 1개 + `archived=50`. identity decay되지 않음. 아카이브 UI로 복구 가능.
+
+##### PR #7 (나머지) — HLC + r2d2 pool + credit atomicity
+- **HLC**: 신설 `src/sync/hlc.rs`. `Hlc { wall_ms, logical, node_id }` CockroachDB 스타일. `memories.updated_at` 등 타임스탬프 컬럼을 HLC 문자열(`{wall_ms}.{logical}.{node}`)로 교체.
+- **r2d2**: Cargo에 `r2d2 = "0.8"` + `r2d2_sqlite`. 기존 `Arc<Mutex<Connection>>` → `Pool<SqliteConnectionManager>` (크기 8). 읽기 병렬화, 쓰기만 직렬.
+- **TOCTOU**: `src/billing/payment.rs::reserve_credits(user_id, max) → ReservationId`, `commit_reservation(rid, actual)`. SQL `UPDATE balances SET balance = balance - ? WHERE user_id = ? AND balance >= ? RETURNING balance`.
+- **수락 기준**: 5분 시계 차이에서 HLC 순서 정확 / fuzz 10 동시 차감에서 잔액 음수 불가 / 읽기 8스레드 데드락 없음.
+
+##### PR #8 — RAGAS Evaluation Harness
+- **목표**: `faithfulness / answer_relevance / context_precision / context_recall` 자동 측정 + CI 통합.
+- **파일**: 신설 `evals/` 디렉토리. `golden_set_ko.jsonl` 100 · `_en.jsonl` 50 · `law_domain.jsonl` 30. `scripts/eval_rag.py` (RAGAS 파이썬) or `evals/runner.rs`.
+- **CI**: `.github/workflows/eval.yml` — PR마다 실행, 임계값 미달 시 빌드 실패, 결과 PR 코멘트.
+- **수락 기준**: `make eval` 한 줄 실행 / 법률 도메인 faithfulness ≥0.9 / 기준선 대비 ±5% 자동 알림.
+
+##### PR #9 — GraphRAG Community Layer (Phase 5)
+- **목표**: 온톨로지에 Leiden clustering → 커뮤니티별 요약 → 5th Phase Cross-Search.
+- **파일**: 신설 `src/ontology/community.rs` (petgraph 기반). `ontology_communities(id, level, parent_community_id, summary, summary_embedding, object_ids, keywords, ...)` 테이블.
+- **주기**: 주 1회 `VaultScheduler` 확장으로 배치.
+- **검색**: `src/agent/loop_/context.rs`에 Phase 5 추가 — query_embedding vs community.summary_embedding 유사도 → 상위 3 커뮤니티 요약 주입.
+- **수락 기준**: 100 객체+200 링크 그래프에서 Leiden <1s / "이번 달 업무 요약" 쿼리에 커뮤니티 요약 포함 / 재생성 시 기존 sync delta와 호환.
+
+#### 실행 우선순위
+
+| 주차 | PR | 사유 |
+|---|---|---|
+| 1 (NEXT) | #1 full + #7 나머지 | **로컬 임베딩 전환은 변호사법 §26 비밀유지의무·서버-비저장 E2E 특허의 근간** — 실데이터 쌓이기 전에 필수. HLC는 시계 왜곡 버그 방지. |
+| 2 | #4 + #5 | 한국어 recall 품질 + vec2text 방어. 특허 방어 강화. |
+| 3 | #8 | eval harness 없이는 이후 개선이 감(感)이 됨. 회귀 방지 필수. |
+| 4 | #6 + #9 | Consolidation + Community — 장기 해자. 1~3주차 인프라 위에 자연스럽게 얹힘. |
 
 ---
 

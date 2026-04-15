@@ -13,6 +13,7 @@ pub mod health;
 pub mod hub;
 pub mod ingest;
 pub mod llm_engine;
+pub mod normalize;
 pub mod schema;
 pub mod scheduler;
 pub mod slm_engine;

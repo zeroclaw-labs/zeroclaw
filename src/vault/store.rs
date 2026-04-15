@@ -287,7 +287,10 @@ non-knowledge (confidence {:.2}): {}",
 
     /// FTS5 keyword search over `vault_documents`.
     /// Returns (doc_id, title, snippet_score).
+    /// Query is normalised (fullwidth→halfwidth, whitespace squeeze) and
+    /// FTS-escaped before the MATCH clause — see `vault::normalize`.
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<(i64, String, f32)>> {
+        let normalised = super::normalize::normalize_text(query);
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT d.id, COALESCE(d.title, ''), bm25(vault_docs_fts)
@@ -296,7 +299,7 @@ non-knowledge (confidence {:.2}): {}",
              ORDER BY bm25(vault_docs_fts)
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![fts_escape(query), limit as i64], |r| {
+        let rows = stmt.query_map(params![fts_escape(&normalised), limit as i64], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)? as f32))
         })?;
         let mut result = Vec::new();
@@ -747,7 +750,8 @@ mod tests {
             })
             .await
             .unwrap();
-        let hits = store.search_fts("민법", 10).unwrap();
+        // trigram tokenizer needs ≥3-char contiguous substring
+        let hits = store.search_fts("불법행", 10).unwrap();
         assert!(!hits.is_empty());
     }
 

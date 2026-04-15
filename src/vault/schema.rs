@@ -29,8 +29,16 @@ pub fn init_schema(conn: &Connection) -> anyhow::Result<()> {
             doc_type         TEXT,
             char_count       INTEGER NOT NULL DEFAULT 0,
             created_at       INTEGER NOT NULL DEFAULT (unixepoch()),
-            updated_at       INTEGER NOT NULL DEFAULT (unixepoch())
+            updated_at       INTEGER NOT NULL DEFAULT (unixepoch()),
+            -- Embedding metadata (PR #2: model lock-in prevention)
+            embedding_model    TEXT,        -- e.g. "bge-m3"
+            embedding_dim      INTEGER,     -- 1024 for BGE-M3
+            embedding_provider TEXT,        -- "local_fastembed" / "openai" / "custom_http"
+            embedding_version  INTEGER NOT NULL DEFAULT 1,
+            embedding_created_at INTEGER
         );
+        CREATE INDEX IF NOT EXISTS idx_vault_docs_emb_model
+            ON vault_documents(embedding_model) WHERE embedding_model IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_vault_docs_source
             ON vault_documents(source_type, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_vault_docs_device
@@ -107,11 +115,15 @@ pub fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         );
 
         -- ── §2.4 FTS5 mirror (distinct from memories_fts) ────────
+        -- PR #3: trigram tokenizer for Korean — unicode61 default misses
+        -- morphology ("김대리가" vs "김대리"). trigram matches 3-char windows
+        -- so conjugation/particle variation is recallable.
         CREATE VIRTUAL TABLE IF NOT EXISTS vault_docs_fts USING fts5(
             title,
             content,
             content='vault_documents',
-            content_rowid='id'
+            content_rowid='id',
+            tokenize='trigram'
         );
         CREATE TRIGGER IF NOT EXISTS vault_docs_ai
         AFTER INSERT ON vault_documents BEGIN
@@ -305,7 +317,8 @@ mod tests {
         .unwrap();
         let hits: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM vault_docs_fts WHERE vault_docs_fts MATCH '민법'",
+                // trigram tokenizer requires ≥3-char contiguous substring
+                "SELECT COUNT(*) FROM vault_docs_fts WHERE vault_docs_fts MATCH '불법행'",
                 [],
                 |r| r.get(0),
             )
