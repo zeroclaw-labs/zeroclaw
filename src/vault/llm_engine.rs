@@ -10,7 +10,10 @@
 
 use crate::providers::traits::Provider;
 use crate::vault::wikilink::{
-    ai_stub::{BriefingNarrative, ContentClaim, Contradiction, HeuristicAIEngine},
+    ai_stub::{
+        heuristic_knowledge_classify, BriefingNarrative, ContentClaim, Contradiction,
+        HeuristicAIEngine, KnowledgeVerdict,
+    },
     AIEngine, CompoundToken, GatekeepVerdict, KeyConcept,
 };
 use async_trait::async_trait;
@@ -297,6 +300,56 @@ JSON만: {{\"contradictions\":[{{\"left\":<idx>,\"right\":<idx>,\
             Err(e) => {
                 tracing::warn!("detect_contradictions parse failed: {e}");
                 Ok(Vec::new())
+            }
+        }
+    }
+
+    async fn classify_as_knowledge(
+        &self,
+        text: &str,
+    ) -> anyhow::Result<KnowledgeVerdict> {
+        let preview = text.chars().take(1800).collect::<String>();
+        let prompt = format!(
+            "아래 텍스트가 '참조 지식'(세컨드브레인에 저장할 가치가 있는 문서)인지 \
+'일상 대화'인지 분류하세요. 법률·의료·금융 등 전문 도메인의 요약·해설·정의·\
+메모·판례 요약 등은 지식. 인사·안부·간단 질문·감탄·답장 단문은 대화. \
+JSON만 반환: {{\"is_knowledge\":true|false,\"confidence\":0.0-1.0,\
+\"reason\":\"짧은 설명\"}}\n\n텍스트:\n---\n{preview}\n---"
+        );
+        let raw = match self
+            .provider
+            .simple_chat(&prompt, &self.model, DEFAULT_TEMPERATURE)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("classify_as_knowledge call failed, falling back: {e}");
+                return Ok(heuristic_knowledge_classify(text));
+            }
+        };
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(default)]
+            is_knowledge: bool,
+            #[serde(default = "default_conf")]
+            confidence: f32,
+            #[serde(default)]
+            reason: String,
+        }
+        fn default_conf() -> f32 { 0.7 }
+        match extract_json_object::<Resp>(&raw) {
+            Ok(r) => Ok(KnowledgeVerdict {
+                is_knowledge: r.is_knowledge,
+                confidence: r.confidence.clamp(0.0, 1.0),
+                reason: if r.reason.is_empty() {
+                    "LLM 판정".into()
+                } else {
+                    r.reason
+                },
+            }),
+            Err(e) => {
+                tracing::warn!("classify_as_knowledge parse failed: {e}; falling back");
+                Ok(heuristic_knowledge_classify(text))
             }
         }
     }

@@ -101,6 +101,129 @@ pub trait AIEngine: Send + Sync {
     ) -> anyhow::Result<Vec<Contradiction>> {
         Ok(Vec::new())
     }
+
+    /// Qualitative gate for mid-length texts (200 ≤ len < 2000).
+    /// Return whether the text reads as **reference knowledge** worth
+    /// storing in the second brain, vs everyday conversation that
+    /// should NOT be indexed.
+    ///
+    /// Default implementation is rule-based and runs offline:
+    /// - knowledge signals: markdown headers, compound-token citations
+    ///   (statute/case/precedent), multi-sentence density, numeric/date
+    ///   enumerations, formal-paragraph structure.
+    /// - conversation signals: greetings, one-sentence asks, emoji /
+    ///   chat particles, imperative fragments.
+    async fn classify_as_knowledge(
+        &self,
+        text: &str,
+    ) -> anyhow::Result<KnowledgeVerdict> {
+        Ok(heuristic_knowledge_classify(text))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct KnowledgeVerdict {
+    pub is_knowledge: bool,
+    /// 0.0–1.0
+    pub confidence: f32,
+    /// Short human-readable rationale (ko).
+    pub reason: String,
+}
+
+/// Rule-based "is this knowledge" classifier used by HeuristicAIEngine
+/// and as the safe fallback for any `AIEngine` that can't reach its
+/// provider. Conservative on purpose: ambiguous cases are treated as
+/// conversation so the vault doesn't fill up with greetings.
+pub fn heuristic_knowledge_classify(text: &str) -> KnowledgeVerdict {
+    let trimmed = text.trim();
+    let char_count = trimmed.chars().count();
+    if char_count < 50 {
+        return KnowledgeVerdict {
+            is_knowledge: false,
+            confidence: 0.95,
+            reason: "매우 짧은 텍스트 (< 50자) — 잡담으로 간주".into(),
+        };
+    }
+
+    let compounds =
+        super::tokens::detect_compound_tokens(trimmed);
+    let has_markdown_header = trimmed
+        .lines()
+        .any(|l| l.trim_start().starts_with("# ") || l.trim_start().starts_with("## "));
+    let sentence_terminators = trimmed
+        .chars()
+        .filter(|c| matches!(c, '.' | '?' | '!' | '。' | '!' | '?' | '…'))
+        .count();
+    let newline_paragraphs = trimmed.matches("\n\n").count();
+
+    // Conversation markers (Korean).
+    const CHAT_OPENERS: &[&str] = &[
+        "안녕", "반가", "고마", "고맙", "감사", "미안", "죄송", "잠깐", "잠시만",
+        "저기", "ㅎㅎ", "ㅋㅋ", "ㅠㅠ", "ㅜㅜ",
+    ];
+    const CHAT_PARTICLES: &[&str] = &[
+        "요?", "까?", "죠?", "지?", "해?", "하셨어?", "줘", "주세요",
+    ];
+    let mut convo_score = 0i32;
+    for marker in CHAT_OPENERS {
+        if trimmed.starts_with(marker) || trimmed.contains(marker) {
+            convo_score += 1;
+        }
+    }
+    for p in CHAT_PARTICLES {
+        if trimmed.contains(p) {
+            convo_score += 1;
+        }
+    }
+    // Single sentence + a question mark → very likely a direct question.
+    if sentence_terminators <= 1 && trimmed.contains('?') {
+        convo_score += 2;
+    }
+
+    // Knowledge markers.
+    let mut knowledge_score = 0i32;
+    if has_markdown_header {
+        knowledge_score += 3;
+    }
+    if !compounds.is_empty() {
+        knowledge_score += 2 + (compounds.len().min(3) as i32);
+    }
+    if sentence_terminators >= 4 {
+        knowledge_score += 2;
+    }
+    if sentence_terminators >= 8 {
+        knowledge_score += 1;
+    }
+    if newline_paragraphs >= 2 {
+        knowledge_score += 2;
+    }
+    // Dense numeric / date enumerations (e.g., amounts, dates).
+    let digit_runs = trimmed
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| s.len() >= 3)
+        .count();
+    if digit_runs >= 3 {
+        knowledge_score += 1;
+    }
+
+    let is_knowledge = knowledge_score > convo_score && knowledge_score >= 3;
+    let net = (knowledge_score - convo_score) as f32;
+    let confidence = ((net.abs() / 8.0) + 0.4).clamp(0.4, 0.95);
+    let reason = if is_knowledge {
+        format!(
+            "지식 점수 {knowledge_score} ≥ 잡담 점수 {convo_score} (헤더/복합토큰/문장 밀도로 판단)"
+        )
+    } else {
+        format!(
+            "잡담 점수 {convo_score} · 지식 점수 {knowledge_score} — 세컨드브레인 편입 부적합"
+        )
+    };
+
+    KnowledgeVerdict {
+        is_knowledge,
+        confidence,
+        reason,
+    }
 }
 
 /// A single factual statement extracted from a vault document, used as
@@ -298,5 +421,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(verdict.kept.len(), 2);
+    }
+
+    // ── Q1 heuristic classifier tests ─────────────────────────────
+
+    #[test]
+    fn classify_tiny_text_is_conversation() {
+        let v = heuristic_knowledge_classify("안녕하세요");
+        assert!(!v.is_knowledge);
+    }
+
+    #[test]
+    fn classify_formal_legal_note_is_knowledge() {
+        let text = "# 민법 제750조 요건 요약\n\n\
+민법 제750조는 불법행위의 일반 조항이다. \
+요건은 고의/과실, 위법성, 손해, 인과관계 4가지다. \
+대법원 2026. 2. 2. 선고 2025다12345 판결은 입증 책임을 정리했다. \
+재산상 + 정신상 손해 모두 청구 가능하다.";
+        let v = heuristic_knowledge_classify(text);
+        assert!(v.is_knowledge, "expected knowledge, got {v:?}");
+    }
+
+    #[test]
+    fn classify_chatty_mid_length_is_conversation() {
+        let text = "안녕하세요 변호사님. 오늘 시간 되시나요? \
+잠시만 여쭤봐도 괜찮을까요? 고마워요. \
+저기 저희 일정 조율이 필요해서요. 혹시 오후 3시에 가능한가요? \
+답장 주세요. 감사합니다.";
+        let v = heuristic_knowledge_classify(text);
+        assert!(!v.is_knowledge, "expected conversation, got {v:?}");
+    }
+
+    #[tokio::test]
+    async fn heuristic_engine_classify_as_knowledge_wraps_rule() {
+        let text = "# 법률 요약\n\n\
+민법 제750조는 불법행위의 일반 조항이다. \
+요건은 고의/과실, 위법성, 손해 발생, 인과관계 4가지다. \
+대법원 2026. 2. 2. 선고 2025다12345 판결이 이를 확인했다.";
+        let v = HeuristicAIEngine
+            .classify_as_knowledge(text)
+            .await
+            .unwrap();
+        assert!(v.is_knowledge, "expected knowledge, got {v:?}");
     }
 }

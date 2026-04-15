@@ -9,7 +9,8 @@ pub mod tokens;
 pub mod vocabulary;
 
 pub use ai_stub::{
-    AIEngine, ContentClaim, Contradiction, GatekeepVerdict, HeuristicAIEngine, KeyConcept,
+    heuristic_knowledge_classify, AIEngine, ContentClaim, Contradiction, GatekeepVerdict,
+    HeuristicAIEngine, KeyConcept, KnowledgeVerdict,
 };
 pub use tokens::{CompoundToken, CompoundTokenKind};
 

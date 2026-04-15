@@ -80,15 +80,40 @@ impl VaultStore {
     /// for document, links, frontmatter, tags, aliases. Returns early with
     /// `already_present=true` if the checksum is already in the vault.
     pub async fn ingest_markdown(&self, input: IngestInput<'_>) -> Result<IngestOutput> {
-        // §4.0 guard: chat_paste < threshold is rejected (caller should have
-        // filtered, but we double-check).
+        // §4.0 guard: chat_paste uses a three-tier rule:
+        //   char_count >= DOCUMENT_MIN_CHARS (2000) → always ingest (quantitative)
+        //   DOCUMENT_QUALITATIVE_MIN_CHARS <= char_count < DOCUMENT_MIN_CHARS →
+        //       ingest only if AIEngine classifies the text as knowledge
+        //       (qualitative: formal document, citations, multi-sentence
+        //       density, not everyday conversation)
+        //   char_count < DOCUMENT_QUALITATIVE_MIN_CHARS (200) → reject
         let char_count = input.markdown.chars().count();
-        if input.source_type == SourceType::ChatPaste
-            && char_count < DOCUMENT_MIN_CHARS
-        {
-            anyhow::bail!(
-                "chat_paste below {DOCUMENT_MIN_CHARS}-char threshold (got {char_count}); not ingesting"
-            );
+        if input.source_type == SourceType::ChatPaste {
+            if char_count < super::DOCUMENT_QUALITATIVE_MIN_CHARS {
+                anyhow::bail!(
+                    "chat_paste below qualitative floor ({} chars, need ≥ {}); not ingesting",
+                    char_count,
+                    super::DOCUMENT_QUALITATIVE_MIN_CHARS
+                );
+            }
+            if char_count < DOCUMENT_MIN_CHARS {
+                // Mid-range: consult the AI engine.
+                let verdict = self.ai.classify_as_knowledge(input.markdown).await?;
+                if !verdict.is_knowledge {
+                    anyhow::bail!(
+                        "chat_paste in qualitative range ({char_count} chars) classified as \
+non-knowledge (confidence {:.2}): {}",
+                        verdict.confidence,
+                        verdict.reason
+                    );
+                }
+                tracing::debug!(
+                    char_count,
+                    confidence = verdict.confidence,
+                    reason = %verdict.reason,
+                    "chat_paste qualitatively accepted as knowledge"
+                );
+            }
         }
 
         // §4.1 checksum
@@ -583,14 +608,89 @@ mod tests {
                 source_device_id: "dev",
                 original_path: None,
                 title: None,
-                markdown: "짧은 텍스트",
+                markdown: "짧은 텍스트", // < 200 chars — hard floor
                 html_content: None,
                 doc_type: None,
                 domain: "legal",
             })
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("threshold"));
+        assert!(err.to_string().contains("qualitative floor"));
+    }
+
+    // ── Q1: mid-range qualitative gate ──────────────────────────
+
+    #[tokio::test]
+    async fn chat_paste_in_mid_range_rejected_if_chatty() {
+        let (store, _conn) = mem_store().await;
+        // ~500 chars of pure conversation — no headers, no citations, lots
+        // of chat particles. Heuristic default classifies as non-knowledge.
+        let chatty = "안녕하세요 변호사님. 오늘 시간 되시나요? 잠시만 여쭤봐도 괜찮을까요? \
+고마워요. 저기 저희 일정 조율이 필요해서요. 혹시 오후 3시에 가능한가요? ".repeat(6);
+        let err = store
+            .ingest_markdown(IngestInput {
+                source_type: SourceType::ChatPaste,
+                source_device_id: "dev",
+                original_path: None,
+                title: None,
+                markdown: &chatty,
+                html_content: None,
+                doc_type: None,
+                domain: "legal",
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-knowledge"));
+    }
+
+    #[tokio::test]
+    async fn chat_paste_in_mid_range_accepted_if_knowledge() {
+        let (store, _conn) = mem_store().await;
+        // ~500 chars formal note: markdown header + compound-token citation +
+        // multi-sentence density → heuristic classifies as knowledge.
+        let knowledge = "# 민법 제750조 요건 요약\n\n\
+민법 제750조는 불법행위의 일반 조항이다. \
+요건은 고의 또는 과실, 위법성, 손해 발생, 인과관계 4가지다. \
+대법원 2026. 2. 2. 선고 2025다12345 판결은 네 요건의 개별 입증 책임을 확인했다. \
+재산상 손해뿐 아니라 정신상 손해에 대해서도 위자료 청구가 가능하다. \
+공동불법행위의 경우 부진정연대채무 관계가 성립한다.".to_string();
+        let out = store
+            .ingest_markdown(IngestInput {
+                source_type: SourceType::ChatPaste,
+                source_device_id: "dev",
+                original_path: None,
+                title: Some("민법 제750조 요약"),
+                markdown: &knowledge,
+                html_content: None,
+                doc_type: None,
+                domain: "legal",
+            })
+            .await
+            .unwrap();
+        assert!(!out.already_present);
+        assert!(out.link_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn chat_paste_over_2000_still_accepted_without_gate() {
+        let (store, _conn) = mem_store().await;
+        // Pure conversation but > 2000 chars — still auto-ingested per the
+        // quantitative threshold (users explicitly pasted long content).
+        let long_chatty = "안녕하세요 반가워요 고마워요. ".repeat(400);
+        let out = store
+            .ingest_markdown(IngestInput {
+                source_type: SourceType::ChatPaste,
+                source_device_id: "dev",
+                original_path: None,
+                title: None,
+                markdown: &long_chatty,
+                html_content: None,
+                doc_type: None,
+                domain: "legal",
+            })
+            .await
+            .unwrap();
+        assert!(!out.already_present);
     }
 
     #[tokio::test]

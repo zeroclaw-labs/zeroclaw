@@ -3281,7 +3281,12 @@ IngestInput { source_type, source_device_id, original_path, title,
 
 **채팅 유래 문서**도 동일 경로를 탄다 — `source_type=chat_upload` 또는
 `chat_paste`. 원본 파일이 없는 경우 `original_path=NULL`, 나머지는 동일.
-`SourceType::ChatPaste`는 ≥2000자 강제 가드(`store.rs:84–93`). **[구현]**
+**3-tier chat_paste 게이트** (store.rs):
+- `< DOCUMENT_QUALITATIVE_MIN_CHARS (200)` → 거부 (hard floor, 잡담).
+- `200 ≤ len < DOCUMENT_MIN_CHARS (2000)` → **정성적 분류** `AIEngine::classify_as_knowledge` → 지식(헤더·복합토큰·문장밀도 등) 판정 시만 수용, 일상 대화는 거부.
+- `≥ 2000` → 자동 수용 (정량 임계값).
+
+Heuristic rule classifier는 provider 없이 작동 (`heuristic_knowledge_classify` — 마크다운 헤더 + 복합 토큰 + 문장 종결자 + 한국어 챗 마커 휴리스틱). LlmAIEngine은 JSON schema prompt로 동일 판정. **[구현]**
 
 ### 6D-4. 통합 검색 (Unified First + Second Brain Search)
 

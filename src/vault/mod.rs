@@ -29,6 +29,9 @@ pub use wikilink::{
     LinkRecord, WikilinkPipeline,
 };
 
-/// Minimum chars for chat-paste ingestion into the vault (§4 of spec).
-/// Shorter inputs are treated as transient chat, not second-brain material.
+/// Quantitative threshold: chat-paste ≥ this auto-ingests.
 pub const DOCUMENT_MIN_CHARS: usize = 2000;
+
+/// Qualitative lower bound: texts below this are never ingested, regardless
+/// of AI classification — too short to carry standalone knowledge.
+pub const DOCUMENT_QUALITATIVE_MIN_CHARS: usize = 200;
