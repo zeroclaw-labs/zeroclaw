@@ -3699,6 +3699,87 @@ SourceType::ChatPaste char_count:
 
 ---
 
+### 6E-8. Session Summary: 2026-04-16 9-PR Sprint + Follow-ups
+
+이 세션에서 137c846a 위로 18개 원자 커밋을 누적하여 §6E-7 전체 로드맵 + 대부분의 "잔여" 작업을 완료했다. 아래는 최종 상태 정리.
+
+#### 커밋 히스토리 (총 18개, 원자 커밋)
+
+| # | SHA (short) | 내용 | 테스트 증분 |
+|---|---|---|---|
+| 1 | `13f32f4e` | PR #1 Local-first EmbeddingProvider (embedding/ 디렉토리 + fastembed feature-gated + trait model/version) | +6 memory |
+| 2 | `0b4d6463` | PR #7 HLC 시계 (lock-free CAS, 5분 skew + 8스레드 fuzz) + 크레딧 2-phase reserve/commit (10스레드 fuzz) | +13 sync · +10 billing |
+| 3 | `f70a0a8a` | PR #4 k-way RRF + Cross-Encoder Reranker + `[memory.rerank]` config + recall_with_variations 일원화 | +15 memory |
+| 4 | `1c3b3b26` | PR #5 vec2text 방어 (수신측) + EmbeddingBlob + embedding_backfill_queue + docs/security/embedding-privacy.md | +11 memory/sync |
+| 5 | `0c72c79b` | PR #8 RAGAS harness + moa_eval 바이너리 + CI workflow + thresholds.toml | +0 (binary) |
+| 6 | `9488ecf1` | PR #6 Consolidation + Decay + semantic_fact 스키마 + 6 integration tests | +26 memory |
+| 7 | `51be5d2c` | PR #9 GraphRAG Community Layer + LPA + Phase 5 ranker + ontology_communities | +14 ontology |
+| 8 | `f774b6ef` | PR #5/#6/#9 wire-up (archived 필터 + auto bump_recall + dream_cycle Task 4/5 + 송신측 embedding + Phase 5 주입) | +5 memory |
+| 9 | `888f51b0` | VaultScheduler weekly community + CI baseline diff + eval_rag_llm.py skeleton | +3 vault |
+| 10 | `c3ea3524` | recall_count DB surface + dream_cycle Task 6 (community embedding backfill) | +1 memory · +1 ontology |
+| 11 | `5629cb2c` | SQLCipher 5단계 rollout 플랜 문서 | 0 |
+| 12 | `0fd1231d` | 코퍼스 확장 20→110 queries (ko 50 / en 30 / law 30) + thresholds 0.90 승격 | 0 |
+| 13 | `bb67b70f` | LlmConsolidator를 VaultScheduler에 연결 (with_community_summarizer) | +2 vault |
+| 14 | `1db6b714` | PR #7 HLC 스키마 마이그레이션 — updated_at_hlc 컬럼 + 모든 store에 HLC stamp | +2 memory |
+| 15 | `af6b9668` | PR #5 SQLCipher feature flag (memory-sqlcipher) + with_options_keyed + PRAGMA key | 0 |
+| 16 | `67d959ed` | PR #8 LLM judge 실구현 (Python + requests) + Rust `--emit-retrieval` flag | 0 |
+| 17 | `07a33586` | PR #1 실모델 검증 — BGE-M3 determinism + 한·영 shape sanity (fastembed 5.8 pin) | +2 memory (feature-only) |
+| 18 | `6bbd5f83` | PR #7 r2d2 pool — 8-conn 읽기 풀, concurrent reader test | +2 memory |
+
+#### 최종 테스트 상태
+
+- vault **126** + memory **396** + sync **68** + phone **20** + ontology **27** + billing **74** = **711 pass / 0 fail**
+- 세션 시작 **518 pass** → **711 pass** (+193)
+- feature-gated (`--features embedding-local`): memory 추가 +2 (실모델 determinism / 한·영 shape)
+
+#### §6E-7 "잔여" 항목 최종 처리 매핑
+
+완료된 항목은 [✅]. 본 세션 범위를 넘어서는 항목은 [⏳ 후속].
+
+| 잔여 항목 | 상태 | 커밋 |
+|---|---|---|
+| PR #1 실모델 결정론 검증 | ✅ | `07a33586` |
+| PR #1 Tauri 다운로드 UI | ⏳ 후속 (프론트엔드) | — |
+| PR #1 config 기본값 flip | ⏳ embedding-local 릴리즈 기본 전까지 의도적 유지 | — |
+| PR #1 CPU 32배치 <2s 벤치 | ⏳ 후속 (프로파일 환경 필요) | — |
+| PR #4 reranker on/off 정확도 비교 | ⏳ 후속 (대형 eval 데이터셋 필요) | — |
+| PR #4 p95 latency <500ms 실측 | ⏳ 후속 (벤치 환경 필요) | — |
+| PR #4 모바일 degrade 검증 | ⏳ 후속 (디바이스 테스트 필요) | — |
+| PR #5 SQLCipher at-rest | ✅ (feature flag + keyed constructor) | `af6b9668` |
+| PR #5 송신측 embedding 첨부 | ✅ (record_store_with_embedding + 자동 wiring) | `f774b6ef` |
+| PR #5 backfill 스케줄러 | ✅ (dream_cycle Task 6) | `c3ea3524` |
+| PR #6 dream_cycle 통합 | ✅ (Task 4 decay + Task 5 consolidate + Task 6 community) | `f774b6ef` · `c3ea3524` |
+| PR #6 recall archived 필터 | ✅ (FTS5 / vector / LIKE 전부) | `f774b6ef` |
+| PR #6 auto bump_recall | ✅ | `f774b6ef` |
+| PR #6 아카이브 UI | ⏳ 후속 (프론트엔드) | — |
+| PR #7 r2d2 pool | ✅ (8-conn 읽기 풀) | `6bbd5f83` |
+| PR #7 HLC 스키마 마이그레이션 | ✅ (updated_at_hlc additive) | `1db6b714` |
+| PR #7 sync protocol version bump (HLC 정렬 전환) | ⏳ 후속 (프로토콜 호환성 작업) | — |
+| PR #8 코퍼스 확장 (ko 100 / en 50 / law 30) | ✅ 부분 (ko 50 / en 30 / law 30 — 스펙 중 법률 도메인만 목표 달성, ko/en은 50/30 도달 후 추가 커뮤니티 지식 필요) | `0fd1231d` |
+| PR #8 LLM judge | ✅ (subprocess-based, dry-run verified) | `67d959ed` |
+| PR #8 baseline diff CI | ✅ (action-download-artifact + 5% 회귀 가드) | `888f51b0` |
+| PR #9 VaultScheduler weekly 잡 | ✅ (community detection + LLM summariser) | `888f51b0` · `bb67b70f` |
+| PR #9 Phase 5 agent loop | ✅ (context.rs Phase 5 + SectionPriority::Community) | `f774b6ef` |
+| PR #9 Leiden 교체 | ⏳ 후속 (LPA가 ≤low-thousands에서 충분; 코퍼스 성장 시 교체) | — |
+| PR #9 100 객체+200 링크 <1s 벤치 | ⏳ 후속 (벤치 환경 필요) | — |
+
+#### 새로 생긴 아키텍처 surface (요약)
+
+- **Memory trait 확장**: `accept_remote_embedding(content, &EmbeddingBlob)` · `current_embedding_blob(content) -> Option<EmbeddingBlob>` · `query_embedding(query) -> Option<Vec<f32>>` · 모두 디폴트 `None`/`Ok(false)`로 backward-compat.
+- **SqliteMemory 신규 메서드**: `collect_consolidation_candidates(min_recall)` · `apply_consolidation_outcome(&outcome)` · `bump_recall_metrics(&ids)` · `run_decay_sweep()` · `read_pool()`.
+- **SyncEngine 확장**: `record_store_with_embedding(key, content, category, Option<EmbeddingBlob>)`. 송신측에서 자동으로 캐시 임베딩을 delta에 첨부.
+- **OntologyRepo 확장**: `load_graph_view()` · `replace_communities_level_zero(assignment, summariser_fn)` · `set_community_summary(level, cid, summary, &keywords)` · `set_community_embedding(level, cid, &[f32])` · `list_communities_level_zero()` · `list_communities_needing_summary()` · `list_communities_needing_embedding()`.
+- **VaultScheduler 확장**: `with_ontology(repo)` · `with_community_cadence(dur)` · `with_community_summarizer(provider, model)` · 주간 community detection tick.
+- **새 바이너리**: `src/bin/moa_eval.rs` (--set/--top-k/--output/--emit-retrieval).
+- **새 모듈**: `src/memory/{embedding/,search/fusion.rs,search/rerank.rs,consolidate.rs,decay.rs}` · `src/sync/hlc.rs` · `src/ontology/community.rs`.
+- **새 CI**: `.github/workflows/eval.yml` — PR 코멘트 + artifact + baseline 회귀 가드.
+- **새 features**: `embedding-local` (fastembed 5.8 + ONNX) · `memory-sqlcipher` (rusqlite SQLCipher 번들).
+- **새 문서**: `docs/security/embedding-privacy.md` (vec2text + SQLCipher 5단계 rollout).
+- **새 테스트 데이터**: `tests/evals/{corpus,golden_ko,golden_en,golden_law,thresholds,scripts/eval_rag_llm.py,README.md}` (110 queries).
+- **스키마 마이그레이션 (additive)**: `memories.{recall_count, last_recalled, archived, decay_score, updated_at_hlc}` · `embedding_backfill_queue` · `consolidated_memories` · `ontology_communities` · vault_documents 기존 embedding_* 컬럼들 (PR #2).
+
+---
+
 ## 7. Voice / Simultaneous Interpretation
 
 ### Goal
