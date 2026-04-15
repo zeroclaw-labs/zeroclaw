@@ -144,6 +144,18 @@ pub enum DeltaOperation {
         truth_version: u32,
     },
 
+    /// Vault (Second Brain) document upserted (v6 §6).
+    /// Idempotent via `uuid` + `checksum` uniqueness on receiving side.
+    VaultDocUpsert {
+        uuid: String,
+        source_type: String,
+        title: Option<String>,
+        checksum: String,
+        content_sha256: String,
+        frontmatter_json: Option<String>,
+        links_json: Option<String>,
+    },
+
     /// Ontology action logged (read-only replication — actions are
     /// never replayed, only the log entry is synced).
     OntologyActionLog {
@@ -702,6 +714,43 @@ impl SyncEngine {
         self.journal.push(entry);
         if let Err(e) = self.save() {
             tracing::warn!("Failed to persist compiled truth sync: {e}");
+        }
+    }
+
+    /// Record a vault (second brain) document upsert (v6 §6).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_vault_doc_upsert(
+        &mut self,
+        uuid: &str,
+        source_type: &str,
+        title: Option<&str>,
+        checksum: &str,
+        content_sha256: &str,
+        frontmatter_json: Option<&str>,
+        links_json: Option<&str>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.version.increment(&self.device_id.0);
+        let entry = DeltaEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            device_id: self.device_id.0.clone(),
+            version: self.version.clone(),
+            operation: DeltaOperation::VaultDocUpsert {
+                uuid: uuid.to_string(),
+                source_type: source_type.to_string(),
+                title: title.map(String::from),
+                checksum: checksum.to_string(),
+                content_sha256: content_sha256.to_string(),
+                frontmatter_json: frontmatter_json.map(String::from),
+                links_json: links_json.map(String::from),
+            },
+            timestamp: current_epoch_secs(),
+        };
+        self.journal.push(entry);
+        if let Err(e) = self.save() {
+            tracing::warn!("Failed to persist vault doc sync: {e}");
         }
     }
 

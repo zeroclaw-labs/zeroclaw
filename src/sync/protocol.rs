@@ -314,6 +314,10 @@ pub fn merge_deltas_lww(
             crate::memory::sync::DeltaOperation::CompiledTruthUpdate { memory_key, .. } => {
                 format!("truth_{memory_key}")
             }
+            // v6 vault doc deltas: uuid is already globally unique.
+            crate::memory::sync::DeltaOperation::VaultDocUpsert { uuid, .. } => {
+                format!("vault_{uuid}")
+            }
         };
 
         match winners.get(&key) {

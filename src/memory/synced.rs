@@ -187,6 +187,21 @@ impl SyncedMemory {
                         }
                     }
                 }
+                // ── v6 Vault (Second Brain) delta ─────────────────
+                DeltaOperation::VaultDocUpsert { uuid, .. } => {
+                    match self.inner.apply_remote_v3_delta(op).await {
+                        Ok(true) => {
+                            tracing::debug!(uuid, "Applied remote vault doc upsert");
+                            applied += 1;
+                        }
+                        Ok(false) => {
+                            tracing::trace!(uuid, "Backend ignored vault doc delta (not supported)");
+                        }
+                        Err(e) => {
+                            tracing::warn!(uuid, "Failed to apply remote vault doc delta: {e}");
+                        }
+                    }
+                }
             }
         }
 

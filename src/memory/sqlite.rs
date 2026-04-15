@@ -1343,6 +1343,54 @@ impl Memory for SqliteMemory {
                 )?;
                 Ok(changed > 0)
             }
+            DeltaOperation::VaultDocUpsert {
+                uuid,
+                source_type,
+                title,
+                checksum,
+                content_sha256: _,
+                frontmatter_json: _,
+                links_json: _,
+            } => {
+                // Vault (second-brain) docs: shell row only. Full content
+                // travels via Layer 3 manifest (existing full-sync path) to
+                // keep delta journal small. Here we just register the
+                // document identity + checksum so peer knows it exists.
+                // Content marked "(pending body sync)" — filled when Layer 3
+                // transfers the full text.
+                let conn = self.conn.lock();
+                // Ensure vault_documents exists; if schema not installed on this
+                // SqliteMemory instance (test fixture without vault), ignore.
+                let has_table: Option<i64> = conn
+                    .query_row(
+                        "SELECT 1 FROM sqlite_master
+                         WHERE type='table' AND name='vault_documents'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if has_table.is_none() {
+                    return Ok(false);
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let changed = conn.execute(
+                    "INSERT OR IGNORE INTO vault_documents
+                        (uuid, title, content, source_type, source_device_id,
+                         checksum, char_count, created_at, updated_at)
+                     VALUES (?1, ?2, '(pending body sync)', ?3, 'remote', ?4, 0, ?5, ?5)",
+                    params![
+                        uuid,
+                        title,
+                        source_type,
+                        checksum,
+                        now as i64
+                    ],
+                )?;
+                Ok(changed > 0)
+            }
             // Non-v3 operations fall through — SyncedMemory handles them.
             _ => Ok(false),
         }
