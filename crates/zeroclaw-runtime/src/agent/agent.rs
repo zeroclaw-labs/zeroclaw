@@ -1126,12 +1126,8 @@ impl Agent {
                         }
                         zeroclaw_providers::traits::StreamEvent::ToolCall(tc) => {
                             got_stream = true;
-                            let _ = event_tx
-                                .send(TurnEvent::ToolCall {
-                                    name: tc.name.clone(),
-                                    args: serde_json::from_str(&tc.arguments).unwrap_or_default(),
-                                })
-                                .await;
+                            // ToolCall event is sent later (after parse_response) to
+                            // avoid duplicates; just collect here.
                             streamed_tool_calls.push(tc);
                         }
                         zeroclaw_providers::traits::StreamEvent::PreExecutedToolCall {
