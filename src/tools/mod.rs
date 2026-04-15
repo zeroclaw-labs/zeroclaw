@@ -57,6 +57,7 @@ pub mod image_info;
 pub mod mcp_client;
 pub mod mcp_protocol;
 pub mod mcp_tool;
+pub mod document_fetch;
 pub mod mcp_transport;
 pub mod media_gen;
 pub mod memory_forget;
@@ -379,6 +380,12 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryObserveTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
+        Arc::new(document_fetch::DocumentFetchTool::new(Arc::new(
+            workspace_dir.to_path_buf(),
+        ))),
+        Arc::new(document_fetch::DocumentSearchTool::new(Arc::new(
+            workspace_dir.to_path_buf(),
+        ))),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Arc::new(TaskPlanTool::new(security.clone())),
         Arc::new(ModelRoutingConfigTool::new(

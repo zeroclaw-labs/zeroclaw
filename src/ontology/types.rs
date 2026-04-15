@@ -52,6 +52,10 @@ pub struct OntologyObject {
     pub properties: serde_json::Value,
     /// Owner scope for multi-user isolation.
     pub owner_user_id: String,
+    /// **Themes (주제)** — topic labels attached to this object.
+    /// Enables fast theme-based categorization and retrieval.
+    #[serde(default)]
+    pub themes: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -196,6 +200,13 @@ pub struct OntologyAction {
     /// e.g. "서울 서초구 법원로 서울중앙지방법원", "골프장 레이크사이드CC",
     /// "서울 강남구 테헤란로 사무실").
     pub location: Option<String>,
+    /// **Themes (주제)** — topic labels extracted from the action for fast
+    /// categorization and retrieval. One action can have multiple themes.
+    /// Example: ["차용금반환청구", "물품대금청구", "소장"] for a lawsuit filing
+    /// that covered both loan recovery and goods payment claims.
+    /// Enables theme-based browsing ("show all 차용금반환청구 actions").
+    #[serde(default)]
+    pub themes: Vec<String>,
     pub status: ActionStatus,
     pub error_message: Option<String>,
     pub created_at: i64,

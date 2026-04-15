@@ -424,6 +424,48 @@ impl SqliteMemory {
                 ON workflow_suggestions(created_at DESC) WHERE reviewed_at IS NULL;",
         )?;
 
+        // ── LLM Wiki: documents table for long-content summary/link pattern ──
+        // Stores full originals + LLM-generated summaries + extracted entities.
+        // When a user uploads a document or pastes long text (2000+ chars),
+        // the summary goes into chat context, original stays here.
+        // LLM can fetch the original via document_fetch(content_id) when needed.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS documents (
+                content_id   TEXT PRIMARY KEY,
+                title        TEXT NOT NULL,
+                summary      TEXT NOT NULL,
+                content      TEXT NOT NULL,
+                category     TEXT NOT NULL DEFAULT 'general',
+                entities     TEXT NOT NULL DEFAULT '[]',
+                token_count  INTEGER NOT NULL DEFAULT 0,
+                char_count   INTEGER NOT NULL DEFAULT 0,
+                source_type  TEXT NOT NULL DEFAULT 'text',
+                created_at   TEXT NOT NULL,
+                last_accessed TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_documents_category ON documents(category);
+            CREATE INDEX IF NOT EXISTS idx_documents_created ON documents(created_at DESC);
+
+            -- FTS5 full-text index on summaries + entities (search-first)
+            CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+                title, summary, entities, content=documents, content_rowid=rowid
+            );
+            CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
+                INSERT INTO documents_fts(rowid, title, summary, entities)
+                VALUES (new.rowid, new.title, new.summary, new.entities);
+            END;
+            CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
+                INSERT INTO documents_fts(documents_fts, rowid, title, summary, entities)
+                VALUES ('delete', old.rowid, old.title, old.summary, old.entities);
+            END;
+            CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
+                INSERT INTO documents_fts(documents_fts, rowid, title, summary, entities)
+                VALUES ('delete', old.rowid, old.title, old.summary, old.entities);
+                INSERT INTO documents_fts(rowid, title, summary, entities)
+                VALUES (new.rowid, new.title, new.summary, new.entities);
+            END;",
+        )?;
+
         Ok(())
     }
 

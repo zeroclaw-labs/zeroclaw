@@ -17213,8 +17213,10 @@ impl Default for AuthConfig {
 /// Multi-device synchronization configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SyncConfig {
-    /// Enable cross-device memory synchronization (default: false).
-    #[serde(default)]
+    /// Enable cross-device memory synchronization (default: true).
+    /// Automatically syncs long-term memories and ontology across all
+    /// devices logged in with the same account.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// WebSocket URL of the Railway relay server for cross-device sync.
     /// Example: "wss://api.mymoa.app/sync"

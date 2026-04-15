@@ -252,7 +252,7 @@ impl OntologyRepo {
     pub fn get_object(&self, id: i64) -> anyhow::Result<Option<OntologyObject>> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT id, type_id, title, properties, owner_user_id, created_at, updated_at
+            "SELECT id, type_id, title, properties, owner_user_id, created_at, updated_at, themes
              FROM ontology_objects WHERE id = ?1",
             params![id],
             |r| {
@@ -262,6 +262,7 @@ impl OntologyRepo {
                     title: r.get(2)?,
                     properties: parse_json_col(r.get::<_, String>(3)?),
                     owner_user_id: r.get(4)?,
+                    themes: parse_themes_col(r.get::<_, Option<String>>(7).ok().flatten()),
                     created_at: r.get(5)?,
                     updated_at: r.get(6)?,
                 })
@@ -282,7 +283,7 @@ impl OntologyRepo {
     ) -> anyhow::Result<Option<OntologyObject>> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT id, type_id, title, properties, owner_user_id, created_at, updated_at
+            "SELECT id, type_id, title, properties, owner_user_id, created_at, updated_at, themes
              FROM ontology_objects WHERE id = ?1 AND owner_user_id = ?2",
             params![id, owner_user_id],
             |r| {
@@ -292,6 +293,7 @@ impl OntologyRepo {
                     title: r.get(2)?,
                     properties: parse_json_col(r.get::<_, String>(3)?),
                     owner_user_id: r.get(4)?,
+                    themes: parse_themes_col(r.get::<_, Option<String>>(7).ok().flatten()),
                     created_at: r.get(5)?,
                     updated_at: r.get(6)?,
                 })
@@ -416,6 +418,7 @@ impl OntologyRepo {
                 title: r.get(2)?,
                 properties: parse_json_col(r.get::<_, String>(3)?),
                 owner_user_id: r.get(4)?,
+                themes: parse_themes_col(r.get::<_, Option<String>>(7).ok().flatten()),
                 created_at: r.get(5)?,
                 updated_at: r.get(6)?,
             })
@@ -437,7 +440,7 @@ impl OntologyRepo {
             // No FTS query — simple list by type.
             if let Some(tid) = type_id {
                 let mut stmt = conn.prepare_cached(
-                    "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at
+                    "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at, o.themes
                      FROM ontology_objects o
                      WHERE o.owner_user_id = ?1 AND o.type_id = ?2
                      ORDER BY o.updated_at DESC LIMIT ?3",
@@ -448,7 +451,7 @@ impl OntologyRepo {
                 }
             } else {
                 let mut stmt = conn.prepare_cached(
-                    "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at
+                    "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at, o.themes
                      FROM ontology_objects o
                      WHERE o.owner_user_id = ?1
                      ORDER BY o.updated_at DESC LIMIT ?2",
@@ -462,7 +465,7 @@ impl OntologyRepo {
             // FTS5 search — always use parameter binding.
             if let Some(tid) = type_id {
                 let mut stmt = conn.prepare_cached(
-                    "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at
+                    "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at, o.themes
                      FROM ontology_objects_fts f
                      JOIN ontology_objects o ON o.id = f.rowid
                      WHERE ontology_objects_fts MATCH ?1
@@ -479,7 +482,7 @@ impl OntologyRepo {
                 }
             } else {
                 let mut stmt = conn.prepare_cached(
-                    "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at
+                    "SELECT o.id, o.type_id, o.title, o.properties, o.owner_user_id, o.created_at, o.updated_at, o.themes
                      FROM ontology_objects_fts f
                      JOIN ontology_objects o ON o.id = f.rowid
                      WHERE ontology_objects_fts MATCH ?1
@@ -851,7 +854,7 @@ impl OntologyRepo {
                         occurred_at_utc, occurred_at_local, timezone,
                         occurred_at_home, home_timezone, location,
                         status, error_message,
-                        created_at, updated_at
+                        created_at, updated_at, themes
                  FROM ontology_actions
                  WHERE actor_user_id = ?1 AND channel = ?3
                  ORDER BY COALESCE(occurred_at_utc, datetime(created_at/1000, 'unixepoch')) DESC LIMIT ?2"
@@ -866,7 +869,7 @@ impl OntologyRepo {
                         occurred_at_utc, occurred_at_local, timezone,
                         occurred_at_home, home_timezone, location,
                         status, error_message,
-                        created_at, updated_at
+                        created_at, updated_at, themes
                  FROM ontology_actions
                  WHERE actor_user_id = ?1
                  ORDER BY COALESCE(occurred_at_utc, datetime(created_at/1000, 'unixepoch')) DESC LIMIT ?2"
@@ -908,6 +911,7 @@ impl OntologyRepo {
                 location: r.get(15)?,
                 status: ActionStatus::from_str_lossy(&r.get::<_, String>(16)?),
                 error_message: r.get(17)?,
+                themes: parse_themes_col(r.get::<_, Option<String>>(20).ok().flatten()),
                 created_at: r.get(18)?,
                 updated_at: r.get(19)?,
             })
@@ -968,6 +972,24 @@ fn now_millis() -> i64 {
 
 fn parse_json_col(s: String) -> serde_json::Value {
     serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s))
+}
+
+/// Parse a themes JSON array column (stored as Option<String>).
+/// Returns empty vec if NULL, empty string, or invalid JSON.
+fn parse_themes_col(s: Option<String>) -> Vec<String> {
+    s.and_then(|raw| {
+        if raw.trim().is_empty() {
+            None
+        } else {
+            serde_json::from_str::<Vec<String>>(&raw).ok()
+        }
+    })
+    .unwrap_or_default()
+}
+
+/// Serialize a themes vec into JSON array string for storage.
+fn serialize_themes(themes: &[String]) -> String {
+    serde_json::to_string(themes).unwrap_or_else(|_| "[]".to_string())
 }
 
 #[cfg(test)]

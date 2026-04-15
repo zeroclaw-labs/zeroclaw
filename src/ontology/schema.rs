@@ -169,6 +169,12 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
     migrate_add_column(conn, "ontology_actions", "occurred_at_home", "TEXT")?;
     migrate_add_column(conn, "ontology_actions", "home_timezone", "TEXT")?;
     migrate_add_column(conn, "ontology_actions", "location", "TEXT")?;
+    // ── Theme (주제/테마) migration ──
+    // A JSON array of theme strings extracted from the action.
+    // Example: ["차용금반환청구", "물품대금청구", "소장"] for a lawsuit filing.
+    // Enables fast theme-based categorization and retrieval.
+    migrate_add_column(conn, "ontology_actions", "themes", "TEXT")?;
+    migrate_add_column(conn, "ontology_objects", "themes", "TEXT")?;
     // Legacy migration: rename old occurred_at → occurred_at_utc if present.
     migrate_add_column(conn, "ontology_actions", "occurred_at", "TEXT")?;
     // Copy legacy occurred_at data to occurred_at_utc (best-effort).
@@ -191,7 +197,11 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
          CREATE INDEX IF NOT EXISTS idx_onto_actions_when_where
              ON ontology_actions(occurred_at_utc, location);
          CREATE INDEX IF NOT EXISTS idx_onto_actions_where_when
-             ON ontology_actions(location, occurred_at_utc);",
+             ON ontology_actions(location, occurred_at_utc);
+         CREATE INDEX IF NOT EXISTS idx_onto_actions_themes
+             ON ontology_actions(themes);
+         CREATE INDEX IF NOT EXISTS idx_onto_objects_themes
+             ON ontology_objects(themes);",
     );
 
     Ok(())
