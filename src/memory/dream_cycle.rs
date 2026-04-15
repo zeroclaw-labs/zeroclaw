@@ -140,11 +140,31 @@ pub fn is_leader(state: &DeviceState) -> bool {
 /// Run the Dream Cycle consolidation tasks.
 ///
 /// Call this only after `check_idle_conditions` and `is_leader` return true.
+///
+/// `ontology` is the optional PR #9 community-embedding backfill target.
+/// When provided, the dream cycle fills in `summary_embedding` for any
+/// `ontology_communities` rows whose summary exists but whose embedding
+/// is still NULL (the VaultScheduler writes the summary-less skeleton;
+/// the LLM-driven summariser + this backfill are the two halves of the
+/// Phase 5 data). Pass `None` for vault-only deployments.
 pub async fn run_dream_cycle(
     memory: &SqliteMemory,
     provider: &dyn Provider,
     config: &DreamCycleConfig,
     device_id: &str,
+) -> Result<DreamCycleReport> {
+    run_dream_cycle_with_ontology(memory, provider, config, device_id, None).await
+}
+
+/// Variant of [`run_dream_cycle`] that accepts an optional ontology repo
+/// for Phase 5 embedding backfill. Existing callers stay on the wrapper
+/// above so this does not turn into a signature-churn PR.
+pub async fn run_dream_cycle_with_ontology(
+    memory: &SqliteMemory,
+    provider: &dyn Provider,
+    config: &DreamCycleConfig,
+    device_id: &str,
+    ontology: Option<&crate::ontology::OntologyRepo>,
 ) -> Result<DreamCycleReport> {
     let mut report = DreamCycleReport::default();
 
@@ -196,6 +216,44 @@ pub async fn run_dream_cycle(
             let msg = format!("Dream Cycle decay sweep failed: {e}");
             tracing::warn!("{msg}");
             report.errors.push(msg);
+        }
+    }
+
+    // Task 6 (PR #9 wire-up): community embedding backfill. When an
+    // OntologyRepo is provided, fill in summary_embedding for any
+    // level-0 community whose summary exists but whose embedding is
+    // still NULL. Cheap: one SELECT + N embed calls + N UPDATEs, and
+    // re-embedding is idempotent (the hot path doesn't re-read until
+    // the next tick).
+    if let Some(repo) = ontology {
+        match repo.list_communities_needing_embedding() {
+            Ok(pending) => {
+                let mut embedded = 0usize;
+                for (cid, level, summary) in pending {
+                    match memory.query_embedding(&summary).await {
+                        Some(emb) if !emb.is_empty() => {
+                            if let Err(e) = repo.set_community_embedding(level, cid, &emb) {
+                                tracing::warn!(cid, "set_community_embedding failed: {e}");
+                            } else {
+                                embedded += 1;
+                            }
+                        }
+                        _ => {
+                            // No embedder configured (Noop) or
+                            // compute failed — skip this community,
+                            // try again next cycle.
+                        }
+                    }
+                }
+                if embedded > 0 {
+                    tracing::info!("Dream Cycle: embedded {embedded} community summaries");
+                }
+            }
+            Err(e) => {
+                let msg = format!("Dream Cycle community backfill failed: {e}");
+                tracing::warn!("{msg}");
+                report.errors.push(msg);
+            }
         }
     }
 

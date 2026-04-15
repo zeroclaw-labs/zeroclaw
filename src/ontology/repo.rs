@@ -1216,6 +1216,35 @@ impl OntologyRepo {
         Ok(written)
     }
 
+    /// PR #9 wire-up — list every level-0 community that has a non-empty
+    /// summary but no embedding yet. Feeds the backfill pass that runs
+    /// inside the dream cycle: for each row, compute an embedding from
+    /// the summary text and call [`Self::set_community_embedding`].
+    pub fn list_communities_needing_embedding(
+        &self,
+    ) -> anyhow::Result<Vec<(u32, u32, String)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT community_id, level, summary
+               FROM ontology_communities
+              WHERE level = 0
+                AND summary_embedding IS NULL
+                AND length(summary) > 0
+              ORDER BY community_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let cid: i64 = row.get(0)?;
+            let level: i64 = row.get(1)?;
+            let summary: String = row.get(2)?;
+            Ok((
+                u32::try_from(cid).unwrap_or(u32::MAX),
+                u32::try_from(level).unwrap_or(0),
+                summary,
+            ))
+        })?;
+        rows.collect::<Result<_, _>>().map_err(anyhow::Error::from)
+    }
+
     /// Attach a freshly-computed embedding to one community. Called by the
     /// embedding backfill pass after the LLM summary has been written.
     pub fn set_community_embedding(
@@ -1424,6 +1453,45 @@ mod community_tests {
         let listed = r.list_communities_level_zero().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].object_ids, vec![5, 6, 7]);
+    }
+
+    #[test]
+    fn list_communities_needing_embedding_filters_correctly() {
+        use super::super::community::CommunityAssignment;
+        use std::collections::{BTreeMap, HashMap};
+
+        let (_tmp, r) = repo();
+        let mut members: BTreeMap<u32, Vec<i64>> = BTreeMap::new();
+        members.insert(0, vec![1, 2]);
+        members.insert(1, vec![3]);
+        members.insert(2, vec![4]);
+        let mut of_node: HashMap<i64, u32> = HashMap::new();
+        for (cid, ms) in &members {
+            for m in ms {
+                of_node.insert(*m, *cid);
+            }
+        }
+        r.replace_communities_level_zero(
+            &CommunityAssignment { of_node, members },
+            |cid, _| match cid {
+                // 0 → summary present, needs embedding
+                0 => ("summary A".into(), vec![]),
+                // 1 → empty summary (scheduler placeholder), should be
+                //     excluded so we don't embed empty strings
+                1 => (String::new(), vec![]),
+                // 2 → summary present, needs embedding
+                _ => ("summary C".into(), vec![]),
+            },
+        )
+        .unwrap();
+        // Pre-embed community 2 so it drops off the "needs embedding" list.
+        r.set_community_embedding(0, 2, &[0.1, 0.2, 0.3]).unwrap();
+
+        let pending = r.list_communities_needing_embedding().unwrap();
+        // Only community 0 should remain (has summary + no embedding).
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, 0);
+        assert_eq!(pending[0].2, "summary A");
     }
 
     #[test]

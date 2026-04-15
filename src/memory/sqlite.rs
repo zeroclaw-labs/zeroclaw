@@ -2244,11 +2244,17 @@ impl Memory for SqliteMemory {
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
+            // PR #6 wire-up: surface recall_count / last_recalled from the
+            // DB so callers (UI, debuggers, tests) can see what the decay
+            // layer actually observed.
             let mut stmt = conn.prepare_cached(
-                "SELECT id, key, content, category, created_at, session_id FROM memories WHERE key = ?1",
+                "SELECT id, key, content, category, created_at, session_id,
+                        recall_count, last_recalled
+                   FROM memories WHERE key = ?1",
             )?;
 
             let mut rows = stmt.query_map(params![key], |row| {
+                let recall_count_i: i64 = row.get(6)?;
                 Ok(MemoryEntry {
                     id: row.get(0)?,
                     key: row.get(1)?,
@@ -2257,8 +2263,8 @@ impl Memory for SqliteMemory {
                     timestamp: row.get(4)?,
                     session_id: row.get(5)?,
                     score: None,
-                recall_count: 0,
-                last_recalled: None,
+                    recall_count: u32::try_from(recall_count_i.max(0)).unwrap_or(u32::MAX),
+                    last_recalled: row.get(7)?,
                 })
             })?;
 
@@ -4256,6 +4262,29 @@ mod tests {
         let keys: Vec<&str> = hits.iter().map(|h| h.key.as_str()).collect();
         assert!(keys.contains(&"k_active"), "got {keys:?}");
         assert!(!keys.contains(&"k_archived"), "got {keys:?}");
+    }
+
+    #[tokio::test]
+    async fn get_surfaces_recall_count_and_last_recalled_from_db() {
+        // PR #6 wire-up: the DB columns are populated by
+        // bump_recall_metrics; `get()` must expose them so the UI /
+        // diagnostics can see the same numbers the decay sweep does.
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_surface", "data", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let first = mem.get("k_surface").await.unwrap().unwrap();
+        assert_eq!(first.recall_count, 0);
+        assert!(first.last_recalled.is_none());
+
+        // Drive the counter up via bump_recall_metrics directly (no
+        // recall(), to keep the test focused on the SELECT path).
+        mem.bump_recall_metrics(&[first.id.clone()]).unwrap();
+        mem.bump_recall_metrics(&[first.id.clone()]).unwrap();
+
+        let after = mem.get("k_surface").await.unwrap().unwrap();
+        assert_eq!(after.recall_count, 2);
+        assert!(after.last_recalled.is_some());
     }
 
     #[tokio::test]
