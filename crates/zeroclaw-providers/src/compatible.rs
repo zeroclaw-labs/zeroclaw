@@ -1570,6 +1570,46 @@ impl OpenAiCompatibleProvider {
             .collect()
     }
 
+    /// Strip native tool-calling constructs from messages for providers that
+    /// do not support native tool calling (e.g. MiniMax).
+    ///
+    /// Conversation history may contain tool-role messages and assistant
+    /// messages with `tool_calls` JSON from previous sessions or from
+    /// provider switches.  Sending these to a non-native-tool provider
+    /// causes hard API errors like MiniMax's
+    /// "tool result's tool id not found" (#5743).
+    ///
+    /// - **tool-role messages** are dropped entirely.
+    /// - **assistant messages with `tool_calls`** are converted to plain
+    ///   text by extracting only the `content` field (or dropped when the
+    ///   content is empty).
+    fn strip_native_tool_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        messages
+            .iter()
+            .filter_map(|msg| {
+                if msg.role == "tool" {
+                    return None;
+                }
+                if msg.role == "assistant"
+                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content)
+                    && value.get("tool_calls").is_some()
+                {
+                    let text = value
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    return if text.is_empty() {
+                        None
+                    } else {
+                        Some(ChatMessage::assistant(&text))
+                    };
+                }
+                Some(msg.clone())
+            })
+            .collect()
+    }
+
     fn with_prompt_guided_tool_instructions(
         messages: &[ChatMessage],
         tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
@@ -1808,6 +1848,12 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             messages.to_vec()
         };
+        // Strip native tool constructs for non-native-tool providers (#5743).
+        let effective_messages = if self.native_tool_calling {
+            effective_messages
+        } else {
+            Self::strip_native_tool_messages(&effective_messages)
+        };
         let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
@@ -2019,6 +2065,12 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             request.messages.to_vec()
         };
+        // Strip native tool constructs for non-native-tool providers (#5743).
+        let effective_messages = if self.native_tool_calling {
+            effective_messages
+        } else {
+            Self::strip_native_tool_messages(&effective_messages)
+        };
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages_for_native(&effective_messages, !merge),
@@ -2155,6 +2207,12 @@ impl Provider for OpenAiCompatibleProvider {
             Self::flatten_system_messages(request.messages)
         } else {
             request.messages.to_vec()
+        };
+        // Strip native tool constructs for non-native-tool providers (#5743).
+        let effective_messages = if self.native_tool_calling {
+            effective_messages
+        } else {
+            Self::strip_native_tool_messages(&effective_messages)
         };
 
         let tools = Self::convert_tool_specs(request.tools);
@@ -3238,6 +3296,72 @@ mod tests {
             "MiniMax should use prompt-guided tool calling, not native"
         );
         assert!(!caps.vision);
+    }
+
+    /// Regression test for #5743: native tool messages must be stripped for
+    /// providers that don't support native tool calling (e.g. MiniMax).
+    #[test]
+    fn strip_native_tool_messages_removes_tool_and_tool_calls() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("search for cats"),
+            ChatMessage::assistant(
+                r#"{"content":"I'll search","tool_calls":[{"id":"chatcmpl-tool-abc","name":"web_search","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(
+                r#"{"tool_call_id":"chatcmpl-tool-abc","content":"Found 10 results"}"#,
+            ),
+            ChatMessage::assistant("Here are the results about cats"),
+            ChatMessage::user("thanks"),
+        ];
+        let stripped = OpenAiCompatibleProvider::strip_native_tool_messages(&messages);
+        assert_eq!(stripped.len(), 5);
+        assert_eq!(stripped[0].role, "system");
+        assert_eq!(stripped[1].role, "user");
+        assert_eq!(stripped[1].content, "search for cats");
+        // Assistant with tool_calls → plain text with only content
+        assert_eq!(stripped[2].role, "assistant");
+        assert_eq!(stripped[2].content, "I'll search");
+        // tool message → dropped
+        assert_eq!(stripped[3].role, "assistant");
+        assert_eq!(stripped[3].content, "Here are the results about cats");
+        assert_eq!(stripped[4].role, "user");
+    }
+
+    #[test]
+    fn strip_native_tool_messages_drops_empty_assistant_tool_calls() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("do it"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"tc1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"tc1","content":"ok"}"#),
+            ChatMessage::assistant("Done"),
+        ];
+        let stripped = OpenAiCompatibleProvider::strip_native_tool_messages(&messages);
+        // assistant with empty content + tool_calls → dropped; tool → dropped
+        assert_eq!(stripped.len(), 3);
+        assert_eq!(stripped[0].role, "system");
+        assert_eq!(stripped[1].role, "user");
+        assert_eq!(stripped[2].role, "assistant");
+        assert_eq!(stripped[2].content, "Done");
+    }
+
+    #[test]
+    fn strip_native_tool_messages_preserves_regular_messages() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi there"),
+            ChatMessage::user("bye"),
+        ];
+        let stripped = OpenAiCompatibleProvider::strip_native_tool_messages(&messages);
+        assert_eq!(stripped.len(), 4);
+        for (orig, result) in messages.iter().zip(stripped.iter()) {
+            assert_eq!(orig.role, result.role);
+            assert_eq!(orig.content, result.content);
+        }
     }
 
     #[test]
