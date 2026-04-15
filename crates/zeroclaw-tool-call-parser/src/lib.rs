@@ -2648,4 +2648,126 @@ Let me check the result."#;
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Additional parser internals tests (moved from zeroclaw-runtime to keep
+    // functions crate-private per Beta-tier API stability policy)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_tool_call_value_handles_missing_name_field() {
+        let value = serde_json::json!({"function": {"arguments": {}}});
+        let result = parse_tool_call_value(&value);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_tool_call_value_handles_top_level_name() {
+        let value = serde_json::json!({"name": "test_tool", "arguments": {}});
+        let result = parse_tool_call_value(&value);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "test_tool");
+    }
+
+    #[test]
+    fn parse_tool_call_value_accepts_top_level_parameters_alias() {
+        let value = serde_json::json!({
+            "name": "schedule",
+            "parameters": {"action": "create", "message": "test"}
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "schedule");
+        assert_eq!(
+            result.arguments.get("action").and_then(|v| v.as_str()),
+            Some("create")
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_value_accepts_function_parameters_alias() {
+        let value = serde_json::json!({
+            "function": {
+                "name": "shell",
+                "parameters": {"command": "date"}
+            }
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "shell");
+        assert_eq!(
+            result.arguments.get("command").and_then(|v| v.as_str()),
+            Some("date")
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_value_preserves_tool_call_id_aliases() {
+        let value = serde_json::json!({
+            "call_id": "legacy_1",
+            "function": {
+                "name": "shell",
+                "arguments": {"command": "date"}
+            }
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.tool_call_id.as_deref(), Some("legacy_1"));
+    }
+
+    #[test]
+    fn extract_json_values_handles_empty_string() {
+        let result = extract_json_values("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn extract_json_values_handles_whitespace_only() {
+        let result = extract_json_values(
+            "   
+	  ",
+        );
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn extract_json_values_handles_multiple_objects() {
+        let input = r#"{"a": 1}{"b": 2}{"c": 3}"#;
+        let result = extract_json_values(input);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn extract_json_values_handles_arrays() {
+        let input = r#"[1, 2, 3]{"key": "value"}"#;
+        let result = extract_json_values(input);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn map_tool_name_alias_direct_coverage() {
+        assert_eq!(map_tool_name_alias("bash"), "shell");
+        assert_eq!(map_tool_name_alias("filelist"), "file_list");
+        assert_eq!(map_tool_name_alias("memorystore"), "memory_store");
+        assert_eq!(map_tool_name_alias("memoryforget"), "memory_forget");
+        assert_eq!(map_tool_name_alias("http"), "http_request");
+        assert_eq!(
+            map_tool_name_alias("totally_unknown_tool"),
+            "totally_unknown_tool"
+        );
+    }
+
+    #[test]
+    fn default_param_for_tool_coverage() {
+        assert_eq!(default_param_for_tool("shell"), "command");
+        assert_eq!(default_param_for_tool("bash"), "command");
+        assert_eq!(default_param_for_tool("file_read"), "path");
+        assert_eq!(default_param_for_tool("memory_recall"), "query");
+        assert_eq!(default_param_for_tool("memory_store"), "content");
+        assert_eq!(default_param_for_tool("web_search_tool"), "query");
+        assert_eq!(default_param_for_tool("web_search"), "query");
+        assert_eq!(default_param_for_tool("search"), "query");
+        assert_eq!(default_param_for_tool("http_request"), "url");
+        assert_eq!(default_param_for_tool("browser_open"), "url");
+        assert_eq!(default_param_for_tool("unknown_tool"), "input");
+    }
 }
