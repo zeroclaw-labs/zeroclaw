@@ -412,7 +412,7 @@ async fn process_chat_message(
     let _ = state.event_tx.send(serde_json::json!({
         "type": "agent_start",
         "provider": provider_label,
-        "model": state.model,
+        "model": state.active_model(),
     }));
 
     // Set session state to running
@@ -469,7 +469,7 @@ async fn process_chat_message(
             if state.auto_save {
                 let mem = state.mem.clone();
                 let provider = state.provider.clone();
-                let model = state.model.clone();
+                let model = state.active_model();
                 let user_msg = content.to_string();
                 let assistant_resp = response.clone();
                 tokio::spawn(async move {
@@ -507,7 +507,7 @@ async fn process_chat_message(
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "agent_end",
                 "provider": provider_label,
-                "model": state.model,
+                "model": state.active_model(),
             }));
         }
         Err(e) => {
