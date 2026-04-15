@@ -445,6 +445,11 @@ pub fn create_synced_memory(
         let engine = sync::SyncEngine::new(workspace_dir, true)?;
         let engine = Arc::new(parking_lot::Mutex::new(engine));
         let base_arc: Arc<dyn Memory> = Arc::from(base);
+        // v3.0: attach sync engine to the concrete backend so typed mutations
+        // (timeline append, compiled truth update, phone call insert)
+        // auto-record delta journal entries. Default is no-op for non-sqlite
+        // backends; SqliteMemory overrides `attach_sync_engine`.
+        base_arc.attach_sync_engine(engine.clone());
         let synced = SyncedMemory::new(base_arc, engine.clone());
         tracing::info!(
             device_id = %engine.lock().device_id().0,

@@ -138,20 +138,54 @@ impl SyncedMemory {
                     tracing::debug!("Received remote ontology action log (read-only)");
                 }
                 // ── v3.0 Timeline / Phone / Truth deltas ──────────────
+                // Delegate to the backend's typed apply hook. SqliteMemory
+                // persists into local tables (idempotent via UUID/LWW) and
+                // does NOT re-record the delta (no replication loop).
                 DeltaOperation::TimelineAppend { uuid, .. } => {
-                    // Timeline entries are append-only; the receiving device
-                    // inserts them directly into its local memory_timeline table.
-                    // Actual DB insertion is handled by the caller after sync.
-                    tracing::debug!(uuid, "Received remote timeline append (pending local insert)");
-                    applied += 1;
+                    match self.inner.apply_remote_v3_delta(op).await {
+                        Ok(true) => {
+                            tracing::debug!(uuid, "Applied remote timeline append");
+                            applied += 1;
+                        }
+                        Ok(false) => {
+                            tracing::trace!(uuid, "Backend ignored timeline delta (not supported)");
+                        }
+                        Err(e) => {
+                            tracing::warn!(uuid, "Failed to apply remote timeline delta: {e}");
+                        }
+                    }
                 }
                 DeltaOperation::PhoneCallRecord { call_uuid, .. } => {
-                    tracing::debug!(call_uuid, "Received remote phone call record (pending local insert)");
-                    applied += 1;
+                    match self.inner.apply_remote_v3_delta(op).await {
+                        Ok(true) => {
+                            tracing::debug!(call_uuid, "Applied remote phone call record");
+                            applied += 1;
+                        }
+                        Ok(false) => {
+                            tracing::trace!(call_uuid, "Backend ignored phone call delta (not supported)");
+                        }
+                        Err(e) => {
+                            tracing::warn!(call_uuid, "Failed to apply remote phone call delta: {e}");
+                        }
+                    }
                 }
                 DeltaOperation::CompiledTruthUpdate { memory_key, .. } => {
-                    tracing::debug!(memory_key, "Received remote compiled truth update (pending local apply)");
-                    applied += 1;
+                    match self.inner.apply_remote_v3_delta(op).await {
+                        Ok(true) => {
+                            tracing::debug!(memory_key, "Applied remote compiled truth update");
+                            applied += 1;
+                        }
+                        Ok(false) => {
+                            // LWW rejected: local version >= remote. Expected case.
+                            tracing::trace!(
+                                memory_key,
+                                "Remote truth superseded by local version (LWW)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(memory_key, "Failed to apply remote truth delta: {e}");
+                        }
+                    }
                 }
             }
         }

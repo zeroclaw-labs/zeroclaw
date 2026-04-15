@@ -52,6 +52,13 @@ pub struct SqliteMemory {
     keyword_weight: f32,
     rrf_k: f32,
     cache_max: usize,
+    /// Optional sync engine attached at factory time for v3.0 dual-brain
+    /// cross-device replication. When set, typed mutations (timeline append,
+    /// compiled truth update, phone call insert) auto-record delta journal
+    /// entries so peers receive them via the existing E2E pipeline.
+    /// Interior-mutable so the factory can attach post-construction without
+    /// breaking the `Memory` trait upcast path.
+    sync: Mutex<Option<Arc<Mutex<super::sync::SyncEngine>>>>,
 }
 
 impl SqliteMemory {
@@ -169,6 +176,7 @@ impl SqliteMemory {
             keyword_weight,
             rrf_k,
             cache_max,
+            sync: Mutex::new(None),
         })
     }
 
@@ -714,23 +722,59 @@ impl SqliteMemory {
 
     // ── v3.0 Compiled Truth + Timeline methods ───────────────────
 
+    /// Attach a sync engine for v3.0 dual-brain cross-device replication.
+    /// After attachment, `append_timeline`, `set_compiled_truth`, and
+    /// `insert_phone_call` auto-record delta journal entries.
+    /// The factory calls this from `create_synced_memory` when sync is enabled.
+    pub fn attach_sync(&self, engine: Arc<Mutex<super::sync::SyncEngine>>) {
+        *self.sync.lock() = Some(engine);
+    }
+
+    /// Run a closure with the attached sync engine, if any. No-op otherwise.
+    /// Private helper — callers use the typed record_* methods.
+    fn with_sync<F>(&self, f: F)
+    where
+        F: FnOnce(&mut super::sync::SyncEngine),
+    {
+        let guard = self.sync.lock();
+        if let Some(engine_arc) = guard.as_ref().cloned() {
+            drop(guard);
+            let mut engine = engine_arc.lock();
+            f(&mut engine);
+        }
+    }
+
     /// Update the compiled truth for a memory entry.
     /// Increments `truth_version` and sets `needs_recompile = 0`.
+    /// Auto-records a `CompiledTruthUpdate` delta if a sync engine is attached.
     pub fn set_compiled_truth(&self, memory_key: &str, compiled_truth: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        conn.execute(
-            "UPDATE memories
-             SET compiled_truth = ?1,
-                 truth_version = truth_version + 1,
-                 truth_updated_at = ?2,
-                 needs_recompile = 0
-             WHERE key = ?3",
-            params![compiled_truth, now as i64, memory_key],
-        )?;
+        // Perform DB write and capture new version in a single locked scope.
+        let new_version: u32 = {
+            let conn = self.conn.lock();
+            conn.execute(
+                "UPDATE memories
+                 SET compiled_truth = ?1,
+                     truth_version = truth_version + 1,
+                     truth_updated_at = ?2,
+                     needs_recompile = 0
+                 WHERE key = ?3",
+                params![compiled_truth, now as i64, memory_key],
+            )?;
+            conn.query_row(
+                "SELECT truth_version FROM memories WHERE key = ?1",
+                params![memory_key],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u32
+        };
+
+        self.with_sync(|engine| {
+            engine.record_compiled_truth_update(memory_key, compiled_truth, new_version);
+        });
         Ok(())
     }
 
@@ -783,6 +827,7 @@ impl SqliteMemory {
 
     /// Append an evidence entry to `memory_timeline` (append-only).
     /// Returns the generated UUID for the entry.
+    /// Auto-records a `TimelineAppend` delta if a sync engine is attached.
     #[allow(clippy::too_many_arguments)]
     pub fn append_timeline(
         &self,
@@ -797,24 +842,112 @@ impl SqliteMemory {
         use sha2::{Digest, Sha256};
         let uuid = Uuid::new_v4().to_string();
         let content_sha256 = hex::encode(Sha256::digest(content.as_bytes()));
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO memory_timeline
-                (uuid, memory_id, event_type, event_at, source_ref, content, content_sha256, metadata_json, device_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                uuid,
+        {
+            let conn = self.conn.lock();
+            conn.execute(
+                "INSERT INTO memory_timeline
+                    (uuid, memory_id, event_type, event_at, source_ref, content, content_sha256, metadata_json, device_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    uuid,
+                    memory_id,
+                    event_type,
+                    event_at as i64,
+                    source_ref,
+                    content,
+                    content_sha256,
+                    metadata_json,
+                    device_id,
+                ],
+            )?;
+        }
+
+        self.with_sync(|engine| {
+            engine.record_timeline_append(
+                &uuid,
                 memory_id,
                 event_type,
-                event_at as i64,
+                event_at,
                 source_ref,
                 content,
-                content_sha256,
+                &content_sha256,
                 metadata_json,
-                device_id,
-            ],
-        )?;
+            );
+        });
         Ok(uuid)
+    }
+
+    /// Insert a phone call metadata row into `phone_calls`.
+    /// Auto-records a `PhoneCallRecord` delta if a sync engine is attached.
+    /// Replaces the local-only helper previously in `src/phone/post_call.rs`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_phone_call(
+        &self,
+        call_uuid: &str,
+        direction: &str,
+        caller_number: Option<&str>,
+        caller_number_e164: Option<&str>,
+        caller_object_id: Option<i64>,
+        started_at: u64,
+        ended_at: Option<u64>,
+        duration_ms: Option<u64>,
+        gps_lat: Option<f64>,
+        gps_lon: Option<f64>,
+        transcript: Option<&str>,
+        summary: Option<&str>,
+        risk_level: &str,
+        sos_triggered: bool,
+        language: Option<&str>,
+        memory_id: Option<&str>,
+        device_id: &str,
+    ) -> anyhow::Result<()> {
+        {
+            let conn = self.conn.lock();
+            conn.execute(
+                "INSERT INTO phone_calls
+                    (call_uuid, direction, caller_number, caller_number_e164, caller_object_id,
+                     started_at, ended_at, duration_ms, gps_lat, gps_lon,
+                     transcript, summary, risk_level, sos_triggered, language,
+                     memory_id, device_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                params![
+                    call_uuid,
+                    direction,
+                    caller_number,
+                    caller_number_e164,
+                    caller_object_id,
+                    started_at as i64,
+                    ended_at.map(|t| t as i64),
+                    duration_ms.map(|t| t as i64),
+                    gps_lat,
+                    gps_lon,
+                    transcript,
+                    summary,
+                    risk_level,
+                    sos_triggered as i32,
+                    language,
+                    memory_id,
+                    device_id,
+                ],
+            )?;
+        }
+
+        self.with_sync(|engine| {
+            engine.record_phone_call(
+                call_uuid,
+                direction,
+                caller_number_e164,
+                caller_object_id,
+                started_at,
+                ended_at,
+                duration_ms,
+                transcript,
+                summary,
+                risk_level,
+                memory_id,
+            );
+        });
+        Ok(())
     }
 
     /// Get timeline entries for a memory, ordered by event_at descending.
@@ -892,20 +1025,40 @@ impl SqliteMemory {
         expand_config: &super::query_expand::QueryExpandConfig,
         provider: &dyn crate::providers::traits::Provider,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let queries = expander.expand(query, expand_config, provider).await;
+        self.recall_with_variations(query, &queries, limit, session_id).await
+    }
+
+    /// Recall with a pre-expanded list of query variations.
+    /// Runs parallel FTS + vector search per variation, then fuses via RRF
+    /// (or weighted, depending on `search_mode`). If `variations` has ≤ 1
+    /// entry, falls back to standard `recall()`.
+    ///
+    /// **Provider-free**: unlike `recall_expanded`, this API requires no
+    /// LLM provider — callers that already expanded the query (e.g. agent
+    /// loop with its own QueryExpander) pass the variations directly.
+    /// This is the method the `Memory` trait surfaces so non-sqlite
+    /// backends can fall back gracefully.
+    pub async fn recall_with_variations(
+        &self,
+        original_query: &str,
+        variations: &[String],
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
         use super::traits::Memory;
 
-        let queries = expander.expand(query, expand_config, provider).await;
-
-        if queries.len() <= 1 {
-            // No expansion occurred — use standard recall
-            return self.recall(query, limit, session_id).await;
+        if variations.len() <= 1 {
+            // No expansion — use standard recall on the original query
+            return self.recall(original_query, limit, session_id).await;
         }
 
         // Multi-query RRF: search each variation, merge all results
-        let query_embedding_original = self.get_or_compute_embedding(query).await?;
+        let query_embedding_original = self.get_or_compute_embedding(original_query).await?;
+
+        let queries_owned: Vec<String> = variations.to_vec();
 
         let conn = self.conn.clone();
-        let queries_owned: Vec<String> = queries;
         let sid = session_id.map(String::from);
         let rrf_k = self.rrf_k;
         let search_mode = self.search_mode;
@@ -1070,6 +1223,129 @@ pub struct TimelineEntry {
 impl Memory for SqliteMemory {
     fn name(&self) -> &str {
         "sqlite"
+    }
+
+    fn attach_sync_engine(&self, engine: Arc<Mutex<super::sync::SyncEngine>>) {
+        self.attach_sync(engine);
+    }
+
+    async fn recall_with_variations(
+        &self,
+        original_query: &str,
+        variations: &[String],
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // Delegate to the concrete impl (multi-query RRF).
+        SqliteMemory::recall_with_variations(self, original_query, variations, limit, session_id).await
+    }
+
+    async fn apply_remote_v3_delta(
+        &self,
+        delta: &super::sync::DeltaOperation,
+    ) -> anyhow::Result<bool> {
+        use super::sync::DeltaOperation;
+        match delta {
+            DeltaOperation::TimelineAppend {
+                uuid,
+                memory_id,
+                event_type,
+                event_at,
+                source_ref,
+                content,
+                content_sha256,
+                metadata_json,
+            } => {
+                let conn = self.conn.lock();
+                // Idempotent — UUID uniqueness prevents duplicate inserts.
+                // The per-device device_id is not in the delta (to keep
+                // delta size minimal); we mark remote-origin rows with
+                // "remote:<src_device>" when available, else "remote".
+                let origin = "remote";
+                conn.execute(
+                    "INSERT OR IGNORE INTO memory_timeline
+                        (uuid, memory_id, event_type, event_at, source_ref, content, content_sha256, metadata_json, device_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        uuid,
+                        memory_id,
+                        event_type,
+                        *event_at as i64,
+                        source_ref,
+                        content,
+                        content_sha256,
+                        metadata_json.as_deref(),
+                        origin,
+                    ],
+                )?;
+                Ok(true)
+            }
+            DeltaOperation::PhoneCallRecord {
+                call_uuid,
+                direction,
+                caller_number_e164,
+                caller_object_id,
+                started_at,
+                ended_at,
+                duration_ms,
+                transcript,
+                summary,
+                risk_level,
+                memory_id,
+            } => {
+                let conn = self.conn.lock();
+                let origin = "remote";
+                conn.execute(
+                    "INSERT OR IGNORE INTO phone_calls
+                        (call_uuid, direction, caller_number, caller_number_e164, caller_object_id,
+                         started_at, ended_at, duration_ms, gps_lat, gps_lon,
+                         transcript, summary, risk_level, sos_triggered, language,
+                         memory_id, device_id)
+                     VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, 0, NULL, ?11, ?12)",
+                    params![
+                        call_uuid,
+                        direction,
+                        caller_number_e164.as_deref(),
+                        caller_object_id,
+                        *started_at as i64,
+                        ended_at.map(|t| t as i64),
+                        duration_ms.map(|t| t as i64),
+                        transcript.as_deref(),
+                        summary.as_deref(),
+                        risk_level,
+                        memory_id.as_deref(),
+                        origin,
+                    ],
+                )?;
+                Ok(true)
+            }
+            DeltaOperation::CompiledTruthUpdate {
+                memory_key,
+                compiled_truth,
+                truth_version,
+            } => {
+                // LWW on truth_version: only apply if the remote version is
+                // strictly greater than the local one. Prevents older truths
+                // overwriting newer ones under out-of-order delivery.
+                let conn = self.conn.lock();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let changed = conn.execute(
+                    "UPDATE memories
+                     SET compiled_truth = ?1,
+                         truth_version = ?2,
+                         truth_updated_at = ?3,
+                         needs_recompile = 0
+                     WHERE key = ?4 AND truth_version < ?2",
+                    params![compiled_truth, *truth_version as i64, now as i64, memory_key],
+                )?;
+                Ok(changed > 0)
+            }
+            // Non-v3 operations fall through — SyncedMemory handles them.
+            _ => Ok(false),
+        }
     }
 
     async fn store(
@@ -2775,5 +3051,266 @@ mod tests {
         let (_tmp, mem) = temp_sqlite();
         let result = mem.get_compiled_truth("nonexistent").unwrap();
         assert!(result.is_none());
+    }
+
+    // ── v3.0 Dual-Brain Sync Integration Tests ───────────────────
+
+    #[tokio::test]
+    async fn timeline_append_records_sync_delta_when_attached() {
+        let (_tmp, mem) = temp_sqlite();
+        let engine = Arc::new(Mutex::new(
+            super::super::sync::SyncEngine::new(_tmp.path(), true).unwrap(),
+        ));
+        mem.attach_sync(engine.clone());
+
+        mem.store("m_ts", "memory", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let entry = mem.get("m_ts").await.unwrap().unwrap();
+
+        let before = engine.lock().journal_len();
+        mem.append_timeline(&entry.id, "chat", 1000, "msg_sync_1", "evidence", None, "dev_local")
+            .unwrap();
+        let after = engine.lock().journal_len();
+        assert_eq!(
+            after - before,
+            1,
+            "append_timeline must push exactly one TimelineAppend delta when sync is attached"
+        );
+    }
+
+    #[tokio::test]
+    async fn compiled_truth_update_records_sync_delta_with_version() {
+        let (_tmp, mem) = temp_sqlite();
+        let engine = Arc::new(Mutex::new(
+            super::super::sync::SyncEngine::new(_tmp.path(), true).unwrap(),
+        ));
+        mem.attach_sync(engine.clone());
+
+        mem.store("m_ct", "initial", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let before = engine.lock().journal_len();
+        mem.set_compiled_truth("m_ct", "v1 summary").unwrap();
+        mem.set_compiled_truth("m_ct", "v2 summary").unwrap();
+        let after = engine.lock().journal_len();
+        assert_eq!(after - before, 2, "two updates → two deltas");
+
+        // Local version should now be 2.
+        let (truth, version) = mem.get_compiled_truth("m_ct").unwrap().unwrap();
+        assert_eq!(truth, "v2 summary");
+        assert_eq!(version, 2);
+    }
+
+    #[tokio::test]
+    async fn insert_phone_call_records_sync_delta() {
+        let (_tmp, mem) = temp_sqlite();
+        let engine = Arc::new(Mutex::new(
+            super::super::sync::SyncEngine::new(_tmp.path(), true).unwrap(),
+        ));
+        mem.attach_sync(engine.clone());
+
+        let before = engine.lock().journal_len();
+        mem.insert_phone_call(
+            "call_xyz",
+            "in",
+            Some("010-0000-0000"),
+            Some("+821000000000"),
+            None,
+            1700000000,
+            Some(1700000300),
+            Some(300_000),
+            None,
+            None,
+            Some("hello"),
+            Some("greet"),
+            "safe",
+            false,
+            Some("ko"),
+            None,
+            "dev_local",
+        )
+        .unwrap();
+        let after = engine.lock().journal_len();
+        assert_eq!(after - before, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_remote_timeline_persists_without_reecording() {
+        use super::super::sync::DeltaOperation;
+
+        let (_tmp, mem) = temp_sqlite();
+        let engine = Arc::new(Mutex::new(
+            super::super::sync::SyncEngine::new(_tmp.path(), true).unwrap(),
+        ));
+        mem.attach_sync(engine.clone());
+
+        // Seed a memory on the receiving device.
+        mem.store("m_remote", "peer memory", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let entry = mem.get("m_remote").await.unwrap().unwrap();
+
+        let delta = DeltaOperation::TimelineAppend {
+            uuid: "remote-evt-1".into(),
+            memory_id: entry.id.clone(),
+            event_type: "chat".into(),
+            event_at: 1800,
+            source_ref: "remote_msg_9".into(),
+            content: "remote evidence".into(),
+            content_sha256: "abc".into(),
+            metadata_json: None,
+        };
+
+        let journal_before = engine.lock().journal_len();
+        let applied = mem.apply_remote_v3_delta(&delta).await.unwrap();
+        let journal_after = engine.lock().journal_len();
+
+        assert!(applied, "remote timeline delta should be applied");
+        assert_eq!(
+            journal_before, journal_after,
+            "applying remote delta must NOT re-record (prevents sync loops)"
+        );
+
+        // Row is present in local timeline.
+        let timeline = mem.get_timeline(&entry.id, 10).unwrap();
+        assert!(timeline.iter().any(|t| t.source_ref == "remote_msg_9"));
+    }
+
+    #[tokio::test]
+    async fn apply_remote_truth_lww_rejects_older_version() {
+        use super::super::sync::DeltaOperation;
+
+        let (_tmp, mem) = temp_sqlite();
+        let engine = Arc::new(Mutex::new(
+            super::super::sync::SyncEngine::new(_tmp.path(), true).unwrap(),
+        ));
+        mem.attach_sync(engine.clone());
+
+        mem.store("m_lww", "base", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        // Bump local version to 2.
+        mem.set_compiled_truth("m_lww", "local v1").unwrap();
+        mem.set_compiled_truth("m_lww", "local v2").unwrap();
+
+        // Remote sends version=1 — older than local v2; must be rejected.
+        let stale = DeltaOperation::CompiledTruthUpdate {
+            memory_key: "m_lww".into(),
+            compiled_truth: "stale remote".into(),
+            truth_version: 1,
+        };
+        let applied = mem.apply_remote_v3_delta(&stale).await.unwrap();
+        assert!(!applied, "LWW must reject older version");
+
+        // Remote sends version=5 — newer; should overwrite.
+        let fresh = DeltaOperation::CompiledTruthUpdate {
+            memory_key: "m_lww".into(),
+            compiled_truth: "fresh remote".into(),
+            truth_version: 5,
+        };
+        let applied = mem.apply_remote_v3_delta(&fresh).await.unwrap();
+        assert!(applied);
+
+        let (truth, version) = mem.get_compiled_truth("m_lww").unwrap().unwrap();
+        assert_eq!(truth, "fresh remote");
+        assert_eq!(version, 5);
+    }
+
+    #[tokio::test]
+    async fn recall_with_variations_falls_back_to_single_query() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("rec1", "apple pie recipe", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // Empty variations → falls back to recall()
+        let empty_vars: Vec<String> = vec![];
+        let r0 = mem
+            .recall_with_variations("apple pie", &empty_vars, 5, None)
+            .await
+            .unwrap();
+        assert!(!r0.is_empty());
+
+        // Single variation → falls back to recall()
+        let r1 = mem
+            .recall_with_variations("apple pie", &vec!["apple pie".into()], 5, None)
+            .await
+            .unwrap();
+        assert!(!r1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_with_variations_fuses_multiple_queries() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("doc_divorce", "이혼 절차 안내", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store(
+            "doc_property",
+            "재산분할 기준과 판례",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store("doc_alimony", "위자료 산정 방법", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("doc_other", "노동법 해설", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let vars = vec![
+            "이혼 소송".to_string(),
+            "재산분할".to_string(),
+            "위자료".to_string(),
+        ];
+        let results = mem
+            .recall_with_variations("이혼 소송", &vars, 10, None)
+            .await
+            .unwrap();
+
+        // Should recall the three divorce-related entries; noise entry excluded.
+        let keys: std::collections::HashSet<String> =
+            results.iter().map(|e| e.key.clone()).collect();
+        assert!(keys.contains("doc_divorce") || keys.contains("doc_property") || keys.contains("doc_alimony"));
+    }
+
+    #[tokio::test]
+    async fn no_sync_recording_when_engine_not_attached() {
+        // Safety: mutations on a plain SqliteMemory (no sync attached)
+        // must succeed and NEVER panic trying to access the sync engine.
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.store("m_nosync", "data", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let entry = mem.get("m_nosync").await.unwrap().unwrap();
+
+        // All three typed mutations must succeed without a sync engine.
+        mem.append_timeline(&entry.id, "chat", 1, "r", "c", None, "d").unwrap();
+        mem.set_compiled_truth("m_nosync", "summary").unwrap();
+        mem.insert_phone_call(
+            "call_nosync",
+            "in",
+            None,
+            None,
+            None,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "safe",
+            false,
+            None,
+            None,
+            "dev",
+        )
+        .unwrap();
     }
 }

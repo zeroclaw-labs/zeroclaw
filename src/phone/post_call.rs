@@ -8,7 +8,6 @@
 // 5. Record to delta journal for cross-device sync
 
 use anyhow::{Context, Result};
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
 use crate::memory::sqlite::SqliteMemory;
@@ -168,37 +167,29 @@ pub fn process_post_call(
     Ok(result)
 }
 
-/// Insert a phone_calls row into SQLite.
+/// Insert a phone_calls row via the SqliteMemory typed API.
+/// Delegates to `SqliteMemory::insert_phone_call` which handles DB write
+/// + optional sync journal recording (v3.0 dual-brain replication).
 fn insert_phone_call(memory: &SqliteMemory, data: &PostCallData) -> Result<()> {
-    let conn = memory.connection();
-    conn.execute(
-        "INSERT INTO phone_calls
-            (call_uuid, direction, caller_number, caller_number_e164, caller_object_id,
-             started_at, ended_at, duration_ms, gps_lat, gps_lon,
-             transcript, summary, risk_level, sos_triggered, language,
-             memory_id, device_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-        params![
-            data.call_uuid,
-            data.direction,
-            data.caller_number,
-            data.caller_number_e164,
-            data.caller_object_id,
-            data.started_at as i64,
-            data.ended_at.map(|t| t as i64),
-            data.duration_ms.map(|t| t as i64),
-            data.gps_lat,
-            data.gps_lon,
-            data.transcript,
-            data.summary,
-            data.risk_level,
-            data.sos_triggered as i32,
-            data.language,
-            data.memory_id,
-            data.device_id,
-        ],
-    )?;
-    Ok(())
+    memory.insert_phone_call(
+        &data.call_uuid,
+        &data.direction,
+        data.caller_number.as_deref(),
+        data.caller_number_e164.as_deref(),
+        data.caller_object_id,
+        data.started_at,
+        data.ended_at,
+        data.duration_ms,
+        data.gps_lat,
+        data.gps_lon,
+        data.transcript.as_deref(),
+        data.summary.as_deref(),
+        &data.risk_level,
+        data.sos_triggered,
+        data.language.as_deref(),
+        data.memory_id.as_deref(),
+        &data.device_id,
+    )
 }
 
 #[cfg(test)]
@@ -246,7 +237,7 @@ mod tests {
         // Verify it was inserted
         let conn = mem.conn_for_test();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM phone_calls WHERE call_uuid = ?1", params!["call-001"], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM phone_calls WHERE call_uuid = ?1", rusqlite::params!["call-001"], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
     }
