@@ -31,6 +31,25 @@ gh label create "duplicate"          --color "CFD3D7" --repo zeroclaw-labs/zeroc
 
 Only create labels that are actually needed in the current run.
 
+### Non-English issues
+
+The project has contributors filing issues in Chinese, Japanese, Russian, Vietnamese, and French (supported locales per `docs/contributing/docs-contract.md`). When triaging a non-English issue:
+
+- Classify and label it the same as any English issue — language does not affect priority or validity.
+- Respond in the same language the reporter used if you can do so accurately. If you cannot, respond in English.
+- Do not apply `r:needs-repro` solely because the issue is in a language you find harder to parse — if the repro steps are present in the reporter's language, they count.
+
+### Maintainer identification
+
+When the protocol refers to "maintainer comments" (e.g., stale clock computation), identify maintainers by checking the CODEOWNERS file or repository collaborator list. If neither is accessible, use org membership in `zeroclaw-labs`. Do not guess based on comment tone or authority — use an explicit check.
+
+### Cross-mode session awareness
+
+If multiple modes run in the same session (e.g., triage then sweep), the later mode must be aware of actions taken by earlier modes. Specifically:
+
+- Issues labeled during triage in this session should not be immediately proposed for closure in a sweep. Flag them as "just triaged in this session — skip or re-evaluate?" in the batch preview.
+- Issues already closed in this session should be excluded from subsequent passes.
+
 ### Truncation check (all modes)
 
 Any `gh issue list` with `--limit N` may silently truncate. After every bulk fetch, compare the returned count to the limit. If they are equal, warn the user: "Returned exactly N issues — there may be more. Results may be incomplete." Consider paginating or narrowing the query.
@@ -171,20 +190,22 @@ Proceed? (yes / no / review each one)
 ```
 
 - **yes**: execute all proposed closures and comments.
-- **no**: skip all closures; still post the comment-only actions (labeling and answering are always safe). Report what was skipped so the user can handle them manually.
+- **no**: stop entirely — no closures, no comments. Report the full list of proposed actions so the user can handle them manually or re-run with adjustments.
+- **just closures**: skip closures, but post the comment-only actions (labeling and answering are always safe).
 - **review each one**: step through closures individually, presenting each with its reason before executing.
 
 Do not close a single issue until the user confirms.
 
 ### Pass 1 — Fixed by merged PR
 
-1. For each open bug/feature issue, check for merged PRs that reference it.
+1. Batch-search for merged PRs that reference open issues. Rather than running one API call per issue (which hits rate limits at scale), fetch recently merged PRs once and scan their titles and bodies for issue references:
 
    ```bash
-   gh pr list --repo zeroclaw-labs/zeroclaw --state merged --search "fixes #N OR closes #N OR resolves #N" --json number,title,mergedAt
+   gh pr list --repo zeroclaw-labs/zeroclaw --state merged --limit 100 \
+     --json number,title,body,mergedAt
    ```
 
-   Also search the PR body for the issue number directly.
+   Scan each PR's title and body for patterns like `fixes #N`, `closes #N`, `resolves #N`, or bare `#N` references. Cross-reference against the list of open issue numbers. For issues not covered by the recent batch, fall back to per-issue search only for high-priority or old issues.
 
 2. Before closing, verify no **open** PR currently references this issue. If one exists, apply `status:in-progress`, comment linking the PR, and leave the issue open to auto-close on merge.
 
@@ -263,11 +284,13 @@ Activity is defined as: a follow-up comment or update from the **original author
    - Apply `status:stale`
    - Comment: acknowledge the issue is still valid, ask if it is still relevant or if the reporter has a workaround; mention that it will be closed in 15 days without a response but can always be reopened
 
-4. For issues at 60+ days since author-last-active, already carrying `status:stale`:
+4. For issues already carrying `status:stale`, compute when the label was applied (check the label-application comment date or use `gh api` to check issue timeline events). Close only if **15+ days have passed since `status:stale` was applied** — not since author-last-active. The 15-day window is the reporter's guaranteed response time; do not shorten it.
    - Close with a comment: thank the reporter, explain the backlog hygiene reason, and include the phrase **"you can reopen this issue by commenting here, or open a new issue with updated context — either works"**
    - Reference a related open issue or feature if one exists
 
-5. Report the full list of actions to the user before executing. Confirm before proceeding.
+5. **Reopened issues:** if an issue carrying `status:stale` has a comment from the original author posted *after* the stale label was applied, remove the `status:stale` label and skip it — the author has re-engaged. Similarly, if an issue was recently reopened (closed then reopened), remove `status:stale` and reset the clock from the reopen date.
+
+6. Report the full list of actions to the user before executing. Confirm before proceeding.
 
 ### Tone requirement for stale closures
 
