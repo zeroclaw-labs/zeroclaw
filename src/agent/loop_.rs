@@ -3513,9 +3513,9 @@ pub async fn run(
         mut tools_registry,
         delegate_handle,
         _reaction_handle,
-        _channel_map_handle,
-        _ask_user_handle,
-        _escalate_handle,
+        channel_map_handle,
+        ask_user_handle,
+        escalate_handle,
     ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -3852,6 +3852,31 @@ pub async fn run(
         None
     };
     let channel_name = if interactive { "cli" } else { "daemon" };
+
+    // ── Register CLI channel for interactive tools (ask_user, escalate, poll) ──
+    // In the `start_channels` path these handles are populated after channel
+    // init.  The agent CLI path skipped this, causing ask_user / escalate /
+    // poll to see an empty channel map and fail.  Fix: populate with a
+    // CliChannel when running interactively so those tools work from the
+    // terminal.  (Fixes #5685)
+    if interactive {
+        let cli_ch: Arc<dyn crate::channels::traits::Channel> =
+            Arc::new(crate::channels::CliChannel::new());
+        {
+            let mut map = channel_map_handle.write();
+            map.insert("cli".to_string(), Arc::clone(&cli_ch));
+        }
+        if let Some(ref handle) = ask_user_handle {
+            let mut map = handle.write();
+            map.insert("cli".to_string(), Arc::clone(&cli_ch));
+        }
+        if let Some(ref handle) = escalate_handle {
+            let mut map = handle.write();
+            map.insert("cli".to_string(), Arc::clone(&cli_ch));
+        }
+        tracing::debug!("CLI channel registered for interactive agent tools");
+    }
+
     let memory_session_id = session_state_file.as_deref().and_then(|path| {
         let raw = path.to_string_lossy().trim().to_string();
         if raw.is_empty() {
