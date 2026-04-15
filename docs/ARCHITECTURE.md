@@ -1,8 +1,15 @@
 # MoA — Architecture & Product Vision
 
-> **Date**: 2026-03-01
+> **Date**: 2026-04-15
+> **Version**: v6 (Dual-Brain v3.0 — compiled truth + timeline + multi-query + dream cycle, and sync journal integration for these)
 > **Status**: Living document — updated with each major feature milestone
 > **Audience**: AI reviewers (Gemini, Claude), human contributors, future maintainers
+>
+> **v6 changes** (2026-04-15):
+> - §3b **Patent 3 — Dual-Brain Second Memory** (new): compiled_truth + append-only timeline + Dream Cycle.
+> - §3c **Sync Journal v3** (new): `TimelineAppend`, `PhoneCallRecord`, `CompiledTruthUpdate` delta operations + inbound `apply_remote_v3_delta` hook with LWW on `truth_version`.
+> - §6★★ updated: hybrid search now defaults to weighted but `search_mode = "rrf"` unlocks Reciprocal Rank Fusion (k=60) via `Memory::recall` and `Memory::recall_with_variations` for multi-query expansion.
+> - §3 §6★★ §6A already existed; only wording/integration points refreshed to match `src/memory/*` as of commit `831d070e`.
 
 ---
 
@@ -1318,6 +1325,225 @@ for AI Agents Using Episodic Memory and Structural Ontology)
 
 ---
 
+## 3b. Patent 3: Dual-Brain Second Memory — Compiled Truth + Append-Only Timeline (v3.0)
+
+> **Status**: 특허 3 (준비 중) · v3.0 코드 반영일 2026-04-15
+> **위치**: `src/memory/sqlite.rs`, `src/memory/dream_cycle.rs`, `src/memory/sync.rs`
+> **원칙**: Patent 1(서버 비저장 E2E 동기화)과 Patent 2(이중 저장소 교차참조) 위에
+> **추가 레이어**로 통합. 특허 청구항을 훼손하지 않는 비파괴적(additive) 확장.
+
+### 3b-0. 왜 두 번째 뇌(Second Brain)인가
+
+기존 `memories.content`는 원본을 보존하지만, 변호사 업무처럼 "의뢰인 A 현황"
+같은 질문에는 요약이 필요합니다. 반대로 요약만 주면 할루시네이션 위험이 있습니다.
+
+v3.0은 `memories` 테이블을 두 뇌로 분리합니다.
+
+| 뇌 | 테이블/컬럼 | 역할 | 변경 가능성 |
+|---|---|---|---|
+| **First brain (증거)** | `memory_timeline` (신규) | append-only 원본 증거, 모든 호출/대화/문서 스냅샷 | **절대 수정 불가** (trigger로 enforce) |
+| **Second brain (요약)** | `memories.compiled_truth` + `truth_version` | "현재까지의 최선의 요약" (Dream Cycle이 LLM으로 재컴파일) | `truth_version` 단조 증가 |
+| 하위호환 | `memories.content` | 기존 질의가 의존하는 원본 필드 | 삭제 금지 |
+
+LLM 답변 시 요약(`compiled_truth`)을 주면서 각주로 증거(`memory_timeline.uuid`)를
+인용 → **할루시네이션 방지 + 법적 감사 가능**.
+
+### 3b-1. 스키마 (비파괴 확장)
+
+```
+memories                       memory_timeline (신규, append-only)
+──────                         ──────
+id           TEXT PK           id              INTEGER PK AUTOINCREMENT
+key          TEXT UNIQUE       uuid            TEXT UNIQUE      ← 동기화 ID
+content      TEXT              memory_id       TEXT → memories.id
+embedding    BLOB              event_type      TEXT             ← 'call'/'chat'/'doc'/...
+created_at   TEXT              event_at        INTEGER          ← ms since epoch
+updated_at   TEXT              source_ref      TEXT NOT NULL    ← call_uuid / msg_id / sha256
+session_id   TEXT              content         TEXT NOT NULL    ← 원본 증거 (수정 금지)
+-- v3.0 additions --           content_sha256  TEXT NOT NULL    ← 무결성 검증
+compiled_truth  TEXT           metadata_json   TEXT
+truth_version   INT DEFAULT 0  device_id       TEXT NOT NULL
+truth_updated_at INT           created_at      INTEGER DEFAULT unixepoch()
+needs_recompile INT DEFAULT 0
+```
+
+append-only는 데이터 레벨 트리거로 강제:
+
+```sql
+CREATE TRIGGER trg_timeline_no_update
+BEFORE UPDATE ON memory_timeline
+BEGIN
+    SELECT RAISE(ABORT, 'memory_timeline is append-only');
+END;
+```
+
+FTS5 미러 (`memory_timeline_fts`)로 자연어 검색 지원.
+
+### 3b-2. 타입드 API (Rust)
+
+`src/memory/sqlite.rs`가 세 가지 mutation을 노출:
+
+| 메서드 | 효과 | 자동 동기화 |
+|---|---|---|
+| `append_timeline(memory_id, event_type, event_at, source_ref, content, metadata, device_id) -> uuid` | `memory_timeline`에 행 추가, SHA256 계산, UUID 반환 | `TimelineAppend` delta 자동 push |
+| `set_compiled_truth(memory_key, compiled_truth)` | `compiled_truth` 갱신, `truth_version`++, `needs_recompile=0` | `CompiledTruthUpdate` delta 자동 push |
+| `mark_needs_recompile(memory_key)` | 다음 Dream Cycle에서 재컴파일 대상으로 플래그 | (로컬 스케줄 플래그 — delta 없음) |
+| `insert_phone_call(…17 fields)` | `phone_calls` 행 추가 | `PhoneCallRecord` delta 자동 push |
+
+자동 동기화는 **Interior mutability** 패턴으로 구현:
+`SqliteMemory`가 `Mutex<Option<Arc<Mutex<SyncEngine>>>>`를 보유.
+factory(`create_synced_memory`)가 `Memory::attach_sync_engine(engine)`을 호출하면
+모든 타입드 mutation이 DB 쓰기 후 SyncEngine에 자동 기록.
+
+### 3b-3. Dream Cycle (야간 consolidation)
+
+`src/memory/dream_cycle.rs`가 디바이스 idle 시 로컬에서 자동 실행:
+
+```
+조건(AND): 02:00 ≤ 현재시각 ≤ 06:00
+           battery ≥ 50% OR charging
+           network stable
+리더 선출: 같은 사용자의 device_id 최솟값 1대만 실행
+작업:
+  1. needs_recompile = 1 인 memory 의 timeline → compiled_truth 재컴파일
+  2. 온톨로지 엔티티 속성 강화 (recall_count 기반)
+  3. 핫 캐시 재계산
+  4. 중복 병합 제안 큐잉 (cosine similarity > 0.95)
+결과: 델타 저널 기록 → 타 기기 E2E 전파
+```
+
+### 3b-4. 하이브리드 검색 v3.0 (RRF + Multi-Query)
+
+| 모드 | 공식 | 구현 | 기본값 |
+|---|---|---|---|
+| Weighted (기존) | `0.7*norm(vec) + 0.3*norm(fts)` | `src/memory/vector.rs::hybrid_merge` | ✅ 기본 |
+| RRF (v3.0) | `Σ 1/(k + rank_i)`, k=60 | `src/memory/vector.rs::rrf_merge` | feature flag `memory.search_mode="rrf"` |
+
+**Multi-Query 확장 경로** (S3):
+
+```
+Agent Loop
+   └─▶ QueryExpander::expand(msg, config, provider) → Vec<String>(3~5)
+         (provider = Haiku, 24h cache)
+   └─▶ Memory::recall_with_variations(original, variations, limit, session)
+         ├─▶ SqliteMemory override: 각 variation × {vec, fts} 병렬 검색 → RRF
+         └─▶ 기본 fallback: 첫 variation으로 단일 recall()
+```
+
+`recall_with_variations`는 Memory trait 메서드이므로 **provider 스레딩 없이**
+SqliteMemory의 RRF 경로를 활용할 수 있습니다. Agent loop이 provider 컨텍스트에서
+expand를 먼저 수행한 뒤 확장된 쿼리 배열을 Memory trait로 넘깁니다.
+
+### 3b-5. 특허 청구항 (추가)
+
+- **청구항 19**: 동일 키를 갖는 메모리 엔트리에 대해,
+  - (a) 원본 증거를 저장하는 append-only 타임라인 서브-저장소와
+  - (b) LLM이 주기적으로 재컴파일하는 compiled_truth 요약 필드
+  를 이중으로 유지하되, AI 답변 생성 시 요약을 제시하고 타임라인 엔트리
+  UUID를 각주로 인용함으로써 할루시네이션을 방지하고 법적 감사 가능성을
+  보장하는 것을 특징으로 하는 AI 에이전트 기억 시스템.
+
+- **청구항 20**: 청구항 19에 있어서, 상기 compiled_truth는 `truth_version`
+  단조 증가 정수를 동반하며, 원격 디바이스로부터 수신한 업데이트는
+  로컬 `truth_version`보다 **엄격히 더 큰** 경우에만 적용 (Last-Writer-Wins
+  on monotone version) 하여 순서 역전에 대해 결정적 병합 결과를 보장하는
+  것을 특징으로 하는 시스템.
+
+- **청구항 21**: 청구항 19에 있어서, 상기 타임라인 서브-저장소에 대한
+  UPDATE 시도는 데이터베이스 레벨 트리거에 의해 `RAISE(ABORT)`로 차단되어
+  애플리케이션 레벨 버그와 무관하게 append-only 무결성이 구조적으로
+  강제되는 것을 특징으로 하는 시스템.
+
+- **청구항 22**: 청구항 19에 있어서, 야간 idle 구간에서 단일 기기 리더
+  (같은 사용자의 가장 작은 device_id)가 `needs_recompile=1` 항목에 대해
+  타임라인 증거 → LLM → compiled_truth 재생성을 수행하고, 결과를 E2E 암호화
+  델타 저널로 전파하여 타 기기가 별도 연산 없이 최신 요약을 수신하는
+  것을 특징으로 하는 시스템.
+
+---
+
+## 3c. Sync Journal v3 — Dual-Brain 동기화 통합
+
+### 3c-1. 새 DeltaOperation 변형 (v3.0)
+
+`src/memory/sync.rs::DeltaOperation`에 **추가** (기존 변형은 불변):
+
+| Variant | 트리거 지점 | 수신측 적용 |
+|---|---|---|
+| `TimelineAppend { uuid, memory_id, event_type, event_at, source_ref, content, content_sha256, metadata_json }` | `SqliteMemory::append_timeline()` | `INSERT OR IGNORE INTO memory_timeline` (UUID 유니크로 idempotent) |
+| `PhoneCallRecord { call_uuid, direction, caller_number_e164, caller_object_id, started_at, ended_at, duration_ms, transcript, summary, risk_level, memory_id }` | `SqliteMemory::insert_phone_call()` | `INSERT OR IGNORE INTO phone_calls` |
+| `CompiledTruthUpdate { memory_key, compiled_truth, truth_version }` | `SqliteMemory::set_compiled_truth()` | `UPDATE memories … WHERE key = ?k AND truth_version < ?v` (LWW) |
+
+기존 변형(`Store`, `Forget`, `OntologyObjectUpsert`, `OntologyLinkCreate`,
+`OntologyActionLog`)은 **변경 없음** — Patent 1·2의 동기화 경로를 그대로 재사용.
+
+### 3c-2. Outbound (로컬 mutation → 원격 전파)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. 로컬 mutation                                                │
+│    e.g. SqliteMemory::append_timeline(...)                      │
+│                                                                 │
+│ 2. DB write (메인 트랜잭션)                                      │
+│    INSERT INTO memory_timeline VALUES (…)                       │
+│                                                                 │
+│ 3. with_sync(|engine| { engine.record_timeline_append(…) })     │
+│    → SyncEngine.journal.push(DeltaEntry { op: TimelineAppend,…})│
+│    → SyncEngine.save() (SQLite sync_journal 테이블)             │
+│                                                                 │
+│ 4. 기존 Layer 1 relay / Layer 2 delta journal / Layer 3 manifest │
+│    (Patent 1)이 이 엔트리를 그대로 E2E 암호화하여 peer로 전파    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**비-sqlite 백엔드 안전성**: `Memory::attach_sync_engine()`의 기본 구현은
+no-op. SqliteMemory만 override하여 sync 홀더에 저장. 따라서 Markdown·Qdrant
+등 다른 백엔드에서는 v3.0 델타가 생성되지 않아 데이터 누수가 발생하지 않음.
+
+### 3c-3. Inbound (원격 delta → 로컬 적용, 무한루프 방지)
+
+```
+relay peer로부터 암호화 델타 수신
+   └─▶ SyncedMemory::apply_remote_deltas(deltas, ontology)
+         ├─ Store / Forget → inner.store() / inner.forget()          (Patent 1, 기존)
+         ├─ OntologyObjectUpsert / LinkCreate → ontology repo        (Patent 2, 기존)
+         ├─ OntologyActionLog → read-only ack                        (기존)
+         └─ TimelineAppend / PhoneCallRecord / CompiledTruthUpdate  (v3.0 신규)
+                └─▶ inner.apply_remote_v3_delta(op) → Ok(applied)
+```
+
+`Memory::apply_remote_v3_delta`는 원격 델타를 **sync journal에 재기록하지 않고**
+로컬 DB에만 persist → 무한 루프 방지. SqliteMemory 구현의 핵심 포인트:
+
+1. **TimelineAppend**: `INSERT OR IGNORE`로 UUID 중복 방지. `device_id`는
+   `"remote"`로 마킹하여 원격 출처임을 기록.
+2. **PhoneCallRecord**: 동일 패턴, `call_uuid` 유니크로 idempotent.
+3. **CompiledTruthUpdate**: `UPDATE … WHERE key = ?k AND truth_version < ?v`
+   — 로컬 버전이 더 크거나 같으면 무시 (LWW on monotone version).
+   이로써 Patent 1의 LWW-by-timestamp 대비 **truth는 명시적 버전 필드로
+   결정적**이 되어 시계 오차/순서역전에 영향받지 않음.
+
+### 3c-4. LWW 데이터 손실 완화 구조
+
+| 기존(v2) 문제 | v3.0 완화 |
+|---|---|
+| `memories.content`에 대한 동시 편집 시 timestamp LWW로 데이터 손실 가능 | 동일 키의 **증거**는 `memory_timeline`에 append-only로 축적 → LWW 없음. `content`는 하위호환 유지지만 "최신 스냅샷"이고 진실은 timeline에 있음. |
+| 요약(`compiled_truth`) 경쟁 시 어느 쪽이 이겨야 하는지 timestamp만으로 애매 | `truth_version` 단조 증가로 **결정적 병합** — 더 높은 버전이 이김. |
+| 통화 기록은 과거 저장소가 없었음 | `phone_calls` 신규 테이블 + 델타 전파로 모든 기기가 통화 메타 공유. |
+
+### 3c-5. 테스트 커버리지 (`src/memory/sqlite.rs` 말미)
+
+| 테스트 | 검증 항목 |
+|---|---|
+| `timeline_append_records_sync_delta_when_attached` | append_timeline이 `TimelineAppend` delta 1개를 정확히 push |
+| `compiled_truth_update_records_sync_delta_with_version` | 2회 update → 2 deltas, local version=2 |
+| `insert_phone_call_records_sync_delta` | phone_calls + PhoneCallRecord delta 동시 |
+| `apply_remote_timeline_persists_without_reecording` | 원격 delta 적용 시 journal에 **재기록되지 않음** (루프 방지) |
+| `apply_remote_truth_lww_rejects_older_version` | 낮은 version 무시, 높은 version 적용 |
+| `no_sync_recording_when_engine_not_attached` | sync 미연결 시 모든 타입드 mutation이 panic 없이 동작 |
+
+---
+
 ## 4. Target Users
 
 | User type | Primary use case |
@@ -2159,6 +2385,12 @@ performs **bidirectional enrichment** between the two knowledge stores:
 
 ### Hybrid Search Engine (하이브리드 검색 엔진)
 
+> **v3.0 note**: Weighted fusion is still the default. Setting
+> `memory.search_mode = "rrf"` switches `Memory::recall` and
+> `Memory::recall_with_variations` to Reciprocal Rank Fusion
+> (`k = 60`) — rank-agnostic, fairer for BM25 × cosine mixing.
+> See **§3b-4** for the multi-query expansion path.
+
 Memory recall uses a **weighted fusion** of two search methods:
 
 ```
@@ -2223,9 +2455,12 @@ All memory and ontology data syncs across devices via the
 
 - Memory deltas: Store/Forget operations
 - Ontology deltas: ObjectUpsert, LinkCreate, ActionLog operations
+- **v3.0 deltas (§3c)**: TimelineAppend, PhoneCallRecord, CompiledTruthUpdate
 - Each delta encrypted with ChaCha20-Poly1305
 - Server holds encrypted data **maximum 5 minutes**, then permanently deletes
 - Offline reconciliation via version vectors
+- Timeline entries are **append-only** → no LWW conflict
+- Compiled truth uses **LWW on monotone `truth_version`** (deterministic)
 
 ---
 
