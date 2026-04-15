@@ -7,12 +7,13 @@
 use super::ingest::{IngestInput, IngestOutput, SourceType};
 use super::schema;
 use super::wikilink::{AIEngine, HeuristicAIEngine, WikilinkPipeline};
+use crate::memory::embeddings::{EmbeddingProvider, NoopEmbedding};
 use crate::memory::sync::SyncEngine;
 use anyhow::Result;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 pub const DOCUMENT_MIN_CHARS: usize = super::DOCUMENT_MIN_CHARS;
@@ -25,6 +26,10 @@ pub struct VaultStore {
     conn: Arc<Mutex<Connection>>,
     sync: Mutex<Option<Arc<Mutex<SyncEngine>>>>,
     ai: Arc<dyn AIEngine>,
+    /// Embedding provider for vector search. Defaults to Noop (returns
+    /// empty vec) so pure-FTS mode still works. Production callers swap
+    /// in an OpenAI/custom provider via `with_embedder`.
+    embedder: Arc<dyn EmbeddingProvider>,
 }
 
 impl VaultStore {
@@ -40,12 +45,20 @@ impl VaultStore {
             conn,
             sync: Mutex::new(None),
             ai: Arc::new(HeuristicAIEngine),
+            embedder: Arc::new(NoopEmbedding),
         })
     }
 
     /// Swap in a different AI engine (e.g. LLM-backed in production).
     pub fn with_ai_engine(mut self, engine: Arc<dyn AIEngine>) -> Self {
         self.ai = engine;
+        self
+    }
+
+    /// Swap in an embedding provider (OpenAI / custom HTTP / ...).
+    /// Required to enable vector search on the vault.
+    pub fn with_embedder(mut self, embedder: Arc<dyn EmbeddingProvider>) -> Self {
+        self.embedder = embedder;
         self
     }
 
@@ -99,6 +112,12 @@ impl VaultStore {
         let pipeline = WikilinkPipeline::new(&*self.ai, &self.conn, input.domain);
         let out = pipeline.run(body).await?;
 
+        // §4.5a embedding (computed BEFORE taking the DB lock; async)
+        let embedding = match self.embedder.embed_one(body).await {
+            Ok(v) if !v.is_empty() => Some(v),
+            _ => None,
+        };
+
         // §4.5 write rows
         let uuid = uuid::Uuid::new_v4().to_string();
         let doc_id = {
@@ -124,6 +143,16 @@ impl VaultStore {
                 ],
             )?;
             let id = conn.last_insert_rowid();
+
+            // Embedding row (if provider produced one).
+            if let Some(ref emb) = embedding {
+                let bytes = crate::memory::vector::vec_to_bytes(emb);
+                conn.execute(
+                    "INSERT INTO vault_embeddings (doc_id, embedding, dim)
+                     VALUES (?1, ?2, ?3)",
+                    params![id, bytes, emb.len() as i64],
+                )?;
+            }
 
             // Frontmatter rows.
             for (k, v) in &frontmatter {
@@ -259,6 +288,198 @@ impl VaultStore {
     pub fn doc_count(&self) -> Result<i64> {
         let conn = self.conn.lock();
         Ok(conn.query_row("SELECT COUNT(*) FROM vault_documents", [], |r| r.get(0))?)
+    }
+
+    /// Cosine-similarity vector search. Requires `with_embedder` to have
+    /// installed a non-noop provider; otherwise returns empty.
+    pub async fn search_vector(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, f32)>> {
+        let q_emb = self.embedder.embed_one(query).await?;
+        if q_emb.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT d.id, COALESCE(d.title,''), e.embedding
+             FROM vault_embeddings e JOIN vault_documents d ON d.id = e.doc_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Vec<u8>>(2)?))
+        })?;
+
+        let mut scored: Vec<(i64, String, f32)> = Vec::new();
+        for row in rows {
+            let (id, title, bytes) = row?;
+            let emb = crate::memory::vector::bytes_to_vec(&bytes);
+            if emb.is_empty() {
+                continue;
+            }
+            let score = crate::memory::vector::cosine_similarity(&q_emb, &emb);
+            scored.push((id, title, score));
+        }
+        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored)
+    }
+
+    /// Graph BFS over `vault_links`. Seeds: docs whose title or any
+    /// existing wikilink `target_raw` matches `query`. Expands both
+    /// inbound (backlinks) and outbound (linked-to) edges up to `depth`.
+    ///
+    /// Returns (doc_id, title, distance) where distance 0 = seed, 1 =
+    /// direct neighbour, etc. Score = 1.0 / (1.0 + distance).
+    pub fn search_graph(
+        &self,
+        query: &str,
+        depth: u32,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, f32)>> {
+        if depth == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+
+        // Seeds: docs whose title matches query exactly, OR docs that
+        // have any link targeting a matching `target_raw`.
+        let mut seeds: HashSet<i64> = HashSet::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM vault_documents
+                 WHERE title = ?1 OR instr(title, ?1) > 0",
+            )?;
+            for row in stmt.query_map(params![query], |r| r.get::<_, i64>(0))? {
+                seeds.insert(row?);
+            }
+        }
+        {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT source_doc_id FROM vault_links
+                 WHERE target_raw = ?1 OR instr(target_raw, ?1) > 0",
+            )?;
+            for row in stmt.query_map(params![query], |r| r.get::<_, i64>(0))? {
+                seeds.insert(row?);
+            }
+            let mut stmt2 = conn.prepare(
+                "SELECT DISTINCT target_doc_id FROM vault_links
+                 WHERE (target_raw = ?1 OR instr(target_raw, ?1) > 0)
+                   AND target_doc_id IS NOT NULL",
+            )?;
+            for row in stmt2.query_map(params![query], |r| r.get::<_, Option<i64>>(0))? {
+                if let Some(id) = row? {
+                    seeds.insert(id);
+                }
+            }
+        }
+
+        if seeds.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // BFS.
+        let mut visited: HashMap<i64, u32> = seeds.iter().map(|id| (*id, 0u32)).collect();
+        let mut queue: VecDeque<(i64, u32)> = seeds.iter().map(|id| (*id, 0u32)).collect();
+        while let Some((id, dist)) = queue.pop_front() {
+            if dist >= depth {
+                continue;
+            }
+            let next_dist = dist + 1;
+
+            // outbound: docs linked FROM this id
+            let mut out = conn.prepare(
+                "SELECT DISTINCT target_doc_id FROM vault_links
+                 WHERE source_doc_id = ?1 AND target_doc_id IS NOT NULL",
+            )?;
+            for row in out.query_map(params![id], |r| r.get::<_, Option<i64>>(0))? {
+                if let Some(next) = row? {
+                    visited.entry(next).or_insert(next_dist);
+                    if next_dist < depth {
+                        queue.push_back((next, next_dist));
+                    }
+                }
+            }
+            // inbound: docs that link TO this id
+            let mut inb = conn.prepare(
+                "SELECT DISTINCT source_doc_id FROM vault_links
+                 WHERE target_doc_id = ?1",
+            )?;
+            for row in inb.query_map(params![id], |r| r.get::<_, i64>(0))? {
+                let next = row?;
+                visited.entry(next).or_insert(next_dist);
+                if next_dist < depth {
+                    queue.push_back((next, next_dist));
+                }
+            }
+        }
+
+        // Fetch titles; score = 1/(1+distance).
+        let mut result: Vec<(i64, String, f32)> = Vec::with_capacity(visited.len());
+        for (id, dist) in visited {
+            let title: String = conn
+                .query_row(
+                    "SELECT COALESCE(title,'') FROM vault_documents WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_default();
+            let score = 1.0 / (1.0 + dist as f32);
+            result.push((id, title, score));
+        }
+        result.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        result.truncate(limit);
+        Ok(result)
+    }
+
+    /// Metadata-filter search over `vault_frontmatter`.
+    /// Filters: pairs of (key, value_substring). All must match (AND).
+    /// Score = 1.0 (uniform; ordering by recency).
+    pub fn search_meta(
+        &self,
+        filters: &[(String, String)],
+        limit: usize,
+    ) -> Result<Vec<(i64, String, f32)>> {
+        if filters.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+        // Build: intersect doc_ids matching each (k,v) filter.
+        let mut matching: Option<HashSet<i64>> = None;
+        for (k, v) in filters {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT doc_id FROM vault_frontmatter
+                 WHERE key = ?1 AND (value = ?2 OR instr(value, ?2) > 0)",
+            )?;
+            let set: HashSet<i64> = stmt
+                .query_map(params![k, v], |r| r.get::<_, i64>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            matching = Some(match matching {
+                Some(prev) => prev.intersection(&set).copied().collect(),
+                None => set,
+            });
+            if let Some(ref s) = matching {
+                if s.is_empty() {
+                    return Ok(Vec::new());
+                }
+            }
+        }
+        let ids = matching.unwrap_or_default();
+        let mut rows: Vec<(i64, String, f32)> = Vec::with_capacity(ids.len());
+        for id in ids {
+            let title: String = conn
+                .query_row(
+                    "SELECT COALESCE(title,'') FROM vault_documents WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_default();
+            rows.push((id, title, 1.0));
+        }
+        rows.sort_by_key(|(id, _, _)| std::cmp::Reverse(*id)); // recent first
+        rows.truncate(limit);
+        Ok(rows)
     }
 
     fn lookup_by_checksum(&self, checksum: &str) -> Result<Option<(i64, String)>> {

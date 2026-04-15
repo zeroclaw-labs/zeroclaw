@@ -36,6 +36,15 @@ pub fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_vault_docs_device
             ON vault_documents(source_device_id, created_at DESC);
 
+        -- ── §2.1b Vault embeddings (kept separate to keep vault_documents lean) ──
+        CREATE TABLE IF NOT EXISTS vault_embeddings (
+            doc_id     INTEGER PRIMARY KEY,
+            embedding  BLOB NOT NULL,
+            dim        INTEGER NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            FOREIGN KEY (doc_id) REFERENCES vault_documents(id) ON DELETE CASCADE
+        );
+
         -- ── §2.2 Wikilinks + backlinks ───────────────────────────
         CREATE TABLE IF NOT EXISTS vault_links (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
