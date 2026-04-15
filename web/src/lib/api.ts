@@ -334,6 +334,35 @@ export function renameSession(id: string, name: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Skills
+// ---------------------------------------------------------------------------
+
+export interface Skill {
+  name: string;
+  version: string;
+  description: string;
+  tools: string[];
+  tags: string[];
+}
+
+export function getSkills(): Promise<Skill[]> {
+  return apiFetch<Skill[] | { skills: Skill[] }>('/api/skills').then((data) =>
+    unwrapField(data, 'skills'),
+  );
+}
+
+export function installSkill(source: string): Promise<void> {
+  return apiFetch('/api/skills/install', {
+    method: 'POST',
+    body: JSON.stringify({ source }),
+  });
+}
+
+export function removeSkill(name: string): Promise<void> {
+  return apiFetch(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' });
+}
+
+// ---------------------------------------------------------------------------
 // Channels (detailed)
 // ---------------------------------------------------------------------------
 

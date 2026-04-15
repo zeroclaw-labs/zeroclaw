@@ -1,16 +1,15 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Send, Bot, User, AlertCircle, Copy, Check } from 'lucide-react';
+import { Send, Bot, User, AlertCircle, Copy, Check, Plus } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import type { WsMessage } from '@/types/api';
+import type { Session, WsMessage } from '@/types/api';
 import { WebSocketClient, getOrCreateSessionId, SESSION_STORAGE_KEY } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
-import { getSessionMessages } from '@/lib/api';
+import { getSessionMessages, getSessions, getStatus, getConfig, putConfig } from '@/lib/api';
 import ToolCallCard from '@/components/ToolCallCard';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
-import ModelSelector from '@/components/ModelSelector';
 import {
   loadChatHistory,
   mapServerMessagesToPersisted,
@@ -18,6 +17,77 @@ import {
   saveChatHistory,
   uiMessagesToPersisted,
 } from '@/lib/chatHistoryStorage';
+
+// ---------------------------------------------------------------------------
+// Model route helpers (folded from ModelSelector component)
+// ---------------------------------------------------------------------------
+
+interface ModelRoute {
+  provider: string;
+  model: string;
+  hint?: string;
+}
+
+/**
+ * Parse [[model_routes]] entries from a TOML config string.
+ */
+function parseModelRoutes(toml: string): ModelRoute[] {
+  const routes: ModelRoute[] = [];
+  const blocks = toml.split(/\[\[model_routes\]\]/);
+  for (let i = 1; i < blocks.length; i++) {
+    const block = blocks[i]!;
+    const nextSection = new RegExp('^\\[(?!\\[model_routes\\])', 'm');
+    const sectionEnd = block.search(nextSection);
+    const content = sectionEnd === -1 ? block : block.slice(0, sectionEnd);
+
+    const providerMatch = content.match(/^\s*provider\s*=\s*"([^"]+)"/m);
+    const modelMatch = content.match(/^\s*model\s*=\s*"([^"]+)"/m);
+    const hintMatch = content.match(/^\s*hint\s*=\s*"([^"]+)"/m);
+    if (providerMatch && modelMatch) {
+      routes.push({
+        provider: providerMatch[1]!,
+        model: modelMatch[1]!,
+        hint: hintMatch?.[1],
+      });
+    }
+  }
+  return routes;
+}
+
+/**
+ * Update the default_provider and default_model in a TOML config string.
+ */
+function updateDefaultModel(toml: string, provider: string, model: string): string {
+  let updated = toml;
+
+  if (/^\s*default_provider\s*=/m.test(updated)) {
+    updated = updated.replace(/^(\s*default_provider\s*=\s*).*$/m, `$1"${provider}"`);
+  } else {
+    const aiMatch = updated.match(/^\[ai\]\s*$/m);
+    if (aiMatch && aiMatch.index !== undefined) {
+      const insertPos = aiMatch.index + aiMatch[0].length;
+      updated = `${updated.slice(0, insertPos)}\ndefault_provider = "${provider}"${updated.slice(insertPos)}`;
+    } else {
+      updated += `\n[ai]\ndefault_provider = "${provider}"\n`;
+    }
+  }
+
+  if (/^\s*default_model\s*=/m.test(updated)) {
+    updated = updated.replace(/^(\s*default_model\s*=\s*).*$/m, `$1"${model}"`);
+  } else {
+    const providerLine = updated.match(/^\s*default_provider\s*=.*$/m);
+    if (providerLine && providerLine.index !== undefined) {
+      const insertPos = providerLine.index + providerLine[0].length;
+      updated = `${updated.slice(0, insertPos)}\ndefault_model = "${model}"${updated.slice(insertPos)}`;
+    }
+  }
+
+  return updated;
+}
+
+// ---------------------------------------------------------------------------
+// Chat types
+// ---------------------------------------------------------------------------
 
 interface ChatMessage {
   id: string;
@@ -46,6 +116,13 @@ export default function AgentChat() {
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // --- Session & model controls state (OpenClaw-style inline header) ---
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [currentProvider, setCurrentProvider] = useState<string | null>(null);
+  const [currentModel, setCurrentModel] = useState<string>('');
+  const [modelRoutes, setModelRoutes] = useState<ModelRoute[]>([]);
+  const [switchingModel, setSwitchingModel] = useState(false);
+
   const wsRef = useRef<WebSocketClient | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -61,6 +138,78 @@ export default function AgentChat() {
   useEffect(() => {
     saveDraft(input);
   }, [input, saveDraft]);
+
+  // Fetch sessions list and current model/provider + available routes
+  const fetchSessions = useCallback(async () => {
+    try {
+      const data = await getSessions();
+      data.sort((a, b) => new Date(b.last_activity).getTime() - new Date(a.last_activity).getTime());
+      setSessions(data);
+    } catch {
+      // Non-critical
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [status, configToml] = await Promise.all([getStatus(), getConfig()]);
+        if (cancelled) return;
+        setCurrentProvider(status.provider);
+        setCurrentModel(status.model);
+        setModelRoutes(parseModelRoutes(configToml));
+      } catch {
+        // Non-critical
+      }
+    })();
+    fetchSessions();
+    return () => { cancelled = true; };
+  }, [fetchSessions]);
+
+  // Refresh session list when session changes
+  useEffect(() => {
+    const handler = () => { fetchSessions(); };
+    window.addEventListener('zeroclaw-session-change', handler);
+    return () => window.removeEventListener('zeroclaw-session-change', handler);
+  }, [fetchSessions]);
+
+  // --- Session dropdown handler ---
+  const handleSessionSelect = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
+    const newSessionId = e.target.value;
+    if (newSessionId === sessionIdRef.current) return;
+    window.dispatchEvent(new CustomEvent('zeroclaw-session-change', { detail: { sessionId: newSessionId } }));
+  }, []);
+
+  // --- New chat handler ---
+  const handleNewChat = useCallback(() => {
+    const newId = generateUUID();
+    sessionStorage.setItem(SESSION_STORAGE_KEY, newId);
+    window.dispatchEvent(new CustomEvent('zeroclaw-session-change', { detail: { sessionId: newId } }));
+  }, []);
+
+  // --- Model select handler ---
+  const handleModelSelect = useCallback(async (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const value = e.target.value;
+    if (!value) return; // "Default" selected, no change
+    const [provider, ...modelParts] = value.split('/');
+    const model = modelParts.join('/');
+    if (!provider || !model) return;
+    if (provider === currentProvider && model === currentModel) return;
+
+    setSwitchingModel(true);
+    try {
+      const configToml = await getConfig();
+      const updated = updateDefaultModel(configToml, provider, model);
+      await putConfig(updated);
+      setCurrentProvider(provider);
+      setCurrentModel(model);
+    } catch {
+      // Failed — keep current
+    } finally {
+      setSwitchingModel(false);
+    }
+  }, [currentProvider, currentModel]);
 
   // Hydrate chat from server (preferred) or localStorage fallback
   useEffect(() => {
@@ -448,9 +597,72 @@ export default function AgentChat() {
         </div>
       )}
 
-      {/* Model selector bar */}
-      <div className="px-4 py-2 border-b flex items-center" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
-        <ModelSelector />
+      {/* Chat controls row — OpenClaw-style inline session + model selectors */}
+      <div className="flex items-center gap-2 px-4 py-2 border-b" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
+        {/* Session select */}
+        <select
+          value={sessionIdRef.current}
+          onChange={handleSessionSelect}
+          className="text-sm rounded-lg px-2 py-1.5 min-w-0 max-w-[220px] truncate"
+          style={{ background: 'var(--pc-bg-elevated)', border: '1px solid var(--pc-border)', color: 'var(--pc-text-primary)' }}
+        >
+          {sessions.length === 0 && (
+            <option value={sessionIdRef.current}>
+              {sessionIdRef.current.slice(0, 8)}...
+            </option>
+          )}
+          {sessions.map((s) => (
+            <option key={s.session_id} value={s.session_id}>
+              {s.name || `Session ${s.session_id.slice(0, 8)}`} ({s.message_count} msgs)
+            </option>
+          ))}
+        </select>
+
+        {/* Model select */}
+        <select
+          value={currentProvider && currentModel ? `${currentProvider}/${currentModel}` : ''}
+          onChange={handleModelSelect}
+          disabled={switchingModel}
+          className="text-sm rounded-lg px-2 py-1.5 min-w-0 max-w-[260px] truncate"
+          style={{
+            background: 'var(--pc-bg-elevated)',
+            border: '1px solid var(--pc-border)',
+            color: 'var(--pc-text-primary)',
+            opacity: switchingModel ? 0.6 : 1,
+          }}
+        >
+          <option value="">
+            Default ({currentModel ? `${currentProvider ?? 'unknown'}/${currentModel}` : 'loading...'})
+          </option>
+          {modelRoutes.map((r) => (
+            <option key={`${r.provider}/${r.model}`} value={`${r.provider}/${r.model}`}>
+              {r.hint ? `${r.hint} \u2014 ` : ''}{r.provider}/{r.model}
+            </option>
+          ))}
+        </select>
+
+        {/* New Chat */}
+        <button
+          type="button"
+          title="New chat"
+          onClick={handleNewChat}
+          className="flex items-center justify-center rounded-lg p-1.5 transition-all shrink-0"
+          style={{
+            background: 'var(--pc-bg-elevated)',
+            border: '1px solid var(--pc-border)',
+            color: 'var(--pc-text-muted)',
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.borderColor = 'var(--pc-accent-dim)';
+            e.currentTarget.style.color = 'var(--pc-text-primary)';
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.borderColor = 'var(--pc-border)';
+            e.currentTarget.style.color = 'var(--pc-text-muted)';
+          }}
+        >
+          <Plus className="h-4 w-4" />
+        </button>
       </div>
 
       {/* Messages area */}

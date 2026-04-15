@@ -14,6 +14,7 @@ import Logs from './pages/Logs';
 import Doctor from './pages/Doctor';
 import Pairing from './pages/Pairing';
 import Canvas from './pages/Canvas';
+import Skills from './pages/Skills';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
 import { setLocale, type Locale } from './lib/i18n';
@@ -232,6 +233,7 @@ function AppContent() {
             <Route path="/tools" element={<Tools />} />
             <Route path="/cron" element={<Cron />} />
             <Route path="/integrations" element={<Integrations />} />
+            <Route path="/skills" element={<Skills />} />
             <Route path="/memory" element={<Memory />} />
             <Route path="/config" element={<Config />} />
             <Route path="/cost" element={<Cost />} />
