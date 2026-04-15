@@ -45,6 +45,8 @@ allowed_commands = [
     "head",
     "tail",
     "date",
+    "python3",
+    "python",
 ]
 command_context_rules = []
 forbidden_paths = [
@@ -117,7 +119,11 @@ non_cli_natural_language_approval_mode = "direct"
 roles = []
 
 [security.sandbox]
-backend = "auto"
+# "none" is appropriate for Pi: Docker auto-detection would select an Alpine
+# container that has no python3 and no workspace mount, breaking all Python
+# skill commands.  Application-layer policy (allowed_commands, path guards) is
+# the primary security control on constrained, trusted edge devices.
+backend = "none"
 firejail_args = []
 
 [security.resources]

@@ -1,18 +1,26 @@
 //! Docker sandbox (container isolation)
 
 use crate::security::traits::Sandbox;
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Docker sandbox backend
 #[derive(Debug, Clone)]
 pub struct DockerSandbox {
     image: String,
+    /// Workspace directory to bind-mount into the container at the same path.
+    /// Without this mount the container cannot see skill scripts or project
+    /// files, causing Python (and other interpreter) commands to fail with
+    /// "file not found" — or worse, to silently fall back to shell execution
+    /// of the script when the interpreter is absent from the image.
+    workspace_dir: Option<PathBuf>,
 }
 
 impl Default for DockerSandbox {
     fn default() -> Self {
         Self {
             image: "alpine:latest".to_string(),
+            workspace_dir: None,
         }
     }
 }
@@ -29,9 +37,29 @@ impl DockerSandbox {
         }
     }
 
+    /// Create a sandbox that bind-mounts `workspace_dir` into the container at
+    /// the same absolute path, so interpreter commands (python3, node, etc.) can
+    /// reach skill scripts without any path translation.
+    pub fn new_with_workspace(workspace_dir: PathBuf) -> std::io::Result<Self> {
+        if Self::is_installed() {
+            Ok(Self {
+                image: "alpine:latest".to_string(),
+                workspace_dir: Some(workspace_dir),
+            })
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Docker not found",
+            ))
+        }
+    }
+
     pub fn with_image(image: String) -> std::io::Result<Self> {
         if Self::is_installed() {
-            Ok(Self { image })
+            Ok(Self {
+                image,
+                workspace_dir: None,
+            })
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -72,6 +100,26 @@ impl Sandbox for DockerSandbox {
             "--network",
             "none",
         ]);
+
+        // Bind-mount the workspace so scripts at absolute paths inside the
+        // workspace are reachable from within the container.  The mount uses
+        // the same path on both sides so interpreter commands like
+        //   PYTHONPATH=/workspace python3 /workspace/commands/fetch.py
+        // work without any path translation.
+        if let Some(ws) = &self.workspace_dir {
+            if let Some(ws_str) = ws.to_str() {
+                docker_cmd.arg("-v");
+                docker_cmd.arg(format!("{ws_str}:{ws_str}:ro"));
+                docker_cmd.arg("--workdir");
+                docker_cmd.arg(ws_str);
+            } else {
+                tracing::warn!(
+                    "workspace_dir contains non-UTF-8 bytes, skipping Docker bind-mount: {:?}",
+                    ws
+                );
+            }
+        }
+
         docker_cmd.arg(&self.image);
         docker_cmd.arg(&program);
         docker_cmd.args(&args);
@@ -199,6 +247,7 @@ mod tests {
     fn docker_wrap_command_uses_custom_image() {
         let sandbox = DockerSandbox {
             image: "ubuntu:22.04".to_string(),
+            workspace_dir: None,
         };
         let mut cmd = Command::new("echo");
         sandbox.wrap_command(&mut cmd).unwrap();
@@ -211,6 +260,95 @@ mod tests {
         assert!(
             args.contains(&"ubuntu:22.04".to_string()),
             "must use the custom image"
+        );
+    }
+
+    // ── Workspace mount tests ───────────────────────────────────────
+
+    #[test]
+    fn docker_without_workspace_omits_volume_flags() {
+        let sandbox = DockerSandbox::default();
+        let mut cmd = Command::new("echo");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            !args.contains(&"-v".to_string()),
+            "no workspace configured: -v flag must not appear"
+        );
+        assert!(
+            !args.contains(&"--workdir".to_string()),
+            "no workspace configured: --workdir flag must not appear"
+        );
+    }
+
+    #[test]
+    fn docker_with_workspace_adds_volume_and_workdir() {
+        let ws = std::path::PathBuf::from("/home/pi/investorclaw");
+        let sandbox = DockerSandbox {
+            image: "alpine:latest".to_string(),
+            workspace_dir: Some(ws.clone()),
+        };
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("echo hello");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        let expected_volume = format!("{}:{}:ro", ws.display(), ws.display());
+        assert!(
+            args.contains(&"-v".to_string()),
+            "workspace configured: -v flag must appear"
+        );
+        assert!(
+            args.contains(&expected_volume),
+            "volume must be workspace:workspace:ro, got: {args:?}"
+        );
+        assert!(
+            args.contains(&"--workdir".to_string()),
+            "workspace configured: --workdir flag must appear"
+        );
+        assert!(
+            args.contains(&ws.to_string_lossy().to_string()),
+            "workdir must be the workspace path"
+        );
+    }
+
+    #[test]
+    fn docker_with_workspace_still_includes_isolation_flags() {
+        let ws = std::path::PathBuf::from("/home/pi/investorclaw");
+        let sandbox = DockerSandbox {
+            image: "alpine:latest".to_string(),
+            workspace_dir: Some(ws),
+        };
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("python3 script.py");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        assert!(args.contains(&"--rm".to_string()), "must still include --rm");
+        assert!(
+            args.contains(&"--network".to_string()),
+            "must still include --network"
+        );
+        assert!(
+            args.contains(&"none".to_string()),
+            "network must still be none"
+        );
+        assert!(
+            args.contains(&"--memory".to_string()),
+            "must still include --memory"
         );
     }
 }
