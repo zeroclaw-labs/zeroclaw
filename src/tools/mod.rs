@@ -73,6 +73,7 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod microsoft365;
 pub mod model_routing_config;
+pub mod model_spawn;
 pub mod model_switch;
 pub mod node_capabilities;
 pub mod node_tool;
@@ -171,6 +172,7 @@ pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use microsoft365::Microsoft365Tool;
 pub use model_routing_config::ModelRoutingConfigTool;
+pub use model_spawn::ModelSpawnTool;
 pub use model_switch::ModelSwitchTool;
 #[allow(unused_imports)]
 pub use node_tool::NodeTool;
@@ -485,6 +487,17 @@ pub fn all_tools_with_runtime(
             root_config.default_temperature,
             root_config.api_key.clone(),
             llm_task_runtime_options,
+        )));
+    }
+
+    // model_spawn — live session model switching and ephemeral spawns
+    {
+        let spawn_runtime_options =
+            crate::providers::provider_runtime_options_from_config(root_config);
+        tool_arcs.push(Arc::new(ModelSpawnTool::new(
+            security.clone(),
+            root_config.api_key.clone(),
+            spawn_runtime_options,
         )));
     }
 
