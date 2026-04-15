@@ -457,11 +457,15 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         archive_after_days: if profile.uses_sqlite_hygiene { 7 } else { 0 },
         purge_after_days: if profile.uses_sqlite_hygiene { 30 } else { 0 },
         conversation_retention_days: 30,
+        search_mode: "weighted".to_string(),
         embedding_provider: "none".to_string(),
         embedding_model: "text-embedding-3-small".to_string(),
         embedding_dimensions: 1536,
         vector_weight: 0.7,
         keyword_weight: 0.3,
+        rrf_k: 60.0,
+        multi_query_expansion: false,
+        multi_query_model: "claude-haiku-4-5-20251001".to_string(),
         min_relevance_score: 0.4,
         embedding_cache_size: if profile.uses_sqlite_hygiene {
             10000

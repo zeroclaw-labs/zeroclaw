@@ -1,0 +1,34 @@
+name: "영수증/비용 정리"
+parent_category: "daily"
+description: "영수증 사진 → 항목 추출 → 사건별 비용 집계"
+icon: "🧾"
+inputs:
+  - name: receipt_image_path
+    type: file
+    required: true
+  - name: case_id
+    type: string
+    required: false
+steps:
+  - type: llm
+    id: ocr_extract
+    model: claude-opus-4-6
+    system: "영수증 이미지에서 항목/금액/날짜/가맹점 추출 (JSON)."
+    user_template: "영수증 경로: {{input.receipt_image_path}}"
+  - type: llm
+    id: categorize
+    model: claude-haiku-4-5-20251001
+    system: "비용 카테고리 분류 (법원수수료/출장비/복사/자료구입/기타)."
+    user_template: "{{ocr_extract.output}}"
+  - type: memory_store
+    id: record_expense
+    content: "영수증 - {{ocr_extract.merchant}} {{ocr_extract.amount}}원 ({{categorize.output}})"
+    timeline_event_type: "ocr"
+    link_to_ontology: "case_{{input.case_id}}"
+  - type: file_write
+    id: save_receipt
+    path: "expenses/{{input.case_id}}/{{ocr_extract.date}}.json"
+    content_from: "{{ocr_extract.output}}"
+limits:
+  max_tokens_per_run: 10000
+  max_llm_calls_per_run: 2

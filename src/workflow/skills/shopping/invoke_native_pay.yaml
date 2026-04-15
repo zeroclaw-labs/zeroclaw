@@ -1,0 +1,59 @@
+name: "skill.shopping.invoke_native_pay"
+parent_category: "shopping"
+description: "Layer C: hand off to OS native payment (Passkey/KakaoPay/NaverPay/TossPay). MoA's role ends at deep-link/callback. Biometric/PIN happens inside OS."
+inputs:
+  - name: provider
+    type: selection
+    options: ["passkey", "kakaopay", "naverpay", "tosspay"]
+    required: true
+  - name: amount
+    type: number
+    required: true
+  - name: merchant
+    type: string
+    required: true
+  - name: return_to
+    type: string
+    required: true
+steps:
+  - type: tool_call
+    id: pre_audit
+    tool: skill.shopping.audit_log_payment
+    args:
+      stage: "pre_invoke"
+      provider: "{{input.provider}}"
+      amount: "{{input.amount}}"
+      merchant: "{{input.merchant}}"
+  - type: conditional
+    id: route
+    cond: "input.provider == 'passkey'"
+    then:
+      - type: tool_call
+        id: passkey_invoke
+        tool: shell
+        args:
+          command: "moa-bridge passkey-pay --amount {{input.amount}} --merchant '{{input.merchant}}' --return '{{input.return_to}}'"
+          timeout_sec: 120
+    else:
+      - type: tool_call
+        id: deeplink_invoke
+        tool: shell
+        args:
+          command: "moa-bridge open-deeplink --provider {{input.provider}} --amount {{input.amount}} --merchant '{{input.merchant}}' --return '{{input.return_to}}'"
+          timeout_sec: 120
+  - type: user_confirm
+    id: wait_callback
+    message: "결제 완료 후 앱으로 돌아오면 확인을 눌러주세요."
+    timeout_sec: 600
+  - type: tool_call
+    id: post_audit
+    tool: skill.shopping.audit_log_payment
+    args:
+      stage: "post_callback"
+      provider: "{{input.provider}}"
+      amount: "{{input.amount}}"
+      merchant: "{{input.merchant}}"
+limits:
+  max_tokens_per_run: 500
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 900

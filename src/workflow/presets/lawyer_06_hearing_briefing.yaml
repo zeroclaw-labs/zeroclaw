@@ -1,0 +1,42 @@
+name: "기일 전 브리핑 자동 생성"
+parent_category: "daily"
+description: "매일 08:00 - 오늘 기일 조회 → 각 사건 compiled_truth + 최근 이벤트 → 카드형 브리핑"
+icon: "📅"
+inputs:
+  - name: target_date
+    type: date
+    required: false
+    default: "today"
+steps:
+  - type: memory_recall
+    id: todays_hearings
+    query: "기일 {{input.target_date}}"
+    search_mode: rrf
+    top_k: 10
+  - type: loop
+    id: per_case
+    over: "{{todays_hearings.results}}"
+    as: hearing
+    body:
+      - type: memory_recall
+        id: case_context
+        query: "{{hearing.case_name}} compiled_truth"
+        search_mode: rrf
+        top_k: 5
+      - type: llm
+        id: build_card
+        model: claude-haiku-4-5-20251001
+        system: "사건별 브리핑 카드 (당사자/쟁점/오늘 할 일/준비서류)."
+        user_template: "기일: {{hearing}}\n요약: {{case_context.results}}"
+  - type: llm
+    id: dashboard
+    model: claude-sonnet-4-6
+    system: "하루 전체 브리핑 대시보드 생성."
+    user_template: "카드들: {{per_case.results}}"
+  - type: memory_store
+    id: save_dashboard
+    content: "{{input.target_date}} 기일 브리핑"
+    timeline_event_type: "workflow"
+limits:
+  max_tokens_per_run: 40000
+  max_llm_calls_per_run: 20

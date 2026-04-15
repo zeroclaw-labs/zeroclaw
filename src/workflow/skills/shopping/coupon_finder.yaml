@@ -1,0 +1,42 @@
+name: "skill.shopping.coupon_finder"
+parent_category: "shopping"
+description: "Find max applicable coupons for a cart (stackable combos)."
+inputs:
+  - name: site
+    type: string
+    required: true
+  - name: cart_total_krw
+    type: number
+    required: true
+steps:
+  - type: tool_call
+    id: load_selectors
+    tool: file
+    args:
+      action: "read"
+      path: "resources/shopping/malls/{{input.site}}.selectors.json"
+  - type: tool_call
+    id: fetch_coupons
+    tool: browser
+    args:
+      action: "goto"
+      url: "{{load_selectors.coupons_url}}"
+  - type: tool_call
+    id: list_coupons
+    tool: browser
+    args:
+      action: "extract"
+      selector: "{{load_selectors.coupon_list}}"
+  - type: llm
+    id: optimize
+    model: claude-haiku-4-5-20251001
+    system: "스택 가능한 쿠폰 조합에서 최대 할인액을 계산 (JSON: chosen[], total_discount, final_price)."
+    user_template: "쿠폰: {{list_coupons.items}}\n장바구니: {{input.cart_total_krw}}원"
+  - type: memory_store
+    id: record
+    content: "Coupons optimized: -{{optimize.total_discount}}원"
+    timeline_event_type: "workflow"
+limits:
+  max_tokens_per_run: 10000
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 60

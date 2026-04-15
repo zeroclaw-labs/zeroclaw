@@ -1,0 +1,35 @@
+name: "skill.shopping.gift_recommender"
+parent_category: "shopping"
+description: "Given recipient profile + budget, recommend gift items."
+inputs:
+  - name: recipient_profile
+    type: string
+    required: true
+  - name: budget_krw
+    type: number
+    required: true
+  - name: occasion
+    type: string
+    required: false
+steps:
+  - type: memory_recall
+    id: past_gifts
+    query: "gift history {{input.recipient_profile}}"
+    search_mode: rrf
+    top_k: 10
+  - type: llm
+    id: brainstorm
+    model: claude-opus-4-6
+    system: "수신자 프로필/예산/계기를 고려해 선물 후보 5개를 카테고리별로 제시. 중복 방지."
+    user_template: "수신자: {{input.recipient_profile}}\n예산: {{input.budget_krw}}원\n계기: {{input.occasion}}\n과거 선물: {{past_gifts.results}}"
+  - type: tool_call
+    id: search_each
+    tool: skill.shopping.search_browser
+    args:
+      site: "coupang"
+      query: "{{brainstorm.top_query}}"
+      limit: 10
+limits:
+  max_tokens_per_run: 20000
+  max_llm_calls_per_run: 3
+  max_runtime_sec: 120

@@ -1,0 +1,46 @@
+name: "skill.shopping.price_watch"
+parent_category: "shopping"
+description: "Track price of a product URL, notify on drop beyond threshold."
+inputs:
+  - name: product_url
+    type: string
+    required: true
+  - name: target_price_krw
+    type: number
+    required: true
+  - name: drop_pct_threshold
+    type: number
+    default: 10
+steps:
+  - type: tool_call
+    id: fetch_current
+    tool: web_fetch
+    args:
+      url: "{{input.product_url}}"
+  - type: llm
+    id: extract_price
+    model: claude-haiku-4-5-20251001
+    system: "HTML에서 현재 가격 추출 (숫자만)."
+    user_template: "{{fetch_current.body}}"
+  - type: memory_recall
+    id: price_history
+    query: "price history {{input.product_url}}"
+    search_mode: rrf
+    top_k: 10
+  - type: memory_store
+    id: save_snapshot
+    content: "Price snapshot: {{extract_price.value}}원"
+    timeline_event_type: "workflow"
+    source_ref: "price_watch:{{input.product_url}}"
+  - type: conditional
+    id: alert
+    cond: "extract_price.value <= input.target_price_krw"
+    then:
+      - type: memory_store
+        id: trigger_alert
+        content: "PRICE DROP ALERT: {{input.product_url}} → {{extract_price.value}}원 (target {{input.target_price_krw}})"
+        timeline_event_type: "workflow"
+limits:
+  max_tokens_per_run: 5000
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 30

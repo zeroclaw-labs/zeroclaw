@@ -1,0 +1,64 @@
+name: "skill.shopping.add_to_cart"
+parent_category: "shopping"
+description: "Layer B: add product to cart via browser automation. No payment involved."
+inputs:
+  - name: site
+    type: string
+    required: true
+  - name: product_url
+    type: string
+    required: true
+  - name: qty
+    type: number
+    required: false
+    default: 1
+  - name: options
+    type: string
+    required: false
+steps:
+  - type: tool_call
+    id: load_selectors
+    tool: file
+    args:
+      action: "read"
+      path: "resources/shopping/malls/{{input.site}}.selectors.json"
+  - type: tool_call
+    id: goto_product
+    tool: browser
+    args:
+      action: "goto"
+      url: "{{input.product_url}}"
+  - type: tool_call
+    id: snapshot_pdp
+    tool: browser
+    args:
+      action: "snapshot"
+  - type: tool_call
+    id: set_qty
+    tool: browser
+    args:
+      action: "form_input"
+      selector: "{{load_selectors.qty_input}}"
+      value: "{{input.qty}}"
+  - type: tool_call
+    id: click_cart
+    tool: browser
+    args:
+      action: "click"
+      selector: "{{load_selectors.add_to_cart_button}}"
+  - type: tool_call
+    id: verify_added
+    tool: browser
+    args:
+      action: "wait_for_text"
+      text: "{{load_selectors.cart_confirm_text}}"
+      timeout_ms: 5000
+  - type: memory_store
+    id: record
+    content: "Cart: {{input.site}} x{{input.qty}}"
+    timeline_event_type: "workflow"
+    source_ref: "cart:{{input.site}}:{{run_uuid}}"
+limits:
+  max_tokens_per_run: 1000
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 20

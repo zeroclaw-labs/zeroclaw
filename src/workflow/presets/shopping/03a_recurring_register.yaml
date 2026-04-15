@@ -1,0 +1,58 @@
+name: "정기 구매 루틴 등록"
+parent_category: "shopping"
+description: "생필품 정기 배송 사전 승인 등록 (L2)"
+icon: "📅"
+inputs:
+  - name: product_name
+    type: string
+    required: true
+  - name: mall
+    type: selection
+    options: ["coupang","naver","ssg"]
+    required: true
+  - name: frequency
+    type: selection
+    options: ["매주","격주","매월"]
+    required: true
+  - name: max_price_krw
+    type: number
+    required: true
+  - name: max_quantity
+    type: number
+    default: 1
+  - name: pause_if_price_exceeds
+    type: boolean
+    default: true
+steps:
+  - type: tool_call
+    id: verify_item
+    tool: skill.shopping.search_browser
+    args:
+      site: "{{input.mall}}"
+      query: "{{input.product_name}}"
+      limit: 5
+  - type: user_confirm
+    id: consent_l2
+    message: |
+      ★ 정기 구매 사전 승인 (L2)
+      상품: {{verify_item.top.title}}
+      몰: {{input.mall}}
+      주기: {{input.frequency}}
+      한도: {{input.max_price_krw}}원 × {{input.max_quantity}}
+      ※ 매회 실행 전 확인 알림 전송
+      ※ 한도 초과 시 자동 일시중지
+      음성으로 '동의'라고 말씀해주세요.
+    timeout_sec: 300
+  - type: calendar_add
+    id: register_schedule
+    title: "MoA 정기구매: {{input.product_name}}"
+    date: "+1w"
+  - type: memory_store
+    id: save_routine
+    content: "정기구매 등록: {{input.product_name}} / {{input.mall}} / {{input.frequency}}"
+    timeline_event_type: "workflow"
+    link_to_ontology: "recurring_purchase"
+limits:
+  max_tokens_per_run: 5000
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 600

@@ -1,0 +1,35 @@
+name: "skill.shopping.compare_danawa"
+parent_category: "shopping"
+description: "Danawa price comparison crawl via browser + web_fetch"
+inputs:
+  - name: query
+    type: string
+    required: true
+steps:
+  - type: tool_call
+    id: fetch_list
+    tool: web_fetch
+    args:
+      url: "https://search.danawa.com/dsearch.php?query={{input.query}}"
+  - type: tool_call
+    id: snapshot
+    tool: browser
+    args:
+      action: "goto"
+      url: "https://search.danawa.com/dsearch.php?query={{input.query}}"
+  - type: tool_call
+    id: extract
+    tool: browser
+    args:
+      action: "extract"
+      selector: ".product_list"
+      limit: 20
+  - type: memory_store
+    id: cache
+    content: "Danawa compare: {{input.query}}"
+    timeline_event_type: "manual"
+    source_ref: "danawa:{{input.query}}"
+limits:
+  max_tokens_per_run: 1000
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 30

@@ -1,0 +1,46 @@
+name: "의뢰인별 주간 진행 리포트"
+parent_category: "daily"
+description: "매주 금 17:00 - 의뢰인 전체 순회 → 주간 진행 요약 → 발송"
+icon: "📊"
+inputs:
+  - name: week_start
+    type: date
+    required: false
+steps:
+  - type: memory_recall
+    id: active_clients
+    query: "의뢰인 활성 진행중"
+    search_mode: rrf
+    top_k: 50
+    filter_ontology_type: "client"
+  - type: loop
+    id: per_client
+    over: "{{active_clients.results}}"
+    as: client
+    body:
+      - type: memory_recall
+        id: weekly_events
+        query: "{{client.name}} 이번주 진행"
+        search_mode: rrf
+        top_k: 20
+      - type: llm
+        id: summarize
+        model: claude-sonnet-4-6
+        system: "의뢰인 주간 진행 요약 (완료/진행중/다음주 계획)."
+        user_template: "이벤트: {{weekly_events.results}}"
+      - type: file_write
+        id: save
+        path: "reports/weekly_{{client.id}}_{{week_start}}.md"
+        content_from: "{{summarize.output}}"
+  - type: llm
+    id: office_summary
+    model: claude-opus-4-6
+    system: "사무실 전체 주간 요약."
+    user_template: "의뢰인별: {{per_client.results}}"
+  - type: memory_store
+    id: archive
+    content: "주간 리포트 - {{week_start}}"
+    timeline_event_type: "workflow"
+limits:
+  max_tokens_per_run: 80000
+  max_llm_calls_per_run: 30

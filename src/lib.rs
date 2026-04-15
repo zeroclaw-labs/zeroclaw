@@ -44,6 +44,7 @@ pub mod agent;
 pub(crate) mod approval;
 pub(crate) mod auth;
 pub mod billing;
+pub mod categories;
 pub mod channels;
 pub mod coding;
 pub mod config;
@@ -71,6 +72,7 @@ pub mod observability;
 pub(crate) mod onboard;
 pub mod ontology;
 pub mod peripherals;
+pub mod phone;
 #[allow(unused_imports)]
 pub(crate) mod plugins;
 pub mod providers;
@@ -90,6 +92,7 @@ pub(crate) mod tunnel;
 pub mod update;
 pub(crate) mod util;
 pub mod voice;
+pub mod workflow;
 
 pub use config::Config;
 

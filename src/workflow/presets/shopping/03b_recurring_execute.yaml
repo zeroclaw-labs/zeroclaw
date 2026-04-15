@@ -1,0 +1,68 @@
+name: "정기 구매 실행"
+parent_category: "shopping"
+description: "등록된 정기 구매 루틴의 매회 실행 (L1 — 사전 승인된 L2 한도 내에서만)"
+icon: "🔁"
+inputs:
+  - name: product_url
+    type: string
+    required: true
+  - name: mall
+    type: string
+    required: true
+  - name: max_price_krw
+    type: number
+    required: true
+  - name: qty
+    type: number
+    default: 1
+steps:
+  - type: tool_call
+    id: check_stock_price
+    tool: skill.shopping.search_browser
+    args:
+      site: "{{input.mall}}"
+      query: "{{input.product_url}}"
+      limit: 1
+  - type: conditional
+    id: price_guard
+    cond: "check_stock_price.price > input.max_price_krw"
+    then:
+      - type: memory_store
+        id: pause_log
+        content: "정기구매 일시중지: 가격 초과"
+        timeline_event_type: "workflow"
+    else:
+      - type: user_confirm
+        id: consent_l1
+        message: "{{input.mall}} 정기구매 진행? {{check_stock_price.price}}원"
+        timeout_sec: 1800
+      - type: tool_call
+        id: cart
+        tool: skill.shopping.add_to_cart
+        args:
+          site: "{{input.mall}}"
+          product_url: "{{input.product_url}}"
+          qty: "{{input.qty}}"
+      - type: tool_call
+        id: pay_method
+        tool: skill.shopping.fill_payment_method
+        args:
+          site: "{{input.mall}}"
+          method: "kakaopay"
+      - type: tool_call
+        id: invoke_pay
+        tool: skill.shopping.invoke_native_pay
+        args:
+          provider: "kakaopay"
+          amount: "{{check_stock_price.price}}"
+          merchant: "{{input.mall}}"
+          return_to: "moa://shopping/complete"
+      - type: memory_store
+        id: log_purchase
+        content: "정기구매 완료 - {{input.mall}}"
+        timeline_event_type: "workflow"
+        link_to_ontology: "recurring_purchase"
+limits:
+  max_tokens_per_run: 3000
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 1200

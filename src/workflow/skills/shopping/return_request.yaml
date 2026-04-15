@@ -1,0 +1,68 @@
+name: "skill.shopping.return_request"
+parent_category: "shopping"
+description: "Initiate return/refund via site's return UI (L1)."
+inputs:
+  - name: site
+    type: string
+    required: true
+  - name: order_id
+    type: string
+    required: true
+  - name: reason_code
+    type: selection
+    options: ["defect", "size_mismatch", "color_mismatch", "change_of_mind", "other"]
+    required: true
+  - name: reason_detail
+    type: string
+    required: false
+steps:
+  - type: tool_call
+    id: load_selectors
+    tool: file
+    args:
+      action: "read"
+      path: "resources/shopping/malls/{{input.site}}.selectors.json"
+  - type: tool_call
+    id: goto_order
+    tool: browser
+    args:
+      action: "goto"
+      url: "{{load_selectors.order_detail_prefix}}{{input.order_id}}"
+  - type: tool_call
+    id: click_return
+    tool: browser
+    args:
+      action: "click"
+      selector: "{{load_selectors.return_button}}"
+  - type: tool_call
+    id: select_reason
+    tool: browser
+    args:
+      action: "form_input"
+      selector: "{{load_selectors.return_reason_select}}"
+      value: "{{input.reason_code}}"
+  - type: tool_call
+    id: fill_detail
+    tool: browser
+    args:
+      action: "form_input"
+      selector: "{{load_selectors.return_detail_text}}"
+      value: "{{input.reason_detail}}"
+  - type: user_confirm
+    id: final_submit
+    message: "반품 요청 최종 제출? ({{input.order_id}})"
+    timeout_sec: 300
+  - type: tool_call
+    id: submit
+    tool: browser
+    args:
+      action: "click"
+      selector: "{{load_selectors.return_submit}}"
+  - type: memory_store
+    id: record
+    content: "Return requested: {{input.site}}/{{input.order_id}} ({{input.reason_code}})"
+    timeline_event_type: "workflow"
+limits:
+  max_tokens_per_run: 500
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 300

@@ -1,0 +1,59 @@
+name: "skill.shopping.fill_payment_method"
+parent_category: "shopping"
+description: "Layer C (pre-payment): select payment method on checkout page. Does NOT input passwords/CVC/OTP — those stay in user's hands."
+inputs:
+  - name: site
+    type: string
+    required: true
+  - name: method
+    type: selection
+    options: ["kakaopay", "naverpay", "tosspay", "passkey", "saved_card"]
+    required: true
+  - name: card_token_ref
+    type: string
+    required: false
+steps:
+  - type: tool_call
+    id: load_selectors
+    tool: file
+    args:
+      action: "read"
+      path: "resources/shopping/malls/{{input.site}}.selectors.json"
+  - type: tool_call
+    id: snapshot_checkout
+    tool: browser
+    args:
+      action: "snapshot"
+  - type: tool_call
+    id: select_method
+    tool: browser
+    args:
+      action: "click"
+      selector: "{{load_selectors.pay_method_{{input.method}}}}"
+  - type: conditional
+    id: saved_card_path
+    cond: "input.method == 'saved_card'"
+    then:
+      - type: tool_call
+        id: fetch_card_token
+        tool: memory
+        args:
+          action: "credential_read"
+          scope: "shopping.saved_card"
+          ttl_seconds: 30
+          ref: "{{input.card_token_ref}}"
+      - type: tool_call
+        id: autofill_card_select
+        tool: browser
+        args:
+          action: "form_input"
+          selector: "{{load_selectors.card_token_select}}"
+          value: "{{fetch_card_token.masked_id}}"
+      - type: memory_store
+        id: purge_token_marker
+        content: "card token autofilled — token discarded after 30s"
+        timeline_event_type: "workflow"
+limits:
+  max_tokens_per_run: 500
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 10

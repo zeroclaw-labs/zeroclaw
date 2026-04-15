@@ -1,0 +1,22 @@
+name: "skill.shopping.image_search_to_query"
+parent_category: "shopping"
+description: "User-uploaded image → reverse search + LLM extraction → text query"
+inputs:
+  - name: image_path
+    type: file
+    required: true
+steps:
+  - type: llm
+    id: visual_analyze
+    model: claude-opus-4-6
+    system: "이미지에서 의상/상품 속성 추출 (카테고리/색상/패턴/브랜드 추정). 검색 쿼리 생성."
+    user_template: "이미지: {{input.image_path}}"
+  - type: memory_store
+    id: cache
+    content: "Image→query: {{visual_analyze.query}}"
+    timeline_event_type: "manual"
+    source_ref: "image_search:{{run_uuid}}"
+limits:
+  max_tokens_per_run: 8000
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 30

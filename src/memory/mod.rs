@@ -1,9 +1,11 @@
 pub mod backend;
+pub mod chunk_semantic;
 pub mod chunker;
 pub mod cli;
 pub mod cortex;
 pub mod document_store;
 pub mod document_summarizer;
+pub mod dream_cycle;
 pub mod embeddings;
 pub mod hot_cache;
 pub mod hybrid;
@@ -14,6 +16,7 @@ pub mod none;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod qdrant;
+pub mod query_expand;
 pub mod response_cache;
 pub mod snapshot;
 pub mod sqlite;
@@ -36,7 +39,7 @@ pub use none::NoneMemory;
 pub use postgres::PostgresMemory;
 pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
-pub use sqlite::SqliteMemory;
+pub use sqlite::{SearchMode, SqliteMemory};
 pub use synced::SyncedMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
@@ -285,8 +288,10 @@ pub fn create_memory_with_storage_and_routes(
         let mem = SqliteMemory::with_options(
             workspace_dir,
             embedder,
+            sqlite::SearchMode::from_str_config(&config.search_mode),
             config.vector_weight as f32,
             config.keyword_weight as f32,
+            config.rrf_k as f32,
             config.embedding_cache_size,
             config.sqlite_open_timeout_secs,
             &config.sqlite_journal_mode,

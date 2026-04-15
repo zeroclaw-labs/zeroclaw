@@ -1,0 +1,44 @@
+name: "skill.shopping.parse_receipt"
+parent_category: "shopping"
+description: "Parse completion email/receipt via web_fetch or file + LLM extraction"
+inputs:
+  - name: source
+    type: selection
+    options: ["email", "image", "html"]
+    required: true
+  - name: filter_subject
+    type: string
+    required: false
+  - name: file_path
+    type: string
+    required: false
+steps:
+  - type: conditional
+    id: source_route
+    cond: "input.source == 'email'"
+    then:
+      - type: tool_call
+        id: fetch_email
+        tool: web_fetch
+        args:
+          url: "gmail://search?q=subject:{{input.filter_subject}}&limit=1"
+    else:
+      - type: tool_call
+        id: read_file
+        tool: file
+        args:
+          action: "read"
+          path: "{{input.file_path}}"
+  - type: llm
+    id: extract
+    model: claude-sonnet-4-6
+    system: "영수증/결제 완료 메일에서 항목/금액/날짜/가맹점/결제수단 추출 (JSON)."
+    user_template: "소스: {{source_route.content}}"
+  - type: memory_store
+    id: record
+    content: "Receipt parsed: {{extract.merchant}} {{extract.amount}}"
+    timeline_event_type: "ocr"
+limits:
+  max_tokens_per_run: 15000
+  max_llm_calls_per_run: 2
+  max_runtime_sec: 60

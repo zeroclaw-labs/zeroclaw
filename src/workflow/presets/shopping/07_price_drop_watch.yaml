@@ -1,0 +1,56 @@
+name: "가격 하락 감시"
+parent_category: "shopping"
+description: "특정 상품의 가격 모니터링, 목표가 도달 시 알림 (L0, L1 선택적 자동 구매)"
+icon: "📉"
+inputs:
+  - name: product_url
+    type: string
+    required: true
+  - name: target_price_krw
+    type: number
+    required: true
+  - name: auto_buy_on_drop
+    type: boolean
+    default: false
+  - name: max_price_krw
+    type: number
+    required: false
+steps:
+  - type: tool_call
+    id: check
+    tool: skill.shopping.price_watch
+    args:
+      product_url: "{{input.product_url}}"
+      target_price_krw: "{{input.target_price_krw}}"
+      drop_pct_threshold: 10
+  - type: conditional
+    id: auto_buy_branch
+    cond: "input.auto_buy_on_drop && check.extract_price.value <= input.target_price_krw"
+    then:
+      - type: user_confirm
+        id: consent_l1
+        message: "목표가 도달! {{check.extract_price.value}}원. 즉시 구매?"
+        timeout_sec: 300
+      - type: tool_call
+        id: cart
+        tool: skill.shopping.add_to_cart
+        args:
+          site: "coupang"
+          product_url: "{{input.product_url}}"
+          qty: 1
+      - type: tool_call
+        id: pay
+        tool: skill.shopping.invoke_native_pay
+        args:
+          provider: "passkey"
+          amount: "{{check.extract_price.value}}"
+          merchant: "coupang"
+          return_to: "moa://shopping/price_drop_buy"
+  - type: memory_store
+    id: record
+    content: "가격 감시: {{input.product_url}} 현재가 {{check.extract_price.value}}"
+    timeline_event_type: "workflow"
+limits:
+  max_tokens_per_run: 8000
+  max_llm_calls_per_run: 2
+  max_runtime_sec: 600

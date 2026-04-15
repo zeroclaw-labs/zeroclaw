@@ -1,0 +1,46 @@
+name: "오늘의 코디 추천 + 쇼핑"
+parent_category: "shopping"
+description: "현재 계절·날씨·사용자 스타일에 맞는 코디 제안 + 부족 아이템 검색 (L0, L1 옵션)"
+icon: "👗"
+inputs:
+  - name: occasion
+    type: selection
+    options: ["일상","출근","미팅","데이트","운동","격식"]
+    default: "일상"
+  - name: budget_krw
+    type: number
+    default: 200000
+steps:
+  - type: tool_call
+    id: outfit
+    tool: skill.shopping.outfit_from_weather
+    args:
+      occasion: "{{input.occasion}}"
+      budget_krw: "{{input.budget_krw}}"
+      lat: "{{user.home_lat}}"
+      lon: "{{user.home_lon}}"
+  - type: loop
+    id: search_items
+    over: "{{outfit.needed_items}}"
+    as: item
+    body:
+      - type: tool_call
+        id: search_fashion
+        tool: skill.shopping.search_browser
+        args:
+          site: "musinsa"
+          query: "{{item.query}}"
+          limit: 10
+  - type: llm
+    id: final_card
+    model: claude-sonnet-4-6
+    system: "코디 카드 1장 (상의/하의/신발/액세서리) + 상품 링크 추천"
+    user_template: "{{outfit.plan}}\n검색: {{search_items.results}}"
+  - type: memory_store
+    id: save
+    content: "오늘 코디 추천: {{input.occasion}}"
+    timeline_event_type: "manual"
+limits:
+  max_tokens_per_run: 40000
+  max_llm_calls_per_run: 6
+  max_runtime_sec: 180

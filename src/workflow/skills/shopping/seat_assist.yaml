@@ -1,0 +1,35 @@
+name: "skill.shopping.seat_assist"
+parent_category: "shopping"
+description: "Live seat map analysis + DOM overlay highlight (user clicks, MoA analyzes)"
+inputs:
+  - name: preference
+    type: string
+    required: true
+  - name: live_highlight
+    type: boolean
+    default: true
+steps:
+  - type: tool_call
+    id: snapshot_seats
+    tool: browser
+    args:
+      action: "snapshot"
+  - type: llm
+    id: analyze
+    model: claude-haiku-4-5-20251001
+    system: "좌석 맵 snapshot을 분석해 사용자 선호도에 맞는 top 5 좌석을 추천. JSON 반환."
+    user_template: "선호: {{input.preference}}\nSnapshot: {{snapshot_seats.accessibility_tree}}"
+  - type: conditional
+    id: highlight
+    cond: "input.live_highlight == true"
+    then:
+      - type: tool_call
+        id: overlay
+        tool: browser
+        args:
+          action: "inject_css"
+          css: "{{analyze.highlight_css}}"
+limits:
+  max_tokens_per_run: 10000
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 30

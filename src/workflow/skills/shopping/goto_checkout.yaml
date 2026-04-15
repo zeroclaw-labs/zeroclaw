@@ -1,0 +1,40 @@
+name: "skill.shopping.goto_checkout"
+parent_category: "shopping"
+description: "Navigate to checkout page (Layer C entry). Does not submit any payment."
+inputs:
+  - name: site
+    type: string
+    required: true
+steps:
+  - type: tool_call
+    id: load_selectors
+    tool: file
+    args:
+      action: "read"
+      path: "resources/shopping/malls/{{input.site}}.selectors.json"
+  - type: tool_call
+    id: goto_cart
+    tool: browser
+    args:
+      action: "goto"
+      url: "{{load_selectors.cart_url}}"
+  - type: tool_call
+    id: click_checkout
+    tool: browser
+    args:
+      action: "click"
+      selector: "{{load_selectors.checkout_button}}"
+  - type: tool_call
+    id: wait_load
+    tool: browser
+    args:
+      action: "wait_for_navigation"
+      timeout_ms: 10000
+  - type: memory_store
+    id: record
+    content: "Checkout page: {{input.site}}"
+    timeline_event_type: "workflow"
+limits:
+  max_tokens_per_run: 300
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 30

@@ -1,0 +1,39 @@
+name: "판례 3단 요약"
+parent_category: "document"
+description: "판례 URL/텍스트 입력 → 쟁점/판단/시사점 3섹션 구조화"
+icon: "⚖️"
+inputs:
+  - name: precedent_text
+    type: string
+    required: true
+  - name: case_context
+    type: string
+    required: false
+steps:
+  - type: llm
+    id: extract_issues
+    model: claude-opus-4-6
+    system: "판례에서 핵심 쟁점을 추출하세요."
+    user_template: "{{input.precedent_text}}"
+  - type: llm
+    id: extract_holding
+    model: claude-opus-4-6
+    system: "법원의 판단 내용을 요약하세요."
+    user_template: "판례: {{input.precedent_text}}\n쟁점: {{extract_issues.output}}"
+  - type: llm
+    id: extract_implications
+    model: claude-opus-4-6
+    system: "본 판례의 실무상 시사점을 도출하세요."
+    user_template: "판례: {{input.precedent_text}}\n사용자 사건 맥락: {{input.case_context}}"
+  - type: llm
+    id: compose
+    model: claude-sonnet-4-6
+    system: "3단 구조 (쟁점/판단/시사점)로 최종 정리."
+    user_template: "쟁점: {{extract_issues.output}}\n판단: {{extract_holding.output}}\n시사점: {{extract_implications.output}}"
+  - type: memory_store
+    id: archive
+    content: "판례 요약 - {{input.case_context}}"
+    timeline_event_type: "doc"
+limits:
+  max_tokens_per_run: 80000
+  max_llm_calls_per_run: 4

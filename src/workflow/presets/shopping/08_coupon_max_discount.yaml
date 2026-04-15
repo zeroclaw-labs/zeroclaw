@@ -1,0 +1,50 @@
+name: "쿠폰 최대 할인 적용"
+parent_category: "shopping"
+description: "장바구니에서 최대 쿠폰 조합 계산 후 적용 + 결제 (L1)"
+icon: "💰"
+inputs:
+  - name: site
+    type: string
+    required: true
+  - name: cart_total_krw
+    type: number
+    required: true
+steps:
+  - type: tool_call
+    id: find
+    tool: skill.shopping.coupon_finder
+    args:
+      site: "{{input.site}}"
+      cart_total_krw: "{{input.cart_total_krw}}"
+  - type: user_confirm
+    id: confirm_coupons
+    message: "최대 할인 적용 시 -{{find.total_discount}}원, 최종 {{find.final_price}}원. 적용?"
+    timeout_sec: 300
+  - type: tool_call
+    id: apply
+    tool: skill.shopping.apply_coupons
+    args:
+      site: "{{input.site}}"
+      coupon_ids: "{{find.chosen}}"
+  - type: tool_call
+    id: pay_method
+    tool: skill.shopping.fill_payment_method
+    args:
+      site: "{{input.site}}"
+      method: "passkey"
+  - type: tool_call
+    id: invoke_pay
+    tool: skill.shopping.invoke_native_pay
+    args:
+      provider: "passkey"
+      amount: "{{find.final_price}}"
+      merchant: "{{input.site}}"
+      return_to: "moa://shopping/coupon_complete"
+  - type: memory_store
+    id: record
+    content: "쿠폰 적용 결제: -{{find.total_discount}}원"
+    timeline_event_type: "workflow"
+limits:
+  max_tokens_per_run: 15000
+  max_llm_calls_per_run: 2
+  max_runtime_sec: 1200

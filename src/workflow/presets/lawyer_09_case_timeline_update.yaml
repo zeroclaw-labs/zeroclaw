@@ -1,0 +1,41 @@
+name: "사건 타임라인 자동 업데이트"
+parent_category: "phone"
+description: "새 통화 종료 이벤트 → 해당 사건 타임라인에 자동 append"
+icon: "🔄"
+inputs:
+  - name: call_uuid
+    type: string
+    required: true
+  - name: caller_object_id
+    type: number
+    required: true
+steps:
+  - type: memory_recall
+    id: get_call_context
+    query: "{{input.call_uuid}}"
+    search_mode: rrf
+    top_k: 5
+  - type: llm
+    id: extract_events
+    model: claude-sonnet-4-6
+    system: "통화 전사본에서 사건 진행 이벤트 (약속/증거/결정사항) 추출."
+    user_template: "{{get_call_context.results}}"
+  - type: loop
+    id: append_events
+    over: "{{extract_events.events}}"
+    as: event
+    body:
+      - type: memory_store
+        id: timeline_entry
+        content: "{{event.description}}"
+        timeline_event_type: "call"
+        link_to_ontology: "case_{{input.caller_object_id}}"
+  - type: phone_action
+    id: link_to_case
+    action: link_call_to_case
+    args:
+      call_uuid: "{{input.call_uuid}}"
+      case_object_id: "{{input.caller_object_id}}"
+limits:
+  max_tokens_per_run: 15000
+  max_llm_calls_per_run: 2

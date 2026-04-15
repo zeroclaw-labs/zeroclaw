@@ -1,0 +1,45 @@
+name: "법정 녹음 통역"
+parent_category: "interpret"
+description: "외국인 의뢰인 동석 시 실시간 통역 + 전사본 저장"
+icon: "🎙️"
+inputs:
+  - name: source_lang
+    type: selection
+    options: ["ko", "en", "zh", "ja", "vi", "ru"]
+    required: true
+  - name: target_lang
+    type: selection
+    options: ["ko", "en", "zh", "ja", "vi", "ru"]
+    required: true
+  - name: hearing_id
+    type: string
+    required: true
+steps:
+  - type: tool_call
+    id: start_session
+    tool: voice_interpret
+    args:
+      mode: "bidirectional"
+      source: "{{input.source_lang}}"
+      target: "{{input.target_lang}}"
+      domain: "legal"
+  - type: user_confirm
+    id: end_session
+    message: "통역 세션 종료 시 확인"
+    timeout_sec: 14400
+  - type: llm
+    id: transcript_summary
+    model: claude-opus-4-6
+    system: "법정 통역 세션 전사본에서 핵심 진술/쟁점 추출."
+    user_template: "전사: {{start_session.transcript}}"
+  - type: file_write
+    id: save_transcript
+    path: "hearings/{{input.hearing_id}}_transcript.md"
+    content_from: "{{start_session.transcript}}"
+  - type: memory_store
+    id: record
+    content: "법정 통역 - {{input.hearing_id}} ({{input.source_lang}}→{{input.target_lang}})"
+    timeline_event_type: "call"
+limits:
+  max_tokens_per_run: 50000
+  max_llm_calls_per_run: 2

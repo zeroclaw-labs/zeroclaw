@@ -1,0 +1,56 @@
+name: "선물 추천 및 구매"
+parent_category: "shopping"
+description: "수신자 프로필/예산/계기 → 선물 후보 추천 → 선택 후 결제 (L1)"
+icon: "🎁"
+inputs:
+  - name: recipient_profile
+    type: string
+    required: true
+  - name: budget_krw
+    type: number
+    required: true
+  - name: occasion
+    type: string
+    required: false
+steps:
+  - type: tool_call
+    id: recommend
+    tool: skill.shopping.gift_recommender
+    args:
+      recipient_profile: "{{input.recipient_profile}}"
+      budget_krw: "{{input.budget_krw}}"
+      occasion: "{{input.occasion}}"
+  - type: user_confirm
+    id: pick_gift
+    message: "추천 선물 중 하나를 선택하세요: {{recommend.top_picks}}"
+    timeout_sec: 600
+  - type: tool_call
+    id: cart
+    tool: skill.shopping.add_to_cart
+    args:
+      site: "coupang"
+      product_url: "{{pick_gift.selected_url}}"
+      qty: 1
+  - type: tool_call
+    id: pay_method
+    tool: skill.shopping.fill_payment_method
+    args:
+      site: "coupang"
+      method: "passkey"
+  - type: tool_call
+    id: invoke_pay
+    tool: skill.shopping.invoke_native_pay
+    args:
+      provider: "passkey"
+      amount: "{{pick_gift.selected_price}}"
+      merchant: "coupang"
+      return_to: "moa://shopping/gift_complete"
+  - type: memory_store
+    id: record
+    content: "선물 구매: {{input.recipient_profile}} - {{pick_gift.selected_title}}"
+    timeline_event_type: "workflow"
+    link_to_ontology: "gift_history"
+limits:
+  max_tokens_per_run: 25000
+  max_llm_calls_per_run: 4
+  max_runtime_sec: 1800

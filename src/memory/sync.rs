@@ -111,6 +111,39 @@ pub enum DeltaOperation {
         to_object_id: i64,
         properties_json: Option<String>,
     },
+    // ── v3.0 Timeline / Phone sync operations ─────────────────────
+    /// Append-only timeline evidence entry (never updated/deleted).
+    TimelineAppend {
+        uuid: String,
+        memory_id: String,
+        event_type: String,
+        event_at: u64,
+        source_ref: String,
+        content: String,
+        content_sha256: String,
+        metadata_json: Option<String>,
+    },
+    /// Phone call metadata record.
+    PhoneCallRecord {
+        call_uuid: String,
+        direction: String,
+        caller_number_e164: Option<String>,
+        caller_object_id: Option<i64>,
+        started_at: u64,
+        ended_at: Option<u64>,
+        duration_ms: Option<u64>,
+        transcript: Option<String>,
+        summary: Option<String>,
+        risk_level: String,
+        memory_id: Option<String>,
+    },
+    /// Compiled truth updated for a memory entry (Dream Cycle output).
+    CompiledTruthUpdate {
+        memory_key: String,
+        compiled_truth: String,
+        truth_version: u32,
+    },
+
     /// Ontology action logged (read-only replication — actions are
     /// never replayed, only the log entry is synced).
     OntologyActionLog {
@@ -556,6 +589,119 @@ impl SyncEngine {
         self.journal.push(entry);
         if let Err(e) = self.save() {
             tracing::warn!("Failed to persist ontology action sync: {e}");
+        }
+    }
+
+    /// Record a timeline evidence append in the delta journal (v3.0).
+    /// Timeline entries are append-only — no update/delete ops.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_timeline_append(
+        &mut self,
+        uuid: &str,
+        memory_id: &str,
+        event_type: &str,
+        event_at: u64,
+        source_ref: &str,
+        content: &str,
+        content_sha256: &str,
+        metadata_json: Option<&str>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.version.increment(&self.device_id.0);
+        let entry = DeltaEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            device_id: self.device_id.0.clone(),
+            version: self.version.clone(),
+            operation: DeltaOperation::TimelineAppend {
+                uuid: uuid.to_string(),
+                memory_id: memory_id.to_string(),
+                event_type: event_type.to_string(),
+                event_at,
+                source_ref: source_ref.to_string(),
+                content: content.to_string(),
+                content_sha256: content_sha256.to_string(),
+                metadata_json: metadata_json.map(String::from),
+            },
+            timestamp: current_epoch_secs(),
+        };
+        self.journal.push(entry);
+        if let Err(e) = self.save() {
+            tracing::warn!("Failed to persist timeline sync: {e}");
+        }
+    }
+
+    /// Record a phone call metadata entry in the delta journal (v3.0).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_phone_call(
+        &mut self,
+        call_uuid: &str,
+        direction: &str,
+        caller_number_e164: Option<&str>,
+        caller_object_id: Option<i64>,
+        started_at: u64,
+        ended_at: Option<u64>,
+        duration_ms: Option<u64>,
+        transcript: Option<&str>,
+        summary: Option<&str>,
+        risk_level: &str,
+        memory_id: Option<&str>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.version.increment(&self.device_id.0);
+        let entry = DeltaEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            device_id: self.device_id.0.clone(),
+            version: self.version.clone(),
+            operation: DeltaOperation::PhoneCallRecord {
+                call_uuid: call_uuid.to_string(),
+                direction: direction.to_string(),
+                caller_number_e164: caller_number_e164.map(String::from),
+                caller_object_id,
+                started_at,
+                ended_at,
+                duration_ms,
+                transcript: transcript.map(String::from),
+                summary: summary.map(String::from),
+                risk_level: risk_level.to_string(),
+                memory_id: memory_id.map(String::from),
+            },
+            timestamp: current_epoch_secs(),
+        };
+        self.journal.push(entry);
+        if let Err(e) = self.save() {
+            tracing::warn!("Failed to persist phone call sync: {e}");
+        }
+    }
+
+    /// Record a compiled truth update in the delta journal (v3.0, Dream Cycle).
+    pub fn record_compiled_truth_update(
+        &mut self,
+        memory_key: &str,
+        compiled_truth: &str,
+        truth_version: u32,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.version.increment(&self.device_id.0);
+        let entry = DeltaEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            device_id: self.device_id.0.clone(),
+            version: self.version.clone(),
+            operation: DeltaOperation::CompiledTruthUpdate {
+                memory_key: memory_key.to_string(),
+                compiled_truth: compiled_truth.to_string(),
+                truth_version,
+            },
+            timestamp: current_epoch_secs(),
+        };
+        self.journal.push(entry);
+        if let Err(e) = self.save() {
+            tracing::warn!("Failed to persist compiled truth sync: {e}");
         }
     }
 

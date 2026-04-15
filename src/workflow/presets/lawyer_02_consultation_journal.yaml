@@ -1,0 +1,43 @@
+name: "상담일지 자동 작성"
+parent_category: "document"
+description: "의뢰인 이름 입력 → 최근 통화/메모 RRF 검색 → Opus 초안 → Gemini 리뷰 → 최종본 → .docx 저장"
+icon: "📝"
+inputs:
+  - name: client_name
+    type: string
+    required: true
+  - name: consultation_date
+    type: date
+    required: false
+steps:
+  - type: memory_recall
+    id: fetch_context
+    query: "{{input.client_name}} 상담 통화 기록"
+    search_mode: rrf
+    top_k: 20
+  - type: llm
+    id: draft
+    model: claude-opus-4-6
+    system: "법률 상담일지 작성 전문가. 사건/쟁점/조치/후속업무를 구조화."
+    user_template: "의뢰인: {{input.client_name}}\n참고자료: {{fetch_context.results}}"
+  - type: llm
+    id: review
+    model: gemini-3.1-pro
+    system: "법률 문서 교정 전문가. 사실 누락/과장을 점검."
+    user_template: "초안:\n{{draft.output}}"
+  - type: llm
+    id: finalize
+    model: claude-opus-4-6
+    system: "리뷰를 반영한 최종본."
+    user_template: "초안: {{draft.output}}\n리뷰: {{review.output}}"
+  - type: file_write
+    id: save_docx
+    path: "consultations/{{input.client_name}}_{{today}}.docx"
+    content_from: "{{finalize.output}}"
+  - type: memory_store
+    id: record
+    content: "상담일지 작성 완료 - {{input.client_name}}"
+    timeline_event_type: "doc"
+limits:
+  max_tokens_per_run: 60000
+  max_llm_calls_per_run: 3

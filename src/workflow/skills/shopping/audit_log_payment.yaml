@@ -1,0 +1,38 @@
+name: "skill.shopping.audit_log_payment"
+parent_category: "shopping"
+description: "HMAC-chained append-only audit log to audit.db. Required before and after any Layer C call."
+inputs:
+  - name: stage
+    type: string
+    required: true
+  - name: provider
+    type: string
+    required: false
+  - name: amount
+    type: number
+    required: false
+  - name: merchant
+    type: string
+    required: false
+  - name: workflow
+    type: string
+    required: false
+  - name: risk
+    type: string
+    required: false
+steps:
+  - type: tool_call
+    id: append_log
+    tool: shell
+    args:
+      command: "moa-bridge audit-append --stage '{{input.stage}}' --provider '{{input.provider}}' --amount '{{input.amount}}' --merchant '{{input.merchant}}' --workflow '{{input.workflow}}' --risk '{{input.risk}}'"
+      timeout_sec: 5
+  - type: memory_store
+    id: mirror_timeline
+    content: "Audit: {{input.stage}} / {{input.provider}} / {{input.amount}} @ {{input.merchant}}"
+    timeline_event_type: "workflow"
+    source_ref: "audit:{{input.stage}}:{{run_uuid}}"
+limits:
+  max_tokens_per_run: 200
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 10

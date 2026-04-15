@@ -1,0 +1,54 @@
+name: "skill.shopping.preload_ticket_page"
+parent_category: "shopping"
+description: "T-30min preparation: warm cookies, preload multiple tabs, snapshot button @Ref"
+inputs:
+  - name: site
+    type: string
+    required: true
+  - name: show_name
+    type: string
+    required: true
+  - name: target_url
+    type: string
+    required: true
+steps:
+  - type: tool_call
+    id: load_selectors
+    tool: file
+    args:
+      action: "read"
+      path: "resources/shopping/malls/{{input.site}}.selectors.json"
+  - type: tool_call
+    id: warm_session
+    tool: browser
+    args:
+      action: "goto"
+      url: "{{load_selectors.home_url}}"
+  - type: tool_call
+    id: verify_logged_in
+    tool: browser
+    args:
+      action: "wait_for_selector"
+      selector: "{{load_selectors.user_nav}}"
+      timeout_ms: 5000
+  - type: tool_call
+    id: preload_main_tab
+    tool: browser
+    args:
+      action: "goto"
+      url: "{{input.target_url}}"
+  - type: tool_call
+    id: snapshot_for_refs
+    tool: browser
+    args:
+      action: "snapshot"
+  - type: tool_call
+    id: preload_tab_2
+    tool: browser
+    args:
+      action: "new_tab"
+      url: "{{input.target_url}}"
+limits:
+  max_tokens_per_run: 500
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 90

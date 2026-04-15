@@ -1,0 +1,32 @@
+name: "skill.shopping.tos_for_site"
+parent_category: "shopping"
+description: "Check site TOS automation policy from cache (30d TTL) or re-check via compliance_check"
+inputs:
+  - name: site
+    type: string
+    required: true
+steps:
+  - type: memory_recall
+    id: cached
+    query: "TOS compliance {{input.site}}"
+    search_mode: rrf
+    top_k: 1
+  - type: conditional
+    id: cache_fresh
+    cond: "cached.is_fresh_30d"
+    then:
+      - type: memory_store
+        id: use_cache
+        content: "Using cached TOS for {{input.site}}"
+        timeline_event_type: "workflow"
+    else:
+      - type: tool_call
+        id: refresh
+        tool: skill.shopping.compliance_check
+        args:
+          site: "{{input.site}}"
+          tos_url: "{{cached.tos_url}}"
+limits:
+  max_tokens_per_run: 30000
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 60

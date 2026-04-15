@@ -1,0 +1,44 @@
+name: "계약서 리뷰"
+parent_category: "document"
+description: "PDF 업로드 → 조항별 리스크 체크리스트 → 수정 제안"
+icon: "📋"
+inputs:
+  - name: contract_text
+    type: string
+    required: true
+  - name: party_role
+    type: selection
+    options: ["매수인/임차인 입장", "매도인/임대인 입장", "중립"]
+    default: "중립"
+steps:
+  - type: llm
+    id: extract_clauses
+    model: claude-haiku-4-5-20251001
+    system: "계약서를 조항별로 분리 (JSON 배열)."
+    user_template: "{{input.contract_text}}"
+  - type: loop
+    id: review_clauses
+    over: "{{extract_clauses.output}}"
+    as: clause
+    body:
+      - type: llm
+        id: risk_check
+        model: claude-sonnet-4-6
+        system: "{{input.party_role}} 관점에서 리스크 평가 (상/중/하 + 사유)."
+        user_template: "조항: {{clause.text}}"
+  - type: llm
+    id: aggregate_risks
+    model: claude-opus-4-6
+    system: "전체 리스크 요약 + 우선 수정 제안 Top 5."
+    user_template: "조항별 리뷰: {{review_clauses.results}}"
+  - type: file_write
+    id: save_report
+    path: "reviews/contract_review_{{today}}.md"
+    content_from: "{{aggregate_risks.output}}"
+  - type: memory_store
+    id: archive
+    content: "계약서 리뷰 완료 - {{input.party_role}}"
+    timeline_event_type: "doc"
+limits:
+  max_tokens_per_run: 100000
+  max_llm_calls_per_run: 15

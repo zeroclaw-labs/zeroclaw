@@ -1,0 +1,48 @@
+name: "skill.shopping.outfit_from_weather"
+parent_category: "shopping"
+description: "Build outfit recommendation from weather + user style + owned items."
+inputs:
+  - name: occasion
+    type: string
+    default: "일상"
+  - name: budget_krw
+    type: number
+    default: 200000
+  - name: lat
+    type: number
+    required: true
+  - name: lon
+    type: number
+    required: true
+steps:
+  - type: tool_call
+    id: weather
+    tool: web_fetch
+    args:
+      url: "https://api.openweathermap.org/data/3.0/onecall?lat={{input.lat}}&lon={{input.lon}}&appid={{vault.openweather_key}}&units=metric&lang=kr"
+  - type: memory_recall
+    id: style_profile
+    query: "사용자 의류 스타일 선호 체형 사이즈"
+    search_mode: rrf
+    top_k: 10
+  - type: memory_recall
+    id: owned_items
+    query: "보유 의류 목록"
+    search_mode: rrf
+    top_k: 30
+  - type: llm
+    id: outfit
+    model: claude-opus-4-6
+    system: "패션 스타일리스트. 날씨/상황/스타일/보유 아이템 고려해 '추천 코디 1세트 + 구매 필요 1-2 아이템' JSON 제시."
+    user_template: "날씨: {{weather.summary}}\n상황: {{input.occasion}}\n스타일: {{style_profile.results}}\n보유: {{owned_items.results}}\n예산: {{input.budget_krw}}"
+  - type: tool_call
+    id: lookbook
+    tool: media_gen
+    args:
+      kind: "image"
+      prompt: "{{outfit.image_prompt}}, fashion lookbook, 2K"
+      resolution: "2k"
+limits:
+  max_tokens_per_run: 30000
+  max_llm_calls_per_run: 2
+  max_runtime_sec: 120

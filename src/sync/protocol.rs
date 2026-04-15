@@ -304,6 +304,16 @@ pub fn merge_deltas_lww(
                 ..
             } => format!("onto_link_{link_type_name}_{from_object_id}_{to_object_id}"),
             crate::memory::sync::DeltaOperation::OntologyActionLog { .. } => delta.id.clone(),
+            // v3.0 timeline/phone/truth deltas use their uuid as dedup key
+            crate::memory::sync::DeltaOperation::TimelineAppend { uuid, .. } => {
+                format!("timeline_{uuid}")
+            }
+            crate::memory::sync::DeltaOperation::PhoneCallRecord { call_uuid, .. } => {
+                format!("phone_{call_uuid}")
+            }
+            crate::memory::sync::DeltaOperation::CompiledTruthUpdate { memory_key, .. } => {
+                format!("truth_{memory_key}")
+            }
         };
 
         match winners.get(&key) {

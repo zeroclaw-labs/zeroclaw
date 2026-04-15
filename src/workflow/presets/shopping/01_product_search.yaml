@@ -1,0 +1,54 @@
+name: "상품 검색 및 가격비교"
+parent_category: "shopping"
+description: "여러 쇼핑몰에서 동시 검색 후 최저가/최고평점/빠른배송 기준 비교 (L0 — 결제 없음)"
+icon: "🔍"
+inputs:
+  - name: product_query
+    type: string
+    required: true
+  - name: max_price_krw
+    type: number
+    required: false
+  - name: preferred_malls
+    type: selection
+    options: ["auto", "naver", "coupang", "musinsa", "danawa"]
+    default: "auto"
+steps:
+  - type: llm
+    id: intent_parse
+    model: claude-haiku-4-5-20251001
+    system: "쇼핑 의도 분석: 카테고리/브랜드/사이즈/색상 등 속성 추출 (JSON)"
+    user_template: "{{input.product_query}}"
+  - type: conditional
+    id: route_fashion
+    cond: "intent_parse.category == 'fashion'"
+    then:
+      - type: tool_call
+        id: search_musinsa
+        tool: skill.shopping.search_browser
+        args:
+          site: "musinsa"
+          query: "{{input.product_query}}"
+          limit: 20
+    else:
+      - type: tool_call
+        id: search_coupang
+        tool: skill.shopping.search_browser
+        args:
+          site: "coupang"
+          query: "{{input.product_query}}"
+          limit: 30
+  - type: llm
+    id: rank
+    model: claude-sonnet-4-6
+    system: "가격/평점/배송을 종합해 상위 5개 선정. 가짜후기 휴리스틱 적용."
+    user_template: "검색결과: {{route_fashion.results}}\n한도: {{input.max_price_krw}}"
+  - type: memory_store
+    id: save_snapshot
+    content: "{{input.product_query}} 검색 결과 스냅샷"
+    timeline_event_type: "manual"
+    source_ref: "shopping_search:{{run_uuid}}"
+limits:
+  max_tokens_per_run: 20000
+  max_llm_calls_per_run: 5
+  max_runtime_sec: 60

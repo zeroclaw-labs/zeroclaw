@@ -131,6 +131,71 @@ pub fn hybrid_merge(
     results
 }
 
+/// Reciprocal Rank Fusion: combine vector and keyword results using rank-based scoring.
+///
+/// RRF is score-scale agnostic — it only uses the *rank position* from each ranker,
+/// making it fair when mixing BM25 (unbounded) with cosine similarity (0–1).
+///
+/// Formula: `rrf_score(doc) = Σ 1 / (k + rank_i)` where `k` is a constant (default 60).
+///
+/// Both input lists must be pre-sorted by their respective scores (descending).
+/// Deduplicates by id across sources.
+pub fn rrf_merge(
+    vector_results: &[(String, f32)],  // (id, cosine_similarity) — sorted desc
+    keyword_results: &[(String, f32)], // (id, bm25_score) — sorted desc
+    rrf_k: f32,
+    limit: usize,
+) -> Vec<ScoredResult> {
+    use std::collections::HashMap;
+
+    let mut map: HashMap<String, ScoredResult> = HashMap::new();
+
+    // Accumulate RRF contributions from vector ranker
+    for (rank_0, (id, score)) in vector_results.iter().enumerate() {
+        let rank = rank_0 + 1; // 1-based
+        let contribution = 1.0 / (rrf_k + rank as f32);
+        map.entry(id.clone())
+            .and_modify(|r| {
+                r.final_score += contribution;
+                r.vector_score = Some(*score);
+            })
+            .or_insert_with(|| ScoredResult {
+                id: id.clone(),
+                vector_score: Some(*score),
+                keyword_score: None,
+                final_score: contribution,
+            });
+    }
+
+    // Accumulate RRF contributions from keyword ranker
+    for (rank_0, (id, score)) in keyword_results.iter().enumerate() {
+        let rank = rank_0 + 1;
+        let contribution = 1.0 / (rrf_k + rank as f32);
+        map.entry(id.clone())
+            .and_modify(|r| {
+                r.final_score += contribution;
+                if r.keyword_score.is_none() {
+                    r.keyword_score = Some(*score);
+                }
+            })
+            .or_insert_with(|| ScoredResult {
+                id: id.clone(),
+                vector_score: None,
+                keyword_score: Some(*score),
+                final_score: contribution,
+            });
+    }
+
+    let mut results: Vec<ScoredResult> = map.into_values().collect();
+    results.sort_by(|a, b| {
+        b.final_score
+            .partial_cmp(&a.final_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.truncate(limit);
+    results
+}
+
 #[cfg(test)]
 #[allow(
     clippy::float_cmp,
@@ -398,5 +463,110 @@ mod tests {
         let merged = hybrid_merge(&[("only".into(), 0.8)], &[], 0.7, 0.3, 10);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].id, "only");
+    }
+
+    // ── RRF merge tests ─────────────────────────────────────────
+
+    #[test]
+    fn rrf_formula_reference() {
+        // rank 1 contribution with k=60: 1/(60+1) ≈ 0.01639
+        let v1 = 1.0_f32 / (60.0 + 1.0);
+        let v2 = 1.0_f32 / (60.0 + 2.0);
+        assert!(v1 > v2);
+        assert!((v1 - 0.01639).abs() < 1e-4);
+    }
+
+    #[test]
+    fn rrf_merge_vector_only() {
+        let vec_results = vec![("a".into(), 0.9), ("b".into(), 0.5)];
+        let merged = rrf_merge(&vec_results, &[], 60.0, 10);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, "a");
+        // rank 1 → 1/61, rank 2 → 1/62
+        assert!(merged[0].final_score > merged[1].final_score);
+    }
+
+    #[test]
+    fn rrf_merge_keyword_only() {
+        let kw_results = vec![("x".into(), 10.0), ("y".into(), 5.0)];
+        let merged = rrf_merge(&[], &kw_results, 60.0, 10);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, "x");
+    }
+
+    #[test]
+    fn rrf_merge_deduplicates_boosts() {
+        // doc "a" appears rank 1 in both rankers → gets 2 * 1/(k+1)
+        let vec_results = vec![("a".into(), 0.9), ("b".into(), 0.5)];
+        let kw_results = vec![("a".into(), 10.0), ("c".into(), 5.0)];
+        let merged = rrf_merge(&vec_results, &kw_results, 60.0, 10);
+
+        // "a" should be top (appears in both rankers at rank 1)
+        assert_eq!(merged[0].id, "a");
+        let expected_a = 1.0 / 61.0 + 1.0 / 61.0; // rank 1 in both
+        assert!((merged[0].final_score - expected_a).abs() < 1e-6);
+        assert!(merged[0].vector_score.is_some());
+        assert!(merged[0].keyword_score.is_some());
+
+        // total docs = a, b, c → 3
+        assert_eq!(merged.len(), 3);
+    }
+
+    #[test]
+    fn rrf_merge_respects_limit() {
+        let vec_results: Vec<(String, f32)> = (0..20)
+            .map(|i| (format!("item_{i}"), 1.0 - i as f32 * 0.05))
+            .collect();
+        let merged = rrf_merge(&vec_results, &[], 60.0, 5);
+        assert_eq!(merged.len(), 5);
+        assert_eq!(merged[0].id, "item_0");
+    }
+
+    #[test]
+    fn rrf_merge_empty_inputs() {
+        let merged = rrf_merge(&[], &[], 60.0, 10);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn rrf_merge_limit_zero() {
+        let vec_results = vec![("a".into(), 0.9)];
+        let merged = rrf_merge(&vec_results, &[], 60.0, 0);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn rrf_merge_score_scale_agnostic() {
+        // BM25 score 1000 vs cosine 0.9 — RRF only uses rank, so both rank 1 → same contribution
+        let vec_results = vec![("a".into(), 0.9)];
+        let kw_results = vec![("b".into(), 1000.0)];
+        let merged = rrf_merge(&vec_results, &kw_results, 60.0, 10);
+        // Both are rank 1 in their respective ranker → same RRF score
+        assert!((merged[0].final_score - merged[1].final_score).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rrf_merge_different_k_values() {
+        let vec_results = vec![("a".into(), 0.9), ("b".into(), 0.5)];
+
+        let merged_k1 = rrf_merge(&vec_results, &[], 1.0, 10);
+        let merged_k60 = rrf_merge(&vec_results, &[], 60.0, 10);
+
+        // With k=1: rank1 → 1/2=0.5, rank2 → 1/3=0.333 → gap = 0.167
+        // With k=60: rank1 → 1/61≈0.0164, rank2 → 1/62≈0.0161 → gap = 0.0003
+        // Smaller k means top ranks get disproportionately more weight
+        let gap_k1 = merged_k1[0].final_score - merged_k1[1].final_score;
+        let gap_k60 = merged_k60[0].final_score - merged_k60[1].final_score;
+        assert!(gap_k1 > gap_k60);
+    }
+
+    #[test]
+    fn rrf_merge_preserves_raw_scores() {
+        let vec_results = vec![("a".into(), 0.85)];
+        let kw_results = vec![("a".into(), 42.0)];
+        let merged = rrf_merge(&vec_results, &kw_results, 60.0, 10);
+        assert_eq!(merged.len(), 1);
+        assert!((merged[0].vector_score.unwrap() - 0.85).abs() < 1e-6);
+        assert!((merged[0].keyword_score.unwrap() - 42.0).abs() < 1e-6);
     }
 }

@@ -1,0 +1,32 @@
+name: "skill.shopping.search_naver_api"
+parent_category: "shopping"
+description: "Naver Shopping Search API via web_fetch (fast metadata: price/ship/review count)"
+inputs:
+  - name: query
+    type: string
+    required: true
+  - name: sort
+    type: selection
+    options: ["sim", "date", "asc", "dsc"]
+    default: "sim"
+  - name: display
+    type: number
+    default: 30
+steps:
+  - type: tool_call
+    id: call_api
+    tool: web_fetch
+    args:
+      url: "https://openapi.naver.com/v1/search/shop.json?query={{input.query}}&sort={{input.sort}}&display={{input.display}}"
+      headers:
+        X-Naver-Client-Id: "{{vault.naver_client_id}}"
+        X-Naver-Client-Secret: "{{vault.naver_client_secret}}"
+  - type: memory_store
+    id: cache
+    content: "Naver API search: {{input.query}}"
+    timeline_event_type: "manual"
+    source_ref: "naver_api:{{input.query}}"
+limits:
+  max_tokens_per_run: 500
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 15

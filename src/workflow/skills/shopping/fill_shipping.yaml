@@ -1,0 +1,56 @@
+name: "skill.shopping.fill_shipping"
+parent_category: "shopping"
+description: "Autofill shipping address from credential vault."
+inputs:
+  - name: site
+    type: string
+    required: true
+  - name: address_id
+    type: string
+    required: true
+steps:
+  - type: tool_call
+    id: load_selectors
+    tool: file
+    args:
+      action: "read"
+      path: "resources/shopping/malls/{{input.site}}.selectors.json"
+  - type: tool_call
+    id: fetch_address
+    tool: memory
+    args:
+      action: "credential_read"
+      scope: "shopping.addresses"
+      ref: "{{input.address_id}}"
+  - type: tool_call
+    id: fill_name
+    tool: browser
+    args:
+      action: "form_input"
+      selector: "{{load_selectors.ship_name}}"
+      value: "{{fetch_address.name}}"
+  - type: tool_call
+    id: fill_phone
+    tool: browser
+    args:
+      action: "form_input"
+      selector: "{{load_selectors.ship_phone}}"
+      value: "{{fetch_address.phone}}"
+  - type: tool_call
+    id: fill_address
+    tool: browser
+    args:
+      action: "form_input"
+      selector: "{{load_selectors.ship_address}}"
+      value: "{{fetch_address.address_line}}"
+  - type: tool_call
+    id: fill_zip
+    tool: browser
+    args:
+      action: "form_input"
+      selector: "{{load_selectors.ship_zip}}"
+      value: "{{fetch_address.zip}}"
+limits:
+  max_tokens_per_run: 300
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 15

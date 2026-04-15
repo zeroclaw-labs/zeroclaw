@@ -1,0 +1,51 @@
+name: "skill.shopping.search_browser"
+parent_category: "shopping"
+description: "General mall search via ZeroClaw browser daemon (Playwright + @Ref)"
+inputs:
+  - name: site
+    type: string
+    required: true
+  - name: query
+    type: string
+    required: true
+  - name: limit
+    type: number
+    required: false
+    default: 20
+  - name: filters
+    type: string
+    required: false
+steps:
+  - type: tool_call
+    id: load_selectors
+    tool: file
+    args:
+      action: "read"
+      path: "resources/shopping/malls/{{input.site}}.selectors.json"
+  - type: tool_call
+    id: goto
+    tool: browser
+    args:
+      action: "goto"
+      url: "{{load_selectors.search_url}}?q={{input.query}}"
+  - type: tool_call
+    id: snapshot
+    tool: browser
+    args:
+      action: "snapshot"
+  - type: tool_call
+    id: extract
+    tool: browser
+    args:
+      action: "extract"
+      selector: "{{load_selectors.result_list}}"
+      limit: "{{input.limit}}"
+  - type: memory_store
+    id: cache_search
+    content: "{{input.site}} search: {{input.query}} ({{extract.count}} results)"
+    timeline_event_type: "manual"
+    source_ref: "search:{{input.site}}:{{input.query}}"
+limits:
+  max_tokens_per_run: 3000
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 30

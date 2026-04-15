@@ -1,0 +1,63 @@
+name: "일회성 상품 구매"
+parent_category: "shopping"
+description: "단발 요청 → 검색 → 사용자 확인 → 결제 (L1)"
+icon: "🛍️"
+inputs:
+  - name: request
+    type: string
+    required: true
+  - name: max_price_krw
+    type: number
+    required: true
+steps:
+  - type: llm
+    id: parse
+    model: claude-haiku-4-5-20251001
+    system: "상품명/브랜드/핵심 속성/선호몰 추출 (JSON)"
+    user_template: "{{input.request}}"
+  - type: tool_call
+    id: search
+    tool: skill.shopping.search_browser
+    args:
+      site: "coupang"
+      query: "{{parse.product_name}}"
+      limit: 30
+  - type: llm
+    id: select
+    model: claude-sonnet-4-6
+    system: "가격/평점/신뢰도/반품정책 기준 최적 1건 선정. 가짜후기 배제."
+    user_template: "결과: {{search.results}}\n한도: {{input.max_price_krw}}"
+  - type: user_confirm
+    id: consent_l1
+    message: "선택: {{select.title}} / {{select.price}}원. 구매하기를 선택하면 결제창이 열립니다 (생체인증 본인)."
+    timeout_sec: 600
+  - type: tool_call
+    id: cart
+    tool: skill.shopping.add_to_cart
+    args:
+      site: "{{select.mall}}"
+      product_url: "{{select.url}}"
+      qty: 1
+  - type: tool_call
+    id: pay_method
+    tool: skill.shopping.fill_payment_method
+    args:
+      site: "{{select.mall}}"
+      method: "passkey"
+  - type: tool_call
+    id: invoke_pay
+    tool: skill.shopping.invoke_native_pay
+    args:
+      provider: "passkey"
+      amount: "{{select.price}}"
+      merchant: "{{select.mall}}"
+      return_to: "moa://shopping/complete"
+  - type: memory_store
+    id: record
+    content: "{{select.title}} 구매 - {{select.price}}원"
+    timeline_event_type: "workflow"
+    link_to_ontology: "purchase_history"
+limits:
+  max_tokens_per_run: 15000
+  max_llm_calls_per_run: 3
+  max_runtime_sec: 1800

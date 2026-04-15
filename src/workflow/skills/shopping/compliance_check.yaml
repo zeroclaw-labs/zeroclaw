@@ -1,0 +1,30 @@
+name: "skill.shopping.compliance_check"
+parent_category: "shopping"
+description: "Fetch site TOS page + LLM detects automation-prohibition clauses. Cache to memory."
+inputs:
+  - name: site
+    type: string
+    required: true
+  - name: tos_url
+    type: string
+    required: true
+steps:
+  - type: tool_call
+    id: fetch_tos
+    tool: web_fetch
+    args:
+      url: "{{input.tos_url}}"
+  - type: llm
+    id: analyze
+    model: claude-haiku-4-5-20251001
+    system: "사이트 약관에서 '자동화 매크로 금지' / 'automation prohibited' 조항을 찾으세요. JSON 반환: {allows_automation: bool, reason: string, excerpt: string}"
+    user_template: "약관 텍스트: {{fetch_tos.body}}"
+  - type: memory_store
+    id: cache_result
+    content: "TOS compliance: {{input.site}} allows_automation={{analyze.allows_automation}}"
+    timeline_event_type: "doc"
+    source_ref: "tos:{{input.site}}"
+limits:
+  max_tokens_per_run: 30000
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 60

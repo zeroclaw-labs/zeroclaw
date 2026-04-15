@@ -1,0 +1,115 @@
+name: "콘서트 티켓 오픈런 (Assisted)"
+parent_category: "shopping"
+description: "L3 고위험 — 준비작업 자동화, 최종 클릭은 사용자 (약관 통과 시 1-click 옵션)"
+icon: "🎫"
+inputs:
+  - name: show_name
+    type: string
+    required: true
+  - name: site
+    type: selection
+    options: ["interpark","yes24","melonticket","ticketlink"]
+    required: true
+  - name: target_url
+    type: string
+    required: true
+  - name: open_at
+    type: string
+    required: true
+  - name: seat_preference
+    type: string
+    default: "1층 앞, 통로 우선"
+  - name: max_price_krw
+    type: number
+    required: true
+  - name: quantity
+    type: number
+    default: 1
+  - name: assist_mode
+    type: selection
+    options: ["assisted","one_click_if_allowed"]
+    default: "assisted"
+steps:
+  - type: user_confirm
+    id: consent_l3
+    message: |
+      ★★★ 오픈런 예매 설정 확인 (L3 고위험)
+      공연: {{input.show_name}} / 사이트: {{input.site}}
+      오픈: {{input.open_at}} / 좌석선호: {{input.seat_preference}}
+      한도: {{input.max_price_krw}}원 × {{input.quantity}}매
+      모드: {{input.assist_mode}}
+
+      ⚠️ 법적 고지:
+      - 자동화 매크로 금지 약관이 있는 사이트에서는 Assisted 강제
+      - 최종 클릭/좌석 선택/결제는 본인
+
+      음성으로 '동의'라고 말씀해주세요.
+    timeout_sec: 120
+  - type: tool_call
+    id: check_tos
+    tool: skill.shopping.tos_for_site
+    args:
+      site: "{{input.site}}"
+  - type: tool_call
+    id: preload
+    tool: skill.shopping.preload_ticket_page
+    args:
+      site: "{{input.site}}"
+      show_name: "{{input.show_name}}"
+      target_url: "{{input.target_url}}"
+  - type: user_confirm
+    id: manual_click
+    message: "예매 버튼이 활성화되었습니다. 직접 클릭하세요."
+    timeout_sec: 180
+  - type: tool_call
+    id: seat_highlight
+    tool: skill.shopping.seat_assist
+    args:
+      preference: "{{input.seat_preference}}"
+      live_highlight: true
+  - type: user_confirm
+    id: seat_confirm
+    message: "좌석을 선택하고 다음으로 진행하세요."
+    timeout_sec: 300
+  - type: tool_call
+    id: shipping
+    tool: skill.shopping.fill_shipping
+    args:
+      site: "{{input.site}}"
+      address_id: "default"
+  - type: tool_call
+    id: pay_method
+    tool: skill.shopping.fill_payment_method
+    args:
+      site: "{{input.site}}"
+      method: "passkey"
+  - type: tool_call
+    id: invoke_pay
+    tool: skill.shopping.invoke_native_pay
+    args:
+      provider: "passkey"
+      amount: "{{input.max_price_krw}}"
+      merchant: "{{input.site}}"
+      return_to: "moa://ticket/complete"
+  - type: tool_call
+    id: parse_confirm
+    tool: skill.shopping.parse_receipt
+    args:
+      source: "email"
+      filter_subject: "{{input.show_name}}"
+  - type: memory_store
+    id: record
+    content: "티켓 예매 - {{input.show_name}} / {{parse_confirm.status}}"
+    timeline_event_type: "workflow"
+    source_ref: "ticket_openrun:{{run_uuid}}"
+  - type: tool_call
+    id: audit
+    tool: skill.shopping.audit_log_payment
+    args:
+      stage: "ticket_complete"
+      workflow: "ticket_openrun"
+      risk: "high"
+limits:
+  max_tokens_per_run: 15000
+  max_llm_calls_per_run: 3
+  max_runtime_sec: 2400

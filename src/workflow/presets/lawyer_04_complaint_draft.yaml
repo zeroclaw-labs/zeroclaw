@@ -1,0 +1,57 @@
+name: "소장/답변서 초안"
+parent_category: "document"
+description: "사건 기본정보 → 관련 판례 검색 → 6단계 mixture-of-agents 초안"
+icon: "📄"
+inputs:
+  - name: case_summary
+    type: string
+    required: true
+  - name: doc_type
+    type: selection
+    options: ["소장", "답변서", "준비서면"]
+    required: true
+  - name: party_info
+    type: string
+    required: true
+steps:
+  - type: memory_recall
+    id: find_precedents
+    query: "{{input.case_summary}} 판례"
+    search_mode: rrf
+    top_k: 10
+  - type: llm
+    id: structure_facts
+    model: claude-opus-4-6
+    system: "사실관계를 시간순으로 정리."
+    user_template: "{{input.case_summary}}"
+  - type: llm
+    id: legal_argument
+    model: claude-opus-4-6
+    system: "적용 법리와 논증 구조 작성."
+    user_template: "사실: {{structure_facts.output}}\n판례: {{find_precedents.results}}"
+  - type: llm
+    id: relief_sought
+    model: claude-sonnet-4-6
+    system: "청구취지/신청취지 작성."
+    user_template: "사건: {{input.case_summary}}\n유형: {{input.doc_type}}"
+  - type: llm
+    id: compose_draft
+    model: claude-opus-4-6
+    system: "{{input.doc_type}} 형식으로 통합 작성."
+    user_template: "당사자: {{input.party_info}}\n사실: {{structure_facts.output}}\n법리: {{legal_argument.output}}\n청구: {{relief_sought.output}}"
+  - type: llm
+    id: review
+    model: gemini-3.1-pro
+    system: "법률문서 교차 검증."
+    user_template: "{{compose_draft.output}}"
+  - type: file_write
+    id: save
+    path: "drafts/{{input.doc_type}}_{{today}}.docx"
+    content_from: "{{compose_draft.output}}"
+  - type: user_confirm
+    id: lawyer_review
+    message: "초안 검토 후 승인"
+    timeout_sec: 86400
+limits:
+  max_tokens_per_run: 150000
+  max_llm_calls_per_run: 7

@@ -1,0 +1,36 @@
+name: "반품/환불 요청"
+parent_category: "shopping"
+description: "주문 번호 입력 → 반품 사유 → 사용자 최종 확인 후 제출 (L1)"
+icon: "↩️"
+inputs:
+  - name: site
+    type: string
+    required: true
+  - name: order_id
+    type: string
+    required: true
+  - name: reason_code
+    type: selection
+    options: ["defect", "size_mismatch", "color_mismatch", "change_of_mind", "other"]
+    required: true
+  - name: reason_detail
+    type: string
+    required: false
+steps:
+  - type: tool_call
+    id: request
+    tool: skill.shopping.return_request
+    args:
+      site: "{{input.site}}"
+      order_id: "{{input.order_id}}"
+      reason_code: "{{input.reason_code}}"
+      reason_detail: "{{input.reason_detail}}"
+  - type: memory_store
+    id: record
+    content: "반품 요청 완료 - {{input.site}}/{{input.order_id}}"
+    timeline_event_type: "workflow"
+    link_to_ontology: "return_history"
+limits:
+  max_tokens_per_run: 3000
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 600

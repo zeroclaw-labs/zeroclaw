@@ -137,6 +137,22 @@ impl SyncedMemory {
                     // actions on remote devices, just acknowledge them.
                     tracing::debug!("Received remote ontology action log (read-only)");
                 }
+                // ── v3.0 Timeline / Phone / Truth deltas ──────────────
+                DeltaOperation::TimelineAppend { uuid, .. } => {
+                    // Timeline entries are append-only; the receiving device
+                    // inserts them directly into its local memory_timeline table.
+                    // Actual DB insertion is handled by the caller after sync.
+                    tracing::debug!(uuid, "Received remote timeline append (pending local insert)");
+                    applied += 1;
+                }
+                DeltaOperation::PhoneCallRecord { call_uuid, .. } => {
+                    tracing::debug!(call_uuid, "Received remote phone call record (pending local insert)");
+                    applied += 1;
+                }
+                DeltaOperation::CompiledTruthUpdate { memory_key, .. } => {
+                    tracing::debug!(memory_key, "Received remote compiled truth update (pending local apply)");
+                    applied += 1;
+                }
             }
         }
 

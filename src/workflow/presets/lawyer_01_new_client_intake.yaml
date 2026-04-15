@@ -1,0 +1,39 @@
+name: "신규 의뢰인 접수 인터뷰"
+parent_category: "phone"
+description: "전화 수신 후 이름/연락처/사건유형 청취 → 온톨로지 Object 생성 → 사건 일정 템플릿 생성"
+icon: "📞"
+inputs:
+  - name: caller_number
+    type: string
+    required: true
+  - name: case_type
+    type: string
+    required: false
+steps:
+  - type: memory_recall
+    id: check_existing
+    query: "{{input.caller_number}} 의뢰인"
+    search_mode: rrf
+    top_k: 5
+  - type: llm
+    id: classify_case
+    model: claude-haiku-4-5-20251001
+    system: "통화 내용에서 사건 유형을 분류하세요 (민사/형사/가사/행정/기타)."
+    user_template: "발신번호: {{input.caller_number}}"
+  - type: phone_action
+    id: create_caller_object
+    action: create_caller_ontology
+    args:
+      phone_number: "{{input.caller_number}}"
+  - type: memory_store
+    id: save_intake
+    content: "신규 의뢰인 접수 완료 - {{input.caller_number}}"
+    timeline_event_type: "call"
+  - type: calendar_add
+    id: schedule_followup
+    title: "신규 의뢰인 후속 상담"
+    date: "+3d"
+    duration_min: 30
+limits:
+  max_tokens_per_run: 8000
+  max_llm_calls_per_run: 2

@@ -1,0 +1,32 @@
+name: "skill.shopping.apply_coupons"
+parent_category: "shopping"
+description: "Apply chosen coupons at checkout page."
+inputs:
+  - name: site
+    type: string
+    required: true
+  - name: coupon_ids
+    type: string
+    required: true
+steps:
+  - type: tool_call
+    id: load_selectors
+    tool: file
+    args:
+      action: "read"
+      path: "resources/shopping/malls/{{input.site}}.selectors.json"
+  - type: loop
+    id: apply_each
+    over: "{{input.coupon_ids}}"
+    as: coupon_id
+    body:
+      - type: tool_call
+        id: select_coupon
+        tool: browser
+        args:
+          action: "click"
+          selector: "{{load_selectors.coupon_item_prefix}}{{coupon_id}}"
+limits:
+  max_tokens_per_run: 300
+  max_llm_calls_per_run: 1
+  max_runtime_sec: 20
