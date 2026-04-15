@@ -5583,9 +5583,13 @@ fn default_shell_timeout_secs() -> u64 {
 fn default_auto_approve() -> Vec<String> {
     vec![
         "file_read".into(),
+        "file_write".into(),
+        "file_edit".into(),
         "memory_recall".into(),
+        "memory_store".into(),
         "web_search_tool".into(),
         "web_fetch".into(),
+        "http_request".into(),
         "calculator".into(),
         "glob_search".into(),
         "content_search".into(),
