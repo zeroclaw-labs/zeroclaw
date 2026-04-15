@@ -299,7 +299,10 @@ impl OpenAiCompatibleProvider {
     /// Collect all `system` role messages, concatenate their content,
     /// and prepend to the first `user` message. Drop all system messages.
     /// Used for providers (e.g. MiniMax) that reject `role: system`.
-    fn flatten_system_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    fn flatten_system_messages(messages: &[ChatMessage], merge: bool) -> Vec<ChatMessage> {
+        if !merge {
+            return messages.to_vec();
+        }
         let system_content: String = messages
             .iter()
             .filter(|m| m.role == "system")
@@ -1764,11 +1767,7 @@ impl Provider for OpenAiCompatibleProvider {
             fallback_messages.push(ChatMessage::system(system_prompt));
         }
         fallback_messages.push(ChatMessage::user(message));
-        let fallback_messages = if merge {
-            Self::flatten_system_messages(&fallback_messages)
-        } else {
-            fallback_messages
-        };
+        let fallback_messages = Self::flatten_system_messages(&fallback_messages, merge);
 
         let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
@@ -1846,11 +1845,7 @@ impl Provider for OpenAiCompatibleProvider {
         let credential = self.credential.as_deref();
 
         let merge = self.effective_merge_system(model);
-        let effective_messages = if merge {
-            Self::flatten_system_messages(messages)
-        } else {
-            messages.to_vec()
-        };
+        let effective_messages = Self::flatten_system_messages(messages, merge);
         // Strip native tool constructs for non-native-tool providers (#5743).
         let effective_messages = self.strip_native_tool_messages(&effective_messages);
         let api_messages: Vec<Message> = effective_messages
@@ -1950,11 +1945,7 @@ impl Provider for OpenAiCompatibleProvider {
         let credential = self.credential.as_deref();
 
         let merge = self.effective_merge_system(model);
-        let effective_messages = if merge {
-            Self::flatten_system_messages(messages)
-        } else {
-            messages.to_vec()
-        };
+        let effective_messages = Self::flatten_system_messages(messages, merge);
         let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
@@ -2059,11 +2050,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         let merge = self.effective_merge_system(model);
         let tools = Self::convert_tool_specs(request.tools);
-        let effective_messages = if merge {
-            Self::flatten_system_messages(request.messages)
-        } else {
-            request.messages.to_vec()
-        };
+        let effective_messages = Self::flatten_system_messages(request.messages, merge);
         let effective_messages = self.strip_native_tool_messages(&effective_messages);
         let native_request = NativeChatRequest {
             model: model.to_string(),
@@ -2197,11 +2184,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         let merge = self.effective_merge_system(model);
         let has_tools = request.tools.is_some_and(|tools| !tools.is_empty());
-        let effective_messages = if merge {
-            Self::flatten_system_messages(request.messages)
-        } else {
-            request.messages.to_vec()
-        };
+        let effective_messages = Self::flatten_system_messages(request.messages, merge);
         let effective_messages = self.strip_native_tool_messages(&effective_messages);
 
         let tools = Self::convert_tool_specs(request.tools);
@@ -2404,11 +2387,7 @@ impl Provider for OpenAiCompatibleProvider {
         let credential = self.credential.clone();
 
         let merge = self.effective_merge_system(model);
-        let effective_messages = if merge {
-            Self::flatten_system_messages(messages)
-        } else {
-            messages.to_vec()
-        };
+        let effective_messages = Self::flatten_system_messages(messages, merge);
         let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
@@ -3140,7 +3119,7 @@ mod tests {
             ChatMessage::assistant("post-user"),
         ];
 
-        let output = OpenAiCompatibleProvider::flatten_system_messages(&input);
+        let output = OpenAiCompatibleProvider::flatten_system_messages(&input, false);
         assert_eq!(output.len(), 3);
         assert_eq!(output[0].role, "assistant");
         assert_eq!(output[0].content, "ack");
@@ -3158,7 +3137,7 @@ mod tests {
             ChatMessage::assistant("ack"),
         ];
 
-        let output = OpenAiCompatibleProvider::flatten_system_messages(&input);
+        let output = OpenAiCompatibleProvider::flatten_system_messages(&input, false);
         assert_eq!(output.len(), 2);
         assert_eq!(output[0].role, "user");
         assert_eq!(output[0].content, "core policy");
@@ -3710,7 +3689,7 @@ mod tests {
             ChatMessage::tool(r#"{"ok":true}"#),
         ];
 
-        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages);
+        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages, false);
         assert_eq!(flattened.len(), 3);
         assert_eq!(flattened[0].role, "assistant");
         assert_eq!(
@@ -3729,7 +3708,7 @@ mod tests {
             ChatMessage::system("Synthetic system"),
         ];
 
-        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages);
+        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages, false);
         assert_eq!(flattened.len(), 2);
         assert_eq!(flattened[0].role, "user");
         assert_eq!(flattened[0].content, "Synthetic system");
