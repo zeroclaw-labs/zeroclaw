@@ -306,6 +306,9 @@ probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
 rag-pdf = ["zeroclaw-tools/rag-pdf"]
 webauthn = ["zeroclaw-runtime/webauthn"]
 
+# enable native-tls to allow for self-signed certificates
+native-tls = ["reqwest/native-tls"]
+
 # Backward-compatible aliases
 fantoccini = ["browser-native"]
 landlock = ["sandbox-landlock"]
