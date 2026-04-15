@@ -1104,6 +1104,7 @@ impl Agent {
 
             let mut streamed_text = String::new();
             let mut streamed_tool_calls: Vec<zeroclaw_providers::traits::ToolCall> = Vec::new();
+            let mut streamed_reasoning = String::new();
             let mut got_stream = false;
 
             while let Some(item) = stream.next().await {
@@ -1113,6 +1114,7 @@ impl Agent {
                             if let Some(reasoning) = chunk.reasoning
                                 && !reasoning.is_empty()
                             {
+                                streamed_reasoning.push_str(&reasoning);
                                 let _ = event_tx
                                     .send(TurnEvent::Thinking { delta: reasoning })
                                     .await;
@@ -1164,7 +1166,7 @@ impl Agent {
                     text: Some(streamed_text),
                     tool_calls: streamed_tool_calls,
                     usage: None,
-                    reasoning_content: None,
+                    reasoning_content: Some(streamed_reasoning).filter(|s| !s.is_empty()),
                 }
             } else {
                 // Fall back to non-streaming chat
@@ -1979,6 +1981,140 @@ mod tests {
         assert!(
             has_tool_result,
             "Should have emitted a ToolResult event for 'echo'"
+        );
+    }
+
+    // Regression for issue #5600: Kimi/GLM thinking models require
+    // reasoning_content on assistant tool_call messages in follow-up requests.
+    struct StreamReasoningProvider {
+        call_count: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl Provider for StreamReasoningProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            unreachable!("streaming path must be used in this test");
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::stream::{self, StreamExt};
+            let mut count = self.call_count.lock();
+            *count += 1;
+            if *count == 1 {
+                let reasoning_chunk = zeroclaw_providers::traits::StreamEvent::TextDelta(
+                    zeroclaw_providers::traits::StreamChunk {
+                        delta: String::new(),
+                        is_final: false,
+                        reasoning: Some("deliberating about the echo tool".into()),
+                        token_count: 0,
+                    },
+                );
+                let tc = zeroclaw_providers::traits::StreamEvent::ToolCall(
+                    zeroclaw_providers::ToolCall {
+                        id: "tc_r1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                    },
+                );
+                stream::iter(vec![
+                    Ok(reasoning_chunk),
+                    Ok(tc),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            } else {
+                let chunk = zeroclaw_providers::traits::StreamEvent::TextDelta(
+                    zeroclaw_providers::traits::StreamChunk {
+                        delta: "done".into(),
+                        is_final: false,
+                        reasoning: None,
+                        token_count: 0,
+                    },
+                );
+                stream::iter(vec![
+                    Ok(chunk),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_preserves_reasoning_on_assistant_tool_calls() {
+        let provider = Box::new(StreamReasoningProvider {
+            call_count: Arc::new(Mutex::new(0)),
+        });
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let response = agent
+            .turn_streamed("use the echo tool", event_tx)
+            .await
+            .unwrap();
+        assert_eq!(response, "done");
+
+        let preserved = agent
+            .history()
+            .iter()
+            .find_map(|msg| match msg {
+                ConversationMessage::AssistantToolCalls {
+                    reasoning_content, ..
+                } => Some(reasoning_content.clone()),
+                _ => None,
+            })
+            .expect("history should contain an AssistantToolCalls entry");
+        assert_eq!(
+            preserved.as_deref(),
+            Some("deliberating about the echo tool"),
+            "streamed reasoning_content must be preserved on the AssistantToolCalls entry"
         );
     }
 
