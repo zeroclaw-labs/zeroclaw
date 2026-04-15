@@ -1,4 +1,5 @@
 use crate::platform::RuntimeAdapter;
+use crate::security::OtpValidator;
 use crate::security::SecurityPolicy;
 use crate::security::traits::Sandbox;
 use async_trait::async_trait;
@@ -47,6 +48,7 @@ pub struct ShellTool {
     runtime: Arc<dyn RuntimeAdapter>,
     sandbox: Arc<dyn Sandbox>,
     timeout_secs: u64,
+    otp_validator: Option<Arc<OtpValidator>>,
 }
 
 impl ShellTool {
@@ -56,6 +58,7 @@ impl ShellTool {
             runtime,
             sandbox: Arc::new(crate::security::NoopSandbox),
             timeout_secs: DEFAULT_SHELL_TIMEOUT_SECS,
+            otp_validator: None,
         }
     }
 
@@ -69,12 +72,19 @@ impl ShellTool {
             runtime,
             sandbox,
             timeout_secs: DEFAULT_SHELL_TIMEOUT_SECS,
+            otp_validator: None,
         }
     }
 
     /// Override the command execution timeout (in seconds).
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
+        self
+    }
+
+    /// Attach an OTP validator used to enforce `gated_commands` patterns.
+    pub fn with_otp_validator(mut self, validator: Arc<OtpValidator>) -> Self {
+        self.otp_validator = Some(validator);
         self
     }
 }
@@ -129,6 +139,10 @@ impl Tool for ShellTool {
                     "type": "boolean",
                     "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
                     "default": false
+                },
+                "otp_code": {
+                    "type": "string",
+                    "description": "6-digit TOTP code required when the command matches a gated_commands pattern"
                 }
             },
             "required": ["command"]
@@ -153,6 +167,65 @@ impl Tool for ShellTool {
                     output: String::new(),
                     error: Some(reason),
                 });
+            }
+        }
+
+        // Enforce gated_commands: commands matching configured patterns require
+        // a valid TOTP code supplied via the `otp_code` parameter.
+        if self.security.is_command_gated(command) {
+            let otp_code = args
+                .get("otp_code")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+
+            match &self.otp_validator {
+                None => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(
+                            "Command matches a gated_commands pattern but OTP is not configured. \
+                             Set security.otp.enabled = true to use gated_commands."
+                                .to_string(),
+                        ),
+                    });
+                }
+                Some(validator) => {
+                    if otp_code.is_empty() {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(
+                                "Command requires TOTP verification. \
+                                 Provide your 6-digit authenticator code via the 'otp_code' \
+                                 parameter and retry."
+                                    .to_string(),
+                            ),
+                        });
+                    }
+                    match validator.validate(otp_code) {
+                        Ok(true) => {} // valid — proceed to execution
+                        Ok(false) => {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(
+                                    "Invalid or expired TOTP code. \
+                                     Please check your authenticator and try again."
+                                        .to_string(),
+                                ),
+                            });
+                        }
+                        Err(e) => {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!("OTP validation error: {e}")),
+                            });
+                        }
+                    }
+                }
             }
         }
 

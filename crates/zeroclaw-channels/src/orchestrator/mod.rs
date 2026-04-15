@@ -5067,10 +5067,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
+    let security = Arc::new(
+        SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+            .with_gated_commands(config.security.otp.gated_commands.clone()),
+    );
     let model = resolved_default_model(&config);
     let temperature = config
         .providers
