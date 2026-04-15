@@ -408,7 +408,7 @@ pub fn all_tools_with_runtime(
     Option<ChannelMapHandle>,
 ) {
     let has_shell_access = runtime.has_shell_access();
-    let sandbox = create_sandbox(&root_config.security);
+    let sandbox = create_sandbox(&root_config.security, Some(workspace_dir), runtime.name());
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
