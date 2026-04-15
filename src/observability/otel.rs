@@ -1,10 +1,11 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
-use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
-use opentelemetry::{KeyValue, global};
+use opentelemetry::trace::{Span, SpanBuilder, SpanKind, Status, TraceContextExt, Tracer};
+use opentelemetry::{Context, KeyValue, global};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use parking_lot::Mutex;
 use std::any::Any;
 use std::time::SystemTime;
 
@@ -30,6 +31,23 @@ pub struct OtelObserver {
     hand_runs: Counter<u64>,
     hand_duration: Histogram<f64>,
     hand_findings: Counter<u64>,
+
+    // ── Span parenting state ────────────────────────────────────
+    // Stores the active root span context so child spans (llm.call,
+    // tool.call, etc.) share the same trace_id and parent_id.
+    //
+    // Note: this assumes one agent invocation at a time per observer
+    // instance. Concurrent invocations on the same observer will
+    // overwrite the context — a follow-up change to the Observer trait
+    // (adding session_id to events) would be needed for full concurrency.
+    /// Context holding the active `agent.invocation` root span.
+    agent_context: Mutex<Option<Context>>,
+    /// Messages count from the last `LlmRequest`, pending attachment to
+    /// the next `LlmResponse` span.
+    pending_messages_count: Mutex<Option<usize>>,
+    /// Tool arguments from the last `ToolCallStart`, pending attachment
+    /// to the next `ToolCall` span.
+    pending_tool_args: Mutex<Option<String>>,
 }
 
 impl OtelObserver {
@@ -190,6 +208,9 @@ impl OtelObserver {
             hand_runs,
             hand_duration,
             hand_findings,
+            agent_context: Mutex::new(None),
+            pending_messages_count: Mutex::new(None),
+            pending_tool_args: Mutex::new(None),
         })
     }
 }
@@ -199,6 +220,7 @@ impl Observer for OtelObserver {
         let tracer = global::tracer("zeroclaw");
 
         match event {
+            // ── Agent lifecycle: root span ───────────────────────
             ObserverEvent::AgentStart { provider, model } => {
                 self.agent_starts.add(
                     1,
@@ -207,51 +229,18 @@ impl Observer for OtelObserver {
                         KeyValue::new("model", model.clone()),
                     ],
                 );
-            }
-            ObserverEvent::LlmRequest { .. }
-            | ObserverEvent::ToolCallStart { .. }
-            | ObserverEvent::TurnComplete
-            | ObserverEvent::CacheHit { .. }
-            | ObserverEvent::CacheMiss { .. } => {}
-            ObserverEvent::LlmResponse {
-                provider,
-                model,
-                duration,
-                success,
-                error_message: _,
-                input_tokens: _,
-                output_tokens: _,
-            } => {
-                let secs = duration.as_secs_f64();
-                let attrs = [
-                    KeyValue::new("provider", provider.clone()),
-                    KeyValue::new("model", model.clone()),
-                    KeyValue::new("success", success.to_string()),
-                ];
-                self.llm_calls.add(1, &attrs);
-                self.llm_duration.record(secs, &attrs);
 
-                // Create a completed span for visibility in trace backends.
-                let start_time = SystemTime::now()
-                    .checked_sub(*duration)
-                    .unwrap_or(SystemTime::now());
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("llm.call")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
+                // Create root span — child spans will reference this as parent.
+                let span = tracer.build(
+                    SpanBuilder::from_name("agent.invocation")
+                        .with_kind(SpanKind::Server)
                         .with_attributes(vec![
                             KeyValue::new("provider", provider.clone()),
                             KeyValue::new("model", model.clone()),
-                            KeyValue::new("success", *success),
-                            KeyValue::new("duration_s", secs),
                         ]),
                 );
-                if *success {
-                    span.set_status(Status::Ok);
-                } else {
-                    span.set_status(Status::error(""));
-                }
-                span.end();
+                let cx = Context::current_with_span(span);
+                *self.agent_context.lock() = Some(cx);
             }
             ObserverEvent::AgentEnd {
                 provider,
@@ -261,28 +250,26 @@ impl Observer for OtelObserver {
                 cost_usd,
             } => {
                 let secs = duration.as_secs_f64();
-                let start_time = SystemTime::now()
-                    .checked_sub(*duration)
-                    .unwrap_or(SystemTime::now());
 
-                // Create a completed span with correct timing
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("agent.invocation")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("provider", provider.clone()),
-                            KeyValue::new("model", model.clone()),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
-                if let Some(t) = tokens_used {
-                    span.set_attribute(KeyValue::new("tokens_used", *t as i64));
+                // Clear any stale pending state from incomplete LlmRequest
+                // or ToolCallStart events (e.g. timeout before response).
+                self.pending_messages_count.lock().take();
+                self.pending_tool_args.lock().take();
+
+                // Finalize and end the root span created at AgentStart.
+                let cx = self.agent_context.lock().take();
+                if let Some(cx) = cx {
+                    let span = cx.span();
+                    span.set_attribute(KeyValue::new("duration_s", secs));
+                    if let Some(t) = tokens_used {
+                        span.set_attribute(KeyValue::new("gen_ai.usage.total_tokens", *t as i64));
+                    }
+                    if let Some(c) = cost_usd {
+                        span.set_attribute(KeyValue::new("cost_usd", *c));
+                    }
+                    span.set_status(Status::Ok);
+                    span.end();
                 }
-                if let Some(c) = cost_usd {
-                    span.set_attribute(KeyValue::new("cost_usd", *c));
-                }
-                span.end();
 
                 self.agent_duration.record(
                     secs,
@@ -294,6 +281,79 @@ impl Observer for OtelObserver {
                 // Note: tokens are recorded via record_metric(TokensUsed) to avoid
                 // double-counting. AgentEnd only records duration.
             }
+
+            // ── LLM calls: child spans with token attributes ────
+            ObserverEvent::LlmRequest { messages_count, .. } => {
+                *self.pending_messages_count.lock() = Some(*messages_count);
+            }
+            ObserverEvent::LlmResponse {
+                provider,
+                model,
+                duration,
+                success,
+                error_message,
+                input_tokens,
+                output_tokens,
+            } => {
+                let secs = duration.as_secs_f64();
+                let metric_attrs = [
+                    KeyValue::new("provider", provider.clone()),
+                    KeyValue::new("model", model.clone()),
+                    KeyValue::new("success", success.to_string()),
+                ];
+                self.llm_calls.add(1, &metric_attrs);
+                self.llm_duration.record(secs, &metric_attrs);
+
+                let start_time = SystemTime::now()
+                    .checked_sub(*duration)
+                    .unwrap_or(SystemTime::now());
+
+                let mut attrs = vec![
+                    KeyValue::new("provider", provider.clone()),
+                    KeyValue::new("model", model.clone()),
+                    KeyValue::new("success", *success),
+                ];
+                if let Some(t) = input_tokens {
+                    attrs.push(KeyValue::new("gen_ai.usage.input_tokens", *t as i64));
+                }
+                if let Some(t) = output_tokens {
+                    attrs.push(KeyValue::new("gen_ai.usage.output_tokens", *t as i64));
+                }
+                if let (Some(i), Some(o)) = (input_tokens, output_tokens) {
+                    attrs.push(KeyValue::new("gen_ai.usage.total_tokens", (*i + *o) as i64));
+                }
+                if let Some(msg) = error_message {
+                    attrs.push(KeyValue::new("error.message", msg.clone()));
+                }
+                if let Some(count) = self.pending_messages_count.lock().take() {
+                    attrs.push(KeyValue::new("messages_count", count as i64));
+                }
+
+                let builder = SpanBuilder::from_name("llm.call")
+                    .with_kind(SpanKind::Client)
+                    .with_start_time(start_time)
+                    .with_attributes(attrs);
+
+                let parent_cx = self.agent_context.lock().clone();
+                let mut span = match parent_cx {
+                    Some(ref cx) => tracer.build_with_context(builder, cx),
+                    None => tracer.build(builder),
+                };
+                if *success {
+                    span.set_status(Status::Ok);
+                } else {
+                    let err_msg = error_message
+                        .clone()
+                        .unwrap_or_else(|| "LLM call failed".to_string());
+                    span.set_status(Status::error(err_msg));
+                }
+                span.end();
+            }
+
+            // ── Tool calls: child spans with arguments ──────────
+            ObserverEvent::ToolCallStart { arguments, .. } => {
+                *self.pending_tool_args.lock() = arguments.clone();
+            }
             ObserverEvent::ToolCall {
                 tool,
                 duration,
@@ -304,33 +364,59 @@ impl Observer for OtelObserver {
                     .checked_sub(*duration)
                     .unwrap_or(SystemTime::now());
 
-                let status = if *success {
+                let mut attrs = vec![
+                    KeyValue::new("tool.name", tool.clone()),
+                    KeyValue::new("tool.success", *success),
+                ];
+                if let Some(args) = self.pending_tool_args.lock().take() {
+                    // Truncate to 1 KiB to avoid span size limits.
+                    let truncated = if args.len() > 1024 {
+                        let mut end = 1024;
+                        while end > 0 && !args.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        format!("{}…", &args[..end])
+                    } else {
+                        args
+                    };
+                    attrs.push(KeyValue::new("tool.arguments", truncated));
+                }
+
+                let builder = SpanBuilder::from_name("tool.call")
+                    .with_kind(SpanKind::Internal)
+                    .with_start_time(start_time)
+                    .with_attributes(attrs);
+
+                let parent_cx = self.agent_context.lock().clone();
+                let mut span = match parent_cx {
+                    Some(ref cx) => tracer.build_with_context(builder, cx),
+                    None => tracer.build(builder),
+                };
+                span.set_status(if *success {
                     Status::Ok
                 } else {
-                    Status::error("")
-                };
-
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("tool.call")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("tool.name", tool.clone()),
-                            KeyValue::new("tool.success", *success),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
-                span.set_status(status);
+                    Status::error("tool call failed")
+                });
                 span.end();
 
-                let attrs = [
+                let metric_attrs = [
                     KeyValue::new("tool", tool.clone()),
                     KeyValue::new("success", success.to_string()),
                 ];
-                self.tool_calls.add(1, &attrs);
+                self.tool_calls.add(1, &metric_attrs);
                 self.tool_duration
                     .record(secs, &[KeyValue::new("tool", tool.clone())]);
             }
+
+            // ── Lightweight events (metrics only, no spans) ────
+            ObserverEvent::TurnComplete
+            | ObserverEvent::CacheHit { .. }
+            | ObserverEvent::CacheMiss { .. }
+            | ObserverEvent::HandStarted { .. }
+            | ObserverEvent::DeploymentStarted { .. }
+            | ObserverEvent::DeploymentCompleted { .. }
+            | ObserverEvent::DeploymentFailed { .. }
+            | ObserverEvent::RecoveryCompleted { .. } => {}
             ObserverEvent::ChannelMessage { channel, direction } => {
                 self.channel_messages.add(
                     1,
@@ -343,23 +429,29 @@ impl Observer for OtelObserver {
             ObserverEvent::HeartbeatTick => {
                 self.heartbeat_ticks.add(1, &[]);
             }
+
+            // ── Errors: child span when inside an invocation ────
             ObserverEvent::Error { component, message } => {
-                // Create an error span for visibility in trace backends
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("error")
-                        .with_kind(SpanKind::Internal)
-                        .with_attributes(vec![
-                            KeyValue::new("component", component.clone()),
-                            KeyValue::new("error.message", message.clone()),
-                        ]),
-                );
+                let builder = SpanBuilder::from_name("error")
+                    .with_kind(SpanKind::Internal)
+                    .with_attributes(vec![
+                        KeyValue::new("component", component.clone()),
+                        KeyValue::new("error.message", message.clone()),
+                    ]);
+
+                let parent_cx = self.agent_context.lock().clone();
+                let mut span = match parent_cx {
+                    Some(ref cx) => tracer.build_with_context(builder, cx),
+                    None => tracer.build(builder),
+                };
                 span.set_status(Status::error(message.clone()));
                 span.end();
 
                 self.errors
                     .add(1, &[KeyValue::new("component", component.clone())]);
             }
-            ObserverEvent::HandStarted { .. } => {}
+
+            // ── Hand runs: child spans ──────────────────────────
             ObserverEvent::HandCompleted {
                 hand_name,
                 duration_ms,
@@ -371,17 +463,20 @@ impl Observer for OtelObserver {
                     .checked_sub(duration)
                     .unwrap_or(SystemTime::now());
 
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("hand.run")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("hand.name", hand_name.clone()),
-                            KeyValue::new("hand.success", true),
-                            KeyValue::new("hand.findings", *findings_count as i64),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
+                let builder = SpanBuilder::from_name("hand.run")
+                    .with_kind(SpanKind::Internal)
+                    .with_start_time(start_time)
+                    .with_attributes(vec![
+                        KeyValue::new("hand.name", hand_name.clone()),
+                        KeyValue::new("hand.success", true),
+                        KeyValue::new("hand.findings", *findings_count as i64),
+                    ]);
+
+                let parent_cx = self.agent_context.lock().clone();
+                let mut span = match parent_cx {
+                    Some(ref cx) => tracer.build_with_context(builder, cx),
+                    None => tracer.build(builder),
+                };
                 span.set_status(Status::Ok);
                 span.end();
 
@@ -408,17 +503,20 @@ impl Observer for OtelObserver {
                     .checked_sub(duration)
                     .unwrap_or(SystemTime::now());
 
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("hand.run")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("hand.name", hand_name.clone()),
-                            KeyValue::new("hand.success", false),
-                            KeyValue::new("error.message", error.clone()),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
+                let builder = SpanBuilder::from_name("hand.run")
+                    .with_kind(SpanKind::Internal)
+                    .with_start_time(start_time)
+                    .with_attributes(vec![
+                        KeyValue::new("hand.name", hand_name.clone()),
+                        KeyValue::new("hand.success", false),
+                        KeyValue::new("error.message", error.clone()),
+                    ]);
+
+                let parent_cx = self.agent_context.lock().clone();
+                let mut span = match parent_cx {
+                    Some(ref cx) => tracer.build_with_context(builder, cx),
+                    None => tracer.build(builder),
+                };
                 span.set_status(Status::error(error.clone()));
                 span.end();
 
@@ -429,13 +527,8 @@ impl Observer for OtelObserver {
                 self.hand_runs.add(1, &attrs);
                 self.hand_duration
                     .record(secs, &[KeyValue::new("hand", hand_name.clone())]);
-            }
-            ObserverEvent::DeploymentStarted { .. }
-            | ObserverEvent::DeploymentCompleted { .. }
-            | ObserverEvent::DeploymentFailed { .. }
-            | ObserverEvent::RecoveryCompleted { .. } => {
-                // DORA deployment events: OTel pass-through not yet implemented.
-            }
+            } // Note: HandStarted, Deployment*, and RecoveryCompleted are
+              // handled above in the no-op arm (no spans emitted yet).
         }
     }
 
@@ -582,6 +675,156 @@ mod tests {
         obs.record_event(&ObserverEvent::Error {
             component: "provider".into(),
             message: "timeout".into(),
+        });
+    }
+
+    /// Verifies that the full agent lifecycle (start → children → end)
+    /// records without panics and that the root context is properly
+    /// created and cleaned up.
+    #[test]
+    fn span_parenting_lifecycle() {
+        let obs = test_observer();
+
+        // No active context before AgentStart
+        assert!(obs.agent_context.lock().is_none());
+
+        // AgentStart creates the root context
+        obs.record_event(&ObserverEvent::AgentStart {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+        });
+        assert!(obs.agent_context.lock().is_some());
+
+        // LlmRequest stores pending messages count
+        obs.record_event(&ObserverEvent::LlmRequest {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            messages_count: 5,
+        });
+        assert_eq!(*obs.pending_messages_count.lock(), Some(5));
+
+        // LlmResponse consumes pending messages count, creates child span
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: Duration::from_millis(800),
+            success: true,
+            error_message: None,
+            input_tokens: Some(1200),
+            output_tokens: Some(350),
+        });
+        assert!(obs.pending_messages_count.lock().is_none());
+
+        // ToolCallStart stores pending args
+        obs.record_event(&ObserverEvent::ToolCallStart {
+            tool: "shell".into(),
+            arguments: Some(r#"{"command":"ls -la"}"#.into()),
+        });
+        assert!(obs.pending_tool_args.lock().is_some());
+
+        // ToolCall consumes pending args, creates child span
+        obs.record_event(&ObserverEvent::ToolCall {
+            tool: "shell".into(),
+            duration: Duration::from_millis(50),
+            success: true,
+        });
+        assert!(obs.pending_tool_args.lock().is_none());
+
+        // Error creates child span under active context
+        obs.record_event(&ObserverEvent::Error {
+            component: "provider".into(),
+            message: "rate limit exceeded".into(),
+        });
+
+        // AgentEnd closes the root span and clears context
+        obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: Duration::from_millis(2000),
+            tokens_used: Some(1550),
+            cost_usd: Some(0.012),
+        });
+        assert!(obs.agent_context.lock().is_none());
+    }
+
+    /// Child spans outside an agent invocation (no active context)
+    /// still record without panics — they become independent root spans.
+    #[test]
+    fn child_spans_without_parent_do_not_panic() {
+        let obs = test_observer();
+
+        // No AgentStart — these should still work as standalone spans
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: Duration::from_millis(100),
+            success: true,
+            error_message: None,
+            input_tokens: Some(50),
+            output_tokens: Some(20),
+        });
+        obs.record_event(&ObserverEvent::ToolCall {
+            tool: "file_read".into(),
+            duration: Duration::from_millis(5),
+            success: true,
+        });
+        obs.record_event(&ObserverEvent::Error {
+            component: "gateway".into(),
+            message: "connection reset".into(),
+        });
+    }
+
+    /// LlmResponse with error message propagates to span status.
+    #[test]
+    fn llm_error_message_propagated() {
+        let obs = test_observer();
+        obs.record_event(&ObserverEvent::AgentStart {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+        });
+        obs.record_event(&ObserverEvent::LlmResponse {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: Duration::from_millis(0),
+            success: false,
+            error_message: Some("429 Too Many Requests".into()),
+            input_tokens: None,
+            output_tokens: None,
+        });
+        obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: Duration::from_millis(100),
+            tokens_used: None,
+            cost_usd: None,
+        });
+    }
+
+    /// Tool arguments longer than 1 KiB are truncated.
+    #[test]
+    fn tool_arguments_truncated() {
+        let obs = test_observer();
+        obs.record_event(&ObserverEvent::AgentStart {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+        });
+        let long_args = "x".repeat(2048);
+        obs.record_event(&ObserverEvent::ToolCallStart {
+            tool: "shell".into(),
+            arguments: Some(long_args),
+        });
+        // Should not panic — args are truncated to 1 KiB internally
+        obs.record_event(&ObserverEvent::ToolCall {
+            tool: "shell".into(),
+            duration: Duration::from_millis(10),
+            success: true,
+        });
+        obs.record_event(&ObserverEvent::AgentEnd {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: Duration::from_millis(100),
+            tokens_used: None,
+            cost_usd: None,
         });
     }
 
