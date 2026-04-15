@@ -69,6 +69,13 @@ pub struct SqliteMemory {
     /// PR #4 — rerank runtime settings (enabled flag + top_k window).
     /// Defaults to `RerankRuntimeConfig::default()` which is `enabled = false`.
     rerank_config: Mutex<super::search::RerankRuntimeConfig>,
+
+    /// PR #7 HLC migration — monotonic clock used to stamp every INSERT
+    /// / UPDATE into `memories.updated_at_hlc`. Separate from
+    /// `updated_at` (RFC3339 wall-clock string) so peers that speak
+    /// pre-HLC protocol versions keep working — the HLC column is
+    /// additive and not yet the primary ordering key for sync.
+    hlc_clock: Arc<crate::sync::hlc::HlcClock>,
 }
 
 impl SqliteMemory {
@@ -177,6 +184,17 @@ impl SqliteMemory {
 
         Self::init_schema(&conn)?;
 
+        // PR #7 HLC migration — derive a node identifier from the DB path
+        // + hostname so every SqliteMemory instance on this device/user
+        // stamps consistent HLCs. Falls back to "device" when hostname
+        // isn't available.
+        let hostname = hostname::get()
+            .ok()
+            .and_then(|h| h.to_str().map(String::from))
+            .unwrap_or_else(|| "device".to_string());
+        let node_id = format!("{}-{}", hostname, db_path.display());
+        let hlc_clock = Arc::new(crate::sync::hlc::HlcClock::new(node_id));
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             db_path,
@@ -189,6 +207,7 @@ impl SqliteMemory {
             sync: Mutex::new(None),
             reranker: Mutex::new(None),
             rerank_config: Mutex::new(super::search::RerankRuntimeConfig::default()),
+            hlc_clock,
         })
     }
 
@@ -541,6 +560,20 @@ impl SqliteMemory {
                  ALTER TABLE memories ADD COLUMN needs_recompile INTEGER NOT NULL DEFAULT 0;
                  CREATE INDEX IF NOT EXISTS idx_memories_needs_recompile
                      ON memories(needs_recompile) WHERE needs_recompile = 1;",
+            )?;
+        }
+
+        // ── PR #7 HLC migration (additive) ─────────────────────────
+        // Stamp every row with a Hybrid Logical Clock string alongside
+        // the existing RFC3339 updated_at. Future sync protocol version
+        // can switch ordering to this column; today it's informational
+        // but captured on every write so the data is ready when the
+        // protocol flip happens.
+        if !memories_sql.contains("updated_at_hlc") {
+            conn.execute_batch(
+                "ALTER TABLE memories ADD COLUMN updated_at_hlc TEXT;
+                 CREATE INDEX IF NOT EXISTS idx_memories_hlc
+                     ON memories(updated_at_hlc) WHERE updated_at_hlc IS NOT NULL;",
             )?;
         }
 
@@ -2008,6 +2041,11 @@ impl Memory for SqliteMemory {
         let key = key.to_string();
         let content = content.to_string();
         let sid = session_id.map(String::from);
+        // PR #7 HLC migration — tick the clock once per write. Stamp
+        // lives on the row alongside the existing RFC3339 `updated_at`
+        // so peers can compare monotonically once the sync protocol
+        // switches to HLC.
+        let hlc_stamp = self.hlc_clock.tick().encode();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.lock();
@@ -2016,15 +2054,16 @@ impl Memory for SqliteMemory {
             let id = Uuid::new_v4().to_string();
 
             conn.execute(
-                "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id, updated_at_hlc)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(key) DO UPDATE SET
                     content = excluded.content,
                     category = excluded.category,
                     embedding = excluded.embedding,
                     updated_at = excluded.updated_at,
-                    session_id = excluded.session_id",
-                params![id, key, content, cat, embedding_bytes, now, now, sid],
+                    session_id = excluded.session_id,
+                    updated_at_hlc = excluded.updated_at_hlc",
+                params![id, key, content, cat, embedding_bytes, now, now, sid, hlc_stamp],
             )?;
             Ok(())
         })
@@ -4262,6 +4301,78 @@ mod tests {
         let keys: Vec<&str> = hits.iter().map(|h| h.key.as_str()).collect();
         assert!(keys.contains(&"k_active"), "got {keys:?}");
         assert!(!keys.contains(&"k_archived"), "got {keys:?}");
+    }
+
+    #[tokio::test]
+    async fn store_stamps_monotonic_hlc_on_memories_rows() {
+        // PR #7 HLC migration — every INSERT must carry an updated_at_hlc
+        // value that parses cleanly and strictly exceeds the previous row's.
+        use crate::sync::hlc::Hlc;
+
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_one", "first", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("k_two", "second", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("k_three", "third", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let stamps: Vec<String> = {
+            let conn = mem.conn.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT updated_at_hlc FROM memories
+                      WHERE key IN ('k_one','k_two','k_three')
+                      ORDER BY created_at ASC, key ASC",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, Option<String>>(0))
+                .unwrap()
+                .map(|r| r.unwrap().expect("HLC stamp must be non-null"))
+                .collect()
+        };
+        assert_eq!(stamps.len(), 3);
+        let parsed: Vec<Hlc> = stamps.iter().map(|s| Hlc::parse(s).unwrap()).collect();
+        assert!(parsed[1] > parsed[0], "{:?} !> {:?}", parsed[1], parsed[0]);
+        assert!(parsed[2] > parsed[1], "{:?} !> {:?}", parsed[2], parsed[1]);
+    }
+
+    #[tokio::test]
+    async fn store_upsert_refreshes_hlc_on_existing_key() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_upsert", "first", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let first: String = {
+            let conn = mem.conn.lock();
+            conn.query_row(
+                "SELECT updated_at_hlc FROM memories WHERE key = 'k_upsert'",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        mem.store("k_upsert", "second", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let second: String = {
+            let conn = mem.conn.lock();
+            conn.query_row(
+                "SELECT updated_at_hlc FROM memories WHERE key = 'k_upsert'",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_ne!(first, second, "upsert must refresh the HLC stamp");
+        let before = crate::sync::hlc::Hlc::parse(&first).unwrap();
+        let after = crate::sync::hlc::Hlc::parse(&second).unwrap();
+        assert!(after > before);
     }
 
     #[tokio::test]
