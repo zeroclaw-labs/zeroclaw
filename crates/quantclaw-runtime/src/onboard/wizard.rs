@@ -3253,6 +3253,7 @@ fn setup_project_context() -> Result<ProjectContext> {
         "Europe/London (GMT/BST)",
         "Europe/Berlin (CET/CEST)",
         "Asia/Tokyo (JST)",
+        "Asia/Shanghai (CST)",
         "UTC",
         "Other (type manually)",
     ];
