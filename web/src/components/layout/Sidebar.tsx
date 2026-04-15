@@ -14,6 +14,9 @@ import {
   Monitor,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
+import { getOrCreateSessionId } from '@/lib/ws';
+import { useState, useEffect } from 'react';
+import SessionPanel from '@/components/SessionPanel';
 
 const navItems = [
   { to: '/', icon: LayoutDashboard, labelKey: 'nav.dashboard' },
@@ -81,6 +84,18 @@ interface SidebarProps {
 }
 
 export default function Sidebar({ open, onClose, collapsed }: SidebarProps) {
+  const [currentSessionId, setCurrentSessionId] = useState(getOrCreateSessionId());
+
+  // Track session changes so the panel highlights the active session
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ sessionId: string }>).detail;
+      setCurrentSessionId(detail.sessionId);
+    };
+    window.addEventListener('zeroclaw-session-change', handler);
+    return () => window.removeEventListener('zeroclaw-session-change', handler);
+  }, []);
+
   return (
     <>
       {/* Backdrop — mobile only */}
@@ -112,6 +127,15 @@ export default function Sidebar({ open, onClose, collapsed }: SidebarProps) {
               onClick={onClose}
             />
           ))}
+          {/* Session panel — hidden when sidebar is collapsed */}
+          {!collapsed && (
+            <div className="mt-3 pt-3 border-t" style={{ borderColor: 'var(--pc-border)' }}>
+              <p className="text-[10px] uppercase tracking-wider px-3 mb-1" style={{ color: 'var(--pc-text-faint)' }}>
+                Sessions
+              </p>
+              <SessionPanel currentSessionId={currentSessionId} />
+            </div>
+          )}
         </nav>
         <SidebarFooter collapsed={collapsed} layout="desktop" />
       </aside>
@@ -136,6 +160,13 @@ export default function Sidebar({ open, onClose, collapsed }: SidebarProps) {
               onClick={onClose}
             />
           ))}
+          {/* Session panel — always visible on mobile sidebar */}
+          <div className="mt-3 pt-3 border-t" style={{ borderColor: 'var(--pc-border)' }}>
+            <p className="text-[10px] uppercase tracking-wider px-3 mb-1" style={{ color: 'var(--pc-text-faint)' }}>
+              Sessions
+            </p>
+            <SessionPanel currentSessionId={currentSessionId} />
+          </div>
         </nav>
         <SidebarFooter collapsed={false} layout="mobile" />
       </aside>

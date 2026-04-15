@@ -322,6 +322,17 @@ export function getSessionMessages(id: string): Promise<SessionMessagesResponse>
   );
 }
 
+export function deleteSession(id: string): Promise<void> {
+  return apiFetch(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+export function renameSession(id: string, name: string): Promise<void> {
+  return apiFetch(`/api/sessions/${encodeURIComponent(id)}/rename`, {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Channels (detailed)
 // ---------------------------------------------------------------------------

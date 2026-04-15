@@ -3,13 +3,14 @@ import { Send, Bot, User, AlertCircle, Copy, Check } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { WsMessage } from '@/types/api';
-import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
+import { WebSocketClient, getOrCreateSessionId, SESSION_STORAGE_KEY } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
 import { getSessionMessages } from '@/lib/api';
 import ToolCallCard from '@/components/ToolCallCard';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
+import ModelSelector from '@/components/ModelSelector';
 import {
   loadChatHistory,
   mapServerMessagesToPersisted,
@@ -105,9 +106,12 @@ export default function AgentChat() {
     saveChatHistory(sessionIdRef.current, uiMessagesToPersisted(messages));
   }, [messages, historyReady]);
 
-  useEffect(() => {
-    const ws = new WebSocketClient();
+  // Shared WebSocket message handler — stored in a ref so it can be reused
+  // when reconnecting after a session switch.
+  const wsMessageHandlerRef = useRef<(msg: WsMessage) => void>(() => {});
 
+  /** Wire up event handlers on a WebSocketClient and connect it. */
+  const setupAndConnectWs = useCallback((ws: WebSocketClient) => {
     ws.onOpen = () => {
       setConnected(true);
       setError(null);
@@ -124,7 +128,15 @@ export default function AgentChat() {
       setError(t('agent.connection_error'));
     };
 
-    ws.onMessage = (msg: WsMessage) => {
+    ws.onMessage = (msg: WsMessage) => wsMessageHandlerRef.current(msg);
+
+    ws.connect();
+    wsRef.current = ws;
+  }, []);
+
+  // Populate the message handler ref (runs once, closures are stable over state setters)
+  useEffect(() => {
+    wsMessageHandlerRef.current = (msg: WsMessage) => {
       switch (msg.type) {
         case 'session_start':
         case 'connected':
@@ -275,14 +287,71 @@ export default function AgentChat() {
           break;
       }
     };
+  }, []);
 
-    ws.connect();
-    wsRef.current = ws;
+  // Initial WebSocket connection
+  useEffect(() => {
+    const ws = new WebSocketClient();
+    setupAndConnectWs(ws);
 
     return () => {
       ws.disconnect();
     };
-  }, []);
+  }, [setupAndConnectWs]);
+
+  // Listen for session-change events (from SessionPanel or external triggers)
+  useEffect(() => {
+    const handleSessionChange = (e: Event) => {
+      const detail = (e as CustomEvent<{ sessionId: string }>).detail;
+      const newSessionId = detail.sessionId;
+
+      // Disconnect current WebSocket
+      if (wsRef.current) {
+        wsRef.current.disconnect();
+      }
+
+      // Update session ref
+      sessionIdRef.current = newSessionId;
+      sessionStorage.setItem(SESSION_STORAGE_KEY, newSessionId);
+
+      // Clear current messages and streaming state
+      setMessages([]);
+      setTyping(false);
+      setError(null);
+      pendingContentRef.current = '';
+      pendingThinkingRef.current = '';
+      capturedThinkingRef.current = '';
+      setStreamingContent('');
+      setStreamingThinking('');
+
+      // Load history for the new session
+      (async () => {
+        try {
+          const res = await getSessionMessages(newSessionId);
+          if (res.session_persistence && res.messages.length > 0) {
+            setMessages(persistedToUiMessages(mapServerMessagesToPersisted(res.messages)));
+          } else {
+            const ls = loadChatHistory(newSessionId);
+            if (ls.length > 0) {
+              setMessages(persistedToUiMessages(ls));
+            }
+          }
+        } catch {
+          const ls = loadChatHistory(newSessionId);
+          if (ls.length > 0) {
+            setMessages(persistedToUiMessages(ls));
+          }
+        }
+      })();
+
+      // Reconnect WebSocket with new session
+      const ws = new WebSocketClient();
+      setupAndConnectWs(ws);
+    };
+
+    window.addEventListener('zeroclaw-session-change', handleSessionChange);
+    return () => window.removeEventListener('zeroclaw-session-change', handleSessionChange);
+  }, [setupAndConnectWs]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -378,6 +447,11 @@ export default function AgentChat() {
           {error}
         </div>
       )}
+
+      {/* Model selector bar */}
+      <div className="px-4 py-2 border-b flex items-center" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
+        <ModelSelector />
+      </div>
 
       {/* Messages area */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
