@@ -738,7 +738,9 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
     // Session-to-session messaging tools (always available when sessions dir exists)
-    if let Ok(session_store) = crate::channels::session_store::SessionStore::new(workspace_dir) {
+    // Use SqliteSessionBackend (same as gateway) so tools see gateway WS sessions.
+    // SessionStore (JSONL) only sees .jsonl files which the gateway doesn't create.
+    if let Ok(session_store) = crate::channels::session_sqlite::SqliteSessionBackend::new(workspace_dir) {
         let backend: Arc<dyn crate::channels::session_backend::SessionBackend> =
             Arc::new(session_store);
         tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
