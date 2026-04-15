@@ -421,13 +421,54 @@ pub fn all_tools_with_runtime(
     let runtime_kind = root_config.runtime.kind.as_str();
     let sandbox_cfg = risk_profile.sandbox_config();
     let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
+
+    // Build OTP validator for gated_commands enforcement when configured.
+    let otp_validator: Option<Arc<crate::security::OtpValidator>> = if root_config
+        .security
+        .otp
+        .enabled
+        && !root_config.security.otp.gated_commands.is_empty()
+    {
+        root_config.config_path.parent().and_then(|config_dir| {
+            let store = crate::security::SecretStore::new(config_dir, root_config.secrets.encrypt);
+            match crate::security::OtpValidator::from_config(
+                &root_config.security.otp,
+                config_dir,
+                &store,
+            ) {
+                Ok((validator, _)) => Some(Arc::new(validator)),
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Note,
+                        )
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "OTP validator init failed for gated_commands; gate will block matching commands"
+                    );
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
+
+    let shell_tool = {
+        let base = ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
+            .with_timeout_secs(root_config.shell_tool.timeout_secs);
+        match otp_validator {
+            Some(validator) => base.with_otp_validator(validator),
+            None => base,
+        }
+    };
+
+
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
-            PathGuardedTool::new(
-                ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
-                    .with_timeout_secs(root_config.shell_tool.timeout_secs),
-                security.clone(),
-            ),
+            PathGuardedTool::new(shell_tool, security.clone()),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(

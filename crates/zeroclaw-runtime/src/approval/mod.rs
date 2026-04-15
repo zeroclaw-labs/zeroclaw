@@ -310,12 +310,14 @@ fn looks_like_secret_key(key: &str) -> bool {
         "api_key",
         "api-key",
         "apikey",
+        "otp",
         "auth",
         "bearer",
         "private_key",
         "private-key",
         "privatekey",
         "credential",
+        "otp",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -516,6 +518,35 @@ mod tests {
         let args = serde_json::json!("just a string");
         let summary = summarize_args(&args);
         assert!(summary.contains("just a string"));
+    }
+
+    #[test]
+    pub fn summarize_args_redacts_sensitive_fields() {
+        let args = serde_json::json!({
+            "command": "sudo reboot",
+            "otp_code": "123456",
+            "password": "hunter2",
+            "api_key": "sk-secret",
+            "cwd": "/tmp"
+        });
+        let summary = summarize_args(&args);
+        assert!(
+            !summary.contains("123456"),
+            "otp_code value must be redacted"
+        );
+        assert!(
+            !summary.contains("hunter2"),
+            "password value must be redacted"
+        );
+        assert!(
+            !summary.contains("sk-secret"),
+            "api_key value must be redacted"
+        );
+        assert!(summary.contains("otp_code: [redacted]"));
+        assert!(summary.contains("password: [redacted]"));
+        assert!(summary.contains("api_key: [redacted]"));
+        assert!(summary.contains("command: sudo reboot"));
+        assert!(summary.contains("cwd: /tmp"));
     }
 
     // ── non-interactive (channel) mode ────────────────────────
