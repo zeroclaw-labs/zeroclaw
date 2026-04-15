@@ -91,12 +91,12 @@ pub(crate) async fn execute_one_tool(
             });
             if r.success {
                 let normalized_output = if r.output.is_empty() {
-                    "(no output)".to_string()
+                    "(no output)"
                 } else {
-                    r.output.clone()
+                    &r.output
                 };
                 Ok(ToolExecutionOutcome {
-                    output: scrub_credentials(&normalized_output),
+                    output: scrub_credentials(normalized_output),
                     success: true,
                     error_reason: None,
                     duration,

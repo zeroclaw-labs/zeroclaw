@@ -5212,6 +5212,27 @@ mod tests {
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn execute_one_tool_normalizes_empty_success_output() {
+        let observer = NoopObserver;
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EmptySuccessTool)];
+
+        let outcome = execute_one_tool(
+            "empty_success",
+            serde_json::json!({}),
+            &tools,
+            None,
+            &observer,
+            None,
+        )
+        .await
+        .expect("empty successful tool output should still execute");
+
+        assert!(outcome.success);
+        assert_eq!(outcome.output, "(no output)");
+        assert!(outcome.error_reason.is_none());
+    }
+
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::ChatResponse;
@@ -5639,6 +5660,37 @@ mod tests {
             Ok(crate::tools::ToolResult {
                 success: true,
                 output: format!("counted:{value}"),
+                error: None,
+            })
+        }
+    }
+
+    struct EmptySuccessTool;
+
+    #[async_trait]
+    impl Tool for EmptySuccessTool {
+        fn name(&self) -> &str {
+            "empty_success"
+        }
+
+        fn description(&self) -> &str {
+            "Returns success with no stdout"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: String::new(),
                 error: None,
             })
         }
