@@ -7,10 +7,15 @@
 // vault_documents + links + tags + aliases + FTS5 index →
 // delta-journal sync to peers → unified parallel search with first brain.
 
+pub mod briefing;
+pub mod health;
+pub mod hub;
 pub mod ingest;
+pub mod llm_engine;
 pub mod schema;
 pub mod store;
 pub mod unified_search;
+pub mod watcher;
 pub mod wikilink;
 
 pub use ingest::{IngestInput, IngestOutput, SourceType};
