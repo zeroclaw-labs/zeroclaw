@@ -3322,6 +3322,7 @@ mod tests {
         // Assistant with tool_calls → plain text with only content
         assert_eq!(stripped[2].role, "assistant");
         assert_eq!(stripped[2].content, "I'll search");
+        assert!(!stripped[2].content.contains("tool_calls"), "tool_calls structure must be stripped");
         // tool message → dropped
         assert_eq!(stripped[3].role, "assistant");
         assert_eq!(stripped[3].content, "Here are the results about cats");
