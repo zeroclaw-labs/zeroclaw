@@ -381,13 +381,14 @@ impl Agent {
             &config.workspace_dir,
         ));
 
+        let fallback_provider_ag = config.providers.fallback_provider();
         let memory: Arc<dyn Memory> =
             Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
                 &config.memory,
-                &config.embedding_routes,
+                &config.providers.embedding_routes,
                 Some(&config.storage.provider.config),
                 &config.workspace_dir,
-                config.api_key.as_deref(),
+                fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
             )?);
 
         let composio_key = if config.composio.enabled {
@@ -420,7 +421,7 @@ impl Agent {
             &config.web_fetch,
             &config.workspace_dir,
             &config.agents,
-            config.api_key.as_deref(),
+            fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
             config,
             None,
         );
@@ -486,11 +487,10 @@ impl Agent {
             }
         }
 
-        let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+        let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
 
-        let model_name = config
-            .default_model
-            .as_deref()
+        let model_name = fallback_provider_ag
+            .and_then(|e| e.model.as_deref())
             .unwrap_or("anthropic/claude-sonnet-4-20250514")
             .to_string();
 
@@ -499,10 +499,10 @@ impl Agent {
 
         let provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
             provider_name,
-            config.api_key.as_deref(),
-            config.api_url.as_deref(),
+            fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
+            fallback_provider_ag.and_then(|e| e.base_url.as_deref()),
             &config.reliability,
-            &config.model_routes,
+            &config.providers.model_routes,
             &model_name,
             &provider_runtime_options,
         )?;
@@ -516,6 +516,7 @@ impl Agent {
         };
 
         let route_model_by_hint: HashMap<String, String> = config
+            .providers
             .model_routes
             .iter()
             .map(|route| (route.hint.clone(), route.model.clone()))
@@ -549,7 +550,11 @@ impl Agent {
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(config.agent.clone())
             .model_name(model_name)
-            .temperature(config.default_temperature)
+            .temperature(
+                fallback_provider_ag
+                    .and_then(|e| e.temperature)
+                    .unwrap_or(0.7),
+            )
             .workspace_dir(config.workspace_dir.clone())
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
@@ -1123,12 +1128,8 @@ impl Agent {
                         }
                         zeroclaw_providers::traits::StreamEvent::ToolCall(tc) => {
                             got_stream = true;
-                            let _ = event_tx
-                                .send(TurnEvent::ToolCall {
-                                    name: tc.name.clone(),
-                                    args: serde_json::from_str(&tc.arguments).unwrap_or_default(),
-                                })
-                                .await;
+                            // ToolCall event is sent later (after parse_response) to
+                            // avoid duplicates; just collect here.
                             streamed_tool_calls.push(tc);
                         }
                         zeroclaw_providers::traits::StreamEvent::PreExecutedToolCall {
@@ -1320,23 +1321,25 @@ pub async fn run(
 
     let mut effective_config = config;
     if let Some(p) = provider_override {
-        effective_config.default_provider = Some(p);
+        effective_config.providers.fallback = Some(p);
     }
     if let Some(m) = model_override {
-        effective_config.default_model = Some(m);
+        effective_config.ensure_fallback_provider().model = Some(m);
     }
-    effective_config.default_temperature = temperature;
+    effective_config.ensure_fallback_provider().temperature = Some(temperature);
 
     let mut agent = Agent::from_config(&effective_config).await?;
 
     let provider_name = effective_config
-        .default_provider
+        .providers
+        .fallback
         .as_deref()
         .unwrap_or("openrouter")
         .to_string();
     let model_name = effective_config
-        .default_model
-        .as_deref()
+        .providers
+        .fallback_provider()
+        .and_then(|e| e.model.as_deref())
         .unwrap_or("anthropic/claude-sonnet-4-20250514")
         .to_string();
 
@@ -1774,20 +1777,23 @@ mod tests {
         let mut config = zeroclaw_config::schema::Config {
             workspace_dir,
             config_path: tmp.path().join("config.toml"),
-            api_key: Some("test-key".to_string()),
-            default_provider: Some(format!("custom:http://{addr}")),
-            default_model: Some("test-model".to_string()),
-            ..zeroclaw_config::schema::Config::default()
+            ..Default::default()
         };
+        config.providers.fallback = Some(format!("custom:http://{addr}"));
+        {
+            let entry = config.ensure_fallback_provider();
+            entry.api_key = Some("test-key".to_string());
+            entry.model = Some("test-model".to_string());
+            entry.extra_headers.insert(
+                "User-Agent".to_string(),
+                "zeroclaw-web-test/1.0".to_string(),
+            );
+            entry
+                .extra_headers
+                .insert("X-Title".to_string(), "zeroclaw-web".to_string());
+        }
         config.memory.backend = "none".to_string();
         config.memory.auto_save = false;
-        config.extra_headers.insert(
-            "User-Agent".to_string(),
-            "zeroclaw-web-test/1.0".to_string(),
-        );
-        config
-            .extra_headers
-            .insert("X-Title".to_string(), "zeroclaw-web".to_string());
 
         let mut agent = Agent::from_config(&config)
             .await
