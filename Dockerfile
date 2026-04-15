@@ -135,13 +135,10 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
 # ── Stage 2: Development Runtime (Debian) ────────────────────
 FROM debian:trixie-slim@sha256:f6e2cfac5cf956ea044b4bd75e6397b4372ad88fe00908045e9a0d21712ae3ba AS dev
 
-# Install runtime dependencies: shell, curl, python3 (skill scripts need python3)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install essential runtime dependencies only (use docker-compose.override.yml for dev tools)
+RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
-    python3 \
-    python3-pip \
-    python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /zeroclaw-data /zeroclaw-data
@@ -174,7 +171,33 @@ HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
 ENTRYPOINT ["zeroclaw"]
 CMD ["daemon"]
 
-# ── Stage 3: Production Runtime (Distroless) ─────────────────
+# ── Stage 3: Skill Runtime (Python-capable, for deployments using shell skills) ─
+FROM python:3.12-slim AS skill-runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir requests
+
+COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
+COPY --from=builder /zeroclaw-data /zeroclaw-data
+COPY --from=web-builder /web/dist /zeroclaw-data/web/dist
+
+ENV LANG=C.UTF-8
+ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
+ENV HOME=/zeroclaw-data
+ENV ZEROCLAW_GATEWAY_PORT=42617
+
+WORKDIR /zeroclaw-data
+EXPOSE 42617
+HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
+    CMD ["zeroclaw", "status", "--format=exit-code"]
+ENTRYPOINT ["zeroclaw"]
+CMD ["daemon"]
+
+# ── Stage 4: Production Runtime (Distroless, no shell/python) ─
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
