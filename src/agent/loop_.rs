@@ -8848,10 +8848,12 @@ Let me check the result."#;
             "Native prompt must not contain XML protocol header"
         );
 
-        // Positive: native prompt should still list tools and contain task instructions
+        // When native tools are supported, tool definitions are sent via the
+        // API "tools" field — they must NOT also appear in the system prompt
+        // (see issue #5728).
         assert!(
-            system_prompt.contains("shell"),
-            "Native prompt must list tool names"
+            !system_prompt.contains("## Tools"),
+            "Native prompt must not contain ## Tools section (tools sent via API field)"
         );
         assert!(
             system_prompt.contains("## Your Task"),

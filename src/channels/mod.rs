@@ -3858,7 +3858,10 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     );
 
     // ── 1. Tooling ──────────────────────────────────────────────
-    if !tools.is_empty() {
+    // When the provider supports native tools, tool definitions are sent via
+    // the API "tools" field.  Skip system-prompt injection to avoid
+    // duplicating them (see issue #5728).
+    if !native_tools && !tools.is_empty() {
         prompt.push_str("## Tools\n\n");
         if compact_context {
             // Compact mode: tool names only, no descriptions/schemas
