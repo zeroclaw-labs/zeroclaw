@@ -314,6 +314,10 @@ pub fn merge_deltas_lww(
             crate::memory::sync::DeltaOperation::CompiledTruthUpdate { memory_key, .. } => {
                 format!("truth_{memory_key}")
             }
+            // v6 vault doc deltas: uuid is already globally unique.
+            crate::memory::sync::DeltaOperation::VaultDocUpsert { uuid, .. } => {
+                format!("vault_{uuid}")
+            }
         };
 
         match winners.get(&key) {
@@ -418,6 +422,7 @@ mod tests {
                 key: format!("key_{seq}"),
                 content: format!("value_{seq}"),
                 category: "general".into(),
+                embedding: None,
             },
             timestamp: 1000 + seq,
         }
@@ -573,6 +578,7 @@ mod tests {
                 key: "k".into(),
                 content: "old".into(),
                 category: "core".into(),
+                embedding: None,
             },
             timestamp: 1000,
         };
@@ -584,6 +590,7 @@ mod tests {
                 key: "k".into(),
                 content: "new".into(),
                 category: "core".into(),
+                embedding: None,
             },
             timestamp: 2000,
         };
@@ -602,6 +609,7 @@ mod tests {
                 key: "k".into(),
                 content: "from_aaa".into(),
                 category: "core".into(),
+                embedding: None,
             },
             timestamp: 1000,
         };
@@ -613,6 +621,7 @@ mod tests {
                 key: "k".into(),
                 content: "from_zzz".into(),
                 category: "core".into(),
+                embedding: None,
             },
             timestamp: 1000,
         };
@@ -631,6 +640,7 @@ mod tests {
                 key: "shared".into(),
                 content: "from_a".into(),
                 category: "core".into(),
+                embedding: None,
             },
             timestamp: 1000,
         }];
@@ -643,6 +653,7 @@ mod tests {
                 key: "shared".into(),
                 content: "from_b".into(),
                 category: "core".into(),
+                embedding: None,
             },
             timestamp: 2000, // newer
         }];
@@ -665,6 +676,7 @@ mod tests {
                 key: "key_a".into(),
                 content: "val_a".into(),
                 category: "core".into(),
+                embedding: None,
             },
             timestamp: 1000,
         }];
@@ -677,6 +689,7 @@ mod tests {
                 key: "key_b".into(),
                 content: "val_b".into(),
                 category: "core".into(),
+                embedding: None,
             },
             timestamp: 2000,
         }];

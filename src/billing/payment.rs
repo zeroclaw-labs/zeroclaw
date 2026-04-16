@@ -207,6 +207,31 @@ pub struct KakaoPayAmount {
     pub total: u32,
 }
 
+// ── Credit reservation handle ────────────────────────────────────
+
+/// Opaque handle returned by [`PaymentManager::reserve_credits`].
+///
+/// Wraps the UUID so callers cannot accidentally confuse reservation IDs with
+/// other string identifiers, and so we can add structure (e.g. expiry) later
+/// without breaking callers. Committing or cancelling a reservation consumes
+/// the handle semantically, but we accept `&ReservationId` to keep the
+/// idempotent retry story simple — the DB layer is the source of truth.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ReservationId(pub String);
+
+impl ReservationId {
+    /// String view — useful when threading the id through logs or APIs.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ReservationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 // ── Payment manager ──────────────────────────────────────────────
 
 /// Payment manager with SQLite persistence.
@@ -263,7 +288,26 @@ impl PaymentManager {
                     total_purchased INTEGER NOT NULL DEFAULT 0,
                     total_spent INTEGER NOT NULL DEFAULT 0,
                     updated_at INTEGER NOT NULL
-                );",
+                );
+
+                -- PR #7 credit reservation ledger. A reservation moves credits
+                -- out of `credit_balances.balance` into `reserved_amount` at
+                -- reserve_credits() time (atomic UPDATE … WHERE balance >= ?),
+                -- then commit_reservation() settles the actual cost back
+                -- against total_spent and refunds the unused portion to the
+                -- balance. status transitions: 'open' → 'committed' / 'cancelled'.
+                CREATE TABLE IF NOT EXISTS credit_reservations (
+                    reservation_id   TEXT PRIMARY KEY,
+                    user_id          TEXT NOT NULL,
+                    reserved_amount  INTEGER NOT NULL,
+                    committed_amount INTEGER,
+                    status           TEXT NOT NULL DEFAULT 'open'
+                                      CHECK(status IN ('open','committed','cancelled')),
+                    created_at       INTEGER NOT NULL,
+                    settled_at       INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_credit_reservations_user
+                    ON credit_reservations(user_id, status);",
             )?;
             Some(conn)
         } else {
@@ -583,6 +627,184 @@ impl PaymentManager {
         }
 
         self.get_balance(user_id)
+    }
+
+    /// Reserve credits for an operation whose final cost is not yet known
+    /// (typical case: an LLM call priced by token count — reserve the max,
+    /// commit the actual).
+    ///
+    /// Atomicity: the reservation deducts from `credit_balances.balance` in a
+    /// single `UPDATE … WHERE balance >= ?` statement, so concurrent
+    /// reservations can never drive the balance negative — the losing call
+    /// simply sees `updated == 0` and returns `Insufficient credits`. The
+    /// corresponding `credit_reservations` row is created afterwards inside
+    /// the same SQLite transaction so a partial failure never leaves orphan
+    /// reserved credits behind.
+    ///
+    /// Returns a `ReservationId` that must be passed to
+    /// [`PaymentManager::commit_reservation`] or
+    /// [`PaymentManager::cancel_reservation`]. Leaked reservations stay
+    /// visible in the `credit_reservations` table with `status = 'open'` so a
+    /// janitor job can sweep expired holds.
+    pub fn reserve_credits(
+        &self,
+        user_id: &str,
+        max_amount: u32,
+    ) -> anyhow::Result<ReservationId> {
+        if !self.enabled {
+            anyhow::bail!("Payment features are disabled");
+        }
+        if max_amount == 0 {
+            anyhow::bail!("Reservation amount must be positive");
+        }
+
+        let Some(ref conn) = self.conn else {
+            anyhow::bail!("Payment database not initialized");
+        };
+
+        let reservation_id = uuid::Uuid::new_v4().to_string();
+        let now = now_epoch();
+
+        // Atomic deduct-then-record inside a SQLite transaction so we can't
+        // end up with reserved credits that never show up in the ledger.
+        let tx = conn.unchecked_transaction()?;
+        let updated = tx.execute(
+            "UPDATE credit_balances
+                SET balance = balance - ?1,
+                    updated_at = ?2
+              WHERE user_id = ?3 AND balance >= ?1",
+            params![max_amount, now, user_id],
+        )?;
+        if updated == 0 {
+            let current = self.get_balance(user_id)?;
+            anyhow::bail!("Insufficient credits: required {max_amount}, available {current}");
+        }
+        tx.execute(
+            "INSERT INTO credit_reservations
+                 (reservation_id, user_id, reserved_amount, status, created_at)
+             VALUES (?1, ?2, ?3, 'open', ?4)",
+            params![reservation_id, user_id, max_amount, now],
+        )?;
+        tx.commit()?;
+
+        Ok(ReservationId(reservation_id))
+    }
+
+    /// Settle a reservation with the actual amount consumed. Refunds the
+    /// unused portion `(reserved - actual)` back to the balance and records
+    /// `actual` against `total_spent`.
+    ///
+    /// Idempotent: committing a reservation twice returns the current
+    /// balance without re-applying the settlement. `actual > reserved` is
+    /// rejected — callers must cover extra spend with a fresh reservation.
+    pub fn commit_reservation(
+        &self,
+        reservation: &ReservationId,
+        actual_amount: u32,
+    ) -> anyhow::Result<u32> {
+        if !self.enabled {
+            anyhow::bail!("Payment features are disabled");
+        }
+
+        let Some(ref conn) = self.conn else {
+            anyhow::bail!("Payment database not initialized");
+        };
+
+        let now = now_epoch();
+        let tx = conn.unchecked_transaction()?;
+
+        let (user_id, reserved, status): (String, u32, String) = tx.query_row(
+            "SELECT user_id, reserved_amount, status
+               FROM credit_reservations
+              WHERE reservation_id = ?1",
+            params![reservation.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+
+        if status == "committed" {
+            tx.commit()?;
+            return self.get_balance(&user_id);
+        }
+        if status == "cancelled" {
+            tx.commit()?;
+            anyhow::bail!("Reservation already cancelled");
+        }
+        if actual_amount > reserved {
+            tx.commit()?;
+            anyhow::bail!(
+                "Actual amount {actual_amount} exceeds reserved {reserved}; open a second reservation for the excess"
+            );
+        }
+
+        let refund = reserved - actual_amount;
+        if refund > 0 || actual_amount > 0 {
+            tx.execute(
+                "UPDATE credit_balances
+                    SET balance = balance + ?1,
+                        total_spent = total_spent + ?2,
+                        updated_at = ?3
+                  WHERE user_id = ?4",
+                params![refund, actual_amount, now, user_id],
+            )?;
+        }
+        tx.execute(
+            "UPDATE credit_reservations
+                SET status = 'committed',
+                    committed_amount = ?1,
+                    settled_at = ?2
+              WHERE reservation_id = ?3",
+            params![actual_amount, now, reservation.0],
+        )?;
+        tx.commit()?;
+
+        self.get_balance(&user_id)
+    }
+
+    /// Cancel an open reservation and refund the full reserved amount.
+    /// Idempotent: cancelling a cancelled or committed reservation returns
+    /// the current balance without re-refunding.
+    pub fn cancel_reservation(&self, reservation: &ReservationId) -> anyhow::Result<u32> {
+        if !self.enabled {
+            anyhow::bail!("Payment features are disabled");
+        }
+
+        let Some(ref conn) = self.conn else {
+            anyhow::bail!("Payment database not initialized");
+        };
+
+        let now = now_epoch();
+        let tx = conn.unchecked_transaction()?;
+
+        let (user_id, reserved, status): (String, u32, String) = tx.query_row(
+            "SELECT user_id, reserved_amount, status
+               FROM credit_reservations
+              WHERE reservation_id = ?1",
+            params![reservation.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+
+        if status != "open" {
+            tx.commit()?;
+            return self.get_balance(&user_id);
+        }
+
+        tx.execute(
+            "UPDATE credit_balances
+                SET balance = balance + ?1,
+                    updated_at = ?2
+              WHERE user_id = ?3",
+            params![reserved, now, user_id],
+        )?;
+        tx.execute(
+            "UPDATE credit_reservations
+                SET status = 'cancelled',
+                    settled_at = ?1
+              WHERE reservation_id = ?2",
+            params![now, reservation.0],
+        )?;
+        tx.commit()?;
+
+        self.get_balance(&user_id)
     }
 
     /// List payment history for a user, ordered by most recent first.
@@ -984,5 +1206,174 @@ mod tests {
             .initiate_payment("zeroclaw_user", "basic_1000")
             .unwrap();
         assert_eq!(request.cid, "PRODUCTION_CID");
+    }
+
+    // ── PR #7 credit reservation (TOCTOU atomicity) ──────────────
+
+    /// Bootstrap a manager with `credits` already credited to
+    /// `zeroclaw_user` via the standard purchase flow — avoids hand-rolled
+    /// INSERTs that could drift from the production schema.
+    fn make_funded_manager(credits: u32) -> (TempDir, PaymentManager) {
+        let (tmp, manager) = make_manager();
+        manager
+            .add_bonus_credits("zeroclaw_user", credits)
+            .unwrap();
+        assert_eq!(manager.get_balance("zeroclaw_user").unwrap(), credits);
+        (tmp, manager)
+    }
+
+    #[test]
+    fn reserve_then_commit_at_actual_refunds_unused() {
+        let (_tmp, manager) = make_funded_manager(1000);
+
+        let rid = manager.reserve_credits("zeroclaw_user", 400).unwrap();
+        assert_eq!(manager.get_balance("zeroclaw_user").unwrap(), 600);
+
+        let final_balance = manager.commit_reservation(&rid, 150).unwrap();
+        assert_eq!(final_balance, 600 + 250); // 400 reserved - 150 actual = 250 refund
+    }
+
+    #[test]
+    fn reserve_exact_cost_leaves_no_refund() {
+        let (_tmp, manager) = make_funded_manager(1000);
+
+        let rid = manager.reserve_credits("zeroclaw_user", 250).unwrap();
+        let final_balance = manager.commit_reservation(&rid, 250).unwrap();
+        assert_eq!(final_balance, 750);
+    }
+
+    #[test]
+    fn cancel_reservation_returns_reserved_amount() {
+        let (_tmp, manager) = make_funded_manager(1000);
+
+        let rid = manager.reserve_credits("zeroclaw_user", 400).unwrap();
+        assert_eq!(manager.get_balance("zeroclaw_user").unwrap(), 600);
+        let final_balance = manager.cancel_reservation(&rid).unwrap();
+        assert_eq!(final_balance, 1000);
+    }
+
+    #[test]
+    fn reserve_more_than_balance_fails_and_preserves_balance() {
+        let (_tmp, manager) = make_funded_manager(100);
+        let err = manager
+            .reserve_credits("zeroclaw_user", 500)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Insufficient credits"), "got: {err}");
+        assert_eq!(manager.get_balance("zeroclaw_user").unwrap(), 100);
+    }
+
+    #[test]
+    fn commit_cannot_exceed_reservation() {
+        let (_tmp, manager) = make_funded_manager(1000);
+
+        let rid = manager.reserve_credits("zeroclaw_user", 100).unwrap();
+        let err = manager
+            .commit_reservation(&rid, 250)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds reserved"), "got: {err}");
+    }
+
+    #[test]
+    fn double_commit_is_idempotent() {
+        let (_tmp, manager) = make_funded_manager(1000);
+
+        let rid = manager.reserve_credits("zeroclaw_user", 400).unwrap();
+        manager.commit_reservation(&rid, 150).unwrap();
+        let balance = manager.commit_reservation(&rid, 999).unwrap();
+        assert_eq!(balance, 850); // second commit is a no-op; balance unchanged
+    }
+
+    #[test]
+    fn cancel_after_commit_is_no_op() {
+        let (_tmp, manager) = make_funded_manager(1000);
+
+        let rid = manager.reserve_credits("zeroclaw_user", 400).unwrap();
+        manager.commit_reservation(&rid, 150).unwrap();
+        let balance = manager.cancel_reservation(&rid).unwrap();
+        assert_eq!(balance, 850);
+    }
+
+    /// Acceptance criterion: 10 concurrent reservations against a balance
+    /// that can satisfy only some of them must never produce a negative
+    /// balance. The winners deduct cleanly; the losers see
+    /// `Insufficient credits`; the final balance matches `initial - sum(winners)`.
+    #[test]
+    fn fuzz_concurrent_reservations_never_go_negative() {
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        // Bootstrap shared DB with 100 credits via a short-lived manager.
+        {
+            let seed = PaymentManager::new(
+                tmp.path(),
+                Some("test-admin-key".to_string()),
+                "https://zeroclaw.example.com",
+                true,
+            )
+            .unwrap();
+            seed.add_bonus_credits("zeroclaw_user", 100).unwrap();
+        }
+
+        let workspace = StdArc::new(tmp.path().to_path_buf());
+        let winners = StdArc::new(std::sync::atomic::AtomicU32::new(0));
+
+        // 10 threads each try to reserve 30 credits. Balance is 100, so at
+        // most 3 can succeed (90 reserved), the other 7 must fail.
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let ws = StdArc::clone(&workspace);
+                let winners = StdArc::clone(&winners);
+                thread::spawn(move || {
+                    // Fresh Connection per thread — Connection is !Sync so we
+                    // cannot share one. WAL + busy_timeout handles contention.
+                    let m = PaymentManager::new(
+                        ws.as_path(),
+                        Some("test-admin-key".to_string()),
+                        "https://zeroclaw.example.com",
+                        true,
+                    )
+                    .unwrap();
+                    if m.reserve_credits("zeroclaw_user", 30).is_ok() {
+                        winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let won = winners.load(std::sync::atomic::Ordering::SeqCst);
+        let verifier = PaymentManager::new(
+            workspace.as_path(),
+            Some("test-admin-key".to_string()),
+            "https://zeroclaw.example.com",
+            true,
+        )
+        .unwrap();
+        let remaining = verifier.get_balance("zeroclaw_user").unwrap();
+
+        assert!(
+            won >= 1 && won <= 3,
+            "expected 1..=3 winners for 30-credit reservations against 100-credit balance, got {won}"
+        );
+        assert_eq!(
+            remaining,
+            100 - won * 30,
+            "balance must equal initial minus winner deductions; never negative"
+        );
+    }
+
+    #[test]
+    fn commit_with_zero_actual_refunds_everything_and_records_no_spend() {
+        let (_tmp, manager) = make_funded_manager(1000);
+
+        let rid = manager.reserve_credits("zeroclaw_user", 200).unwrap();
+        let balance = manager.commit_reservation(&rid, 0).unwrap();
+        assert_eq!(balance, 1000);
     }
 }

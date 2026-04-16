@@ -113,7 +113,13 @@ ring = "0.17"
 prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
 
 # Memory / persistence
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", default-features = false }
+# PR #7 r2d2 pool — connection pooling for SqliteMemory's hot path.
+# Replaces the single-writer Arc<Mutex<Connection>> pattern with a
+# pool of up to 8 connections so WAL-mode reads can parallelise.
+# Writes are still serialised by SQLite's own page lock + busy_timeout.
+r2d2 = "0.8"
+r2d2_sqlite = "0.31"
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 tokio-postgres-rustls = { version = "0.13", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
@@ -171,6 +177,16 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = ["
 # Serial port for peripheral communication (STM32, etc.)
 tokio-serial = { version = "5", default-features = false, optional = true }
 
+# Local embedding (fastembed + ONNX Runtime). Optional — enable via
+# `--features embedding-local`. Pulls in ~200MB of ONNX Runtime native
+# dependencies and downloads the BGE-M3 weights (~1.1GB) to
+# `~/.moa/embedding-models/` on first use. Default build stays lean.
+#
+# Pinned to 5.8 because 5.9+ depends on `ort 2.0.0-rc.11+` which bumps
+# the rustc MSRV to 1.88 — the repo-wide MSRV is 1.87 per Cargo.toml
+# `rust-version`. Unpinning on the next MSRV bump is a one-liner.
+fastembed = { version = "=5.8.0", optional = true }
+
 # MQTT subscriber for IoT/home-automation event ingestion via src/dispatch/.
 # Used by src/dispatch/mqtt.rs to subscribe to broker topics and publish each
 # message into the EventRouter. rustls TLS support pulls in the same backend
@@ -218,7 +234,20 @@ libc = "0.2"
 
 [features]
 # Keep default minimal for widest host compatibility (including macOS 10.15).
-default = []
+# `sqlite-bundled` ships the usual bundled SQLite static build. Callers who
+# want SQLCipher instead must pass `--no-default-features --features
+# memory-sqlcipher` at build time because the two rusqlite C bundles
+# (plain SQLite vs. SQLCipher+OpenSSL) cannot coexist — an opt-in swap
+# is the standard rusqlite ergonomic.
+default = ["sqlite-bundled"]
+sqlite-bundled = ["rusqlite/bundled"]
+# PR #5 — on-disk encryption of memory/vault state using SQLCipher.
+# Pulls in a vendored OpenSSL so the resulting binary is self-contained;
+# adds ~2 MB of native code. The keyed constructor
+# `SqliteMemory::with_options_keyed` issues `PRAGMA key = '…'` so every
+# page write is AES-256 encrypted at rest. See
+# docs/security/embedding-privacy.md for the five-step rollout plan.
+memory-sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
@@ -247,6 +276,9 @@ wasm-tools = ["dep:wasmtime", "dep:wasmtime-wasi"]
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
 # mqtt = MQTT subscriber wired to src/dispatch/EventRouter for IoT events
 mqtt = ["dep:rumqttc"]
+# embedding-local = on-device BGE-M3 via fastembed + ONNX Runtime.
+# Powers the server-non-storage E2E patent by keeping raw text off the network.
+embedding-local = ["dep:fastembed"]
 # Optional provider feature flags used by cfg(feature = "...") guards.
 # Keep disabled by default to preserve current runtime behavior.
 firecrawl = []

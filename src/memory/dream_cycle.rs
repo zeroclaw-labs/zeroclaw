@@ -84,6 +84,12 @@ pub struct DreamCycleReport {
     pub duplicates_found: usize,
     /// Whether hot cache was refreshed.
     pub cache_refreshed: bool,
+    /// PR #6 wire-up — number of memories soft-archived by the decay sweep.
+    pub decayed_archived: usize,
+    /// PR #6 wire-up — number of clusters consolidated (sources soft-archived).
+    pub consolidated: usize,
+    /// PR #6 wire-up — number of clusters whose summariser flagged a conflict.
+    pub conflicts_flagged: usize,
     /// Errors encountered (non-fatal).
     pub errors: Vec<String>,
 }
@@ -134,11 +140,31 @@ pub fn is_leader(state: &DeviceState) -> bool {
 /// Run the Dream Cycle consolidation tasks.
 ///
 /// Call this only after `check_idle_conditions` and `is_leader` return true.
+///
+/// `ontology` is the optional PR #9 community-embedding backfill target.
+/// When provided, the dream cycle fills in `summary_embedding` for any
+/// `ontology_communities` rows whose summary exists but whose embedding
+/// is still NULL (the VaultScheduler writes the summary-less skeleton;
+/// the LLM-driven summariser + this backfill are the two halves of the
+/// Phase 5 data). Pass `None` for vault-only deployments.
 pub async fn run_dream_cycle(
     memory: &SqliteMemory,
     provider: &dyn Provider,
     config: &DreamCycleConfig,
     device_id: &str,
+) -> Result<DreamCycleReport> {
+    run_dream_cycle_with_ontology(memory, provider, config, device_id, None).await
+}
+
+/// Variant of [`run_dream_cycle`] that accepts an optional ontology repo
+/// for Phase 5 embedding backfill. Existing callers stay on the wrapper
+/// above so this does not turn into a signature-churn PR.
+pub async fn run_dream_cycle_with_ontology(
+    memory: &SqliteMemory,
+    provider: &dyn Provider,
+    config: &DreamCycleConfig,
+    device_id: &str,
+    ontology: Option<&crate::ontology::OntologyRepo>,
 ) -> Result<DreamCycleReport> {
     let mut report = DreamCycleReport::default();
 
@@ -175,6 +201,88 @@ pub async fn run_dream_cycle(
     // Task 3: Hot cache refresh is handled by the HotMemoryCache itself
     // We just signal that the cycle ran so callers can trigger a refresh.
     report.cache_refreshed = true;
+
+    // Task 4 (PR #6 wire-up): forgetting-curve decay sweep.
+    // Runs every cycle; cheap (one SQL pass), idempotent, never archives
+    // identity-category memories (INFINITY half-life is hardwired).
+    match memory.run_decay_sweep() {
+        Ok(n) => {
+            report.decayed_archived = n;
+            if n > 0 {
+                tracing::info!("Dream Cycle: decay sweep archived {n} memories");
+            }
+        }
+        Err(e) => {
+            let msg = format!("Dream Cycle decay sweep failed: {e}");
+            tracing::warn!("{msg}");
+            report.errors.push(msg);
+        }
+    }
+
+    // Task 6 (PR #9 wire-up): community embedding backfill. When an
+    // OntologyRepo is provided, fill in summary_embedding for any
+    // level-0 community whose summary exists but whose embedding is
+    // still NULL. Cheap: one SELECT + N embed calls + N UPDATEs, and
+    // re-embedding is idempotent (the hot path doesn't re-read until
+    // the next tick).
+    if let Some(repo) = ontology {
+        match repo.list_communities_needing_embedding() {
+            Ok(pending) => {
+                let mut embedded = 0usize;
+                for (cid, level, summary) in pending {
+                    match memory.query_embedding(&summary).await {
+                        Some(emb) if !emb.is_empty() => {
+                            if let Err(e) = repo.set_community_embedding(level, cid, &emb) {
+                                tracing::warn!(cid, "set_community_embedding failed: {e}");
+                            } else {
+                                embedded += 1;
+                            }
+                        }
+                        _ => {
+                            // No embedder configured (Noop) or
+                            // compute failed — skip this community,
+                            // try again next cycle.
+                        }
+                    }
+                }
+                if embedded > 0 {
+                    tracing::info!("Dream Cycle: embedded {embedded} community summaries");
+                }
+            }
+            Err(e) => {
+                let msg = format!("Dream Cycle community backfill failed: {e}");
+                tracing::warn!("{msg}");
+                report.errors.push(msg);
+            }
+        }
+    }
+
+    // Task 5 (PR #6 wire-up): semantic consolidation.
+    // Clusters near-duplicate memories and asks an LLM to summarise each
+    // cluster into a single semantic_fact. Source rows are soft-archived
+    // so the user can recover them through the archive UI.
+    //
+    // Uses the configured recompile_model + provider as the summariser —
+    // matches the pattern recompile_stale_truths already established
+    // (one model handles all sleep-cycle LLM tasks for cost predictability).
+    match consolidate_clusters(memory, provider, config).await {
+        Ok((consolidated, conflicts)) => {
+            report.consolidated = consolidated;
+            report.conflicts_flagged = conflicts;
+            if consolidated > 0 {
+                tracing::info!(
+                    consolidated,
+                    conflicts,
+                    "Dream Cycle: consolidated {consolidated} clusters"
+                );
+            }
+        }
+        Err(e) => {
+            let msg = format!("Dream Cycle consolidation failed: {e}");
+            tracing::warn!("{msg}");
+            report.errors.push(msg);
+        }
+    }
 
     tracing::info!(
         recompiled = report.recompiled,
@@ -282,6 +390,128 @@ async fn recompile_one(
 
     tracing::debug!(memory_key, "Recompiled truth (v+1)");
     Ok(())
+}
+
+/// PR #6 wire-up — drive the consolidate pipeline with an LLM-backed
+/// summariser. Returns `(consolidated_clusters, conflict_count)`.
+///
+/// Bounds the work per cycle by `config.max_duplicate_checks` so a
+/// runaway corpus can't blow the cycle past its time budget — the
+/// summariser is the expensive step.
+async fn consolidate_clusters(
+    memory: &SqliteMemory,
+    provider: &dyn Provider,
+    config: &DreamCycleConfig,
+) -> Result<(usize, usize)> {
+    use super::consolidate::{consolidate_candidates, ConsolidationOutcome};
+
+    let mut candidates = memory.collect_consolidation_candidates(1)?;
+    if candidates.is_empty() {
+        return Ok((0, 0));
+    }
+    // Cap the input so a huge corpus doesn't translate into a huge LLM
+    // bill in a single cycle. We sort by id (stable) then truncate.
+    candidates.sort_by_key(|c| c.id.clone());
+    if candidates.len() > config.max_duplicate_checks {
+        candidates.truncate(config.max_duplicate_checks);
+    }
+
+    let summariser = LlmConsolidator {
+        provider,
+        model: config.recompile_model.clone(),
+    };
+    let report =
+        consolidate_candidates(&candidates, config.duplicate_threshold, &summariser).await;
+
+    let mut consolidated = 0usize;
+    let mut conflicts = 0usize;
+    for outcome in &report.outcomes {
+        if let Err(e) = memory.apply_consolidation_outcome(outcome) {
+            tracing::warn!(?outcome, "apply_consolidation_outcome failed: {e}");
+            continue;
+        }
+        consolidated += 1;
+        if outcome.conflict {
+            conflicts += 1;
+        }
+    }
+    for err in &report.errors {
+        tracing::warn!("consolidation cluster error: {err}");
+    }
+    Ok((consolidated, conflicts))
+}
+
+/// LLM-backed summariser used by [`consolidate_clusters`]. Mirrors the
+/// system-prompt structure from `recompile_one` so a single model
+/// handles every sleep-cycle LLM task.
+struct LlmConsolidator<'a> {
+    provider: &'a dyn Provider,
+    model: String,
+}
+
+#[async_trait::async_trait]
+impl<'a> super::consolidate::Summarizer for LlmConsolidator<'a> {
+    async fn summarise(
+        &self,
+        cluster: &[&super::consolidate::CandidateMemory],
+    ) -> anyhow::Result<super::consolidate::SummaryOutcome> {
+        // Build the cluster prompt — number each member so the LLM can cite
+        // contradictions back by index.
+        let mut bullets = String::new();
+        for (i, c) in cluster.iter().enumerate() {
+            use std::fmt::Write;
+            let trimmed: String = c.content.chars().take(500).collect();
+            let _ = writeln!(bullets, "[{}] (key={}): {}", i + 1, c.key, trimmed);
+        }
+
+        let system_prompt = "You are a memory consolidation assistant. \
+            Given a cluster of near-duplicate memories about the same topic, \
+            return ONE concise factual summary that captures the consensus. \
+            Preserve names, dates, numbers. \
+            If members disagree on a key fact, prefix your summary with \
+            'CONFLICT:' on the first line and list the contradicting key=... \
+            identifiers (comma-separated) on the second line, then write the \
+            best-effort summary on subsequent lines. \
+            Output ONLY the summary text — no meta-commentary.";
+
+        let user_msg = format!("Cluster members:\n{bullets}");
+
+        let raw = self
+            .provider
+            .chat_with_system(Some(system_prompt), &user_msg, &self.model, 0.2)
+            .await?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("LLM returned empty consolidation summary");
+        }
+
+        // Detect the CONFLICT: prefix and parse contradicting keys list.
+        if let Some(rest) = trimmed.strip_prefix("CONFLICT:") {
+            let mut lines = rest.lines();
+            let _ = lines.next(); // blank or trailing on the prefix line
+            let keys_line = lines.next().unwrap_or("").trim();
+            let summary = lines.collect::<Vec<&str>>().join("\n").trim().to_string();
+            let contradicting_keys: Vec<String> = keys_line
+                .split(',')
+                .filter_map(|s| {
+                    let s = s.trim().trim_start_matches("key=");
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s.to_string())
+                    }
+                })
+                .collect();
+            return Ok(super::consolidate::SummaryOutcome::Conflict {
+                summary,
+                contradicting_keys,
+            });
+        }
+
+        Ok(super::consolidate::SummaryOutcome::Consensus {
+            summary: trimmed.to_string(),
+        })
+    }
 }
 
 /// Detect near-duplicate memories based on embedding similarity.

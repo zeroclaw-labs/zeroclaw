@@ -672,6 +672,7 @@ mod tests {
                     key: "synced_key".into(),
                     content: "synced_value".into(),
                     category: "core".into(),
+                    embedding: None,
                 },
                 timestamp: 9999,
             }],

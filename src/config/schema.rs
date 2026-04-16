@@ -4206,6 +4206,55 @@ impl Default for QdrantConfig {
     }
 }
 
+/// PR #4 cross-encoder reranker settings (`[memory.rerank]`).
+///
+/// When `enabled = true` and the binary is built with
+/// `--features embedding-local`, `recall_with_variations` applies a BGE
+/// cross-encoder pass after RRF fusion. The pass picks the top
+/// `top_k_before` candidates, scores them, and returns the top
+/// `top_k_after`. On low-end devices where the 560 MB reranker weights are
+/// prohibitive, leave this disabled and the retrieval pipeline degrades to
+/// pure RRF + language-adaptive weights (see `vault::normalize::adaptive_weights`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RerankConfig {
+    /// Master switch. Default off so existing installs opt in explicitly.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Cross-encoder model identifier. Currently recognised:
+    /// `"bge-reranker-v2-m3"` (default), `"bge-reranker-base"`,
+    /// `"jina-reranker-v2-base-multilingual"`.
+    #[serde(default = "default_rerank_model")]
+    pub model: String,
+    /// Upper bound on the candidate window fed into the reranker. Anything
+    /// further down the RRF list is never scored — keeps p95 bounded.
+    #[serde(default = "default_rerank_top_k_before")]
+    pub top_k_before: usize,
+    /// Final list length returned to the caller. Must be ≤ `top_k_before`.
+    #[serde(default = "default_rerank_top_k_after")]
+    pub top_k_after: usize,
+}
+
+fn default_rerank_model() -> String {
+    "bge-reranker-v2-m3".into()
+}
+fn default_rerank_top_k_before() -> usize {
+    50
+}
+fn default_rerank_top_k_after() -> usize {
+    10
+}
+
+impl Default for RerankConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: default_rerank_model(),
+            top_k_before: default_rerank_top_k_before(),
+            top_k_after: default_rerank_top_k_after(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
@@ -4298,6 +4347,10 @@ pub struct MemoryConfig {
     /// None = wait indefinitely (default). Recommended max: 300.
     #[serde(default)]
     pub sqlite_open_timeout_secs: Option<u64>,
+
+    /// PR #4 cross-encoder rerank settings (`[memory.rerank]`).
+    #[serde(default)]
+    pub rerank: RerankConfig,
 
     /// SQLite journal mode: "wal" (default) or "delete".
     ///
@@ -4409,6 +4462,7 @@ impl Default for MemoryConfig {
             auto_hydrate: true,
             sqlite_open_timeout_secs: None,
             sqlite_journal_mode: default_sqlite_journal_mode(),
+            rerank: RerankConfig::default(),
             qdrant: QdrantConfig::default(),
         }
     }

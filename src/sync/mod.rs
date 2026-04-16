@@ -14,6 +14,7 @@
 //! - Sync coordinator (end-to-end orchestration)
 
 pub mod coordinator;
+pub mod hlc;
 pub mod protocol;
 pub mod relay;
 

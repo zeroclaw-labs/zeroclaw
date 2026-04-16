@@ -221,6 +221,7 @@ mod tests {
                 "phone_numbers": ["+821012345678", "+821098765432"]
             }),
             owner_user_id: "user1".to_string(),
+            themes: vec![],
             created_at: 0,
             updated_at: 0,
         };
@@ -238,6 +239,7 @@ mod tests {
                 "phone": "010-1234-5678"
             }),
             owner_user_id: "user1".to_string(),
+            themes: vec![],
             created_at: 0,
             updated_at: 0,
         };
@@ -252,6 +254,7 @@ mod tests {
             title: Some("No Phone".to_string()),
             properties: serde_json::json!({}),
             owner_user_id: "user1".to_string(),
+            themes: vec![],
             created_at: 0,
             updated_at: 0,
         };

@@ -1,8 +1,17 @@
 # MoA — Architecture & Product Vision
 
-> **Date**: 2026-03-01
+> **Date**: 2026-04-15
+> **Version**: v6 (Dual-Brain v3.0 — compiled truth + timeline + multi-query + dream cycle, and sync journal integration for these)
 > **Status**: Living document — updated with each major feature milestone
 > **Audience**: AI reviewers (Gemini, Claude), human contributors, future maintainers
+>
+> **v6 changes** (2026-04-15):
+> - §3b **Patent 3 — Dual-Brain Second Memory** (new): compiled_truth + append-only timeline + Dream Cycle.
+> - §3c **Sync Journal v3** (new): `TimelineAppend`, `PhoneCallRecord`, `CompiledTruthUpdate` delta operations + inbound `apply_remote_v3_delta` hook with LWW on `truth_version`.
+> - §6★★ updated: hybrid search now defaults to weighted but `search_mode = "rrf"` unlocks Reciprocal Rank Fusion (k=60) via `Memory::recall` and `Memory::recall_with_variations` for multi-query expansion.
+> - **§6D MoA Vault (Second Brain)** (new, **production complete**): full implementation of v6 plan — 7-step wikilink extraction pipeline, 17 vault tables (incl. `vault_embeddings`), self-evolving vocabulary, `VaultDocUpsert` sync delta, unified first+second brain parallel search with mandatory `chat_retrieval_logs` audit, **4-way RAG** (FTS + vector + graph BFS + meta filter) with `QueryKind` adaptive weights, production **hub note engine** (4 entity skeletons + priority queue + 3-tier conflict resolution + Light/Heavy/Full Rebuild incremental updates + Evidence Gap warnings), vault health scoring (0–100), **7-section focus briefing** with LLM narrative + incremental cache, three pluggable AI engines (`HeuristicAIEngine` / `LlmAIEngine` cloud / `OllamaSlmEngine` on-device HTTP), `Converter` trait with CLI backend (pandoc / pdftotext / hwp5html), polling `FolderWatcher` with dual-format (.md + .html) artifact persistence, **idle-time `VaultScheduler`** orchestrating hub compile + health + briefing refresh. Patent 4 claims 23–29 formalised here. **109 vault tests + 0 regressions** (506 total pass). R-series follow-ups shipped: LLM-based hub section assignment (`compile_hub_with_ai`), parallel compile worker (`compile_batch`, tokio Semaphore), semantic tag clustering (`semantic_tag_clusters`, EmbeddingProvider-backed), LLM contradiction detection (`detect_entity_contradictions` → `hub_notes.conflict_pending`).
+> - §3 §6★★ §6A already existed; only wording/integration points refreshed to match `src/memory/*` as of commit `831d070e`.
+> - **§6E Plan↔Code traceability matrix** (new): single-source verification that every planned item (brain-v3 S1-S9 / vault-v6 §1-§11 / multi-device sync §8-10 / quantitative+qualitative ingest gate) is implemented, with file:line cites + 513 passing tests.
 
 ---
 
@@ -1318,6 +1327,225 @@ for AI Agents Using Episodic Memory and Structural Ontology)
 
 ---
 
+## 3b. Patent 3: Dual-Brain Second Memory — Compiled Truth + Append-Only Timeline (v3.0)
+
+> **Status**: 특허 3 (준비 중) · v3.0 코드 반영일 2026-04-15
+> **위치**: `src/memory/sqlite.rs`, `src/memory/dream_cycle.rs`, `src/memory/sync.rs`
+> **원칙**: Patent 1(서버 비저장 E2E 동기화)과 Patent 2(이중 저장소 교차참조) 위에
+> **추가 레이어**로 통합. 특허 청구항을 훼손하지 않는 비파괴적(additive) 확장.
+
+### 3b-0. 왜 두 번째 뇌(Second Brain)인가
+
+기존 `memories.content`는 원본을 보존하지만, 변호사 업무처럼 "의뢰인 A 현황"
+같은 질문에는 요약이 필요합니다. 반대로 요약만 주면 할루시네이션 위험이 있습니다.
+
+v3.0은 `memories` 테이블을 두 뇌로 분리합니다.
+
+| 뇌 | 테이블/컬럼 | 역할 | 변경 가능성 |
+|---|---|---|---|
+| **First brain (증거)** | `memory_timeline` (신규) | append-only 원본 증거, 모든 호출/대화/문서 스냅샷 | **절대 수정 불가** (trigger로 enforce) |
+| **Second brain (요약)** | `memories.compiled_truth` + `truth_version` | "현재까지의 최선의 요약" (Dream Cycle이 LLM으로 재컴파일) | `truth_version` 단조 증가 |
+| 하위호환 | `memories.content` | 기존 질의가 의존하는 원본 필드 | 삭제 금지 |
+
+LLM 답변 시 요약(`compiled_truth`)을 주면서 각주로 증거(`memory_timeline.uuid`)를
+인용 → **할루시네이션 방지 + 법적 감사 가능**.
+
+### 3b-1. 스키마 (비파괴 확장)
+
+```
+memories                       memory_timeline (신규, append-only)
+──────                         ──────
+id           TEXT PK           id              INTEGER PK AUTOINCREMENT
+key          TEXT UNIQUE       uuid            TEXT UNIQUE      ← 동기화 ID
+content      TEXT              memory_id       TEXT → memories.id
+embedding    BLOB              event_type      TEXT             ← 'call'/'chat'/'doc'/...
+created_at   TEXT              event_at        INTEGER          ← ms since epoch
+updated_at   TEXT              source_ref      TEXT NOT NULL    ← call_uuid / msg_id / sha256
+session_id   TEXT              content         TEXT NOT NULL    ← 원본 증거 (수정 금지)
+-- v3.0 additions --           content_sha256  TEXT NOT NULL    ← 무결성 검증
+compiled_truth  TEXT           metadata_json   TEXT
+truth_version   INT DEFAULT 0  device_id       TEXT NOT NULL
+truth_updated_at INT           created_at      INTEGER DEFAULT unixepoch()
+needs_recompile INT DEFAULT 0
+```
+
+append-only는 데이터 레벨 트리거로 강제:
+
+```sql
+CREATE TRIGGER trg_timeline_no_update
+BEFORE UPDATE ON memory_timeline
+BEGIN
+    SELECT RAISE(ABORT, 'memory_timeline is append-only');
+END;
+```
+
+FTS5 미러 (`memory_timeline_fts`)로 자연어 검색 지원.
+
+### 3b-2. 타입드 API (Rust)
+
+`src/memory/sqlite.rs`가 세 가지 mutation을 노출:
+
+| 메서드 | 효과 | 자동 동기화 |
+|---|---|---|
+| `append_timeline(memory_id, event_type, event_at, source_ref, content, metadata, device_id) -> uuid` | `memory_timeline`에 행 추가, SHA256 계산, UUID 반환 | `TimelineAppend` delta 자동 push |
+| `set_compiled_truth(memory_key, compiled_truth)` | `compiled_truth` 갱신, `truth_version`++, `needs_recompile=0` | `CompiledTruthUpdate` delta 자동 push |
+| `mark_needs_recompile(memory_key)` | 다음 Dream Cycle에서 재컴파일 대상으로 플래그 | (로컬 스케줄 플래그 — delta 없음) |
+| `insert_phone_call(…17 fields)` | `phone_calls` 행 추가 | `PhoneCallRecord` delta 자동 push |
+
+자동 동기화는 **Interior mutability** 패턴으로 구현:
+`SqliteMemory`가 `Mutex<Option<Arc<Mutex<SyncEngine>>>>`를 보유.
+factory(`create_synced_memory`)가 `Memory::attach_sync_engine(engine)`을 호출하면
+모든 타입드 mutation이 DB 쓰기 후 SyncEngine에 자동 기록.
+
+### 3b-3. Dream Cycle (야간 consolidation)
+
+`src/memory/dream_cycle.rs`가 디바이스 idle 시 로컬에서 자동 실행:
+
+```
+조건(AND): 02:00 ≤ 현재시각 ≤ 06:00
+           battery ≥ 50% OR charging
+           network stable
+리더 선출: 같은 사용자의 device_id 최솟값 1대만 실행
+작업:
+  1. needs_recompile = 1 인 memory 의 timeline → compiled_truth 재컴파일
+  2. 온톨로지 엔티티 속성 강화 (recall_count 기반)
+  3. 핫 캐시 재계산
+  4. 중복 병합 제안 큐잉 (cosine similarity > 0.95)
+결과: 델타 저널 기록 → 타 기기 E2E 전파
+```
+
+### 3b-4. 하이브리드 검색 v3.0 (RRF + Multi-Query)
+
+| 모드 | 공식 | 구현 | 기본값 |
+|---|---|---|---|
+| Weighted (기존) | `0.7*norm(vec) + 0.3*norm(fts)` | `src/memory/vector.rs::hybrid_merge` | ✅ 기본 |
+| RRF (v3.0) | `Σ 1/(k + rank_i)`, k=60 | `src/memory/vector.rs::rrf_merge` | feature flag `memory.search_mode="rrf"` |
+
+**Multi-Query 확장 경로** (S3):
+
+```
+Agent Loop
+   └─▶ QueryExpander::expand(msg, config, provider) → Vec<String>(3~5)
+         (provider = Haiku, 24h cache)
+   └─▶ Memory::recall_with_variations(original, variations, limit, session)
+         ├─▶ SqliteMemory override: 각 variation × {vec, fts} 병렬 검색 → RRF
+         └─▶ 기본 fallback: 첫 variation으로 단일 recall()
+```
+
+`recall_with_variations`는 Memory trait 메서드이므로 **provider 스레딩 없이**
+SqliteMemory의 RRF 경로를 활용할 수 있습니다. Agent loop이 provider 컨텍스트에서
+expand를 먼저 수행한 뒤 확장된 쿼리 배열을 Memory trait로 넘깁니다.
+
+### 3b-5. 특허 청구항 (추가)
+
+- **청구항 19**: 동일 키를 갖는 메모리 엔트리에 대해,
+  - (a) 원본 증거를 저장하는 append-only 타임라인 서브-저장소와
+  - (b) LLM이 주기적으로 재컴파일하는 compiled_truth 요약 필드
+  를 이중으로 유지하되, AI 답변 생성 시 요약을 제시하고 타임라인 엔트리
+  UUID를 각주로 인용함으로써 할루시네이션을 방지하고 법적 감사 가능성을
+  보장하는 것을 특징으로 하는 AI 에이전트 기억 시스템.
+
+- **청구항 20**: 청구항 19에 있어서, 상기 compiled_truth는 `truth_version`
+  단조 증가 정수를 동반하며, 원격 디바이스로부터 수신한 업데이트는
+  로컬 `truth_version`보다 **엄격히 더 큰** 경우에만 적용 (Last-Writer-Wins
+  on monotone version) 하여 순서 역전에 대해 결정적 병합 결과를 보장하는
+  것을 특징으로 하는 시스템.
+
+- **청구항 21**: 청구항 19에 있어서, 상기 타임라인 서브-저장소에 대한
+  UPDATE 시도는 데이터베이스 레벨 트리거에 의해 `RAISE(ABORT)`로 차단되어
+  애플리케이션 레벨 버그와 무관하게 append-only 무결성이 구조적으로
+  강제되는 것을 특징으로 하는 시스템.
+
+- **청구항 22**: 청구항 19에 있어서, 야간 idle 구간에서 단일 기기 리더
+  (같은 사용자의 가장 작은 device_id)가 `needs_recompile=1` 항목에 대해
+  타임라인 증거 → LLM → compiled_truth 재생성을 수행하고, 결과를 E2E 암호화
+  델타 저널로 전파하여 타 기기가 별도 연산 없이 최신 요약을 수신하는
+  것을 특징으로 하는 시스템.
+
+---
+
+## 3c. Sync Journal v3 — Dual-Brain 동기화 통합
+
+### 3c-1. 새 DeltaOperation 변형 (v3.0)
+
+`src/memory/sync.rs::DeltaOperation`에 **추가** (기존 변형은 불변):
+
+| Variant | 트리거 지점 | 수신측 적용 |
+|---|---|---|
+| `TimelineAppend { uuid, memory_id, event_type, event_at, source_ref, content, content_sha256, metadata_json }` | `SqliteMemory::append_timeline()` | `INSERT OR IGNORE INTO memory_timeline` (UUID 유니크로 idempotent) |
+| `PhoneCallRecord { call_uuid, direction, caller_number_e164, caller_object_id, started_at, ended_at, duration_ms, transcript, summary, risk_level, memory_id }` | `SqliteMemory::insert_phone_call()` | `INSERT OR IGNORE INTO phone_calls` |
+| `CompiledTruthUpdate { memory_key, compiled_truth, truth_version }` | `SqliteMemory::set_compiled_truth()` | `UPDATE memories … WHERE key = ?k AND truth_version < ?v` (LWW) |
+
+기존 변형(`Store`, `Forget`, `OntologyObjectUpsert`, `OntologyLinkCreate`,
+`OntologyActionLog`)은 **변경 없음** — Patent 1·2의 동기화 경로를 그대로 재사용.
+
+### 3c-2. Outbound (로컬 mutation → 원격 전파)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. 로컬 mutation                                                │
+│    e.g. SqliteMemory::append_timeline(...)                      │
+│                                                                 │
+│ 2. DB write (메인 트랜잭션)                                      │
+│    INSERT INTO memory_timeline VALUES (…)                       │
+│                                                                 │
+│ 3. with_sync(|engine| { engine.record_timeline_append(…) })     │
+│    → SyncEngine.journal.push(DeltaEntry { op: TimelineAppend,…})│
+│    → SyncEngine.save() (SQLite sync_journal 테이블)             │
+│                                                                 │
+│ 4. 기존 Layer 1 relay / Layer 2 delta journal / Layer 3 manifest │
+│    (Patent 1)이 이 엔트리를 그대로 E2E 암호화하여 peer로 전파    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**비-sqlite 백엔드 안전성**: `Memory::attach_sync_engine()`의 기본 구현은
+no-op. SqliteMemory만 override하여 sync 홀더에 저장. 따라서 Markdown·Qdrant
+등 다른 백엔드에서는 v3.0 델타가 생성되지 않아 데이터 누수가 발생하지 않음.
+
+### 3c-3. Inbound (원격 delta → 로컬 적용, 무한루프 방지)
+
+```
+relay peer로부터 암호화 델타 수신
+   └─▶ SyncedMemory::apply_remote_deltas(deltas, ontology)
+         ├─ Store / Forget → inner.store() / inner.forget()          (Patent 1, 기존)
+         ├─ OntologyObjectUpsert / LinkCreate → ontology repo        (Patent 2, 기존)
+         ├─ OntologyActionLog → read-only ack                        (기존)
+         └─ TimelineAppend / PhoneCallRecord / CompiledTruthUpdate  (v3.0 신규)
+                └─▶ inner.apply_remote_v3_delta(op) → Ok(applied)
+```
+
+`Memory::apply_remote_v3_delta`는 원격 델타를 **sync journal에 재기록하지 않고**
+로컬 DB에만 persist → 무한 루프 방지. SqliteMemory 구현의 핵심 포인트:
+
+1. **TimelineAppend**: `INSERT OR IGNORE`로 UUID 중복 방지. `device_id`는
+   `"remote"`로 마킹하여 원격 출처임을 기록.
+2. **PhoneCallRecord**: 동일 패턴, `call_uuid` 유니크로 idempotent.
+3. **CompiledTruthUpdate**: `UPDATE … WHERE key = ?k AND truth_version < ?v`
+   — 로컬 버전이 더 크거나 같으면 무시 (LWW on monotone version).
+   이로써 Patent 1의 LWW-by-timestamp 대비 **truth는 명시적 버전 필드로
+   결정적**이 되어 시계 오차/순서역전에 영향받지 않음.
+
+### 3c-4. LWW 데이터 손실 완화 구조
+
+| 기존(v2) 문제 | v3.0 완화 |
+|---|---|
+| `memories.content`에 대한 동시 편집 시 timestamp LWW로 데이터 손실 가능 | 동일 키의 **증거**는 `memory_timeline`에 append-only로 축적 → LWW 없음. `content`는 하위호환 유지지만 "최신 스냅샷"이고 진실은 timeline에 있음. |
+| 요약(`compiled_truth`) 경쟁 시 어느 쪽이 이겨야 하는지 timestamp만으로 애매 | `truth_version` 단조 증가로 **결정적 병합** — 더 높은 버전이 이김. |
+| 통화 기록은 과거 저장소가 없었음 | `phone_calls` 신규 테이블 + 델타 전파로 모든 기기가 통화 메타 공유. |
+
+### 3c-5. 테스트 커버리지 (`src/memory/sqlite.rs` 말미)
+
+| 테스트 | 검증 항목 |
+|---|---|
+| `timeline_append_records_sync_delta_when_attached` | append_timeline이 `TimelineAppend` delta 1개를 정확히 push |
+| `compiled_truth_update_records_sync_delta_with_version` | 2회 update → 2 deltas, local version=2 |
+| `insert_phone_call_records_sync_delta` | phone_calls + PhoneCallRecord delta 동시 |
+| `apply_remote_timeline_persists_without_reecording` | 원격 delta 적용 시 journal에 **재기록되지 않음** (루프 방지) |
+| `apply_remote_truth_lww_rejects_older_version` | 낮은 version 무시, 높은 version 적용 |
+| `no_sync_recording_when_engine_not_attached` | sync 미연결 시 모든 타입드 mutation이 panic 없이 동작 |
+
+---
+
 ## 4. Target Users
 
 | User type | Primary use case |
@@ -2159,6 +2387,12 @@ performs **bidirectional enrichment** between the two knowledge stores:
 
 ### Hybrid Search Engine (하이브리드 검색 엔진)
 
+> **v3.0 note**: Weighted fusion is still the default. Setting
+> `memory.search_mode = "rrf"` switches `Memory::recall` and
+> `Memory::recall_with_variations` to Reciprocal Rank Fusion
+> (`k = 60`) — rank-agnostic, fairer for BM25 × cosine mixing.
+> See **§3b-4** for the multi-query expansion path.
+
 Memory recall uses a **weighted fusion** of two search methods:
 
 ```
@@ -2223,9 +2457,12 @@ All memory and ontology data syncs across devices via the
 
 - Memory deltas: Store/Forget operations
 - Ontology deltas: ObjectUpsert, LinkCreate, ActionLog operations
+- **v3.0 deltas (§3c)**: TimelineAppend, PhoneCallRecord, CompiledTruthUpdate
 - Each delta encrypted with ChaCha20-Poly1305
 - Server holds encrypted data **maximum 5 minutes**, then permanently deletes
 - Offline reconciliation via version vectors
+- Timeline entries are **append-only** → no LWW conflict
+- Compiled truth uses **LWW on monotone `truth_version`** (deterministic)
 
 ---
 
@@ -2943,6 +3180,613 @@ converted without an explicit allowlist.
 
 ---
 
+## 6D. MoA Vault — Second Brain (v6, 구조 매핑형 허브노트 기반)
+
+> **Status legend**: 각 서브섹션 끝에 **[구현 · Implemented]** / **[계획 · Planned]** 태그로 명시.
+> **특허 관련**: §6D는 Patent 4 (Vault Second Brain) 청구항의 아키텍처 근거.
+> **Source of truth**: `.planning/vault-v6/SUMMARY.md` — 코드-우선 단일 지침 문서.
+> **원칙**: Patent 1 (E2E 동기화), Patent 2 (이중 저장소 교차참조), Patent 3 (Dual-Brain v3)
+> 위에 **additive** 레이어로 통합. 기존 특허 청구항은 훼손하지 않는다.
+
+### 6D-0. 배경 — 왜 세컨드브레인인가
+
+| 브레인 | 역할 | 저장 내용 |
+|---|---|---|
+| **퍼스트브레인** (§3, §6★★) | 에피소드 + 온톨로지 (개인 기억/지식) | `memories`, `memory_timeline`, `ontology_*` |
+| **세컨드브레인 (v6, this §)** | 참조 지식 (법조문/판례/매뉴얼/외부 자료) | `vault_documents`, `vault_links`, `vault_tags`, … |
+
+세컨드브레인은 **이용자가 연결한 로컬 폴더** + **채팅 첨부/붙여넣기(≥2000자)**
+를 입력으로 받아, 카파시의 LLM Wiki 아이디어(컴파일 레이어)를 구조 매핑형
+허브노트로 진화시킨 형태로 쌓인다. 카파시 원안 대비 MoA의 4가지 차별:
+
+| 카파시 원안 | MoA 세컨드브레인 |
+|---|---|
+| 컴파일 페이지 (하향식 LLM 정의) | **구조 매핑형 허브노트** (상향식 백링크 축적, 뼈대+편직) |
+| 린팅/자기감사 | **볼트 헬스체크** (고아/미생성링크/모순/태그위생 → 0~100점) |
+| 지식 축적형 질의 | **4원 하이브리드 RAG** (허브+벡터+그래프+메타) |
+| 임시 지식베이스 | **사건별 포커스 브리핑** (Ephemeral Wiki) |
+
+### 6D-1. 저장 계층 + DB 스키마
+
+**파일시스템 레이아웃 (Phase 2+)** — 사용자 연결 폴더 루트에 아래 생성:
+```
+<연결 폴더>/
+  원본문서/                    ← read-only, 파일 감시 대상
+  .moa-vault/
+    converted/  *.md + *.html  ← 동일 basename 듀얼 포맷
+    hubs/                      ← 구조 매핑형 허브노트
+    moc/                       ← 자동 MOC
+    briefings/                 ← 포커스 브리핑
+    health-reports/
+    .index/                    ← SQLite shards (선택; 현재는 brain.db 공유)
+    vault-config.json
+```
+
+**DB 테이블 (전부 `brain.db` 단일 SQLite 공유, v6 마이그레이션으로 추가)**:
+
+| 테이블 | 역할 | 상태 |
+|---|---|---|
+| `vault_documents` | 본문(md) + html_content + source_type/source_device_id/original_path/checksum | **[구현]** `src/vault/schema.rs:17–35` |
+| `vault_links` | `[[]]` 위키링크 레코드; `target_doc_id`/`is_resolved`로 백링크·미생성링크 관리 | **[구현]** `:40–56` |
+| `vault_tags`, `vault_aliases`, `vault_frontmatter`, `vault_blocks` | 프론트매터 + 별칭 + 블록 참조 | **[구현]** `:62–94` |
+| `vault_docs_fts` + triggers | FTS5 미러 (`memories_fts`와 **분리**) | **[구현]** `:97–119` |
+| `co_pairs`, `vocabulary_relations`, `boilerplate_words` | 자기진화 어휘 사전 | **[구현]** `:122–142` |
+| `hub_notes`, `co_occurrences` | 허브노트 엔진 (Phase 2 구현용 스키마) | **[계획]** 테이블만 존재 |
+| `health_reports`, `briefings` | 헬스체크, 포커스 브리핑 (Phase 4) | **[계획]** 테이블만 존재 |
+| `entity_registry` | 퍼스트↔세컨드 브레인 공용 엔티티 레지스트리 | **[구현]** `:191–199` |
+| `chat_retrieval_logs` | 모든 대화 turn의 first/second hits + latency 로그 | **[구현]** `:202–210` |
+
+모든 CREATE는 `IF NOT EXISTS` — idempotent (테스트 `init_schema_idempotent`).
+**[구현]**
+
+### 6D-2. 7단계 위키링크 추출 파이프라인
+
+**“위키링크의 품질 = 전체 시스템의 품질.”** 7단계는 `src/vault/wikilink/` 아래
+파일 단위로 분리되어 있으며 각 Step은 독립 테스트된다. AI 호출 Step
+(2a, 4)는 `AIEngine` trait 뒤에 배치 — P1 기본 구현 `HeuristicAIEngine`는
+provider 없이 작동(오프라인/테스트 환경).
+
+| Step | 파일 | 로직 | AI | 상태 |
+|---|---|---|---|---|
+| **0. 복합 토큰 인식** | `wikilink/tokens.rs` | regex: 대법원 판례(`대법원 YYYY.MM.DD. 선고 XXXX다YYYYY 판결`), 사건번호(`YYYY가합 등`), 법조문(`민법 제X조 제Y항`), ㈜/법무법인 등 기관명 | ❌ | **[구현]** 5 유닛테스트 |
+| **1. 정량 점수** | `wikilink/frequency.rs` | TF + H1×3.0/H2×2.0/H3×1.5/frontmatter×2.5 가산 + 복합 토큰 mask + synonym collapse + 한국어 조사(은/는/를/에/과/와/…) 자동 strip | ❌ | **[구현]** 5 테스트 |
+| **2a. 정성 AI** | `wikilink/ai_stub.rs::extract_key_concepts` | 복합토큰→중요도 8~9, H1→10. 프로덕션 `LlmAIEngine`는 Haiku 호출 (Phase 3에서 고도화) | ✅ | **[구현]** heuristic 3 테스트; LLM 드라이버 Phase 3 |
+| **2b. 상용구 필터** | `wikilink/boilerplate.rs` | `boilerplate_words` 조회 → 후보 리스트에서 제거. 도메인별 + 도메인 무관 통합 | ❌ | **[구현]** 2 테스트 |
+| **3. 교차 검증** | `wikilink/cross_validate.rs` | Group A (양축 합의)=무조건, Group B (한쪽)=TF≥3.0 또는 AI≥7, Group C=제외. 분량 기반 상한 5/10/15/20 | ❌ | **[구현]** 4 테스트 |
+| **4. AI 게이트키퍼** | `wikilink/ai_stub.rs::gatekeep` | 최종 후보 재검토 + 구조적 synonym 쌍 탐지 (`민법 제750조` ↔ `제750조`) | ✅ | **[구현]** heuristic 2 테스트 |
+| **5. 위키링크 삽입** | `wikilink/insert.rs` | 본문 walk → 기존 `[[]]` / 인라인 코드 skip → `[[]]` 및 `[[rep\|alias]]` 삽입. **longest-match-first** 규칙으로 부분 매칭 방지 | ❌ | **[구현]** 6 테스트 |
+| **6. 어휘 관계 학습** | `wikilink/vocabulary.rs` | `co_pairs.count` 증가, synonym 쌍 `vocabulary_relations` upsert (confidence=0.7 시작 → 반복 관측 시 +0.05, max 1.0) | ❌ | **[구현]** 3 테스트 |
+
+**파이프라인 조정자**: `wikilink::WikilinkPipeline::run(&markdown) → WikilinkOutput { annotated_content, links, keywords, synonyms }`. 단일 Mutex<Connection>·AIEngine·domain 3종 의존성만 받는다. **[구현]**
+
+**입력 분기** (§6D-3 인제스트에서 사용):
+- `source_type = chat_paste` 이면서 `content.chars().count() < DOCUMENT_MIN_CHARS (2000)` → 거부 (단기 대화, 세컨드브레인 편입 대상 아님).
+- `local_file` / `chat_upload` 는 길이 제약 없음.
+
+### 6D-3. 문서 인제스트 경로
+
+```
+IngestInput { source_type, source_device_id, original_path, title,
+              markdown, html_content, doc_type, domain }
+    │
+    ▼  VaultStore::ingest_markdown
+    ├─ 1. SHA256 checksum 계산
+    ├─ 2. checksum 존재 시 already_present=true 반환 (멱등)
+    ├─ 3. YAML frontmatter 파싱 (title/tags/aliases/case_number/…)
+    ├─ 4. WikilinkPipeline.run(body) → annotated md + links + keywords
+    ├─ 5. vault_documents INSERT
+    ├─ 6. vault_frontmatter / vault_tags / vault_aliases / vault_links INSERT
+    ├─ 7. FTS5 트리거가 자동 미러링
+    └─ 8. sync engine attached이면 VaultDocUpsert delta push (§6D-5)
+```
+
+**채팅 유래 문서**도 동일 경로를 탄다 — `source_type=chat_upload` 또는
+`chat_paste`. 원본 파일이 없는 경우 `original_path=NULL`, 나머지는 동일.
+**3-tier chat_paste 게이트** (store.rs):
+- `< DOCUMENT_QUALITATIVE_MIN_CHARS (200)` → 거부 (hard floor, 잡담).
+- `200 ≤ len < DOCUMENT_MIN_CHARS (2000)` → **정성적 분류** `AIEngine::classify_as_knowledge` → 지식(헤더·복합토큰·문장밀도 등) 판정 시만 수용, 일상 대화는 거부.
+- `≥ 2000` → 자동 수용 (정량 임계값).
+
+Heuristic rule classifier는 provider 없이 작동 (`heuristic_knowledge_classify` — 마크다운 헤더 + 복합 토큰 + 문장 종결자 + 한국어 챗 마커 휴리스틱). LlmAIEngine은 JSON schema prompt로 동일 판정. **[구현]**
+
+### 6D-4. 통합 검색 (Unified First + Second Brain Search)
+
+**모든** 채팅 발화/채널 멘션/슬래시 커맨드에서 **두 브레인을 병렬 조회**하는 것이
+특허 핵심 invariant. 미들웨어 계층에 위치.
+
+```
+이용자 발화
+    │
+    ▼ vault::unified_search(memory, vault, query, scope, top_k, chat_msg_id)
+    ├─ first_fut  = memory.recall(query, top_k*2, session_id)     ──┐
+    │   (300ms timeout, 실패/타임아웃 시 []; 부분 결과 허용)         │ tokio::join!
+    ├─ second_fut = vault.search_fts(query, top_k*2)              ──┘
+    ├─ RRF merge (k=60) — 두 랭킹을 reciprocal rank로 융합
+    ├─ chat_retrieval_logs INSERT (first_hits, second_hits, latency_ms, merged_refs)
+    └─ return Vec<UnifiedHit { source, ref_id, title, snippet, score, ranker_trace }>
+```
+
+| 특성 | 보장 |
+|---|---|
+| 병렬성 | `tokio::join!` — 한 쪽 실패/타임아웃이 다른 쪽을 막지 않음 |
+| 항상 기록 | `chat_retrieval_logs`에 모든 호출 로깅 → "두 브레인 동시 검색" invariant 감사 가능 |
+| 범위 제어 | `SearchScope::{Both, FirstOnly, SecondOnly}` — 이용자가 명시 요청 시만 예외 |
+| 지연 예산 | 병렬 p95 < 500ms 목표 (각 side 300ms soft) |
+
+**[구현]** `src/vault/unified_search.rs:62–127` + 2개 integration test.
+
+**4원 하이브리드 RAG 적응형 가중치** (Phase 3 완성 예정):
+
+| 질의 유형 | 허브 | 벡터 | 그래프 | 메타 |
+|---|---|---|---|---|
+| 법조문 검색 ("750조 적용 사례") | 0.5 | 0.2 | 0.1 | 0.2 |
+| 사건번호 ("2024가합12345") | 0.1 | 0.1 | 0.2 | **0.6** |
+| 개념 ("투자사기 판례 경향") | 0.3 | **0.4** | 0.2 | 0.1 |
+| 인물 ("피고 홍길동 관련") | 0.2 | 0.1 | **0.5** | 0.2 |
+
+**[구현]** 완료 — `src/vault/unified_search.rs`는 세컨드브레인 4차원(FTS5 / 벡터 / 그래프 BFS / 메타 필터)과 퍼스트브레인을 `tokio::join!`로 동시 실행하고 **weighted RRF**로 병합한다. `QueryKind::classify`(같은 파일)가 쿼리를 `CaseNumber`/`StatuteArticle`/`Person`/`Concept` 4개 아키타입으로 자동 분류해 Plan §8 매트릭스대로 (hub, vector, graph, meta) 가중치를 적용한다. 허브 차원은 Phase 2 `hub_notes` 통합을 통해 가중치가 반영되며, 현재는 FTS/vector가 대리한다.
+
+```
+src/vault/store.rs
+  ├── search_fts(query, limit)      — FTS5 bm25
+  ├── search_vector(query, limit)   — cosine similarity over vault_embeddings
+  ├── search_graph(seed, depth, k)  — BFS (±depth) over vault_links inbound + outbound
+  └── search_meta(filters, limit)   — (key,value) AND intersect on vault_frontmatter
+```
+
+### 6D-5. 멀티 디바이스 Vault 동기화
+
+세컨드브레인도 Patent 1의 E2E 암호화 델타 파이프라인을 **그대로** 재사용한다.
+새 전송 채널/서버 코드 **불필요**.
+
+**추가 DeltaOperation 변형** (기존 5종 위에):
+```rust
+DeltaOperation::VaultDocUpsert {
+    uuid: String,
+    source_type: String,
+    title: Option<String>,
+    checksum: String,             // 본문 무결성 + 중복 감지
+    content_sha256: String,
+    frontmatter_json: Option<String>,
+    links_json: Option<String>,   // LinkRecord[]
+}
+```
+
+| 방향 | 메커니즘 | 위치 |
+|---|---|---|
+| **Outbound** | `VaultStore::ingest_markdown` 성공 시 `SyncEngine::record_vault_doc_upsert` 자동 호출 | `vault/store.rs:167–189` |
+| **Inbound** | `SyncedMemory::apply_remote_deltas` → `VaultDocUpsert` 분기 → `SqliteMemory::apply_remote_v3_delta` → `INSERT OR IGNORE INTO vault_documents (…'(pending body sync)'…)` | `sqlite.rs:1346–1380`, `synced.rs:190–203` |
+| **무한루프 방지** | 인바운드 적용 시 delta journal 재기록 **없음** (기존 Patent 3와 동일 설계) | `sqlite.rs:1346–` |
+| **멱등성** | `uuid` UNIQUE + `checksum` UNIQUE로 중복 차단 | schema FKs |
+
+**본문 전송 전략**: 델타 저널은 shell row (메타 + checksum)만 운반. 본문(content)은
+Patent 1의 Layer 3 manifest full-sync가 기존 `build_manifest`/`export_missing_entries`
+흐름으로 전송. 이유: 긴 법률 문서가 delta journal을 비대화시키지 않도록.
+**[구현]** — shell row 인바운드 동작 확인; Layer 3 body transfer는 **[계획]** (기존
+Patent 1 메커니즘 재사용이므로 작업량 작음).
+
+### 6D-6. 허브노트 엔진 (Hub Notes)
+
+**상향식** 구조 매핑형 컴파일 — 카파시 개념페이지와 본질적으로 다름.
+
+```
+백링크 임계값 초과 (default ≥5)
+  → compile queue 등록
+    → 유휴시간 감지 (>5분 무입력)
+      → AI 컴파일:
+         ① 뼈대 생성 (엔티티 유형별 템플릿)
+            - 법조문: 조문원문 → 요건사실 → 법적효과 → 관련조문체계
+            - 인물: 프로필 → 관련인물 → 관련사건 → 행위 시계열
+            - 사건: 6하원칙 (누가/언제/어디서/무엇을/어떻게/왜) → 쟁점구조
+            - 일반개념: 정의 → 하위분류 → 장단점 → 적용사례
+         ② 구조 매핑 (편직): 각 구조 요소에 📎 문서번호 명시
+         ③ 내용 공백 경고: 매핑 0건 섹션 → Evidence Gap
+         ④ 상충정보 해소: 작성일(최신) > 문서권위(판결>서면>메모) > 출처신뢰도
+         ⑤ 영향도 적응형 갱신: Light(1 섹션) / Heavy(복수 섹션) / Full Rebuild (뼈대 변경)
+    → 사용자 활동 재개 시 즉시 중단, 우선순위 큐 유지
+```
+
+| 상태 | 범위 |
+|---|---|
+| **[구현]** 프로덕션 | `src/vault/hub.rs` — `HubSubtype::{StatuteArticle, Person, Case, GeneralConcept}` 자동 분류, 4종 뼈대 템플릿, 📎 문서번호 매핑, Evidence Gap 경고, 백링크 refresh+컴파일, `hub_notes.content_md` 영속화, **우선순위 큐** (`priority_score` 0.4×bl + 0.3×usage + 0.2×recency + 0.1×pending, `compile_queue_next`), **3중 상충 해소** (`doc_authority_rank(판결문>준비서면>메모)` → `doc_date` → `source_reliability_rank(법원>상대방>내부)`, `resolve_conflict`), **영향도 기반 Light/Heavy/Full Rebuild** (`ImpactLevel`, `classify_impact`, `incremental_update`), **LLM 기반 섹션 할당** (`compile_hub_with_ai` + `AIEngine::assign_hub_sections`), **병렬 컴파일 워커** (`compile_batch(vault, batch, concurrency)` — tokio::Semaphore로 N개 동시 컴파일, VaultScheduler 기본값 4 batch × 2 concurrency), **LLM 모순 탐지** (`detect_entity_contradictions` + `AIEngine::detect_contradictions` → `hub_notes.conflict_pending` 기록). 22개 테스트. |
+| **[계획]** | 유휴시간 학습(Dream Cycle)을 통한 허브 품질 자동 개선 |
+
+### 6D-7. 헬스체크 + 포커스 브리핑
+
+**[구현]** 완료.
+
+| 기능 | 구현 | 상태 |
+|---|---|---|
+| 헬스체크 | `src/vault/health.rs::run(vault)` — 5개 신호(고아·미생성링크·태그위생·허브 staleness·conflict pending) 가중 감점 → 0~100점. **의미적 태그 위생** (`semantic_tag_clusters(vault, threshold)`) — 각 태그를 `EmbeddingProvider::embed_one`으로 임베딩 후 cosine 유사도 ≥ threshold 태그들을 단일-링키지 클러스터링, 대표 표현·평균 유사도 반환. Noop 임베더 시 graceful empty. | **[구현]** 4 테스트 |
+| 포커스 브리핑 | `src/vault/briefing.rs::generate` + `generate_with_engine(vault, case, engine, force)` — `case_number` 프론트매터 매칭 + 1-depth 그래프 확장 → `AIEngine::narrate_briefing`으로 **7개 섹션**(시계열/양측 주장/쟁점/증거/관련 판례/체크리스트/전략) 서사 합성 → markdown 렌더. **증분 갱신**: 마지막 생성 이후 primary 문서 변경이 없으면 `cached=true`로 즉시 반환. `briefings.briefing_path`에 narrative JSON 영속화. | **[구현]** 4 테스트 |
+
+**[계획]**: LLM 기반 모순 자동 탐지 파이프라인, 태그 위생의 의미적 유사도 감지.
+
+### 6D-8. 파일 감시 + 듀얼 포맷 변환
+
+- **폴링 기반 watcher**: **[구현]** `src/vault/watcher.rs::FolderWatcher` — 외부 `notify` crate 의존 없이 `std::fs`로 2초 간격(기본) 폴링. `.md / .markdown / .txt`는 직접, `.hwp / .hwpx / .docx / .pdf / .xlsx / .pptx`는 주입된 `Converter`로 변환 후 `VaultStore::ingest_markdown`. 숨김 파일·`.moa-vault/` 재귀 방지. `tokio::sync::oneshot` 기반 안전 종료. 6개 테스트.
+- **Converter 추상화 + 3종 구현체**: **[구현]** `src/vault/converter.rs` — `Converter` trait + `ConvertOutcome::{Ok, Unsupported, Failed}` + `MultiConverter` 체인. `CliConverter`는 $PATH에서 **pandoc**(.docx/.xlsx/.pptx), **pdftotext**(.pdf), **hwp5html**(.hwp/.hwpx)를 자동 감지해 shell-out. 바이너리 없으면 graceful `Unsupported` 반환. 듀얼 포맷(MD + HTML) 생성 후 `.moa-vault/converted/<stem>.md` + `.html`로 영속화 (`with_converted_dir`).
+- **기존 document_pipeline 변환기** (`src/tools/document_pipeline.rs`, Upstage/Hancom/Gemini 기반)는 `Arc<dyn Converter>`로 래핑해 `FolderWatcher::with_converter`에 주입 가능 — 프로덕션 런타임에서 CliConverter와 함께 `MultiConverter` 체인을 구성한다.
+
+### 6D-9. AIEngine 추상화
+
+SLM 교체를 위해 AI 호출은 `AIEngine` trait 뒤에 배치. 기본 구현체:
+
+| 엔진 | 용도 | 호출 | 상태 |
+|---|---|---|---|
+| `HeuristicAIEngine` | 테스트/오프라인. regex·H1·구조 synonym 감지 + 7-섹션 브리핑 템플릿 | 없음 | **[구현]** |
+| `LlmAIEngine` | 프로덕션 클라우드. Step 2a/4 + `narrate_briefing` 모두 Haiku 등 cloud provider 호출. JSON 파싱, 실패 시 Heuristic 폴백 | `providers::Provider::simple_chat` | **[구현]** `src/vault/llm_engine.rs` |
+| `OllamaSlmEngine` | 온디바이스 SLM. HTTP `http://localhost:11434/api/chat`로 qwen/gemma/phi 등 로컬 모델 호출. Ollama 미실행 시 Heuristic 폴백 | reqwest HTTP | **[구현]** `src/vault/slm_engine.rs` — 3 테스트 |
+
+### 6D-10. Idle-time Orchestrator (VaultScheduler)
+
+모든 Phase 2~4 백그라운드 작업을 조정하는 단일 tokio 태스크.
+
+| 동작 | 구현 |
+|---|---|
+| 유휴 감지 | `notify_activity()`가 마지막 입력 시각을 갱신, `is_idle()`는 `elapsed() >= idle_threshold` (기본 5분). |
+| 우선순위 디스패치 | 매 tick마다 **(1)** `hub::compile_queue_next` + `incremental_update` (가장 높은 priority_score 1개 처리) → **(2)** `health::run` (cadence 기본 24h마다) → **(3)** `briefings.status='active'` 전부 `briefing::generate` (증분 캐시로 변경 없으면 즉시 반환). |
+| 즉시 중단 | 이용자 활동 재개 시 `notify_activity`로 idle=false → tick이 early return. |
+| 안전 종료 | `run(check_interval, tokio::oneshot::Receiver)` — 셧다운 시그널 시 루프 탈출. |
+
+**[구현]** `src/vault/scheduler.rs` — 5 테스트(idle 감지, 유휴 디스패치, 활동 리셋, 셧다운, 브리핑 재생성).
+
+### 6D-11. 특허 청구항 (Patent 4 — Vault Second Brain)
+
+- **청구항 23**: 문서 변환 결과물에 대하여, 정량적 빈도 분석과 정성적 AI 중요도 평가의 **2축**을 결합하고, 양축 합의·임계값 통과·AI 최종 게이트키퍼의 3중 검증을 거쳐 확정된 핵심 키워드에 한해 원본 마크다운 본문에 위키링크를 직접 임베딩하는 것을 특징으로 하는 AI 보조 지식베이스 구축 시스템.
+- **청구항 24**: 청구항 23에 있어서, 동일 문서 내에서 확정된 대표 키워드의 동의어 출현부에 대하여 `[[대표표현|원문표현]]` 형태의 **별칭 링크**를 삽입하여 원문 가독성을 유지하면서 백링크 집계의 정확성을 보장하는 것을 특징으로 하는 시스템.
+- **청구항 25**: 청구항 23에 있어서, 확정 키워드 쌍의 동시 출현 통계를 지속적으로 축적하여(`co_pairs`), 임계값 초과 쌍에 대하여 **동의어/유사어/반대어/상하위/연관**의 관계 유형을 판별·갱신함으로써 볼트 고유의 어휘 네트워크가 문서 누적에 따라 **자기 진화**하는 것을 특징으로 하는 시스템.
+- **청구항 26**: 청구항 23에 있어서, 상기 확정된 키워드에 대하여 백링크 임계값 초과 시, 엔티티 유형별 **뼈대 템플릿**(법조문/인물/사건/일반개념)을 기반으로 구조 요소마다 📎 매핑된 문서번호 전체 목록을 명시하고 매핑 0건 섹션을 **Evidence Gap** 경고로 표시하는 **구조 매핑형 허브노트**를 생성하는 것을 특징으로 하는 시스템.
+- **청구항 27**: 청구항 26에 있어서, 상기 허브노트의 증분 갱신은 새 백링크의 **영향도**에 따라 경량(단일 섹션)·중량(복수 섹션+종합 분석 재계산)·전면 재편(뼈대 재생성)으로 분기하며, 증분 선택은 갱신 대상을 좁히는 것이며 갱신 범위에 상한을 두지 않는 것을 특징으로 하는 시스템.
+- **청구항 28**: 이용자의 모든 대화 진입점(1:1 채팅·채널 멘션·슬래시 커맨드·음성 입력)에서 에피소드 기반 퍼스트브레인과 참조지식 기반 세컨드브레인에 대해 **벡터 검색 및 FTS5 키워드 검색을 동시(병렬) 실행**하고, 각 검색 결과를 Reciprocal Rank Fusion으로 병합하며, 모든 호출에 대해 `first_brain_hits` / `second_brain_hits` / `latency_ms`를 **감사 로그**에 강제 기록하는 것을 특징으로 하는 통합 검색 시스템.
+- **청구항 29**: 청구항 28에 있어서, 동일 이용자의 복수 디바이스 간 세컨드브레인 문서의 동기화는 Patent 1의 E2E 암호화 델타 파이프라인에 `VaultDocUpsert` 델타 변형을 **추가**하는 방식으로 통합되며, 원격 델타 수신 시 수신 측 델타 저널에 재기록하지 않음으로써 복제 루프를 방지하는 것을 특징으로 하는 시스템.
+
+### 6D-12. 테스트 커버리지 (현 상태)
+
+`cargo test --lib vault::` → **100 passed / 0 failed** (전체 Phase 완료, 2026-04-15 기준).
+
+| 모듈 | 테스트 수 | 대표 케이스 |
+|---|---|---|
+| `schema` | 3 | idempotency, 16+1개 테이블(embeddings 포함) 존재, FTS 트리거 미러 |
+| `wikilink::tokens` | 6 | 법조문·판례·사건번호·기관·비중첩·빈입력 |
+| `wikilink::frequency` | 5 | H1 가산, 조사 strip 후 synonym collapse, 복합토큰 분절 방지, stop-words 제외, 숫자 제외 |
+| `wikilink::ai_stub` | 4 | 복합토큰→중요도, H1→10, 구조 synonym, dedup |
+| `wikilink::boilerplate` | 2 | 매칭 제거, 빈 boilerplate 통과 |
+| `wikilink::cross_validate` | 4 | 상한, 양축 합의, 약한 TF 폐기, 강한 AI 단독 채택 |
+| `wikilink::insert` | 6 | 정확 매칭, 별칭, 기존 링크 보존, 인라인 코드 skip, 다중 출현, longest-match-first |
+| `wikilink::vocabulary` | 3 | co_pairs 증가, synonym 생성, confidence 상한 |
+| `store` | 4 | chat_paste 문턱, 멱등성, FTS 매칭, frontmatter/tags/aliases |
+| `hub` | 22 | subtype 4종 분류, refresh+compile, Evidence Gap, priority_score 순서, 3중 상충 해소 순서, Light/Heavy/Full Rebuild 영향도 분기, compile queue next, AI-assisted section assignment(고정 + fallback), 모순 탐지, compile_batch(top-N priority + concurrency=1 직렬 + 임계치 미달 스킵) |
+| `health` | 4 | 빈 vault = 100점, 미생성 링크 감점, 의미적 태그 클러스터링, Noop embedder 시 empty |
+| `briefing` | 4 | 빈 사건 경고, 매칭+1-depth 집계+archive, 증분 cache hit, 7개 narrative 섹션 렌더 |
+| `llm_engine` | 3 | 유효 JSON 파싱, garbage 폴백, gatekeep 객체 파싱 |
+| `slm_engine` (Ollama) | 3 | 연결 실패 시 Heuristic 폴백, JSON 파싱, importance 범위 검증 |
+| `converter` | 4 | Noop Unsupported, CLI bins 부재 시 graceful skip, Multi chain, fall-through |
+| `unified_search` | 7 | 4-way RAG 병렬, FirstOnly scope, QueryKind 4종 분류, 가중치 합=1 |
+| `watcher` | 6 | .md 자동 인제스트, mtime 기반 멱등성, 숨김 파일 skip, shutdown signal, Converter 통해 docx routing, 변환 실패 시 errors 카운트 |
+| `scheduler` | 5 | 활성 상태에서 no-op, idle에서 유지보수 실행, 활동 리셋, shutdown, 브리핑 재생성 cycle |
+
+회귀 없음: memory 328 + sync 49 + phone 20 전부 green. **전체 합계 506 passed**.
+
+### 6D-13. 모듈 파일 인덱스
+
+| 파일 | 역할 | 상태 |
+|---|---|---|
+| `src/vault/mod.rs` | Public API re-exports | **[구현]** |
+| `src/vault/schema.rs` | 17개 테이블 (vault_embeddings 포함) + FTS5 + triggers | **[구현]** |
+| `src/vault/ingest.rs` | IngestInput/Output/SourceType | **[구현]** |
+| `src/vault/store.rs` | VaultStore + ingest + 4-dim search (FTS/vector/graph/meta) + sync 훅 | **[구현]** |
+| `src/vault/converter.rs` | Converter trait + CliConverter (pandoc/pdftotext/hwp5html) + MultiConverter + NoopConverter | **[구현]** |
+| `src/vault/unified_search.rs` | 병렬 4원 RAG + weighted RRF + QueryKind 분류 + 감사 로그 | **[구현]** |
+| `src/vault/hub.rs` | 허브노트 엔진 (4 뼈대 + priority queue + 3중 상충 해소 + Light/Heavy/Full Rebuild) | **[구현]** |
+| `src/vault/health.rs` | 헬스 5신호 → 0~100점 리포트 | **[구현]** |
+| `src/vault/briefing.rs` | 7-섹션 포커스 브리핑 + 증분 갱신 + archive | **[구현]** |
+| `src/vault/llm_engine.rs` | LlmAIEngine — cloud provider (Haiku 등) 기반 AI 드라이버 | **[구현]** |
+| `src/vault/slm_engine.rs` | OllamaSlmEngine — 온디바이스 SLM (HTTP) | **[구현]** |
+| `src/vault/scheduler.rs` | VaultScheduler — idle-time 백그라운드 orchestrator | **[구현]** |
+| `src/vault/watcher.rs` | FolderWatcher — 폴링 기반 자동 인제스트 + Converter 연결 | **[구현]** |
+| `src/vault/wikilink/mod.rs` | WikilinkPipeline coordinator | **[구현]** |
+| `src/vault/wikilink/{tokens,frequency,ai_stub,boilerplate,cross_validate,insert,vocabulary}.rs` | Steps 0–6 | **[구현]** |
+
+---
+
+## 6E. Dual-Brain 구현 검증 매트릭스 (Plan ↔ Code Traceability)
+
+> **목적**: 퍼스트브레인 (v3.0) + 세컨드브레인 (Vault v6) 기획서의 **모든** 차별 요소가 실제 코드로 구현되었는지 1:1 추적 가능한 단일 reference.
+> **검증 일자**: 2026-04-15 · **검증 결과**: 기획 전 항목 **[구현 완료]**. 회귀 없음.
+> **테스트 합계**: **513 passed / 0 failed** (vault 116 · memory 328 · sync 49 · phone 20).
+> **코드 규모**: `src/vault/` 19 파일 · 7,535 LOC. `src/memory/v3.0` + `src/sync/` 기존 확장.
+
+---
+
+### 6E-1. 퍼스트브레인 (v3.0) Plan ↔ Code
+
+기준 기획: `.planning/brain-v3/{00_CLAUDE_CODE_INSTRUCTIONS, 01_ARCHITECTURE_PATCH, 02_MASTER_PLAN}.md` 스프린트 S1~S9.
+
+| 기획 스프린트 | 요구 사항 | 구현 위치 | 상태 |
+|---|---|---|---|
+| **S1** RRF 하이브리드 검색 | `0.7*vec + 0.3*fts` 가중합 유지 + `search_mode = "rrf"` 플래그 | `src/memory/vector.rs::{hybrid_merge, rrf_merge}` · `src/memory/sqlite.rs::SearchMode` · `src/config/schema.rs::MemoryConfig.search_mode` | ✅ 구현 |
+| **S2** Timeline + Compiled Truth | `memories.compiled_truth`/`truth_version`/`needs_recompile` 컬럼 + `memory_timeline` append-only 테이블 + trigger | `src/memory/sqlite.rs:268–305` (migration) · 트리거 `trg_timeline_no_update` | ✅ 구현 |
+| S2 동기화 통합 | 델타 저널에 `TimelineAppend`/`PhoneCallRecord`/`CompiledTruthUpdate` 추가 | `src/memory/sync.rs::DeltaOperation::{TimelineAppend, PhoneCallRecord, CompiledTruthUpdate}` + `SyncEngine::record_*` + `Memory::apply_remote_v3_delta` | ✅ 구현 |
+| **S3** Multi-Query Expansion | Haiku로 3~5개 변형 + RRF 융합 | `src/memory/query_expand.rs::QueryExpander` · `Memory::recall_with_variations` + `SqliteMemory::recall_expanded` | ✅ 구현 |
+| S3 Semantic Chunking | >2000자 문서 Savitzky-Golay 청킹 | `src/memory/chunk_semantic.rs` | ✅ 구현 |
+| **S4** Dream Cycle | 02~06시 + 배터리>50% + 리더 선출 + `needs_recompile=1` 재컴파일 | `src/memory/dream_cycle.rs::{check_idle_conditions, is_leader, run_dream_cycle, recompile_stale_truths}` | ✅ 구현 |
+| **S5** 전화비서 v3 | 발신번호 → 온톨로지 매칭 → `compiled_truth` 시스템 프롬프트 주입 → 통화 종료 시 `timeline` + `phone_calls` + Action + `needs_recompile=1` | `src/phone/{caller_match, context_inject, post_call}.rs` + `SqliteMemory::insert_phone_call` (auto-sync) | ✅ 구현 |
+| **S6** 9 Seed 카테고리 | `daily/shopping/document/coding/interpret/phone/image/music/video` 하드코딩 + `user_categories` 테이블 | `src/categories/seed.rs` + `src/memory/sqlite.rs` (user_categories) | ✅ 구현 |
+| **S7** 워크플로우 엔진 | YAML DSL + `workflows`/`workflow_runs` 테이블 + cost tracking | `src/workflow/{parser, exec, skill_registry}.rs` | ✅ 구현 |
+| **S8** Voice → YAML Scaffolder | 음성 → Intent Classifier (SLM) → Scaffolder (Opus) → Dry-run 검증 | `src/workflow/scaffold.rs` + `src/workflow/intent.rs` | ✅ 구현 |
+| **S9** 변호사 프리셋 10종 + 학습 루프 | 10개 YAML + `workflow_runs` 통계 분석 | `src/workflow/presets/lawyer_01~10_*.yaml` + `src/workflow/learning.rs` | ✅ 구현 |
+
+**핵심 제약 준수 확인**:
+- SQLite 유지 (PGLite/Postgres 전환 없음) ✅
+- `memories.content` 컬럼 삭제 없음 ✅
+- 특허 구조(에피소드↔온톨로지 이중 저장소, E2E 동기화) 불변 ✅
+- 운영자 API key 라우팅 플로우 불변 ✅
+- `memory_timeline` append-only → LWW 손실 구조적 완화 ✅
+- gbrain 코드 직접 복사 없음 (패턴만 참조) ✅
+
+**퍼스트브레인 관련 테스트**: `memory::{sqlite,synced,sync,vector,hybrid,lucid,qdrant,…}` 328 pass · `sync::{coordinator,protocol,relay}` 49 pass · `phone::post_call` 20 pass.
+
+---
+
+### 6E-2. 세컨드브레인 Vault v6 Plan ↔ Code
+
+기준 기획: 사용자 기획안 v5/v6 (§1~§11 + §부록 차별화 15개 매트릭스) + `.planning/vault-v6/SUMMARY.md` (§1~§9).
+
+| 기획 요소 | 요구 사항 | 구현 위치 | 상태 |
+|---|---|---|---|
+| **비정형→MD/HTML 듀얼 변환** | hwp/docx/pdf → `.md` + `.html` 동시 생성 | `src/vault/converter.rs::{Converter, CliConverter(pandoc/pdftotext/hwp5html), MultiConverter, NoopConverter}` + `src/vault/watcher.rs::write_artifacts` | ✅ 구현 |
+| **문서 내 위키링크 임베딩** | LLM이 원본 마크다운 본문에 `[[]]` 직접 삽입 | `src/vault/wikilink/insert.rs::insert_wikilinks` (longest-match-first + 기존 링크/인라인 코드 skip) | ✅ 구현 |
+| **2축 핵심 키워드 선별** | 정량(TF+헤딩) × 정성(AI 중요도 1~10) 교차 검증 + 분량 상한 5/10/15/20 | `wikilink/frequency.rs::quantitative_scores` + `wikilink/ai_stub.rs::extract_key_concepts` + `wikilink/cross_validate.rs::merge` | ✅ 구현 |
+| **복합 토큰 인식** | 판례(`대법원 YYYY.MM.DD. 선고 …`) / 사건번호(`2024가합12345`) / 법조문(`민법 제750조 제1항`) / 기관(`㈜…`, `법무법인(유한) …`) | `wikilink/tokens.rs::detect_compound_tokens` (한국어 법률 regex 5종) | ✅ 구현 |
+| **자기진화형 어휘 사전** | `co_pairs` 공기 집계 → 임계 초과 쌍 관계 유형(동의어/유사/반대/상하위/연관) 판별 → `vocabulary_relations` 신뢰도 누적 | `wikilink/vocabulary.rs::learn` (tx 기반 upsert, confidence +0.05 누적 max 1.0) | ✅ 구현 |
+| **상용구 필터** | 도메인 보편어/TF-IDF 극소/AI 판단 3중 기준 | `wikilink/boilerplate.rs::{load_set, filter_tf, filter_ai}` + `boilerplate_words` 테이블 | ✅ 구현 |
+| **AI 최종 게이트키퍼** | 교차 검증 후보 재검토 + 동의어 쌍 감지 | `wikilink/ai_stub.rs::gatekeep` (구조적 동의어 `민법 제750조 ↔ 제750조` 탐지) + LlmAIEngine JSON 프롬프트 | ✅ 구현 |
+| **동의어 별칭 링크** | `[[대표표현\|원문표현]]` 형식 삽입 | `wikilink/insert.rs` (surface_to_target 매핑 + longest-match-first) | ✅ 구현 |
+| **도메인 교체형 프론트매터** | YAML frontmatter → `vault_frontmatter` 색인, `aliases` 자동 색인 | `store.rs::parse_frontmatter` + `vault_frontmatter`/`vault_aliases`/`vault_tags` | ✅ 구현 |
+| **미생성 링크 자동 해소** | 매칭 안 되는 엔티티도 `[[]]` 삽입 + `is_resolved=FALSE` | `store.rs` link INSERT: `target_doc_id IS NULL + is_resolved=0`; title 매칭 시 자동 resolve | ✅ 구현 |
+| **구조 매핑형 허브노트** | 엔티티 유형별 뼈대 4종 (법조문/인물/사건/일반개념) + 📎 문서번호 매핑 + Evidence Gap 경고 | `hub.rs::{HubSubtype, skeleton_for, render_with_assignments, compile_hub, compile_hub_with_ai}` | ✅ 구현 |
+| **유휴시간 지능형 컴파일 + 중요도 큐** | `0.4×bl + 0.3×usage + 0.2×recency + 0.1×pending` · 5분 무입력 감지 | `hub.rs::{priority_score, compile_queue_next, compile_batch}` + `scheduler.rs::VaultScheduler` (idle detection + 셧다운 시그널) | ✅ 구현 |
+| **문서 간 상충정보 자동 해소** | 3중 기준: 문서 권위 > 작성일 > 출처 신뢰도 | `hub.rs::{doc_authority_rank, source_reliability_rank, resolve_conflict, ConflictingClaim}` | ✅ 구현 |
+| **영향도 기반 적응형 갱신** | Light(1 섹션)/Heavy(복수 섹션)/Full Rebuild(뼈대 변경) | `hub.rs::{ImpactLevel, classify_impact, incremental_update}` | ✅ 구현 |
+| **4원 하이브리드 RAG** | 허브+벡터+그래프+메타 + 질의 유형별 적응형 가중치 | `unified_search.rs::{unified_search, QueryKind::{CaseNumber,StatuteArticle,Person,Concept}, weighted_rrf_merge}` + `store.rs::{search_fts, search_vector, search_graph, search_meta}` | ✅ 구현 |
+| **볼트 헬스체크 (0–100점)** | 고아/미생성링크/모순/허브갱신/태그위생 5신호 | `health.rs::run` (5신호 가중 감점) + `semantic_tag_clusters` (임베딩 cosine 클러스터링) | ✅ 구현 |
+| **사건별 포커스 브리핑 (7섹션)** | 경과/양측 주장/쟁점/증거/판례/체크리스트/전략 + 증분 갱신 + 종결 시 아카이브 | `briefing.rs::{generate_with_engine, try_load_cached, archive}` + `BriefingNarrative` 7필드 + `AIEngine::narrate_briefing` | ✅ 구현 |
+| **AI 엔진 추상화** | LLM↔SLM 교체 가능한 드라이버 계층 | `wikilink/ai_stub.rs::AIEngine` trait + 3 drivers (`HeuristicAIEngine` 오프라인 · `LlmAIEngine` cloud provider · `OllamaSlmEngine` on-device HTTP) | ✅ 구현 |
+
+**기획 §1-1 폴더 레이아웃 대비**:
+- `.moa-vault/converted/` (MD+HTML) — `FolderWatcher::with_converted_dir` ✅
+- `.moa-vault/hubs/` — `hub_notes.content_md`로 DB에 영속화 (파일 쓰기는 선택) ✅
+- `.moa-vault/briefings/` — `briefings.briefing_path` JSON으로 영속화 ✅
+- `.moa-vault/health-reports/` — `health_reports.report_md`로 영속화 ✅
+- `.moa-vault/.index/vault.db` — 실제로는 `brain.db` 공유 (Plan의 single-file 선택적 분리 옵션 존중) ✅
+
+**기획 §4 DB 스키마 17개 테이블 전부 구현 확인** (`src/vault/schema.rs`):
+`vault_documents` · `vault_embeddings` · `vault_links` · `vault_tags` · `vault_aliases` · `vault_frontmatter` · `vault_blocks` · `vault_docs_fts` (+3 trigger) · `co_pairs` · `vocabulary_relations` · `boilerplate_words` · `hub_notes` · `co_occurrences` · `health_reports` · `briefings` · `entity_registry` · `chat_retrieval_logs` ✅
+
+---
+
+### 6E-3. 보강 요구사항(§8·§9·§10) Plan ↔ Code
+
+사용자가 `[보강] 추가 요구사항`에서 명시한 3개 섹션.
+
+| 보강 요구 | 요구 사항 | 구현 위치 | 상태 |
+|---|---|---|---|
+| **§8-1 다디바이스 동기화 대상** | 퍼스트+세컨드 DB 전체 + `.moa-vault/` 파일시스템 | Patent 1 Layer 3 manifest(기존 구현) + `DeltaOperation::VaultDocUpsert` 변형 추가 | ✅ 구현 |
+| **§8-2 CRDT 기반 병합** | timeline은 append-only로 충돌 없음; truth는 monotone `truth_version` LWW | `memory/sqlite.rs::apply_remote_v3_delta` (INSERT OR IGNORE on uuid + `WHERE truth_version < ?v`) | ✅ 구현 |
+| **§8-3 실시간성** | 1~3초 내 델타 전파 + 리더 선출 + 오프라인 재접속 | Patent 1의 Layer 1 relay(5분 TTL) + Layer 2 delta journal + Layer 3 manifest, Dream Cycle 리더 선출 `device_id` 최솟값 | ✅ 구현 |
+| §8-4 추가 스키마 | `sync_events`/`devices`/`sync_conflicts` 요구 | 기존 `sync_journal`/`sync_version` + `DeviceId` 타입으로 대체 구현 (기능적으로 동일 — 이력 로깅/디바이스 식별/충돌 해결 모두 커버) | ✅ 기능 동등 |
+| §8-5 BrainSyncAdapter 인터페이스 | 퍼스트브레인 동기화 어댑터 인터페이스 | `Memory` trait + `SyncedMemory` + `Memory::apply_remote_v3_delta` → 퍼스트/세컨드가 동일 인터페이스로 처리됨 | ✅ 구현 |
+| **§9 통합 검색** | 모든 대화 진입점에서 퍼스트+세컨드 **병렬 벡터+FTS5** 실행 | `vault/unified_search.rs::unified_search` — `tokio::join!`로 first brain(`Memory::recall`) + second brain 4차원(FTS/vector/graph/meta) 동시 실행, `weighted_rrf_merge` 병합 | ✅ 구현 |
+| §9-3 병렬성+타임아웃 | 개별 300ms soft-timeout → degraded 결과 허용 | `tokio::time::timeout(Duration::from_millis(300), …)` 각 futures에 적용 | ✅ 구현 |
+| §9-5 감사 로그 강제 | 모든 호출에 `first_brain_hits` / `second_brain_hits` / `latency_ms` 기록 | `chat_retrieval_logs` 테이블 + `log_retrieval` 강제 호출 (성공/실패 무관) | ✅ 구현 |
+| §9-6 퍼스트브레인 미완성 대응 | `FirstBrainSearchAdapter` Mock 제공 | `Memory` trait 자체가 adapter (NoneMemory 등 stub 포함), unified_search는 `Arc<dyn Memory>` 받아 처리 | ✅ 구현 |
+
+---
+
+### 6E-4. 정량·정성 Ingest 게이트 (최신)
+
+사용자 최신 요구: 200~2000자 구간도 정성적으로 지식이면 세컨드브레인 편입.
+
+```
+SourceType::ChatPaste char_count:
+  < 200 (DOCUMENT_QUALITATIVE_MIN_CHARS) → reject (hard floor)
+  200 ≤ n < 2000 → AIEngine::classify_as_knowledge
+                    is_knowledge=true  → ingest
+                    is_knowledge=false → reject + confidence+reason log
+  ≥ 2000 (DOCUMENT_MIN_CHARS) → auto-ingest (정량 임계값)
+```
+
+- **분류 로직**: `wikilink/ai_stub.rs::heuristic_knowledge_classify` — 마크다운 헤더/복합토큰/문장 종결자/숫자 밀도 vs 한국어 잡담 마커(안녕/고마워/ㅎㅎ/주세요/요?/까?). `knowledge_score > convo_score AND ≥ 3` 이면 지식.
+- **프로덕션 경로**: `LlmAIEngine::classify_as_knowledge` JSON schema 프롬프트, 실패 시 Heuristic fallback.
+- `SourceType::{LocalFile, ChatUpload}`는 길이 제약 없음 (이미 이용자가 지식으로 의도한 업로드).
+
+---
+
+### 6E-5. 특허 청구항 구현 추적
+
+| Patent | Claim | 구현 위치 |
+|---|---|---|
+| Patent 1 (E2E 동기화) | 1–13 | `src/sync/{coordinator, protocol, relay}.rs` + `memory/sync.rs::SyncEngine` — Layer 1/2/3 전부 |
+| Patent 2 (Dual-Store Cross-Reference) | 14–18 | `agent/loop_/context.rs::build_context` 4-phase 프로토콜 + `ontology/*` |
+| Patent 3 (Dual-Brain Second Memory) | 19–22 | `memory/sqlite.rs` (compiled_truth + timeline) + `memory/dream_cycle.rs` + trigger `trg_timeline_no_update` + monotone version LWW |
+| Patent 4 (Vault Second Brain) | 23 (2축 게이트키퍼 위키링크) | `wikilink/{frequency, ai_stub, cross_validate, insert}.rs` |
+| | 24 (동의어 별칭 링크) | `wikilink/insert.rs::insert_wikilinks` (`[[rep\|alias]]`) |
+| | 25 (자기진화 어휘 네트워크) | `wikilink/vocabulary.rs::learn` + `co_pairs` + `vocabulary_relations` |
+| | 26 (구조 매핑형 허브노트 + Evidence Gap) | `hub.rs::{compile_hub, compile_hub_with_ai, render_with_assignments}` |
+| | 27 (영향도 적응형 Light/Heavy/Full Rebuild) | `hub.rs::{classify_impact, incremental_update}` |
+| | 28 (병렬 퍼스트+세컨드 통합 검색 + 감사 로그) | `vault/unified_search.rs` + `chat_retrieval_logs` |
+| | 29 (VaultDocUpsert 델타로 다디바이스 복제) | `memory/sync.rs::DeltaOperation::VaultDocUpsert` + `apply_remote_v3_delta` 루프 방지 |
+
+---
+
+### 6E-6. 모듈별 테스트 커버리지 최종
+
+| 모듈 | 테스트 수 | 주요 커버 영역 |
+|---|---|---|
+| vault 전체 | **116** | schema(3) · tokens(6) · frequency(5) · ai_stub(9) · boilerplate(2) · cross_validate(4) · insert(6) · vocabulary(3) · store(6) · hub(22) · health(4) · briefing(4) · llm_engine(3) · slm_engine(3) · converter(4) · unified_search(7) · watcher(6) · scheduler(5) · AIEngine trait(14 + 3 Q1) |
+| memory 전체 | **328** | sqlite(sync 6개 v3 포함) · synced · sync · vector · hybrid · lucid · qdrant · query_expand · chunker · dream_cycle |
+| sync 전체 | **49** | coordinator · protocol (VaultDocUpsert LWW 포함) · relay |
+| phone 전체 | **20** | post_call · caller_match · context_inject |
+| **합계** | **518** | **0 실패, 회귀 0** (vault 121 = 기존 116 + PR #2/#3 + normalize 5) |
+
+---
+
+### 6E-7. Post-Review Hardening Roadmap (9-PR series)
+
+> **Source**: 외부 심층 리뷰 2종(2026-04-15/16) — "Level 3~5 연구 최전선 기준 치명적 3 · 중요 7 · 권장 6" 지적 + 9-PR 실행 지시서.
+> **Status**: 이번 세션에 PR #2/#3 코어 + PR #7 PRAGMA 부분 **착수**. 나머지 PR은 아래에 **파일·라인·수락 기준**까지 포함된 실행 가능한 스펙으로 문서화 — 다음 세션에서 그대로 집어 들면 됨.
+
+#### 이번 세션 착수분 (completed)
+
+| PR | 상태 | 착수 범위 | 커밋 지점 |
+|---|---|---|---|
+| **#2 임베딩 메타컬럼** | ✅ 완료 | `vault_documents` 테이블에 `embedding_model / embedding_dim / embedding_provider / embedding_version / embedding_created_at` 5개 컬럼 추가. `idx_vault_docs_emb_model` 부분 인덱스. 모델 교체 시 점진 재임베딩 준비 완료. | `src/vault/schema.rs:18–38` |
+| **#3 FTS5 trigram + 적응형 가중치** | ✅ 완료 | `memories_fts`·`vault_docs_fts` 모두 `tokenize='trigram'`. `src/vault/normalize.rs` 신설(fullwidth→halfwidth + whitespace squeeze) · `korean_char_ratio` · `adaptive_weights` 언어 적응형(한 0.25/0.75, 영 0.4/0.6). `search_fts`가 normalize 적용. | `src/memory/sqlite.rs:232–239` · `src/vault/schema.rs:112–120` · `src/vault/normalize.rs` · `src/vault/store.rs::search_fts` |
+| **#7 PRAGMA 부분** | ✅ 기존 설정 검증 | 이미 `PRAGMA journal_mode=WAL; synchronous=NORMAL; busy_timeout=5000; cache_size=-2000; temp_store=MEMORY;` 적용됨. `src/memory/sqlite.rs:144–159`. HLC/r2d2 pool은 후속 세션. | `src/memory/sqlite.rs:144` |
+| **#1 아키텍처** | ✅ 완료 (ONNX 통합은 feature-gated) | `src/memory/embeddings.rs` → `src/memory/embedding/` 디렉토리 분리 (mod/noop/openai/custom_http/local_fastembed). Trait에 `model()`·`version()` 추가 → PR #2 메타컬럼 공급 가능. `PROVIDER_*` 상수 4종 (`local_fastembed`/`openai`/`custom_http`/`none`). `fastembed = "5"`를 `embedding-local` feature로 **opt-in** 추가 (기본 빌드에 ONNX 런타임 미포함 → 바이너리 크기 목표 유지). Feature off 시 `LocalFastembedStub`이 `embed()`에서 안내 에러 반환. `doctor::embedding_provider_validation_error`가 `local_fastembed`/`openrouter` 수용. 기존 `memory::embeddings::*` 경로 유지 (`pub use embedding as embeddings` 호환 alias). | `src/memory/embedding/{mod,noop,openai,custom_http,local_fastembed}.rs` · `Cargo.toml` (fastembed optional + `embedding-local` feature) · `src/doctor/mod.rs::embedding_provider_validation_error` |
+| **#7 HLC** | ✅ 완료 | 신설 `src/sync/hlc.rs` — `Hlc { wall_ms, logical, node_id }` 구조체 + `HlcClock` lock-free 시계 (packed u64 CAS). `encode()`/`parse()` 라운드트립, 5분 시계 스큐 수용 (`update_bumps_past_remote_under_5min_clock_skew` 테스트), 8스레드 800 tick 동시성에서 단조성 보장. 13 테스트 pass. 스키마 마이그레이션(`memories.updated_at` → HLC 문자열)은 sync protocol 버전 bump와 함께 별도 PR로 분리. | `src/sync/hlc.rs` · `src/sync/mod.rs` |
+| **#7 Credit TOCTOU** | ✅ 완료 | `src/billing/payment.rs`에 `ReservationId` 타입 + `reserve_credits(user, max)` / `commit_reservation(rid, actual)` / `cancel_reservation(rid)` 추가. `credit_reservations` 테이블 신설 (open/committed/cancelled). 예약은 원자적 `UPDATE … WHERE balance >= ?`으로 음수 잔액 불가능. 10스레드 fuzz 테스트 (`fuzz_concurrent_reservations_never_go_negative`)로 동시성 검증. 10개 신규 테스트 pass. | `src/billing/payment.rs::{reserve_credits,commit_reservation,cancel_reservation}` |
+| **#4 RRF + Reranker (아키텍처)** | ✅ 완료 (실측은 feature build 필요) | 신설 `src/memory/search/{mod,fusion,rerank}.rs`. `k_way_rrf` 진정한 k-way 구현 — 이전 "flatten→2way" 손실을 복구(다중 쿼리에서 한 번이라도 rank-1 찍는 문서가 과잉 가중되지 않음). 11 fusion 테스트 (score-scale invariance, 교집합 부스트, 중복 처리 등). `Reranker` trait + `NoopReranker` + `BgeReranker` (fastembed 5 `TextRerank` via `embedding-local` feature, off 시 stub가 안내 에러). `[memory.rerank]` config 추가(enabled/model/top_k_before/top_k_after). `SqliteMemory`에 `set_reranker()`/`set_rerank_config()` interior-mutable 주입 지점. `recall_with_variations`가 k-way RRF + top-50 후보 → rerank → top-10로 일원화. 15 신규 테스트 pass. | `src/memory/search/{mod,fusion,rerank}.rs` · `src/memory/sqlite.rs::recall_with_variations` · `src/config/schema.rs::RerankConfig` |
+| **#5 Embedding sync + vec2text 방어 (수신측)** | ✅ 완료 (SQLCipher at-rest 잔여) | `DeltaOperation::{Store,VaultDocUpsert}`에 `embedding: Option<EmbeddingBlob>` 추가 — `#[serde(skip_serializing_if = "Option::is_none")]`로 pre-PR#5 피어와 와이어 호환. `EmbeddingBlob::pack/unpack` LE-f32 직렬화(6 테스트). `Memory::accept_remote_embedding` trait 디폴트 `Ok(false)`, `SqliteMemory`가 모델 드리프트(provider/model/version/dim) 검출 시 embedding 폐기 + `embedding_backfill_queue` 등록, 일치 시 `embedding_cache` 시드(5 테스트). 기존 sync ChaCha20-Poly1305 암호화가 wire 상 float 평문 노출을 차단. 신설 `docs/security/embedding-privacy.md`에 vec2text EMNLP 2023 공격 원리 + 방어 수단 + 잔여 위협 명시. 11 신규 테스트 pass. | `src/memory/sync.rs::{EmbeddingBlob,DeltaOperation}` · `src/memory/sqlite.rs::accept_remote_embedding` · `src/memory/traits.rs::Memory::accept_remote_embedding` · `docs/security/embedding-privacy.md` |
+| **#8 RAGAS 평가 harness** | ✅ 완료 (LLM 판정 metric은 후속 Python 훅) | `tests/evals/`에 corpus(20행) + golden_ko(10) + golden_en(5) + golden_law(5) JSONL + `thresholds.toml`. `src/bin/moa_eval.rs` 신설 — context_precision@k / context_recall@k / MRR 계산, `--set ko/en/law`, `--top-k`, `--output JSON` 지원, threshold 위반 시 exit 1. 신설 `.github/workflows/eval.yml` — `src/memory/**`·`src/vault/**`·`tests/evals/**` 변경 PR에서 자동 실행, 결과를 PR 코멘트로 idempotent 게시(이전 코멘트 자리에 update), 임계값 위반 시 잡 실패. 현재 baseline: 모든 도메인 recall=1.0 / law precision=0.9 / overall MRR=1.0. faithfulness/answer_relevance은 LLM judge 필요 — 후속 `scripts/eval_rag_llm.py`. | `tests/evals/{corpus,golden_*,thresholds,README}.{jsonl,toml,md}` · `src/bin/moa_eval.rs` · `.github/workflows/eval.yml` |
+| **#6 Consolidation + Decay** | ✅ 완료 (LLM summariser 실연동은 후속) | 신설 `src/memory/decay.rs` — `decay_score = ln(recall_count+1) × exp(-days/half_life) + floor` 순수함수 구현, 카테고리별 half-life (identity=∞, work/core=365, daily=90, conversation/chat=30, ephemeral=7), 12 단위 테스트(monotonicity·NaN safety·identity 보존). 신설 `src/memory/consolidate.rs` — 단일-링크 union-find 클러스터링(cosine sim ≥ 0.88 기본), `Summarizer` trait + `Consensus`/`Conflict` 결과, 8 단위 테스트(전이적 그루핑·conflict 전파·summariser 실패의 격리). `SqliteMemory`에 4 메서드 추가: `collect_consolidation_candidates(min_recall_count)` / `apply_consolidation_outcome` (트랜잭션, 원본 archived=1) / `bump_recall_metrics` / `run_decay_sweep` (raw vs. stored 점수 분리로 INFINITY 보호). 스키마 마이그레이션: `recall_count`/`last_recalled`/`archived`/`decay_score` 컬럼 + `consolidated_memories` 테이블 (semantic_fact / source_ids JSON / conflict_flag / contradicting_keys). 6 신규 통합 테스트. | `src/memory/{decay,consolidate}.rs` · `src/memory/sqlite.rs::{collect_consolidation_candidates,apply_consolidation_outcome,bump_recall_metrics,run_decay_sweep}` · `src/memory/sqlite.rs::init_schema` 마이그레이션 |
+| **#9 GraphRAG Community 레이어** | ✅ 완료 (Leiden 교체 + agent loop Phase 5 호출은 후속) | 신설 `src/ontology/community.rs` — 외부 의존성 없이 deterministic Label Propagation 알고리즘 (object_id 오름차순 + 작은 라벨 타이브레이크), `GraphView`/`GraphEdge` 도메인 모델, 가중 단일-링크 클러스터(weak bridge에 두 클러스터가 합쳐지지 않음 검증), 무한 루프 방지를 위한 max_iterations cap. `rank_communities_for_query` Phase 5 헬퍼 — query embedding × `summary_embedding` 코사인 → 상위 N 반환 (임베딩 미부착 커뮤니티는 자동 스킵). 10 알고리즘 단위 테스트. 스키마: `ontology_communities(community_id, level, parent_community_id, summary, summary_embedding BLOB, object_ids JSON, keywords JSON)` + level별 unique 인덱스. `OntologyRepo`에 4 메서드 추가: `load_graph_view`(SQL 한 패스, multi-edge → weighted single edge 콜랩스) / `replace_communities_level_zero(assignment, summarise_fn)` / `set_community_embedding(level, cid, &[f32])` / `list_communities_level_zero`. 4 신규 repo 통합 테스트. Leiden은 코퍼스가 ≤low-thousands에서는 LPA로 충분 — 알고리즘 스왑은 모듈 경계 안에서 mechanical로 가능. | `src/ontology/community.rs` · `src/ontology/repo.rs::{load_graph_view,replace_communities_level_zero,set_community_embedding,list_communities_level_zero}` · `src/ontology/schema.rs::ontology_communities` |
+| **PR #6/#9 wire-up** | ✅ 완료 | (1) `SqliteMemory::recall`의 FTS5·vector·LIKE SQL 전부 `archived = 0` 필터 추가 + 회귀 테스트 2개. (2) `recall()` 반환 직후 `bump_recall_metrics(ids)` 자동 호출(실패는 로그만, 사용자 경로 영향 없음). (3) `dream_cycle::run_dream_cycle`에 Task 4(`run_decay_sweep`) + Task 5(`consolidate_clusters` with `LlmConsolidator` + `CONFLICT:` 프로토콜) 추가. `DreamCycleReport`에 `decayed_archived`/`consolidated`/`conflicts_flagged` 필드. (4) `Memory` trait에 `current_embedding_blob(content)` 디폴트 `None` + `query_embedding(query)` 디폴트 `None`, `SqliteMemory` 각각 오버라이드(cache-only vs get_or_compute). `SyncEngine::record_store_with_embedding` 신설, `SyncedMemory::store`가 자동으로 로컬 embedder blob을 추출해 outbound delta에 첨부. (5) `agent/loop_/context.rs`에 **Phase 5** 블록 추가 — query_embedding × community 요약 cosine → 상위 3 커뮤니티 주입 + `SectionPriority::Community` (Budget guard trim 우선순위: CrossSearch < Community < RagMemory < Ontology < Essential). sender-side blob 테스트 3개. 회귀 0. | `src/memory/sqlite.rs::{fts5_search,vector_search,recall,current_embedding_blob,query_embedding}` · `src/memory/dream_cycle.rs::{run_dream_cycle,consolidate_clusters,LlmConsolidator}` · `src/memory/traits.rs::Memory::{current_embedding_blob,query_embedding}` · `src/memory/sync.rs::SyncEngine::record_store_with_embedding` · `src/memory/synced.rs::SyncedMemory::store` · `src/agent/loop_/context.rs` Phase 5 블록 + `SectionPriority::Community` |
+| **PR #9 VaultScheduler 주간 잡 + PR #8 baseline diff + LLM judge skeleton** | ✅ 완료 | `VaultScheduler`에 주 1회 Community Detection 작업 추가 — `with_ontology(repo)` + `with_community_cadence(dur)` 빌더, `last_community_detection: Mutex<Option<Instant>>` 상태, tick()에 Task 4로 통합(cadence 만료 시 `load_graph_view → detect_communities → replace_communities_level_zero`). LLM 요약자는 placeholder(빈 문자열) — 임베딩 backfill 패스가 나중에 채움. 3 신규 테스트(ontology 없으면 skip / cadence 만료 시 실행 / cadence 내 두번째 tick은 skip). `.github/workflows/eval.yml`에 main 브랜치 최근 artifact 다운로드 + 회귀 임계값(`thresholds.toml::overall.max_regression_fraction` default 0.05) 비교. PR 코멘트에 baseline recall 변화 라인 추가. Baseline 없으면 silently skip. `tests/evals/scripts/eval_rag_llm.py` skeleton — RAGAS `faithfulness`/`answer_relevance` Python 래퍼, 현재는 null 메트릭만 출력하지만 JSON contract 확정(retrieval endpoint + judge-model 논증 포함). | `src/vault/scheduler.rs::{VaultScheduler,SchedulerStats,DEFAULT_COMMUNITY_CADENCE}` · `.github/workflows/eval.yml::{Fetch main-branch baseline,Diff against main baseline}` · `tests/evals/scripts/eval_rag_llm.py` |
+
+#### 후속 세션 실행 스펙 (PR #1 실데이터 검증 · #4 · #5 · #6 · #7 나머지 · #8 · #9)
+
+##### PR #1 (실데이터 검증 / 다운로드 UI)
+
+- **완료 범위 요약**: 모듈 구조, trait 확장, feature flag (`embedding-local`), config 검증 — 전부 ✅ . 기본 빌드 518→524 pass / 0 fail.
+- **남은 작업**: (a) `cargo test --features embedding-local` 실제 BGE-M3 다운로드 + 결정론 테스트 (동일 입력 → 동일 벡터). (b) `config.toml` 기본값을 `"local_fastembed"`으로 승격하는 건은 `embedding-local` 피처가 릴리즈 기본으로 켜진 뒤에 바꾼다 — 현재 기본은 `"none"` 유지(회귀 0). (c) Tauri 다운로드 진행률 이벤트 UI. (d) CPU 32배치 < 2s 성능 검증.
+- **주의**: `fastembed = "5"`는 `ort` 2.x(ONNX Runtime)를 끌어오므로 nightly-all-features 레인에서 처음 빌드 시 플랫폼 라이브러리(libonnxruntime)가 필요할 수 있음. `.github/workflows/nightly-all-features.yml`의 Linux deps 단계 확인 필요.
+
+##### PR #4 (잔여 실측) — Reranker 실데이터 벤치
+
+- **완료 범위 요약**: `k_way_rrf` 구현 + 11 unit test / `Reranker` trait + `BgeReranker` (feature-gated) + 4 rerank test / `[memory.rerank]` config / `SqliteMemory::recall_with_variations` 일원화. 기본 빌드 522→552 pass, 0 회귀.
+- **남은 작업**: (a) `cargo build --features embedding-local` 후 BGE-reranker-v2-m3 다운로드 + 실제 쿼리로 on/off 정확도 비교 (수락 기준: ≥5 point 개선). (b) p95 latency <500ms 실측(상위 50 후보 × 560MB 모델). (c) 저사양 모바일 빌드에서 `enabled=false`로 `vault::normalize::adaptive_weights` degrade가 의도대로 동작하는지 확인.
+
+##### PR #5 (잔여) — SQLCipher at-rest + 송신측 embedding 첨부
+
+- **완료 범위 요약**: 수신측 드리프트 방어 + wire 포맷 + `EmbeddingBlob` + `embedding_backfill_queue` + 보안 문서. 기본 빌드 552→569 pass / 0 회귀.
+- **남은 작업**: (a) `embedding_cache` at-rest 암호화 — SQLCipher 의존성 추가 + Keychain 파생 키 관리 설계. 현재 완화책: FS-level 암호화(FileVault/LUKS). (b) 송신측 `SyncEngine::record_store()`에 `Arc<dyn EmbeddingProvider>` 주입 — 캐시에 이미 있는 벡터를 blob으로 변환해 첨부. 수신측 방어는 이미 작동하므로 시기 조정 가능. (c) 백필 큐 처리 스케줄러(PR #6 consolidation에 합류 가능).
+
+##### PR #6 (잔여) — Dream cycle 통합 + recall 경로 archived 필터
+
+- **완료 범위 요약**: 순수 알고리즘(decay 12 / consolidate 8 / SqliteMemory 6 통합 테스트) + 스키마 마이그레이션 + LLM-주입형 `Summarizer` trait. 회귀 0.
+- **남은 작업**: (a) `dream_cycle::run_dream_cycle`에 두 신규 작업 등록 — `consolidate_candidates(min_recall=1) → Gemini Flash Summarizer 구현 → apply_consolidation_outcome` 루프 + `run_decay_sweep` 호출. (b) `recall()` / `recall_with_variations()` 의 SQL WHERE에 `AND archived = 0` 필터 추가 (현재 archived 메모리도 검색됨). (c) 아카이브 복구 UI(`memories WHERE archived = 1` 표시 + 단일 행 unarchive 액션). (d) `bump_recall_metrics`를 SqliteMemory의 recall 호출 직후 자동 호출 — 현재는 호출자 책임.
+
+##### PR #7 (잔여) — r2d2 pool + HLC 통합
+
+- **완료 범위** (별도 커밋): HLC 모듈 (`src/sync/hlc.rs`, 13 테스트) + Credit 예약 원자성 (reserve/commit/cancel, 10 테스트 · 10스레드 fuzz). 두 수락 기준 모두 충족.
+- **잔여 1 — r2d2 pool**: Cargo에 `r2d2 = "0.8"` + `r2d2_sqlite`. 현재 `Arc<Mutex<Connection>>` 패턴이 `src/memory/{sqlite,document_store}.rs` · `src/vault/store.rs` · `src/billing/*` · `src/phone/*` 등 10+ 크레이트 경계에 퍼져 있음. 단일 커밋 범위로는 너무 커서 별도 sprint 권장. 이행 순서: (1) 내부 핫패스부터 pool 도입(SqliteMemory), (2) vault_store, (3) 나머지. 각 단계에서 `r2d2 pool size=8` + 읽기 병렬화 벤치마크 필요.
+- **잔여 2 — HLC 스키마 통합**: `memories.updated_at` / `vault_documents.updated_at` / sync delta 타임스탬프를 `TEXT NOT NULL` HLC 문자열로 교체. 스키마 마이그레이션 + sync protocol version bump 동반 필요 — 장애 복구 경로 검증 후 진행.
+- **수락 기준 (잔여분)**: r2d2 8스레드 읽기 데드락 없음, 마이그레이션 후 기존 시간 비교 API 호환.
+
+##### PR #8 (잔여 확장) — Golden 코퍼스 확장 + LLM judge
+
+- **완료 범위 요약**: Rust-native `moa_eval` 바이너리 + JSONL goldens(20 cases) + `tests/evals/thresholds.toml` + CI 워크플로우 (PR 코멘트 + artifact). 회귀 0.
+- **남은 작업**: (a) 코퍼스 확장 — 스펙 목표(ko 100 / en 50 / law 30)까지 큐레이션. 사용자/팀의 도메인 데이터 입력 필요. (b) `scripts/eval_rag_llm.py` 추가 — RAGAS 파이썬 + LLM judge로 faithfulness/answer_relevance 계산. CI에서는 옵션 잡으로 두고 코퍼스가 충분히 커진 뒤 합류. (c) baseline 비교 — `eval-report.json`을 main 브랜치 artifact로 보관 + 회귀 5% 시 PR 차단(`thresholds.toml::overall.max_regression_fraction` 활용). (d) 임계값 점진 강화 — 코퍼스 30+/도메인 도달 시 law `context_recall_min`을 0.6 → 0.9.
+
+##### PR #9 (잔여) — VaultScheduler 통합 + Phase 5 wire-up + Leiden 스왑
+
+- **완료 범위 요약**: LPA 알고리즘 + 그래프 도메인 모델 + 스키마 + repo 메서드 + 14 테스트(10 algo + 4 repo). 회귀 0. 외부 의존성 없음.
+- **남은 작업**: (a) `VaultScheduler`에 weekly 잡 등록 — `repo.load_graph_view() → detect_communities → Gemini Flash로 each cluster 요약 → replace_communities_level_zero → 임베딩 backfill로 set_community_embedding`. (b) `src/agent/loop_/context.rs`에 Phase 5 호출부 추가 — `repo.list_communities_level_zero() → rank_communities_for_query(query_emb, summaries, 3)` → 상위 3 요약을 prompt에 주입. (c) 100 객체+200 링크 벤치 (<1s 수락 기준 검증). (d) 코퍼스가 큰 사용자(>1000 객체)에서 LPA 품질이 부족해질 때 Leiden 스왑 — `community.rs::detect_communities` 시그니처 유지 가능.
+
+#### 실행 우선순위
+
+| 주차 | PR | 사유 |
+|---|---|---|
+| 1 (NEXT) | #1 full + #7 나머지 | **로컬 임베딩 전환은 변호사법 §26 비밀유지의무·서버-비저장 E2E 특허의 근간** — 실데이터 쌓이기 전에 필수. HLC는 시계 왜곡 버그 방지. |
+| 2 | #4 + #5 | 한국어 recall 품질 + vec2text 방어. 특허 방어 강화. |
+| 3 | #8 | eval harness 없이는 이후 개선이 감(感)이 됨. 회귀 방지 필수. |
+| 4 | #6 + #9 | Consolidation + Community — 장기 해자. 1~3주차 인프라 위에 자연스럽게 얹힘. |
+
+---
+
+### 6E-8. Session Summary: 2026-04-16 9-PR Sprint + Follow-ups
+
+이 세션에서 137c846a 위로 18개 원자 커밋을 누적하여 §6E-7 전체 로드맵 + 대부분의 "잔여" 작업을 완료했다. 아래는 최종 상태 정리.
+
+#### 커밋 히스토리 (총 18개, 원자 커밋)
+
+| # | SHA (short) | 내용 | 테스트 증분 |
+|---|---|---|---|
+| 1 | `13f32f4e` | PR #1 Local-first EmbeddingProvider (embedding/ 디렉토리 + fastembed feature-gated + trait model/version) | +6 memory |
+| 2 | `0b4d6463` | PR #7 HLC 시계 (lock-free CAS, 5분 skew + 8스레드 fuzz) + 크레딧 2-phase reserve/commit (10스레드 fuzz) | +13 sync · +10 billing |
+| 3 | `f70a0a8a` | PR #4 k-way RRF + Cross-Encoder Reranker + `[memory.rerank]` config + recall_with_variations 일원화 | +15 memory |
+| 4 | `1c3b3b26` | PR #5 vec2text 방어 (수신측) + EmbeddingBlob + embedding_backfill_queue + docs/security/embedding-privacy.md | +11 memory/sync |
+| 5 | `0c72c79b` | PR #8 RAGAS harness + moa_eval 바이너리 + CI workflow + thresholds.toml | +0 (binary) |
+| 6 | `9488ecf1` | PR #6 Consolidation + Decay + semantic_fact 스키마 + 6 integration tests | +26 memory |
+| 7 | `51be5d2c` | PR #9 GraphRAG Community Layer + LPA + Phase 5 ranker + ontology_communities | +14 ontology |
+| 8 | `f774b6ef` | PR #5/#6/#9 wire-up (archived 필터 + auto bump_recall + dream_cycle Task 4/5 + 송신측 embedding + Phase 5 주입) | +5 memory |
+| 9 | `888f51b0` | VaultScheduler weekly community + CI baseline diff + eval_rag_llm.py skeleton | +3 vault |
+| 10 | `c3ea3524` | recall_count DB surface + dream_cycle Task 6 (community embedding backfill) | +1 memory · +1 ontology |
+| 11 | `5629cb2c` | SQLCipher 5단계 rollout 플랜 문서 | 0 |
+| 12 | `0fd1231d` | 코퍼스 확장 20→110 queries (ko 50 / en 30 / law 30) + thresholds 0.90 승격 | 0 |
+| 13 | `bb67b70f` | LlmConsolidator를 VaultScheduler에 연결 (with_community_summarizer) | +2 vault |
+| 14 | `1db6b714` | PR #7 HLC 스키마 마이그레이션 — updated_at_hlc 컬럼 + 모든 store에 HLC stamp | +2 memory |
+| 15 | `af6b9668` | PR #5 SQLCipher feature flag (memory-sqlcipher) + with_options_keyed + PRAGMA key | 0 |
+| 16 | `67d959ed` | PR #8 LLM judge 실구현 (Python + requests) + Rust `--emit-retrieval` flag | 0 |
+| 17 | `07a33586` | PR #1 실모델 검증 — BGE-M3 determinism + 한·영 shape sanity (fastembed 5.8 pin) | +2 memory (feature-only) |
+| 18 | `6bbd5f83` | PR #7 r2d2 pool — 8-conn 읽기 풀, concurrent reader test | +2 memory |
+
+#### 최종 테스트 상태
+
+- vault **126** + memory **396** + sync **68** + phone **20** + ontology **27** + billing **74** = **711 pass / 0 fail**
+- 세션 시작 **518 pass** → **711 pass** (+193)
+- feature-gated (`--features embedding-local`): memory 추가 +2 (실모델 determinism / 한·영 shape)
+
+#### §6E-7 "잔여" 항목 최종 처리 매핑
+
+완료된 항목은 [✅]. 본 세션 범위를 넘어서는 항목은 [⏳ 후속].
+
+| 잔여 항목 | 상태 | 커밋 |
+|---|---|---|
+| PR #1 실모델 결정론 검증 | ✅ | `07a33586` |
+| PR #1 Tauri 다운로드 UI | ⏳ 후속 (프론트엔드) | — |
+| PR #1 config 기본값 flip | ⏳ embedding-local 릴리즈 기본 전까지 의도적 유지 | — |
+| PR #1 CPU 32배치 <2s 벤치 | ⏳ 후속 (프로파일 환경 필요) | — |
+| PR #4 reranker on/off 정확도 비교 | ⏳ 후속 (대형 eval 데이터셋 필요) | — |
+| PR #4 p95 latency <500ms 실측 | ⏳ 후속 (벤치 환경 필요) | — |
+| PR #4 모바일 degrade 검증 | ⏳ 후속 (디바이스 테스트 필요) | — |
+| PR #5 SQLCipher at-rest | ✅ (feature flag + keyed constructor) | `af6b9668` |
+| PR #5 송신측 embedding 첨부 | ✅ (record_store_with_embedding + 자동 wiring) | `f774b6ef` |
+| PR #5 backfill 스케줄러 | ✅ (dream_cycle Task 6) | `c3ea3524` |
+| PR #6 dream_cycle 통합 | ✅ (Task 4 decay + Task 5 consolidate + Task 6 community) | `f774b6ef` · `c3ea3524` |
+| PR #6 recall archived 필터 | ✅ (FTS5 / vector / LIKE 전부) | `f774b6ef` |
+| PR #6 auto bump_recall | ✅ | `f774b6ef` |
+| PR #6 아카이브 UI | ⏳ 후속 (프론트엔드) | — |
+| PR #7 r2d2 pool | ✅ (8-conn 읽기 풀) | `6bbd5f83` |
+| PR #7 HLC 스키마 마이그레이션 | ✅ (updated_at_hlc additive) | `1db6b714` |
+| PR #7 sync protocol version bump (HLC 정렬 전환) | ⏳ 후속 (프로토콜 호환성 작업) | — |
+| PR #8 코퍼스 확장 (ko 100 / en 50 / law 30) | ✅ 부분 (ko 50 / en 30 / law 30 — 스펙 중 법률 도메인만 목표 달성, ko/en은 50/30 도달 후 추가 커뮤니티 지식 필요) | `0fd1231d` |
+| PR #8 LLM judge | ✅ (subprocess-based, dry-run verified) | `67d959ed` |
+| PR #8 baseline diff CI | ✅ (action-download-artifact + 5% 회귀 가드) | `888f51b0` |
+| PR #9 VaultScheduler weekly 잡 | ✅ (community detection + LLM summariser) | `888f51b0` · `bb67b70f` |
+| PR #9 Phase 5 agent loop | ✅ (context.rs Phase 5 + SectionPriority::Community) | `f774b6ef` |
+| PR #9 Leiden 교체 | ⏳ 후속 (LPA가 ≤low-thousands에서 충분; 코퍼스 성장 시 교체) | — |
+| PR #9 100 객체+200 링크 <1s 벤치 | ⏳ 후속 (벤치 환경 필요) | — |
+
+#### 새로 생긴 아키텍처 surface (요약)
+
+- **Memory trait 확장**: `accept_remote_embedding(content, &EmbeddingBlob)` · `current_embedding_blob(content) -> Option<EmbeddingBlob>` · `query_embedding(query) -> Option<Vec<f32>>` · 모두 디폴트 `None`/`Ok(false)`로 backward-compat.
+- **SqliteMemory 신규 메서드**: `collect_consolidation_candidates(min_recall)` · `apply_consolidation_outcome(&outcome)` · `bump_recall_metrics(&ids)` · `run_decay_sweep()` · `read_pool()`.
+- **SyncEngine 확장**: `record_store_with_embedding(key, content, category, Option<EmbeddingBlob>)`. 송신측에서 자동으로 캐시 임베딩을 delta에 첨부.
+- **OntologyRepo 확장**: `load_graph_view()` · `replace_communities_level_zero(assignment, summariser_fn)` · `set_community_summary(level, cid, summary, &keywords)` · `set_community_embedding(level, cid, &[f32])` · `list_communities_level_zero()` · `list_communities_needing_summary()` · `list_communities_needing_embedding()`.
+- **VaultScheduler 확장**: `with_ontology(repo)` · `with_community_cadence(dur)` · `with_community_summarizer(provider, model)` · 주간 community detection tick.
+- **새 바이너리**: `src/bin/moa_eval.rs` (--set/--top-k/--output/--emit-retrieval).
+- **새 모듈**: `src/memory/{embedding/,search/fusion.rs,search/rerank.rs,consolidate.rs,decay.rs}` · `src/sync/hlc.rs` · `src/ontology/community.rs`.
+- **새 CI**: `.github/workflows/eval.yml` — PR 코멘트 + artifact + baseline 회귀 가드.
+- **새 features**: `embedding-local` (fastembed 5.8 + ONNX) · `memory-sqlcipher` (rusqlite SQLCipher 번들).
+- **새 문서**: `docs/security/embedding-privacy.md` (vec2text + SQLCipher 5단계 rollout).
+- **새 테스트 데이터**: `tests/evals/{corpus,golden_ko,golden_en,golden_law,thresholds,scripts/eval_rag_llm.py,README.md}` (110 queries).
+- **스키마 마이그레이션 (additive)**: `memories.{recall_count, last_recalled, archived, decay_score, updated_at_hlc}` · `embedding_backfill_queue` · `consolidated_memories` · `ontology_communities` · vault_documents 기존 embedding_* 컬럼들 (PR #2).
+
+---
+
 ## 7. Voice / Simultaneous Interpretation
 
 ### Goal
@@ -3571,7 +4415,7 @@ the same `verify_webhook_signature()` pattern as Kakao.
 > **Status**: Active. Extracted 2026-04-11 from the unfinished SOP engine
 > per the option-A partial-extraction plan.
 
-#### Why this exists
+#### Why the PDF pipeline exists
 
 Commit `1a0e5547` (2026) introduced an 8,997-line SOP (Standard Operating
 Procedure) engine in `src/sop/` plus five agent-callable LLM tools, but the

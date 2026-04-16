@@ -91,6 +91,7 @@ pub mod tools;
 pub(crate) mod tunnel;
 pub mod update;
 pub(crate) mod util;
+pub mod vault;
 pub mod voice;
 pub mod workflow;
 

@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mymoa.app/schemas/workflow.v3.schema.json",
+  "title": "MoA Workflow DSL",
+  "description": "YAML 워크플로우 사양의 JSON Schema (Claude Code 는 이 스키마로 사용자 생성 YAML을 validate 해야 한다).",
+  "type": "object",
+  "required": ["name", "parent_category", "steps", "limits"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "parent_category": {
+      "type": "string",
+      "description": "Seed key (daily/shopping/document/coding/interpret/phone/image/music/video) 또는 user_category UUID"
+    },
+    "description": {"type": "string", "maxLength": 1000},
+    "icon": {"type": "string"},
+    "inputs": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/InputDef"}
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/Step"}
+    },
+    "post_hooks": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/PostHook"}
+    },
+    "limits": {"$ref": "#/$defs/Limits"}
+  },
+  "$defs": {
+    "InputDef": {
+      "type": "object",
+      "required": ["name", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,32}$"},
+        "type": {"enum": ["string", "date", "number", "file", "selection", "boolean"]},
+        "prompt": {"type": "string"},
+        "default": {},
+        "autofill_from": {
+          "type": "string",
+          "description": "예: ontology.Object(type=client).last_contacted"
+        },
+        "required": {"type": "boolean", "default": false},
+        "options": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "type=selection 일 때 필수"
+        }
+      }
+    },
+    "Limits": {
+      "type": "object",
+      "required": ["max_tokens_per_run", "max_llm_calls_per_run"],
+      "additionalProperties": false,
+      "properties": {
+        "max_tokens_per_run": {"type": "integer", "minimum": 1, "maximum": 2000000},
+        "max_llm_calls_per_run": {"type": "integer", "minimum": 1, "maximum": 50},
+        "max_runtime_sec": {"type": "integer", "minimum": 1, "maximum": 3600},
+        "max_cost_krw": {"type": "number", "minimum": 0, "description": "선택: 원화 기준 상한"}
+      }
+    },
+    "PostHook": {
+      "type": "object",
+      "required": ["type", "args"],
+      "properties": {
+        "type": {"enum": ["calendar_add", "notify", "email_send", "memory_pin"]},
+        "args": {}
+      }
+    },
+
+    "Step": {
+      "oneOf": [
+        {"$ref": "#/$defs/MemoryRecallStep"},
+        {"$ref": "#/$defs/MemoryStoreStep"},
+        {"$ref": "#/$defs/SqlStep"},
+        {"$ref": "#/$defs/LlmStep"},
+        {"$ref": "#/$defs/ToolCallStep"},
+        {"$ref": "#/$defs/FileWriteStep"},
+        {"$ref": "#/$defs/CalendarAddStep"},
+        {"$ref": "#/$defs/PhoneActionStep"},
+        {"$ref": "#/$defs/ShellStep"},
+        {"$ref": "#/$defs/ConditionalStep"},
+        {"$ref": "#/$defs/LoopStep"},
+        {"$ref": "#/$defs/UserConfirmStep"}
+      ]
+    },
+
+    "StepId": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,32}$"},
+
+    "MemoryRecallStep": {
+      "type": "object",
+      "required": ["type", "id", "query"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "memory_recall"},
+        "id": {"$ref": "#/$defs/StepId"},
+        "query": {"type": "string"},
+        "search_mode": {"enum": ["rrf", "weighted"], "default": "rrf"},
+        "top_k": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+        "multi_query_expand": {"type": "boolean", "default": true},
+        "filter_ontology_type": {"type": "string"}
+      }
+    },
+    "MemoryStoreStep": {
+      "type": "object",
+      "required": ["type", "id", "content"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "memory_store"},
+        "id": {"$ref": "#/$defs/StepId"},
+        "content": {"type": "string"},
+        "timeline_event_type": {"enum": ["call","chat","doc","manual","workflow","email","ocr"]},
+        "link_to_ontology": {"type": "string"},
+        "source_ref": {"type": "string"}
+      }
+    },
+    "SqlStep": {
+      "type": "object",
+      "required": ["type", "id", "query"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "sql"},
+        "id": {"$ref": "#/$defs/StepId"},
+        "query": {
+          "type": "string",
+          "description": "오직 SELECT 만 허용 (화이트리스트 파서로 검증)"
+        },
+        "params": {"type": "object"}
+      }
+    },
+    "LlmStep": {
+      "type": "object",
+      "required": ["type", "id", "model"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "llm"},
+        "id": {"$ref": "#/$defs/StepId"},
+        "model": {
+          "enum": [
+            "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001",
+            "gemini-3.1-pro", "gemini-3.1-flash", "gemini-3.1-flash-live",
+            "local-slm"
+          ]
+        },
+        "system": {"type": "string"},
+        "user": {"type": "string"},
+        "user_template": {"type": "string"},
+        "output": {"$ref": "#/$defs/StepId"},
+        "temperature": {"type": "number", "minimum": 0, "maximum": 2},
+        "max_tokens": {"type": "integer", "minimum": 1, "maximum": 100000}
+      },
+      "oneOf": [
+        {"required": ["user"]},
+        {"required": ["user_template"]}
+      ]
+    },
+    "ToolCallStep": {
+      "type": "object",
+      "required": ["type", "id", "tool", "args"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "tool_call"},
+        "id": {"$ref": "#/$defs/StepId"},
+        "tool": {"type": "string", "description": "tool_registry 등록 명"},
+        "args": {}
+      }
+    },
+    "FileWriteStep": {
+      "type": "object",
+      "required": ["type", "id", "path"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "file_write"},
+        "id": {"$ref": "#/$defs/StepId"},
+        "path": {
+          "type": "string",
+          "description": "sandbox 디렉토리 내 상대경로 (절대경로 금지)"
+        },
+        "content_from": {"type": "string"},
+        "content": {"type": "string"},
+        "format": {"enum": ["markdown","docx","pdf","xlsx","pptx","txt","json"]}
+      }
+    },
+    "CalendarAddStep": {
+      "type": "object",
+      "required": ["type", "id", "title", "date"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "calendar_add"},
+        "id": {"$ref": "#/$defs/StepId"},
+        "title": {"type": "string"},
+        "date": {"type": "string"},
+        "duration_min": {"type": "integer", "minimum": 1},
+        "attendees": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "PhoneActionStep": {
+      "type": "object",
+      "required": ["type", "id", "action"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "phone_action"},
+        "id": {"$ref": "#/$defs/StepId"},
+        "action": {
+          "enum": [
+            "create_caller_ontology",
+            "mark_vip",
+            "mark_spam",
+            "link_call_to_case",
+            "send_followup_sms"
+          ]
+        },
+        "args": {}
+      }
+    },
+    "ShellStep": {
+      "type": "object",
+      "required": ["type", "id", "command"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "shell"},
+        "id": {"$ref": "#/$defs/StepId"},
+        "command": {"type": "string"},
+        "cwd": {"type": "string"},
+        "timeout_sec": {"type": "integer", "default": 30, "maximum": 600}
+      }
+    },
+    "ConditionalStep": {
+      "type": "object",
+      "required": ["type", "id", "cond", "then"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "conditional"},
+        "id": {"$ref": "#/$defs/StepId"},
+        "cond": {"type": "string"},
+        "then": {"type": "array", "items": {"$ref": "#/$defs/Step"}},
+        "else": {"type": "array", "items": {"$ref": "#/$defs/Step"}}
+      }
+    },
+    "LoopStep": {
+      "type": "object",
+      "required": ["type", "id", "over", "as", "body"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "loop"},
+        "id": {"$ref": "#/$defs/StepId"},
+        "over": {"type": "string"},
+        "as": {"type": "string"},
+        "body": {"type": "array", "items": {"$ref": "#/$defs/Step"}},
+        "max_iterations": {"type": "integer", "default": 100, "maximum": 1000}
+      }
+    },
+    "UserConfirmStep": {
+      "type": "object",
+      "required": ["type", "id", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "user_confirm"},
+        "id": {"$ref": "#/$defs/StepId"},
+        "message": {"type": "string"},
+        "timeout_sec": {"type": "integer", "minimum": 1, "default": 300},
+        "on_timeout": {"enum": ["cancel", "proceed"], "default": "cancel"}
+      }
+    }
+  }
+}

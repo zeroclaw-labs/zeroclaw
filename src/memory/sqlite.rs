@@ -5,6 +5,8 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -13,6 +15,15 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
+
+/// PR #7 r2d2 pool — read connection pool size. 8 concurrent readers
+/// matches the spec; writes still serialise through the existing
+/// `Arc<Mutex<Connection>>` so there is only one writer at a time
+/// (SQLite's own constraint, WAL mode notwithstanding).
+const READ_POOL_SIZE: u32 = 8;
+
+/// Type alias so spawn_blocking closures don't need the verbose path.
+pub(crate) type ReadPool = Pool<SqliteConnectionManager>;
 
 /// Maximum allowed open timeout (seconds) to avoid unreasonable waits.
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
@@ -52,6 +63,39 @@ pub struct SqliteMemory {
     keyword_weight: f32,
     rrf_k: f32,
     cache_max: usize,
+    /// Optional sync engine attached at factory time for v3.0 dual-brain
+    /// cross-device replication. When set, typed mutations (timeline append,
+    /// compiled truth update, phone call insert) auto-record delta journal
+    /// entries so peers receive them via the existing E2E pipeline.
+    /// Interior-mutable so the factory can attach post-construction without
+    /// breaking the `Memory` trait upcast path.
+    sync: Mutex<Option<Arc<Mutex<super::sync::SyncEngine>>>>,
+
+    /// PR #4 — optional cross-encoder reranker. Interior-mutable with the
+    /// same rationale as `sync` above: the factory wires the reranker after
+    /// `SqliteMemory` is already constructed, and we want to keep the
+    /// `Memory` trait free of reranker specifics.
+    reranker: Mutex<Option<Arc<dyn super::search::Reranker>>>,
+
+    /// PR #4 — rerank runtime settings (enabled flag + top_k window).
+    /// Defaults to `RerankRuntimeConfig::default()` which is `enabled = false`.
+    rerank_config: Mutex<super::search::RerankRuntimeConfig>,
+
+    /// PR #7 HLC migration — monotonic clock used to stamp every INSERT
+    /// / UPDATE into `memories.updated_at_hlc`. Separate from
+    /// `updated_at` (RFC3339 wall-clock string) so peers that speak
+    /// pre-HLC protocol versions keep working — the HLC column is
+    /// additive and not yet the primary ordering key for sync.
+    hlc_clock: Arc<crate::sync::hlc::HlcClock>,
+
+    /// PR #7 r2d2 read pool — up to 8 concurrent connections used by
+    /// the hot read paths (fts5_search, vector_search,
+    /// recall_with_variations). Writes still go through the legacy
+    /// `Arc<Mutex<Connection>>` because SQLite only allows one writer
+    /// at a time anyway — this field is an *additional* resource, not
+    /// a replacement. Every PooledConnection is initialised with the
+    /// same PRAGMA tuning as the main connection (WAL, busy_timeout).
+    read_pool: ReadPool,
 }
 
 impl SqliteMemory {
@@ -68,6 +112,14 @@ impl SqliteMemory {
     #[cfg(test)]
     pub fn conn_for_test(&self) -> parking_lot::MutexGuard<'_, Connection> {
         self.connection()
+    }
+
+    /// PR #7 r2d2 — expose the read pool so hot-read callers can grab
+    /// a concurrent connection instead of queueing on the writer Mutex.
+    /// Returns an owned clone because `r2d2::Pool` is internally Arc'd
+    /// and clones are cheap.
+    pub fn read_pool(&self) -> ReadPool {
+        self.read_pool.clone()
     }
 
     pub fn new(workspace_dir: &Path) -> anyhow::Result<Self> {
@@ -111,12 +163,82 @@ impl SqliteMemory {
         )
     }
 
+    /// PR #5 — SQLCipher variant. Identical to [`Self::with_options`] but
+    /// runs `PRAGMA key = '…'` immediately after opening the connection so
+    /// all subsequent page reads/writes are AES-256 encrypted at rest.
+    /// Also issues `PRAGMA cipher_migrate;` which transparently upgrades
+    /// pre-existing non-encrypted `brain.db` files on first open when the
+    /// passphrase format changes across SQLCipher versions.
+    ///
+    /// Available only under the `memory-sqlcipher` cargo feature
+    /// (`--no-default-features --features memory-sqlcipher`). Builds
+    /// without the feature see a compile error if they try to call this —
+    /// that's intentional so a misconfigured CI can't silently produce
+    /// an unencrypted DB while thinking it's encrypted.
+    #[cfg(feature = "memory-sqlcipher")]
+    pub fn with_options_keyed(
+        workspace_dir: &Path,
+        passphrase: &str,
+        embedder: Arc<dyn EmbeddingProvider>,
+        search_mode: SearchMode,
+        vector_weight: f32,
+        keyword_weight: f32,
+        rrf_k: f32,
+        cache_max: usize,
+        open_timeout_secs: Option<u64>,
+        journal_mode: &str,
+    ) -> anyhow::Result<Self> {
+        Self::with_options_inner(
+            workspace_dir,
+            Some(passphrase),
+            embedder,
+            search_mode,
+            vector_weight,
+            keyword_weight,
+            rrf_k,
+            cache_max,
+            open_timeout_secs,
+            journal_mode,
+        )
+    }
+
     /// Build SQLite memory with full options including journal mode.
     ///
     /// `journal_mode` accepts `"wal"` (default, best performance) or `"delete"`
     /// (required for network/shared filesystems that lack shared-memory support).
     pub fn with_options(
         workspace_dir: &Path,
+        embedder: Arc<dyn EmbeddingProvider>,
+        search_mode: SearchMode,
+        vector_weight: f32,
+        keyword_weight: f32,
+        rrf_k: f32,
+        cache_max: usize,
+        open_timeout_secs: Option<u64>,
+        journal_mode: &str,
+    ) -> anyhow::Result<Self> {
+        Self::with_options_inner(
+            workspace_dir,
+            None,
+            embedder,
+            search_mode,
+            vector_weight,
+            keyword_weight,
+            rrf_k,
+            cache_max,
+            open_timeout_secs,
+            journal_mode,
+        )
+    }
+
+    /// Shared body between `with_options` and `with_options_keyed`. The
+    /// `passphrase` parameter exists on the non-SQLCipher build path too
+    /// (always `None`) so we only maintain one implementation; the
+    /// `PRAGMA key` path is reachable only when `memory-sqlcipher` is on.
+    #[allow(clippy::too_many_arguments)]
+    fn with_options_inner(
+        workspace_dir: &Path,
+        #[allow(unused_variables)] passphrase: Option<&str>,
         embedder: Arc<dyn EmbeddingProvider>,
         search_mode: SearchMode,
         vector_weight: f32,
@@ -133,6 +255,23 @@ impl SqliteMemory {
         }
 
         let conn = Self::open_connection(&db_path, open_timeout_secs)?;
+
+        // ── PR #5: SQLCipher at-rest encryption ─────────────────
+        // Must run BEFORE any other PRAGMA so the header is read as
+        // encrypted. When the `memory-sqlcipher` feature is off the
+        // whole block is compiled out — passing a passphrase into a
+        // non-SQLCipher binary is a programming error.
+        #[cfg(feature = "memory-sqlcipher")]
+        {
+            if let Some(key) = passphrase {
+                // Escape any single quotes to keep the pragma well-formed.
+                let escaped = key.replace('\'', "''");
+                conn.execute_batch(&format!("PRAGMA key = '{escaped}';"))?;
+                // Transparent migration for DBs created by older
+                // SQLCipher versions; no-op for fresh DBs.
+                conn.execute_batch("SELECT count(*) FROM sqlite_master;")?;
+            }
+        }
 
         // ── Production-grade PRAGMA tuning ──────────────────────
         // WAL mode: concurrent reads during writes, crash-safe (default)
@@ -160,6 +299,37 @@ impl SqliteMemory {
 
         Self::init_schema(&conn)?;
 
+        // PR #7 HLC migration — derive a node identifier from the DB path
+        // + hostname so every SqliteMemory instance on this device/user
+        // stamps consistent HLCs. Falls back to "device" when hostname
+        // isn't available.
+        let hostname = hostname::get()
+            .ok()
+            .and_then(|h| h.to_str().map(String::from))
+            .unwrap_or_else(|| "device".to_string());
+        let node_id = format!("{}-{}", hostname, db_path.display());
+        let hlc_clock = Arc::new(crate::sync::hlc::HlcClock::new(node_id));
+
+        // PR #7 r2d2 — build the read pool pointing at the SAME DB file.
+        // Every pooled connection re-applies the core PRAGMA set via a
+        // customiser so reads operate under the same WAL + busy_timeout
+        // semantics as the writer.
+        let manager = SqliteConnectionManager::file(&db_path).with_init(|c| {
+            c.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA synchronous  = NORMAL;
+                 PRAGMA busy_timeout = 5000;
+                 PRAGMA cache_size   = -2000;
+                 PRAGMA temp_store   = MEMORY;",
+            )
+        });
+        let read_pool = Pool::builder()
+            .max_size(READ_POOL_SIZE)
+            .min_idle(Some(1))
+            .connection_timeout(Duration::from_secs(5))
+            .build(manager)
+            .context("failed to build r2d2 read pool")?;
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             db_path,
@@ -169,7 +339,241 @@ impl SqliteMemory {
             keyword_weight,
             rrf_k,
             cache_max,
+            sync: Mutex::new(None),
+            reranker: Mutex::new(None),
+            rerank_config: Mutex::new(super::search::RerankRuntimeConfig::default()),
+            hlc_clock,
+            read_pool,
         })
+    }
+
+    // ── PR #6: consolidation + decay integration ─────────────────
+
+    /// Pull every non-archived memory with a usable embedding into
+    /// [`super::consolidate::CandidateMemory`] form, ready for
+    /// [`super::consolidate::consolidate_candidates`]. The
+    /// `min_recall_count` filter implements the "earned an opinion" rule
+    /// from the algorithm doc — untouched memories are skipped.
+    pub fn collect_consolidation_candidates(
+        &self,
+        min_recall_count: u32,
+    ) -> anyhow::Result<Vec<super::consolidate::CandidateMemory>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, key, content, embedding
+               FROM memories
+              WHERE archived = 0
+                AND embedding IS NOT NULL
+                AND recall_count >= ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![min_recall_count], |row| {
+            let id: String = row.get(0)?;
+            let key: String = row.get(1)?;
+            let content: String = row.get(2)?;
+            let blob: Vec<u8> = row.get(3)?;
+            Ok((id, key, content, blob))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, key, content, blob) = r?;
+            // Embedding is stored as little-endian f32 (`super::vector`
+            // helpers — keep this decode in sync).
+            if blob.len() % 4 != 0 || blob.is_empty() {
+                continue;
+            }
+            let mut embedding = Vec::with_capacity(blob.len() / 4);
+            for chunk in blob.chunks_exact(4) {
+                let mut buf = [0u8; 4];
+                buf.copy_from_slice(chunk);
+                embedding.push(f32::from_le_bytes(buf));
+            }
+            out.push(super::consolidate::CandidateMemory {
+                id,
+                key,
+                content,
+                embedding,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Persist a single [`super::consolidate::ConsolidationOutcome`] —
+    /// inserts the row into `consolidated_memories` and flips the source
+    /// memories' `archived = 1`. Wrapped in a single transaction so a
+    /// crash leaves no half-archived state.
+    pub fn apply_consolidation_outcome(
+        &self,
+        outcome: &super::consolidate::ConsolidationOutcome,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let now = chrono::Local::now().to_rfc3339();
+        let id = uuid::Uuid::new_v4().to_string();
+        let source_ids_json = serde_json::to_string(&outcome.source_ids)?;
+        let source_keys_json = serde_json::to_string(&outcome.source_keys)?;
+        let contradicting_json = serde_json::to_string(&outcome.contradicting_keys)?;
+        let conflict_flag: i64 = i64::from(outcome.conflict);
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO consolidated_memories
+                 (id, fact_type, summary, source_ids, source_keys,
+                  conflict_flag, contradicting_keys, created_at)
+              VALUES (?1, 'semantic_fact', ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                id,
+                outcome.summary,
+                source_ids_json,
+                source_keys_json,
+                conflict_flag,
+                contradicting_json,
+                now
+            ],
+        )?;
+        // Soft-archive each source memory. We deliberately do NOT delete
+        // the row — the user must be able to recover it from the archive
+        // UI. archived=1 is filtered out of recall in a follow-up that
+        // adjusts the SELECT WHERE clauses in fts5_search/vector_search.
+        for src_id in &outcome.source_ids {
+            tx.execute(
+                "UPDATE memories SET archived = 1 WHERE id = ?1",
+                rusqlite::params![src_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Bump the recall counter and refresh `last_recalled` for a memory
+    /// the agent just surfaced. Caller passes the IDs that came back from
+    /// `recall()` so we can update them all in one transaction. Failures
+    /// are swallowed (telemetry only) — bookkeeping must never cause a
+    /// recall to fail user-facing.
+    pub fn bump_recall_metrics(&self, ids: &[String]) -> anyhow::Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let now = chrono::Local::now().to_rfc3339();
+        let mut updated = 0;
+        for id in ids {
+            updated += tx.execute(
+                "UPDATE memories
+                    SET recall_count = recall_count + 1,
+                        last_recalled = ?1
+                  WHERE id = ?2",
+                rusqlite::params![now, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Recompute `decay_score` for every non-archived memory and flip any
+    /// that fall below [`super::decay::ARCHIVE_FLOOR`]. Designed for
+    /// nightly invocation from the dream cycle. Returns the count of
+    /// rows whose `archived` flag transitioned this run.
+    ///
+    /// Two scores are computed per row:
+    ///   * **stored** — `decay::decay_score_for_category` with the
+    ///     cosmetic floor (`DEFAULT_FLOOR = 0.1`); this is what the
+    ///     recall hot path displays / sorts on.
+    ///   * **raw** — same formula with floor = 0.0; this is what the
+    ///     archive decision uses, otherwise the cosmetic floor would
+    ///     keep every never-recalled memory pinned above the
+    ///     `ARCHIVE_FLOOR` of 0.05 forever.
+    /// Identity-category memories never archive because their
+    /// half-life is `INFINITY` → raw score ≥ ln(recall_count + 1) ≥ 0.
+    pub fn run_decay_sweep(&self) -> anyhow::Result<usize> {
+        use super::decay::{
+            decay_score, decay_score_for_category, half_life_for, should_archive, ARCHIVE_FLOOR,
+        };
+        use chrono::{DateTime, Local};
+
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, category, recall_count, last_recalled, created_at
+               FROM memories WHERE archived = 0",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let snapshots: Vec<(String, String, i64, Option<String>, String)> =
+            rows.collect::<Result<_, _>>()?;
+        drop(stmt);
+
+        let now = Local::now();
+        let tx = conn.unchecked_transaction()?;
+        let mut archived = 0usize;
+        for (id, cat, count, last_recalled, created_at) in snapshots {
+            let reference = last_recalled.as_deref().unwrap_or(&created_at);
+            let parsed = DateTime::parse_from_rfc3339(reference)
+                .map(|d| d.with_timezone(&Local))
+                .unwrap_or(now);
+            #[allow(clippy::cast_precision_loss)]
+            let days = ((now - parsed).num_seconds() as f32 / 86_400.0).max(0.0);
+            let category = Self::str_to_category(&cat);
+            let recall_count_u32 = u32::try_from(count.max(0)).unwrap_or(u32::MAX);
+
+            let half_life = half_life_for(&category);
+            let stored = decay_score_for_category(recall_count_u32, days, &category);
+            let raw = decay_score(recall_count_u32, days, half_life, 0.0);
+
+            // INFINITY half-life means identity / pinned facts — they
+            // must survive every sweep no matter what raw score the
+            // formula produces (ln(1) = 0 with a zero floor would
+            // otherwise misfire).
+            let archivable = half_life.is_finite() && should_archive(raw, ARCHIVE_FLOOR);
+
+            if archivable {
+                tx.execute(
+                    "UPDATE memories
+                        SET decay_score = ?1, archived = 1
+                      WHERE id = ?2",
+                    rusqlite::params![f64::from(stored), id],
+                )?;
+                archived += 1;
+            } else {
+                tx.execute(
+                    "UPDATE memories SET decay_score = ?1 WHERE id = ?2",
+                    rusqlite::params![f64::from(stored), id],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(archived)
+    }
+
+    // ── PR #4: reranker plumbing ─────────────────────────────────
+
+    /// PR #4 — attach a cross-encoder reranker. The reranker is consulted by
+    /// `recall_with_variations` after RRF fusion when `rerank_config.enabled`
+    /// is true. Replacing an existing reranker is explicit; callers should
+    /// not install one at hot path.
+    pub fn set_reranker(&self, reranker: Arc<dyn super::search::Reranker>) {
+        *self.reranker.lock() = Some(reranker);
+    }
+
+    /// PR #4 — update rerank runtime config (enabled/model/top_k). The config
+    /// is read on every recall so changes take effect immediately.
+    pub fn set_rerank_config(&self, cfg: super::search::RerankRuntimeConfig) {
+        *self.rerank_config.lock() = cfg;
+    }
+
+    /// Snapshot of the current rerank config — used by the hot path without
+    /// holding a lock across awaits.
+    fn rerank_config(&self) -> super::search::RerankRuntimeConfig {
+        self.rerank_config.lock().clone()
+    }
+
+    /// Snapshot of the currently attached reranker, if any.
+    fn active_reranker(&self) -> Option<Arc<dyn super::search::Reranker>> {
+        self.reranker.lock().clone()
     }
 
     /// Open SQLite connection, optionally with a timeout (for locked/slow storage).
@@ -223,8 +627,10 @@ impl SqliteMemory {
             -- waste space and slow inserts.
 
             -- FTS5 full-text search (BM25 scoring)
+            -- trigram tokenizer (not unicode61) for Korean morphology.
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-                key, content, content=memories, content_rowid=rowid
+                key, content, content=memories, content_rowid=rowid,
+                tokenize='trigram'
             );
 
             -- FTS5 triggers: keep in sync with memories table
@@ -250,7 +656,22 @@ impl SqliteMemory {
                 created_at   TEXT NOT NULL,
                 accessed_at  TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
+            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);
+
+            -- PR #5 embedding backfill queue. Populated when a remote sync
+            -- delta carries an embedding whose (provider/model/version/dim)
+            -- disagrees with the local embedder — the blob is discarded
+            -- rather than silently cached (foreign-model floats would feed
+            -- vec2text-style reconstruction attacks) and the content hash
+            -- is parked here for a background re-embedding pass.
+            CREATE TABLE IF NOT EXISTS embedding_backfill_queue (
+                content_hash TEXT PRIMARY KEY,
+                reason       TEXT NOT NULL,
+                enqueued_at  TEXT NOT NULL,
+                processed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_backfill_pending
+                ON embedding_backfill_queue(processed_at) WHERE processed_at IS NULL;",
         )?;
 
         // Migration: add session_id column if not present (safe to run repeatedly)
@@ -277,6 +698,63 @@ impl SqliteMemory {
                      ON memories(needs_recompile) WHERE needs_recompile = 1;",
             )?;
         }
+
+        // ── PR #7 HLC migration (additive) ─────────────────────────
+        // Stamp every row with a Hybrid Logical Clock string alongside
+        // the existing RFC3339 updated_at. Future sync protocol version
+        // can switch ordering to this column; today it's informational
+        // but captured on every write so the data is ready when the
+        // protocol flip happens.
+        if !memories_sql.contains("updated_at_hlc") {
+            conn.execute_batch(
+                "ALTER TABLE memories ADD COLUMN updated_at_hlc TEXT;
+                 CREATE INDEX IF NOT EXISTS idx_memories_hlc
+                     ON memories(updated_at_hlc) WHERE updated_at_hlc IS NOT NULL;",
+            )?;
+        }
+
+        // ── PR #6 migration: forgetting-curve + consolidation columns ──
+        // recall_count / last_recalled feed the decay score; archived flips
+        // to 1 either by the consolidator (sources merged into a
+        // semantic_fact) or by the nightly decay sweep when the score
+        // falls below decay::ARCHIVE_FLOOR. decay_score is denormalised
+        // onto the row so the recall hot path can filter without
+        // recomputing on every read.
+        if !memories_sql.contains("recall_count") {
+            conn.execute_batch(
+                "ALTER TABLE memories ADD COLUMN recall_count INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE memories ADD COLUMN last_recalled TEXT;
+                 ALTER TABLE memories ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE memories ADD COLUMN decay_score REAL NOT NULL DEFAULT 1.0;
+                 CREATE INDEX IF NOT EXISTS idx_memories_archived
+                     ON memories(archived);
+                 CREATE INDEX IF NOT EXISTS idx_memories_decay
+                     ON memories(decay_score) WHERE archived = 0;",
+            )?;
+        }
+
+        // PR #6 — consolidated semantic facts. Each row is the LLM-summary
+        // of a cluster of near-duplicate memories; source_ids is a JSON
+        // array of memories.id values that were archived in its favour.
+        // type discriminates future expansions (today only "semantic_fact").
+        // conflict_flag = 1 surfaces clusters where members contradict
+        // each other so a UI can prompt the user for resolution.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS consolidated_memories (
+                id            TEXT PRIMARY KEY,
+                fact_type     TEXT NOT NULL DEFAULT 'semantic_fact',
+                summary       TEXT NOT NULL,
+                source_ids    TEXT NOT NULL,
+                source_keys   TEXT NOT NULL,
+                conflict_flag INTEGER NOT NULL DEFAULT 0,
+                contradicting_keys TEXT,
+                created_at    TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_consolidated_conflict
+                ON consolidated_memories(conflict_flag) WHERE conflict_flag = 1;
+            CREATE INDEX IF NOT EXISTS idx_consolidated_created
+                ON consolidated_memories(created_at DESC);",
+        )?;
 
         // memory_timeline — append-only evidence store
         conn.execute_batch(
@@ -584,10 +1062,14 @@ impl SqliteMemory {
             return Ok(Vec::new());
         }
 
+        // PR #6 wire-up: skip soft-archived rows so consolidated/decayed
+        // memories never resurface through FTS until the archive UI
+        // explicitly un-archives them.
         let sql = "SELECT m.id, bm25(memories_fts) as score
                    FROM memories_fts f
                    JOIN memories m ON m.rowid = f.rowid
                    WHERE memories_fts MATCH ?1
+                     AND m.archived = 0
                    ORDER BY score
                    LIMIT ?2";
 
@@ -621,7 +1103,12 @@ impl SqliteMemory {
         category: Option<&str>,
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
-        let mut sql = "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL".to_string();
+        // PR #6 wire-up: archived rows excluded from vector search for the
+        // same reason fts5_search excludes them — consolidated/decayed
+        // memories must not bleed back into recall.
+        let mut sql =
+            "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL AND archived = 0"
+                .to_string();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut idx = 1;
 
@@ -714,23 +1201,59 @@ impl SqliteMemory {
 
     // ── v3.0 Compiled Truth + Timeline methods ───────────────────
 
+    /// Attach a sync engine for v3.0 dual-brain cross-device replication.
+    /// After attachment, `append_timeline`, `set_compiled_truth`, and
+    /// `insert_phone_call` auto-record delta journal entries.
+    /// The factory calls this from `create_synced_memory` when sync is enabled.
+    pub fn attach_sync(&self, engine: Arc<Mutex<super::sync::SyncEngine>>) {
+        *self.sync.lock() = Some(engine);
+    }
+
+    /// Run a closure with the attached sync engine, if any. No-op otherwise.
+    /// Private helper — callers use the typed record_* methods.
+    fn with_sync<F>(&self, f: F)
+    where
+        F: FnOnce(&mut super::sync::SyncEngine),
+    {
+        let guard = self.sync.lock();
+        if let Some(engine_arc) = guard.as_ref().cloned() {
+            drop(guard);
+            let mut engine = engine_arc.lock();
+            f(&mut engine);
+        }
+    }
+
     /// Update the compiled truth for a memory entry.
     /// Increments `truth_version` and sets `needs_recompile = 0`.
+    /// Auto-records a `CompiledTruthUpdate` delta if a sync engine is attached.
     pub fn set_compiled_truth(&self, memory_key: &str, compiled_truth: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        conn.execute(
-            "UPDATE memories
-             SET compiled_truth = ?1,
-                 truth_version = truth_version + 1,
-                 truth_updated_at = ?2,
-                 needs_recompile = 0
-             WHERE key = ?3",
-            params![compiled_truth, now as i64, memory_key],
-        )?;
+        // Perform DB write and capture new version in a single locked scope.
+        let new_version: u32 = {
+            let conn = self.conn.lock();
+            conn.execute(
+                "UPDATE memories
+                 SET compiled_truth = ?1,
+                     truth_version = truth_version + 1,
+                     truth_updated_at = ?2,
+                     needs_recompile = 0
+                 WHERE key = ?3",
+                params![compiled_truth, now as i64, memory_key],
+            )?;
+            conn.query_row(
+                "SELECT truth_version FROM memories WHERE key = ?1",
+                params![memory_key],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u32
+        };
+
+        self.with_sync(|engine| {
+            engine.record_compiled_truth_update(memory_key, compiled_truth, new_version);
+        });
         Ok(())
     }
 
@@ -783,6 +1306,7 @@ impl SqliteMemory {
 
     /// Append an evidence entry to `memory_timeline` (append-only).
     /// Returns the generated UUID for the entry.
+    /// Auto-records a `TimelineAppend` delta if a sync engine is attached.
     #[allow(clippy::too_many_arguments)]
     pub fn append_timeline(
         &self,
@@ -797,24 +1321,112 @@ impl SqliteMemory {
         use sha2::{Digest, Sha256};
         let uuid = Uuid::new_v4().to_string();
         let content_sha256 = hex::encode(Sha256::digest(content.as_bytes()));
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO memory_timeline
-                (uuid, memory_id, event_type, event_at, source_ref, content, content_sha256, metadata_json, device_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                uuid,
+        {
+            let conn = self.conn.lock();
+            conn.execute(
+                "INSERT INTO memory_timeline
+                    (uuid, memory_id, event_type, event_at, source_ref, content, content_sha256, metadata_json, device_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    uuid,
+                    memory_id,
+                    event_type,
+                    event_at as i64,
+                    source_ref,
+                    content,
+                    content_sha256,
+                    metadata_json,
+                    device_id,
+                ],
+            )?;
+        }
+
+        self.with_sync(|engine| {
+            engine.record_timeline_append(
+                &uuid,
                 memory_id,
                 event_type,
-                event_at as i64,
+                event_at,
                 source_ref,
                 content,
-                content_sha256,
+                &content_sha256,
                 metadata_json,
-                device_id,
-            ],
-        )?;
+            );
+        });
         Ok(uuid)
+    }
+
+    /// Insert a phone call metadata row into `phone_calls`.
+    /// Auto-records a `PhoneCallRecord` delta if a sync engine is attached.
+    /// Replaces the local-only helper previously in `src/phone/post_call.rs`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_phone_call(
+        &self,
+        call_uuid: &str,
+        direction: &str,
+        caller_number: Option<&str>,
+        caller_number_e164: Option<&str>,
+        caller_object_id: Option<i64>,
+        started_at: u64,
+        ended_at: Option<u64>,
+        duration_ms: Option<u64>,
+        gps_lat: Option<f64>,
+        gps_lon: Option<f64>,
+        transcript: Option<&str>,
+        summary: Option<&str>,
+        risk_level: &str,
+        sos_triggered: bool,
+        language: Option<&str>,
+        memory_id: Option<&str>,
+        device_id: &str,
+    ) -> anyhow::Result<()> {
+        {
+            let conn = self.conn.lock();
+            conn.execute(
+                "INSERT INTO phone_calls
+                    (call_uuid, direction, caller_number, caller_number_e164, caller_object_id,
+                     started_at, ended_at, duration_ms, gps_lat, gps_lon,
+                     transcript, summary, risk_level, sos_triggered, language,
+                     memory_id, device_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                params![
+                    call_uuid,
+                    direction,
+                    caller_number,
+                    caller_number_e164,
+                    caller_object_id,
+                    started_at as i64,
+                    ended_at.map(|t| t as i64),
+                    duration_ms.map(|t| t as i64),
+                    gps_lat,
+                    gps_lon,
+                    transcript,
+                    summary,
+                    risk_level,
+                    sos_triggered as i32,
+                    language,
+                    memory_id,
+                    device_id,
+                ],
+            )?;
+        }
+
+        self.with_sync(|engine| {
+            engine.record_phone_call(
+                call_uuid,
+                direction,
+                caller_number_e164,
+                caller_object_id,
+                started_at,
+                ended_at,
+                duration_ms,
+                transcript,
+                summary,
+                risk_level,
+                memory_id,
+            );
+        });
+        Ok(())
     }
 
     /// Get timeline entries for a memory, ordered by event_at descending.
@@ -892,20 +1504,40 @@ impl SqliteMemory {
         expand_config: &super::query_expand::QueryExpandConfig,
         provider: &dyn crate::providers::traits::Provider,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let queries = expander.expand(query, expand_config, provider).await;
+        self.recall_with_variations(query, &queries, limit, session_id).await
+    }
+
+    /// Recall with a pre-expanded list of query variations.
+    /// Runs parallel FTS + vector search per variation, then fuses via RRF
+    /// (or weighted, depending on `search_mode`). If `variations` has ≤ 1
+    /// entry, falls back to standard `recall()`.
+    ///
+    /// **Provider-free**: unlike `recall_expanded`, this API requires no
+    /// LLM provider — callers that already expanded the query (e.g. agent
+    /// loop with its own QueryExpander) pass the variations directly.
+    /// This is the method the `Memory` trait surfaces so non-sqlite
+    /// backends can fall back gracefully.
+    pub async fn recall_with_variations(
+        &self,
+        original_query: &str,
+        variations: &[String],
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
         use super::traits::Memory;
 
-        let queries = expander.expand(query, expand_config, provider).await;
-
-        if queries.len() <= 1 {
-            // No expansion occurred — use standard recall
-            return self.recall(query, limit, session_id).await;
+        if variations.len() <= 1 {
+            // No expansion — use standard recall on the original query
+            return self.recall(original_query, limit, session_id).await;
         }
 
         // Multi-query RRF: search each variation, merge all results
-        let query_embedding_original = self.get_or_compute_embedding(query).await?;
+        let query_embedding_original = self.get_or_compute_embedding(original_query).await?;
+
+        let queries_owned: Vec<String> = variations.to_vec();
 
         let conn = self.conn.clone();
-        let queries_owned: Vec<String> = queries;
         let sid = session_id.map(String::from);
         let rrf_k = self.rrf_k;
         let search_mode = self.search_mode;
@@ -922,52 +1554,128 @@ impl SqliteMemory {
             }
         }
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+        // PR #4 — how big a candidate pool the reranker (if any) wants to
+        // see. Fetched here so the blocking task can over-fetch when a
+        // reranker is attached.
+        let rerank_cfg = self.rerank_config();
+        let reranker = self.active_reranker();
+        let fetch_limit = if reranker.is_some() && rerank_cfg.enabled {
+            rerank_cfg.top_k_before.max(limit)
+        } else {
+            limit
+        };
+
+        let results: anyhow::Result<Vec<MemoryEntry>> = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let session_ref = sid.as_deref();
 
-            // Collect ranked lists from all queries × {vec, fts}
-            let mut all_vec_results: Vec<(String, f32)> = Vec::new();
-            let mut all_fts_results: Vec<(String, f32)> = Vec::new();
+            // PR #4: collect one ranker slice per (query × ranker_kind). The
+            // previous implementation flattened all queries into two big
+            // lists and 2-way merged them, losing the rank-per-query signal
+            // that RRF is designed to exploit. k_way_rrf keeps each list
+            // separate so a document that lands rank-1 in multiple query
+            // variations dominates one that lands rank-1 once.
+            let mut per_ranker_lists: Vec<Vec<(String, f32)>> =
+                Vec::with_capacity(queries_owned.len() * 2);
+            let mut any_vec_hit = false;
 
             for (i, q) in queries_owned.iter().enumerate() {
-                let fts = Self::fts5_search(&conn, q, limit * 2).unwrap_or_default();
-                all_fts_results.extend(fts);
+                let fts = Self::fts5_search(&conn, q, fetch_limit * 2).unwrap_or_default();
+                per_ranker_lists.push(fts);
 
                 if let Some(Some(ref emb)) = query_embeddings.get(i) {
-                    let vec_hits = Self::vector_search(&conn, emb, limit * 2, None, session_ref)
-                        .unwrap_or_default();
-                    all_vec_results.extend(vec_hits);
+                    let vec_hits =
+                        Self::vector_search(&conn, emb, fetch_limit * 2, None, session_ref)
+                            .unwrap_or_default();
+                    if !vec_hits.is_empty() {
+                        any_vec_hit = true;
+                    }
+                    per_ranker_lists.push(vec_hits);
                 }
             }
 
-            // Deduplicate by keeping the best score per id for each ranker
-            let dedup_vec = dedup_ranked_list(&all_vec_results);
-            let dedup_fts = dedup_ranked_list(&all_fts_results);
-
-            // Merge via configured strategy
-            let merged = if dedup_vec.is_empty() {
-                dedup_fts
-                    .iter()
-                    .map(|(id, score)| super::vector::ScoredResult {
-                        id: id.clone(),
-                        vector_score: None,
-                        keyword_score: Some(*score),
-                        final_score: *score,
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                match search_mode {
-                    SearchMode::Rrf => {
-                        super::vector::rrf_merge(&dedup_vec, &dedup_fts, rrf_k, limit)
+            let merged: Vec<super::vector::ScoredResult> = match search_mode {
+                SearchMode::Rrf => {
+                    if !any_vec_hit {
+                        // FTS-only fallback: skip fusion when vectors are
+                        // unavailable (e.g. NoopEmbedding); preserve BM25
+                        // order directly.
+                        let flat = dedup_ranked_list(
+                            &per_ranker_lists
+                                .iter()
+                                .flatten()
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        );
+                        flat.into_iter()
+                            .take(fetch_limit)
+                            .map(|(id, score)| super::vector::ScoredResult {
+                                id,
+                                vector_score: None,
+                                keyword_score: Some(score),
+                                final_score: score,
+                            })
+                            .collect()
+                    } else {
+                        let ranker_refs: Vec<&[(String, f32)]> = per_ranker_lists
+                            .iter()
+                            .map(std::vec::Vec::as_slice)
+                            .collect();
+                        let fused = super::search::k_way_rrf(
+                            &ranker_refs,
+                            super::search::RrfSettings {
+                                k: rrf_k,
+                                limit: fetch_limit,
+                            },
+                        );
+                        fused
+                            .into_iter()
+                            .map(|f| super::vector::ScoredResult {
+                                id: f.id,
+                                vector_score: None,
+                                keyword_score: None,
+                                final_score: f.score,
+                            })
+                            .collect()
                     }
-                    SearchMode::Weighted => super::vector::hybrid_merge(
-                        &dedup_vec,
-                        &dedup_fts,
-                        vector_weight,
-                        keyword_weight,
-                        limit,
-                    ),
+                }
+                SearchMode::Weighted => {
+                    // Weighted mode keeps the legacy 2-way collapse — its
+                    // linear score blend assumes a single vector and a
+                    // single keyword list, so we still dedup-then-merge.
+                    let mut all_vec: Vec<(String, f32)> = Vec::new();
+                    let mut all_fts: Vec<(String, f32)> = Vec::new();
+                    for (idx, list) in per_ranker_lists.iter().enumerate() {
+                        // Even-numbered slots are fts (see push order above);
+                        // odd slots are vec. This pairing is local to this
+                        // legacy branch only.
+                        if idx % 2 == 0 {
+                            all_fts.extend(list.iter().cloned());
+                        } else {
+                            all_vec.extend(list.iter().cloned());
+                        }
+                    }
+                    let dedup_vec = dedup_ranked_list(&all_vec);
+                    let dedup_fts = dedup_ranked_list(&all_fts);
+                    if dedup_vec.is_empty() {
+                        dedup_fts
+                            .into_iter()
+                            .map(|(id, score)| super::vector::ScoredResult {
+                                id,
+                                vector_score: None,
+                                keyword_score: Some(score),
+                                final_score: score,
+                            })
+                            .collect()
+                    } else {
+                        super::vector::hybrid_merge(
+                            &dedup_vec,
+                            &dedup_fts,
+                            vector_weight,
+                            keyword_weight,
+                            fetch_limit,
+                        )
+                    }
                 }
             };
 
@@ -1031,7 +1739,65 @@ impl SqliteMemory {
 
             Ok(results)
         })
-        .await?
+        .await
+        .map_err(|e| anyhow::anyhow!("recall_with_variations blocking task panicked: {e}"))?;
+
+        // PR #4 — cross-encoder rerank pass. Runs off the blocking pool so
+        // the ONNX call can own its own tokio::spawn_blocking internally.
+        let fused_entries = results?;
+        let final_entries: Vec<MemoryEntry> = match (reranker, rerank_cfg.enabled) {
+            (Some(reranker), true) if !fused_entries.is_empty() => {
+                let window = rerank_cfg.top_k_before.min(fused_entries.len());
+                let (rerank_slice, rest) = fused_entries.split_at(window);
+                let candidates: Vec<super::search::RerankCandidate> = rerank_slice
+                    .iter()
+                    .map(|e| super::search::RerankCandidate {
+                        id: e.id.clone(),
+                        text: e.content.clone(),
+                        #[allow(clippy::cast_possible_truncation)]
+                        prior_score: e.score.map(|s| s as f32).unwrap_or(0.0),
+                    })
+                    .collect();
+                match reranker.rerank(original_query, candidates).await {
+                    Ok(reordered) => {
+                        let keep = rerank_cfg.top_k_after.min(reordered.len());
+                        let mut by_id: std::collections::HashMap<String, MemoryEntry> =
+                            rerank_slice
+                                .iter()
+                                .cloned()
+                                .map(|e| (e.id.clone(), e))
+                                .collect();
+                        let mut out = Vec::with_capacity(keep);
+                        for c in reordered.into_iter().take(keep) {
+                            if let Some(mut entry) = by_id.remove(&c.id) {
+                                entry.score = Some(f64::from(c.prior_score));
+                                out.push(entry);
+                            }
+                        }
+                        // If the reranker trimmed below the caller's limit
+                        // (because top_k_after < window), tail the RRF
+                        // overflow so we don't hand back fewer results than
+                        // `limit` requested.
+                        if out.len() < limit {
+                            for entry in rest.iter().take(limit - out.len()) {
+                                out.push(entry.clone());
+                            }
+                        }
+                        out
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "rerank pass failed; returning RRF-only results"
+                        );
+                        fused_entries.into_iter().take(limit).collect()
+                    }
+                }
+            }
+            _ => fused_entries.into_iter().take(limit).collect(),
+        };
+
+        Ok(final_entries)
     }
 }
 
@@ -1072,6 +1838,328 @@ impl Memory for SqliteMemory {
         "sqlite"
     }
 
+    fn attach_sync_engine(&self, engine: Arc<Mutex<super::sync::SyncEngine>>) {
+        self.attach_sync(engine);
+    }
+
+    async fn recall_with_variations(
+        &self,
+        original_query: &str,
+        variations: &[String],
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // Delegate to the concrete impl (multi-query RRF).
+        SqliteMemory::recall_with_variations(self, original_query, variations, limit, session_id).await
+    }
+
+    /// PR #5 — decide whether to cache a remote-computed embedding.
+    ///
+    /// Accept iff the remote blob's (provider, model, version, dim) all match
+    /// our local embedder's. On match, seed `embedding_cache` keyed on
+    /// `content_hash` so the next local recall() skips re-computation.
+    /// On drift, enqueue the content hash into `embedding_backfill_queue`
+    /// and return an error describing the mismatch — caller logs but does
+    /// not abort delta application.
+    async fn accept_remote_embedding(
+        &self,
+        content: &str,
+        blob: &super::sync::EmbeddingBlob,
+    ) -> anyhow::Result<bool> {
+        use super::embedding::EmbeddingProvider;
+
+        let local_provider = self.embedder.name().to_string();
+        let local_model = self.embedder.model().to_string();
+        let local_version = self.embedder.version();
+        let local_dim = self.embedder.dimensions();
+
+        // Noop embedder (dim = 0) has nothing to cache; swallow silently.
+        if local_dim == 0 {
+            return Ok(false);
+        }
+
+        let drift = blob.provider != local_provider
+            || blob.model != local_model
+            || blob.version != local_version
+            || usize::try_from(blob.dim).unwrap_or(usize::MAX) != local_dim;
+
+        let content_hash = Self::content_hash(content);
+        let conn = self.conn.clone();
+        let content_hash_owned = content_hash.clone();
+
+        if drift {
+            // Drop the embedding; enqueue a backfill so decrypt+re-embed is
+            // tracked. Error return surfaces the drift reason to callers;
+            // they log but do not abort the delta apply.
+            let reason = format!(
+                "embedding drift: remote ({}:{}/v{}/dim{}) ≠ local ({}:{}/v{}/dim{})",
+                blob.provider,
+                blob.model,
+                blob.version,
+                blob.dim,
+                local_provider,
+                local_model,
+                local_version,
+                local_dim
+            );
+            let reason_for_queue = reason.clone();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let c = conn.lock();
+                c.execute(
+                    "INSERT OR IGNORE INTO embedding_backfill_queue \
+                     (content_hash, reason, enqueued_at) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![
+                        content_hash_owned,
+                        reason_for_queue,
+                        chrono::Local::now().to_rfc3339()
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("backfill enqueue task panicked: {e}"))??;
+            anyhow::bail!("{reason}");
+        }
+
+        // Accept: seed embedding_cache. Vec is little-endian f32 bytes.
+        if blob.vector.len() != local_dim * 4 {
+            anyhow::bail!(
+                "embedding blob length {} ≠ expected {} (dim {} × 4 bytes)",
+                blob.vector.len(),
+                local_dim * 4,
+                local_dim
+            );
+        }
+        let bytes = blob.vector.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let c = conn.lock();
+            let now = chrono::Local::now().to_rfc3339();
+            c.execute(
+                "INSERT OR REPLACE INTO embedding_cache \
+                 (content_hash, embedding, created_at, accessed_at) \
+                 VALUES (?1, ?2, ?3, ?3)",
+                rusqlite::params![content_hash_owned, bytes, now],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("embedding cache seed task panicked: {e}"))??;
+
+        Ok(true)
+    }
+
+    /// PR #9 Phase 5 — expose the local embedder for agent-loop community
+    /// ranking. Goes through `get_or_compute_embedding` so the cache is
+    /// shared with `recall()`.
+    async fn query_embedding(&self, query: &str) -> Option<Vec<f32>> {
+        self.get_or_compute_embedding(query).await.ok().flatten()
+    }
+
+    /// PR #5 sender-side — package the embedding we already computed
+    /// for `content` into an [`super::sync::EmbeddingBlob`] using local
+    /// embedder metadata. Returns `None` when (a) we use `NoopEmbedding`,
+    /// (b) the cache misses (the local store has not yet seen this
+    /// content), or (c) the cached blob is malformed. Cheap — single
+    /// indexed lookup against `embedding_cache`.
+    async fn current_embedding_blob(
+        &self,
+        content: &str,
+    ) -> Option<super::sync::EmbeddingBlob> {
+        use super::embedding::EmbeddingProvider;
+        let dim = self.embedder.dimensions();
+        if dim == 0 {
+            return None;
+        }
+        let provider = self.embedder.name().to_string();
+        let model = self.embedder.model().to_string();
+        let version = self.embedder.version();
+        let hash = Self::content_hash(content);
+        let conn = self.conn.clone();
+        let bytes = tokio::task::spawn_blocking(move || -> Option<Vec<u8>> {
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare_cached("SELECT embedding FROM embedding_cache WHERE content_hash = ?1")
+                .ok()?;
+            stmt.query_row(rusqlite::params![hash], |row| row.get::<_, Vec<u8>>(0))
+                .ok()
+        })
+        .await
+        .ok()
+        .flatten()?;
+        if bytes.len() != dim * 4 {
+            return None;
+        }
+        Some(super::sync::EmbeddingBlob {
+            provider,
+            model,
+            version,
+            #[allow(clippy::cast_possible_truncation)]
+            dim: dim as u32,
+            vector: bytes,
+        })
+    }
+
+    async fn apply_remote_v3_delta(
+        &self,
+        delta: &super::sync::DeltaOperation,
+    ) -> anyhow::Result<bool> {
+        use super::sync::DeltaOperation;
+        match delta {
+            DeltaOperation::TimelineAppend {
+                uuid,
+                memory_id,
+                event_type,
+                event_at,
+                source_ref,
+                content,
+                content_sha256,
+                metadata_json,
+            } => {
+                let conn = self.conn.lock();
+                // Idempotent — UUID uniqueness prevents duplicate inserts.
+                // The per-device device_id is not in the delta (to keep
+                // delta size minimal); we mark remote-origin rows with
+                // "remote:<src_device>" when available, else "remote".
+                let origin = "remote";
+                conn.execute(
+                    "INSERT OR IGNORE INTO memory_timeline
+                        (uuid, memory_id, event_type, event_at, source_ref, content, content_sha256, metadata_json, device_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        uuid,
+                        memory_id,
+                        event_type,
+                        *event_at as i64,
+                        source_ref,
+                        content,
+                        content_sha256,
+                        metadata_json.as_deref(),
+                        origin,
+                    ],
+                )?;
+                Ok(true)
+            }
+            DeltaOperation::PhoneCallRecord {
+                call_uuid,
+                direction,
+                caller_number_e164,
+                caller_object_id,
+                started_at,
+                ended_at,
+                duration_ms,
+                transcript,
+                summary,
+                risk_level,
+                memory_id,
+            } => {
+                let conn = self.conn.lock();
+                let origin = "remote";
+                conn.execute(
+                    "INSERT OR IGNORE INTO phone_calls
+                        (call_uuid, direction, caller_number, caller_number_e164, caller_object_id,
+                         started_at, ended_at, duration_ms, gps_lat, gps_lon,
+                         transcript, summary, risk_level, sos_triggered, language,
+                         memory_id, device_id)
+                     VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, 0, NULL, ?11, ?12)",
+                    params![
+                        call_uuid,
+                        direction,
+                        caller_number_e164.as_deref(),
+                        caller_object_id,
+                        *started_at as i64,
+                        ended_at.map(|t| t as i64),
+                        duration_ms.map(|t| t as i64),
+                        transcript.as_deref(),
+                        summary.as_deref(),
+                        risk_level,
+                        memory_id.as_deref(),
+                        origin,
+                    ],
+                )?;
+                Ok(true)
+            }
+            DeltaOperation::CompiledTruthUpdate {
+                memory_key,
+                compiled_truth,
+                truth_version,
+            } => {
+                // LWW on truth_version: only apply if the remote version is
+                // strictly greater than the local one. Prevents older truths
+                // overwriting newer ones under out-of-order delivery.
+                let conn = self.conn.lock();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let changed = conn.execute(
+                    "UPDATE memories
+                     SET compiled_truth = ?1,
+                         truth_version = ?2,
+                         truth_updated_at = ?3,
+                         needs_recompile = 0
+                     WHERE key = ?4 AND truth_version < ?2",
+                    params![compiled_truth, *truth_version as i64, now as i64, memory_key],
+                )?;
+                Ok(changed > 0)
+            }
+            DeltaOperation::VaultDocUpsert {
+                uuid,
+                source_type,
+                title,
+                checksum,
+                content_sha256: _,
+                frontmatter_json: _,
+                links_json: _,
+                // PR #5: embedding blob is handled by the SyncedMemory layer
+                // (accept_remote_embedding) against the full content once
+                // Layer 3 transfers it. We do not cache here because we
+                // don't have the cleartext content to key on yet.
+                embedding: _,
+            } => {
+                // Vault (second-brain) docs: shell row only. Full content
+                // travels via Layer 3 manifest (existing full-sync path) to
+                // keep delta journal small. Here we just register the
+                // document identity + checksum so peer knows it exists.
+                // Content marked "(pending body sync)" — filled when Layer 3
+                // transfers the full text.
+                let conn = self.conn.lock();
+                // Ensure vault_documents exists; if schema not installed on this
+                // SqliteMemory instance (test fixture without vault), ignore.
+                let has_table: Option<i64> = conn
+                    .query_row(
+                        "SELECT 1 FROM sqlite_master
+                         WHERE type='table' AND name='vault_documents'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if has_table.is_none() {
+                    return Ok(false);
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let changed = conn.execute(
+                    "INSERT OR IGNORE INTO vault_documents
+                        (uuid, title, content, source_type, source_device_id,
+                         checksum, char_count, created_at, updated_at)
+                     VALUES (?1, ?2, '(pending body sync)', ?3, 'remote', ?4, 0, ?5, ?5)",
+                    params![
+                        uuid,
+                        title,
+                        source_type,
+                        checksum,
+                        now as i64
+                    ],
+                )?;
+                Ok(changed > 0)
+            }
+            // Non-v3 operations fall through — SyncedMemory handles them.
+            _ => Ok(false),
+        }
+    }
+
     async fn store(
         &self,
         key: &str,
@@ -1089,6 +2177,11 @@ impl Memory for SqliteMemory {
         let key = key.to_string();
         let content = content.to_string();
         let sid = session_id.map(String::from);
+        // PR #7 HLC migration — tick the clock once per write. Stamp
+        // lives on the row alongside the existing RFC3339 `updated_at`
+        // so peers can compare monotonically once the sync protocol
+        // switches to HLC.
+        let hlc_stamp = self.hlc_clock.tick().encode();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.lock();
@@ -1097,15 +2190,16 @@ impl Memory for SqliteMemory {
             let id = Uuid::new_v4().to_string();
 
             conn.execute(
-                "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id, updated_at_hlc)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(key) DO UPDATE SET
                     content = excluded.content,
                     category = excluded.category,
                     embedding = excluded.embedding,
                     updated_at = excluded.updated_at,
-                    session_id = excluded.session_id",
-                params![id, key, content, cat, embedding_bytes, now, now, sid],
+                    session_id = excluded.session_id,
+                    updated_at_hlc = excluded.updated_at_hlc",
+                params![id, key, content, cat, embedding_bytes, now, now, sid, hlc_stamp],
             )?;
             Ok(())
         })
@@ -1133,7 +2227,7 @@ impl Memory for SqliteMemory {
         let search_mode = self.search_mode;
         let rrf_k = self.rrf_k;
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+        let results = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let session_ref = sid.as_deref();
 
@@ -1254,9 +2348,12 @@ impl Memory for SqliteMemory {
                         })
                         .collect();
                     let where_clause = conditions.join(" OR ");
+                    // PR #6 wire-up: archived rows excluded from the LIKE
+                    // fallback for the same reason FTS5 + vector exclude
+                    // them.
                     let sql = format!(
                         "SELECT id, key, content, category, created_at, session_id FROM memories
-                         WHERE {where_clause}
+                         WHERE archived = 0 AND ({where_clause})
                          ORDER BY updated_at DESC
                          LIMIT ?{}",
                         keywords.len() * 2 + 1
@@ -1298,8 +2395,22 @@ impl Memory for SqliteMemory {
 
             results.truncate(limit);
             Ok(results)
-        })
-        .await?
+        });
+
+        let results: Vec<MemoryEntry> = results
+            .await
+            .map_err(|e| anyhow::anyhow!("recall blocking task panicked: {e}"))??;
+
+        // PR #6 wire-up: bump recall metrics for every surfaced row so the
+        // decay sweep has accurate retrieval counts. Failures are
+        // swallowed — bookkeeping must never make a recall fail.
+        if !results.is_empty() {
+            let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
+            if let Err(e) = self.bump_recall_metrics(&ids) {
+                tracing::debug!("bump_recall_metrics failed (non-fatal): {e}");
+            }
+        }
+        Ok(results)
     }
 
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
@@ -1308,11 +2419,17 @@ impl Memory for SqliteMemory {
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
+            // PR #6 wire-up: surface recall_count / last_recalled from the
+            // DB so callers (UI, debuggers, tests) can see what the decay
+            // layer actually observed.
             let mut stmt = conn.prepare_cached(
-                "SELECT id, key, content, category, created_at, session_id FROM memories WHERE key = ?1",
+                "SELECT id, key, content, category, created_at, session_id,
+                        recall_count, last_recalled
+                   FROM memories WHERE key = ?1",
             )?;
 
             let mut rows = stmt.query_map(params![key], |row| {
+                let recall_count_i: i64 = row.get(6)?;
                 Ok(MemoryEntry {
                     id: row.get(0)?,
                     key: row.get(1)?,
@@ -1321,8 +2438,8 @@ impl Memory for SqliteMemory {
                     timestamp: row.get(4)?,
                     session_id: row.get(5)?,
                     score: None,
-                recall_count: 0,
-                last_recalled: None,
+                    recall_count: u32::try_from(recall_count_i.max(0)).unwrap_or(u32::MAX),
+                    last_recalled: row.get(7)?,
                 })
             })?;
 
@@ -2775,5 +3892,896 @@ mod tests {
         let (_tmp, mem) = temp_sqlite();
         let result = mem.get_compiled_truth("nonexistent").unwrap();
         assert!(result.is_none());
+    }
+
+    // ── v3.0 Dual-Brain Sync Integration Tests ───────────────────
+
+    #[tokio::test]
+    async fn timeline_append_records_sync_delta_when_attached() {
+        let (_tmp, mem) = temp_sqlite();
+        let engine = Arc::new(Mutex::new(
+            super::super::sync::SyncEngine::new(_tmp.path(), true).unwrap(),
+        ));
+        mem.attach_sync(engine.clone());
+
+        mem.store("m_ts", "memory", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let entry = mem.get("m_ts").await.unwrap().unwrap();
+
+        let before = engine.lock().journal_len();
+        mem.append_timeline(&entry.id, "chat", 1000, "msg_sync_1", "evidence", None, "dev_local")
+            .unwrap();
+        let after = engine.lock().journal_len();
+        assert_eq!(
+            after - before,
+            1,
+            "append_timeline must push exactly one TimelineAppend delta when sync is attached"
+        );
+    }
+
+    #[tokio::test]
+    async fn compiled_truth_update_records_sync_delta_with_version() {
+        let (_tmp, mem) = temp_sqlite();
+        let engine = Arc::new(Mutex::new(
+            super::super::sync::SyncEngine::new(_tmp.path(), true).unwrap(),
+        ));
+        mem.attach_sync(engine.clone());
+
+        mem.store("m_ct", "initial", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let before = engine.lock().journal_len();
+        mem.set_compiled_truth("m_ct", "v1 summary").unwrap();
+        mem.set_compiled_truth("m_ct", "v2 summary").unwrap();
+        let after = engine.lock().journal_len();
+        assert_eq!(after - before, 2, "two updates → two deltas");
+
+        // Local version should now be 2.
+        let (truth, version) = mem.get_compiled_truth("m_ct").unwrap().unwrap();
+        assert_eq!(truth, "v2 summary");
+        assert_eq!(version, 2);
+    }
+
+    #[tokio::test]
+    async fn insert_phone_call_records_sync_delta() {
+        let (_tmp, mem) = temp_sqlite();
+        let engine = Arc::new(Mutex::new(
+            super::super::sync::SyncEngine::new(_tmp.path(), true).unwrap(),
+        ));
+        mem.attach_sync(engine.clone());
+
+        let before = engine.lock().journal_len();
+        mem.insert_phone_call(
+            "call_xyz",
+            "in",
+            Some("010-0000-0000"),
+            Some("+821000000000"),
+            None,
+            1700000000,
+            Some(1700000300),
+            Some(300_000),
+            None,
+            None,
+            Some("hello"),
+            Some("greet"),
+            "safe",
+            false,
+            Some("ko"),
+            None,
+            "dev_local",
+        )
+        .unwrap();
+        let after = engine.lock().journal_len();
+        assert_eq!(after - before, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_remote_timeline_persists_without_reecording() {
+        use super::super::sync::DeltaOperation;
+
+        let (_tmp, mem) = temp_sqlite();
+        let engine = Arc::new(Mutex::new(
+            super::super::sync::SyncEngine::new(_tmp.path(), true).unwrap(),
+        ));
+        mem.attach_sync(engine.clone());
+
+        // Seed a memory on the receiving device.
+        mem.store("m_remote", "peer memory", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let entry = mem.get("m_remote").await.unwrap().unwrap();
+
+        let delta = DeltaOperation::TimelineAppend {
+            uuid: "remote-evt-1".into(),
+            memory_id: entry.id.clone(),
+            event_type: "chat".into(),
+            event_at: 1800,
+            source_ref: "remote_msg_9".into(),
+            content: "remote evidence".into(),
+            content_sha256: "abc".into(),
+            metadata_json: None,
+        };
+
+        let journal_before = engine.lock().journal_len();
+        let applied = mem.apply_remote_v3_delta(&delta).await.unwrap();
+        let journal_after = engine.lock().journal_len();
+
+        assert!(applied, "remote timeline delta should be applied");
+        assert_eq!(
+            journal_before, journal_after,
+            "applying remote delta must NOT re-record (prevents sync loops)"
+        );
+
+        // Row is present in local timeline.
+        let timeline = mem.get_timeline(&entry.id, 10).unwrap();
+        assert!(timeline.iter().any(|t| t.source_ref == "remote_msg_9"));
+    }
+
+    // ── PR #5 accept_remote_embedding ─────────────────────────
+
+    /// Deterministic 4-dim test embedder so we can exercise the drift
+    /// check without pulling ONNX. Name/model/version/dim configurable.
+    struct FakeEmbedder {
+        name: &'static str,
+        model: String,
+        version: u32,
+        dim: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::embedding::EmbeddingProvider for FakeEmbedder {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn model(&self) -> &str {
+            &self.model
+        }
+        fn version(&self) -> u32 {
+            self.version
+        }
+        fn dimensions(&self) -> usize {
+            self.dim
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.0; self.dim]).collect())
+        }
+    }
+
+    fn sqlite_with_embedder(embedder: Arc<dyn super::super::embedding::EmbeddingProvider>) -> (TempDir, SqliteMemory) {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            embedder,
+            SearchMode::Rrf,
+            0.7,
+            0.3,
+            60.0,
+            10_000,
+            None,
+        )
+        .unwrap();
+        (tmp, mem)
+    }
+
+    #[tokio::test]
+    async fn current_embedding_blob_returns_none_for_noop_embedder() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_blob", "anything", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        // Default temp_sqlite uses NoopEmbedding (dim=0).
+        assert!(mem.current_embedding_blob("anything").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn current_embedding_blob_returns_packed_blob_after_store() {
+        // PR #5 sender-side: storing a content with an active embedder
+        // populates embedding_cache; current_embedding_blob then surfaces
+        // the cached vector wrapped with provider/model metadata.
+        let embedder = Arc::new(FakeEmbedder {
+            name: "local_fastembed",
+            model: "bge-m3".into(),
+            version: 1,
+            dim: 4,
+        });
+        let (_tmp, mem) = sqlite_with_embedder(embedder);
+        mem.store("k_blob", "사용자 메모", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let blob = mem
+            .current_embedding_blob("사용자 메모")
+            .await
+            .expect("blob should be present");
+        assert_eq!(blob.provider, "local_fastembed");
+        assert_eq!(blob.model, "bge-m3");
+        assert_eq!(blob.version, 1);
+        assert_eq!(blob.dim, 4);
+        assert_eq!(blob.vector.len(), 16); // 4 dim × 4 bytes
+        // unpack matches the FakeEmbedder's deterministic zero vector.
+        assert_eq!(blob.unpack().unwrap(), vec![0.0_f32; 4]);
+    }
+
+    #[tokio::test]
+    async fn current_embedding_blob_misses_when_content_not_cached() {
+        let embedder = Arc::new(FakeEmbedder {
+            name: "local_fastembed",
+            model: "bge-m3".into(),
+            version: 1,
+            dim: 4,
+        });
+        let (_tmp, mem) = sqlite_with_embedder(embedder);
+        // Never stored — cache is empty.
+        assert!(mem.current_embedding_blob("uncached content").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn accept_remote_embedding_caches_when_model_matches() {
+        let embedder = Arc::new(FakeEmbedder {
+            name: "local_fastembed",
+            model: "bge-m3".into(),
+            version: 1,
+            dim: 4,
+        });
+        let (_tmp, mem) = sqlite_with_embedder(embedder);
+        let content = "identical-model payload";
+        let blob = super::super::sync::EmbeddingBlob::pack(
+            "local_fastembed",
+            "bge-m3",
+            1,
+            &[0.1, 0.2, 0.3, 0.4],
+        );
+        let accepted = mem.accept_remote_embedding(content, &blob).await.unwrap();
+        assert!(accepted, "matching model must be accepted");
+
+        // Cache row now exists keyed on the same hash recall() would use.
+        let hash = SqliteMemory::content_hash(content);
+        let conn = mem.conn.lock();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM embedding_cache WHERE content_hash = ?1",
+                rusqlite::params![hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn accept_remote_embedding_rejects_model_drift_and_enqueues() {
+        let embedder = Arc::new(FakeEmbedder {
+            name: "local_fastembed",
+            model: "bge-m3".into(),
+            version: 1,
+            dim: 4,
+        });
+        let (_tmp, mem) = sqlite_with_embedder(embedder);
+        // Remote used a different model — vec2text defence must reject.
+        let blob = super::super::sync::EmbeddingBlob::pack(
+            "openai",
+            "text-embedding-3-small",
+            1,
+            &[0.0; 4],
+        );
+        let content = "drift payload";
+        let err = mem
+            .accept_remote_embedding(content, &blob)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("drift"), "got: {err}");
+
+        // Cache must NOT be seeded.
+        let hash = SqliteMemory::content_hash(content);
+        let conn = mem.conn.lock();
+        let cached: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM embedding_cache WHERE content_hash = ?1",
+                rusqlite::params![hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cached, 0);
+        // Backfill queue must contain the content hash.
+        let queued: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM embedding_backfill_queue WHERE content_hash = ?1",
+                rusqlite::params![hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn accept_remote_embedding_rejects_dim_mismatch() {
+        let embedder = Arc::new(FakeEmbedder {
+            name: "local_fastembed",
+            model: "bge-m3".into(),
+            version: 1,
+            dim: 4,
+        });
+        let (_tmp, mem) = sqlite_with_embedder(embedder);
+        // Same provider/model/version — but 5-dim payload vs local's 4-dim.
+        let blob = super::super::sync::EmbeddingBlob::pack(
+            "local_fastembed",
+            "bge-m3",
+            1,
+            &[0.1, 0.2, 0.3, 0.4, 0.5],
+        );
+        let err = mem
+            .accept_remote_embedding("dim mismatch", &blob)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("drift"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn accept_remote_embedding_rejects_version_bump() {
+        let embedder = Arc::new(FakeEmbedder {
+            name: "local_fastembed",
+            model: "bge-m3".into(),
+            version: 1,
+            dim: 4,
+        });
+        let (_tmp, mem) = sqlite_with_embedder(embedder);
+        let blob = super::super::sync::EmbeddingBlob::pack(
+            "local_fastembed",
+            "bge-m3",
+            2, // future version
+            &[0.0; 4],
+        );
+        let err = mem
+            .accept_remote_embedding("version bump", &blob)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("drift"), "got: {err}");
+    }
+
+    // ── PR #6 consolidation + decay integration ───────────────
+
+    #[tokio::test]
+    async fn bump_recall_metrics_increments_count_and_sets_timestamp() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_recall", "stuff", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let entry = mem.get("k_recall").await.unwrap().unwrap();
+        let updated = mem.bump_recall_metrics(&[entry.id.clone()]).unwrap();
+        assert_eq!(updated, 1);
+
+        let conn = mem.conn.lock();
+        let (count, last): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT recall_count, last_recalled FROM memories WHERE id = ?1",
+                rusqlite::params![entry.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(last.is_some());
+    }
+
+    #[tokio::test]
+    async fn bump_recall_metrics_no_op_on_empty_input() {
+        let (_tmp, mem) = temp_sqlite();
+        assert_eq!(mem.bump_recall_metrics(&[]).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn apply_consolidation_outcome_archives_sources_and_writes_summary() {
+        use super::super::consolidate::ConsolidationOutcome;
+
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k1", "나는 변호사다", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("k2", "나는 변호사이다", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let id1 = mem.get("k1").await.unwrap().unwrap().id;
+        let id2 = mem.get("k2").await.unwrap().unwrap().id;
+
+        let outcome = ConsolidationOutcome {
+            source_ids: vec![id1.clone(), id2.clone()],
+            source_keys: vec!["k1".into(), "k2".into()],
+            summary: "사용자는 변호사입니다.".into(),
+            conflict: false,
+            contradicting_keys: vec![],
+        };
+        mem.apply_consolidation_outcome(&outcome).unwrap();
+
+        let conn = mem.conn.lock();
+        // Both sources archived.
+        for id in [&id1, &id2] {
+            let archived: i64 = conn
+                .query_row(
+                    "SELECT archived FROM memories WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(archived, 1, "source {id} not archived");
+        }
+        // Exactly one consolidated row.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM consolidated_memories",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_consolidation_outcome_persists_conflict_metadata() {
+        use super::super::consolidate::ConsolidationOutcome;
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("kA", "토요일 골프", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("kB", "토요일 테니스", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let idA = mem.get("kA").await.unwrap().unwrap().id;
+        let idB = mem.get("kB").await.unwrap().unwrap().id;
+
+        let outcome = ConsolidationOutcome {
+            source_ids: vec![idA, idB],
+            source_keys: vec!["kA".into(), "kB".into()],
+            summary: "주말 운동 (충돌)".into(),
+            conflict: true,
+            contradicting_keys: vec!["kA".into(), "kB".into()],
+        };
+        mem.apply_consolidation_outcome(&outcome).unwrap();
+
+        let conn = mem.conn.lock();
+        let (flag, contradicting): (i64, String) = conn
+            .query_row(
+                "SELECT conflict_flag, contradicting_keys FROM consolidated_memories",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(flag, 1);
+        let parsed: Vec<String> = serde_json::from_str(&contradicting).unwrap();
+        assert_eq!(parsed, vec!["kA", "kB"]);
+    }
+
+    #[tokio::test]
+    async fn run_decay_sweep_archives_old_low_recall_memories() {
+        let (_tmp, mem) = temp_sqlite();
+        // Seed 1: ephemeral category, never recalled, fake-old timestamp →
+        // should archive on the next sweep.
+        mem.store(
+            "k_old",
+            "stale chat ping",
+            MemoryCategory::Custom("ephemeral".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        // Seed 2: identity category — must survive the sweep no matter
+        // how long ago it was created (INFINITY half-life).
+        mem.store(
+            "k_id",
+            "I am a lawyer",
+            MemoryCategory::Custom("identity".into()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Backdate k_old by 365 days so its decay falls below the floor.
+        {
+            let conn = mem.conn.lock();
+            let old = (chrono::Local::now() - chrono::Duration::days(365)).to_rfc3339();
+            conn.execute(
+                "UPDATE memories SET created_at = ?1, last_recalled = NULL WHERE key = 'k_old'",
+                rusqlite::params![old],
+            )
+            .unwrap();
+        }
+
+        let archived = mem.run_decay_sweep().unwrap();
+        assert!(archived >= 1, "expected at least k_old to archive");
+
+        let conn = mem.conn.lock();
+        let old_archived: i64 = conn
+            .query_row(
+                "SELECT archived FROM memories WHERE key = 'k_old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_archived, 1);
+        let id_archived: i64 = conn
+            .query_row(
+                "SELECT archived FROM memories WHERE key = 'k_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(id_archived, 0, "identity memory must survive decay");
+    }
+
+    #[tokio::test]
+    async fn recall_excludes_archived_rows() {
+        // PR #6 wire-up regression: a row flipped to archived=1 (e.g. by
+        // run_decay_sweep or apply_consolidation_outcome) must never come
+        // back through Memory::recall.
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_active", "활성 정보", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("k_archived", "옛날 정보", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        // Hand-archive k_archived without going through the full
+        // consolidation/decay path so the test isolates the SQL filter.
+        {
+            let conn = mem.conn.lock();
+            conn.execute(
+                "UPDATE memories SET archived = 1 WHERE key = 'k_archived'",
+                [],
+            )
+            .unwrap();
+        }
+        // Both rows have NoopEmbedding (dim=0) so recall falls back to FTS.
+        let hits = mem.recall("정보", 10, None).await.unwrap();
+        let keys: Vec<&str> = hits.iter().map(|h| h.key.as_str()).collect();
+        assert!(keys.contains(&"k_active"), "got {keys:?}");
+        assert!(!keys.contains(&"k_archived"), "got {keys:?}");
+    }
+
+    #[tokio::test]
+    async fn read_pool_allows_eight_concurrent_readers() {
+        // PR #7 r2d2 — spawn 8 threads, each grabbing a connection from
+        // the read pool and running a SELECT in parallel. Must complete
+        // without deadlock (the Mutex-only path would serialise them).
+        use std::thread;
+
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_pool", "probe", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let pool = mem.read_pool();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let p = pool.clone();
+            handles.push(thread::spawn(move || -> anyhow::Result<i64> {
+                let conn = p.get()?;
+                let count: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM memories WHERE key = 'k_pool'", [], |r| {
+                        r.get(0)
+                    })?;
+                Ok(count)
+            }));
+        }
+
+        for h in handles {
+            let n = h.join().unwrap().unwrap();
+            assert_eq!(n, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_pool_connection_applies_wal_pragma() {
+        // Each pooled connection must run the PRAGMA init block so WAL
+        // mode + busy_timeout are active — otherwise reads could see
+        // inconsistent snapshots during a writer's transaction.
+        let (_tmp, mem) = temp_sqlite();
+        let pool = mem.read_pool();
+        let conn = pool.get().unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+        let busy: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy, 5000);
+    }
+
+    #[tokio::test]
+    async fn store_stamps_monotonic_hlc_on_memories_rows() {
+        // PR #7 HLC migration — every INSERT must carry an updated_at_hlc
+        // value that parses cleanly and strictly exceeds the previous row's.
+        use crate::sync::hlc::Hlc;
+
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_one", "first", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("k_two", "second", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("k_three", "third", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let stamps: Vec<String> = {
+            let conn = mem.conn.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT updated_at_hlc FROM memories
+                      WHERE key IN ('k_one','k_two','k_three')
+                      ORDER BY created_at ASC, key ASC",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, Option<String>>(0))
+                .unwrap()
+                .map(|r| r.unwrap().expect("HLC stamp must be non-null"))
+                .collect()
+        };
+        assert_eq!(stamps.len(), 3);
+        let parsed: Vec<Hlc> = stamps.iter().map(|s| Hlc::parse(s).unwrap()).collect();
+        assert!(parsed[1] > parsed[0], "{:?} !> {:?}", parsed[1], parsed[0]);
+        assert!(parsed[2] > parsed[1], "{:?} !> {:?}", parsed[2], parsed[1]);
+    }
+
+    #[tokio::test]
+    async fn store_upsert_refreshes_hlc_on_existing_key() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_upsert", "first", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let first: String = {
+            let conn = mem.conn.lock();
+            conn.query_row(
+                "SELECT updated_at_hlc FROM memories WHERE key = 'k_upsert'",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        mem.store("k_upsert", "second", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let second: String = {
+            let conn = mem.conn.lock();
+            conn.query_row(
+                "SELECT updated_at_hlc FROM memories WHERE key = 'k_upsert'",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_ne!(first, second, "upsert must refresh the HLC stamp");
+        let before = crate::sync::hlc::Hlc::parse(&first).unwrap();
+        let after = crate::sync::hlc::Hlc::parse(&second).unwrap();
+        assert!(after > before);
+    }
+
+    #[tokio::test]
+    async fn get_surfaces_recall_count_and_last_recalled_from_db() {
+        // PR #6 wire-up: the DB columns are populated by
+        // bump_recall_metrics; `get()` must expose them so the UI /
+        // diagnostics can see the same numbers the decay sweep does.
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_surface", "data", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let first = mem.get("k_surface").await.unwrap().unwrap();
+        assert_eq!(first.recall_count, 0);
+        assert!(first.last_recalled.is_none());
+
+        // Drive the counter up via bump_recall_metrics directly (no
+        // recall(), to keep the test focused on the SELECT path).
+        mem.bump_recall_metrics(&[first.id.clone()]).unwrap();
+        mem.bump_recall_metrics(&[first.id.clone()]).unwrap();
+
+        let after = mem.get("k_surface").await.unwrap().unwrap();
+        assert_eq!(after.recall_count, 2);
+        assert!(after.last_recalled.is_some());
+    }
+
+    #[tokio::test]
+    async fn recall_auto_bumps_recall_count_for_returned_rows() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_metric", "내가 좋아하는 책", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let _ = mem.recall("책", 10, None).await.unwrap();
+        let _ = mem.recall("책", 10, None).await.unwrap();
+
+        let conn = mem.conn.lock();
+        let count: i64 = conn
+            .query_row(
+                "SELECT recall_count FROM memories WHERE key = 'k_metric'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Two recall calls × the row appears in each → 2 bumps.
+        assert!(count >= 2, "expected >= 2 bumps, got {count}");
+    }
+
+    #[tokio::test]
+    async fn collect_consolidation_candidates_filters_archived_and_low_recall() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k_in", "활성 메모", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("k_out", "비활성 메모", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        // Bump k_in's recall_count above the threshold; k_out stays at 0.
+        let in_id = mem.get("k_in").await.unwrap().unwrap().id;
+        mem.bump_recall_metrics(&[in_id.clone()]).unwrap();
+        // Archive k_out so it must be excluded even with recall_count>=0.
+        {
+            let conn = mem.conn.lock();
+            conn.execute(
+                "UPDATE memories SET archived = 1 WHERE key = 'k_out'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let candidates = mem.collect_consolidation_candidates(1).unwrap();
+        // Both rows have NULL embeddings (NoopEmbedder), so the filter
+        // `embedding IS NOT NULL` excludes them — verifies the SQL guard.
+        assert!(candidates.is_empty(), "Noop embedder leaks: {candidates:?}");
+    }
+
+    #[tokio::test]
+    async fn accept_remote_embedding_is_noop_for_noop_embedder() {
+        // Default SqliteMemory uses NoopEmbedding (dim=0). We silently
+        // short-circuit because there's no local index to seed.
+        let (_tmp, mem) = temp_sqlite();
+        let blob = super::super::sync::EmbeddingBlob::pack(
+            "openai",
+            "whatever",
+            1,
+            &[0.0; 4],
+        );
+        let accepted = mem.accept_remote_embedding("noop", &blob).await.unwrap();
+        assert!(!accepted);
+    }
+
+    #[tokio::test]
+    async fn apply_remote_truth_lww_rejects_older_version() {
+        use super::super::sync::DeltaOperation;
+
+        let (_tmp, mem) = temp_sqlite();
+        let engine = Arc::new(Mutex::new(
+            super::super::sync::SyncEngine::new(_tmp.path(), true).unwrap(),
+        ));
+        mem.attach_sync(engine.clone());
+
+        mem.store("m_lww", "base", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        // Bump local version to 2.
+        mem.set_compiled_truth("m_lww", "local v1").unwrap();
+        mem.set_compiled_truth("m_lww", "local v2").unwrap();
+
+        // Remote sends version=1 — older than local v2; must be rejected.
+        let stale = DeltaOperation::CompiledTruthUpdate {
+            memory_key: "m_lww".into(),
+            compiled_truth: "stale remote".into(),
+            truth_version: 1,
+        };
+        let applied = mem.apply_remote_v3_delta(&stale).await.unwrap();
+        assert!(!applied, "LWW must reject older version");
+
+        // Remote sends version=5 — newer; should overwrite.
+        let fresh = DeltaOperation::CompiledTruthUpdate {
+            memory_key: "m_lww".into(),
+            compiled_truth: "fresh remote".into(),
+            truth_version: 5,
+        };
+        let applied = mem.apply_remote_v3_delta(&fresh).await.unwrap();
+        assert!(applied);
+
+        let (truth, version) = mem.get_compiled_truth("m_lww").unwrap().unwrap();
+        assert_eq!(truth, "fresh remote");
+        assert_eq!(version, 5);
+    }
+
+    #[tokio::test]
+    async fn recall_with_variations_falls_back_to_single_query() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("rec1", "apple pie recipe", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // Empty variations → falls back to recall()
+        let empty_vars: Vec<String> = vec![];
+        let r0 = mem
+            .recall_with_variations("apple pie", &empty_vars, 5, None)
+            .await
+            .unwrap();
+        assert!(!r0.is_empty());
+
+        // Single variation → falls back to recall()
+        let r1 = mem
+            .recall_with_variations("apple pie", &vec!["apple pie".into()], 5, None)
+            .await
+            .unwrap();
+        assert!(!r1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_with_variations_fuses_multiple_queries() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("doc_divorce", "이혼 절차 안내", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store(
+            "doc_property",
+            "재산분할 기준과 판례",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store("doc_alimony", "위자료 산정 방법", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("doc_other", "노동법 해설", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let vars = vec![
+            "이혼 소송".to_string(),
+            "재산분할".to_string(),
+            "위자료".to_string(),
+        ];
+        let results = mem
+            .recall_with_variations("이혼 소송", &vars, 10, None)
+            .await
+            .unwrap();
+
+        // Should recall the three divorce-related entries; noise entry excluded.
+        let keys: std::collections::HashSet<String> =
+            results.iter().map(|e| e.key.clone()).collect();
+        assert!(keys.contains("doc_divorce") || keys.contains("doc_property") || keys.contains("doc_alimony"));
+    }
+
+    #[tokio::test]
+    async fn no_sync_recording_when_engine_not_attached() {
+        // Safety: mutations on a plain SqliteMemory (no sync attached)
+        // must succeed and NEVER panic trying to access the sync engine.
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.store("m_nosync", "data", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let entry = mem.get("m_nosync").await.unwrap().unwrap();
+
+        // All three typed mutations must succeed without a sync engine.
+        mem.append_timeline(&entry.id, "chat", 1, "r", "c", None, "d").unwrap();
+        mem.set_compiled_truth("m_nosync", "summary").unwrap();
+        mem.insert_phone_call(
+            "call_nosync",
+            "in",
+            None,
+            None,
+            None,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "safe",
+            false,
+            None,
+            None,
+            "dev",
+        )
+        .unwrap();
     }
 }

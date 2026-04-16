@@ -481,6 +481,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         auto_hydrate: true,
         sqlite_open_timeout_secs: None,
         sqlite_journal_mode: "wal".to_string(),
+        rerank: crate::config::RerankConfig::default(),
         qdrant: crate::config::QdrantConfig::default(),
     }
 }

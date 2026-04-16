@@ -83,6 +83,94 @@ impl VersionVector {
     }
 }
 
+/// Embedding vector attached to a sync delta (PR #5 — vec2text defence).
+///
+/// Replicating pre-computed embeddings saves the receiving peer a costly
+/// re-embedding pass **only when model/version/dim all match**. When they
+/// do not, the receiver MUST drop this blob and enqueue re-embedding
+/// locally — a vec2text-style attack that recovered the remote embedding
+/// would let the attacker reconstruct the source text, so silently
+/// accepting foreign-model floats would leak information.
+///
+/// All fields are copied from the [`EmbeddingProvider`] that produced the
+/// vector on the source device; see `crate::memory::embedding::PROVIDER_*`
+/// constants for canonical `provider` strings. The raw `vector` bytes are
+/// little-endian IEEE-754 f32s packed back-to-back (length = `dim * 4`),
+/// bincode-compatible.
+///
+/// [`EmbeddingProvider`]: crate::memory::embedding::EmbeddingProvider
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EmbeddingBlob {
+    /// Provider family (e.g. `"local_fastembed"`, `"openai"`).
+    pub provider: String,
+    /// Concrete model identifier (e.g. `"bge-m3"`).
+    pub model: String,
+    /// Schema version bumped on semantic change. See
+    /// `EMBEDDING_SCHEMA_VERSION`.
+    pub version: u32,
+    /// Vector dimensionality — the receiving side cross-checks before
+    /// feeding into its local vector index.
+    pub dim: u32,
+    /// Little-endian packed f32 payload. Serde serialisation keeps this
+    /// as a Vec<u8> so bincode/JSON both work without special handling.
+    pub vector: Vec<u8>,
+}
+
+impl EmbeddingBlob {
+    /// Pack an f32 slice into a blob. Uses little-endian byte order so
+    /// the wire representation is identical regardless of host endianness.
+    pub fn pack(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        version: u32,
+        vector: &[f32],
+    ) -> Self {
+        let mut bytes = Vec::with_capacity(vector.len() * 4);
+        for f in vector {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let dim = vector.len() as u32;
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            version,
+            dim,
+            vector: bytes,
+        }
+    }
+
+    /// Reverse of [`pack`] — unpack the little-endian f32 payload. Returns
+    /// an error when the byte length is not a multiple of 4 or doesn't
+    /// match `dim × 4`.
+    ///
+    /// [`pack`]: Self::pack
+    pub fn unpack(&self) -> anyhow::Result<Vec<f32>> {
+        if self.vector.len() % 4 != 0 {
+            anyhow::bail!(
+                "embedding blob length {} is not a multiple of 4 bytes",
+                self.vector.len()
+            );
+        }
+        let count = self.vector.len() / 4;
+        let expected = usize::try_from(self.dim).unwrap_or(usize::MAX);
+        if count != expected {
+            anyhow::bail!(
+                "embedding blob declares dim={} but carries {} f32 values",
+                self.dim,
+                count
+            );
+        }
+        let mut out = Vec::with_capacity(count);
+        for chunk in self.vector.chunks_exact(4) {
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(chunk);
+            out.push(f32::from_le_bytes(buf));
+        }
+        Ok(out)
+    }
+}
+
 /// Type of change in a delta journal entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DeltaOperation {
@@ -91,6 +179,12 @@ pub enum DeltaOperation {
         key: String,
         content: String,
         category: String,
+        /// PR #5 — optional pre-computed embedding for this content. Sent
+        /// only by newer peers; older peers omit the field and receivers
+        /// treat `None` as "compute locally". When present and model/version
+        /// mismatch, the receiver MUST discard and re-embed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        embedding: Option<EmbeddingBlob>,
     },
     /// Memory entry deleted.
     Forget { key: String },
@@ -142,6 +236,22 @@ pub enum DeltaOperation {
         memory_key: String,
         compiled_truth: String,
         truth_version: u32,
+    },
+
+    /// Vault (Second Brain) document upserted (v6 §6).
+    /// Idempotent via `uuid` + `checksum` uniqueness on receiving side.
+    VaultDocUpsert {
+        uuid: String,
+        source_type: String,
+        title: Option<String>,
+        checksum: String,
+        content_sha256: String,
+        frontmatter_json: Option<String>,
+        links_json: Option<String>,
+        /// PR #5 — optional pre-computed embedding. Subject to the same
+        /// model-drift rejection policy as `Store::embedding`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        embedding: Option<EmbeddingBlob>,
     },
 
     /// Ontology action logged (read-only replication — actions are
@@ -407,6 +517,53 @@ impl SyncEngine {
         self.enabled
     }
 
+    /// PR #5 sender-side — record a store delta with an optional
+    /// pre-computed embedding attached. When the receiving peer's local
+    /// embedder matches `(provider, model, version, dim)`, this lets it
+    /// skip the re-embed; when it doesn't, the receiver's drift logic
+    /// (`Memory::accept_remote_embedding`) discards the blob and queues
+    /// re-embedding locally.
+    pub fn record_store_with_embedding(
+        &mut self,
+        key: &str,
+        content: &str,
+        category: &str,
+        embedding: Option<EmbeddingBlob>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+
+        self.version.increment(&self.device_id.0);
+        let seq = self.version.get(&self.device_id.0);
+
+        let entry = DeltaEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            device_id: self.device_id.0.clone(),
+            version: self.version.clone(),
+            operation: DeltaOperation::Store {
+                key: key.to_string(),
+                content: content.to_string(),
+                category: category.to_string(),
+                embedding,
+            },
+            timestamp: current_epoch_secs(),
+        };
+
+        self.journal.push(entry);
+        tracing::debug!(
+            key,
+            category,
+            seq,
+            device_id = %self.device_id.0,
+            journal_size = self.journal.len(),
+            "Sync: recorded store delta (with embedding)"
+        );
+        if let Err(e) = self.save() {
+            tracing::warn!("Failed to persist sync journal: {e}");
+        }
+    }
+
     /// Record a memory store operation in the delta journal.
     pub fn record_store(&mut self, key: &str, content: &str, category: &str) {
         if !self.enabled {
@@ -424,6 +581,10 @@ impl SyncEngine {
                 key: key.to_string(),
                 content: content.to_string(),
                 category: category.to_string(),
+                // PR #5: local record_store() has no embedder on hand, so
+                // it omits the embedding. Callers that want to attach one
+                // use record_store_with_embedding() — see below.
+                embedding: None,
             },
             timestamp: current_epoch_secs(),
         };
@@ -702,6 +863,45 @@ impl SyncEngine {
         self.journal.push(entry);
         if let Err(e) = self.save() {
             tracing::warn!("Failed to persist compiled truth sync: {e}");
+        }
+    }
+
+    /// Record a vault (second brain) document upsert (v6 §6).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_vault_doc_upsert(
+        &mut self,
+        uuid: &str,
+        source_type: &str,
+        title: Option<&str>,
+        checksum: &str,
+        content_sha256: &str,
+        frontmatter_json: Option<&str>,
+        links_json: Option<&str>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.version.increment(&self.device_id.0);
+        let entry = DeltaEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            device_id: self.device_id.0.clone(),
+            version: self.version.clone(),
+            operation: DeltaOperation::VaultDocUpsert {
+                uuid: uuid.to_string(),
+                source_type: source_type.to_string(),
+                title: title.map(String::from),
+                checksum: checksum.to_string(),
+                content_sha256: content_sha256.to_string(),
+                frontmatter_json: frontmatter_json.map(String::from),
+                links_json: links_json.map(String::from),
+                // PR #5: absent by default; set by record_vault_doc_with_embedding().
+                embedding: None,
+            },
+            timestamp: current_epoch_secs(),
+        };
+        self.journal.push(entry);
+        if let Err(e) = self.save() {
+            tracing::warn!("Failed to persist vault doc sync: {e}");
         }
     }
 
@@ -992,6 +1192,7 @@ mod tests {
                 key: "old".into(),
                 content: "stale".into(),
                 category: "general".into(),
+                embedding: None,
             },
             timestamp: 1000, // Very old
         });
@@ -1079,4 +1280,86 @@ mod tests {
         let applied2 = engine2.apply_deltas(deltas);
         assert_eq!(applied2.len(), 0);
     }
+
+    // ── PR #5 embedding blob pack/unpack ───────────────────────
+
+    #[test]
+    fn embedding_blob_pack_round_trips_through_unpack() {
+        let src: Vec<f32> = vec![0.125, -0.5, 1.0, std::f32::consts::PI, -f32::EPSILON];
+        let blob = EmbeddingBlob::pack("local_fastembed", "bge-m3", 1, &src);
+        assert_eq!(blob.provider, "local_fastembed");
+        assert_eq!(blob.model, "bge-m3");
+        assert_eq!(blob.version, 1);
+        assert_eq!(blob.dim, src.len() as u32);
+        assert_eq!(blob.vector.len(), src.len() * 4);
+
+        let round_tripped = blob.unpack().unwrap();
+        assert_eq!(round_tripped, src);
+    }
+
+    #[test]
+    fn embedding_blob_unpack_rejects_bad_length() {
+        let mut blob = EmbeddingBlob::pack("openai", "text-embedding-3-small", 1, &[1.0, 2.0]);
+        // Corrupt byte length so it's no longer a multiple of 4.
+        blob.vector.push(0xAB);
+        let err = blob.unpack().unwrap_err().to_string();
+        assert!(err.contains("multiple of 4"), "got: {err}");
+    }
+
+    #[test]
+    fn embedding_blob_unpack_rejects_dim_mismatch() {
+        let mut blob = EmbeddingBlob::pack("openai", "text-embedding-3-small", 1, &[1.0, 2.0]);
+        // Lie about dim so byte-count disagrees.
+        blob.dim = 5;
+        let err = blob.unpack().unwrap_err().to_string();
+        assert!(err.contains("dim=5"), "got: {err}");
+    }
+
+    #[test]
+    fn embedding_blob_is_little_endian_regardless_of_host() {
+        // Sanity: if the host were big-endian the pack would still emit LE,
+        // so byte 0 of f32 1.0 is always 0x00.
+        let blob = EmbeddingBlob::pack("none", "", 1, &[1.0f32]);
+        assert_eq!(blob.vector, vec![0x00, 0x00, 0x80, 0x3F]);
+    }
+
+    #[test]
+    fn delta_store_with_embedding_serialises_and_deserialises() {
+        let op = DeltaOperation::Store {
+            key: "k".into(),
+            content: "hello".into(),
+            category: "core".into(),
+            embedding: Some(EmbeddingBlob::pack(
+                "local_fastembed",
+                "bge-m3",
+                1,
+                &[0.1, 0.2, 0.3],
+            )),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let parsed: DeltaOperation = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, op);
+    }
+
+    #[test]
+    fn delta_store_without_embedding_omits_field_on_wire() {
+        // skip_serializing_if = "Option::is_none" means old peers never see
+        // the key — preserves wire compatibility with pre-PR#5 nodes.
+        let op = DeltaOperation::Store {
+            key: "k".into(),
+            content: "hello".into(),
+            category: "core".into(),
+            embedding: None,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert!(!json.contains("embedding"), "unexpected key in {json}");
+        // And a wire message missing the field must still parse.
+        let old_wire = r#"{"Store":{"key":"k","content":"hello","category":"core"}}"#;
+        let parsed: DeltaOperation = serde_json::from_str(old_wire).unwrap();
+        match parsed {
+            DeltaOperation::Store { embedding, .. } => assert!(embedding.is_none()),
+            _ => panic!("unexpected variant"),
+        }
+    }
 }
+

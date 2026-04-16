@@ -128,7 +128,32 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
             ON ontology_actions(status);
 
         -- ================================================================
-        -- 4. FTS5 indexes for ontology search
+        -- 4. Community layer (PR #9 — GraphRAG Phase 5)
+        -- ================================================================
+        -- One row per detected community in the ontology graph. `level`
+        -- supports future hierarchical clustering (Leiden's hierarchy);
+        -- this commit only writes level=0. `parent_community_id` is
+        -- nullable for the root level. `summary_embedding` is a LE-f32
+        -- BLOB so it slots into the existing embedding cache pipeline.
+
+        CREATE TABLE IF NOT EXISTS ontology_communities (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            community_id         INTEGER NOT NULL,
+            level                INTEGER NOT NULL DEFAULT 0,
+            parent_community_id  INTEGER REFERENCES ontology_communities(id),
+            summary              TEXT NOT NULL,
+            summary_embedding    BLOB,
+            object_ids           TEXT NOT NULL,
+            keywords             TEXT NOT NULL DEFAULT '[]',
+            created_at           INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+        CREATE INDEX IF NOT EXISTS idx_onto_communities_level
+            ON ontology_communities(level);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_onto_communities_unique
+            ON ontology_communities(level, community_id);
+
+        -- ================================================================
+        -- 5. FTS5 indexes for ontology search
         -- ================================================================
 
         CREATE VIRTUAL TABLE IF NOT EXISTS ontology_objects_fts USING fts5(

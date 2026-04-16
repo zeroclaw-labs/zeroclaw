@@ -6,7 +6,10 @@ pub mod cortex;
 pub mod document_store;
 pub mod document_summarizer;
 pub mod dream_cycle;
-pub mod embeddings;
+pub mod embedding;
+// Backwards-compatible alias so older call-sites (`memory::embeddings::…`)
+// keep working without a sweeping rename. New code should use `memory::embedding`.
+pub use embedding as embeddings;
 pub mod hot_cache;
 pub mod hybrid;
 pub mod hygiene;
@@ -16,7 +19,10 @@ pub mod none;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod qdrant;
+pub mod consolidate;
+pub mod decay;
 pub mod query_expand;
+pub mod search;
 pub mod response_cache;
 pub mod snapshot;
 pub mod sqlite;
@@ -445,6 +451,11 @@ pub fn create_synced_memory(
         let engine = sync::SyncEngine::new(workspace_dir, true)?;
         let engine = Arc::new(parking_lot::Mutex::new(engine));
         let base_arc: Arc<dyn Memory> = Arc::from(base);
+        // v3.0: attach sync engine to the concrete backend so typed mutations
+        // (timeline append, compiled truth update, phone call insert)
+        // auto-record delta journal entries. Default is no-op for non-sqlite
+        // backends; SqliteMemory overrides `attach_sync_engine`.
+        base_arc.attach_sync_engine(engine.clone());
         let synced = SyncedMemory::new(base_arc, engine.clone());
         tracing::info!(
             device_id = %engine.lock().device_id().0,

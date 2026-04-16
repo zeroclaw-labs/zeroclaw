@@ -44,6 +44,7 @@
 //! [`schema::seed_default_types`] and add any routing logic in
 //! [`dispatcher::ActionDispatcher`].
 
+pub mod community;
 pub mod context;
 pub mod dispatcher;
 pub mod repo;

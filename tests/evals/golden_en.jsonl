@@ -1,0 +1,30 @@
+{"query":"weekly retrospective schedule","gold_keys":["corpus_en_001"],"domain":"en"}
+{"query":"production incident escalation policy","gold_keys":["corpus_en_002"],"domain":"en"}
+{"query":"staging database refresh cadence","gold_keys":["corpus_en_003"],"domain":"en"}
+{"query":"feature flag naming convention LaunchDarkly","gold_keys":["corpus_en_004"],"domain":"en"}
+{"query":"performance review self-review deadline","gold_keys":["corpus_en_005"],"domain":"en"}
+{"query":"code review approvals required","gold_keys":["corpus_en_006"],"domain":"en"}
+{"query":"internal documentation site URL","gold_keys":["corpus_en_007"],"domain":"en"}
+{"query":"design sprint five-day structure","gold_keys":["corpus_en_008"],"domain":"en"}
+{"query":"legal review queue SLA","gold_keys":["corpus_en_009"],"domain":"en"}
+{"query":"quarterly OKR all-hands time","gold_keys":["corpus_en_010"],"domain":"en"}
+{"query":"VPN YubiKey access requirement","gold_keys":["corpus_en_011"],"domain":"en"}
+{"query":"Dependabot auto-merge rules","gold_keys":["corpus_en_012"],"domain":"en"}
+{"query":"cloud infrastructure cost review","gold_keys":["corpus_en_013"],"domain":"en"}
+{"query":"new hire onboarding program weeks","gold_keys":["corpus_en_014"],"domain":"en"}
+{"query":"company Slack channel purposes","gold_keys":["corpus_en_015"],"domain":"en"}
+{"query":"engineering manager one-on-one schedule","gold_keys":["corpus_en_016"],"domain":"en"}
+{"query":"remote work core hours policy","gold_keys":["corpus_en_017"],"domain":"en"}
+{"query":"security incident severity levels","gold_keys":["corpus_en_018"],"domain":"en"}
+{"query":"employee benefits PTO minimum","gold_keys":["corpus_en_019"],"domain":"en"}
+{"query":"customer database Postgres snapshot retention","gold_keys":["corpus_en_020"],"domain":"en"}
+{"query":"engineering blog publishing day","gold_keys":["corpus_en_021"],"domain":"en"}
+{"query":"travel expense policy receipts","gold_keys":["corpus_en_022"],"domain":"en"}
+{"query":"senior engineer hiring rubric","gold_keys":["corpus_en_023"],"domain":"en"}
+{"query":"weekly engineering planning day","gold_keys":["corpus_en_024"],"domain":"en"}
+{"query":"API rate limit authenticated users","gold_keys":["corpus_en_025"],"domain":"en"}
+{"query":"CI provider primary fallback","gold_keys":["corpus_en_026"],"domain":"en"}
+{"query":"customer on-call rotation handoff","gold_keys":["corpus_en_027"],"domain":"en"}
+{"query":"log retention policy defaults","gold_keys":["corpus_en_028"],"domain":"en"}
+{"query":"production deploy code freeze window","gold_keys":["corpus_en_029"],"domain":"en"}
+{"query":"SSO provider new service access","gold_keys":["corpus_en_030"],"domain":"en"}

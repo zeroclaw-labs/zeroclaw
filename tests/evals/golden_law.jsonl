@@ -1,0 +1,30 @@
+{"query":"주택임대차보호법 대항력 요건","gold_keys":["corpus_law_001"],"domain":"law"}
+{"query":"상가건물임대차보호법 환산보증금 초과","gold_keys":["corpus_law_002"],"domain":"law"}
+{"query":"대법원 2023다12345 갱신거절","gold_keys":["corpus_law_003"],"domain":"law"}
+{"query":"민법 제621조 임차물 전대","gold_keys":["corpus_law_004"],"domain":"law"}
+{"query":"부동산 명도 강제집행 절차","gold_keys":["corpus_law_005"],"domain":"law"}
+{"query":"민법 제750조 일반 불법행위","gold_keys":["corpus_law_006"],"domain":"law"}
+{"query":"손해배상 청구권 소멸시효","gold_keys":["corpus_law_007"],"domain":"law"}
+{"query":"근로기준법 해고예고 30일","gold_keys":["corpus_law_008"],"domain":"law"}
+{"query":"퇴직금 지급 요건","gold_keys":["corpus_law_009"],"domain":"law"}
+{"query":"상법 제401조 이사 책임","gold_keys":["corpus_law_010"],"domain":"law"}
+{"query":"대법원 2022다67890 주주대표소송","gold_keys":["corpus_law_011"],"domain":"law"}
+{"query":"민법 제103조 반사회질서 무효","gold_keys":["corpus_law_012"],"domain":"law"}
+{"query":"형법 사기죄 처벌","gold_keys":["corpus_law_013"],"domain":"law"}
+{"query":"업무상 배임 특경법 기준","gold_keys":["corpus_law_014"],"domain":"law"}
+{"query":"민사소송법 자유심증주의","gold_keys":["corpus_law_015"],"domain":"law"}
+{"query":"가사소송 조정전치주의","gold_keys":["corpus_law_016"],"domain":"law"}
+{"query":"개인정보보호법 목적외 이용","gold_keys":["corpus_law_017"],"domain":"law"}
+{"query":"변호사법 비밀유지의무","gold_keys":["corpus_law_018"],"domain":"law"}
+{"query":"대법원 2024다22222 신탁재산","gold_keys":["corpus_law_019"],"domain":"law"}
+{"query":"공인중개사법 금지행위","gold_keys":["corpus_law_020"],"domain":"law"}
+{"query":"임대차 보증금 5% 증액 한도","gold_keys":["corpus_law_021"],"domain":"law"}
+{"query":"부동산 실거래가 30일 신고","gold_keys":["corpus_law_022"],"domain":"law"}
+{"query":"민법 제547조 연대책임 구상권","gold_keys":["corpus_law_023"],"domain":"law"}
+{"query":"특경사기 이득액 가중처벌","gold_keys":["corpus_law_024"],"domain":"law"}
+{"query":"부동산등기법 원본 보관","gold_keys":["corpus_law_025"],"domain":"law"}
+{"query":"대법원 2023다99999 공용부분 결의","gold_keys":["corpus_law_026"],"domain":"law"}
+{"query":"강제집행 정지 청구이의의 소","gold_keys":["corpus_law_027"],"domain":"law"}
+{"query":"상속세 배우자 공제 한도","gold_keys":["corpus_law_028"],"domain":"law"}
+{"query":"재건축 조합 설립 동의율","gold_keys":["corpus_law_029"],"domain":"law"}
+{"query":"공정거래법 거래상 지위 남용","gold_keys":["corpus_law_030"],"domain":"law"}

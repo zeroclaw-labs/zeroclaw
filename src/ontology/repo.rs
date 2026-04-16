@@ -1135,3 +1135,447 @@ mod tests {
         assert!(results[0].title.as_deref().unwrap().contains("Hotel"));
     }
 }
+
+// ── PR #9 GraphRAG community layer ──────────────────────────────────
+
+impl OntologyRepo {
+    /// PR #9 — read the entire ontology graph into a [`super::community::GraphView`]
+    /// for community detection. One SQL pass per side (objects + links) so the
+    /// reader is O(V + E).
+    ///
+    /// Edges with the same `(from, to)` regardless of `link_type_id` collapse into a
+    /// single weighted edge — link multiplicity is the natural proxy for "how
+    /// strongly are these two things related?". Direction is dropped (the
+    /// algorithm operates on an undirected projection).
+    pub fn load_graph_view(&self) -> anyhow::Result<super::community::GraphView> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT id, title FROM ontology_objects")?;
+        let nodes: Vec<super::community::GraphNode> = stmt
+            .query_map([], |row| {
+                Ok(super::community::GraphNode {
+                    object_id: row.get::<_, i64>(0)?,
+                    title: row.get::<_, Option<String>>(1)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        drop(stmt);
+
+        // Group by undirected (min, max) endpoint pair to collapse multi-edges.
+        let mut edge_stmt = conn.prepare(
+            "SELECT MIN(from_object_id, to_object_id) AS a,
+                    MAX(from_object_id, to_object_id) AS b,
+                    COUNT(*) AS cnt
+               FROM ontology_links
+              WHERE from_object_id <> to_object_id
+              GROUP BY a, b",
+        )?;
+        let edges: Vec<super::community::GraphEdge> = edge_stmt
+            .query_map([], |row| {
+                Ok(super::community::GraphEdge {
+                    from_object_id: row.get::<_, i64>(0)?,
+                    to_object_id: row.get::<_, i64>(1)?,
+                    weight: row.get::<_, i64>(2)?.max(0).try_into().unwrap_or(u32::MAX),
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(super::community::GraphView { nodes, edges })
+    }
+
+    /// Persist a [`super::community::CommunityAssignment`] into
+    /// `ontology_communities` as level-0 rows. Existing rows for `level=0` are
+    /// purged first so the table always reflects the latest detection — this
+    /// matches the weekly batch model in the roadmap, where stale assignments
+    /// have no value.
+    ///
+    /// `summarise` is called once per community with its member object_ids; the
+    /// returned `(summary, keywords)` pair is stored verbatim. Pass a no-op
+    /// closure to defer LLM summarisation (the row will store an empty
+    /// `summary`, which the Phase 5 ranker correctly skips).
+    pub fn replace_communities_level_zero(
+        &self,
+        assignment: &super::community::CommunityAssignment,
+        mut summarise: impl FnMut(u32, &[i64]) -> (String, Vec<String>),
+    ) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM ontology_communities WHERE level = 0", [])?;
+        let mut written = 0usize;
+        for (cid, members) in &assignment.members {
+            let (summary, keywords) = summarise(*cid, members);
+            let object_ids_json = serde_json::to_string(members)?;
+            let keywords_json = serde_json::to_string(&keywords)?;
+            tx.execute(
+                "INSERT INTO ontology_communities
+                     (community_id, level, summary, object_ids, keywords)
+                  VALUES (?1, 0, ?2, ?3, ?4)",
+                params![*cid as i64, summary, object_ids_json, keywords_json],
+            )?;
+            written += 1;
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// PR #9 LlmConsolidator share — list level-0 communities whose
+    /// summary column is empty (scheduler wrote the placeholder when no
+    /// provider was attached). Feeds the async summariser pass that
+    /// calls the LLM once per community and writes the result via
+    /// [`Self::set_community_summary`]. Returns `(community_id, level,
+    /// object_ids)` so the caller can join against `ontology_objects`
+    /// to build the LLM prompt input.
+    pub fn list_communities_needing_summary(
+        &self,
+    ) -> anyhow::Result<Vec<(u32, u32, Vec<i64>)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT community_id, level, object_ids
+               FROM ontology_communities
+              WHERE level = 0
+                AND length(summary) = 0
+              ORDER BY community_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let cid: i64 = row.get(0)?;
+            let level: i64 = row.get(1)?;
+            let object_ids_json: String = row.get(2)?;
+            Ok((
+                u32::try_from(cid).unwrap_or(u32::MAX),
+                u32::try_from(level).unwrap_or(0),
+                object_ids_json,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (cid, level, ids_json) = row?;
+            let object_ids: Vec<i64> = serde_json::from_str(&ids_json).unwrap_or_default();
+            out.push((cid, level, object_ids));
+        }
+        Ok(out)
+    }
+
+    /// PR #9 LlmConsolidator share — attach a generated summary + keywords
+    /// to one community. Invoked by the scheduler after the LLM call
+    /// completes. Keywords are stored as a JSON array to match the
+    /// existing column shape.
+    pub fn set_community_summary(
+        &self,
+        level: u32,
+        community_id: u32,
+        summary: &str,
+        keywords: &[String],
+    ) -> anyhow::Result<()> {
+        let keywords_json = serde_json::to_string(keywords)?;
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE ontology_communities
+                SET summary = ?1, keywords = ?2
+              WHERE level = ?3 AND community_id = ?4",
+            params![summary, keywords_json, level as i64, community_id as i64],
+        )?;
+        Ok(())
+    }
+
+    /// PR #9 wire-up — list every level-0 community that has a non-empty
+    /// summary but no embedding yet. Feeds the backfill pass that runs
+    /// inside the dream cycle: for each row, compute an embedding from
+    /// the summary text and call [`Self::set_community_embedding`].
+    pub fn list_communities_needing_embedding(
+        &self,
+    ) -> anyhow::Result<Vec<(u32, u32, String)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT community_id, level, summary
+               FROM ontology_communities
+              WHERE level = 0
+                AND summary_embedding IS NULL
+                AND length(summary) > 0
+              ORDER BY community_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let cid: i64 = row.get(0)?;
+            let level: i64 = row.get(1)?;
+            let summary: String = row.get(2)?;
+            Ok((
+                u32::try_from(cid).unwrap_or(u32::MAX),
+                u32::try_from(level).unwrap_or(0),
+                summary,
+            ))
+        })?;
+        rows.collect::<Result<_, _>>().map_err(anyhow::Error::from)
+    }
+
+    /// Attach a freshly-computed embedding to one community. Called by the
+    /// embedding backfill pass after the LLM summary has been written.
+    pub fn set_community_embedding(
+        &self,
+        level: u32,
+        community_id: u32,
+        embedding: &[f32],
+    ) -> anyhow::Result<()> {
+        let mut bytes = Vec::with_capacity(embedding.len() * 4);
+        for f in embedding {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE ontology_communities
+                SET summary_embedding = ?1
+              WHERE level = ?2 AND community_id = ?3",
+            params![bytes, level as i64, community_id as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Read every level-0 community for Phase 5 cross-search. Communities
+    /// without an embedding are still returned (caller decides whether to
+    /// include them via `rank_communities_for_query`, which skips `None`
+    /// embeddings).
+    pub fn list_communities_level_zero(
+        &self,
+    ) -> anyhow::Result<Vec<super::community::CommunitySummary>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT community_id, level, summary, object_ids, keywords, summary_embedding
+               FROM ontology_communities
+              WHERE level = 0
+              ORDER BY community_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let community_id: i64 = row.get(0)?;
+            let level: i64 = row.get(1)?;
+            let summary: String = row.get(2)?;
+            let object_ids_json: String = row.get(3)?;
+            let keywords_json: String = row.get(4)?;
+            let embedding: Option<Vec<u8>> = row.get(5)?;
+            Ok((
+                community_id,
+                level,
+                summary,
+                object_ids_json,
+                keywords_json,
+                embedding,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (community_id, level, summary, ids_json, kw_json, emb_bytes) = r?;
+            let object_ids: Vec<i64> = serde_json::from_str(&ids_json).unwrap_or_default();
+            let keywords: Vec<String> = serde_json::from_str(&kw_json).unwrap_or_default();
+            let summary_embedding = emb_bytes.and_then(|bytes| {
+                if bytes.len() % 4 != 0 {
+                    return None;
+                }
+                let mut emb = Vec::with_capacity(bytes.len() / 4);
+                for chunk in bytes.chunks_exact(4) {
+                    let mut buf = [0u8; 4];
+                    buf.copy_from_slice(chunk);
+                    emb.push(f32::from_le_bytes(buf));
+                }
+                Some(emb)
+            });
+            out.push(super::community::CommunitySummary {
+                community_id: u32::try_from(community_id).unwrap_or(u32::MAX),
+                level: u32::try_from(level).unwrap_or(0),
+                summary,
+                keywords,
+                object_ids,
+                summary_embedding,
+            });
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod community_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn repo() -> (TempDir, OntologyRepo) {
+        let tmp = TempDir::new().unwrap();
+        let r = OntologyRepo::open(tmp.path()).unwrap();
+        (tmp, r)
+    }
+
+    fn seed_object(repo: &OntologyRepo, type_name: &str, title: &str, owner: &str) -> i64 {
+        // The default schema seeds Contact / Task / Document / etc. — see
+        // schema::seed_default_types. Tests stick to those names so we don't
+        // depend on a per-test type creator.
+        repo.ensure_object(type_name, title, &serde_json::json!({}), owner)
+            .unwrap()
+    }
+
+    #[test]
+    fn load_graph_view_returns_nodes_and_collapsed_edges() {
+        let (_tmp, r) = repo();
+        let a = seed_object(&r, "Contact", "Alice", "u1");
+        let b = seed_object(&r, "Contact", "Bob", "u1");
+        let c = seed_object(&r, "Contact", "Carol", "u1");
+        // Two parallel links between A and B → should collapse to weight 2.
+        r.create_link("knows", a, b, None).unwrap();
+        r.create_link("knows", b, a, None).unwrap();
+        r.create_link("knows", b, c, None).unwrap();
+        let view = r.load_graph_view().unwrap();
+        assert_eq!(view.nodes.len(), 3);
+        // Two distinct undirected pairs → two edges; weight on (A,B) = 2.
+        assert_eq!(view.edges.len(), 2);
+        let ab_weight = view
+            .edges
+            .iter()
+            .find(|e| {
+                (e.from_object_id == a && e.to_object_id == b)
+                    || (e.from_object_id == b && e.to_object_id == a)
+            })
+            .map(|e| e.weight)
+            .unwrap();
+        assert_eq!(ab_weight, 2);
+    }
+
+    #[test]
+    fn replace_and_list_communities_round_trip() {
+        use super::super::community::{CommunityAssignment, CommunitySummary};
+        use std::collections::{BTreeMap, HashMap};
+
+        let (_tmp, r) = repo();
+        // Hand-build an assignment so the test does not depend on the
+        // detection algorithm — we verify the persistence layer here.
+        let mut members: BTreeMap<u32, Vec<i64>> = BTreeMap::new();
+        members.insert(0, vec![1, 2]);
+        members.insert(1, vec![3]);
+        let mut of_node: HashMap<i64, u32> = HashMap::new();
+        for (cid, ms) in &members {
+            for m in ms {
+                of_node.insert(*m, *cid);
+            }
+        }
+        let assignment = CommunityAssignment { of_node, members };
+
+        let written = r
+            .replace_communities_level_zero(&assignment, |cid, members| {
+                (
+                    format!("community {cid} ({} members)", members.len()),
+                    vec![format!("kw_{cid}")],
+                )
+            })
+            .unwrap();
+        assert_eq!(written, 2);
+
+        let listed: Vec<CommunitySummary> = r.list_communities_level_zero().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].community_id, 0);
+        assert_eq!(listed[0].object_ids, vec![1, 2]);
+        assert_eq!(listed[0].keywords, vec!["kw_0".to_string()]);
+        assert!(listed[0].summary_embedding.is_none());
+    }
+
+    #[test]
+    fn replace_communities_purges_prior_level_zero_rows() {
+        use super::super::community::CommunityAssignment;
+        use std::collections::{BTreeMap, HashMap};
+
+        let (_tmp, r) = repo();
+        let mut first = BTreeMap::new();
+        first.insert(0u32, vec![1i64, 2]);
+        first.insert(1, vec![3]);
+        let mut node = HashMap::new();
+        for (cid, ms) in &first {
+            for m in ms {
+                node.insert(*m, *cid);
+            }
+        }
+        r.replace_communities_level_zero(
+            &CommunityAssignment {
+                of_node: node,
+                members: first,
+            },
+            |_, _| (String::new(), Vec::new()),
+        )
+        .unwrap();
+
+        let mut second = BTreeMap::new();
+        second.insert(0u32, vec![5i64, 6, 7]);
+        let mut node2 = HashMap::new();
+        for (cid, ms) in &second {
+            for m in ms {
+                node2.insert(*m, *cid);
+            }
+        }
+        r.replace_communities_level_zero(
+            &CommunityAssignment {
+                of_node: node2,
+                members: second,
+            },
+            |_, _| (String::new(), Vec::new()),
+        )
+        .unwrap();
+
+        let listed = r.list_communities_level_zero().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].object_ids, vec![5, 6, 7]);
+    }
+
+    #[test]
+    fn list_communities_needing_embedding_filters_correctly() {
+        use super::super::community::CommunityAssignment;
+        use std::collections::{BTreeMap, HashMap};
+
+        let (_tmp, r) = repo();
+        let mut members: BTreeMap<u32, Vec<i64>> = BTreeMap::new();
+        members.insert(0, vec![1, 2]);
+        members.insert(1, vec![3]);
+        members.insert(2, vec![4]);
+        let mut of_node: HashMap<i64, u32> = HashMap::new();
+        for (cid, ms) in &members {
+            for m in ms {
+                of_node.insert(*m, *cid);
+            }
+        }
+        r.replace_communities_level_zero(
+            &CommunityAssignment { of_node, members },
+            |cid, _| match cid {
+                // 0 → summary present, needs embedding
+                0 => ("summary A".into(), vec![]),
+                // 1 → empty summary (scheduler placeholder), should be
+                //     excluded so we don't embed empty strings
+                1 => (String::new(), vec![]),
+                // 2 → summary present, needs embedding
+                _ => ("summary C".into(), vec![]),
+            },
+        )
+        .unwrap();
+        // Pre-embed community 2 so it drops off the "needs embedding" list.
+        r.set_community_embedding(0, 2, &[0.1, 0.2, 0.3]).unwrap();
+
+        let pending = r.list_communities_needing_embedding().unwrap();
+        // Only community 0 should remain (has summary + no embedding).
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, 0);
+        assert_eq!(pending[0].2, "summary A");
+    }
+
+    #[test]
+    fn set_community_embedding_round_trips_via_list() {
+        use super::super::community::CommunityAssignment;
+        use std::collections::{BTreeMap, HashMap};
+
+        let (_tmp, r) = repo();
+        let mut members = BTreeMap::new();
+        members.insert(0u32, vec![1i64]);
+        let mut node = HashMap::new();
+        node.insert(1, 0u32);
+        r.replace_communities_level_zero(
+            &CommunityAssignment {
+                of_node: node,
+                members,
+            },
+            |_, _| (String::from("hi"), vec![]),
+        )
+        .unwrap();
+        r.set_community_embedding(0, 0, &[0.5, -0.25, 0.75]).unwrap();
+
+        let listed = r.list_communities_level_zero().unwrap();
+        let emb = listed[0].summary_embedding.as_ref().unwrap();
+        assert_eq!(emb, &vec![0.5_f32, -0.25, 0.75]);
+    }
+}
+

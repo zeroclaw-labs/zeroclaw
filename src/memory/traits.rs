@@ -318,6 +318,93 @@ pub trait Memory: Send + Sync {
     async fn forget_matching(&self, _pattern: &str) -> anyhow::Result<usize> {
         Ok(0) // default no-op; SQLite backend overrides this
     }
+
+    /// Attach a sync engine so that v3.0 typed mutations (timeline append,
+    /// compiled truth update, phone call insert) auto-record delta journal
+    /// entries for cross-device replication. Default is no-op — only
+    /// backends that hold v3.0 state (SqliteMemory) need to implement this.
+    fn attach_sync_engine(
+        &self,
+        _engine: std::sync::Arc<parking_lot::Mutex<crate::memory::sync::SyncEngine>>,
+    ) {
+        // default no-op
+    }
+
+    /// Apply a v3.0 remote delta (timeline, phone call, or compiled truth)
+    /// locally WITHOUT re-recording to the sync journal. Prevents infinite
+    /// replication loops on inbound deltas. Default returns `Ok(false)`
+    /// (not applied); SqliteMemory overrides to persist to local tables.
+    async fn apply_remote_v3_delta(
+        &self,
+        _delta: &crate::memory::sync::DeltaOperation,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// PR #5 — decide whether to seed the local embedding cache from a
+    /// remote sync delta's precomputed vector. Returns `Ok(true)` when
+    /// the embedding was accepted, `Ok(false)` when it was silently
+    /// dropped (e.g. backend doesn't cache), and `Err` when the remote
+    /// blob's (provider, model, version, dim) disagree with this node's
+    /// embedder — drift.
+    ///
+    /// On drift the backend SHOULD enqueue a re-embedding work item so
+    /// the local representation gets rebuilt with the current model. The
+    /// default impl returns `Ok(false)` so backends without an embedding
+    /// cache are free to ignore the call.
+    async fn accept_remote_embedding(
+        &self,
+        _content: &str,
+        _blob: &crate::memory::sync::EmbeddingBlob,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// PR #5 sender-side — produce an [`EmbeddingBlob`] for `content` so
+    /// the sync layer can attach it to outbound deltas, sparing peers a
+    /// re-embed when their (provider, model, version, dim) match. Returns
+    /// `None` when the backend has no usable embedding (`NoopEmbedding`)
+    /// or no cached vector for `content`.
+    ///
+    /// Default impl returns `None` so backends without a cache stay
+    /// wire-compatible with pre-PR#5 peers (they just don't get the
+    /// optimisation).
+    ///
+    /// [`EmbeddingBlob`]: crate::memory::sync::EmbeddingBlob
+    async fn current_embedding_blob(
+        &self,
+        _content: &str,
+    ) -> Option<crate::memory::sync::EmbeddingBlob> {
+        None
+    }
+
+    /// PR #9 Phase 5 — compute a fresh embedding for a query string, used
+    /// by the agent loop to rank community summaries against the user's
+    /// current request. Returns `None` when the backend has no embedder
+    /// (`NoopEmbedding`) or embedding fails. Default: `None` so Phase 5
+    /// degrades gracefully when running against a backend without an
+    /// embedder.
+    async fn query_embedding(&self, _query: &str) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// Recall with a pre-expanded set of query variations (v3.0 S3).
+    /// Default falls back to `recall(original_query, ...)` ignoring
+    /// variations. SqliteMemory overrides to run parallel FTS+vector
+    /// search across all variations and fuse via RRF.
+    ///
+    /// Callers: agent loop or tools that have already invoked
+    /// `QueryExpander::expand()` with provider access should call this
+    /// instead of `recall()` to benefit from multi-query fusion.
+    async fn recall_with_variations(
+        &self,
+        original_query: &str,
+        _variations: &[String],
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall(original_query, limit, session_id).await
+    }
 }
 
 /// Detected conflict between existing and new memory content.
@@ -381,6 +468,39 @@ mod tests {
         let cat = InteractionCategory::Document;
         assert_eq!(cat.to_string(), "document");
         assert_eq!(InteractionCategory::from_str_lossy("document"), cat);
+    }
+
+    #[tokio::test]
+    async fn recall_with_variations_default_falls_back_to_recall() {
+        // A minimal Memory impl to verify the default trait method falls back
+        // to `recall()` when not overridden.
+        struct EchoMem {
+            called_with: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl Memory for EchoMem {
+            fn name(&self) -> &str { "echo" }
+            async fn store(&self, _k: &str, _c: &str, _cat: MemoryCategory, _s: Option<&str>) -> anyhow::Result<()> { Ok(()) }
+            async fn recall(&self, q: &str, _l: usize, _s: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> {
+                self.called_with.lock().unwrap().push(q.to_string());
+                Ok(vec![])
+            }
+            async fn get(&self, _k: &str) -> anyhow::Result<Option<MemoryEntry>> { Ok(None) }
+            async fn list(&self, _c: Option<&MemoryCategory>, _s: Option<&str>) -> anyhow::Result<Vec<MemoryEntry>> { Ok(vec![]) }
+            async fn forget(&self, _k: &str) -> anyhow::Result<bool> { Ok(false) }
+            async fn count(&self) -> anyhow::Result<usize> { Ok(0) }
+            async fn health_check(&self) -> bool { true }
+        }
+
+        let mem = EchoMem { called_with: std::sync::Mutex::new(vec![]) };
+        let _ = mem
+            .recall_with_variations("origin", &["v1".into(), "v2".into()], 5, None)
+            .await
+            .unwrap();
+        let calls = mem.called_with.lock().unwrap();
+        // Default must delegate to recall() with the ORIGINAL query
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], "origin");
     }
 
     #[test]

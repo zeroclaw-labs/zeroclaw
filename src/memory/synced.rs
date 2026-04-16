@@ -64,11 +64,21 @@ impl SyncedMemory {
                     key,
                     content,
                     category,
+                    embedding,
                 } => {
                     let cat = category_from_str(category);
                     if let Err(e) = self.inner.store(key, content, cat, None).await {
                         tracing::warn!(key, "Failed to apply remote store delta: {e}");
                         continue;
+                    }
+                    // PR #5 — opportunistically seed local embedding cache
+                    // from the remote blob if model/version/dim all match.
+                    // Drift → drop + enqueue re-embed. Errors never block
+                    // the content apply (already succeeded above).
+                    if let Some(blob) = embedding {
+                        if let Err(e) = self.inner.accept_remote_embedding(content, blob).await {
+                            tracing::debug!(key, "Embedding drift on remote store: {e}");
+                        }
                     }
                     tracing::debug!(key, "Applied remote store delta");
                     applied += 1;
@@ -138,20 +148,69 @@ impl SyncedMemory {
                     tracing::debug!("Received remote ontology action log (read-only)");
                 }
                 // ── v3.0 Timeline / Phone / Truth deltas ──────────────
+                // Delegate to the backend's typed apply hook. SqliteMemory
+                // persists into local tables (idempotent via UUID/LWW) and
+                // does NOT re-record the delta (no replication loop).
                 DeltaOperation::TimelineAppend { uuid, .. } => {
-                    // Timeline entries are append-only; the receiving device
-                    // inserts them directly into its local memory_timeline table.
-                    // Actual DB insertion is handled by the caller after sync.
-                    tracing::debug!(uuid, "Received remote timeline append (pending local insert)");
-                    applied += 1;
+                    match self.inner.apply_remote_v3_delta(op).await {
+                        Ok(true) => {
+                            tracing::debug!(uuid, "Applied remote timeline append");
+                            applied += 1;
+                        }
+                        Ok(false) => {
+                            tracing::trace!(uuid, "Backend ignored timeline delta (not supported)");
+                        }
+                        Err(e) => {
+                            tracing::warn!(uuid, "Failed to apply remote timeline delta: {e}");
+                        }
+                    }
                 }
                 DeltaOperation::PhoneCallRecord { call_uuid, .. } => {
-                    tracing::debug!(call_uuid, "Received remote phone call record (pending local insert)");
-                    applied += 1;
+                    match self.inner.apply_remote_v3_delta(op).await {
+                        Ok(true) => {
+                            tracing::debug!(call_uuid, "Applied remote phone call record");
+                            applied += 1;
+                        }
+                        Ok(false) => {
+                            tracing::trace!(call_uuid, "Backend ignored phone call delta (not supported)");
+                        }
+                        Err(e) => {
+                            tracing::warn!(call_uuid, "Failed to apply remote phone call delta: {e}");
+                        }
+                    }
                 }
                 DeltaOperation::CompiledTruthUpdate { memory_key, .. } => {
-                    tracing::debug!(memory_key, "Received remote compiled truth update (pending local apply)");
-                    applied += 1;
+                    match self.inner.apply_remote_v3_delta(op).await {
+                        Ok(true) => {
+                            tracing::debug!(memory_key, "Applied remote compiled truth update");
+                            applied += 1;
+                        }
+                        Ok(false) => {
+                            // LWW rejected: local version >= remote. Expected case.
+                            tracing::trace!(
+                                memory_key,
+                                "Remote truth superseded by local version (LWW)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(memory_key, "Failed to apply remote truth delta: {e}");
+                        }
+                    }
+                }
+                // ── v6 Vault (Second Brain) delta ─────────────────
+                DeltaOperation::VaultDocUpsert { uuid, .. } => {
+                    match self.inner.apply_remote_v3_delta(op).await {
+                        Ok(true) => {
+                            tracing::debug!(uuid, "Applied remote vault doc upsert");
+                            applied += 1;
+                        }
+                        Ok(false) => {
+                            tracing::trace!(uuid, "Backend ignored vault doc delta (not supported)");
+                        }
+                        Err(e) => {
+                            tracing::warn!(uuid, "Failed to apply remote vault doc delta: {e}");
+                        }
+                    }
                 }
             }
         }
@@ -239,6 +298,9 @@ impl SyncedMemory {
                         key: entry.key.clone(),
                         content: entry.content.clone(),
                         category: entry.category.to_string(),
+                        // PR #5: full-sync replay of local entries; we do not
+                        // attach embeddings here because they are cache-only.
+                        embedding: None,
                     },
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -301,8 +363,18 @@ impl Memory for SyncedMemory {
         //    Short-term (Conversation) memory is NOT synced across devices.
         //    Sync only triggers when data is promoted to Core/Daily or ontology.
         if category != MemoryCategory::Conversation {
+            // PR #5 sender-side — fetch the embedding the inner backend
+            // just cached so we can attach it to the outbound delta.
+            // Returns None for NoopEmbedding or cache miss; receiver
+            // falls back to local re-embed in either case.
+            let embedding_blob = self.inner.current_embedding_blob(content).await;
             let mut engine = self.sync.lock();
-            engine.record_store(key, content, &category.to_string());
+            engine.record_store_with_embedding(
+                key,
+                content,
+                &category.to_string(),
+                embedding_blob,
+            );
             tracing::trace!(key, %category, "Sync: recorded store delta");
         } else {
             tracing::trace!(key, %category, "Sync: skipped Conversation category (short-term only)");
@@ -454,6 +526,7 @@ mod tests {
                 key: "remote_key".into(),
                 content: "remote_value".into(),
                 category: "core".into(),
+                embedding: None,
             },
             timestamp: 9999,
         }];
@@ -511,6 +584,7 @@ mod tests {
                 key: "dup_key".into(),
                 content: "dup_value".into(),
                 category: "core".into(),
+                embedding: None,
             },
             timestamp: 9999,
         };

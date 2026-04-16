@@ -195,6 +195,42 @@ pub(super) async fn build_context(
                 }
             }
         }
+
+        // ── Phase 5 (PR #9 GraphRAG): community summaries ─────────
+        // Inject the top-3 community summaries most similar to the
+        // user's query, giving the LLM a "which slice of the world
+        // matters here" anchor. Skipped silently when (a) no embedder
+        // is configured, (b) no communities exist yet, or (c) all
+        // communities lack embeddings (backfill still pending).
+        if let Some(query_emb) = mem.query_embedding(user_msg).await {
+            if let Ok(summaries) = repo.list_communities_level_zero() {
+                if !summaries.is_empty() {
+                    let ranked = crate::ontology::community::rank_communities_for_query(
+                        &query_emb,
+                        &summaries,
+                        3,
+                    );
+                    if !ranked.is_empty() {
+                        let start = context.len();
+                        context.push_str("[Community summaries]\n");
+                        for c in &ranked {
+                            let kws = if c.keywords.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" ({})", c.keywords.join(", "))
+                            };
+                            let _ = writeln!(
+                                context,
+                                "- community_{}{}: {}",
+                                c.community_id, kws, c.summary
+                            );
+                        }
+                        context.push('\n');
+                        section_boundaries.push((start, SectionPriority::Community));
+                    }
+                }
+            }
+        }
     }
 
     // ── ACE Layer 3: Budget guard ──
@@ -218,6 +254,7 @@ pub(super) async fn build_context(
             // Find and summarize the section to trim
             let label = match priority {
                 SectionPriority::CrossSearch => "[Cross-referenced",
+                SectionPriority::Community => "[Community summaries",
                 SectionPriority::RagMemory => "[Memory context",
                 SectionPriority::Ontology => "[Ontology context",
                 SectionPriority::Essential => continue,
@@ -710,6 +747,7 @@ enum SectionPriority {
     Essential,   // user profile — never trimmed
     Ontology,    // relationship graph — trimmed last
     RagMemory,   // past conversation RAG — trimmed second
+    Community,   // PR #9 GraphRAG community summaries — trimmed mid-low
     CrossSearch, // cross-referenced enrichment — trimmed first
 }
 
@@ -722,9 +760,10 @@ impl SectionPriority {
     fn rank(&self) -> u8 {
         match self {
             Self::CrossSearch => 0,
-            Self::RagMemory => 1,
-            Self::Ontology => 2,
-            Self::Essential => 3,
+            Self::Community => 1,
+            Self::RagMemory => 2,
+            Self::Ontology => 3,
+            Self::Essential => 4,
         }
     }
 }
