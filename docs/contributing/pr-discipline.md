@@ -22,7 +22,7 @@ Treat privacy and neutrality as merge gates, not best-effort guidelines.
 
 Superseding a contributor PR is appropriate in a limited set of situations. Before opening a superseding PR, consider the alternatives in this order:
 
-1. **Push fixups to the contributor's branch.** If the contributor PR has `maintainerCanModify: true` (the default for PRs from personal forks — check with `gh pr view <number> --json maintainerCanModify`), push small fixes directly to their branch and merge the contributor's PR. This preserves full attribution in `git log`, `git blame`, and the contributor's GitHub profile. Coordinate with the contributor if the fix isn't trivial — pushing to their branch while they have unpushed local work creates conflicts they'll need to resolve.
+1. **Push fixups to the contributor's branch.** If the contributor PR has `maintainerCanModify: true` (the default for PRs from personal forks — check with `gh pr view <number> --json maintainerCanModify`), push small fixes directly to their branch and merge the contributor's PR. This preserves full attribution in `git log`, `git blame`, and the contributor's GitHub profile. Coordinate with the contributor if the fix isn't trivial — pushing to their branch while they have unpushed local work creates conflicts they'll need to resolve. If the contributor is actively iterating, prefer option 2 below.
 
 2. **Leave a review with specific requested changes.** If the contributor is active and the fix is within their scope (e.g., a single clippy lint, an edge case, a test addition), request the change and give them an opportunity to push a fixup commit. Single-line fixes are usually better handled by requesting the change or pushing a fixup directly.
 
