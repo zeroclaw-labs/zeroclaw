@@ -277,7 +277,10 @@ async fn run_agent_job(
     let memory_context = match zeroclaw_memory::create_memory(
         &config.memory,
         &config.workspace_dir,
-        config.api_key.as_deref(),
+        config
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.api_key.as_deref()),
     ) {
         Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
             Ok(entries) if !entries.is_empty() => {
@@ -306,14 +309,21 @@ async fn run_agent_job(
     let prefixed_prompt = format!("{memory_context}[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
+    let mut cron_config = config.clone();
+    cron_config.memory.auto_save = false;
+
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
             Box::pin(crate::agent::run(
-                config.clone(),
+                cron_config,
                 Some(prefixed_prompt),
                 None,
                 model_override,
-                config.default_temperature,
+                config
+                    .providers
+                    .fallback_provider()
+                    .and_then(|e| e.temperature)
+                    .unwrap_or(0.7),
                 vec![],
                 false,
                 None,

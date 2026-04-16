@@ -106,7 +106,7 @@ pub async fn handle_api_status(
 
     let mut channels = serde_json::Map::new();
 
-    for (channel, present) in config.channels_config.channels() {
+    for (channel, present) in config.channels.channels() {
         channels.insert(channel.name().to_string(), serde_json::Value::Bool(present));
     }
 
@@ -118,7 +118,7 @@ pub async fn handle_api_status(
         .unwrap_or_else(zeroclaw_runtime::i18n::detect_locale);
 
     let body = serde_json::json!({
-        "provider": config.default_provider,
+        "provider": config.providers.fallback,
         "model": state.model,
         "temperature": state.temperature,
         "uptime_seconds": health.uptime_seconds,
@@ -978,7 +978,6 @@ fn mask_sensitive_fields(
 ) -> zeroclaw_config::schema::Config {
     let mut masked = config.clone();
 
-    mask_optional_secret(&mut masked.api_key);
     mask_vec_secrets(&mut masked.reliability.api_keys);
     mask_vec_secrets(&mut masked.gateway.paired_tokens);
     mask_optional_secret(&mut masked.composio.api_key);
@@ -996,78 +995,83 @@ fn mask_sensitive_fields(
     for agent in masked.agents.values_mut() {
         mask_optional_secret(&mut agent.api_key);
     }
-    for route in &mut masked.model_routes {
+
+    // Mask providers
+    for model in masked.providers.models.values_mut() {
+        mask_optional_secret(&mut model.api_key);
+    }
+    for route in &mut masked.providers.model_routes {
         mask_optional_secret(&mut route.api_key);
     }
-    for route in &mut masked.embedding_routes {
+    for route in &mut masked.providers.embedding_routes {
         mask_optional_secret(&mut route.api_key);
     }
 
-    if let Some(telegram) = masked.channels_config.telegram.as_mut() {
+    if let Some(telegram) = masked.channels.telegram.as_mut() {
         mask_required_secret(&mut telegram.bot_token);
     }
-    if let Some(discord) = masked.channels_config.discord.as_mut() {
+    if let Some(discord) = masked.channels.discord.as_mut() {
         mask_required_secret(&mut discord.bot_token);
     }
-    if let Some(slack) = masked.channels_config.slack.as_mut() {
+    if let Some(slack) = masked.channels.slack.as_mut() {
         mask_required_secret(&mut slack.bot_token);
         mask_optional_secret(&mut slack.app_token);
     }
-    if let Some(mattermost) = masked.channels_config.mattermost.as_mut() {
+    if let Some(mattermost) = masked.channels.mattermost.as_mut() {
         mask_required_secret(&mut mattermost.bot_token);
     }
-    if let Some(webhook) = masked.channels_config.webhook.as_mut() {
+    if let Some(webhook) = masked.channels.webhook.as_mut() {
         mask_optional_secret(&mut webhook.secret);
     }
-    if let Some(matrix) = masked.channels_config.matrix.as_mut() {
+    if let Some(matrix) = masked.channels.matrix.as_mut() {
         mask_required_secret(&mut matrix.access_token);
     }
-    if let Some(whatsapp) = masked.channels_config.whatsapp.as_mut() {
+    if let Some(whatsapp) = masked.channels.whatsapp.as_mut() {
         mask_optional_secret(&mut whatsapp.access_token);
         mask_optional_secret(&mut whatsapp.app_secret);
         mask_optional_secret(&mut whatsapp.verify_token);
     }
-    if let Some(linq) = masked.channels_config.linq.as_mut() {
+    if let Some(linq) = masked.channels.linq.as_mut() {
         mask_required_secret(&mut linq.api_token);
         mask_optional_secret(&mut linq.signing_secret);
     }
-    if let Some(nextcloud) = masked.channels_config.nextcloud_talk.as_mut() {
+    if let Some(nextcloud) = masked.channels.nextcloud_talk.as_mut() {
         mask_required_secret(&mut nextcloud.app_token);
         mask_optional_secret(&mut nextcloud.webhook_secret);
     }
-    if let Some(wati) = masked.channels_config.wati.as_mut() {
+    if let Some(wati) = masked.channels.wati.as_mut() {
         mask_required_secret(&mut wati.api_token);
     }
-    if let Some(irc) = masked.channels_config.irc.as_mut() {
+    if let Some(irc) = masked.channels.irc.as_mut() {
         mask_optional_secret(&mut irc.server_password);
         mask_optional_secret(&mut irc.nickserv_password);
         mask_optional_secret(&mut irc.sasl_password);
     }
-    if let Some(lark) = masked.channels_config.lark.as_mut() {
+    if let Some(lark) = masked.channels.lark.as_mut() {
         mask_required_secret(&mut lark.app_secret);
         mask_optional_secret(&mut lark.encrypt_key);
         mask_optional_secret(&mut lark.verification_token);
     }
-    if let Some(feishu) = masked.channels_config.feishu.as_mut() {
+    if let Some(feishu) = masked.channels.feishu.as_mut() {
         mask_required_secret(&mut feishu.app_secret);
         mask_optional_secret(&mut feishu.encrypt_key);
         mask_optional_secret(&mut feishu.verification_token);
     }
-    if let Some(dingtalk) = masked.channels_config.dingtalk.as_mut() {
+    if let Some(dingtalk) = masked.channels.dingtalk.as_mut() {
         mask_required_secret(&mut dingtalk.client_secret);
     }
-    if let Some(qq) = masked.channels_config.qq.as_mut() {
+    if let Some(qq) = masked.channels.qq.as_mut() {
         mask_required_secret(&mut qq.app_secret);
     }
     #[cfg(feature = "channel-nostr")]
-    if let Some(nostr) = masked.channels_config.nostr.as_mut() {
+    if let Some(nostr) = masked.channels.nostr.as_mut() {
         mask_required_secret(&mut nostr.private_key);
     }
-    if let Some(clawdtalk) = masked.channels_config.clawdtalk.as_mut() {
+    if let Some(clawdtalk) = masked.channels.clawdtalk.as_mut() {
         mask_required_secret(&mut clawdtalk.api_key);
         mask_optional_secret(&mut clawdtalk.webhook_secret);
     }
-    if let Some(email) = masked.channels_config.email.as_mut() {
+    if let Some(email) = masked.channels.email.as_mut() {
         mask_required_secret(&mut email.password);
     }
     mask_optional_secret(&mut masked.transcription.api_key);
@@ -1078,7 +1082,6 @@ fn restore_masked_sensitive_fields(
     incoming: &mut zeroclaw_config::schema::Config,
     current: &zeroclaw_config::schema::Config,
 ) {
-    restore_optional_secret(&mut incoming.api_key, &current.api_key);
     restore_vec_secrets(
         &mut incoming.gateway.paired_tokens,
         &current.gateway.paired_tokens,
@@ -1122,77 +1125,83 @@ fn restore_masked_sensitive_fields(
             restore_optional_secret(&mut agent.api_key, &current_agent.api_key);
         }
     }
-    restore_model_route_api_keys(&mut incoming.model_routes, &current.model_routes);
-    restore_embedding_route_api_keys(&mut incoming.embedding_routes, &current.embedding_routes);
+    restore_model_route_api_keys(
+        &mut incoming.providers.model_routes,
+        &current.providers.model_routes,
+    );
+    restore_embedding_route_api_keys(
+        &mut incoming.providers.embedding_routes,
+        &current.providers.embedding_routes,
+    );
 
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.telegram.as_mut(),
-        current.channels_config.telegram.as_ref(),
+        incoming.channels.telegram.as_mut(),
+        current.channels.telegram.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.discord.as_mut(),
-        current.channels_config.discord.as_ref(),
+        incoming.channels.discord.as_mut(),
+        current.channels.discord.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.slack.as_mut(),
-        current.channels_config.slack.as_ref(),
+        incoming.channels.slack.as_mut(),
+        current.channels.slack.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
         restore_optional_secret(&mut incoming_ch.app_token, &current_ch.app_token);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.mattermost.as_mut(),
-        current.channels_config.mattermost.as_ref(),
+        incoming.channels.mattermost.as_mut(),
+        current.channels.mattermost.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.webhook.as_mut(),
-        current.channels_config.webhook.as_ref(),
+        incoming.channels.webhook.as_mut(),
+        current.channels.webhook.as_ref(),
     ) {
         restore_optional_secret(&mut incoming_ch.secret, &current_ch.secret);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.matrix.as_mut(),
-        current.channels_config.matrix.as_ref(),
+        incoming.channels.matrix.as_mut(),
+        current.channels.matrix.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.access_token, &current_ch.access_token);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.whatsapp.as_mut(),
-        current.channels_config.whatsapp.as_ref(),
+        incoming.channels.whatsapp.as_mut(),
+        current.channels.whatsapp.as_ref(),
     ) {
         restore_optional_secret(&mut incoming_ch.access_token, &current_ch.access_token);
         restore_optional_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
         restore_optional_secret(&mut incoming_ch.verify_token, &current_ch.verify_token);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.linq.as_mut(),
-        current.channels_config.linq.as_ref(),
+        incoming.channels.linq.as_mut(),
+        current.channels.linq.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.api_token, &current_ch.api_token);
         restore_optional_secret(&mut incoming_ch.signing_secret, &current_ch.signing_secret);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.nextcloud_talk.as_mut(),
-        current.channels_config.nextcloud_talk.as_ref(),
+        incoming.channels.nextcloud_talk.as_mut(),
+        current.channels.nextcloud_talk.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.app_token, &current_ch.app_token);
         restore_optional_secret(&mut incoming_ch.webhook_secret, &current_ch.webhook_secret);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.wati.as_mut(),
-        current.channels_config.wati.as_ref(),
+        incoming.channels.wati.as_mut(),
+        current.channels.wati.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.api_token, &current_ch.api_token);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.irc.as_mut(),
-        current.channels_config.irc.as_ref(),
+        incoming.channels.irc.as_mut(),
+        current.channels.irc.as_ref(),
     ) {
         restore_optional_secret(
             &mut incoming_ch.server_password,
@@ -1205,8 +1214,8 @@ fn restore_masked_sensitive_fields(
         restore_optional_secret(&mut incoming_ch.sasl_password, &current_ch.sasl_password);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.lark.as_mut(),
-        current.channels_config.lark.as_ref(),
+        incoming.channels.lark.as_mut(),
+        current.channels.lark.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
         restore_optional_secret(&mut incoming_ch.encrypt_key, &current_ch.encrypt_key);
@@ -1216,8 +1225,8 @@ fn restore_masked_sensitive_fields(
         );
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.feishu.as_mut(),
-        current.channels_config.feishu.as_ref(),
+        incoming.channels.feishu.as_mut(),
+        current.channels.feishu.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
         restore_optional_secret(&mut incoming_ch.encrypt_key, &current_ch.encrypt_key);
@@ -1227,34 +1236,33 @@ fn restore_masked_sensitive_fields(
         );
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.dingtalk.as_mut(),
-        current.channels_config.dingtalk.as_ref(),
+        incoming.channels.dingtalk.as_mut(),
+        current.channels.dingtalk.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.client_secret, &current_ch.client_secret);
     }
-    if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.qq.as_mut(),
-        current.channels_config.qq.as_ref(),
-    ) {
+    if let (Some(incoming_ch), Some(current_ch)) =
+        (incoming.channels.qq.as_mut(), current.channels.qq.as_ref())
+    {
         restore_required_secret(&mut incoming_ch.app_secret, &current_ch.app_secret);
     }
     #[cfg(feature = "channel-nostr")]
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.nostr.as_mut(),
-        current.channels_config.nostr.as_ref(),
+        incoming.channels.nostr.as_mut(),
+        current.channels.nostr.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.private_key, &current_ch.private_key);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.clawdtalk.as_mut(),
-        current.channels_config.clawdtalk.as_ref(),
+        incoming.channels.clawdtalk.as_mut(),
+        current.channels.clawdtalk.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.api_key, &current_ch.api_key);
         restore_optional_secret(&mut incoming_ch.webhook_secret, &current_ch.webhook_secret);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
-        incoming.channels_config.email.as_mut(),
-        current.channels_config.email.as_ref(),
+        incoming.channels.email.as_mut(),
+        current.channels.email.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.password, &current_ch.password);
     }
@@ -1262,6 +1270,13 @@ fn restore_masked_sensitive_fields(
         &mut incoming.transcription.api_key,
         &current.transcription.api_key,
     );
+
+    // Restore api_keys inside providers.models entries.
+    for (name, incoming_entry) in &mut incoming.providers.models {
+        if let Some(current_entry) = current.providers.models.get(name) {
+            restore_optional_secret(&mut incoming_entry.api_key, &current_entry.api_key);
+        }
+    }
 }
 
 fn hydrate_config_for_save(
@@ -1677,17 +1692,23 @@ mod tests {
 
     #[test]
     fn masking_keeps_toml_valid_and_preserves_api_keys_type() {
-        let mut cfg = zeroclaw_config::schema::Config {
-            api_key: Some("sk-live-123".to_string()),
-            ..Default::default()
-        };
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.providers.fallback = Some("default".into());
+        cfg.providers.models.insert(
+            "default".into(),
+            zeroclaw_config::schema::ModelProviderConfig {
+                api_key: Some("sk-live-123".to_string()),
+                ..Default::default()
+            },
+        );
+        // Provider fields are now resolved directly — no cache needed.
         cfg.reliability.api_keys = vec!["rk-1".to_string(), "rk-2".to_string()];
         cfg.gateway.paired_tokens = vec!["pair-token-1".to_string()];
         cfg.tunnel.cloudflare = Some(zeroclaw_config::schema::CloudflareTunnelConfig {
             token: "cf-token".to_string(),
         });
         cfg.memory.qdrant.api_key = Some("qdrant-key".to_string());
-        cfg.channels_config.wati = Some(zeroclaw_config::schema::WatiConfig {
+        cfg.channels.wati = Some(zeroclaw_config::schema::WatiConfig {
             enabled: true,
             api_token: "wati-token".to_string(),
             api_url: "https://live-mt-server.wati.io".to_string(),
@@ -1695,7 +1716,7 @@ mod tests {
             allowed_numbers: vec![],
             proxy_url: None,
         });
-        cfg.channels_config.feishu = Some(zeroclaw_config::schema::FeishuConfig {
+        cfg.channels.feishu = Some(zeroclaw_config::schema::FeishuConfig {
             enabled: true,
             app_id: "cli_aabbcc".to_string(),
             app_secret: "feishu-secret".to_string(),
@@ -1706,7 +1727,8 @@ mod tests {
             port: None,
             proxy_url: None,
         });
-        cfg.channels_config.email = Some(zeroclaw_config::scattered_types::EmailConfig {
+        cfg.channels.email = Some(zeroclaw_config::scattered_types::EmailConfig {
+            enabled: true,
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
             imap_folder: "INBOX".to_string(),
@@ -1721,26 +1743,36 @@ mod tests {
             default_subject: "ZeroClaw Message".to_string(),
             max_attachment_bytes: 25 * 1024 * 1024,
         });
-        cfg.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+        cfg.providers.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "reasoning".to_string(),
             provider: "openrouter".to_string(),
             model: "anthropic/claude-sonnet-4.6".to_string(),
             api_key: Some("route-model-key".to_string()),
         }];
-        cfg.embedding_routes = vec![zeroclaw_config::schema::EmbeddingRouteConfig {
+        cfg.providers.embedding_routes = vec![zeroclaw_config::schema::EmbeddingRouteConfig {
             hint: "semantic".to_string(),
             provider: "openai".to_string(),
             model: "text-embedding-3-small".to_string(),
             dimensions: Some(1536),
             api_key: Some("route-embed-key".to_string()),
         }];
+        // Provider fields are now resolved directly — no cache needed.
 
         let masked = mask_sensitive_fields(&cfg);
         let toml = toml::to_string_pretty(&masked).expect("masked config should serialize");
         let parsed: zeroclaw_config::schema::Config =
-            toml::from_str(&toml).expect("masked config should remain valid TOML for Config");
+            toml::from_str::<zeroclaw_config::migration::V1Compat>(&toml)
+                .expect("masked config should remain valid TOML for Config")
+                .into_config();
 
-        assert_eq!(parsed.api_key.as_deref(), Some(MASKED_SECRET));
+        assert_eq!(
+            parsed
+                .providers
+                .models
+                .get("default")
+                .and_then(|m| m.api_key.as_deref()),
+            Some(MASKED_SECRET)
+        );
         assert_eq!(
             parsed.reliability.api_keys,
             vec![MASKED_SECRET.to_string(), MASKED_SECRET.to_string()]
@@ -1754,17 +1786,13 @@ mod tests {
             Some(MASKED_SECRET)
         );
         assert_eq!(
-            parsed
-                .channels_config
-                .wati
-                .as_ref()
-                .map(|v| v.api_token.as_str()),
+            parsed.channels.wati.as_ref().map(|v| v.api_token.as_str()),
             Some(MASKED_SECRET)
         );
         assert_eq!(parsed.memory.qdrant.api_key.as_deref(), Some(MASKED_SECRET));
         assert_eq!(
             parsed
-                .channels_config
+                .channels
                 .feishu
                 .as_ref()
                 .map(|v| v.app_secret.as_str()),
@@ -1772,7 +1800,7 @@ mod tests {
         );
         assert_eq!(
             parsed
-                .channels_config
+                .channels
                 .feishu
                 .as_ref()
                 .and_then(|v| v.encrypt_key.as_deref()),
@@ -1780,7 +1808,7 @@ mod tests {
         );
         assert_eq!(
             parsed
-                .channels_config
+                .channels
                 .feishu
                 .as_ref()
                 .and_then(|v| v.verification_token.as_deref()),
@@ -1788,6 +1816,7 @@ mod tests {
         );
         assert_eq!(
             parsed
+                .providers
                 .model_routes
                 .first()
                 .and_then(|v| v.api_key.as_deref()),
@@ -1795,17 +1824,14 @@ mod tests {
         );
         assert_eq!(
             parsed
+                .providers
                 .embedding_routes
                 .first()
                 .and_then(|v| v.api_key.as_deref()),
             Some(MASKED_SECRET)
         );
         assert_eq!(
-            parsed
-                .channels_config
-                .email
-                .as_ref()
-                .map(|v| v.password.as_str()),
+            parsed.channels.email.as_ref().map(|v| v.password.as_str()),
             Some(MASKED_SECRET)
         );
     }
@@ -1815,9 +1841,16 @@ mod tests {
         let mut current = zeroclaw_config::schema::Config {
             config_path: std::path::PathBuf::from("/tmp/current/config.toml"),
             workspace_dir: std::path::PathBuf::from("/tmp/current/workspace"),
-            api_key: Some("real-key".to_string()),
             ..Default::default()
         };
+        current.providers.fallback = Some("default".into());
+        current.providers.models.insert(
+            "default".into(),
+            zeroclaw_config::schema::ModelProviderConfig {
+                api_key: Some("real-key".to_string()),
+                ..Default::default()
+            },
+        );
         current.reliability.api_keys = vec!["r1".to_string(), "r2".to_string()];
         current.gateway.paired_tokens = vec!["pair-1".to_string(), "pair-2".to_string()];
         current.tunnel.cloudflare = Some(zeroclaw_config::schema::CloudflareTunnelConfig {
@@ -1828,7 +1861,7 @@ mod tests {
             domain: None,
         });
         current.memory.qdrant.api_key = Some("qdrant-real".to_string());
-        current.channels_config.wati = Some(zeroclaw_config::schema::WatiConfig {
+        current.channels.wati = Some(zeroclaw_config::schema::WatiConfig {
             enabled: true,
             api_token: "wati-real".to_string(),
             api_url: "https://live-mt-server.wati.io".to_string(),
@@ -1836,7 +1869,7 @@ mod tests {
             allowed_numbers: vec![],
             proxy_url: None,
         });
-        current.channels_config.feishu = Some(zeroclaw_config::schema::FeishuConfig {
+        current.channels.feishu = Some(zeroclaw_config::schema::FeishuConfig {
             enabled: true,
             app_id: "cli_current".to_string(),
             app_secret: "feishu-secret-real".to_string(),
@@ -1847,7 +1880,8 @@ mod tests {
             port: None,
             proxy_url: None,
         });
-        current.channels_config.email = Some(zeroclaw_config::scattered_types::EmailConfig {
+        current.channels.email = Some(zeroclaw_config::scattered_types::EmailConfig {
+            enabled: true,
             imap_host: "imap.example.com".to_string(),
             imap_port: 993,
             imap_folder: "INBOX".to_string(),
@@ -1862,7 +1896,7 @@ mod tests {
             default_subject: "ZeroClaw Message".to_string(),
             max_attachment_bytes: 25 * 1024 * 1024,
         });
-        current.model_routes = vec![
+        current.providers.model_routes = vec![
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "reasoning".to_string(),
                 provider: "openrouter".to_string(),
@@ -1876,7 +1910,7 @@ mod tests {
                 api_key: Some("route-model-key-2".to_string()),
             },
         ];
-        current.embedding_routes = vec![
+        current.providers.embedding_routes = vec![
             zeroclaw_config::schema::EmbeddingRouteConfig {
                 hint: "semantic".to_string(),
                 provider: "openai".to_string(),
@@ -1894,7 +1928,9 @@ mod tests {
         ];
 
         let mut incoming = mask_sensitive_fields(&current);
-        incoming.default_model = Some("gpt-4.1-mini".to_string());
+        if let Some(entry) = incoming.providers.fallback_provider_mut() {
+            entry.model = Some("gpt-4.1-mini".to_string());
+        }
         // Simulate UI changing only one key and keeping the first masked.
         incoming.reliability.api_keys = vec![MASKED_SECRET.to_string(), "r2-new".to_string()];
         incoming.gateway.paired_tokens = vec![MASKED_SECRET.to_string(), "pair-2-new".to_string()];
@@ -1905,26 +1941,41 @@ mod tests {
             ngrok.auth_token = MASKED_SECRET.to_string();
         }
         incoming.memory.qdrant.api_key = Some(MASKED_SECRET.to_string());
-        if let Some(wati) = incoming.channels_config.wati.as_mut() {
+        if let Some(wati) = incoming.channels.wati.as_mut() {
             wati.api_token = MASKED_SECRET.to_string();
         }
-        if let Some(feishu) = incoming.channels_config.feishu.as_mut() {
+        if let Some(feishu) = incoming.channels.feishu.as_mut() {
             feishu.app_secret = MASKED_SECRET.to_string();
             feishu.encrypt_key = Some(MASKED_SECRET.to_string());
             feishu.verification_token = Some("feishu-verify-new".to_string());
         }
-        if let Some(email) = incoming.channels_config.email.as_mut() {
+        if let Some(email) = incoming.channels.email.as_mut() {
             email.password = MASKED_SECRET.to_string();
         }
-        incoming.model_routes[1].api_key = Some("route-model-key-2-new".to_string());
-        incoming.embedding_routes[1].api_key = Some("route-embed-key-2-new".to_string());
+        incoming.providers.model_routes[1].api_key = Some("route-model-key-2-new".to_string());
+        incoming.providers.embedding_routes[1].api_key = Some("route-embed-key-2-new".to_string());
 
         let hydrated = hydrate_config_for_save(incoming, &current);
 
         assert_eq!(hydrated.config_path, current.config_path);
         assert_eq!(hydrated.workspace_dir, current.workspace_dir);
-        assert_eq!(hydrated.api_key, current.api_key);
-        assert_eq!(hydrated.default_model.as_deref(), Some("gpt-4.1-mini"));
+        assert_eq!(
+            hydrated
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.api_key.clone()),
+            current
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.api_key.clone())
+        );
+        assert_eq!(
+            hydrated
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.model.as_deref()),
+            Some("gpt-4.1-mini")
+        );
         assert_eq!(
             hydrated.reliability.api_keys,
             vec!["r1".to_string(), "r2-new".to_string()]
@@ -1955,7 +2006,7 @@ mod tests {
         );
         assert_eq!(
             hydrated
-                .channels_config
+                .channels
                 .wati
                 .as_ref()
                 .map(|v| v.api_token.as_str()),
@@ -1963,7 +2014,7 @@ mod tests {
         );
         assert_eq!(
             hydrated
-                .channels_config
+                .channels
                 .feishu
                 .as_ref()
                 .map(|v| v.app_secret.as_str()),
@@ -1971,7 +2022,7 @@ mod tests {
         );
         assert_eq!(
             hydrated
-                .channels_config
+                .channels
                 .feishu
                 .as_ref()
                 .and_then(|v| v.encrypt_key.as_deref()),
@@ -1979,31 +2030,31 @@ mod tests {
         );
         assert_eq!(
             hydrated
-                .channels_config
+                .channels
                 .feishu
                 .as_ref()
                 .and_then(|v| v.verification_token.as_deref()),
             Some("feishu-verify-new")
         );
         assert_eq!(
-            hydrated.model_routes[0].api_key.as_deref(),
+            hydrated.providers.model_routes[0].api_key.as_deref(),
             Some("route-model-key-1")
         );
         assert_eq!(
-            hydrated.model_routes[1].api_key.as_deref(),
+            hydrated.providers.model_routes[1].api_key.as_deref(),
             Some("route-model-key-2-new")
         );
         assert_eq!(
-            hydrated.embedding_routes[0].api_key.as_deref(),
+            hydrated.providers.embedding_routes[0].api_key.as_deref(),
             Some("route-embed-key-1")
         );
         assert_eq!(
-            hydrated.embedding_routes[1].api_key.as_deref(),
+            hydrated.providers.embedding_routes[1].api_key.as_deref(),
             Some("route-embed-key-2-new")
         );
         assert_eq!(
             hydrated
-                .channels_config
+                .channels
                 .email
                 .as_ref()
                 .map(|v| v.password.as_str()),
@@ -2013,24 +2064,22 @@ mod tests {
 
     #[test]
     fn hydrate_config_for_save_restores_route_keys_by_identity_and_clears_unmatched_masks() {
-        let mut current = zeroclaw_config::schema::Config {
-            model_routes: vec![
-                zeroclaw_config::schema::ModelRouteConfig {
-                    hint: "reasoning".to_string(),
-                    provider: "openrouter".to_string(),
-                    model: "anthropic/claude-sonnet-4.6".to_string(),
-                    api_key: Some("route-model-key-1".to_string()),
-                },
-                zeroclaw_config::schema::ModelRouteConfig {
-                    hint: "fast".to_string(),
-                    provider: "openrouter".to_string(),
-                    model: "openai/gpt-4.1-mini".to_string(),
-                    api_key: Some("route-model-key-2".to_string()),
-                },
-            ],
-            ..Default::default()
-        };
-        current.embedding_routes = vec![
+        let mut current = zeroclaw_config::schema::Config::default();
+        current.providers.model_routes = vec![
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "reasoning".to_string(),
+                provider: "openrouter".to_string(),
+                model: "anthropic/claude-sonnet-4.6".to_string(),
+                api_key: Some("route-model-key-1".to_string()),
+            },
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "fast".to_string(),
+                provider: "openrouter".to_string(),
+                model: "openai/gpt-4.1-mini".to_string(),
+                api_key: Some("route-model-key-2".to_string()),
+            },
+        ];
+        current.providers.embedding_routes = vec![
             zeroclaw_config::schema::EmbeddingRouteConfig {
                 hint: "semantic".to_string(),
                 provider: "openai".to_string(),
@@ -2048,9 +2097,10 @@ mod tests {
         ];
 
         let mut incoming = mask_sensitive_fields(&current);
-        incoming.model_routes.swap(0, 1);
-        incoming.embedding_routes.swap(0, 1);
+        incoming.providers.model_routes.swap(0, 1);
+        incoming.providers.embedding_routes.swap(0, 1);
         incoming
+            .providers
             .model_routes
             .push(zeroclaw_config::schema::ModelRouteConfig {
                 hint: "new".to_string(),
@@ -2059,6 +2109,7 @@ mod tests {
                 api_key: Some(MASKED_SECRET.to_string()),
             });
         incoming
+            .providers
             .embedding_routes
             .push(zeroclaw_config::schema::EmbeddingRouteConfig {
                 hint: "new-embed".to_string(),
@@ -2071,31 +2122,33 @@ mod tests {
         let hydrated = hydrate_config_for_save(incoming, &current);
 
         assert_eq!(
-            hydrated.model_routes[0].api_key.as_deref(),
+            hydrated.providers.model_routes[0].api_key.as_deref(),
             Some("route-model-key-2")
         );
         assert_eq!(
-            hydrated.model_routes[1].api_key.as_deref(),
+            hydrated.providers.model_routes[1].api_key.as_deref(),
             Some("route-model-key-1")
         );
-        assert_eq!(hydrated.model_routes[2].api_key, None);
+        assert_eq!(hydrated.providers.model_routes[2].api_key, None);
         assert_eq!(
-            hydrated.embedding_routes[0].api_key.as_deref(),
+            hydrated.providers.embedding_routes[0].api_key.as_deref(),
             Some("route-embed-key-2")
         );
         assert_eq!(
-            hydrated.embedding_routes[1].api_key.as_deref(),
+            hydrated.providers.embedding_routes[1].api_key.as_deref(),
             Some("route-embed-key-1")
         );
-        assert_eq!(hydrated.embedding_routes[2].api_key, None);
+        assert_eq!(hydrated.providers.embedding_routes[2].api_key, None);
         assert!(
             hydrated
+                .providers
                 .model_routes
                 .iter()
                 .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET))
         );
         assert!(
             hydrated
+                .providers
                 .embedding_routes
                 .iter()
                 .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET))

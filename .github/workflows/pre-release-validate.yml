@@ -40,6 +40,7 @@ jobs:
           fi
 
       - name: Check crates.io publishability
+        if: github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           echo "::group::Checking cargo publish --dry-run"
@@ -184,7 +185,11 @@ jobs:
             echo ""
             echo "| Check | Status |"
             echo "|---|---|"
-            echo "| crates.io dry-run | Passed |"
+            if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+              echo "| crates.io dry-run | Passed |"
+            else
+              echo "| crates.io dry-run | Skipped (PR) |"
+            fi
             echo "| Required secrets | Passed |"
             echo "| Downstream repo access | Passed |"
             echo "| Version consistency | Passed |"

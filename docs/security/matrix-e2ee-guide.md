@@ -105,7 +105,7 @@ curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
 - If `device_id` is missing, set `channels_config.matrix.device_id` manually.
 - To update the access token without re-running onboard:
   ```bash
-  zeroclaw props set channels.matrix.access-token
+  zeroclaw config set channels.matrix.access-token
   ```
 
 ### D. E2EE-specific checks
@@ -116,17 +116,25 @@ curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
 - If logs show `matrix_sdk_crypto::backups: Trying to backup room keys but no backup key was found`, key backup recovery is not enabled on this device yet. This warning is usually non-fatal for live message flow, but you should still complete key backup/recovery setup.
 - If recipients see bot messages as "unverified", verify/sign the bot device from a trusted Matrix session and keep `channels_config.matrix.device_id` stable across restarts.
 
-### E. Message formatting (Markdown)
+### E. Log levels
+
+ZeroClaw suppresses `matrix_sdk`, `matrix_sdk_base`, and `matrix_sdk_crypto` to `warn` by default because they are extremely noisy at `info`. To restore SDK-level output for debugging:
+
+```bash
+RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info zeroclaw daemon
+```
+
+### F. Message formatting (Markdown)
 
 - ZeroClaw sends Matrix text replies as markdown-capable `m.room.message` text content.
 - Matrix clients that support `formatted_body` should render emphasis, lists, and code blocks.
 - If formatting appears as plain text, check client capability first, then confirm ZeroClaw is running a build that includes markdown-enabled Matrix output.
 
-### F. Fresh start test
+### G. Fresh start test
 
 After updating config, restart daemon and send a new message (not just old timeline history).
 
-### G. Finding your `device_id`
+### H. Finding your `device_id`
 
 ZeroClaw needs a stable `device_id` for E2EE session restore. Without it, a new device is registered on every restart, breaking key sharing and device verification.
 
@@ -250,7 +258,7 @@ Paste the recovery key (input is masked). It will be encrypted and stored in `co
 Option B — via the secret CLI (recommended for existing installs):
 
 ```bash
-zeroclaw props set channels.matrix.recovery-key
+zeroclaw config set channels.matrix.recovery-key
 ```
 
 Input is masked. The value is encrypted at rest immediately.
