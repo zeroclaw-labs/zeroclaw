@@ -1588,7 +1588,7 @@ impl OpenAiCompatibleProvider {
     ///   content is empty).
     fn strip_native_tool_messages(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
         if self.native_tool_calling {
-            return messages.into();
+            return messages.to_vec();
         }
         messages
             .iter()
