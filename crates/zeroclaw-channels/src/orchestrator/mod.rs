@@ -578,6 +578,9 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on Matrix:\n\
              - Use Markdown formatting (bold, italic, code blocks)\n\
              - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<absolute-path>], [DOCUMENT:<absolute-path>], [VIDEO:<absolute-path>], [AUDIO:<absolute-path>], or [VOICE:<absolute-path>]\n\
+             - Paths inside markers MUST be absolute (starting with /). Never use relative paths.\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
              - When you receive a [Voice message], the user spoke to you. Respond naturally as in conversation.\n\
              - Your text reply will automatically be converted to audio and sent back as a voice message.\n",
         ),
