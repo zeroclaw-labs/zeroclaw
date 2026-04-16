@@ -1,0 +1,114 @@
+[package]
+name = "zeroclaw-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Miscellaneous ZeroClaw subsystems: security, observability, gateway, cron, SOP, skills, hardware, TUI, and more."
+publish = false
+
+[dependencies]
+zeroclaw-api.workspace = true
+zeroclaw-infra.workspace = true
+zeroclaw-config.workspace = true
+zeroclaw-providers.workspace = true
+zeroclaw-memory.workspace = true
+zeroclaw-tools.workspace = true
+zeroclaw-plugins = { workspace = true, optional = true }
+zeroclaw-tool-call-parser.workspace = true
+anyhow = "1.0"
+async-trait = "0.1"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+chrono-tz = "0.10"
+console = "0.16"
+cron = "0.15"
+dialoguer = { version = "0.12", features = ["fuzzy-select"] }
+directories = "6.0"
+flate2 = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+glob = "0.3"
+hex = "0.4"
+hmac = "0.12"
+hostname = "0.4.2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+indicatif = "0.18"
+lru = "0.16"
+nanohtml2text = "0.2"
+parking_lot = "0.12"
+portable-atomic = "1"
+rand = "0.10"
+regex = "1.10"
+rumqttc = "0.25"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "blocking", "multipart", "stream", "socks"] }
+ring = "0.17"
+rusqlite = { version = "0.37", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1.14.0"
+schemars = { version = "1.2", optional = true }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha2 = "0.10"
+shellexpand = "3.1"
+tar = "0.4"
+tempfile = "3.26"
+thiserror = "2.0"
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
+tokio-stream = { version = "0.1.18", default-features = false, features = ["fs", "sync"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7", default-features = false }
+toml = "1.0"
+tower = { optional = true, version = "0.5", default-features = false, features = ["util"] }
+tower-http = { optional = true, version = "0.6", default-features = false, features = ["limit", "timeout"] }
+tracing = { version = "0.1", default-features = false }
+urlencoding = "2.1"
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+webpki-roots = "1.0.6"
+which = "8.0"
+zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
+zeroclaw-macros.workspace = true
+
+# Optional deps
+aardvark-sys.workspace = true
+prometheus = { version = "0.14", default-features = false, optional = true }
+opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = { version = "0.4", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Optional deps for specific features
+pdf-extract = { version = "0.10", optional = true }
+
+[features]
+default = ["observability-prometheus", "schema-export"]
+observability-prometheus = ["dep:prometheus"]
+observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+sandbox-landlock = ["dep:landlock"]
+schema-export = ["dep:schemars", "zeroclaw-config/schema-export"]
+
+
+channel-nostr = ["zeroclaw-config/channel-nostr"]
+browser-native = []
+rag-pdf = ["dep:pdf-extract"]
+plugins-wasm = ["dep:zeroclaw-plugins"]
+webauthn = []
+sandbox-bubblewrap = []
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+rcgen = "0.13"
+tempfile = "3.26"
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+scopeguard = "1.2"
+
+# Channel features (forwarded to zeroclaw-channels)
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zeroclaw_root_crate)'] }

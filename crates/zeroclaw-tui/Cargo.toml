@@ -1,0 +1,22 @@
+[package]
+name = "zeroclaw-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TUI onboarding wizard for ZeroClaw."
+publish = false
+
+[dependencies]
+zeroclaw-config = { workspace = true, default-features = true }
+anyhow = "1.0"
+crossterm = { version = "0.29", features = ["event-stream"] }
+ratatui = { version = "0.30", default-features = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+toml = "1.0"

@@ -1,0 +1,23 @@
+[package]
+name = "zeroclaw-plugins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WASM plugin system for ZeroClaw — host, manifests, signatures, execution bridge."
+publish = false
+
+[dependencies]
+zeroclaw-api.workspace = true
+anyhow = "1.0"
+async-trait = "0.1"
+base64 = "0.22"
+ring = "0.17"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+thiserror = "2.0"
+tokio = { version = "1.50", default-features = false, features = ["sync", "macros"] }
+toml = "1.0"
+tracing = { version = "0.1", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.26"
