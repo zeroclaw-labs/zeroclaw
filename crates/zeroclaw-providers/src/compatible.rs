@@ -1946,6 +1946,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         let merge = self.effective_merge_system(model);
         let effective_messages = Self::flatten_system_messages(messages, merge);
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
         let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
