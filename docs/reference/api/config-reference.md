@@ -33,7 +33,7 @@ Schema export command:
 | `backend` | `none` | Observability backend: `none`, `noop`, `log`, `prometheus`, `otel`, `opentelemetry`, or `otlp` |
 | `otel_endpoint` | `http://localhost:4318` | OTLP HTTP endpoint used when backend is `otel` |
 | `otel_service_name` | `zeroclaw` | Service name emitted to OTLP collector |
-| `otel_headers` | _(none)_ | Optional HTTP headers for OTLP export (e.g. authorization). Specified as a TOML table `[observability.otel_headers]` |
+| `otel_headers` | _(none)_ | Optional HTTP headers for OTLP export (e.g. authorization). Specified as a TOML table `[observability.otel_headers]`. Edit in `config.toml` directly — not settable via `zeroclaw config set`. Values are stored in plaintext; protect `config.toml` with `chmod 600`. |
 | `runtime_trace_mode` | `none` | Runtime trace storage mode: `none`, `rolling`, or `full` |
 | `runtime_trace_path` | `state/runtime-trace.jsonl` | Runtime trace JSONL path (relative to workspace unless absolute) |
 | `runtime_trace_max_entries` | `200` | Maximum retained events when `runtime_trace_mode = "rolling"` |
