@@ -63,6 +63,9 @@ pub mod hooks;
 pub(crate) mod identity;
 // Intentionally unused re-export — public API surface for plugin authors.
 pub(crate) mod integrations;
+// `local_llm` (on-device Gemma 4 fallback: daemon health, model pull, config).
+// Distinct from `providers::ollama` which handles inference (chat/completion).
+pub mod local_llm;
 pub mod memory;
 pub(crate) mod migration;
 pub(crate) mod multimodal;

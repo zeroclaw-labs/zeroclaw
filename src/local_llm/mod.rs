@@ -1,0 +1,524 @@
+//! Local LLM lifecycle: Ollama daemon health, model installation, and pull
+//! progress reporting for the on-device Gemma 4 fallback path.
+//!
+//! Distinct from `src/providers/ollama.rs` which handles inference (chat /
+//! completion). This module covers the *setup* surface: probing whether the
+//! daemon is reachable, listing installed models, pulling a new model with
+//! NDJSON progress callbacks, and persisting the user's chosen default.
+//!
+//! Design notes:
+//! - All operations target the local Ollama HTTP API at 127.0.0.1:11434.
+//! - Pull progress uses `/api/pull` with `stream: true` (NDJSON), which is
+//!   robust against terminal-formatting drift in `ollama pull` stdout.
+//! - Daemon installation is *out of scope* for this module — installing
+//!   Ollama via `curl … | sh` requires elevated trust and is handled in a
+//!   separate, opt-in installer flow (see plan §2.3 step 3).
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tokio::fs;
+
+/// Default Ollama HTTP endpoint on localhost.
+pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
+
+/// One incremental progress event emitted while pulling a model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullProgress {
+    /// Free-form Ollama status string (e.g. "pulling manifest",
+    /// "downloading", "verifying sha256 digest", "success").
+    pub status: String,
+    /// Layer digest currently being processed, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// Total layer size in bytes, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    /// Bytes transferred so far for this layer, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_bytes: Option<u64>,
+}
+
+impl PullProgress {
+    /// Fractional progress in `[0.0, 1.0]` for the current layer, if both
+    /// `total_bytes` and `completed_bytes` are present.
+    pub fn fraction(&self) -> Option<f32> {
+        match (self.completed_bytes, self.total_bytes) {
+            (Some(done), Some(total)) if total > 0 => {
+                Some((done as f32 / total as f32).clamp(0.0, 1.0))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether this event indicates the pull completed successfully.
+    pub fn is_success(&self) -> bool {
+        self.status.eq_ignore_ascii_case("success")
+    }
+}
+
+/// Summary of a model already installed on the local Ollama instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledModel {
+    /// Full tag, e.g. `gemma4:e4b`.
+    pub name: String,
+    /// On-disk size in bytes.
+    pub size_bytes: u64,
+    /// ISO 8601 modification timestamp reported by Ollama.
+    #[serde(default)]
+    pub modified_at: String,
+}
+
+/// Persisted choice of the default local model used by MoA's on-device
+/// fallback path. Lives at `~/.moa/local_llm.toml` by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalLlmConfig {
+    /// Ollama tag to use as the default local LLM (e.g. `gemma4:e4b`).
+    pub default_model: String,
+    /// ISO 8601 timestamp recording when this config was written.
+    pub installed_at: String,
+    /// Best-effort on-disk size in GB at install time.
+    pub size_gb: f32,
+}
+
+impl LocalLlmConfig {
+    /// Default config path: `~/.moa/local_llm.toml`.
+    pub fn default_path() -> Result<PathBuf> {
+        let home = home_dir().context("cannot determine home directory")?;
+        Ok(home.join(".moa").join("local_llm.toml"))
+    }
+
+    /// Load a previously saved config from disk.
+    pub async fn load(path: &Path) -> Result<Self> {
+        let data = fs::read_to_string(path)
+            .await
+            .with_context(|| format!("reading local_llm config from {}", path.display()))?;
+        toml::from_str(&data).context("parsing local_llm config TOML")
+    }
+
+    /// Save this config to disk (creates parent dirs as needed).
+    pub async fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let toml_str = toml::to_string_pretty(self)?;
+        fs::write(path, toml_str).await?;
+        Ok(())
+    }
+}
+
+// ── Daemon health ───────────────────────────────────────────────────────
+
+/// Returns true when the Ollama daemon at `base_url` responds within 2s.
+/// `base_url` should be the scheme+host+port without trailing slash, e.g.
+/// `http://127.0.0.1:11434`.
+pub async fn is_ollama_running(base_url: &str) -> bool {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    client
+        .get(format!("{base_url}/api/tags"))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+// ── Installed model inventory ───────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct TagsResponse {
+    models: Vec<TagsModel>,
+}
+
+#[derive(Deserialize)]
+struct TagsModel {
+    name: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    modified_at: String,
+}
+
+/// List models currently installed on the local Ollama daemon.
+pub async fn list_installed(base_url: &str) -> Result<Vec<InstalledModel>> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{base_url}/api/tags"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .context("calling /api/tags — is the Ollama daemon running?")?
+        .error_for_status()
+        .context("non-2xx response from /api/tags")?;
+    let parsed: TagsResponse = resp
+        .json()
+        .await
+        .context("parsing /api/tags JSON response")?;
+    Ok(parsed
+        .models
+        .into_iter()
+        .map(|m| InstalledModel {
+            name: m.name,
+            size_bytes: m.size,
+            modified_at: m.modified_at,
+        })
+        .collect())
+}
+
+/// Returns true when a model matching `tag` (with or without `:latest`) is
+/// already installed.
+pub async fn is_installed(base_url: &str, tag: &str) -> Result<bool> {
+    let installed = list_installed(base_url).await?;
+    Ok(installed.iter().any(|m| matches_tag(&m.name, tag)))
+}
+
+/// Returns true when `installed_name` refers to the same model as the
+/// user-supplied `requested_tag`, accounting for the implicit `:latest`
+/// suffix that Ollama applies when no tag is given.
+pub fn matches_tag(installed_name: &str, requested_tag: &str) -> bool {
+    if installed_name == requested_tag {
+        return true;
+    }
+    let normalize = |s: &str| -> String {
+        if s.contains(':') {
+            s.to_string()
+        } else {
+            format!("{s}:latest")
+        }
+    };
+    normalize(installed_name) == normalize(requested_tag)
+}
+
+// ── Model pull with NDJSON progress ─────────────────────────────────────
+
+#[derive(Serialize)]
+struct PullRequest<'a> {
+    model: &'a str,
+    stream: bool,
+}
+
+/// Pull `tag` from the Ollama registry with streaming progress callbacks.
+///
+/// `on_progress` is invoked for each NDJSON event. The function returns
+/// `Ok(())` on the final `success` event or `Err` on any reported error.
+///
+/// If the model is already installed, returns `Ok(())` immediately without
+/// network activity.
+pub async fn pull_model<F>(base_url: &str, tag: &str, mut on_progress: F) -> Result<()>
+where
+    F: FnMut(PullProgress) + Send,
+{
+    if is_installed(base_url, tag).await.unwrap_or(false) {
+        on_progress(PullProgress {
+            status: "already installed".to_string(),
+            digest: None,
+            total_bytes: None,
+            completed_bytes: None,
+        });
+        on_progress(PullProgress {
+            status: "success".to_string(),
+            digest: None,
+            total_bytes: None,
+            completed_bytes: None,
+        });
+        return Ok(());
+    }
+
+    let client = reqwest::Client::builder()
+        // No overall timeout — model pulls can take many minutes on slow
+        // links. Per-event activity is implicit through chunk reads.
+        .build()
+        .context("building reqwest client for pull")?;
+
+    let req = PullRequest {
+        model: tag,
+        stream: true,
+    };
+    let resp = client
+        .post(format!("{base_url}/api/pull"))
+        .json(&req)
+        .send()
+        .await
+        .context("POST /api/pull failed — is the Ollama daemon running?")?
+        .error_for_status()
+        .context("non-2xx response starting /api/pull")?;
+
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut saw_success = false;
+
+    use futures_util::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.context("reading pull NDJSON chunk")?;
+        buf.extend_from_slice(&bytes);
+
+        // Drain complete lines from buf.
+        while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=nl).collect();
+            let trimmed = std::str::from_utf8(&line)
+                .context("non-UTF8 NDJSON line")?
+                .trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let event = parse_pull_event(trimmed)?;
+            if event.is_success() {
+                saw_success = true;
+            }
+            on_progress(event);
+        }
+    }
+    // Handle any final partial line without trailing newline.
+    if !buf.is_empty() {
+        let trimmed = std::str::from_utf8(&buf)
+            .context("non-UTF8 NDJSON tail")?
+            .trim();
+        if !trimmed.is_empty() {
+            let event = parse_pull_event(trimmed)?;
+            if event.is_success() {
+                saw_success = true;
+            }
+            on_progress(event);
+        }
+    }
+
+    if saw_success {
+        Ok(())
+    } else {
+        anyhow::bail!("Ollama pull stream ended without 'success' event")
+    }
+}
+
+/// Parse a single NDJSON event from `/api/pull`. Either a normal progress
+/// event or an error envelope `{"error": "..."}`.
+fn parse_pull_event(line: &str) -> Result<PullProgress> {
+    // Try error envelope first.
+    if let Ok(err) = serde_json::from_str::<PullErrorEnvelope>(line) {
+        if !err.error.is_empty() {
+            anyhow::bail!("Ollama pull error: {}", err.error);
+        }
+    }
+    let raw: PullEventRaw =
+        serde_json::from_str(line).with_context(|| format!("parsing NDJSON event: {line}"))?;
+    Ok(PullProgress {
+        status: raw.status.unwrap_or_default(),
+        digest: raw.digest,
+        total_bytes: raw.total,
+        completed_bytes: raw.completed,
+    })
+}
+
+#[derive(Deserialize)]
+struct PullEventRaw {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    digest: Option<String>,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    completed: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct PullErrorEnvelope {
+    #[serde(default)]
+    error: String,
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────
+
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE").map(PathBuf::from)
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matches_tag_exact() {
+        assert!(matches_tag("gemma4:e4b", "gemma4:e4b"));
+        assert!(!matches_tag("gemma4:e4b", "gemma4:e2b"));
+    }
+
+    #[test]
+    fn matches_tag_implicit_latest() {
+        // User asks for "gemma4" → matches "gemma4:latest"
+        assert!(matches_tag("gemma4:latest", "gemma4"));
+        assert!(matches_tag("gemma4", "gemma4:latest"));
+        // Different explicit tag should not match latest.
+        assert!(!matches_tag("gemma4:e4b", "gemma4:latest"));
+    }
+
+    #[test]
+    fn pull_progress_fraction() {
+        let p = PullProgress {
+            status: "downloading".to_string(),
+            digest: Some("sha256:abc".to_string()),
+            total_bytes: Some(1000),
+            completed_bytes: Some(250),
+        };
+        assert!((p.fraction().unwrap() - 0.25).abs() < 1e-6);
+
+        let p_zero = PullProgress {
+            status: "downloading".to_string(),
+            digest: None,
+            total_bytes: Some(0),
+            completed_bytes: Some(0),
+        };
+        assert_eq!(p_zero.fraction(), None);
+
+        let p_partial = PullProgress {
+            status: "pulling manifest".to_string(),
+            digest: None,
+            total_bytes: None,
+            completed_bytes: None,
+        };
+        assert_eq!(p_partial.fraction(), None);
+    }
+
+    #[test]
+    fn pull_progress_success_detection() {
+        let success = PullProgress {
+            status: "success".to_string(),
+            digest: None,
+            total_bytes: None,
+            completed_bytes: None,
+        };
+        assert!(success.is_success());
+
+        let mid = PullProgress {
+            status: "downloading".to_string(),
+            digest: None,
+            total_bytes: Some(100),
+            completed_bytes: Some(50),
+        };
+        assert!(!mid.is_success());
+    }
+
+    #[test]
+    fn parse_pull_event_progress() {
+        let line =
+            r#"{"status":"downloading","digest":"sha256:abc","total":2048,"completed":1024}"#;
+        let p = parse_pull_event(line).unwrap();
+        assert_eq!(p.status, "downloading");
+        assert_eq!(p.digest.as_deref(), Some("sha256:abc"));
+        assert_eq!(p.total_bytes, Some(2048));
+        assert_eq!(p.completed_bytes, Some(1024));
+        assert!((p.fraction().unwrap() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_pull_event_status_only() {
+        let line = r#"{"status":"pulling manifest"}"#;
+        let p = parse_pull_event(line).unwrap();
+        assert_eq!(p.status, "pulling manifest");
+        assert!(p.digest.is_none());
+        assert!(p.total_bytes.is_none());
+    }
+
+    #[test]
+    fn parse_pull_event_success() {
+        let line = r#"{"status":"success"}"#;
+        let p = parse_pull_event(line).unwrap();
+        assert!(p.is_success());
+    }
+
+    #[test]
+    fn parse_pull_event_error_envelope() {
+        let line = r#"{"error":"model not found"}"#;
+        let err = parse_pull_event(line).expect_err("error envelope must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("model not found"));
+    }
+
+    #[tokio::test]
+    async fn config_roundtrip() {
+        let cfg = LocalLlmConfig {
+            default_model: "gemma4:e4b".to_string(),
+            installed_at: "2026-04-16T03:30:00Z".to_string(),
+            size_gb: 3.0,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local_llm.toml");
+        cfg.save(&path).await.unwrap();
+        let loaded = LocalLlmConfig::load(&path).await.unwrap();
+        assert_eq!(loaded.default_model, "gemma4:e4b");
+        assert!((loaded.size_gb - 3.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn ollama_daemon_health_returns_bool() {
+        // Unreachable port — must return false fast (within timeout).
+        let alive = is_ollama_running("http://127.0.0.1:1").await;
+        assert!(!alive);
+    }
+
+    /// Manual integration test against a live Ollama daemon. Verifies that
+    /// `list_installed` returns at least one model and that `is_installed`
+    /// matches an existing tag. Requires `ollama serve` running.
+    /// Run with:
+    ///     cargo test --lib local_llm::tests::live_list_installed -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_list_installed() {
+        if !is_ollama_running(DEFAULT_OLLAMA_URL).await {
+            eprintln!("skipping: Ollama daemon not reachable at {DEFAULT_OLLAMA_URL}");
+            return;
+        }
+        let models = list_installed(DEFAULT_OLLAMA_URL).await.unwrap();
+        println!("\nInstalled models ({}):", models.len());
+        for m in &models {
+            let gb = m.size_bytes as f32 / (1024.0 * 1024.0 * 1024.0);
+            println!("  {:30}  {:>6.2} GB  {}", m.name, gb, m.modified_at);
+        }
+        if let Some(first) = models.first() {
+            assert!(is_installed(DEFAULT_OLLAMA_URL, &first.name).await.unwrap());
+        }
+    }
+
+    /// Manual integration test that pulls (or re-checks) `gemma4:e4b`.
+    /// If the model is already installed, returns instantly. Run with:
+    ///     cargo test --lib local_llm::tests::live_pull_gemma4_e4b -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_pull_gemma4_e4b() {
+        if !is_ollama_running(DEFAULT_OLLAMA_URL).await {
+            eprintln!("skipping: Ollama daemon not reachable");
+            return;
+        }
+        let mut last_status = String::new();
+        let result = pull_model(DEFAULT_OLLAMA_URL, "gemma4:e4b", |p| {
+            // Print one line per status change to keep output readable.
+            if p.status != last_status {
+                println!(
+                    "[{}] digest={} {}",
+                    p.status,
+                    p.digest.as_deref().unwrap_or("-"),
+                    p.fraction()
+                        .map(|f| format!("{:>5.1}%", f * 100.0))
+                        .unwrap_or_else(|| "—".to_string())
+                );
+                last_status = p.status.clone();
+            }
+        })
+        .await;
+        result.expect("pull should succeed");
+    }
+}
