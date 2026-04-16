@@ -987,11 +987,6 @@ fn parse_themes_col(s: Option<String>) -> Vec<String> {
     .unwrap_or_default()
 }
 
-/// Serialize a themes vec into JSON array string for storage.
-fn serialize_themes(themes: &[String]) -> String {
-    serde_json::to_string(themes).unwrap_or_else(|_| "[]".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

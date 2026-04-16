@@ -45,7 +45,7 @@ pub use none::NoneMemory;
 pub use postgres::PostgresMemory;
 pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
-pub use sqlite::{SearchMode, SqliteMemory};
+pub use sqlite::SqliteMemory;
 pub use synced::SyncedMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]

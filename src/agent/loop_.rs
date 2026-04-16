@@ -3523,53 +3523,51 @@ pub async fn process_message_with_session(
     // summarize it ONCE with Claude Haiku and store the original in the
     // documents table. The chat context gets the summary + content_id,
     // saving ~95% of tokens on the current turn AND all future recalls.
-    let message_for_processing: String = if crate::memory::document_summarizer::should_summarize(
-        message,
-    ) && config.sync.home_timezone.len() > 0
-    {
-        let doc_db_path = config.workspace_dir.join("memory").join("brain.db");
-        match crate::memory::document_store::DocumentStore::open(&doc_db_path) {
-            Ok(store) => {
-                // Infer category from content hints
-                let category = infer_document_category(message);
-                let anthropic_key = config
-                    .provider_api_keys
-                    .get("anthropic")
-                    .map(String::as_str);
-                match crate::memory::document_summarizer::summarize_and_store(
-                    message,
-                    category,
-                    "paste",
-                    &store,
-                    anthropic_key,
-                )
-                .await
-                {
-                    Ok(doc) => {
-                        tracing::info!(
-                            content_id = %doc.content_id,
-                            char_count = doc.char_count,
-                            "Long user input summarized and stored in LLM Wiki"
-                        );
-                        crate::memory::document_store::build_wiki_memo(
-                            &doc.content_id,
-                            &doc.title,
-                            &doc.summary,
-                            doc.char_count as i64,
-                            category,
-                        )
-                    }
-                    Err(e) => {
-                        tracing::debug!("Document summarization skipped: {e}");
-                        message.to_string()
+    let message_for_processing: String =
+        if crate::memory::document_summarizer::should_summarize(message) {
+            let doc_db_path = config.workspace_dir.join("memory").join("brain.db");
+            match crate::memory::document_store::DocumentStore::open(&doc_db_path) {
+                Ok(store) => {
+                    // Infer category from content hints
+                    let category = infer_document_category(message);
+                    let anthropic_key = config
+                        .provider_api_keys
+                        .get("anthropic")
+                        .map(String::as_str);
+                    match crate::memory::document_summarizer::summarize_and_store(
+                        message,
+                        category,
+                        "paste",
+                        &store,
+                        anthropic_key,
+                    )
+                    .await
+                    {
+                        Ok(doc) => {
+                            tracing::info!(
+                                content_id = %doc.content_id,
+                                char_count = doc.char_count,
+                                "Long user input summarized and stored in LLM Wiki"
+                            );
+                            crate::memory::document_store::build_wiki_memo(
+                                &doc.content_id,
+                                &doc.title,
+                                &doc.summary,
+                                doc.char_count as i64,
+                                category,
+                            )
+                        }
+                        Err(e) => {
+                            tracing::debug!("Document summarization skipped: {e}");
+                            message.to_string()
+                        }
                     }
                 }
+                Err(_) => message.to_string(),
             }
-            Err(_) => message.to_string(),
-        }
-    } else {
-        message.to_string()
-    };
+        } else {
+            message.to_string()
+        };
     let message: &str = &message_for_processing;
 
     let ontology_repo = crate::ontology::OntologyRepo::open(&config.workspace_dir).ok();
