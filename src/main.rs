@@ -95,6 +95,7 @@ mod sandbox;
 mod security;
 mod service;
 mod services;
+mod session_search;
 mod skillforge;
 mod skills;
 mod storage;
@@ -104,6 +105,7 @@ mod telemetry;
 mod tools;
 mod tunnel;
 mod update;
+mod user_model;
 mod util;
 mod voice;
 

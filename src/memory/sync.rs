@@ -291,6 +291,38 @@ pub enum DeltaOperation {
         location: Option<String>,
         status: String,
     },
+
+    // ── Self-generating skill system (procedural memory) ────────────
+    /// Procedural skill created or updated. Version LWW: higher wins.
+    SkillUpsert {
+        id: String,
+        name: String,
+        category: Option<String>,
+        description: String,
+        content_md: String,
+        version: i64,
+        created_by: String,
+    },
+
+    /// User profile conclusion (cross-session behavioral modeling).
+    UserProfileConclusion {
+        dimension: String,
+        conclusion: String,
+        confidence: f64,
+        evidence_count: i64,
+    },
+
+    /// Self-learning correction pattern (document/coding/interpret edit learning).
+    CorrectionPatternUpsert {
+        pattern_type: String,
+        original_regex: String,
+        replacement: String,
+        scope: String,
+        confidence: f64,
+        observation_count: i64,
+        accept_count: i64,
+        reject_count: i64,
+    },
 }
 
 /// A single delta journal entry representing one memory change.

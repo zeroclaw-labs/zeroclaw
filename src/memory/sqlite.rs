@@ -122,6 +122,14 @@ impl SqliteMemory {
         self.read_pool.clone()
     }
 
+    /// Workspace directory containing this brain.db — derived from the
+    /// db_path's grandparent (brain.db lives at `<workspace>/memory/brain.db`).
+    /// Used by Dream Cycle to co-locate procedural skill / user profile
+    /// stores on the same SQLite file.
+    pub fn workspace_dir(&self) -> Option<&Path> {
+        self.db_path.parent().and_then(|p| p.parent())
+    }
+
     pub fn new(workspace_dir: &Path) -> anyhow::Result<Self> {
         Self::with_embedder(
             workspace_dir,

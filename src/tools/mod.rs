@@ -73,10 +73,14 @@ pub mod process;
 pub mod proxy_config;
 pub mod pushover;
 pub mod quota_tools;
+pub mod correction_recommend;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
+pub mod session_search_tool;
 pub mod shell;
+pub mod skill_manage;
+pub mod skill_view;
 pub mod subagent_list;
 pub mod subagent_manage;
 pub mod subagent_registry;
@@ -149,11 +153,15 @@ pub use pptx_read::PptxReadTool;
 pub use process::ProcessTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
+pub use correction_recommend::CorrectionRecommendTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
+pub use session_search_tool::SessionSearchTool;
 pub use shell::ShellTool;
+pub use skill_manage::SkillManageTool;
+pub use skill_view::SkillViewTool;
 pub use subagent_list::SubAgentListTool;
 pub use subagent_manage::SubAgentManageTool;
 pub use subagent_registry::SubAgentRegistry;
@@ -407,6 +415,35 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
         )),
     ];
+
+    // Procedural skill system + session search + self-learning correction.
+    // These share brain.db with the SQLite memory backend when present;
+    // on other backends they live in a sibling brain.db file. Failures
+    // here are logged but do not abort tool registration — the agent can
+    // still function without these self-learning capabilities.
+    //
+    // device_id is sourced from the sync engine's `.device_id` file
+    // (see src/memory/sync.rs::SyncEngine::new). When sync is disabled we
+    // fall back to "default" so single-device deployments still work.
+    let device_id_str = std::fs::read_to_string(workspace_dir.join(".device_id"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "default".to_string());
+    if let Ok(store) = crate::skills::procedural::build_store(workspace_dir, &device_id_str) {
+        tool_arcs.push(Arc::new(SkillViewTool::new(store.clone())));
+        tool_arcs.push(Arc::new(SkillManageTool::new(store, security.clone())));
+    } else {
+        tracing::warn!("failed to initialize procedural skill store; skipping skill tools");
+    }
+    if let Ok(store) = crate::session_search::build_store(workspace_dir, &device_id_str) {
+        tool_arcs.push(Arc::new(SessionSearchTool::new(store)));
+    } else {
+        tracing::warn!("failed to initialize session search store; skipping session_search tool");
+    }
+    if let Ok(store) = crate::skills::correction::build_store(workspace_dir, &device_id_str) {
+        tool_arcs.push(Arc::new(CorrectionRecommendTool::new(store)));
+    } else {
+        tracing::warn!("failed to initialize correction store; skipping correction_recommend tool");
+    }
 
     if has_shell_access {
         tool_arcs.push(Arc::new(ShellTool::new_with_syscall_detector(
