@@ -284,6 +284,71 @@ pub async fn run_dream_cycle_with_ontology(
         }
     }
 
+    // Task 7 — Procedural skill hygiene + user-profile decay.
+    // These live in brain.db too (same SQLite file) and benefit from the
+    // same sleep-cycle cadence: low-usage skills are marked for archive
+    // and stale profile conclusions lose confidence so the prompt
+    // injection doesn't keep citing year-old observations.
+    //
+    // We resolve the workspace dir from the memory path's parent so a
+    // single SQLite file is shared. Failure here is non-fatal — the
+    // cycle continues.
+    if let Some(workspace_dir) = memory.workspace_dir() {
+        // Skill archive candidates — not auto-deleted, just logged.
+        // The agent can review via skill_manage delete action.
+        if let Ok(skill_store) =
+            crate::skills::procedural::build_store(workspace_dir, device_id)
+        {
+            match skill_store.low_usage_candidates(30, 0) {
+                Ok(list) if !list.is_empty() => {
+                    tracing::info!(
+                        candidates = list.len(),
+                        "Dream Cycle: {} low-usage skill(s) are archive candidates",
+                        list.len()
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = format!("Dream Cycle skill archive scan failed: {e}");
+                    tracing::warn!("{msg}");
+                    report.errors.push(msg);
+                }
+            }
+        }
+
+        // User profile confidence decay.
+        if let Ok(profiler) = crate::user_model::build_profiler(workspace_dir, device_id) {
+            match profiler.apply_decay(30) {
+                Ok(n) if n > 0 => {
+                    tracing::info!("Dream Cycle: decayed {n} user profile conclusions");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = format!("Dream Cycle profile decay failed: {e}");
+                    tracing::warn!("{msg}");
+                    report.errors.push(msg);
+                }
+            }
+        }
+
+        // Correction pattern decay (same cadence).
+        if let Ok(correction_store) =
+            crate::skills::correction::build_store(workspace_dir, device_id)
+        {
+            match correction_store.apply_decay(30, 0.05) {
+                Ok(n) if n > 0 => {
+                    tracing::info!("Dream Cycle: decayed {n} correction patterns");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = format!("Dream Cycle correction decay failed: {e}");
+                    tracing::warn!("{msg}");
+                    report.errors.push(msg);
+                }
+            }
+        }
+    }
+
     tracing::info!(
         recompiled = report.recompiled,
         duplicates = report.duplicates_found,

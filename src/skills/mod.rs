@@ -10,6 +10,10 @@ mod audit;
 mod templates;
 mod tool_handler;
 
+// Self-generating skill system (procedural memory) + auto-learning correction
+pub mod correction;
+pub mod procedural;
+
 pub use tool_handler::SkillToolHandler;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";

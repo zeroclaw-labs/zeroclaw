@@ -239,6 +239,57 @@ impl SyncedMemory {
                         }
                     }
                 }
+
+                // ── Procedural skills + user model + correction patterns ─
+                // These live in brain.db tables owned by the SkillStore /
+                // UserProfiler / CorrectionStore modules. The typed apply
+                // hook dispatches by variant; backends that don't know
+                // about skills simply ignore them.
+                DeltaOperation::SkillUpsert { id, .. } => {
+                    match self.inner.apply_remote_v3_delta(op).await {
+                        Ok(true) => {
+                            tracing::debug!(skill_id = id.as_str(), "Applied remote skill upsert");
+                            applied += 1;
+                        }
+                        Ok(false) => {
+                            tracing::trace!(skill_id = id.as_str(), "Backend ignored skill delta");
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to apply remote skill delta: {e}");
+                        }
+                    }
+                }
+                DeltaOperation::UserProfileConclusion { dimension, .. } => {
+                    match self.inner.apply_remote_v3_delta(op).await {
+                        Ok(true) => {
+                            tracing::debug!(dimension = dimension.as_str(), "Applied remote user profile");
+                            applied += 1;
+                        }
+                        Ok(false) => {
+                            tracing::trace!(dimension = dimension.as_str(), "Backend ignored profile delta");
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to apply remote profile delta: {e}");
+                        }
+                    }
+                }
+                DeltaOperation::CorrectionPatternUpsert { original_regex, .. } => {
+                    match self.inner.apply_remote_v3_delta(op).await {
+                        Ok(true) => {
+                            tracing::debug!(
+                                pattern = original_regex.as_str(),
+                                "Applied remote correction pattern"
+                            );
+                            applied += 1;
+                        }
+                        Ok(false) => {
+                            tracing::trace!("Backend ignored correction pattern delta");
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to apply remote correction pattern: {e}");
+                        }
+                    }
+                }
             }
         }
 

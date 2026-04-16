@@ -318,6 +318,24 @@ pub fn merge_deltas_lww(
             crate::memory::sync::DeltaOperation::VaultDocUpsert { uuid, .. } => {
                 format!("vault_{uuid}")
             }
+            // Procedural skill deltas: id is a UUID-like string.
+            crate::memory::sync::DeltaOperation::SkillUpsert { id, .. } => {
+                format!("skill_{id}")
+            }
+            // User profile conclusions are keyed by (dimension, conclusion)
+            // so the same conclusion from different devices dedupes correctly.
+            crate::memory::sync::DeltaOperation::UserProfileConclusion {
+                dimension,
+                conclusion,
+                ..
+            } => format!("profile_{dimension}_{conclusion}"),
+            // Correction patterns key on (original, replacement) — same
+            // transformation from any device is the same pattern.
+            crate::memory::sync::DeltaOperation::CorrectionPatternUpsert {
+                original_regex,
+                replacement,
+                ..
+            } => format!("correction_{original_regex}_{replacement}"),
         };
 
         match winners.get(&key) {
