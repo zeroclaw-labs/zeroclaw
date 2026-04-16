@@ -152,7 +152,7 @@ pub fn heuristic_knowledge_classify(text: &str) -> KnowledgeVerdict {
         .any(|l| l.trim_start().starts_with("# ") || l.trim_start().starts_with("## "));
     let sentence_terminators = trimmed
         .chars()
-        .filter(|c| matches!(c, '.' | '?' | '!' | '。' | '!' | '?' | '…'))
+        .filter(|c| matches!(c, '.' | '?' | '!' | '。' | '！' | '？' | '…'))
         .count();
     let newline_paragraphs = trimmed.matches("\n\n").count();
 
