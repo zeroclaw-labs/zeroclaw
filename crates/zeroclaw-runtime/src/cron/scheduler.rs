@@ -49,6 +49,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
             enabled: true,
             model: None,
             allowed_tools: None,
+            uses_memory: true,
             session_target: None,
             delivery: None,
         };
@@ -659,6 +660,7 @@ mod tests {
             delivery: DeliveryConfig::default(),
             delete_after_run: false,
             allowed_tools: None,
+            uses_memory: true,
             source: "imperative".into(),
             created_at: Utc::now(),
             next_run: Utc::now(),
