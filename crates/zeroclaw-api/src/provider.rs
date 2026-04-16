@@ -504,6 +504,14 @@ impl<T: Provider + ?Sized> Provider for Arc<T> {
         self.as_ref().convert_tools(tools)
     }
 
+    fn supports_native_tools(&self) -> bool {
+        self.as_ref().supports_native_tools()
+    }
+
+    fn supports_vision(&self) -> bool {
+        self.as_ref().supports_vision()
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,

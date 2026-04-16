@@ -277,7 +277,10 @@ async fn run_agent_job(
     let memory_context = match zeroclaw_memory::create_memory(
         &config.memory,
         &config.workspace_dir,
-        config.api_key.as_deref(),
+        config
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.api_key.as_deref()),
     ) {
         Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
             Ok(entries) if !entries.is_empty() => {
@@ -316,7 +319,11 @@ async fn run_agent_job(
                 Some(prefixed_prompt),
                 None,
                 model_override,
-                config.default_temperature,
+                config
+                    .providers
+                    .fallback_provider()
+                    .and_then(|e| e.temperature)
+                    .unwrap_or(0.7),
                 vec![],
                 false,
                 None,

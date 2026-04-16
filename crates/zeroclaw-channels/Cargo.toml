@@ -16,7 +16,7 @@ zeroclaw-runtime.workspace = true
 zeroclaw-tools.workspace = true
 anyhow = "1.0"
 lru = "0.16"
-rumqttc = "0.24"
+rumqttc = "0.25"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"] }
 async-imap = { version = "0.11", features = ["runtime-tokio"], default-features = false, optional = true }
 async-trait = "0.1"
