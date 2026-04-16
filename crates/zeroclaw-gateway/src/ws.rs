@@ -401,7 +401,8 @@ async fn process_chat_message(
     let provider_label = state
         .config
         .lock()
-        .default_provider
+        .providers
+        .fallback
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
 

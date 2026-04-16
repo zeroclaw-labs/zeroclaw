@@ -33,6 +33,7 @@ tokio-stream = { version = "0.1.18", default-features = false }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rustls-pki-types = "1.14.0"
 toml = "1.0"
+toml_edit = "0.25"
 tracing = { version = "0.1", default-features = false }
 url = "2.5"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
