@@ -373,6 +373,16 @@ impl Agent {
         self.memory_session_id = session_id;
     }
 
+    /// Replace the observer used by this agent.
+    ///
+    /// This allows callers (e.g. the gateway) to inject a custom observer
+    /// (such as `BroadcastObserver`) after constructing the agent via
+    /// `from_config`, so that internal `record_event` calls are forwarded
+    /// to external consumers like an SSE event stream.
+    pub fn set_observer(&mut self, observer: Arc<dyn Observer>) {
+        self.observer = observer;
+    }
+
     /// Hydrate the agent with prior chat messages (e.g. from a session backend).
     ///
     /// Ensures a system prompt is prepended if history is empty, then appends all

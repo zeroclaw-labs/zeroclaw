@@ -184,6 +184,10 @@ async fn handle_socket(
             return;
         }
     };
+    // Inject the gateway's BroadcastObserver so that internal record_event calls
+    // (ToolCallStart, ToolCall, LlmRequest, etc.) flow into the SSE broadcast
+    // channel and appear on the web dashboard.
+    agent.set_observer(state.observer.clone());
     agent.set_memory_session_id(Some(session_id.clone()));
 
     // Hydrate agent from persisted session (if available)
@@ -398,6 +402,7 @@ async fn process_chat_message(
 ) {
     use zeroclaw_runtime::agent::TurnEvent;
 
+    let started_at = std::time::Instant::now();
     let provider_label = state
         .config
         .lock()
@@ -406,12 +411,14 @@ async fn process_chat_message(
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Broadcast agent_start event
-    let _ = state.event_tx.send(serde_json::json!({
-        "type": "agent_start",
-        "provider": provider_label,
-        "model": state.model,
-    }));
+    // Broadcast agent_start event through the observer so it follows the same
+    // pipeline as all other events (BroadcastObserver → SSE + inner observer).
+    state.observer.record_event(
+        &zeroclaw_runtime::observability::ObserverEvent::AgentStart {
+            provider: provider_label.clone(),
+            model: state.model.clone(),
+        },
+    );
 
     // Set session state to running
     let turn_id = uuid::Uuid::new_v4().to_string();
@@ -501,12 +508,16 @@ async fn process_chat_message(
                 let _ = backend.set_session_state(session_key, "idle", None);
             }
 
-            // Broadcast agent_end event
-            let _ = state.event_tx.send(serde_json::json!({
-                "type": "agent_end",
-                "provider": provider_label,
-                "model": state.model,
-            }));
+            // Broadcast agent_end event through the observer pipeline.
+            state.observer.record_event(
+                &zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
+                    provider: provider_label,
+                    model: state.model.clone(),
+                    duration: started_at.elapsed(),
+                    tokens_used: None,
+                    cost_usd: None,
+                },
+            );
         }
         Err(e) => {
             // Set session state to error
@@ -535,12 +546,13 @@ async fn process_chat_message(
             });
             let _ = sender.send(Message::Text(err.to_string().into())).await;
 
-            // Broadcast error event
-            let _ = state.event_tx.send(serde_json::json!({
-                "type": "error",
-                "component": "ws_chat",
-                "message": sanitized,
-            }));
+            // Broadcast error event through the observer pipeline.
+            state
+                .observer
+                .record_event(&zeroclaw_runtime::observability::ObserverEvent::Error {
+                    component: "ws_chat".to_string(),
+                    message: sanitized,
+                });
         }
     }
 }
