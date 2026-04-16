@@ -48,3 +48,53 @@
 {"query":"사무실 출근 루틴","gold_keys":["corpus_ko_048"],"domain":"ko"}
 {"query":"협업 도구","gold_keys":["corpus_ko_049"],"domain":"ko"}
 {"query":"아이 꿈 직업체험 봉사","gold_keys":["corpus_ko_050"],"domain":"ko"}
+{"query":"사무실 화분 다육식물 관리","gold_keys":["corpus_ko_051"],"domain":"ko"}
+{"query":"수임료 착수금 성공보수 체계","gold_keys":["corpus_ko_052"],"domain":"ko"}
+{"query":"아내 연주회 프로그램 쇼팽","gold_keys":["corpus_ko_053"],"domain":"ko"}
+{"query":"사무실 인터넷 KT 고정 IP","gold_keys":["corpus_ko_054"],"domain":"ko"}
+{"query":"명절 선물 리스트 어머니 장모님","gold_keys":["corpus_ko_055"],"domain":"ko"}
+{"query":"아이 영어학원 목동 레벨테스트","gold_keys":["corpus_ko_056"],"domain":"ko"}
+{"query":"대학 동기 모임 일정","gold_keys":["corpus_ko_057"],"domain":"ko"}
+{"query":"비행기 좌석 마일리지 스카이패스","gold_keys":["corpus_ko_058"],"domain":"ko"}
+{"query":"독서 습관 현재 읽는 책","gold_keys":["corpus_ko_059"],"domain":"ko"}
+{"query":"사무실 주차장 정기주차","gold_keys":["corpus_ko_060"],"domain":"ko"}
+{"query":"법무법인 연말 워크숍 제주도","gold_keys":["corpus_ko_061"],"domain":"ko"}
+{"query":"아이 갑각류 알러지 에피펜","gold_keys":["corpus_ko_062"],"domain":"ko"}
+{"query":"핸드폰 업무 앱 법원전자소송","gold_keys":["corpus_ko_063"],"domain":"ko"}
+{"query":"아침 루틴 기상 명상 출근","gold_keys":["corpus_ko_064"],"domain":"ko"}
+{"query":"어머니 부산 해운대 방문","gold_keys":["corpus_ko_065"],"domain":"ko"}
+{"query":"사무장 이소연 서류 기일 관리","gold_keys":["corpus_ko_066"],"domain":"ko"}
+{"query":"와인 취향 바롤로 부르고뉴","gold_keys":["corpus_ko_067"],"domain":"ko"}
+{"query":"건강검진 삼성서울병원 VIP","gold_keys":["corpus_ko_068"],"domain":"ko"}
+{"query":"사무실 CCTV 녹화 보관","gold_keys":["corpus_ko_069"],"domain":"ko"}
+{"query":"부동산 투자 포트폴리오 오피스텔","gold_keys":["corpus_ko_070"],"domain":"ko"}
+{"query":"소송 상대 변호사 율촌 최영수","gold_keys":["corpus_ko_071"],"domain":"ko"}
+{"query":"호텔 메리어트 본보이 회원","gold_keys":["corpus_ko_072"],"domain":"ko"}
+{"query":"점심 코엑스몰 한일관 미소야","gold_keys":["corpus_ko_073"],"domain":"ko"}
+{"query":"사건 관리 시스템 케이스노트","gold_keys":["corpus_ko_074"],"domain":"ko"}
+{"query":"변호사 의무연수 시간 온라인","gold_keys":["corpus_ko_075"],"domain":"ko"}
+{"query":"세무사 종합소득세 부가세","gold_keys":["corpus_ko_076"],"domain":"ko"}
+{"query":"사무실 보안 지문인식 금고","gold_keys":["corpus_ko_077"],"domain":"ko"}
+{"query":"결혼기념일 미쉐린 레스토랑","gold_keys":["corpus_ko_078"],"domain":"ko"}
+{"query":"법률 리서치 로앤비 Westlaw","gold_keys":["corpus_ko_079"],"domain":"ko"}
+{"query":"직원 복리후생 퇴직연금","gold_keys":["corpus_ko_080"],"domain":"ko"}
+{"query":"주말 브런치 에그 베네딕트","gold_keys":["corpus_ko_081"],"domain":"ko"}
+{"query":"해외여행 교토 토스카나","gold_keys":["corpus_ko_082"],"domain":"ko"}
+{"query":"복합기 리코 유지보수","gold_keys":["corpus_ko_083"],"domain":"ko"}
+{"query":"아이 바이올린 예원학교 입시","gold_keys":["corpus_ko_084"],"domain":"ko"}
+{"query":"프로보노 법률구조공단 봉사","gold_keys":["corpus_ko_085"],"domain":"ko"}
+{"query":"사무실 냉난방 에어컨 온도","gold_keys":["corpus_ko_086"],"domain":"ko"}
+{"query":"비서 박소영 일정 관리","gold_keys":["corpus_ko_087"],"domain":"ko"}
+{"query":"소송 서류 전자소송 등기우편","gold_keys":["corpus_ko_088"],"domain":"ko"}
+{"query":"네이버 블로그 판례 해설","gold_keys":["corpus_ko_089"],"domain":"ko"}
+{"query":"가족 비상 연락망","gold_keys":["corpus_ko_090"],"domain":"ko"}
+{"query":"자동차 보험 삼성화재 갱신","gold_keys":["corpus_ko_091"],"domain":"ko"}
+{"query":"의뢰인 만족도 조사 설문","gold_keys":["corpus_ko_092"],"domain":"ko"}
+{"query":"수면 시간 수면 앱","gold_keys":["corpus_ko_093"],"domain":"ko"}
+{"query":"임대차 분쟁 강연 세미나","gold_keys":["corpus_ko_094"],"domain":"ko"}
+{"query":"헬스장 러닝머신 퇴근 후","gold_keys":["corpus_ko_095"],"domain":"ko"}
+{"query":"긴급 사건 접수 24시간 검토","gold_keys":["corpus_ko_096"],"domain":"ko"}
+{"query":"구독 서비스 넷플릭스 멜론","gold_keys":["corpus_ko_097"],"domain":"ko"}
+{"query":"은퇴 계획 제주도 올리브 농장","gold_keys":["corpus_ko_098"],"domain":"ko"}
+{"query":"조깅 코스 양재천","gold_keys":["corpus_ko_099"],"domain":"ko"}
+{"query":"변호사 배지 번호 등록 연도","gold_keys":["corpus_ko_100"],"domain":"ko"}

@@ -28,3 +28,23 @@
 {"query":"log retention policy defaults","gold_keys":["corpus_en_028"],"domain":"en"}
 {"query":"production deploy code freeze window","gold_keys":["corpus_en_029"],"domain":"en"}
 {"query":"SSO provider new service access","gold_keys":["corpus_en_030"],"domain":"en"}
+{"query":"mobile release cadence QA staged rollout","gold_keys":["corpus_en_031"],"domain":"en"}
+{"query":"analytics data retention BigQuery purge","gold_keys":["corpus_en_032"],"domain":"en"}
+{"query":"Figma design system component naming","gold_keys":["corpus_en_033"],"domain":"en"}
+{"query":"Slack channel naming convention prefix","gold_keys":["corpus_en_034"],"domain":"en"}
+{"query":"error budget availability feature pause","gold_keys":["corpus_en_035"],"domain":"en"}
+{"query":"database migration sqlx up down script","gold_keys":["corpus_en_036"],"domain":"en"}
+{"query":"frontend unit test Vitest coverage threshold","gold_keys":["corpus_en_037"],"domain":"en"}
+{"query":"RFC process proposal decision meeting","gold_keys":["corpus_en_038"],"domain":"en"}
+{"query":"third-party dependency license approval","gold_keys":["corpus_en_039"],"domain":"en"}
+{"query":"on-call handoff checklist PagerDuty","gold_keys":["corpus_en_040"],"domain":"en"}
+{"query":"load testing k6 staging RPS target","gold_keys":["corpus_en_041"],"domain":"en"}
+{"query":"flexible working hours core overlap KST","gold_keys":["corpus_en_042"],"domain":"en"}
+{"query":"secrets Vault rotation API keys certificates","gold_keys":["corpus_en_043"],"domain":"en"}
+{"query":"monorepo Turborepo build cache S3","gold_keys":["corpus_en_044"],"domain":"en"}
+{"query":"accessibility audit axe-core Playwright","gold_keys":["corpus_en_045"],"domain":"en"}
+{"query":"post-incident review PIR Notion template","gold_keys":["corpus_en_046"],"domain":"en"}
+{"query":"container image Trivy CVE scan policy","gold_keys":["corpus_en_047"],"domain":"en"}
+{"query":"analytics pipeline Kafka Flink ClickHouse","gold_keys":["corpus_en_048"],"domain":"en"}
+{"query":"AWS cost allocation tags auto-terminate","gold_keys":["corpus_en_049"],"domain":"en"}
+{"query":"GraphQL schema additive-only deprecation","gold_keys":["corpus_en_050"],"domain":"en"}
