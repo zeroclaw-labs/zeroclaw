@@ -1216,6 +1216,12 @@ async fn main() -> Result<()> {
             temperature,
             peripheral,
         } => {
+            // Wire CLI channel for interactive mode
+            #[cfg(feature = "agent-runtime")]
+            zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
+                Box::new(zeroclaw_channels::cli::CliChannel::new())
+            }));
+
             let final_temperature = temperature.unwrap_or_else(|| {
                 config
                     .providers

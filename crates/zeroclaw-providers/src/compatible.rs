@@ -11,7 +11,7 @@ use crate::traits::{
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use reqwest::{
-    Client,
+    Client, ClientBuilder,
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,9 @@ pub struct OpenAiCompatibleProvider {
     api_path: Option<String>,
     /// Maximum output tokens to include in API requests.
     max_tokens: Option<u32>,
+    /// Raw PEM bytes of a custom CA certificate for TLS connections.
+    /// Loaded from disk once at construction; no per-request I/O.
+    tls_ca_cert_pem: Option<Vec<u8>>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -246,7 +249,23 @@ impl OpenAiCompatibleProvider {
             reasoning_effort: None,
             api_path: None,
             max_tokens: None,
+            tls_ca_cert_pem: None,
         }
+    }
+
+    /// Set a custom CA certificate path for TLS connections.
+    /// Reads and stores the PEM bytes immediately so later HTTP clients
+    /// incur no per-request disk I/O.
+    pub fn with_tls_ca_cert_path(mut self, path: &str) -> Self {
+        match std::fs::read(path) {
+            Ok(bytes) => self.tls_ca_cert_pem = Some(bytes),
+            Err(e) => tracing::warn!(
+                path,
+                error = %e,
+                "Failed to read CA certificate file — TLS will use system roots"
+            ),
+        }
+        self
     }
 
     /// Disable native tool calling, forcing prompt-guided tool use instead.
@@ -331,8 +350,24 @@ impl OpenAiCompatibleProvider {
         let timeout = self.timeout_secs;
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
+        let has_tls_cert = self.tls_ca_cert_pem.is_some();
 
-        if has_user_agent || has_extra_headers {
+        // Helper to add TLS certificate to builder. PEM bytes were loaded at
+        // construction time — no disk I/O here, just parse from memory.
+        let add_tls_cert = |builder: ClientBuilder| -> ClientBuilder {
+            if let Some(ref pem) = self.tls_ca_cert_pem {
+                match reqwest::Certificate::from_pem(pem) {
+                    Ok(cert) => return builder.add_root_certificate(cert),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "Failed to parse CA certificate — TLS will use system roots"
+                    ),
+                }
+            }
+            builder
+        };
+
+        if has_user_agent || has_extra_headers || has_tls_cert {
             let mut headers = HeaderMap::new();
             if let Some(ua) = self.user_agent.as_deref()
                 && let Ok(value) = HeaderValue::from_str(ua)
@@ -357,6 +392,7 @@ impl OpenAiCompatibleProvider {
                 .timeout(std::time::Duration::from_secs(timeout))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .default_headers(headers);
+            let builder = add_tls_cert(builder);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
                 builder,
                 "provider.compatible",
@@ -370,11 +406,13 @@ impl OpenAiCompatibleProvider {
             });
         }
 
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "provider.compatible",
-            timeout,
-            10,
-        )
+        let builder = Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout))
+            .connect_timeout(std::time::Duration::from_secs(10));
+        let builder = add_tls_cert(builder);
+        let builder =
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "provider.compatible");
+        builder.build().unwrap_or_else(|_| Client::new())
     }
 
     /// Build the full URL for chat completions, detecting if base_url already includes the path.

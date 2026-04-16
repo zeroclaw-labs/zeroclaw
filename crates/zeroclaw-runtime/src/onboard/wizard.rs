@@ -1371,6 +1371,12 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
         return true;
     }
 
+    // Named custom providers (defined in [providers.models] or [model_providers])
+    // are also supported for live model fetch if they have a base_url configured.
+    if provider_name == "custom" {
+        return true;
+    }
+
     matches!(
         canonical_provider_name(provider_name),
         "openrouter"
@@ -1438,10 +1444,32 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
     }
 }
 
-fn build_model_fetch_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+fn build_model_fetch_client(tls_ca_cert_path: Option<&str>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
-        .connect_timeout(Duration::from_secs(4))
+        .connect_timeout(Duration::from_secs(4));
+
+    // Add custom CA certificate if provided
+    if let Some(ca_path) = tls_ca_cert_path {
+        tracing::debug!("Loading CA certificate from: {ca_path}");
+        let ca_path = std::path::Path::new(ca_path);
+        if ca_path.exists() {
+            tracing::debug!("Certificate file exists, reading...");
+            let cert_content = std::fs::read(ca_path)
+                .with_context(|| format!("failed to read CA certificate from {ca_path:?}"))?;
+            tracing::debug!("Read {} bytes, parsing PEM...", cert_content.len());
+            let cert = reqwest::Certificate::from_pem(&cert_content)
+                .with_context(|| format!("failed to parse CA certificate from {ca_path:?}"))?;
+            tracing::debug!("Certificate parsed successfully, adding to client");
+            builder = builder.add_root_certificate(cert);
+        } else {
+            tracing::debug!("Certificate file does not exist: {ca_path:?}");
+        }
+    } else {
+        tracing::debug!("No CA certificate path provided");
+    }
+
+    builder
         .build()
         .context("failed to build model-fetch HTTP client")
 }
@@ -1526,8 +1554,9 @@ async fn fetch_openai_compatible_models(
     endpoint: &str,
     api_key: Option<&str>,
     allow_unauthenticated: bool,
+    tls_ca_cert_path: Option<&str>,
 ) -> Result<Vec<String>> {
-    let client = build_model_fetch_client()?;
+    let client = build_model_fetch_client(tls_ca_cert_path)?;
     let mut request = client.get(endpoint);
 
     if let Some(api_key) = api_key {
@@ -1549,7 +1578,7 @@ async fn fetch_openai_compatible_models(
 }
 
 async fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<String>> {
-    let client = build_model_fetch_client()?;
+    let client = build_model_fetch_client(None)?;
     let mut request = client.get("https://openrouter.ai/api/v1/models");
     if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key);
@@ -1572,7 +1601,7 @@ async fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
         bail!("Anthropic model fetch requires API key or OAuth token");
     };
 
-    let client = build_model_fetch_client()?;
+    let client = build_model_fetch_client(None)?;
     let mut request = client
         .get("https://api.anthropic.com/v1/models")
         .header("anthropic-version", "2023-06-01");
@@ -1609,7 +1638,7 @@ async fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
         bail!("Gemini model fetch requires API key");
     };
 
-    let client = build_model_fetch_client()?;
+    let client = build_model_fetch_client(None)?;
     let payload: Value = client
         .get("https://generativelanguage.googleapis.com/v1beta/models")
         .query(&[("key", api_key), ("pageSize", "200")])
@@ -1625,7 +1654,7 @@ async fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
 }
 
 async fn fetch_ollama_models() -> Result<Vec<String>> {
-    let client = build_model_fetch_client()?;
+    let client = build_model_fetch_client(None)?;
     let payload: Value = client
         .get("http://localhost:11434/api/tags")
         .send()
@@ -1719,6 +1748,7 @@ async fn fetch_live_models_for_provider(
     provider_name: &str,
     api_key: &str,
     provider_api_url: Option<&str>,
+    tls_ca_cert_path: Option<&str>,
 ) -> Result<Vec<String>> {
     let requested_provider_name = provider_name;
     let provider_name = canonical_provider_name(provider_name);
@@ -1781,8 +1811,13 @@ async fn fetch_live_models_for_provider(
             {
                 let allow_unauthenticated =
                     allows_unauthenticated_model_fetch(requested_provider_name);
-                fetch_openai_compatible_models(&endpoint, api_key.as_deref(), allow_unauthenticated)
-                    .await?
+                fetch_openai_compatible_models(
+                    &endpoint,
+                    api_key.as_deref(),
+                    allow_unauthenticated,
+                    tls_ca_cert_path,
+                )
+                .await?
             } else {
                 Vec::new()
             }
@@ -2013,6 +2048,16 @@ pub async fn run_models_refresh(
         .and_then(|e| e.api_key.clone())
         .unwrap_or_default();
 
+    let tls_ca_cert_path = config
+        .providers
+        .fallback_provider()
+        .and_then(|e| e.tls_ca_cert_path.as_deref());
+
+    tracing::debug!(
+        "run_models_refresh: tls_ca_cert_path = {:?}",
+        tls_ca_cert_path
+    );
+
     match fetch_live_models_for_provider(
         &provider_name,
         &api_key,
@@ -2020,6 +2065,7 @@ pub async fn run_models_refresh(
             .providers
             .fallback_provider()
             .and_then(|e| e.base_url.as_deref()),
+        tls_ca_cert_path,
     )
     .await
     {
@@ -2992,6 +3038,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                     provider_name,
                     &api_key,
                     provider_api_url.as_deref(),
+                    None, // cert not configured yet during initial wizard setup; run_models_refresh picks it up after config is written
                 )
                 .await
                 {

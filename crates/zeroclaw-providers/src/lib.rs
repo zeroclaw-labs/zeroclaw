@@ -713,6 +713,8 @@ pub struct ProviderRuntimeOptions {
     /// When true, system messages are merged into the first user message before
     /// sending. Propagated from `ModelProviderConfig::merge_system_into_user`.
     pub merge_system_into_user: bool,
+    /// Path to a custom CA certificate file for TLS connections.
+    pub tls_ca_cert_path: Option<String>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -729,6 +731,7 @@ impl Default for ProviderRuntimeOptions {
             api_path: None,
             provider_max_tokens: None,
             merge_system_into_user: false,
+            tls_ca_cert_path: None,
         }
     }
 }
@@ -757,6 +760,8 @@ pub fn provider_runtime_options_from_config(
         .map(|p| p.merge_system_into_user)
         .unwrap_or(false);
 
+    let tls_ca_cert_path = fallback.and_then(|e| e.tls_ca_cert_path.clone());
+
     ProviderRuntimeOptions {
         auth_profile_override: None,
         provider_api_url: fallback.and_then(|e| e.base_url.clone()),
@@ -771,6 +776,7 @@ pub fn provider_runtime_options_from_config(
         api_path: fallback.and_then(|e| e.api_path.clone()),
         provider_max_tokens: fallback.and_then(|e| e.max_tokens),
         merge_system_into_user,
+        tls_ca_cert_path,
     }
 }
 
@@ -1116,6 +1122,7 @@ fn create_provider_with_url_and_options(
         let extra_headers = options.extra_headers.clone();
         let api_path = options.api_path.clone();
         let max_tokens = options.provider_max_tokens;
+        let tls_ca_cert_path = options.tls_ca_cert_path.clone();
         move |p: OpenAiCompatibleProvider| -> Box<dyn Provider> {
             let mut p = p;
             if let Some(t) = timeout {
@@ -1132,6 +1139,9 @@ fn create_provider_with_url_and_options(
             }
             if let Some(mt) = max_tokens {
                 p = p.with_max_tokens(Some(mt));
+            }
+            if let Some(ref cert_path) = tls_ca_cert_path {
+                p = p.with_tls_ca_cert_path(cert_path);
             }
             Box::new(p)
         }
