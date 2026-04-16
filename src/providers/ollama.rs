@@ -11,6 +11,71 @@ pub struct OllamaProvider {
     base_url: String,
     api_key: Option<String>,
     reasoning_enabled: Option<bool>,
+    /// Optional Ollama-specific runtime tuning (keep_alive, num_ctx, num_predict).
+    /// PR #4: lets the routing layer pass per-chat-mode hints — long context for
+    /// channel chat, short for app chat, no-keep on battery saver, etc.
+    tuning: OllamaTuning,
+}
+
+/// Per-request tuning knobs sent to Ollama. All fields optional; `None` means
+/// "use Ollama's server-side default" for that field. The provider applies
+/// these on every `/api/chat` and `/api/generate` request.
+///
+/// Concrete defaults exist as constructors for the three documented chat modes
+/// (`for_app_chat`, `for_channel_chat`, `for_web_chat`) and a battery-saver
+/// variant that immediately unloads the model after each request.
+#[derive(Debug, Clone, Default)]
+pub struct OllamaTuning {
+    /// Top-level `keep_alive` field on the chat/generate request. Accepts
+    /// duration strings Ollama parses (`"30m"`, `"5m"`, `"0"`). When `None`,
+    /// Ollama uses its 5-minute default.
+    pub keep_alive: Option<String>,
+    /// `num_ctx` option — context window size in tokens.
+    pub num_ctx: Option<u32>,
+    /// `num_predict` option — max tokens to generate. `-1` = unlimited.
+    pub num_predict: Option<i32>,
+}
+
+impl OllamaTuning {
+    /// App chat: short context (8K), long keep_alive (30m) so quick follow-ups
+    /// don't hit cold-start. Default for in-process and CLI chat.
+    pub fn for_app_chat() -> Self {
+        Self {
+            keep_alive: Some("30m".to_string()),
+            num_ctx: Some(8_192),
+            num_predict: Some(-1),
+        }
+    }
+
+    /// Channel chat (Telegram/Discord/Slack/...): medium context (32K) for
+    /// thread history; same 30m keep_alive.
+    pub fn for_channel_chat() -> Self {
+        Self {
+            keep_alive: Some("30m".to_string()),
+            num_ctx: Some(32_768),
+            num_predict: Some(-1),
+        }
+    }
+
+    /// Web chat: maximum supported context (128K — Gemma 4 ceiling). Useful
+    /// for long-document Q&A.
+    pub fn for_web_chat() -> Self {
+        Self {
+            keep_alive: Some("30m".to_string()),
+            num_ctx: Some(131_072),
+            num_predict: Some(-1),
+        }
+    }
+
+    /// Battery-saver: unload immediately after each request, narrow context
+    /// to minimize VRAM pressure.
+    pub fn for_battery_saver() -> Self {
+        Self {
+            keep_alive: Some("0".to_string()),
+            num_ctx: Some(4_096),
+            num_predict: Some(-1),
+        }
+    }
 }
 
 // ─── Request Structures ───────────────────────────────────────────────────────
@@ -25,6 +90,11 @@ struct ChatRequest {
     think: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
+    /// Ollama-specific top-level field: how long the model stays resident in
+    /// VRAM/RAM after this call. PR #4: defaults to 30m for app chat to avoid
+    /// per-request cold starts (~5 s on Apple Silicon for gemma4:e4b).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keep_alive: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,6 +126,12 @@ struct OutgoingFunction {
 #[derive(Debug, Serialize)]
 struct Options {
     temperature: f64,
+    /// PR #4: context window size. None defers to Ollama's per-model default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_ctx: Option<u32>,
+    /// PR #4: max tokens to generate. -1 = unlimited (model decides via stop tokens).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_predict: Option<i32>,
 }
 
 // ─── Response Structures ──────────────────────────────────────────────────────
@@ -127,7 +203,22 @@ impl OllamaProvider {
             base_url: Self::normalize_base_url(base_url.unwrap_or("http://localhost:11434")),
             api_key,
             reasoning_enabled,
+            tuning: OllamaTuning::default(),
         }
+    }
+
+    /// Replace the active tuning. PR #4: callers (routing layer, voice
+    /// pipeline) pick a profile via [`OllamaTuning::for_app_chat`] etc. and
+    /// pass it here once at provider construction. Subsequent requests apply
+    /// the tuning automatically.
+    pub fn with_tuning(mut self, tuning: OllamaTuning) -> Self {
+        self.tuning = tuning;
+        self
+    }
+
+    /// Borrow the active tuning. Useful for tests and observability surfaces.
+    pub fn tuning(&self) -> &OllamaTuning {
+        &self.tuning
     }
 
     fn is_local_endpoint(&self) -> bool {
@@ -210,9 +301,14 @@ impl OllamaProvider {
             model: model.to_string(),
             messages,
             stream: false,
-            options: Options { temperature },
+            options: Options {
+                temperature,
+                num_ctx: self.tuning.num_ctx,
+                num_predict: self.tuning.num_predict,
+            },
             think: self.reasoning_enabled,
             tools: tools.map(|t| t.to_vec()),
+            keep_alive: self.tuning.keep_alive.clone(),
         }
     }
 
@@ -731,6 +827,84 @@ mod tests {
     fn default_url() {
         let p = OllamaProvider::new(None, None);
         assert_eq!(p.base_url, "http://localhost:11434");
+    }
+
+    // ── PR #4: tuning profiles ──
+
+    #[test]
+    fn tuning_app_chat_profile() {
+        let t = OllamaTuning::for_app_chat();
+        assert_eq!(t.keep_alive.as_deref(), Some("30m"));
+        assert_eq!(t.num_ctx, Some(8_192));
+        assert_eq!(t.num_predict, Some(-1));
+    }
+
+    #[test]
+    fn tuning_channel_chat_profile() {
+        let t = OllamaTuning::for_channel_chat();
+        assert_eq!(t.num_ctx, Some(32_768));
+    }
+
+    #[test]
+    fn tuning_web_chat_profile_uses_max_ctx() {
+        let t = OllamaTuning::for_web_chat();
+        assert_eq!(t.num_ctx, Some(131_072));
+    }
+
+    #[test]
+    fn tuning_battery_saver_unloads_immediately() {
+        let t = OllamaTuning::for_battery_saver();
+        assert_eq!(t.keep_alive.as_deref(), Some("0"));
+        assert_eq!(t.num_ctx, Some(4_096));
+    }
+
+    #[test]
+    fn default_tuning_is_all_none() {
+        let t = OllamaTuning::default();
+        assert!(t.keep_alive.is_none());
+        assert!(t.num_ctx.is_none());
+        assert!(t.num_predict.is_none());
+    }
+
+    #[test]
+    fn provider_starts_with_default_tuning() {
+        let p = OllamaProvider::new(None, None);
+        let t = p.tuning();
+        assert!(t.keep_alive.is_none());
+        assert!(t.num_ctx.is_none());
+    }
+
+    #[test]
+    fn with_tuning_overrides_defaults() {
+        let p = OllamaProvider::new(None, None).with_tuning(OllamaTuning::for_channel_chat());
+        let t = p.tuning();
+        assert_eq!(t.num_ctx, Some(32_768));
+        assert_eq!(t.keep_alive.as_deref(), Some("30m"));
+    }
+
+    #[test]
+    fn build_chat_request_serializes_tuning_into_payload() {
+        let p = OllamaProvider::new(None, None).with_tuning(OllamaTuning::for_channel_chat());
+        let req = p.build_chat_request(Vec::new(), "gemma4:e4b", 0.3, None);
+        let json = serde_json::to_value(&req).unwrap();
+        // keep_alive at top level, num_ctx + num_predict inside options.
+        assert_eq!(json["keep_alive"], "30m");
+        assert_eq!(json["options"]["num_ctx"], 32_768);
+        assert_eq!(json["options"]["num_predict"], -1);
+        assert_eq!(json["options"]["temperature"], 0.3);
+    }
+
+    #[test]
+    fn build_chat_request_omits_unset_tuning_fields() {
+        // Default tuning = all None → fields absent from JSON.
+        let p = OllamaProvider::new(None, None);
+        let req = p.build_chat_request(Vec::new(), "gemma4:e4b", 0.3, None);
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("keep_alive").is_none());
+        assert!(json["options"].get("num_ctx").is_none());
+        assert!(json["options"].get("num_predict").is_none());
+        // temperature is always present.
+        assert_eq!(json["options"]["temperature"], 0.3);
     }
 
     #[test]
