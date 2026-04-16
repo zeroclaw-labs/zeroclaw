@@ -23,4 +23,7 @@ ignore = [
     "RUSTSEC-2024-0384",
     # rustls-webpki CRL matching — via rumqttc 0.24; no upstream fix (even 0.25.1 uses ^0.102.8)
     "RUSTSEC-2026-0049",
+    # rustls-webpki name constraints — via rumqttc; same underlying dep, no upstream fix yet
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
 ]
