@@ -4795,19 +4795,78 @@ pub async fn ws_connect_with_proxy(
 
     match proxy_url {
         None => {
-            // No proxy — delegate directly.
-            let (stream, resp) = tokio_tungstenite::connect_async(ws_url).await?;
-            // Re-wrap the inner stream into our boxed type so the caller
-            // always gets `ProxiedWsStream`.
-            let inner = stream.into_inner();
-            let boxed = BoxedIo(Box::new(inner));
-            let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
-                boxed,
-                tokio_tungstenite::tungstenite::protocol::Role::Client,
-                None,
-            )
-            .await;
-            Ok((ws, resp))
+            // No proxy — establish TCP+TLS manually, wrap in BoxedIo, then
+            // perform the WebSocket handshake over the wrapped stream.
+            //
+            // Previous implementation used `connect_async` followed by
+            // `into_inner()` + `from_raw_socket` to normalize the return
+            // type.  That pattern discards data already buffered by the
+            // tungstenite frame codec, causing channels (Slack Socket Mode,
+            // Discord, etc.) to silently miss the first frames sent by the
+            // server and all subsequent events.
+            use tokio::net::TcpStream;
+
+            let target = reqwest::Url::parse(ws_url)
+                .with_context(|| format!("Invalid WebSocket URL: {ws_url}"))?;
+            let target_host = target
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("WebSocket URL has no host: {ws_url}"))?
+                .to_string();
+            let target_port = target
+                .port_or_known_default()
+                .unwrap_or(if target.scheme() == "wss" { 443 } else { 80 });
+
+            let tcp = TcpStream::connect(format!("{target_host}:{target_port}"))
+                .await
+                .with_context(|| format!("TCP connect to {target_host}:{target_port}"))?;
+
+            let is_secure = target.scheme() == "wss";
+            let stream: BoxedIo = if is_secure {
+                let mut root_store = rustls::RootCertStore::empty();
+                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                let tls_config = std::sync::Arc::new(
+                    rustls::ClientConfig::builder()
+                        .with_root_certificates(root_store)
+                        .with_no_client_auth(),
+                );
+                let connector = tokio_rustls::TlsConnector::from(tls_config);
+                let server_name = rustls_pki_types::ServerName::try_from(target_host.clone())
+                    .with_context(|| format!("Invalid TLS server name: {target_host}"))?;
+                let tls_stream = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .with_context(|| format!("TLS handshake with {target_host}"))?;
+                BoxedIo(Box::new(tls_stream))
+            } else {
+                BoxedIo(Box::new(tcp))
+            };
+
+            let default_port = if is_secure { 443 } else { 80 };
+            let host_header = if target_port == default_port {
+                target_host.clone()
+            } else {
+                format!("{target_host}:{target_port}")
+            };
+
+            let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
+                .uri(ws_url)
+                .header("Host", host_header)
+                .header("Connection", "Upgrade")
+                .header("Upgrade", "websocket")
+                .header(
+                    "Sec-WebSocket-Key",
+                    tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+                )
+                .header("Sec-WebSocket-Version", "13")
+                .body(())
+                .with_context(|| "Failed to build WebSocket upgrade request")?;
+
+            let (ws_stream, response) =
+                tokio_tungstenite::client_async(ws_request, stream)
+                    .await
+                    .with_context(|| format!("WebSocket handshake failed for {ws_url}"))?;
+
+            Ok((ws_stream, response))
         }
         Some(proxy) => ws_connect_via_proxy(ws_url, &proxy).await,
     }
