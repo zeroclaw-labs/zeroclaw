@@ -227,4 +227,43 @@ mod tests {
         // Index 5 is inside "你" (3-byte char), floor should move back to 3.
         assert_eq!(floor_utf8_char_boundary(s, 5), 3);
     }
+
+    #[test]
+    fn test_home_dir_returns_some_when_env_set() {
+        let h = home_dir();
+        assert!(h.is_some(), "home_dir should resolve in CI/dev shells");
+    }
+
+    #[test]
+    fn test_now_unix_secs_monotonic() {
+        let a = now_unix_secs();
+        let b = now_unix_secs();
+        assert!(b >= a);
+        assert!(a > 1_735_689_600, "expected timestamp after 2026-01-01");
+    }
+}
+
+// ── Cross-module helpers (also added to PR #184 for main; mirrored here so
+// the voice files on this branch can converge) ──
+
+/// Resolve the user's home directory from the platform-appropriate env var.
+/// `None` only when the var is unset (sandboxed environments).
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        std::env::var_os("HOME").map(std::path::PathBuf::from)
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE").map(std::path::PathBuf::from)
+    }
+}
+
+/// Wall-clock seconds since the Unix epoch.
+pub fn now_unix_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
