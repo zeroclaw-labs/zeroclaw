@@ -62,11 +62,11 @@ FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash ca-certificates curl git \
-        python3 python3-pip python3-venv \
+        python3 python3-pip \
         ffmpeg jq sqlite3 \
     && ln -sf /usr/bin/python3 /usr/bin/python \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --no-cache-dir --break-system-packages yt-dlp
+    && pip3 install --no-cache-dir --break-system-packages yt-dlp \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js so yt-dlp EJS plugin can bypass YouTube bot detection
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
