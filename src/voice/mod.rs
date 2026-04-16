@@ -24,10 +24,12 @@ pub mod events;
 pub mod gemini_live;
 pub mod gemma_asr;
 pub mod gemma_simul;
+pub mod kokoro_tts;
 pub mod openai_realtime;
 pub mod pipeline;
 pub mod simul;
 pub mod simul_session;
+pub mod tts_engine;
 pub mod typecast_interp;
 
 // ── Shared voice event type ──────────────────────────────────────
