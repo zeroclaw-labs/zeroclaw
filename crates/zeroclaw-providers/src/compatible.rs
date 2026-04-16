@@ -3356,6 +3356,40 @@ mod tests {
         }
     }
 
+    /// Confirm that `strip_native_tool_messages` is a no-op when the provider
+    /// has `native_tool_calling = true` — tool-role and assistant-with-tool-calls
+    /// messages must pass through unchanged.
+    #[test]
+    fn strip_native_tool_messages_passthrough_when_native_tool_calling_enabled() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("search for cats"),
+            ChatMessage::assistant(
+                r#"{"content":"I'll search","tool_calls":[{"id":"chatcmpl-tool-abc","name":"web_search","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(
+                r#"{"tool_call_id":"chatcmpl-tool-abc","content":"Found 10 results"}"#,
+            ),
+            ChatMessage::assistant("Here are the results about cats"),
+        ];
+        let p = OpenAiCompatibleProvider::new(
+            "NativeToolProvider",
+            "https://api.example.com/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        assert!(
+            <OpenAiCompatibleProvider as Provider>::capabilities(&p).native_tool_calling,
+            "provider must have native_tool_calling enabled for this test"
+        );
+        let result = p.strip_native_tool_messages(&messages);
+        assert_eq!(result.len(), messages.len());
+        for (orig, out) in messages.iter().zip(result.iter()) {
+            assert_eq!(orig.role, out.role);
+            assert_eq!(orig.content, out.content);
+        }
+    }
+
     #[test]
     fn user_agent_constructor_keeps_native_tool_calling_enabled() {
         let p = OpenAiCompatibleProvider::new_with_user_agent(
