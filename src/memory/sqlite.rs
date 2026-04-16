@@ -5018,4 +5018,79 @@ mod tests {
         let row = mem.get("shared").await.unwrap().unwrap();
         assert_eq!(row.content, "from_a_newest");
     }
+
+    /// PR #4 mobile degrade contract — on a mobile build we intentionally
+    /// ship without the reranker (150MB model) and without a local
+    /// embedder (1.1GB BGE-M3). The retrieval path must stay functional
+    /// with both absent: `recall()` should return results from FTS5 +
+    /// vector-when-available, and `recall_with_variations` should never
+    /// panic or stall when the caller passes a non-empty variations list
+    /// on a stub-embedder build.
+    ///
+    /// This test simulates the bare-mobile environment (default features,
+    /// no set_reranker, NoopEmbedding) and asserts the core query path
+    /// still returns hits for all three corpus domains.
+    #[tokio::test]
+    async fn mobile_degrade_recall_still_functional_without_reranker_or_embedder() {
+        let (_tmp, mem) = temp_sqlite();
+
+        // Seed a mini cross-domain corpus.
+        for (k, v) in [
+            ("ko_A", "주택임대차보호법 대항력 발생 시점"),
+            ("ko_B", "사무실 화분 다육식물 관리 루틴"),
+            ("en_A", "code review approvals required from CODEOWNERS"),
+            ("en_B", "feature flag naming convention platform_search_v2"),
+            ("law_A", "민법 제621조 임대인 동의 전대 금지"),
+        ] {
+            mem.store(k, v, MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+
+        // Default SqliteMemory has no reranker attached and uses
+        // NoopEmbedding — the exact mobile posture.
+        // 1) Plain recall() must return something across all queries.
+        for (query, expected_key) in [
+            ("대항력", "ko_A"),
+            ("CODEOWNERS", "en_A"),
+            ("임대인", "law_A"),
+        ] {
+            let hits = mem.recall(query, 5, None).await.unwrap();
+            assert!(
+                !hits.is_empty(),
+                "mobile recall must return hits for `{query}`, got empty"
+            );
+            assert!(
+                hits.iter().any(|h| h.key == expected_key),
+                "mobile recall for `{query}` should surface `{expected_key}`, got {:?}",
+                hits.iter().map(|h| h.key.clone()).collect::<Vec<_>>()
+            );
+        }
+
+        // 2) recall_with_variations must fall through to recall() when no
+        //    reranker is attached and variations.len() <= 1 — exact
+        //    contract preserved by the PR #4 short-circuit fix.
+        let empty_var: [String; 0] = [];
+        let hits = mem
+            .recall_with_variations("다육식물", &empty_var, 5, None)
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().any(|h| h.key == "ko_B"),
+            "mobile recall_with_variations must still work without variations + no reranker"
+        );
+
+        // 3) Even a multi-variation call without a reranker must return
+        //    results (the RRF path without rerank is the default mobile
+        //    behaviour when the agent loop does query expansion).
+        let variations = vec!["다육식물 물주기".to_string(), "화분 관리".to_string()];
+        let hits = mem
+            .recall_with_variations("다육식물", &variations, 5, None)
+            .await
+            .unwrap();
+        assert!(
+            !hits.is_empty(),
+            "mobile multi-variation recall must return hits without a reranker"
+        );
+    }
 }
