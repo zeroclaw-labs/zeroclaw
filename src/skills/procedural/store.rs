@@ -59,6 +59,10 @@ impl SkillStore {
     }
 
     /// Create a new skill from a generated SKILL.md document.
+    ///
+    /// Rejects empty / whitespace-only names (UNIQUE NOT NULL would panic on
+    /// the second blank insert) and empty content (an empty skill is useless
+    /// and produces empty FTS5 rows that pollute search rankings).
     pub fn create(
         &self,
         name: &str,
@@ -67,19 +71,29 @@ impl SkillStore {
         content_md: &str,
         created_by: &str,
     ) -> Result<String> {
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
+            anyhow::bail!("skill name must not be empty");
+        }
+        if description.trim().is_empty() {
+            anyhow::bail!("skill description must not be empty");
+        }
+        if content_md.trim().is_empty() {
+            anyhow::bail!("skill content_md must not be empty");
+        }
         let id = uuid::Uuid::new_v4().to_string();
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO skills (id, name, category, description, content_md, created_by, device_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id, name, category, description, content_md, created_by, self.device_id],
+            params![id, trimmed_name, category, description, content_md, created_by, self.device_id],
         )
         .context("failed to insert skill")?;
         // Mirror into FTS5
         conn.execute(
             "INSERT INTO skills_fts (skill_id, name, description, content_md)
              VALUES (?1, ?2, ?3, ?4)",
-            params![id, name, description, content_md],
+            params![id, trimmed_name, description, content_md],
         )
         .context("failed to mirror skill into FTS5")?;
         Ok(id)
@@ -421,8 +435,13 @@ fn now_epoch() -> i64 {
 
 /// Append content after a markdown section header. If the section doesn't
 /// exist, append it at the end of the document.
+///
+/// Uses `rfind` to locate the *last* occurrence of the header — if a skill
+/// ever ends up with duplicate section headers (manual edits, merge hiccup),
+/// new pitfalls still land in the most recent section rather than the first
+/// stale one.
 fn append_to_section(doc: &str, header: &str, content: &str) -> String {
-    if let Some(pos) = doc.find(header) {
+    if let Some(pos) = doc.rfind(header) {
         // Find the next section header (## ...) after the current one
         let after_header = pos + header.len();
         if let Some(next_section) = doc[after_header..].find("\n## ") {
@@ -529,6 +548,31 @@ mod tests {
         let result = append_to_section(doc, "## Pitfalls", "Watch out");
         assert!(result.contains("## Pitfalls"));
         assert!(result.contains("Watch out"));
+    }
+
+    #[test]
+    fn create_rejects_empty_name() {
+        let store = test_store();
+        assert!(store.create("", Some("coding"), "desc", "# body", "agent").is_err());
+        assert!(store.create("   ", Some("coding"), "desc", "# body", "agent").is_err());
+    }
+
+    #[test]
+    fn create_rejects_empty_description_and_content() {
+        let store = test_store();
+        assert!(store.create("name", None, "", "# body", "agent").is_err());
+        assert!(store.create("name", None, "desc", "", "agent").is_err());
+        assert!(store.create("name", None, "desc", "   \n  ", "agent").is_err());
+    }
+
+    #[test]
+    fn create_trims_whitespace_from_name() {
+        let store = test_store();
+        let id = store
+            .create("  spaced-name  ", None, "d", "# body", "agent")
+            .unwrap();
+        let skill = store.get(&id).unwrap().unwrap();
+        assert_eq!(skill.name, "spaced-name");
     }
 
     #[test]

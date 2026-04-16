@@ -137,6 +137,10 @@ impl CorrectionStore {
     // ── Patterns ───────────────────────────────────────────────────────
 
     /// Create a new pattern.
+    ///
+    /// Rejects empty original or replacement — an empty pattern would never
+    /// match (or match the entire document with substring search), polluting
+    /// the store with noise patterns.
     pub fn create_pattern(
         &self,
         pattern_type: PatternType,
@@ -144,6 +148,12 @@ impl CorrectionStore {
         replacement: &str,
         scope: &str,
     ) -> Result<i64> {
+        if original_regex.is_empty() {
+            anyhow::bail!("correction pattern original_regex must not be empty");
+        }
+        if replacement.is_empty() {
+            anyhow::bail!("correction pattern replacement must not be empty");
+        }
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO correction_patterns
@@ -464,5 +474,12 @@ mod tests {
         assert_eq!(legal.len(), 2);
         let emails = store.active_patterns_for_scope("email").unwrap();
         assert_eq!(emails.len(), 2);
+    }
+
+    #[test]
+    fn create_pattern_rejects_empty_inputs() {
+        let store = test_store();
+        assert!(store.create_pattern(PatternType::Style, "", "b", "all").is_err());
+        assert!(store.create_pattern(PatternType::Style, "a", "", "all").is_err());
     }
 }

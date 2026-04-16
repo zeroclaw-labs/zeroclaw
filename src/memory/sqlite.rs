@@ -1958,8 +1958,6 @@ impl Memory for SqliteMemory {
         content: &str,
         blob: &super::sync::EmbeddingBlob,
     ) -> anyhow::Result<bool> {
-        use super::embedding::EmbeddingProvider;
-
         let local_provider = self.embedder.name().to_string();
         let local_model = self.embedder.model().to_string();
         let local_version = self.embedder.version();
@@ -2057,7 +2055,6 @@ impl Memory for SqliteMemory {
         &self,
         content: &str,
     ) -> Option<super::sync::EmbeddingBlob> {
-        use super::embedding::EmbeddingProvider;
         let dim = self.embedder.dimensions();
         if dim == 0 {
             return None;
@@ -2332,6 +2329,83 @@ impl Memory for SqliteMemory {
                     ],
                 )?;
                 Ok(changed > 0)
+            }
+            // ── Self-learning skill system deltas (v6.1) ─────────────
+            // Forward to the SkillStore / UserProfiler / CorrectionStore
+            // upsert_from_sync methods. Each uses its own LWW policy
+            // (skills: version-LWW; profiles: confidence-max; patterns:
+            // counts-max). Failure to resolve the workspace dir (e.g.
+            // in-memory test fixtures) is silent — returns Ok(false) so
+            // the caller logs the skip but doesn't treat it as an error.
+            DeltaOperation::SkillUpsert {
+                id,
+                name,
+                category,
+                description,
+                content_md,
+                version,
+                created_by,
+            } => {
+                let Some(workspace) = self.workspace_dir() else {
+                    return Ok(false);
+                };
+                let store = crate::skills::procedural::build_store(workspace, "remote")?;
+                store.upsert_from_sync(
+                    id,
+                    name,
+                    category.as_deref(),
+                    description,
+                    content_md,
+                    *version,
+                    created_by,
+                    "remote",
+                )?;
+                Ok(true)
+            }
+            DeltaOperation::UserProfileConclusion {
+                dimension,
+                conclusion,
+                confidence,
+                evidence_count,
+            } => {
+                let Some(workspace) = self.workspace_dir() else {
+                    return Ok(false);
+                };
+                let profiler = crate::user_model::build_profiler(workspace, "remote")?;
+                profiler.upsert_from_sync(
+                    dimension,
+                    conclusion,
+                    *confidence,
+                    *evidence_count,
+                    "remote",
+                )?;
+                Ok(true)
+            }
+            DeltaOperation::CorrectionPatternUpsert {
+                pattern_type,
+                original_regex,
+                replacement,
+                scope,
+                confidence,
+                observation_count,
+                accept_count,
+                reject_count,
+            } => {
+                let Some(workspace) = self.workspace_dir() else {
+                    return Ok(false);
+                };
+                let store = crate::skills::correction::build_store(workspace, "remote")?;
+                store.upsert_from_sync(
+                    pattern_type,
+                    original_regex,
+                    replacement,
+                    scope,
+                    *confidence,
+                    *observation_count,
+                    *accept_count,
+                    *reject_count,
+                )?;
+                Ok(true)
             }
             // Non-v3 operations fall through — SyncedMemory handles them.
             _ => Ok(false),
@@ -4506,11 +4580,11 @@ mod tests {
         mem.store("kB", "토요일 테니스", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let idA = mem.get("kA").await.unwrap().unwrap().id;
-        let idB = mem.get("kB").await.unwrap().unwrap().id;
+        let id_a = mem.get("kA").await.unwrap().unwrap().id;
+        let id_b = mem.get("kB").await.unwrap().unwrap().id;
 
         let outcome = ConsolidationOutcome {
-            source_ids: vec![idA, idB],
+            source_ids: vec![id_a, id_b],
             source_keys: vec!["kA".into(), "kB".into()],
             summary: "주말 운동 (충돌)".into(),
             conflict: true,
@@ -4865,6 +4939,74 @@ mod tests {
         let (truth, version) = mem.get_compiled_truth("m_lww").unwrap().unwrap();
         assert_eq!(truth, "fresh remote");
         assert_eq!(version, 5);
+    }
+
+    #[tokio::test]
+    async fn apply_remote_v3_delta_forwards_skill_upsert() {
+        use super::super::sync::DeltaOperation;
+
+        let (tmp, mem) = temp_sqlite();
+        let delta = DeltaOperation::SkillUpsert {
+            id: "sk-remote-1".into(),
+            name: "remote-skill".into(),
+            category: Some("coding".into()),
+            description: "from remote".into(),
+            content_md: "# Remote\n\n## Procedure\n...".into(),
+            version: 7,
+            created_by: "remote-agent".into(),
+        };
+        assert!(mem.apply_remote_v3_delta(&delta).await.unwrap());
+
+        // Skill must be visible via a freshly-built SkillStore on the same DB.
+        let store = crate::skills::procedural::build_store(tmp.path(), "verifier").unwrap();
+        let skill = store.get("sk-remote-1").unwrap().expect("skill present");
+        assert_eq!(skill.name, "remote-skill");
+        assert_eq!(skill.version, 7);
+    }
+
+    #[tokio::test]
+    async fn apply_remote_v3_delta_forwards_user_profile_conclusion() {
+        use super::super::sync::DeltaOperation;
+
+        let (tmp, mem) = temp_sqlite();
+        let delta = DeltaOperation::UserProfileConclusion {
+            dimension: "work_style".into(),
+            conclusion: "prefers atomic commits".into(),
+            confidence: 0.85,
+            evidence_count: 4,
+        };
+        assert!(mem.apply_remote_v3_delta(&delta).await.unwrap());
+
+        let profiler = crate::user_model::build_profiler(tmp.path(), "verifier").unwrap();
+        let rows = profiler.find_existing("work_style").unwrap();
+        assert!(rows.iter().any(|c| {
+            c.conclusion == "prefers atomic commits"
+                && (c.confidence - 0.85).abs() < f64::EPSILON
+                && c.evidence_count == 4
+        }));
+    }
+
+    #[tokio::test]
+    async fn apply_remote_v3_delta_forwards_correction_pattern() {
+        use super::super::sync::DeltaOperation;
+
+        let (tmp, mem) = temp_sqlite();
+        let delta = DeltaOperation::CorrectionPatternUpsert {
+            pattern_type: "style".into(),
+            original_regex: "하였다".into(),
+            replacement: "합니다".into(),
+            scope: "all".into(),
+            confidence: 0.6,
+            observation_count: 3,
+            accept_count: 2,
+            reject_count: 0,
+        };
+        assert!(mem.apply_remote_v3_delta(&delta).await.unwrap());
+
+        let store = crate::skills::correction::build_store(tmp.path(), "verifier").unwrap();
+        let pattern = store.find_pattern("하였다", "합니다").unwrap().expect("pattern present");
+        assert_eq!(pattern.observation_count, 3);
+        assert!((pattern.confidence - 0.6).abs() < f64::EPSILON);
     }
 
     #[tokio::test]

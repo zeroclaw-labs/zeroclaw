@@ -260,19 +260,49 @@ impl OrderBuffer {
 
 /// Resolve a concurrent write conflict using Last-Writer-Wins (LWW).
 ///
-/// When two deltas are causally concurrent (neither version vector dominates
-/// the other), we break the tie deterministically:
-///   1. **Higher timestamp wins** (wall-clock, seconds).
-///   2. **On timestamp tie**: lexicographically greater `device_id` wins.
-///
-/// This ensures every device converges to the same state without coordination.
+/// Resolution order (v6.1):
+///   0. **Explicit version numbers** — when both deltas are `SkillUpsert`
+///      carrying a `version: i64`, the higher version wins regardless of
+///      wall-clock. Prevents skills from regressing when stale deltas
+///      arrive after a network partition heals.
+///   1. **HLC stamp** (PR #7, v2 peers) — compare `hlc_stamp` strings with
+///      `crate::sync::hlc::Hlc::parse` + `PartialOrd` when both sides carry
+///      one. Resistant to wall-clock drift between nodes.
+///   2. **Higher timestamp wins** (wall-clock, seconds) — legacy v1 path.
+///   3. **On timestamp tie**: lexicographically greater `device_id` wins.
 ///
 /// Returns `true` if `incoming` should win (overwrite local).
 pub fn lww_resolve(local: &DeltaEntry, incoming: &DeltaEntry) -> bool {
+    // Layer 0 — version-LWW for explicitly versioned deltas
+    if let (
+        crate::memory::sync::DeltaOperation::SkillUpsert { version: lv, .. },
+        crate::memory::sync::DeltaOperation::SkillUpsert { version: iv, .. },
+    ) = (&local.operation, &incoming.operation)
+    {
+        if lv != iv {
+            return iv > lv;
+        }
+        // Same version → fall through to HLC / wall-clock tiebreakers
+    }
+
+    // Layer 1 — HLC when both sides stamped it
+    if let (Some(local_hlc), Some(incoming_hlc)) = (&local.hlc_stamp, &incoming.hlc_stamp) {
+        if let (Ok(l), Ok(i)) =
+            (crate::sync::hlc::Hlc::parse(local_hlc), crate::sync::hlc::Hlc::parse(incoming_hlc))
+        {
+            match i.partial_cmp(&l) {
+                Some(std::cmp::Ordering::Greater) => return true,
+                Some(std::cmp::Ordering::Less) => return false,
+                _ => {} // equal → fall through
+            }
+        }
+    }
+
+    // Layer 2 — wall-clock
     if incoming.timestamp != local.timestamp {
         return incoming.timestamp > local.timestamp;
     }
-    // Deterministic tiebreaker: higher device_id wins
+    // Layer 3 — deterministic tiebreaker
     incoming.device_id > local.device_id
 }
 
@@ -651,6 +681,162 @@ mod tests {
 
         assert!(super::lww_resolve(&local, &incoming)); // zzz > aaa
         assert!(!super::lww_resolve(&incoming, &local)); // aaa < zzz
+    }
+
+    fn make_skill_delta(device_id: &str, timestamp: u64, version: i64, hlc: Option<&str>) -> DeltaEntry {
+        DeltaEntry {
+            id: format!("{device_id}-v{version}"),
+            device_id: device_id.into(),
+            version: VersionVector::default(),
+            operation: DeltaOperation::SkillUpsert {
+                id: "skill-1".into(),
+                name: "test-skill".into(),
+                category: None,
+                description: "d".into(),
+                content_md: format!("body v{version}"),
+                version,
+                created_by: "agent".into(),
+            },
+            timestamp,
+            hlc_stamp: hlc.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn lww_higher_skill_version_wins_over_newer_timestamp() {
+        // Newer wall-clock but lower version must NOT win — prevents skills
+        // regressing when a stale high-timestamp delta arrives late.
+        let local = make_skill_delta("dev_a", 1_000, 5, None);
+        let incoming = make_skill_delta("dev_b", 9_999, 3, None);
+
+        assert!(!super::lww_resolve(&local, &incoming));
+        assert!(super::lww_resolve(&incoming, &local));
+    }
+
+    #[test]
+    fn lww_equal_skill_version_falls_through_to_timestamp() {
+        let local = make_skill_delta("dev_a", 1_000, 5, None);
+        let incoming = make_skill_delta("dev_b", 2_000, 5, None);
+
+        // Same version → Layer 2 (wall-clock) decides.
+        assert!(super::lww_resolve(&local, &incoming));
+    }
+
+    #[test]
+    fn lww_hlc_wins_over_wall_clock_skew() {
+        // Wall-clock says local is newer, but HLC says incoming is newer —
+        // HLC must win because it's drift-resistant.
+        let local = DeltaEntry {
+            id: "d1".into(),
+            device_id: "dev_a".into(),
+            version: VersionVector::default(),
+            operation: DeltaOperation::Store {
+                key: "k".into(),
+                content: "old".into(),
+                category: "core".into(),
+                embedding: None,
+            },
+            timestamp: 5_000,
+            hlc_stamp: Some("1000.0.dev_a".into()),
+        };
+        let incoming = DeltaEntry {
+            id: "d2".into(),
+            device_id: "dev_b".into(),
+            version: VersionVector::default(),
+            operation: DeltaOperation::Store {
+                key: "k".into(),
+                content: "new".into(),
+                category: "core".into(),
+                embedding: None,
+            },
+            timestamp: 1_000, // wall-clock older
+            hlc_stamp: Some("9000.0.dev_b".into()), // but HLC newer
+        };
+
+        assert!(super::lww_resolve(&local, &incoming));
+        assert!(!super::lww_resolve(&incoming, &local));
+    }
+
+    #[test]
+    fn lww_hlc_equal_falls_through_to_wall_clock() {
+        let local = DeltaEntry {
+            id: "d1".into(),
+            device_id: "dev_a".into(),
+            version: VersionVector::default(),
+            operation: DeltaOperation::Store {
+                key: "k".into(),
+                content: "a".into(),
+                category: "core".into(),
+                embedding: None,
+            },
+            timestamp: 1_000,
+            hlc_stamp: Some("5000.0.dev_a".into()),
+        };
+        let incoming = DeltaEntry {
+            id: "d2".into(),
+            device_id: "dev_a".into(),
+            version: VersionVector::default(),
+            operation: DeltaOperation::Store {
+                key: "k".into(),
+                content: "b".into(),
+                category: "core".into(),
+                embedding: None,
+            },
+            timestamp: 2_000, // wall-clock decides
+            hlc_stamp: Some("5000.0.dev_a".into()), // HLC tie
+        };
+
+        assert!(super::lww_resolve(&local, &incoming));
+    }
+
+    #[test]
+    fn lww_malformed_hlc_falls_through_to_wall_clock() {
+        // If either HLC stamp fails to parse, Layer 1 skips gracefully
+        // and Layer 2 takes over.
+        let local = DeltaEntry {
+            id: "d1".into(),
+            device_id: "dev_a".into(),
+            version: VersionVector::default(),
+            operation: DeltaOperation::Store {
+                key: "k".into(),
+                content: "old".into(),
+                category: "core".into(),
+                embedding: None,
+            },
+            timestamp: 2_000,
+            hlc_stamp: Some("not-a-valid-hlc".into()),
+        };
+        let incoming = DeltaEntry {
+            id: "d2".into(),
+            device_id: "dev_b".into(),
+            version: VersionVector::default(),
+            operation: DeltaOperation::Store {
+                key: "k".into(),
+                content: "new".into(),
+                category: "core".into(),
+                embedding: None,
+            },
+            timestamp: 3_000,
+            hlc_stamp: Some("9000.0.dev_b".into()),
+        };
+
+        // Layer 1 skipped, Layer 2 (wall-clock) picks incoming.
+        assert!(super::lww_resolve(&local, &incoming));
+    }
+
+    #[test]
+    fn merge_deltas_lww_version_lww_chooses_higher_version() {
+        // Round-trip check: merge_deltas_lww uses lww_resolve internally,
+        // so version LWW must survive through the batch merge path.
+        let local = vec![make_skill_delta("dev_a", 9_999, 3, None)]; // newer ts, lower v
+        let incoming = vec![make_skill_delta("dev_b", 1_000, 7, None)]; // older ts, higher v
+
+        let merged = super::merge_deltas_lww(&local, &incoming);
+        assert_eq!(merged.len(), 1);
+        match &merged[0].operation {
+            DeltaOperation::SkillUpsert { version, .. } => assert_eq!(*version, 7),
+            _ => panic!("expected SkillUpsert"),
+        }
     }
 
     #[test]
