@@ -47,6 +47,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use zeroclaw_api::channel::Channel;
 use zeroclaw_api::provider::StreamEvent;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory, decay};
@@ -643,6 +644,7 @@ pub async fn agent_turn(
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
+    channel: Option<&dyn Channel>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -669,6 +671,7 @@ pub async fn agent_turn(
         0,    // max_tool_result_chars: 0 = disabled (legacy callers)
         0,    // context_token_budget: 0 = disabled (legacy callers)
         None, // shared_budget: no shared budget for legacy callers
+        channel,
     )
     .await
 }
@@ -807,6 +810,7 @@ pub async fn run_tool_call_loop(
     max_tool_result_chars: usize,
     context_token_budget: usize,
     shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    channel: Option<&dyn Channel>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -1517,10 +1521,40 @@ pub async fn run_tool_call_loop(
                 };
 
                 // Interactive CLI: prompt the operator.
-                // Non-interactive (channels): auto-deny since no operator
-                // is present to approve.
+                // Non-interactive (channels): try the channel's inline
+                // approval (e.g. Telegram inline keyboard) before falling
+                // back to auto-deny.
                 let decision = if mgr.is_non_interactive() {
-                    ApprovalResponse::No
+                    let channel_decision = if let Some(ch) = channel {
+                        let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
+                            tool_name: request.tool_name.clone(),
+                            arguments_summary: crate::approval::summarize_args(&request.arguments),
+                        };
+                        let recipient = channel_reply_target.unwrap_or_default();
+                        match ch.request_approval(recipient, &ch_request).await {
+                            Ok(Some(r)) => Some(r),
+                            Ok(None) => None,
+                            Err(e) => {
+                                tracing::warn!("Channel approval request failed: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    match channel_decision {
+                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve) => {
+                            ApprovalResponse::Yes
+                        }
+                        Some(zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove) => {
+                            ApprovalResponse::Always
+                        }
+                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny) => {
+                            ApprovalResponse::No
+                        }
+                        // Channel doesn't support approval — auto-deny.
+                        None => ApprovalResponse::No,
+                    }
                 } else {
                     mgr.prompt_cli(&request)
                 };
@@ -2501,6 +2535,7 @@ pub async fn run(
                         config.agent.max_tool_result_chars,
                         config.agent.max_context_tokens,
                         None, // shared_budget
+                        None, // channel: CLI mode — uses prompt_cli
                     ),
                 )
                 .await
@@ -2810,6 +2845,7 @@ pub async fn run(
                             config.agent.max_tool_result_chars,
                             config.agent.max_context_tokens,
                             None, // shared_budget
+                            None, // channel: interactive CLI — uses prompt_cli
                         ),
                     )
                     .await
@@ -3322,6 +3358,7 @@ pub async fn process_message(
         &config.agent.tool_call_dedup_exempt,
         activated_handle_pm.as_ref(),
         None,
+        None, // channel: process_message path has no channel ref
     )
     .await
 }
@@ -4367,6 +4404,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -4422,6 +4460,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4471,6 +4510,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -4519,6 +4559,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect_err("should fail without vision_provider config");
@@ -4574,6 +4615,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect_err("should fail when vision provider cannot be created");
@@ -4629,6 +4671,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("text-only messages should succeed with default provider");
@@ -4685,6 +4728,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect_err("should fail due to nonexistent vision provider");
@@ -4739,6 +4783,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -4793,6 +4838,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect_err("should attempt vision provider creation for multiple images");
@@ -4930,6 +4976,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("parallel execution should complete");
@@ -5007,6 +5054,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -5076,6 +5124,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -5140,6 +5189,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -5217,6 +5267,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -5284,6 +5335,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -5371,6 +5423,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("loop should complete");
@@ -5432,6 +5485,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("native fallback id flow should complete");
@@ -5520,6 +5574,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -5585,6 +5640,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("streaming provider should complete");
@@ -5653,6 +5709,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -5728,6 +5785,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -5812,6 +5870,7 @@ mod tests {
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("routed streaming provider should complete");
@@ -5895,6 +5954,7 @@ mod tests {
                 &[],
                 Some(&activated),
                 None,
+                None, // channel
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -6872,6 +6932,7 @@ Let me check the result."#;
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("tool loop should complete");
@@ -7031,6 +7092,7 @@ Let me check the result."#;
                     0,
                     0,
                     None,
+                    None, // channel
                 ),
             )
             .await
@@ -7116,6 +7178,7 @@ Let me check the result."#;
                     0,
                     0,
                     None,
+                    None, // channel
                 ),
             )
             .await
@@ -7174,6 +7237,7 @@ Let me check the result."#;
             0,
             0,
             None,
+            None, // channel
         )
         .await
         .expect("should succeed without cost scope");

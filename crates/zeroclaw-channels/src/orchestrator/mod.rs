@@ -3055,6 +3055,7 @@ async fn process_channel_message(
                         ctx.max_tool_result_chars,
                         ctx.context_token_budget,
                         None, // shared_budget
+                        target_channel.as_deref(),
                     ),
                     ),
                     ),
