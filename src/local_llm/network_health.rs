@@ -189,12 +189,8 @@ pub async fn check_endpoints(urls: &[&str], timeout_per: Duration) -> bool {
     false
 }
 
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+// Use the shared helper from src/util.rs (was duplicated here + cosyvoice2).
+use crate::util::now_unix_secs;
 
 // ── Tests ───────────────────────────────────────────────────────────────
 

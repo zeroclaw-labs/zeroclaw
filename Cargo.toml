@@ -140,6 +140,13 @@ which = "8.0"
 # Temporary directory creation (for self-update)
 tempfile = "3.14"
 
+# Host hardware probing (RAM, CPU) for Gemma 4 tier auto-selection.
+# Disk space and GPU VRAM are detected via OS commands to avoid heavy native deps.
+sysinfo = { version = "0.34", default-features = false, features = ["system"] }
+
+# Timestamp formatting for hardware profile snapshots
+# (chrono is already a top-level dep; no version line needed here)
+
 # WebSocket client channels (Discord/Lark/DingTalk/Nostr)
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }

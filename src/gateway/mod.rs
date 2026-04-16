@@ -456,6 +456,26 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
              [gateway] allow_public_bind = true in config.toml (NOT recommended)."
         );
     }
+
+    // ── QA fix: arm the on-device Gemma 4 fallback path ───────────────
+    // Probes network reachability + spawns the refresh loop, then mutates
+    // `reliability.fallback_providers` / `model_fallbacks` in place to add
+    // an "ollama" tier when the local daemon + model are present. Without
+    // this call, the patent §1 cl. 4 fallback wiring sits dead even though
+    // every supporting module (PR #2 / #3) is on disk.
+    let mut config = config;
+    let armed = crate::local_llm::arm_local_fallback(
+        &mut config.reliability,
+        crate::local_llm::DEFAULT_OLLAMA_URL,
+        true,
+    )
+    .await;
+    tracing::info!(
+        outcome = ?armed.registration,
+        local_model = ?armed.local_model,
+        "Armed local Gemma 4 fallback path"
+    );
+
     let config_state = Arc::new(Mutex::new(config.clone()));
 
     // ── Hooks ──────────────────────────────────────────────────────

@@ -47,7 +47,10 @@ pub fn shared_health() -> Arc<NetworkHealth> {
         .get_or_init(|| {
             let h = NetworkHealth::new();
             if tokio::runtime::Handle::try_current().is_ok() {
-                let _ = Arc::clone(&h)
+                // Fire-and-forget refresh loop; binding the JoinHandle keeps
+                // clippy happy (otherwise it warns about non-binding `let _`
+                // on a future-returning call).
+                let _refresh_handle: tokio::task::JoinHandle<()> = Arc::clone(&h)
                     .spawn_refresh_loop(network_health::DEFAULT_REFRESH_INTERVAL);
             }
             h
@@ -483,16 +486,9 @@ struct PullErrorEnvelope {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-fn home_dir() -> Option<PathBuf> {
-    #[cfg(unix)]
-    {
-        std::env::var_os("HOME").map(PathBuf::from)
-    }
-    #[cfg(windows)]
-    {
-        std::env::var_os("USERPROFILE").map(PathBuf::from)
-    }
-}
+// Use the shared helper in src/util.rs (PR #1 host_probe and PR #8 cosyvoice2
+// used to define their own near-identical copies).
+use crate::util::home_dir;
 
 // ── Tests ───────────────────────────────────────────────────────────────
 

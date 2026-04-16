@@ -227,4 +227,47 @@ mod tests {
         // Index 5 is inside "你" (3-byte char), floor should move back to 3.
         assert_eq!(floor_utf8_char_boundary(s, 5), 3);
     }
+
+    #[test]
+    fn test_home_dir_returns_some_when_env_set() {
+        // Test environments always have HOME on unix or USERPROFILE on windows.
+        let h = home_dir();
+        assert!(h.is_some(), "home_dir should resolve in CI/dev shells");
+    }
+
+    #[test]
+    fn test_now_unix_secs_monotonic() {
+        let a = now_unix_secs();
+        let b = now_unix_secs();
+        assert!(b >= a);
+        // Sanity: should be after 2026-01-01 (1735689600).
+        assert!(a > 1_735_689_600);
+    }
+}
+
+// ── Cross-module helpers (PR #1/#2/#3/#8 used to duplicate these) ──
+
+/// Resolve the user's home directory from the platform-appropriate env var.
+/// `None` only when the var is unset (sandboxed environments). Centralised
+/// here in QA so PR #1 host_probe / PR #2 local_llm / PR #8 cosyvoice2 all
+/// agree on a single implementation.
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        std::env::var_os("HOME").map(std::path::PathBuf::from)
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE").map(std::path::PathBuf::from)
+    }
+}
+
+/// Wall-clock seconds since the Unix epoch. Returns 0 if the system clock
+/// is set before the epoch (impossible in practice but gracefully handled).
+pub fn now_unix_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
