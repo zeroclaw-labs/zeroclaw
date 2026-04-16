@@ -150,8 +150,13 @@ impl Reranker for BgeRerankerStub {
 }
 
 // Re-export the real type so call sites can name it without `cfg` gates.
+// Kept behind `#[allow(unused_imports)]` because no internal caller names
+// `BgeReranker` directly yet — the factory helper above handles both cases.
+// Still exposed for downstream code that wants the unified name.
+#[allow(unused_imports)]
 #[cfg(feature = "embedding-local")]
 pub use real::BgeReranker;
+#[allow(unused_imports)]
 #[cfg(not(feature = "embedding-local"))]
 pub use BgeRerankerStub as BgeReranker;
 

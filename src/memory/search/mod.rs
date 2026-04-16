@@ -17,5 +17,10 @@
 pub mod fusion;
 pub mod rerank;
 
+// `Ranker` and `NoopReranker` are the named "default" and "trait" entry
+// points documented in the module header. They have no internal consumer
+// today, but the public surface is intentional — keep them re-exported.
+#[allow(unused_imports)]
 pub use fusion::{k_way_rrf, Ranker, RrfSettings};
+#[allow(unused_imports)]
 pub use rerank::{NoopReranker, Reranker, RerankCandidate, RerankConfig as RerankRuntimeConfig};

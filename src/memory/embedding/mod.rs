@@ -21,6 +21,12 @@ pub mod local_fastembed;
 pub mod noop;
 pub mod openai;
 
+// Feature-resilient alias — callers get a name that resolves to the real
+// provider with `embedding-local` enabled and the stub otherwise, without
+// having to write `cfg` gates at every use site. Currently all call paths
+// go through the `create_embedding_provider` factory, so allow the re-export
+// to stay unused without a warning.
+#[allow(unused_imports)]
 pub use local_fastembed::LocalFastembedProvider;
 pub use noop::NoopEmbedding;
 pub use openai::OpenAiEmbedding;
