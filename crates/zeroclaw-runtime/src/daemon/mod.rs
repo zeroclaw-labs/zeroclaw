@@ -143,7 +143,7 @@ pub async fn run(
             ));
         } else {
             crate::health::mark_component_ok("channels");
-            tracing::info!("No real-time channels configured; channel supervisor disabled");
+            tracing::info!("No channels configured; channel supervisor disabled");
         }
     } else {
         crate::health::mark_component_ok("channels");
@@ -152,7 +152,7 @@ pub async fn run(
 
     // Wire up MQTT SOP listener if configured and enabled
     if let Some(mqtt_start) = subsystems.mqtt_start {
-        if let Some(ref mqtt_config) = config.channels_config.mqtt {
+        if let Some(ref mqtt_config) = config.channels.mqtt {
             if mqtt_config.enabled {
                 let mqtt_cfg = mqtt_config.clone();
                 let mqtt_start = std::sync::Arc::new(mqtt_start);
@@ -481,7 +481,10 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             zeroclaw_memory::create_memory(
                 &config.memory,
                 &config.workspace_dir,
-                config.api_key.as_deref(),
+                config
+                    .providers
+                    .fallback_provider()
+                    .and_then(|e| e.api_key.as_deref()),
             )
             .ok();
 
@@ -525,7 +528,11 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 (None, Some(mc)) => format!("{mc}\n\n{task_prompt}"),
                 (None, None) => task_prompt,
             };
-            let temp = config.default_temperature;
+            let temp = config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.temperature)
+                .unwrap_or(0.7);
             let phase2_fut = Box::pin(crate::agent::run(
                 config.clone(),
                 Some(prompt),
@@ -894,22 +901,22 @@ fn load_jsonl_messages(path: &std::path::Path) -> Vec<zeroclaw_providers::traits
 /// channels are configured. Returns the first match in priority order.
 fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
     // Priority order: telegram > discord > slack > mattermost
-    if let Some(tg) = &config.channels_config.telegram {
+    if let Some(tg) = &config.channels.telegram {
         // Use the first allowed_user as target, or fall back to empty (broadcast)
         let target = tg.allowed_users.first().cloned().unwrap_or_default();
         if !target.is_empty() {
             return Some(("telegram".to_string(), target));
         }
     }
-    if config.channels_config.discord.is_some() {
+    if config.channels.discord.is_some() {
         // Discord requires explicit target — can't auto-detect
         return None;
     }
-    if config.channels_config.slack.is_some() {
+    if config.channels.slack.is_some() {
         // Slack requires explicit target
         return None;
     }
-    if config.channels_config.mattermost.is_some() {
+    if config.channels.mattermost.is_some() {
         // Mattermost requires explicit target
         return None;
     }
@@ -919,30 +926,30 @@ fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
 fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<()> {
     match channel.to_ascii_lowercase().as_str() {
         "telegram" => {
-            if config.channels_config.telegram.is_none() {
+            if config.channels.telegram.is_none() {
                 anyhow::bail!(
-                    "heartbeat.target is set to telegram but channels_config.telegram is not configured"
+                    "heartbeat.target is set to telegram but channels.telegram is not configured"
                 );
             }
         }
         "discord" => {
-            if config.channels_config.discord.is_none() {
+            if config.channels.discord.is_none() {
                 anyhow::bail!(
-                    "heartbeat.target is set to discord but channels_config.discord is not configured"
+                    "heartbeat.target is set to discord but channels.discord is not configured"
                 );
             }
         }
         "slack" => {
-            if config.channels_config.slack.is_none() {
+            if config.channels.slack.is_none() {
                 anyhow::bail!(
-                    "heartbeat.target is set to slack but channels_config.slack is not configured"
+                    "heartbeat.target is set to slack but channels.slack is not configured"
                 );
             }
         }
         "mattermost" => {
-            if config.channels_config.mattermost.is_none() {
+            if config.channels.mattermost.is_none() {
                 anyhow::bail!(
-                    "heartbeat.target is set to mattermost but channels_config.mattermost is not configured"
+                    "heartbeat.target is set to mattermost but channels.mattermost is not configured"
                 );
             }
         }
@@ -953,11 +960,7 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
-    config
-        .channels_config
-        .channels_except_webhook()
-        .iter()
-        .any(|(_, ok)| *ok)
+    config.channels.channels().iter().any(|(_, ok)| *ok)
 }
 
 // run_mqtt_sop_listener has been moved to zeroclaw-channels::orchestrator::mqtt.
@@ -1038,7 +1041,7 @@ mod tests {
     #[test]
     fn detects_supervised_channels_present() {
         let mut config = Config::default();
-        config.channels_config.telegram = Some(zeroclaw_config::schema::TelegramConfig {
+        config.channels.telegram = Some(zeroclaw_config::schema::TelegramConfig {
             enabled: true,
             bot_token: "token".into(),
             allowed_users: vec![],
@@ -1055,7 +1058,7 @@ mod tests {
     #[test]
     fn detects_dingtalk_as_supervised_channel() {
         let mut config = Config::default();
-        config.channels_config.dingtalk = Some(zeroclaw_config::schema::DingTalkConfig {
+        config.channels.dingtalk = Some(zeroclaw_config::schema::DingTalkConfig {
             enabled: true,
             client_id: "client_id".into(),
             client_secret: "client_secret".into(),
@@ -1068,7 +1071,7 @@ mod tests {
     #[test]
     fn detects_mattermost_as_supervised_channel() {
         let mut config = Config::default();
-        config.channels_config.mattermost = Some(zeroclaw_config::schema::MattermostConfig {
+        config.channels.mattermost = Some(zeroclaw_config::schema::MattermostConfig {
             enabled: true,
             url: "https://mattermost.example.com".into(),
             bot_token: "token".into(),
@@ -1085,7 +1088,7 @@ mod tests {
     #[test]
     fn detects_qq_as_supervised_channel() {
         let mut config = Config::default();
-        config.channels_config.qq = Some(zeroclaw_config::schema::QQConfig {
+        config.channels.qq = Some(zeroclaw_config::schema::QQConfig {
             enabled: true,
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
@@ -1098,16 +1101,30 @@ mod tests {
     #[test]
     fn detects_nextcloud_talk_as_supervised_channel() {
         let mut config = Config::default();
-        config.channels_config.nextcloud_talk =
-            Some(zeroclaw_config::schema::NextcloudTalkConfig {
-                enabled: true,
-                base_url: "https://cloud.example.com".into(),
-                app_token: "app-token".into(),
-                webhook_secret: None,
-                allowed_users: vec!["*".into()],
-                proxy_url: None,
-                bot_name: None,
-            });
+        config.channels.nextcloud_talk = Some(zeroclaw_config::schema::NextcloudTalkConfig {
+            enabled: true,
+            base_url: "https://cloud.example.com".into(),
+            app_token: "app-token".into(),
+            webhook_secret: None,
+            allowed_users: vec!["*".into()],
+            proxy_url: None,
+            bot_name: None,
+        });
+        assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn webhook_only_config_is_supervised() {
+        let mut config = Config::default();
+        config.channels.webhook = Some(zeroclaw_config::schema::WebhookConfig {
+            enabled: true,
+            port: 8080,
+            listen_path: None,
+            send_url: None,
+            send_method: None,
+            auth_header: None,
+            secret: None,
+        });
         assert!(has_supervised_channels(&config));
     }
 
@@ -1160,7 +1177,7 @@ mod tests {
         let err = resolve_heartbeat_delivery(&config).unwrap_err();
         assert!(
             err.to_string()
-                .contains("channels_config.telegram is not configured")
+                .contains("channels.telegram is not configured")
         );
     }
 
@@ -1169,7 +1186,7 @@ mod tests {
         let mut config = Config::default();
         config.heartbeat.target = Some("telegram".into());
         config.heartbeat.to = Some("123456".into());
-        config.channels_config.telegram = Some(zeroclaw_config::schema::TelegramConfig {
+        config.channels.telegram = Some(zeroclaw_config::schema::TelegramConfig {
             enabled: true,
             bot_token: "bot-token".into(),
             allowed_users: vec![],
@@ -1188,7 +1205,7 @@ mod tests {
     #[test]
     fn auto_detect_telegram_when_configured() {
         let mut config = Config::default();
-        config.channels_config.telegram = Some(zeroclaw_config::schema::TelegramConfig {
+        config.channels.telegram = Some(zeroclaw_config::schema::TelegramConfig {
             enabled: true,
             bot_token: "bot-token".into(),
             allowed_users: vec!["user123".into()],
