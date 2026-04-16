@@ -325,3 +325,7 @@ harness = false
 [[bench]]
 name = "community_detection"
 harness = false
+
+[[bench]]
+name = "embedding_batch"
+harness = false
