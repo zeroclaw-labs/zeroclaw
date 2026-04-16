@@ -112,7 +112,7 @@ urlencoding = "2.1"
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"
 
-rumqttc = "0.24"
+rumqttc = "0.25"
 
 # Tarball extraction for binary updates
 flate2 = "1"
