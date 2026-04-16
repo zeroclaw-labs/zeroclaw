@@ -196,14 +196,18 @@ pub enum StreamEvent {
     PreExecutedToolCall { name: String, args: String },
     /// The result of a pre-executed tool call.
     PreExecutedToolResult { name: String, output: String },
-    /// Stream has completed.
-    Final,
+    /// Stream has completed, optionally carrying final token usage.
+    Final {
+        /// Token usage reported by the provider at end-of-stream.
+        /// `None` if the provider does not report usage during streaming.
+        usage: Option<TokenUsage>,
+    },
 }
 
 impl StreamEvent {
     pub fn from_chunk(chunk: StreamChunk) -> Self {
         if chunk.is_final {
-            Self::Final
+            Self::Final { usage: None }
         } else {
             Self::TextDelta(chunk)
         }

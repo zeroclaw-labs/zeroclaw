@@ -42,10 +42,15 @@ pub async fn execute_one_tool(
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<ToolExecutionOutcome> {
+    let trace_content = crate::agent::agent::trace_content_enabled();
     let args_summary = truncate_with_ellipsis(&call_arguments.to_string(), 300);
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
-        arguments: Some(args_summary),
+        arguments: if trace_content {
+            Some(args_summary)
+        } else {
+            None
+        },
     });
     let start = Instant::now();
 
@@ -62,6 +67,11 @@ pub async fn execute_one_tool(
             tool: call_name.to_string(),
             duration,
             success: false,
+            output: if trace_content {
+                Some(reason.clone())
+            } else {
+                None
+            },
         });
         return Ok(ToolExecutionOutcome {
             output: reason.clone(),
@@ -84,10 +94,16 @@ pub async fn execute_one_tool(
     match tool_result {
         Ok(r) => {
             let duration = start.elapsed();
+            let tool_output_for_trace = if trace_content {
+                Some(crate::agent::agent::truncate_utf8(&r.output, 4096))
+            } else {
+                None
+            };
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
                 duration,
                 success: r.success,
+                output: tool_output_for_trace,
             });
             if r.success {
                 let normalized_output = if r.output.is_empty() {
@@ -113,12 +129,17 @@ pub async fn execute_one_tool(
         }
         Err(e) => {
             let duration = start.elapsed();
+            let reason = format!("Error executing {call_name}: {e}");
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
                 duration,
                 success: false,
+                output: if trace_content {
+                    Some(crate::agent::agent::truncate_utf8(&reason, 4096))
+                } else {
+                    None
+                },
             });
-            let reason = format!("Error executing {call_name}: {e}");
             Ok(ToolExecutionOutcome {
                 output: reason.clone(),
                 success: false,

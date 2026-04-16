@@ -1280,7 +1280,7 @@ pub(crate) fn sse_bytes_to_events(
             }
         }
 
-        let _ = tx.send(Ok(StreamEvent::Final)).await;
+        let _ = tx.send(Ok(StreamEvent::Final { usage: None })).await;
     });
 
     stream::unfold(rx, |mut rx| async move {
@@ -2178,7 +2178,7 @@ impl Provider for OpenAiCompatibleProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         if !options.enabled {
-            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+            return stream::once(async { Ok(StreamEvent::Final { usage: None }) }).boxed();
         }
 
         let credential = self.credential.clone();

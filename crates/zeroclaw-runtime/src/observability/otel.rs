@@ -1,18 +1,26 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
-use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
-use opentelemetry::{KeyValue, global};
+use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt, Tracer};
+use opentelemetry::{Context, KeyValue, global};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use parking_lot::Mutex;
 use std::any::Any;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::SystemTime;
+
+static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
+static METER_PROVIDER: OnceLock<SdkMeterProvider> = OnceLock::new();
 
 /// OpenTelemetry-backed observer — exports traces and metrics via OTLP.
 pub struct OtelObserver {
-    tracer_provider: SdkTracerProvider,
-    meter_provider: SdkMeterProvider,
+    // Span parenting state
+    agent_context: Mutex<Option<Context>>,
+    pending_messages_count: Mutex<Option<usize>>,
+    pending_tool_args: Mutex<Option<String>>,
+    pending_prompt_content: Mutex<Option<String>>,
 
     // Metrics instruments
     agent_starts: Counter<u64>,
@@ -48,53 +56,58 @@ impl OtelObserver {
         let metrics_endpoint = format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
         let service_name = service_name.unwrap_or("zeroclaw");
 
-        // ── Trace exporter ──────────────────────────────────────
-        let mut span_builder = opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_endpoint(&traces_endpoint);
-        if let Some(ref h) = headers {
-            span_builder = span_builder.with_headers(h.clone());
-        }
-        let span_exporter = span_builder
-            .build()
-            .map_err(|e| format!("Failed to create OTLP span exporter: {e}"))?;
+        // ── Singleton tracer provider (OnceLock) ────────────────
+        let _tp = TRACER_PROVIDER.get_or_init(|| {
+            let mut span_builder = opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_endpoint(&traces_endpoint);
+            if let Some(ref h) = headers {
+                span_builder = span_builder.with_headers(h.clone());
+            }
+            let span_exporter = span_builder
+                .build()
+                .expect("Failed to create OTLP span exporter");
 
-        let tracer_provider = SdkTracerProvider::builder()
-            .with_batch_exporter(span_exporter)
-            .with_resource(
-                opentelemetry_sdk::Resource::builder()
-                    .with_service_name(service_name.to_string())
-                    .build(),
-            )
-            .build();
+            let tp = SdkTracerProvider::builder()
+                .with_batch_exporter(span_exporter)
+                .with_resource(
+                    opentelemetry_sdk::Resource::builder()
+                        .with_service_name(service_name.to_string())
+                        .build(),
+                )
+                .build();
 
-        global::set_tracer_provider(tracer_provider.clone());
+            global::set_tracer_provider(tp.clone());
+            tp
+        });
 
-        // ── Metric exporter ─────────────────────────────────────
-        let mut metric_builder = opentelemetry_otlp::MetricExporter::builder()
-            .with_http()
-            .with_endpoint(&metrics_endpoint);
-        if let Some(ref h) = headers {
-            metric_builder = metric_builder.with_headers(h.clone());
-        }
-        let metric_exporter = metric_builder
-            .build()
-            .map_err(|e| format!("Failed to create OTLP metric exporter: {e}"))?;
+        // ── Singleton meter provider (OnceLock) ─────────────────
+        let _mp = METER_PROVIDER.get_or_init(|| {
+            let mut metric_builder = opentelemetry_otlp::MetricExporter::builder()
+                .with_http()
+                .with_endpoint(&metrics_endpoint);
+            if let Some(ref h) = headers {
+                metric_builder = metric_builder.with_headers(h.clone());
+            }
+            let metric_exporter = metric_builder
+                .build()
+                .expect("Failed to create OTLP metric exporter");
 
-        let metric_reader =
-            opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
+            let metric_reader =
+                opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
 
-        let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-            .with_reader(metric_reader)
-            .with_resource(
-                opentelemetry_sdk::Resource::builder()
-                    .with_service_name(service_name.to_string())
-                    .build(),
-            )
-            .build();
+            let mp = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+                .with_reader(metric_reader)
+                .with_resource(
+                    opentelemetry_sdk::Resource::builder()
+                        .with_service_name(service_name.to_string())
+                        .build(),
+                )
+                .build();
 
-        let meter_provider_clone = meter_provider.clone();
-        global::set_meter_provider(meter_provider);
+            global::set_meter_provider(mp.clone());
+            mp
+        });
 
         // ── Create metric instruments ────────────────────────────
         let meter = global::meter("zeroclaw");
@@ -185,8 +198,10 @@ impl OtelObserver {
             .build();
 
         Ok(Self {
-            tracer_provider,
-            meter_provider: meter_provider_clone,
+            agent_context: Mutex::new(None),
+            pending_messages_count: Mutex::new(None),
+            pending_tool_args: Mutex::new(None),
+            pending_prompt_content: Mutex::new(None),
             agent_starts,
             agent_duration,
             llm_calls,
@@ -211,6 +226,17 @@ impl Observer for OtelObserver {
     fn record_event(&self, event: &ObserverEvent) {
         let tracer = global::tracer("zeroclaw");
 
+        // Macro: build a span as child of the agent root context, or standalone.
+        macro_rules! child_span {
+            ($builder:expr, $ctx:expr) => {
+                if let Some(parent_ctx) = $ctx.as_ref() {
+                    tracer.build_with_context($builder, parent_ctx)
+                } else {
+                    tracer.build($builder)
+                }
+            };
+        }
+
         match event {
             ObserverEvent::AgentStart { provider, model } => {
                 self.agent_starts.add(
@@ -220,10 +246,31 @@ impl Observer for OtelObserver {
                         KeyValue::new("model", model.clone()),
                     ],
                 );
+
+                // Create root span for the agent invocation
+                let span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("agent.invocation")
+                        .with_kind(SpanKind::Internal)
+                        .with_attributes(vec![
+                            KeyValue::new("provider", provider.clone()),
+                            KeyValue::new("model", model.clone()),
+                        ]),
+                );
+                let ctx = Context::current_with_span(span);
+                *self.agent_context.lock() = Some(ctx);
             }
-            ObserverEvent::LlmRequest { .. }
-            | ObserverEvent::ToolCallStart { .. }
-            | ObserverEvent::TurnComplete
+            ObserverEvent::LlmRequest {
+                messages_count,
+                prompt_content,
+                ..
+            } => {
+                *self.pending_messages_count.lock() = Some(*messages_count);
+                *self.pending_prompt_content.lock() = prompt_content.clone();
+            }
+            ObserverEvent::ToolCallStart { arguments, .. } => {
+                *self.pending_tool_args.lock() = arguments.clone();
+            }
+            ObserverEvent::TurnComplete
             | ObserverEvent::CacheHit { .. }
             | ObserverEvent::CacheMiss { .. } => {}
             ObserverEvent::LlmResponse {
@@ -231,9 +278,10 @@ impl Observer for OtelObserver {
                 model,
                 duration,
                 success,
-                error_message: _,
-                input_tokens: _,
-                output_tokens: _,
+                error_message,
+                input_tokens,
+                output_tokens,
+                response_content,
             } => {
                 let secs = duration.as_secs_f64();
                 let attrs = [
@@ -244,25 +292,51 @@ impl Observer for OtelObserver {
                 self.llm_calls.add(1, &attrs);
                 self.llm_duration.record(secs, &attrs);
 
-                // Create a completed span for visibility in trace backends.
                 let start_time = SystemTime::now()
                     .checked_sub(*duration)
                     .unwrap_or(SystemTime::now());
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("llm.call")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("provider", provider.clone()),
-                            KeyValue::new("model", model.clone()),
-                            KeyValue::new("success", *success),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
+
+                let messages_count = self.pending_messages_count.lock().take().unwrap_or(0);
+                let prompt_content = self.pending_prompt_content.lock().take();
+
+                let mut span_attrs = vec![
+                    KeyValue::new("provider", provider.clone()),
+                    KeyValue::new("model", model.clone()),
+                    KeyValue::new("success", *success),
+                    KeyValue::new("duration_s", secs),
+                    KeyValue::new("messages_count", messages_count as i64),
+                ];
+                if let Some(input) = input_tokens {
+                    span_attrs.push(KeyValue::new("gen_ai.usage.input_tokens", *input as i64));
+                }
+                if let Some(output) = output_tokens {
+                    span_attrs.push(KeyValue::new("gen_ai.usage.output_tokens", *output as i64));
+                }
+                let total = input_tokens.unwrap_or(0) + output_tokens.unwrap_or(0);
+                if total > 0 {
+                    span_attrs.push(KeyValue::new("gen_ai.usage.total_tokens", total as i64));
+                }
+                if let Some(err) = error_message {
+                    span_attrs.push(KeyValue::new("error.message", err.clone()));
+                }
+                if let Some(content) = prompt_content {
+                    span_attrs.push(KeyValue::new("gen_ai.content.prompt", content));
+                }
+                if let Some(content) = response_content {
+                    span_attrs.push(KeyValue::new("gen_ai.content.completion", content.clone()));
+                }
+
+                let builder = opentelemetry::trace::SpanBuilder::from_name("llm.call")
+                    .with_kind(SpanKind::Client)
+                    .with_start_time(start_time)
+                    .with_attributes(span_attrs);
+
+                let parent_ctx = self.agent_context.lock().clone();
+                let mut span = child_span!(builder, parent_ctx);
                 if *success {
                     span.set_status(Status::Ok);
                 } else {
-                    span.set_status(Status::error(""));
+                    span.set_status(Status::error(error_message.clone().unwrap_or_default()));
                 }
                 span.end();
             }
@@ -274,28 +348,25 @@ impl Observer for OtelObserver {
                 cost_usd,
             } => {
                 let secs = duration.as_secs_f64();
-                let start_time = SystemTime::now()
-                    .checked_sub(*duration)
-                    .unwrap_or(SystemTime::now());
 
-                // Create a completed span with correct timing
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("agent.invocation")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("provider", provider.clone()),
-                            KeyValue::new("model", model.clone()),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
-                if let Some(t) = tokens_used {
-                    span.set_attribute(KeyValue::new("tokens_used", *t as i64));
+                // End the root agent span that was created in AgentStart
+                if let Some(ctx) = self.agent_context.lock().take() {
+                    let span = ctx.span();
+                    span.set_attribute(KeyValue::new("duration_s", secs));
+                    if let Some(t) = tokens_used {
+                        span.set_attribute(KeyValue::new("gen_ai.usage.total_tokens", *t as i64));
+                    }
+                    if let Some(c) = cost_usd {
+                        span.set_attribute(KeyValue::new("cost_usd", *c));
+                    }
+                    span.set_status(Status::Ok);
+                    span.end();
                 }
-                if let Some(c) = cost_usd {
-                    span.set_attribute(KeyValue::new("cost_usd", *c));
-                }
-                span.end();
+
+                // Clear pending state
+                *self.pending_messages_count.lock() = None;
+                *self.pending_tool_args.lock() = None;
+                *self.pending_prompt_content.lock() = None;
 
                 self.agent_duration.record(
                     secs,
@@ -304,13 +375,12 @@ impl Observer for OtelObserver {
                         KeyValue::new("model", model.clone()),
                     ],
                 );
-                // Note: tokens are recorded via record_metric(TokensUsed) to avoid
-                // double-counting. AgentEnd only records duration.
             }
             ObserverEvent::ToolCall {
                 tool,
                 duration,
                 success,
+                output,
             } => {
                 let secs = duration.as_secs_f64();
                 let start_time = SystemTime::now()
@@ -323,16 +393,30 @@ impl Observer for OtelObserver {
                     Status::error("")
                 };
 
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("tool.call")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("tool.name", tool.clone()),
-                            KeyValue::new("tool.success", *success),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
+                let mut span_attrs = vec![
+                    KeyValue::new("tool.name", tool.clone()),
+                    KeyValue::new("tool.success", *success),
+                    KeyValue::new("duration_s", secs),
+                ];
+                if let Some(args) = self.pending_tool_args.lock().take() {
+                    span_attrs.push(KeyValue::new("tool.arguments", args));
+                }
+                if let Some(out) = output {
+                    let truncated = if out.len() > 4096 {
+                        format!("{}...", &out[..out.floor_char_boundary(4096)])
+                    } else {
+                        out.clone()
+                    };
+                    span_attrs.push(KeyValue::new("tool.output", truncated));
+                }
+
+                let builder = opentelemetry::trace::SpanBuilder::from_name("tool.call")
+                    .with_kind(SpanKind::Internal)
+                    .with_start_time(start_time)
+                    .with_attributes(span_attrs);
+
+                let parent_ctx = self.agent_context.lock().clone();
+                let mut span = child_span!(builder, parent_ctx);
                 span.set_status(status);
                 span.end();
 
@@ -357,15 +441,15 @@ impl Observer for OtelObserver {
                 self.heartbeat_ticks.add(1, &[]);
             }
             ObserverEvent::Error { component, message } => {
-                // Create an error span for visibility in trace backends
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("error")
-                        .with_kind(SpanKind::Internal)
-                        .with_attributes(vec![
-                            KeyValue::new("component", component.clone()),
-                            KeyValue::new("error.message", message.clone()),
-                        ]),
-                );
+                let builder = opentelemetry::trace::SpanBuilder::from_name("error")
+                    .with_kind(SpanKind::Internal)
+                    .with_attributes(vec![
+                        KeyValue::new("component", component.clone()),
+                        KeyValue::new("error.message", message.clone()),
+                    ]);
+
+                let parent_ctx = self.agent_context.lock().clone();
+                let mut span = child_span!(builder, parent_ctx);
                 span.set_status(Status::error(message.clone()));
                 span.end();
 
@@ -384,17 +468,18 @@ impl Observer for OtelObserver {
                     .checked_sub(duration)
                     .unwrap_or(SystemTime::now());
 
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("hand.run")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("hand.name", hand_name.clone()),
-                            KeyValue::new("hand.success", true),
-                            KeyValue::new("hand.findings", *findings_count as i64),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
+                let builder = opentelemetry::trace::SpanBuilder::from_name("hand.run")
+                    .with_kind(SpanKind::Internal)
+                    .with_start_time(start_time)
+                    .with_attributes(vec![
+                        KeyValue::new("hand.name", hand_name.clone()),
+                        KeyValue::new("hand.success", true),
+                        KeyValue::new("hand.findings", *findings_count as i64),
+                        KeyValue::new("duration_s", secs),
+                    ]);
+
+                let parent_ctx = self.agent_context.lock().clone();
+                let mut span = child_span!(builder, parent_ctx);
                 span.set_status(Status::Ok);
                 span.end();
 
@@ -421,17 +506,18 @@ impl Observer for OtelObserver {
                     .checked_sub(duration)
                     .unwrap_or(SystemTime::now());
 
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("hand.run")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("hand.name", hand_name.clone()),
-                            KeyValue::new("hand.success", false),
-                            KeyValue::new("error.message", error.clone()),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
+                let builder = opentelemetry::trace::SpanBuilder::from_name("hand.run")
+                    .with_kind(SpanKind::Internal)
+                    .with_start_time(start_time)
+                    .with_attributes(vec![
+                        KeyValue::new("hand.name", hand_name.clone()),
+                        KeyValue::new("hand.success", false),
+                        KeyValue::new("error.message", error.clone()),
+                        KeyValue::new("duration_s", secs),
+                    ]);
+
+                let parent_ctx = self.agent_context.lock().clone();
+                let mut span = child_span!(builder, parent_ctx);
                 span.set_status(Status::error(error.clone()));
                 span.end();
 
@@ -496,10 +582,14 @@ impl Observer for OtelObserver {
     }
 
     fn flush(&self) {
-        if let Err(e) = self.tracer_provider.force_flush() {
+        if let Some(tp) = TRACER_PROVIDER.get()
+            && let Err(e) = tp.force_flush()
+        {
             tracing::warn!("OTel trace flush failed: {e}");
         }
-        if let Err(e) = self.meter_provider.force_flush() {
+        if let Some(mp) = METER_PROVIDER.get()
+            && let Err(e) = mp.force_flush()
+        {
             tracing::warn!("OTel metric flush failed: {e}");
         }
     }
@@ -548,6 +638,7 @@ mod tests {
             provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             messages_count: 2,
+            prompt_content: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             provider: "openrouter".into(),
@@ -557,6 +648,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
+            response_content: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             provider: "openrouter".into(),
@@ -580,11 +672,13 @@ mod tests {
             tool: "shell".into(),
             duration: Duration::from_millis(10),
             success: true,
+            output: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "file_read".into(),
             duration: Duration::from_millis(5),
             success: false,
+            output: None,
         });
         obs.record_event(&ObserverEvent::TurnComplete);
         obs.record_event(&ObserverEvent::ChannelMessage {
@@ -638,6 +732,7 @@ mod tests {
             error_message: Some("404 Not Found".into()),
             input_tokens: None,
             output_tokens: None,
+            response_content: None,
         });
     }
 
@@ -730,11 +825,13 @@ mod tests {
             error_message: None,
             input_tokens: Some(10),
             output_tokens: Some(5),
+            response_content: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
             duration: Duration::from_millis(50),
             success: true,
+            output: None,
         });
     }
 

@@ -339,7 +339,7 @@ impl Observer for PrometheusObserver {
                 success,
                 input_tokens,
                 output_tokens,
-                ..
+                ..  // duration, error_message, response_content
             } => {
                 let success_str = if *success { "true" } else { "false" };
                 self.llm_requests
@@ -365,6 +365,7 @@ impl Observer for PrometheusObserver {
                 tool,
                 duration,
                 success,
+                ..
             } => {
                 let success_str = if *success { "true" } else { "false" };
                 self.tool_calls
@@ -554,11 +555,13 @@ mod tests {
             tool: "shell".into(),
             duration: Duration::from_millis(10),
             success: true,
+            output: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "file_read".into(),
             duration: Duration::from_millis(5),
             success: false,
+            output: None,
         });
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),
@@ -592,6 +595,7 @@ mod tests {
             tool: "shell".into(),
             duration: Duration::from_millis(100),
             success: true,
+            output: None,
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_metric(&ObserverMetric::RequestLatency(Duration::from_millis(250)));
@@ -623,16 +627,19 @@ mod tests {
             tool: "shell".into(),
             duration: Duration::from_millis(10),
             success: true,
+            output: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
             duration: Duration::from_millis(10),
             success: true,
+            output: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
             duration: Duration::from_millis(10),
             success: false,
+            output: None,
         });
 
         let output = obs.encode();
@@ -683,6 +690,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
+            response_content: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             provider: "openrouter".into(),
@@ -692,6 +700,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(200),
             output_tokens: Some(80),
+            response_content: None,
         });
 
         let output = obs.encode();
@@ -773,6 +782,7 @@ mod tests {
             error_message: Some("timeout".into()),
             input_tokens: None,
             output_tokens: None,
+            response_content: None,
         });
 
         let output = obs.encode();
