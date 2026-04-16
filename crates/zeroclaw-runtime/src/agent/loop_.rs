@@ -282,18 +282,18 @@ pub fn scrub_credentials(input: &str) -> String {
 /// Minimum interval between progress sends to avoid flooding the draft channel.
 pub const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
 
-/// Structured event sent through the draft channel so channels can
-/// differentiate between status/progress updates and actual response content.
+/// Delta sent from the agent loop to the channel's draft updater.
+/// Append-only — no clear/reset variant exists by design.
 #[derive(Debug, Clone)]
-pub enum DraftEvent {
-    /// Clear accumulated draft content (e.g. before streaming a new response).
-    Clear,
-    /// Progress / status text — channels can show this in a status bar
-    /// rather than in the message body (e.g. "🤔 Thinking...", "⏳ shell_command").
-    Progress(String),
-    /// Actual response content delta to append to the draft message.
-    Content(String),
+pub enum StreamDelta {
+    /// Response text to append to the message buffer.
+    Text(String),
+    /// Ephemeral tool progress (not part of the response body).
+    Status(String),
 }
+
+/// Backwards-compatible alias while callers are migrated.
+pub type DraftEvent = StreamDelta;
 
 pub use zeroclaw_api::TOOL_CHOICE_OVERRIDE;
 
@@ -572,12 +572,6 @@ async fn consume_provider_streaming_response(
             StreamEvent::ToolCall(tool_call) => {
                 outcome.tool_calls.push(tool_call);
                 suppress_forwarding = true;
-                if outcome.forwarded_live_deltas {
-                    if let Some(tx) = delta_sender {
-                        let _ = tx.send(DraftEvent::Clear).await;
-                    }
-                    outcome.forwarded_live_deltas = false;
-                }
             }
             StreamEvent::PreExecutedToolCall { .. } | StreamEvent::PreExecutedToolResult { .. } => {
                 // Pre-executed tool events are for observability only.
@@ -608,12 +602,6 @@ async fn consume_provider_streaming_response(
                         || lowered.contains("\"tool_calls\"")
                 } {
                     suppress_forwarding = true;
-                    if outcome.forwarded_live_deltas {
-                        if let Some(tx) = delta_sender {
-                            let _ = tx.send(DraftEvent::Clear).await;
-                        }
-                        outcome.forwarded_live_deltas = false;
-                    }
                 }
 
                 if suppress_forwarding {
@@ -621,11 +609,8 @@ async fn consume_provider_streaming_response(
                 }
 
                 if let Some(tx) = delta_sender {
-                    if !outcome.forwarded_live_deltas {
-                        let _ = tx.send(DraftEvent::Clear).await;
-                        outcome.forwarded_live_deltas = true;
-                    }
-                    if tx.send(DraftEvent::Content(chunk.delta)).await.is_err() {
+                    outcome.forwarded_live_deltas = true;
+                    if tx.send(StreamDelta::Text(chunk.delta)).await.is_err() {
                         delta_sender = None;
                     }
                 }
@@ -847,6 +832,9 @@ pub async fn run_tool_call_loop(
         },
     );
 
+    // Accumulated display text across all tool-loop calls.
+    let mut accumulated_display_text = String::new();
+
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
@@ -998,7 +986,7 @@ pub async fn run_tool_call_loop(
             } else {
                 format!("\u{1f914} Thinking (round {})...\n", iteration + 1)
             };
-            let _ = tx.send(DraftEvent::Progress(phase)).await;
+            let _ = tx.send(StreamDelta::Status(phase)).await;
         }
 
         observer.record_event(&ObserverEvent::LlmRequest {
@@ -1102,9 +1090,6 @@ pub async fn run_tool_call_loop(
                             "error": scrub_credentials(&stream_err.to_string()),
                         }),
                     );
-                    if let Some(ref tx) = on_delta {
-                        let _ = tx.send(DraftEvent::Clear).await;
-                    }
                     {
                         let chat_future = active_provider.chat(
                             ChatRequest {
@@ -1365,13 +1350,12 @@ pub async fn run_tool_call_loop(
         } else {
             parsed_text
         };
-
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
             let llm_secs = llm_started_at.elapsed().as_secs();
             if !tool_calls.is_empty() {
                 let _ = tx
-                    .send(DraftEvent::Progress(format!(
+                    .send(StreamDelta::Status(format!(
                         "\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
                         tool_calls.len()
                     )))
@@ -1394,19 +1378,13 @@ pub async fn run_tool_call_loop(
                 }),
             );
             // No tool calls — this is the final response.
-            // If a streaming sender is provided, relay the text in small chunks
-            // so the channel can progressively update the draft message.
-            if let Some(ref tx) = on_delta {
-                let should_emit_post_hoc_chunks =
-                    !response_streamed_live || display_text != response_text;
-                if !should_emit_post_hoc_chunks {
-                    history.push(ChatMessage::assistant(response_text.clone()));
-                    return Ok(display_text);
-                }
-                // Clear accumulated progress lines before streaming the final answer.
-                let _ = tx.send(DraftEvent::Clear).await;
-                // Split on whitespace boundaries, accumulating chunks of at least
-                // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
+            accumulated_display_text.push_str(&display_text);
+
+            // If text wasn't streamed live, send it now via post-hoc chunking.
+            // When streamed live, the channel already received the deltas.
+            if let Some(ref tx) = on_delta
+                && !response_streamed_live
+            {
                 let mut chunk = String::new();
                 for word in display_text.split_inclusive(char::is_whitespace) {
                     if cancellation_token
@@ -1418,20 +1396,24 @@ pub async fn run_tool_call_loop(
                     chunk.push_str(word);
                     if chunk.len() >= STREAM_CHUNK_MIN_CHARS
                         && tx
-                            .send(DraftEvent::Content(std::mem::take(&mut chunk)))
+                            .send(StreamDelta::Text(std::mem::take(&mut chunk)))
                             .await
                             .is_err()
                     {
-                        break; // receiver dropped
+                        break;
                     }
                 }
                 if !chunk.is_empty() {
-                    let _ = tx.send(DraftEvent::Content(chunk)).await;
+                    let _ = tx.send(StreamDelta::Text(chunk)).await;
                 }
             }
+
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(display_text);
+            return Ok(accumulated_display_text);
         }
+
+        // Accumulate text from this iteration (tool calls present, loop continues).
+        accumulated_display_text.push_str(&display_text);
 
         // Native tool-call providers can return assistant text separately from
         // the structured call payload; relay it to draft-capable channels.
@@ -1443,7 +1425,7 @@ pub async fn run_tool_call_loop(
                 if !narration.ends_with('\n') {
                     narration.push('\n');
                 }
-                let _ = tx.send(DraftEvent::Content(narration)).await;
+                let _ = tx.send(StreamDelta::Text(narration)).await;
             }
             if !silent {
                 print!("{display_text}");
@@ -1492,7 +1474,7 @@ pub async fn run_tool_call_loop(
                         );
                         if let Some(ref tx) = on_delta {
                             let _ = tx
-                                .send(DraftEvent::Progress(format!(
+                                .send(StreamDelta::Status(format!(
                                     "\u{274c} {}: {}\n",
                                     call.name,
                                     truncate_with_ellipsis(&scrub_credentials(&cancelled), 200)
@@ -1563,7 +1545,7 @@ pub async fn run_tool_call_loop(
                     );
                     if let Some(ref tx) = on_delta {
                         let _ = tx
-                            .send(DraftEvent::Progress(format!(
+                            .send(StreamDelta::Status(format!(
                                 "\u{274c} {}: {}\n",
                                 tool_name, denied
                             )))
@@ -1611,7 +1593,7 @@ pub async fn run_tool_call_loop(
                 );
                 if let Some(ref tx) = on_delta {
                     let _ = tx
-                        .send(DraftEvent::Progress(format!(
+                        .send(StreamDelta::Status(format!(
                             "\u{274c} {}: {}\n",
                             tool_name, duplicate
                         )))
@@ -1669,7 +1651,7 @@ pub async fn run_tool_call_loop(
                     format!("\u{23f3} {}: {hint}\n", tool_name)
                 };
                 tracing::debug!(tool = %tool_name, "Sending progress start to draft");
-                let _ = tx.send(DraftEvent::Progress(progress)).await;
+                let _ = tx.send(StreamDelta::Status(progress)).await;
             }
 
             executable_indices.push(idx);
@@ -1748,7 +1730,7 @@ pub async fn run_tool_call_loop(
                     format!("\u{274c} {} ({secs}s)\n", call.name)
                 };
                 tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
-                let _ = tx.send(DraftEvent::Progress(progress_msg)).await;
+                let _ = tx.send(StreamDelta::Status(progress_msg)).await;
             }
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
@@ -1932,7 +1914,8 @@ pub async fn run_tool_call_loop(
             if text.is_empty() {
                 anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
             }
-            Ok(text)
+            accumulated_display_text.push_str(&text);
+            Ok(accumulated_display_text)
         }
         Err(e) => {
             tracing::warn!(error = %e, "Final summary LLM call failed, bailing");
@@ -2005,13 +1988,15 @@ pub async fn run(
         &config.workspace_dir,
     ));
 
+    let fallback_provider_loop = config.providers.fallback_provider();
+
     // ── Memory (the brain) ────────────────────────────────────────
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
-        &config.embedding_routes,
+        &config.providers.embedding_routes,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
-        config.api_key.as_deref(),
+        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
@@ -2051,7 +2036,7 @@ pub async fn run(
         &config.web_fetch,
         &config.workspace_dir,
         &config.agents,
-        config.api_key.as_deref(),
+        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
         &config,
         None,
     );
@@ -2156,13 +2141,13 @@ pub async fn run(
     // ── Resolve provider ─────────────────────────────────────────
     let mut provider_name = provider_override
         .as_deref()
-        .or(config.default_provider.as_deref())
+        .or(config.providers.fallback.as_deref())
         .unwrap_or("openrouter")
         .to_string();
 
     let mut model_name = model_override
         .as_deref()
-        .or(config.default_model.as_deref())
+        .or(fallback_provider_loop.and_then(|e| e.model.as_deref()))
         .unwrap_or("anthropic/claude-sonnet-4")
         .to_string();
 
@@ -2171,10 +2156,10 @@ pub async fn run(
 
     let mut provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
         &provider_name,
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
+        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
+        fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
         &config.reliability,
-        &config.model_routes,
+        &config.providers.model_routes,
         &model_name,
         &provider_runtime_options,
     )?;
@@ -2536,10 +2521,10 @@ pub async fn run(
 
                         provider = zeroclaw_providers::create_routed_provider_with_options(
                             &new_provider,
-                            config.api_key.as_deref(),
-                            config.api_url.as_deref(),
+                            fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
+                            fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
                             &config.reliability,
-                            &config.model_routes,
+                            &config.providers.model_routes,
                             &new_model,
                             &provider_runtime_options,
                         )?;
@@ -2770,10 +2755,7 @@ pub async fn run(
                 use std::io::Write;
                 while let Some(event) = delta_rx.recv().await {
                     match event {
-                        DraftEvent::Clear => {
-                            let _ = writeln!(std::io::stderr());
-                        }
-                        DraftEvent::Progress(text) => {
+                        StreamDelta::Status(text) => {
                             if is_tty {
                                 let _ = write!(std::io::stderr(), "\x1b[2m{text}\x1b[0m");
                             } else {
@@ -2781,7 +2763,7 @@ pub async fn run(
                             }
                             let _ = std::io::stderr().flush();
                         }
-                        DraftEvent::Content(text) => {
+                        StreamDelta::Text(text) => {
                             content_streamed_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                             print!("{text}");
                             let _ = std::io::stdout().flush();
@@ -2849,10 +2831,10 @@ pub async fn run(
 
                             provider = zeroclaw_providers::create_routed_provider_with_options(
                                 &new_provider,
-                                config.api_key.as_deref(),
-                                config.api_url.as_deref(),
+                                fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
+                                fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
                                 &config.reliability,
-                                &config.model_routes,
+                                &config.providers.model_routes,
                                 &new_model,
                                 &provider_runtime_options,
                             )?;
@@ -3006,13 +2988,14 @@ pub async fn process_message(
         &config.autonomy,
         &config.workspace_dir,
     ));
+    let fallback_provider_pm = config.providers.fallback_provider();
     let approval_manager = ApprovalManager::for_non_interactive(&config.autonomy);
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
         &config.memory,
-        &config.embedding_routes,
+        &config.providers.embedding_routes,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
-        config.api_key.as_deref(),
+        fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
     )?);
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
@@ -3042,7 +3025,7 @@ pub async fn process_message(
         &config.web_fetch,
         &config.workspace_dir,
         &config.agents,
-        config.api_key.as_deref(),
+        fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
         &config,
         None,
     );
@@ -3119,19 +3102,18 @@ pub async fn process_message(
         }
     }
 
-    let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
-    let model_name = config
-        .default_model
-        .clone()
+    let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
+    let model_name = fallback_provider_pm
+        .and_then(|e| e.model.clone())
         .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_from_config(&config);
     let provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
         provider_name,
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
+        fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
+        fallback_provider_pm.and_then(|e| e.base_url.as_deref()),
         &config.reliability,
-        &config.model_routes,
+        &config.providers.model_routes,
         &model_name,
         &provider_runtime_options,
     )?;
@@ -3275,7 +3257,12 @@ pub async fn process_message(
     );
     let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
     let effective_temperature = crate::agent::thinking::clamp_temperature(
-        config.default_temperature + thinking_params.temperature_adjustment,
+        config
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.temperature)
+            .unwrap_or(0.7)
+            + thinking_params.temperature_adjustment,
     );
 
     // Prepend thinking system prompt prefix when present.
@@ -3349,6 +3336,7 @@ mod tests {
     use crate::agent::tool_execution::execute_one_tool;
     use tempfile::tempdir;
     use zeroclaw_providers::ChatMessage;
+    use zeroclaw_tool_call_parser::parse_tool_calls;
 
     // ── truncate_tool_result tests ────────────────────────────────
 
@@ -4946,7 +4934,10 @@ mod tests {
         .await
         .expect("parallel execution should complete");
 
-        assert_eq!(result, "done");
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
         assert!(
             max_active.load(Ordering::SeqCst) >= 1,
             "tools should execute successfully"
@@ -5020,7 +5011,10 @@ mod tests {
         .await
         .expect("cron_add delivery defaults should be injected");
 
-        assert_eq!(result, "done");
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
 
         let recorded = recorded_args
             .lock()
@@ -5086,7 +5080,10 @@ mod tests {
         .await
         .expect("explicit delivery mode should be preserved");
 
-        assert_eq!(result, "done");
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
 
         let recorded = recorded_args
             .lock()
@@ -5147,7 +5144,10 @@ mod tests {
         .await
         .expect("loop should finish after deduplicating repeated calls");
 
-        assert_eq!(result, "done");
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
         assert_eq!(
             invocations.load(Ordering::SeqCst),
             1,
@@ -5221,7 +5221,10 @@ mod tests {
         .await
         .expect("non-interactive shell should succeed for low-risk command");
 
-        assert_eq!(result, "done");
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
 
         let tool_results = history
             .iter()
@@ -5285,7 +5288,10 @@ mod tests {
         .await
         .expect("loop should finish with exempt tool executing twice");
 
-        assert_eq!(result, "done");
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
         assert_eq!(
             invocations.load(Ordering::SeqCst),
             2,
@@ -5430,7 +5436,10 @@ mod tests {
         .await
         .expect("native fallback id flow should complete");
 
-        assert_eq!(result, "done");
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert!(
             history.iter().any(|msg| {
@@ -5520,26 +5529,22 @@ mod tests {
             deltas.push(delta);
         }
 
-        let explanation_idx = deltas
-            .iter()
-            .position(|delta| matches!(delta, DraftEvent::Content(t) if t == "Task started. Waiting 30 seconds before checking status.\n"))
-            .expect("native assistant text should be relayed to on_delta");
-        let clear_idx = deltas
-            .iter()
-            .position(|delta| matches!(delta, DraftEvent::Clear))
-            .expect("final answer streaming should clear prior draft state");
-
         assert!(
             deltas
                 .iter()
-                .any(|delta| matches!(delta, DraftEvent::Progress(t) if t.starts_with("\u{1f4ac} Got 1 tool call(s)"))),
+                .any(|delta| matches!(delta, StreamDelta::Text(t) if t == "Task started. Waiting 30 seconds before checking status.\n")),
+            "native assistant text should be relayed to on_delta"
+        );
+        assert!(
+            deltas
+                .iter()
+                .any(|delta| matches!(delta, StreamDelta::Status(t) if t.starts_with("\u{1f4ac} Got 1 tool call(s)"))),
             "tool-call progress line should still be relayed"
         );
         assert!(
-            explanation_idx < clear_idx,
-            "native assistant text should arrive before final-answer draft clearing"
+            result.ends_with("Final answer"),
+            "accumulated result should end with final answer, got: {result}"
         );
-        assert_eq!(result, "Final answer");
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
 
@@ -5587,11 +5592,8 @@ mod tests {
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                DraftEvent::Clear => {
-                    visible_deltas.clear();
-                }
-                DraftEvent::Progress(_) => {}
-                DraftEvent::Content(text) => {
+                StreamDelta::Status(_) => {}
+                StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
             }
@@ -5658,17 +5660,17 @@ mod tests {
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                DraftEvent::Clear => {
-                    visible_deltas.clear();
-                }
-                DraftEvent::Progress(_) => {}
-                DraftEvent::Content(text) => {
+                StreamDelta::Status(_) => {}
+                StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
             }
         }
 
-        assert_eq!(result, "done");
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
         assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
@@ -5733,17 +5735,17 @@ mod tests {
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                DraftEvent::Clear => {
-                    visible_deltas.clear();
-                }
-                DraftEvent::Progress(_) => {}
-                DraftEvent::Content(text) => {
+                StreamDelta::Status(_) => {}
+                StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
             }
         }
 
-        assert_eq!(result, "done");
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
         assert_eq!(provider.stream_tool_requests.load(Ordering::SeqCst), 2);
@@ -5817,11 +5819,8 @@ mod tests {
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                DraftEvent::Clear => {
-                    visible_deltas.clear();
-                }
-                DraftEvent::Progress(_) => {}
-                DraftEvent::Content(text) => {
+                StreamDelta::Status(_) => {}
+                StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
             }
@@ -5900,7 +5899,10 @@ mod tests {
             .await
             .expect("wrapper path should execute activated tools");
 
-            assert_eq!(result, "done");
+            assert!(
+                result.ends_with("done"),
+                "result should end with 'done', got: {result}"
+            );
             assert_eq!(invocations.load(Ordering::SeqCst), 1);
         });
     }
@@ -6097,5 +6099,1085 @@ mod tests {
     #[test]
     fn strip_think_tags_preserves_text_without_tags() {
         assert_eq!(strip_think_tags("plain text"), "plain text");
+    }
+
+    #[test]
+    fn parse_tool_calls_strips_think_before_tool_call() {
+        // Qwen regression: <think> tags before <tool_call> tags should be
+        // stripped, allowing the tool call to be parsed correctly.
+        let response = "<think>I need to list files to understand the project</think>\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>";
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(
+            calls.len(),
+            1,
+            "should parse tool call after stripping think tags"
+        );
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "ls"
+        );
+        assert!(text.is_empty(), "think content should not appear as text");
+    }
+
+    #[test]
+    fn parse_tool_calls_strips_think_only_returns_empty() {
+        // When response is only <think> tags with no tool calls, should
+        // return empty text and no calls.
+        let response = "<think>Just thinking, no action needed</think>";
+        let (text, calls) = parse_tool_calls(response);
+        assert!(calls.is_empty());
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_qwen_think_with_multiple_tool_calls() {
+        let response = "<think>I need to check two things</think>\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\n</tool_call>";
+        let (_, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].arguments.get("command").unwrap().as_str().unwrap(),
+            "date"
+        );
+        assert_eq!(
+            calls[1].arguments.get("command").unwrap().as_str().unwrap(),
+            "pwd"
+        );
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_preserves_clean_text() {
+        let input = "Hello, this is a normal response.";
+        assert_eq!(strip_tool_result_blocks(input), input);
+    }
+
+    #[test]
+    fn strip_tool_result_blocks_returns_empty_for_only_tags() {
+        let input = "<tool_result name=\"memory_recall\" status=\"ok\">\n{}\n</tool_result>";
+        assert_eq!(strip_tool_result_blocks(input), "");
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_empty_tool_calls_array() {
+        // Recovery: Empty tool_calls array returns original response (no tool parsing)
+        let response = r#"{"content": "Hello", "tool_calls": []}"#;
+        let (text, calls) = parse_tool_calls(response);
+        // When tool_calls is empty, the entire JSON is returned as text
+        assert!(text.contains("Hello"));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_flags_malformed_payloads() {
+        let response =
+            "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}</tool_call>";
+        let issue = detect_tool_call_parse_issue(response, &[]);
+        assert!(
+            issue.is_some(),
+            "malformed tool payload should be flagged for diagnostics"
+        );
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_ignores_normal_text() {
+        let issue = detect_tool_call_parse_issue("Thanks, done.", &[]);
+        assert!(issue.is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recovery Tests - History Management
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn trim_history_with_no_system_prompt() {
+        // Recovery: History without system prompt should trim correctly
+        let mut history = vec![];
+        for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
+            history.push(ChatMessage::user(format!("msg {i}")));
+        }
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES);
+    }
+
+    #[test]
+    fn trim_history_preserves_role_ordering() {
+        // Recovery: After trimming, role ordering should remain consistent
+        let mut history = vec![ChatMessage::system("system")];
+        for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 10 {
+            history.push(ChatMessage::user(format!("user {i}")));
+            history.push(ChatMessage::assistant(format!("assistant {i}")));
+        }
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        assert_eq!(history[0].role, "system");
+        assert_eq!(history[history.len() - 1].role, "assistant");
+    }
+
+    #[test]
+    fn trim_history_with_only_system_prompt() {
+        // Recovery: Only system prompt should not be trimmed
+        let mut history = vec![ChatMessage::system("system prompt")];
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        assert_eq!(history.len(), 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recovery Tests - Arguments Parsing
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recovery Tests - JSON Extraction
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recovery Tests - Constants Validation
+    // ═══════════════════════════════════════════════════════════════════════
+
+    const _: () = {
+        assert!(DEFAULT_MAX_TOOL_ITERATIONS > 0);
+        assert!(DEFAULT_MAX_TOOL_ITERATIONS <= 100);
+        assert!(DEFAULT_MAX_HISTORY_MESSAGES > 0);
+        assert!(DEFAULT_MAX_HISTORY_MESSAGES <= 1000);
+    };
+
+    #[test]
+    fn constants_bounds_are_compile_time_checked() {
+        // Bounds are enforced by the const assertions above.
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recovery Tests - Tool Call Value Parsing
+
+    #[test]
+    fn parse_tool_calls_handles_unclosed_tool_call_tag() {
+        let response = "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\nDone";
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "pwd");
+        assert_eq!(text, "Done");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TG4 (inline): parse_tool_calls robustness — malformed/edge-case inputs
+    // Prevents: Pattern 4 issues #746, #418, #777, #848
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_tool_calls_empty_input_returns_empty() {
+        let (text, calls) = parse_tool_calls("");
+        assert!(calls.is_empty(), "empty input should produce no tool calls");
+        assert!(text.is_empty(), "empty input should produce no text");
+    }
+
+    #[test]
+    fn parse_tool_calls_whitespace_only_returns_empty_calls() {
+        let (text, calls) = parse_tool_calls("   \n\t  ");
+        assert!(calls.is_empty());
+        assert!(text.is_empty() || text.trim().is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_nested_xml_tags_handled() {
+        // Double-wrapped tool call should still parse the inner call
+        let response = r#"<tool_call><tool_call>{"name":"echo","arguments":{"msg":"hi"}}</tool_call></tool_call>"#;
+        let (_text, calls) = parse_tool_calls(response);
+        // Should find at least one tool call
+        assert!(
+            !calls.is_empty(),
+            "nested XML tags should still yield at least one tool call"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_truncated_json_no_panic() {
+        // Incomplete JSON inside tool_call tags
+        let response = r#"<tool_call>{"name":"shell","arguments":{"command":"ls"</tool_call>"#;
+        let (_text, _calls) = parse_tool_calls(response);
+        // Should not panic — graceful handling of truncated JSON
+    }
+
+    #[test]
+    fn parse_tool_calls_empty_json_object_in_tag() {
+        let response = "<tool_call>{}</tool_call>";
+        let (_text, calls) = parse_tool_calls(response);
+        // Empty JSON object has no name field — should not produce valid tool call
+        assert!(
+            calls.is_empty(),
+            "empty JSON object should not produce a tool call"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_closing_tag_only_returns_text() {
+        let response = "Some text </tool_call> more text";
+        let (text, calls) = parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "closing tag only should not produce calls"
+        );
+        assert!(
+            !text.is_empty(),
+            "text around orphaned closing tag should be preserved"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_very_large_arguments_no_panic() {
+        let large_arg = "x".repeat(100_000);
+        let response = format!(
+            r#"<tool_call>{{"name":"echo","arguments":{{"message":"{}"}}}}</tool_call>"#,
+            large_arg
+        );
+        let (_text, calls) = parse_tool_calls(&response);
+        assert_eq!(calls.len(), 1, "large arguments should still parse");
+        assert_eq!(calls[0].name, "echo");
+    }
+
+    #[test]
+    fn parse_tool_calls_special_characters_in_arguments() {
+        let response = r#"<tool_call>{"name":"echo","arguments":{"message":"hello \"world\" <>&'\n\t"}}</tool_call>"#;
+        let (_text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "echo");
+    }
+
+    #[test]
+    fn parse_tool_calls_text_with_embedded_json_not_extracted() {
+        // Raw JSON without any tags should NOT be extracted as a tool call
+        let response = r#"Here is some data: {"name":"echo","arguments":{"message":"hi"}} end."#;
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "raw JSON in text without tags should not be extracted"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_multiple_formats_mixed() {
+        // Mix of text and properly tagged tool call
+        let response = r#"I'll help you with that.
+
+<tool_call>
+{"name":"shell","arguments":{"command":"echo hello"}}
+</tool_call>
+
+Let me check the result."#;
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(
+            calls.len(),
+            1,
+            "should extract one tool call from mixed content"
+        );
+        assert_eq!(calls[0].name, "shell");
+        assert!(
+            text.contains("help you"),
+            "text before tool call should be preserved"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TG4 (inline): scrub_credentials edge cases
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn scrub_credentials_empty_input() {
+        let result = scrub_credentials("");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn scrub_credentials_no_sensitive_data() {
+        let input = "normal text without any secrets";
+        let result = scrub_credentials(input);
+        assert_eq!(
+            result, input,
+            "non-sensitive text should pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn scrub_credentials_multibyte_chars_no_panic() {
+        // Regression test for #3024: byte index 4 is not a char boundary
+        // when the captured value contains multi-byte UTF-8 characters.
+        // The regex only matches quoted values for non-ASCII content, since
+        // capture group 4 is restricted to [a-zA-Z0-9_\-\.].
+        let input = "password=\"\u{4f60}\u{7684}WiFi\u{5bc6}\u{7801}ab\"";
+        let result = scrub_credentials(input);
+        assert!(
+            result.contains("[REDACTED]"),
+            "multi-byte quoted value should be redacted without panic, got: {result}"
+        );
+    }
+
+    #[test]
+    fn scrub_credentials_short_values_not_redacted() {
+        // Values shorter than 8 chars should not be redacted
+        let input = r#"api_key="short""#;
+        let result = scrub_credentials(input);
+        assert_eq!(result, input, "short values should not be redacted");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TG4 (inline): trim_history edge cases
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn trim_history_empty_history() {
+        let mut history: Vec<ChatMessage> = vec![];
+        trim_history(&mut history, 10);
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn trim_history_system_only() {
+        let mut history = vec![ChatMessage::system("system prompt")];
+        trim_history(&mut history, 10);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "system");
+    }
+
+    #[test]
+    fn trim_history_exactly_at_limit() {
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("msg 1"),
+            ChatMessage::assistant("reply 1"),
+        ];
+        trim_history(&mut history, 2); // 2 non-system messages = exactly at limit
+        assert_eq!(history.len(), 3, "should not trim when exactly at limit");
+    }
+
+    #[test]
+    fn trim_history_removes_oldest_non_system() {
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("old msg"),
+            ChatMessage::assistant("old reply"),
+            ChatMessage::user("new msg"),
+            ChatMessage::assistant("new reply"),
+        ];
+        trim_history(&mut history, 2);
+        assert_eq!(history.len(), 3); // system + 2 kept
+        assert_eq!(history[0].role, "system");
+        assert_eq!(history[1].content, "new msg");
+    }
+
+    /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
+    /// the output must contain ZERO XML protocol artifacts. In the native path
+    /// `build_tool_instructions` is never called, so the system prompt alone
+    /// must be clean of XML tool-call protocol.
+    #[test]
+    fn native_tools_system_prompt_contains_zero_xml() {
+        use crate::agent::system_prompt::build_system_prompt_with_mode;
+
+        let tool_summaries: Vec<(&str, &str)> = vec![
+            ("shell", "Execute shell commands"),
+            ("file_read", "Read files"),
+        ];
+
+        let system_prompt = build_system_prompt_with_mode(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            &tool_summaries,
+            &[],  // no skills
+            None, // no identity config
+            None, // no bootstrap_max_chars
+            true, // native_tools
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            crate::security::AutonomyLevel::default(),
+        );
+
+        // Must contain zero XML protocol artifacts
+        assert!(
+            !system_prompt.contains("<tool_call>"),
+            "Native prompt must not contain <tool_call>"
+        );
+        assert!(
+            !system_prompt.contains("</tool_call>"),
+            "Native prompt must not contain </tool_call>"
+        );
+        assert!(
+            !system_prompt.contains("<tool_result>"),
+            "Native prompt must not contain <tool_result>"
+        );
+        assert!(
+            !system_prompt.contains("</tool_result>"),
+            "Native prompt must not contain </tool_result>"
+        );
+        assert!(
+            !system_prompt.contains("## Tool Use Protocol"),
+            "Native prompt must not contain XML protocol header"
+        );
+
+        // Positive: native prompt should still list tools and contain task instructions
+        assert!(
+            system_prompt.contains("shell"),
+            "Native prompt must list tool names"
+        );
+        assert!(
+            system_prompt.contains("## Your Task"),
+            "Native prompt should contain task instructions"
+        );
+    }
+
+    // ── Cross-Alias & GLM Shortened Body Tests ──────────────────────────
+
+    #[test]
+    fn parse_tool_calls_cross_alias_close_tag_with_json() {
+        // <tool_call> opened but closed with </invoke> — JSON body
+        let input = r#"<tool_call>{"name": "shell", "arguments": {"command": "ls"}}</invoke>"#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "ls");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_cross_alias_close_tag_with_glm_shortened() {
+        // <tool_call>shell>uname -a</invoke> — GLM shortened inside cross-alias tags
+        let input = "<tool_call>shell>uname -a</invoke>";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "uname -a");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_glm_shortened_body_in_matched_tags() {
+        // <tool_call>shell>pwd</tool_call> — GLM shortened in matched tags
+        let input = "<tool_call>shell>pwd</tool_call>";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "pwd");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_glm_yaml_style_in_tags() {
+        // <tool_call>shell>\ncommand: date\napproved: true</invoke>
+        let input = "<tool_call>shell>\ncommand: date\napproved: true</invoke>";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "date");
+        assert_eq!(calls[0].arguments["approved"], true);
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_attribute_style_in_tags() {
+        // <tool_call>shell command="date" /></tool_call>
+        let input = r#"<tool_call>shell command="date" /></tool_call>"#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "date");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_file_read_shortened_in_cross_alias() {
+        // <tool_call>file_read path=".env" /></invoke>
+        let input = r#"<tool_call>file_read path=".env" /></invoke>"#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(calls[0].arguments["path"], ".env");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_unclosed_glm_shortened_no_close_tag() {
+        // <tool_call>shell>ls -la (no close tag at all)
+        let input = "<tool_call>shell>ls -la";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "ls -la");
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_text_before_cross_alias() {
+        // Text before and after cross-alias tool call
+        let input = "Let me check that.\n<tool_call>shell>uname -a</invoke>\nDone.";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "uname -a");
+        assert!(text.contains("Let me check that."));
+        assert!(text.contains("Done."));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // reasoning_content pass-through tests for history builders
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn build_native_assistant_history_includes_reasoning_content() {
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }];
+        let result = build_native_assistant_history("answer", &calls, Some("thinking step"));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert_eq!(parsed["reasoning_content"].as_str(), Some("thinking step"));
+        assert!(parsed["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn build_native_assistant_history_omits_reasoning_content_when_none() {
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }];
+        let result = build_native_assistant_history("answer", &calls, None);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert!(parsed.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn build_native_assistant_history_from_parsed_calls_includes_reasoning_content() {
+        let calls = vec![ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            tool_call_id: Some("call_2".into()),
+        }];
+        let result = build_native_assistant_history_from_parsed_calls(
+            "answer",
+            &calls,
+            Some("deep thought"),
+        );
+        assert!(result.is_some());
+        let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert_eq!(parsed["reasoning_content"].as_str(), Some("deep thought"));
+        assert!(parsed["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn build_native_assistant_history_from_parsed_calls_omits_reasoning_content_when_none() {
+        let calls = vec![ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            tool_call_id: Some("call_2".into()),
+        }];
+        let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
+        assert!(result.is_some());
+        let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert!(parsed.get("reasoning_content").is_none());
+    }
+
+    // ── glob_match tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn glob_match_exact_no_wildcard() {
+        assert!(glob_match("mcp_browser_navigate", "mcp_browser_navigate"));
+        assert!(!glob_match("mcp_browser_navigate", "mcp_browser_click"));
+    }
+
+    #[test]
+    fn glob_match_prefix_wildcard() {
+        // Suffix pattern: mcp_browser_*
+        assert!(glob_match("mcp_browser_*", "mcp_browser_navigate"));
+        assert!(glob_match("mcp_browser_*", "mcp_browser_click"));
+        assert!(!glob_match("mcp_browser_*", "mcp_filesystem_read"));
+
+        // Prefix pattern: *_read
+        assert!(glob_match("*_read", "mcp_filesystem_read"));
+        assert!(!glob_match("*_read", "mcp_filesystem_write"));
+
+        // Infix: mcp_*_navigate
+        assert!(glob_match("mcp_*_navigate", "mcp_browser_navigate"));
+        assert!(!glob_match("mcp_*_navigate", "mcp_browser_click"));
+    }
+
+    #[test]
+    fn glob_match_star_matches_everything() {
+        assert!(glob_match("*", "anything_at_all"));
+        assert!(glob_match("*", ""));
+    }
+
+    // ── filter_tool_specs_for_turn tests ──────────────────────────────────────
+
+    fn make_spec(name: &str) -> crate::tools::ToolSpec {
+        crate::tools::ToolSpec {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn filter_tool_specs_no_groups_returns_all() {
+        let specs = vec![
+            make_spec("shell_exec"),
+            make_spec("mcp_browser_navigate"),
+            make_spec("mcp_filesystem_read"),
+        ];
+        let result = filter_tool_specs_for_turn(specs, &[], "hello");
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn filter_tool_specs_always_group_includes_matching_mcp_tool() {
+        use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let specs = vec![
+            make_spec("shell_exec"),
+            make_spec("mcp_browser_navigate"),
+            make_spec("mcp_filesystem_read"),
+        ];
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Always,
+            tools: vec!["mcp_filesystem_*".into()],
+            keywords: vec![],
+            filter_builtins: false,
+        }];
+        let result = filter_tool_specs_for_turn(specs, &groups, "anything");
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        // Built-in passes through, matched MCP passes, unmatched MCP excluded.
+        assert!(names.contains(&"shell_exec"));
+        assert!(names.contains(&"mcp_filesystem_read"));
+        assert!(!names.contains(&"mcp_browser_navigate"));
+    }
+
+    #[test]
+    fn filter_tool_specs_dynamic_group_included_on_keyword_match() {
+        use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let specs = vec![make_spec("shell_exec"), make_spec("mcp_browser_navigate")];
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Dynamic,
+            tools: vec!["mcp_browser_*".into()],
+            keywords: vec!["browse".into(), "website".into()],
+            filter_builtins: false,
+        }];
+        let result = filter_tool_specs_for_turn(specs, &groups, "please browse this page");
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"shell_exec"));
+        assert!(names.contains(&"mcp_browser_navigate"));
+    }
+
+    #[test]
+    fn filter_tool_specs_dynamic_group_excluded_on_no_keyword_match() {
+        use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let specs = vec![make_spec("shell_exec"), make_spec("mcp_browser_navigate")];
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Dynamic,
+            tools: vec!["mcp_browser_*".into()],
+            keywords: vec!["browse".into(), "website".into()],
+            filter_builtins: false,
+        }];
+        let result = filter_tool_specs_for_turn(specs, &groups, "read the file /etc/hosts");
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"shell_exec"));
+        assert!(!names.contains(&"mcp_browser_navigate"));
+    }
+
+    #[test]
+    fn filter_tool_specs_dynamic_keyword_match_is_case_insensitive() {
+        use zeroclaw_config::schema::{ToolFilterGroup, ToolFilterGroupMode};
+
+        let specs = vec![make_spec("mcp_browser_navigate")];
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Dynamic,
+            tools: vec!["mcp_browser_*".into()],
+            keywords: vec!["Browse".into()],
+            filter_builtins: false,
+        }];
+        let result = filter_tool_specs_for_turn(specs, &groups, "BROWSE the site");
+        assert_eq!(result.len(), 1);
+    }
+
+    // ── Token-based compaction tests ──────────────────────────
+
+    #[test]
+    fn estimate_history_tokens_empty() {
+        assert_eq!(super::estimate_history_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn estimate_history_tokens_single_message() {
+        let history = vec![ChatMessage::user("hello world")]; // 11 chars
+        let tokens = super::estimate_history_tokens(&history);
+        // 11.div_ceil(4) + 4 = 3 + 4 = 7
+        assert_eq!(tokens, 7);
+    }
+
+    #[test]
+    fn estimate_history_tokens_multiple_messages() {
+        let history = vec![
+            ChatMessage::system("You are helpful."), // 16 chars → 4 + 4 = 8
+            ChatMessage::user("What is Rust?"),      // 13 chars → 4 + 4 = 8
+            ChatMessage::assistant("A language."),   // 11 chars → 3 + 4 = 7
+        ];
+        let tokens = super::estimate_history_tokens(&history);
+        assert_eq!(tokens, 23);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_surfaces_tool_failure_reason_in_on_delta() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"failing_shell","arguments":{"command":"rm -rf /"}}
+</tool_call>"#,
+            "I could not execute that command.",
+        ]);
+
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(FailingTool::new(
+            "failing_shell",
+            "Command not allowed by security policy: rm -rf /",
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("delete everything"),
+        ];
+        let observer = NoopObserver;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+        )
+        .await
+        .expect("tool loop should complete");
+
+        // Collect all messages sent to the on_delta channel.
+        let mut deltas = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            deltas.push(msg);
+        }
+
+        let all_deltas: String = deltas
+            .iter()
+            .map(|d| match d {
+                StreamDelta::Status(t) | StreamDelta::Text(t) => t.as_str(),
+            })
+            .collect();
+
+        // The failure reason should appear in the progress messages.
+        assert!(
+            all_deltas.contains("Command not allowed by security policy"),
+            "on_delta messages should include the tool failure reason, got: {all_deltas}"
+        );
+
+        // Should also contain the cross mark (❌) icon to indicate failure.
+        assert!(
+            all_deltas.contains('\u{274c}'),
+            "on_delta messages should include ❌ for failed tool calls, got: {all_deltas}"
+        );
+
+        assert!(
+            result.ends_with("I could not execute that command."),
+            "result should end with error message, got: {result}"
+        );
+    }
+
+    // ── filter_by_allowed_tools tests ─────────────────────────────────────
+
+    #[test]
+    fn filter_by_allowed_tools_none_passes_all() {
+        let specs = vec![
+            make_spec("shell"),
+            make_spec("memory_store"),
+            make_spec("file_read"),
+        ];
+        let result = filter_by_allowed_tools(specs, None);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn filter_by_allowed_tools_some_restricts_to_listed() {
+        let specs = vec![
+            make_spec("shell"),
+            make_spec("memory_store"),
+            make_spec("file_read"),
+        ];
+        let allowed = vec!["shell".to_string(), "memory_store".to_string()];
+        let result = filter_by_allowed_tools(specs, Some(&allowed));
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"shell"));
+        assert!(names.contains(&"memory_store"));
+        assert!(!names.contains(&"file_read"));
+    }
+
+    #[test]
+    fn filter_by_allowed_tools_unknown_names_silently_ignored() {
+        let specs = vec![make_spec("shell"), make_spec("file_read")];
+        let allowed = vec![
+            "shell".to_string(),
+            "nonexistent_tool".to_string(),
+            "another_missing".to_string(),
+        ];
+        let result = filter_by_allowed_tools(specs, Some(&allowed));
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names.len(), 1);
+        assert!(names.contains(&"shell"));
+    }
+
+    #[test]
+    fn filter_by_allowed_tools_empty_list_excludes_all() {
+        let specs = vec![make_spec("shell"), make_spec("file_read")];
+        let allowed: Vec<String> = vec![];
+        let result = filter_by_allowed_tools(specs, Some(&allowed));
+        assert!(result.is_empty());
+    }
+
+    // ── Cost tracking tests ──
+
+    #[tokio::test]
+    async fn cost_tracking_records_usage_when_scoped() {
+        use super::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, run_tool_call_loop,
+        };
+        use crate::cost::CostTracker;
+        use crate::observability::noop::NoopObserver;
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::ModelPricing;
+
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(200),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut cost_config = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            ..zeroclaw_config::schema::CostConfig::default()
+        };
+        cost_config.prices = HashMap::from([(
+            "mock-model".to_string(),
+            ModelPricing {
+                input: 3.0,
+                output: 15.0,
+            },
+        )]);
+        let tracker = Arc::new(CostTracker::new(cost_config.clone(), workspace.path()).unwrap());
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(cost_config.prices.clone()),
+        );
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                run_tool_call_loop(
+                    &provider,
+                    &mut history,
+                    &[],
+                    &observer,
+                    "mock-provider",
+                    "mock-model",
+                    0.0,
+                    true,
+                    None,
+                    "test",
+                    None,
+                    &zeroclaw_config::schema::MultimodalConfig::default(),
+                    2,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    &[],
+                    None,
+                    None,
+                    &zeroclaw_config::schema::PacingConfig::default(),
+                    0,
+                    0,
+                    None,
+                ),
+            )
+            .await
+            .expect("tool loop should succeed");
+
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
+        let summary = tracker.get_summary().unwrap();
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.total_tokens, 1_200);
+        assert!(summary.session_cost_usd > 0.0);
+    }
+
+    #[tokio::test]
+    async fn cost_tracking_enforces_budget() {
+        use super::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, run_tool_call_loop,
+        };
+        use crate::cost::CostTracker;
+        use crate::observability::noop::NoopObserver;
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::ModelPricing;
+
+        let provider = ScriptedProvider::from_text_responses(vec!["should not reach this"]);
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let cost_config = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            daily_limit_usd: 0.001, // very low limit
+            ..zeroclaw_config::schema::CostConfig::default()
+        };
+        let tracker = Arc::new(CostTracker::new(cost_config.clone(), workspace.path()).unwrap());
+        // Record a usage that already exceeds the limit
+        tracker
+            .record_usage(crate::cost::types::TokenUsage::new(
+                "mock-model",
+                100_000,
+                50_000,
+                1.0,
+                1.0,
+            ))
+            .unwrap();
+
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "mock-model".to_string(),
+                ModelPricing {
+                    input: 1.0,
+                    output: 1.0,
+                },
+            )])),
+        );
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let err = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                run_tool_call_loop(
+                    &provider,
+                    &mut history,
+                    &[],
+                    &observer,
+                    "mock-provider",
+                    "mock-model",
+                    0.0,
+                    true,
+                    None,
+                    "test",
+                    None,
+                    &zeroclaw_config::schema::MultimodalConfig::default(),
+                    2,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    &[],
+                    None,
+                    None,
+                    &zeroclaw_config::schema::PacingConfig::default(),
+                    0,
+                    0,
+                    None,
+                ),
+            )
+            .await
+            .expect_err("should fail with budget exceeded");
+
+        assert!(
+            err.to_string().contains("Budget exceeded"),
+            "error should mention budget: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_tracking_is_noop_without_scope() {
+        use super::run_tool_call_loop;
+        use crate::observability::noop::NoopObserver;
+
+        // No TOOL_LOOP_COST_TRACKING_CONTEXT scoped — should run fine
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(500),
+                    output_tokens: Some(100),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &[],
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "test",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            2,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+        )
+        .await
+        .expect("should succeed without cost scope");
+
+        assert_eq!(result, "ok");
     }
 }
