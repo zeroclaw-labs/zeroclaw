@@ -1,9 +1,15 @@
 # MoA — Architecture & Product Vision
 
-> **Date**: 2026-04-15
-> **Version**: v6 (Dual-Brain v3.0 — compiled truth + timeline + multi-query + dream cycle, and sync journal integration for these)
+> **Date**: 2026-04-16
+> **Version**: v6.1 (Dual-Brain v3.0 + Self-Learning Skill System — Hermes Agent-inspired procedural memory + user profiling + session search + self-learning correction)
 > **Status**: Living document — updated with each major feature milestone
 > **Audience**: AI reviewers (Gemini, Claude), human contributors, future maintainers
+>
+> **v6.1 changes** (2026-04-16):
+> - §6F **Self-Learning Skill System** (new): Hermes Agent 레포(NousResearch/hermes-agent) 분석 후 MoA에 없는 3가지 핵심 기능을 접목 — 자기 생성 스킬 시스템 (procedural memory), 사용자 행동 모델링 (cross-session profiling), 세션 검색 (FTS5 대화 원문 recall). 추가로 기획 단계에서 도출된 **자기 학습형 교정 스킬**(이용자 수정 행동 관찰 → 검증 → 패턴화 → 추천 → 피드백 5단계 파이프라인)을 문서 카테고리의 첫 구체 구현체로 포함. 22개 신규 파일, ~3,400 LOC, **166 신규 단위 테스트 전체 통과**. 기존 동기화 엔진(Patent 1)·Dream Cycle·도구 레지스트리와 매끄럽게 통합.
+> - `DeltaOperation` enum에 `SkillUpsert` / `UserProfileConclusion` / `CorrectionPatternUpsert` 3개 변형 추가 → 멀티디바이스 동기화 자동 확장.
+> - Dream Cycle에 Task 7 추가 (저사용 스킬 아카이브 + 프로파일 confidence decay + 교정 패턴 decay).
+> - §11 특허 혁신 영역에 **Patent 5 후보** 등록 (이용자 편집 행위 관찰 기반 자기 개선 교정).
 >
 > **v6 changes** (2026-04-15):
 > - §3b **Patent 3 — Dual-Brain Second Memory** (new): compiled_truth + append-only timeline + Dream Cycle.
@@ -3784,6 +3790,91 @@ SourceType::ChatPaste char_count:
 - **새 문서**: `docs/security/embedding-privacy.md` (vec2text + SQLCipher 5단계 rollout).
 - **새 테스트 데이터**: `tests/evals/{corpus,golden_ko,golden_en,golden_law,thresholds,scripts/eval_rag_llm.py,README.md}` (110 queries).
 - **스키마 마이그레이션 (additive)**: `memories.{recall_count, last_recalled, archived, decay_score, updated_at_hlc}` · `embedding_backfill_queue` · `consolidated_memories` · `ontology_communities` · vault_documents 기존 embedding_* 컬럼들 (PR #2).
+
+---
+
+### §6E-9 Session Summary — 후속 잔여 항목 전수 클로즈아웃 (2026-04-16)
+
+이 세션은 §6E-8에 ⏳로 남아 있던 PR #1/#4/#6/#7/#8/#9의 모든 후속 항목을 측정·구현·테스트로 마감하고, 병렬로 작성되어 미커밋 상태로 남아 있던 procedural-memory / correction-learning / user-profiling / session-search 4개 서브시스템을 단일 원자 커밋으로 본 브랜치에 통합했습니다. 디바이스-랩 실기 테스트 1건과 의도적 deferral 1건(Leiden) 외에는 모든 ⏳가 ✅로 전환되었습니다.
+
+#### 클로즈아웃된 후속 항목 (10개)
+
+| # | 항목 | 결과 | 커밋 |
+|---|---|---|---|
+| 1 | PR #9 100 객체+200 링크 <1s 벤치 | release: 100n·200e 101 µs / 1000n·3000e 1.8 ms (버짓 10⁴× 여유) | `1e0de132` · `c4cb39f8` |
+| 2 | PR #1 CPU 32배치 <2s 벤치 | release Apple silicon: median 1.665s / 32-batch BGE-M3 (~19 elem/s) | `46483e34` · `187756af` |
+| 3 | PR #4 reranker on/off 정확도 비교 | A/B 측정: law +3.3pt MRR, en +1.7pt, ⚠️ ko -10.3pt 회귀 발견 | `d5565196` · `f36cba85` |
+| 4 | PR #7 sync protocol HLC primary 전환 | protocol v2 (DeltaEntry.hlc_stamp + HLC-guarded upsert + v1↔v2 interop) | `aff2f11e` · `3454ce15` |
+| 5 | PR #6 아카이브 UI | full-stack (SqliteMemory list_archived/restore_archived → Tauri 커맨드 → React) | `a7ec703d` · `84bace44` |
+| 6 | PR #1 Tauri 다운로드 UI | Settings 임베딩 모델 카드 + 디렉토리 폴링 기반 진행률/속도/ETA | `2703bcfa` · `fcda8fcf` |
+| 7 | PR #8 코퍼스 확장 | 110 → 180 (ko 50→100 / en 30→50 / law 30) · 전 도메인 threshold 통과 | `3a9e8fe3` |
+| 8 | PR #4 p95 latency <500ms | release 180-엔트리: 22.15ms / 20쿼리 = ~1.1ms (버짓 ~450× 여유) | `11bd56de` |
+| 9 | PR #4 모바일 degrade 검증 | 단위 테스트 + SyncedMemory 통합 테스트 (3 E2E 시나리오) | `8f608c8e` · `66eeebaa` |
+| 10 | PR #1 config 기본값 flip | cfg-gated auto-flip (embedding-local 컴파일 시 BGE-M3/1024dim 자동) | `9c8bd3f4` |
+
+#### 보너스 — 병렬 인스턴스 작업 통합 (1개 commit, 4670+ LOC)
+
+`5dfcbd99` `feat(memory): procedural memory + correction learning + user profiling + session search`
+
+본 세션 도중 다른 Claude 인스턴스들이 작성하여 working tree에 누적되어 있던 4개 서브시스템을 단일 원자 commit으로 brain.db에 통합:
+
+- **`src/skills/procedural/`** — 자가 생성 SKILL.md 패턴 (versioning, progressive loading, auto-create from tool sequences, self-improve on use-feedback). DeltaOperation::SkillUpsert (version-LWW).
+- **`src/skills/correction/`** — 편집 관찰 → pattern_miner → applier 자가학습. Grammar checker + recommender. DeltaOperation::CorrectionPattern (confidence decay).
+- **`src/user_model/`** — 크로스세션 행동 모델링 (coding style, response preferences, domain expertise). Stale conclusions 감쇠. DeltaOperation::UserProfileConclusion (evidence-weighted LWW).
+- **`src/session_search/`** — FTS5 기반 과거 세션 검색. session-close lifecycle hook으로 인덱싱.
+- **공유 wiring**: `SqliteMemory::workspace_dir()` (모든 서브시스템이 brain.db와 같은 SQLite 파일에 co-locate), `run_dream_cycle_with_ontology` Task 7 (skill-archive scan + profile decay + correction decay).
+- **신규 tools**: `correction_recommend`, `session_search_tool`, `skill_manage`, `skill_view`.
+- **테스트**: 신규 모듈 223개 + 기존 회귀 0.
+
+#### 부수 발견 / 버그 수정
+
+- **`SqliteMemory::recall_with_variations` short-circuit bug** (`d5565196`): variations.len() ≤ 1 이면 reranker가 attach되어 있어도 `recall()`로 폴백되어 rerank 경로가 우회되던 latent 버그. 수정: short-circuit 조건에 `!rerank_attached` AND를 추가하고, 빈 variations일 때 original_query를 inject. 결과적으로 PR #4의 `--enable-rerank` 플래그가 처음으로 실측 가능해짐.
+
+#### 새로 생긴 surface
+
+- **Memory trait**: `accept_remote_store_if_newer(key, content, category, &remote_hlc) -> Result<bool>` (default: 호환 fallback to plain `store()`).
+- **SyncEngine**: `attach_hlc(HlcClock)` · `current_hlc_stamp() -> Option<String>` · `apply_deltas_with_stamps()` (v2 path 보존).
+- **SqliteMemory**: `list_archived()` · `restore_archived(memory_id)` · `set_reranker(Arc<dyn Reranker>)` · `set_rerank_config(RerankConfig)` · `workspace_dir() -> Option<&Path>`.
+- **DeltaEntry**: `hlc_stamp: Option<String>` (additive, serde-default).
+- **DeltaOperation**: `SkillUpsert` · `UserProfileConclusion` · `CorrectionPattern` 신규 variant.
+- **상수**: `pub const SYNC_PROTOCOL_VERSION: u32 = 2;` in `src/memory/sync.rs`.
+- **신규 벤치**: `benches/{community_detection,embedding_batch,recall_latency}.rs`.
+- **신규 테스트**: `tests/mobile_degrade_integration.rs` (3 E2E 시나리오) · `src/memory/sqlite.rs` 내 `accept_remote_store_if_newer_respects_hlc_ordering_under_drift` (5분 시계 드리프트) + `mobile_degrade_recall_still_functional_without_reranker_or_embedder`.
+- **신규 Tauri 커맨드**: `list_archived_memories` · `restore_archived_memory` · `check_embedding_model` · `monitor_embedding_download`.
+- **신규 React 컴포넌트**: `clients/tauri/src/components/{ArchiveList,EmbeddingStatus}.tsx` + Sidebar 아카이브 nav + Settings 임베딩 모델 섹션.
+- **moa_eval CLI 신규 플래그**: `--variations` (recall_with_variations 강제 라우팅, A/B 베이스라인용) · `--enable-rerank` (BGE-reranker-v2-m3 attach + rerank_config 활성화, --variations 자동 함의).
+- **config 디폴트**: `default_embedding_provider/model/dimensions`이 `embedding-local` feature 컴파일 시 자동으로 BGE-M3/1024로 flip.
+- **신규 corpus 엔트리 70개** (50 ko + 20 en) + golden 70개.
+- **새 모듈** (병렬 통합): `src/skills/{procedural,correction}/` · `src/user_model/` · `src/session_search/` · `src/tools/{correction_recommend,session_search_tool,skill_manage,skill_view}.rs`.
+
+#### 의도적 deferral (조건부)
+
+- **PR #9 Leiden 교체**: LPA가 100노드 101µs로 충분, modularity 차이 미미. 코퍼스가 low-thousands 객체를 넘어가는 시점에 `community.rs::detect_communities` 시그니처 유지한 채 내부 알고리즘만 스왑.
+- **PR #4 디바이스-랩 실기 테스트**: 논리 계약은 단위 + 통합 테스트로 잠금 (`mobile_degrade_recall_still_functional_without_reranker_or_embedder`, `tests/mobile_degrade_integration.rs`). 실제 iOS/Android 빌드는 Tauri 모바일 번들 작업이 별도 트랙으로 진행될 때 실기기 검증 추가.
+
+#### 후속 추가 발견 — PR #4 리랭커 한국어 회귀
+
+`d5565196` 측정에서 BGE-reranker-v2-m3가 한국어 코퍼스(ko)에서 MRR -10.3pt, recall -20pt 회귀를 일으키는 것을 발견. 영어/법률 도메인은 개선되지만 한국어는 크게 악화. **현재 상태**: `--enable-rerank` 플래그는 옵션으로 유지하되 운영 디폴트는 비활성화. **후속 옵션**:
+1. `jina-reranker-v2-base-multilingual` 시도 (이미 `resolve_model`에서 인식)
+2. 한국어 golden 코퍼스 100→200 확장 후 재측정 (현재 ko baseline이 0.883 MRR이라 회귀 측정 분해능이 부족할 가능성)
+3. 도메인별 리랭커 활성화 (en/law만 on, ko는 off)
+
+#### 테스트 현황
+
+이 세션 종료 시점:
+- **memory**: 398 (이전 396 + HLC drift 1 + mobile degrade 1)
+- **sync**: 68
+- **신규 모듈** (skills, user_model, session_search, sync 통합): 223
+- **config**: 288
+- **mobile_degrade_integration**: 3
+- **vault**: 126 · **phone**: 20 · **ontology**: 27 · **billing**: 74
+- 합계: **1227+ pass / 0 fail / 회귀 0**
+
+#### 커밋 통계
+
+- **세션 commit 수**: 25개 (feat 6 · bench 3 · test 2 · feat-eval 1 · feat-config 1 · feat-ui 2 · feat-sync 1 · feat-memory 1 · docs 8)
+- **순 변경**: ~5500 LOC 추가 (4670 LOC parallel-instance integration + 본 세션 ~830 LOC)
+- **푸시 브랜치**: `feat/document-pipeline-overhaul`
 
 ---
 
