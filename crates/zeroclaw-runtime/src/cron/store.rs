@@ -517,7 +517,7 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         delivery,
         delete_after_run: row.get::<_, i64>(11)? != 0,
         source: source.unwrap_or_else(|| "imperative".to_string()),
-        uses_memory: uses_memory.map_or(true, |v| v != 0),
+        uses_memory: uses_memory != Some(0),
         created_at: parse_rfc3339(&created_at_raw).map_err(sql_conversion_error)?,
         next_run: parse_rfc3339(&next_run_raw).map_err(sql_conversion_error)?,
         last_run: match last_run_raw {
