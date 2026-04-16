@@ -568,7 +568,7 @@ async fn consume_provider_streaming_response(
 
         let event = event_result.map_err(|err| anyhow::anyhow!("provider stream error: {err}"))?;
         match event {
-            StreamEvent::Final => break,
+            StreamEvent::Final { .. } => break,
             StreamEvent::ToolCall(tool_call) => {
                 outcome.tool_calls.push(tool_call);
                 suppress_forwarding = true;
@@ -4035,12 +4035,12 @@ mod tests {
                 NativeStreamTurn::ToolCall(tool_call) => {
                     Box::pin(futures_util::stream::iter(vec![
                         Ok(StreamEvent::ToolCall(tool_call)),
-                        Ok(StreamEvent::Final),
+                        Ok(StreamEvent::Final { usage: None }),
                     ]))
                 }
                 NativeStreamTurn::Text(text) => Box::pin(futures_util::stream::iter(vec![
                     Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
-                    Ok(StreamEvent::Final),
+                    Ok(StreamEvent::Final { usage: None }),
                 ])),
             }
         }

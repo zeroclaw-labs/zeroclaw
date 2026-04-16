@@ -1233,6 +1233,7 @@ impl Agent {
             let mut streamed_text = String::new();
             let mut streamed_tool_calls: Vec<zeroclaw_providers::traits::ToolCall> = Vec::new();
             let mut got_stream = false;
+            let mut stream_usage: Option<zeroclaw_providers::traits::TokenUsage> = None;
 
             while let Some(item) = stream.next().await {
                 match item {
@@ -1276,7 +1277,10 @@ impl Agent {
                         } => {
                             let _ = event_tx.send(TurnEvent::ToolResult { name, output }).await;
                         }
-                        zeroclaw_providers::traits::StreamEvent::Final => break,
+                        zeroclaw_providers::traits::StreamEvent::Final { usage } => {
+                            stream_usage = usage;
+                            break;
+                        }
                     },
                     Err(_) => break,
                 }
@@ -1287,14 +1291,18 @@ impl Agent {
             // If streaming produced text, use it as the response and
             // check for tool calls via the dispatcher.
             let response = if got_stream {
+                let (s_input, s_output) = stream_usage
+                    .as_ref()
+                    .map(|u| (u.input_tokens, u.output_tokens))
+                    .unwrap_or((None, None));
                 self.observer.record_event(&ObserverEvent::LlmResponse {
                     provider: self.provider_name.clone(),
                     model: effective_model.clone(),
                     duration: llm_start.elapsed(),
                     success: true,
                     error_message: None,
-                    input_tokens: None,
-                    output_tokens: None,
+                    input_tokens: s_input,
+                    output_tokens: s_output,
                     response_content: if tc {
                         Some(truncate_utf8(&streamed_text, 32_768))
                     } else {
@@ -2085,7 +2093,7 @@ mod tests {
                 );
                 stream::iter(vec![
                     Ok(tc),
-                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final { usage: None }),
                 ])
                 .boxed()
             } else {
@@ -2099,7 +2107,7 @@ mod tests {
                 );
                 stream::iter(vec![
                     Ok(chunk),
-                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final { usage: None }),
                 ])
                 .boxed()
             }
