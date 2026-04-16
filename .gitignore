@@ -60,4 +60,4 @@ playground/
 rust_out
 
 # Auto-generated Tauri schemas
-apps/tauri/gen/schemas/linux-schema.json
+apps/tauri/gen/schemas/

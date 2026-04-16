@@ -434,7 +434,9 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Provider validity
-    if let Some(ref provider) = config.default_provider {
+    let fallback_provider = config.providers.fallback.as_deref();
+    let fallback_provider_doc = config.providers.fallback_provider();
+    if let Some(provider) = fallback_provider {
         if let Some(reason) = provider_validation_error(provider) {
             items.push(DiagItem::error(
                 cat,
@@ -451,8 +453,11 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // API key presence
-    if config.default_provider.as_deref() != Some("ollama") {
-        if config.api_key.is_some() {
+    if fallback_provider != Some("ollama") {
+        if fallback_provider_doc
+            .and_then(|e| e.api_key.as_deref())
+            .is_some()
+        {
             items.push(DiagItem::ok(cat, "API key configured"));
         } else {
             items.push(DiagItem::warn(
@@ -463,25 +468,26 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Model configured
-    if config.default_model.is_some() {
+    let default_model = fallback_provider_doc.and_then(|e| e.model.as_deref());
+    if default_model.is_some() {
         items.push(DiagItem::ok(
             cat,
-            format!(
-                "default model: {}",
-                config.default_model.as_deref().unwrap_or("?")
-            ),
+            format!("default model: {}", default_model.unwrap_or("?")),
         ));
     } else {
         items.push(DiagItem::warn(cat, "no default_model configured"));
     }
 
     // Temperature range
-    if config.default_temperature >= 0.0 && config.default_temperature <= 2.0 {
+    let default_temperature = fallback_provider_doc
+        .and_then(|e| e.temperature)
+        .unwrap_or(0.7);
+    if (0.0..=2.0).contains(&default_temperature) {
         items.push(DiagItem::ok(
             cat,
             format!(
                 "temperature {:.1} (valid range 0.0–2.0)",
-                config.default_temperature
+                default_temperature
             ),
         ));
     } else {
@@ -489,7 +495,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             cat,
             format!(
                 "temperature {:.1} is out of range (expected 0.0–2.0)",
-                config.default_temperature
+                default_temperature
             ),
         ));
     }
@@ -513,7 +519,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Model routes validation
-    for route in &config.model_routes {
+    for route in &config.providers.model_routes {
         if route.hint.is_empty() {
             items.push(DiagItem::warn(cat, "model route with empty hint"));
         }
@@ -535,7 +541,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Embedding routes validation
-    for route in &config.embedding_routes {
+    for route in &config.providers.embedding_routes {
         if route.hint.trim().is_empty() {
             items.push(DiagItem::warn(cat, "embedding route with empty hint"));
         }
@@ -572,6 +578,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         && !config
+            .providers
             .embedding_routes
             .iter()
             .any(|route| route.hint.trim() == hint)
@@ -585,7 +592,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Channel: at least one configured
-    let cc = &config.channels_config;
+    let cc = &config.channels;
     let has_channel = cc.channels().iter().any(|(_, ok)| *ok);
 
     if has_channel {
@@ -1060,10 +1067,14 @@ mod tests {
 
     #[test]
     fn config_validation_catches_bad_temperature() {
-        let config = Config {
-            default_temperature: 5.0,
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.providers.fallback = Some("default".into());
+        config
+            .providers
+            .models
+            .entry("default".into())
+            .or_default()
+            .temperature = Some(5.0);
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let temp_item = items.iter().find(|i| i.message.contains("temperature"));
@@ -1073,10 +1084,14 @@ mod tests {
 
     #[test]
     fn config_validation_accepts_valid_temperature() {
-        let config = Config {
-            default_temperature: 0.7,
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.providers.fallback = Some("default".into());
+        config
+            .providers
+            .models
+            .entry("default".into())
+            .or_default()
+            .temperature = Some(0.7);
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let temp_item = items.iter().find(|i| i.message.contains("temperature"));
@@ -1096,10 +1111,8 @@ mod tests {
 
     #[test]
     fn config_validation_catches_unknown_provider() {
-        let config = Config {
-            default_provider: Some("totally-fake".into()),
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.providers.fallback = Some("totally-fake".into());
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let prov_item = items
@@ -1111,10 +1124,8 @@ mod tests {
 
     #[test]
     fn config_validation_catches_malformed_custom_provider() {
-        let config = Config {
-            default_provider: Some("custom:".into()),
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.providers.fallback = Some("custom:".into());
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
 
@@ -1128,10 +1139,8 @@ mod tests {
 
     #[test]
     fn config_validation_accepts_custom_provider() {
-        let config = Config {
-            default_provider: Some("custom:https://my-api.com".into()),
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.providers.fallback = Some("custom:https://my-api.com".into());
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let prov_item = items.iter().find(|i| i.message.contains("is valid"));
@@ -1169,15 +1178,13 @@ mod tests {
 
     #[test]
     fn config_validation_warns_empty_model_route() {
-        let config = Config {
-            model_routes: vec![zeroclaw_config::schema::ModelRouteConfig {
-                hint: "fast".into(),
-                provider: "groq".into(),
-                model: String::new(),
-                api_key: None,
-            }],
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.providers.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            provider: "groq".into(),
+            model: String::new(),
+            api_key: None,
+        }];
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
         let route_item = items.iter().find(|i| i.message.contains("empty model"));
@@ -1187,16 +1194,14 @@ mod tests {
 
     #[test]
     fn config_validation_warns_empty_embedding_route_model() {
-        let config = Config {
-            embedding_routes: vec![zeroclaw_config::schema::EmbeddingRouteConfig {
-                hint: "semantic".into(),
-                provider: "openai".into(),
-                model: String::new(),
-                dimensions: Some(1536),
-                api_key: None,
-            }],
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.providers.embedding_routes = vec![zeroclaw_config::schema::EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "openai".into(),
+            model: String::new(),
+            dimensions: Some(1536),
+            api_key: None,
+        }];
 
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
@@ -1210,16 +1215,14 @@ mod tests {
 
     #[test]
     fn config_validation_warns_invalid_embedding_route_provider() {
-        let config = Config {
-            embedding_routes: vec![zeroclaw_config::schema::EmbeddingRouteConfig {
-                hint: "semantic".into(),
-                provider: "groq".into(),
-                model: "text-embedding-3-small".into(),
-                dimensions: None,
-                api_key: None,
-            }],
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.providers.embedding_routes = vec![zeroclaw_config::schema::EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "groq".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: None,
+            api_key: None,
+        }];
 
         let mut items = Vec::new();
         check_config_semantics(&config, &mut items);
