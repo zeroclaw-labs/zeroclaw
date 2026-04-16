@@ -4382,7 +4382,20 @@ fn default_sqlite_journal_mode() -> String {
 }
 
 fn default_embedding_provider() -> String {
-    "none".into()
+    // PR #1 — auto-flip the default once the `embedding-local` feature is
+    // compiled into the binary. Release builds with embedding-local get
+    // on-device BGE-M3 out of the box; dev builds without the feature
+    // keep the "none" default so `embed()` doesn't error on every recall.
+    // Operators who want a cloud embedder (OpenAI, etc.) still override
+    // explicitly in config.toml regardless of feature posture.
+    #[cfg(feature = "embedding-local")]
+    {
+        "local_fastembed".into()
+    }
+    #[cfg(not(feature = "embedding-local"))]
+    {
+        "none".into()
+    }
 }
 fn default_hygiene_enabled() -> bool {
     true
@@ -4406,10 +4419,32 @@ fn default_multi_query_model() -> String {
     "claude-haiku-4-5-20251001".into()
 }
 fn default_embedding_model() -> String {
-    "text-embedding-3-small".into()
+    // PR #1 — paired with `default_embedding_provider`. When
+    // `embedding-local` is compiled in, the matching on-device model is
+    // BGE-M3 (1024-dim, multilingual, Korean-strong). Otherwise fall
+    // back to the OpenAI text-embedding-3-small so cloud-first installs
+    // still have a sane default without touching config.toml.
+    #[cfg(feature = "embedding-local")]
+    {
+        "bge-m3".into()
+    }
+    #[cfg(not(feature = "embedding-local"))]
+    {
+        "text-embedding-3-small".into()
+    }
 }
 fn default_embedding_dims() -> usize {
-    1536
+    // BGE-M3 is 1024-dim; text-embedding-3-small is 1536-dim. Match the
+    // default_embedding_model pick so a fresh config.toml doesn't cause
+    // a schema-vs-vector dim mismatch on first embed.
+    #[cfg(feature = "embedding-local")]
+    {
+        1024
+    }
+    #[cfg(not(feature = "embedding-local"))]
+    {
+        1536
+    }
 }
 fn default_vector_weight() -> f64 {
     0.7
