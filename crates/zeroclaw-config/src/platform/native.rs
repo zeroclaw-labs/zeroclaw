@@ -54,8 +54,14 @@ impl RuntimeAdapter for NativeRuntime {
 
         #[cfg(target_os = "windows")]
         {
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+
             let mut process = tokio::process::Command::new("cmd.exe");
-            process.arg("/C").arg(command).current_dir(workspace_dir);
+            process
+                .arg("/C")
+                .arg(command)
+                .current_dir(workspace_dir)
+                .creation_flags(CREATE_NO_WINDOW);
             Ok(process)
         }
     }
