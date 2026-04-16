@@ -40,8 +40,8 @@ const TELEGRAM_BIND_COMMAND: &str = "/bind";
 const TELEGRAM_MAX_BOT_COMMANDS: usize = 100;
 /// Telegram command names: 1-32 lowercase a-z, 0-9, and underscore.
 const TELEGRAM_COMMAND_NAME_MAX_LEN: usize = 32;
-/// Telegram command descriptions are at most 256 characters.
-const TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN: usize = 256;
+/// Telegram command descriptions are at most 256 characters, but we keep much lower to avoid `BOT_COMMANDS_TOO_MUCH` error
+const TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN: usize = 100;
 
 /// Sanitize a skill name into a valid Telegram command name.
 /// Telegram commands must be 1-32 characters, lowercase a-z, 0-9, underscore only.
@@ -384,8 +384,8 @@ pub struct TelegramChannel {
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
-    /// Full application config for determining available tool commands.
-    config: Option<std::sync::Arc<zeroclaw_config::schema::Config>>,
+    /// Pre-computed tool command specs (name, description) for bot command registration.
+    tool_command_specs: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,7 +430,7 @@ impl TelegramChannel {
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
-            config: None,
+            tool_command_specs: Vec::new(),
         }
     }
 
@@ -446,9 +446,9 @@ impl TelegramChannel {
         self
     }
 
-    /// Store the application config for determining available tool commands.
-    pub fn with_config(mut self, config: std::sync::Arc<zeroclaw_config::schema::Config>) -> Self {
-        self.config = Some(config);
+    /// Store pre-computed tool command specs for bot command registration.
+    pub fn with_tool_command_specs(mut self, specs: Vec<(String, String)>) -> Self {
+        self.tool_command_specs = specs;
         self
     }
 
@@ -704,20 +704,16 @@ impl TelegramChannel {
         }
 
         // Collect commands from enabled tools.
-        if let Some(ref config) = self.config {
-            let tool_specs =
-                zeroclaw_runtime::tools::tool_command_specs_from_config(config.as_ref());
-            for (name, description) in tool_specs {
-                let sanitized = sanitize_telegram_command_name(name);
-                if sanitized.is_empty() || used_names.contains(&sanitized) {
-                    continue;
-                }
-                used_names.insert(sanitized.clone());
-                commands.push(serde_json::json!({
-                    "command": sanitized,
-                    "description": truncate_telegram_command_description(description),
-                }));
+        for (name, description) in &self.tool_command_specs {
+            let sanitized = sanitize_telegram_command_name(name);
+            if sanitized.is_empty() || used_names.contains(&sanitized) {
+                continue;
             }
+            used_names.insert(sanitized.clone());
+            commands.push(serde_json::json!({
+                "command": sanitized,
+                "description": truncate_telegram_command_description(description),
+            }));
         }
 
         // Telegram allows at most 100 commands.
@@ -5449,48 +5445,15 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // Default config has many tools enabled (browser defaults off, etc.)
-        let config = zeroclaw_config::schema::Config::default();
+        // Pass a sample tool spec to verify it gets registered
+        let specs = vec![("test_tool".to_string(), "A test tool".to_string())];
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
             .with_api_base(mock_server.uri())
-            .with_config(std::sync::Arc::new(config));
+            .with_tool_command_specs(specs);
 
         ch.register_bot_commands().await;
 
         // Just verify the mock was called — tool count depends on default config.
         // The 5 runtime commands + N tool commands should all be registered.
-    }
-
-    #[test]
-    fn tool_command_specs_from_default_config_includes_standard_tools() {
-        let config = zeroclaw_config::schema::Config::default();
-        let specs = zeroclaw_runtime::tools::tool_command_specs_from_config(&config);
-        // Default config always registers core tools
-        let names: Vec<&str> = specs.iter().map(|(n, _)| *n).collect();
-        assert!(names.contains(&"shell"));
-        assert!(names.contains(&"file_read"));
-        assert!(names.contains(&"memory_store"));
-        assert!(names.contains(&"calculator"));
-        assert!(names.contains(&"weather"));
-    }
-
-    #[test]
-    fn tool_command_specs_includes_browser_when_enabled() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.browser.enabled = true;
-        let specs = zeroclaw_runtime::tools::tool_command_specs_from_config(&config);
-        let names: Vec<&str> = specs.iter().map(|(n, _)| *n).collect();
-        assert!(names.contains(&"browser_open"));
-        assert!(names.contains(&"browser"));
-    }
-
-    #[test]
-    fn tool_command_specs_excludes_browser_when_disabled() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.browser.enabled = false;
-        let specs = zeroclaw_runtime::tools::tool_command_specs_from_config(&config);
-        let names: Vec<&str> = specs.iter().map(|(n, _)| *n).collect();
-        assert!(!names.contains(&"browser_open"));
-        assert!(!names.contains(&"browser"));
     }
 }
