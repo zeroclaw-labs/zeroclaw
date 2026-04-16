@@ -258,16 +258,14 @@ impl Tool for DriveTool {
         // Safety: check max drive duration
         {
             let mut last = self.last_command.lock().await;
-            if let Some(instant) = *last {
-                if instant.elapsed() < Duration::from_secs(1) {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(
-                            "Rate limited: wait 1 second between drive commands".to_string(),
-                        ),
-                    });
-                }
+            if let Some(instant) = *last
+                && instant.elapsed() < Duration::from_secs(1)
+            {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("Rate limited: wait 1 second between drive commands".to_string()),
+                });
             }
             *last = Some(std::time::Instant::now());
         }

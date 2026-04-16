@@ -11,6 +11,7 @@ port = 42617
 host = "[::]"
 allow_public_bind = true
 require_pairing = false
+web_dist_dir = "/zeroclaw-data/web/dist"
 
 # Cost tracking and budget enforcement configuration
 # Enable to track API usage costs and enforce spending limits

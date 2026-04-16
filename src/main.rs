@@ -30,7 +30,9 @@
     clippy::unnecessary_literal_bound,
     clippy::unnecessary_map_or,
     clippy::unnecessary_wraps,
-    dead_code
+    dead_code,
+    unused_variables,
+    unused_imports
 )]
 
 use anyhow::{Context, Result, bail};
@@ -71,48 +73,83 @@ fn pause_after_no_command_help() {
     let _ = std::io::stdin().read_line(&mut line);
 }
 
+#[cfg(feature = "agent-runtime")]
 mod agent;
+#[cfg(feature = "agent-runtime")]
 mod approval;
+#[cfg(feature = "agent-runtime")]
 mod auth;
+#[cfg(feature = "agent-runtime")]
 mod channels;
+#[cfg(feature = "agent-runtime")]
 mod cli_input;
 mod commands;
+#[cfg(feature = "agent-runtime")]
 mod rag {
     pub use zeroclaw::rag::*;
 }
 mod config;
+#[cfg(feature = "agent-runtime")]
 mod cost;
+#[cfg(feature = "agent-runtime")]
 mod cron;
+#[cfg(feature = "agent-runtime")]
 mod daemon;
+#[cfg(feature = "agent-runtime")]
 mod doctor;
+#[cfg(feature = "gateway")]
 mod gateway;
+#[cfg(feature = "agent-runtime")]
 mod hardware;
+#[cfg(feature = "agent-runtime")]
 mod health;
+#[cfg(feature = "agent-runtime")]
 mod heartbeat;
+#[cfg(feature = "agent-runtime")]
 mod hooks;
+#[cfg(feature = "agent-runtime")]
 mod i18n;
+#[cfg(feature = "agent-runtime")]
 mod identity;
+#[cfg(feature = "agent-runtime")]
 mod integrations;
 mod memory;
+#[cfg(feature = "agent-runtime")]
 mod migration;
+#[cfg(feature = "agent-runtime")]
 mod multimodal;
+#[cfg(feature = "agent-runtime")]
 mod observability;
+#[cfg(feature = "agent-runtime")]
 mod onboard;
+#[cfg(feature = "agent-runtime")]
 mod peripherals;
+#[cfg(feature = "agent-runtime")]
+mod platform;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
 mod providers;
-mod runtime;
+#[cfg(feature = "agent-runtime")]
 mod security;
+#[cfg(feature = "agent-runtime")]
 mod service;
+#[cfg(feature = "agent-runtime")]
 mod skillforge;
+#[cfg(feature = "agent-runtime")]
 mod skills;
+#[cfg(feature = "agent-runtime")]
 mod sop;
+#[cfg(feature = "agent-runtime")]
 mod tools;
+#[cfg(feature = "agent-runtime")]
 mod trust;
+#[cfg(feature = "tui-onboarding")]
 mod tui;
+#[cfg(feature = "agent-runtime")]
 mod tunnel;
+#[cfg(feature = "agent-runtime")]
 mod util;
+#[cfg(feature = "agent-runtime")]
 mod verifiable_intent;
 
 use config::Config;
@@ -423,6 +460,12 @@ Examples:
         skill_command: SkillCommands,
     },
 
+    /// Manage standard operating procedures (SOPs)
+    Sop {
+        #[command(subcommand)]
+        sop_command: SopCommands,
+    },
+
     /// Migrate data from other agent runtimes
     Migrate {
         #[command(subcommand)]
@@ -494,13 +537,26 @@ Examples:
     #[command(long_about = "\
 Manage ZeroClaw configuration.
 
-Inspect and export configuration settings. Use 'schema' to dump \
-the full JSON Schema for the config file, which documents every \
-available key, type, and default value.
+View, set, or initialize config properties by dotted path. \
+Use 'schema' to dump the full JSON Schema for the config file.
+
+Properties are addressed by dotted path (e.g. channels.matrix.mention-only).
+Secret fields (API keys, tokens) automatically use masked input.
+Enum fields offer interactive selection when value is omitted.
 
 Examples:
-  zeroclaw config schema              # print JSON Schema to stdout
-  zeroclaw config schema > schema.json")]
+  zeroclaw config list                                  # list all properties
+  zeroclaw config list --secrets                        # list only secrets
+  zeroclaw config list --filter channels.matrix         # filter by prefix
+  zeroclaw config get channels.matrix.mention-only      # get a value
+  zeroclaw config set channels.matrix.mention-only true # set a value
+  zeroclaw config set channels.matrix.access-token      # secret: masked input
+  zeroclaw config set channels.matrix.stream-mode       # enum: interactive select
+  zeroclaw config init channels.matrix                  # init section with defaults
+  zeroclaw config schema                                # print JSON Schema to stdout
+  zeroclaw config schema > schema.json
+
+Property path tab completion is included automatically in `zeroclaw completions <shell>`.")]
     Config {
         #[command(subcommand)]
         config_command: ConfigCommands,
@@ -587,28 +643,11 @@ Examples:
         install: bool,
     },
 
-    /// View or change config properties by dotted path
-    #[command(long_about = "\
-View, set, or initialize config properties.
-
-Properties are addressed by dotted path (e.g. channels.matrix.mention-only).
-Secret fields (API keys, tokens) automatically use masked input.
-Enum fields offer interactive selection when value is omitted.
-
-Examples:
-  zeroclaw props list                                  # list all properties
-  zeroclaw props list --secrets                        # list only secrets
-  zeroclaw props list --filter channels.matrix         # filter by prefix
-  zeroclaw props get channels.matrix.mention-only      # get a value
-  zeroclaw props set channels.matrix.mention-only true # set a value
-  zeroclaw props set channels.matrix.access-token      # secret: masked input
-  zeroclaw props set channels.matrix.stream-mode       # enum: interactive select
-  zeroclaw props init channels.matrix                  # init section with defaults
-
-Property path tab completion is included automatically in `zeroclaw completions <shell>`.")]
+    /// Deprecated: use `zeroclaw config` instead
+    #[command(hide = true)]
     Props {
         #[command(subcommand)]
-        props_command: PropsCommands,
+        props_command: DeprecatedPropsCommands,
     },
 
     /// Manage WASM plugins
@@ -619,8 +658,40 @@ Property path tab completion is included automatically in `zeroclaw completions 
     },
 }
 
+/// Stub enum that mirrors the old `props` subcommands so clap can still parse
+/// `zeroclaw props <anything>` and print a deprecation message.
 #[derive(Subcommand, Debug)]
-enum PropsCommands {
+enum DeprecatedPropsCommands {
+    #[command(external_subcommand)]
+    Any(Vec<String>),
+}
+
+#[cfg(feature = "plugins-wasm")]
+#[derive(Subcommand, Debug)]
+enum PluginCommands {
+    /// List installed plugins
+    List,
+    /// Install a plugin from a directory or URL
+    Install {
+        /// Path to plugin directory or manifest
+        source: String,
+    },
+    /// Remove an installed plugin
+    Remove {
+        /// Plugin name
+        name: String,
+    },
+    /// Show information about a plugin
+    Info {
+        /// Plugin name
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommands {
+    /// Dump the full configuration JSON Schema to stdout
+    Schema,
     /// List all config properties with current values
     List {
         /// Filter by path prefix (e.g. "channels.telegram")
@@ -650,40 +721,14 @@ enum PropsCommands {
         /// Section prefix (e.g. channels.matrix). Omit to init all.
         section: Option<String>,
     },
+    /// Migrate config.toml to the current schema version on disk (preserves comments)
+    Migrate,
     /// Print matching property paths for shell completion (hidden)
     #[command(hide = true)]
     Complete {
         /// Partial path to complete
         partial: Option<String>,
     },
-}
-
-#[cfg(feature = "plugins-wasm")]
-#[derive(Subcommand, Debug)]
-enum PluginCommands {
-    /// List installed plugins
-    List,
-    /// Install a plugin from a directory or URL
-    Install {
-        /// Path to plugin directory or manifest
-        source: String,
-    },
-    /// Remove an installed plugin
-    Remove {
-        /// Plugin name
-        name: String,
-    },
-    /// Show information about a plugin
-    Info {
-        /// Plugin name
-        name: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum ConfigCommands {
-    /// Dump the full configuration JSON Schema to stdout
-    Schema,
 }
 
 #[derive(Subcommand, Debug)]
@@ -890,6 +935,7 @@ async fn main() -> Result<()> {
     // Install default crypto provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
+    #[cfg(feature = "agent-runtime")]
     if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
         eprintln!("Warning: Failed to install default crypto provider: {e:?}");
     }
@@ -916,11 +962,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO
+    // Initialize logging - respects RUST_LOG env var, defaults to INFO.
+    // matrix_sdk crates are suppressed to warn because they are extremely
+    // noisy at info level. To restore SDK-level output for Matrix debugging:
+    //   RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info
     let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn")
+        }))
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
@@ -932,6 +981,7 @@ async fn main() -> Result<()> {
     // detection fails.  This means `curl … | bash` and
     // `zeroclaw onboard --api-key …` both take the fast path, while a bare
     // `zeroclaw onboard` in a terminal launches the wizard.
+    #[cfg(feature = "agent-runtime")]
     if let Commands::Onboard {
         force,
         reinit,
@@ -1019,12 +1069,14 @@ async fn main() -> Result<()> {
 
         // TUI onboarding mode (ratatui-based)
         if use_tui {
-            Box::pin(tui::run_tui_onboarding()).await?;
+            Box::pin(run_tui_if_enabled()).await?;
             return Ok(());
         }
 
+        let wizard_callbacks = build_wizard_callbacks();
+
         let config = if channels_only {
-            Box::pin(onboard::run_channels_repair_wizard()).await
+            Box::pin(onboard::run_channels_repair_wizard(wizard_callbacks)).await
         } else if quick || has_provider_flags {
             Box::pin(onboard::run_quick_setup(
                 api_key.as_deref(),
@@ -1035,7 +1087,7 @@ async fn main() -> Result<()> {
             ))
             .await
         } else if is_tty || env_interactive {
-            Box::pin(onboard::run_wizard(force)).await
+            Box::pin(onboard::run_wizard(force, wizard_callbacks)).await
         } else {
             Box::pin(onboard::run_quick_setup(
                 api_key.as_deref(),
@@ -1065,7 +1117,9 @@ async fn main() -> Result<()> {
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
     config.apply_env_overrides();
+    #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
+    #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
         let config_dir = config
             .config_path
@@ -1080,6 +1134,77 @@ async fn main() -> Result<()> {
         }
     }
 
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        // Kernel-only mode: minimal CLI agent without channels/tools/gateway
+        match cli.command {
+            Commands::Agent {
+                message,
+                provider,
+                model,
+                temperature,
+                ..
+            } => {
+                let fallback = config.providers.fallback_provider();
+                let final_temperature = temperature
+                    .unwrap_or_else(|| fallback.and_then(|e| e.temperature).unwrap_or(0.7));
+                if let Some(p) = &provider {
+                    config.providers.fallback = Some(p.clone());
+                }
+                if let Some(m) = &model {
+                    config.ensure_fallback_provider().model = Some(m.clone());
+                }
+                config.ensure_fallback_provider().temperature = Some(final_temperature);
+
+                let provider_name = config.providers.fallback.as_deref().unwrap_or("openai");
+                let provider = zeroclaw::providers::create_provider(
+                    provider_name,
+                    config
+                        .providers
+                        .fallback_provider()
+                        .and_then(|e| e.api_key.as_deref()),
+                )?;
+                let model_name = config
+                    .providers
+                    .fallback_provider()
+                    .and_then(|e| e.model.as_deref())
+                    .unwrap_or("default");
+                match message {
+                    Some(msg) => {
+                        let response = provider
+                            .simple_chat(&msg, model_name, final_temperature)
+                            .await?;
+                        println!("{response}");
+                    }
+                    None => {
+                        // Interactive mode
+                        let stdin = std::io::stdin();
+                        let mut line = String::new();
+                        loop {
+                            eprint!("> ");
+                            line.clear();
+                            if stdin.read_line(&mut line)? == 0 {
+                                break;
+                            }
+                            let response = provider
+                                .simple_chat(line.trim(), model_name, final_temperature)
+                                .await?;
+                            println!("{response}");
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            Commands::Completions { shell } => unreachable!(),
+            _ => {
+                anyhow::bail!(
+                    "This command requires the full runtime. Rebuild with default features:\n  cargo build --release"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
     match cli.command {
         Commands::Onboard { .. } | Commands::Completions { .. } => unreachable!(),
 
@@ -1091,7 +1216,13 @@ async fn main() -> Result<()> {
             temperature,
             peripheral,
         } => {
-            let final_temperature = temperature.unwrap_or(config.default_temperature);
+            let final_temperature = temperature.unwrap_or_else(|| {
+                config
+                    .providers
+                    .fallback_provider()
+                    .and_then(|e| e.temperature)
+                    .unwrap_or(0.7)
+            });
 
             Box::pin(agent::run(
                 config,
@@ -1159,7 +1290,7 @@ async fn main() -> Result<()> {
                     }
 
                     log_gateway_start(&host, port);
-                    Box::pin(gateway::run_gateway(&host, port, config, None)).await
+                    Box::pin(run_gateway_if_enabled(&host, port, config, None)).await
                 }
                 Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
                     let port = config.gateway.port;
@@ -1212,13 +1343,13 @@ async fn main() -> Result<()> {
                 Some(zeroclaw::GatewayCommands::Start { port, host }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     log_gateway_start(&host, port);
-                    Box::pin(gateway::run_gateway(&host, port, config, None)).await
+                    Box::pin(run_gateway_if_enabled(&host, port, config, None)).await
                 }
                 None => {
                     let port = config.gateway.port;
                     let host = config.gateway.host.clone();
                     log_gateway_start(&host, port);
-                    Box::pin(gateway::run_gateway(&host, port, config, None)).await
+                    Box::pin(run_gateway_if_enabled(&host, port, config, None)).await
                 }
             }
         }
@@ -1241,7 +1372,66 @@ async fn main() -> Result<()> {
             } else {
                 info!("🧠 Starting ZeroClaw Daemon on {host}:{port}");
             }
-            Box::pin(daemon::run(config, host, port)).await
+            // Wire CLI channel for interactive mode
+            #[cfg(feature = "agent-runtime")]
+            zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
+                Box::new(zeroclaw_channels::cli::CliChannel::new())
+            }));
+
+            // Wire peripheral tools from zeroclaw-hardware
+            #[cfg(feature = "hardware")]
+            zeroclaw_runtime::agent::loop_::register_peripheral_tools_fn(Box::new(|config| {
+                Box::pin(async move {
+                    zeroclaw_hardware::peripherals::create_peripheral_tools(&config).await
+                })
+            }));
+
+            // Wire cron delivery to the channels orchestrator
+            #[cfg(feature = "agent-runtime")]
+            zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
+                |config, channel, target, output| {
+                    Box::pin(async move {
+                        zeroclaw_channels::orchestrator::deliver_announcement(
+                            &config, &channel, &target, &output,
+                        )
+                        .await
+                    })
+                },
+            ));
+
+            let subsystems = daemon::DaemonSubsystems {
+                #[cfg(feature = "gateway")]
+                gateway_start: Some(Box::new(|host, port, config, tx| {
+                    Box::pin(async move {
+                        Box::pin(zeroclaw_gateway::run_gateway(&host, port, config, tx)).await
+                    })
+                })),
+                #[cfg(not(feature = "gateway"))]
+                gateway_start: None,
+                channels_start: Some(Box::new(|config| {
+                    Box::pin(async move {
+                        Box::pin(zeroclaw_channels::orchestrator::start_channels(config)).await
+                    })
+                })),
+                mqtt_start: Some(Box::new(|mqtt_config| {
+                    Box::pin(async move {
+                        use std::sync::{Arc, Mutex};
+                        use zeroclaw_config::schema::SopConfig;
+                        use zeroclaw_memory::NoneMemory;
+                        use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
+
+                        let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
+                        let audit = Arc::new(SopAuditLogger::new(Arc::new(NoneMemory)));
+                        zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
+                            &mqtt_config,
+                            engine,
+                            audit,
+                        )
+                        .await
+                    })
+                })),
+            };
+            Box::pin(daemon::run(config, host, port, subsystems)).await
         }
 
         Commands::Status { format } => {
@@ -1276,11 +1466,15 @@ async fn main() -> Result<()> {
             println!();
             println!(
                 "🤖 Provider:      {}",
-                config.default_provider.as_deref().unwrap_or("openrouter")
+                config.providers.fallback.as_deref().unwrap_or("openrouter")
             );
             println!(
                 "   Model:         {}",
-                config.default_model.as_deref().unwrap_or("(default)")
+                config
+                    .providers
+                    .fallback_provider()
+                    .and_then(|e| e.model.as_deref())
+                    .unwrap_or("(default)")
             );
             println!("📊 Observability:  {}", config.observability.backend);
             println!(
@@ -1368,7 +1562,7 @@ async fn main() -> Result<()> {
             println!();
             println!("Channels:");
             println!("  CLI:      ✅ always");
-            for (channel, configured) in config.channels_config.channels() {
+            for (channel, configured) in config.channels.channels() {
                 println!(
                     "  {:9} {}",
                     channel.name(),
@@ -1430,7 +1624,8 @@ async fn main() -> Result<()> {
         Commands::Providers => {
             let providers = providers::list_providers();
             let current = config
-                .default_provider
+                .providers
+                .fallback
                 .as_deref()
                 .unwrap_or("openrouter")
                 .trim()
@@ -1499,6 +1694,8 @@ async fn main() -> Result<()> {
         } => integrations::handle_command(integration_command, &config),
 
         Commands::Skills { skill_command } => skills::handle_command(skill_command, &config),
+
+        Commands::Sop { sop_command } => sop::handle_command(sop_command, &config),
 
         Commands::Migrate { migrate_command } => {
             migration::handle_command(migrate_command, &config).await
@@ -1682,10 +1879,7 @@ async fn main() -> Result<()> {
                 );
                 Ok(())
             }
-        },
-
-        Commands::Props { props_command } => match props_command {
-            PropsCommands::List { filter, secrets } => {
+            ConfigCommands::List { filter, secrets } => {
                 let entries = config.prop_fields();
                 let mut current_category = "";
                 for entry in &entries {
@@ -1712,7 +1906,7 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             }
-            PropsCommands::Get { path } => {
+            ConfigCommands::Get { path } => {
                 if Config::prop_is_secret(&path) {
                     let entries = config.prop_fields();
                     let is_set = entries
@@ -1733,16 +1927,15 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             }
-            PropsCommands::Set {
+            ConfigCommands::Set {
                 path,
                 value,
                 no_interactive,
             } => {
                 if no_interactive {
-                    // Scripted mode: require value on CLI, no prompts
                     let val = value.ok_or_else(|| {
                         anyhow::anyhow!(
-                            "Value required in --no-interactive mode. Usage: zeroclaw props set --no-interactive {path} <value>"
+                            "Value required in --no-interactive mode. Usage: zeroclaw config set --no-interactive {path} <value>"
                         )
                     })?;
                     config.set_prop(&path, &val)?;
@@ -1763,7 +1956,6 @@ async fn main() -> Result<()> {
                 } else if let Some(val) = value {
                     config.set_prop(&path, &val)?;
                 } else {
-                    // Enum fields get interactive selection; everything else needs a value
                     let variants = config
                         .prop_fields()
                         .into_iter()
@@ -1785,14 +1977,14 @@ async fn main() -> Result<()> {
                             .interact()?;
                         config.set_prop(&path, &variants[selected])?;
                     } else {
-                        anyhow::bail!("Value required. Usage: zeroclaw props set {path} <value>");
+                        anyhow::bail!("Value required. Usage: zeroclaw config set {path} <value>");
                     }
                 }
                 config.save().await?;
                 println!("{path} updated.");
                 Ok(())
             }
-            PropsCommands::Init { section } => {
+            ConfigCommands::Init { section } => {
                 let initialized = config.init_defaults(section.as_deref());
                 if initialized.is_empty() {
                     println!("All sections already configured.");
@@ -1805,11 +1997,35 @@ async fn main() -> Result<()> {
                         println!("  {name}");
                     }
                     config.save().await?;
-                    println!("\nRun `zeroclaw props list` to review, then set required fields.");
+                    println!("\nRun `zeroclaw config list` to review, then set required fields.");
                 }
                 Ok(())
             }
-            PropsCommands::Complete { partial } => {
+            ConfigCommands::Migrate => {
+                let raw = tokio::fs::read_to_string(&config.config_path)
+                    .await
+                    .context("Failed to read config file")?;
+                match crate::config::migration::migrate_file(&raw)? {
+                    Some(migrated) => {
+                        let backup_path = config.config_path.with_extension("toml.bak");
+                        tokio::fs::copy(&config.config_path, &backup_path)
+                            .await
+                            .context("Failed to create config backup")?;
+                        tokio::fs::write(&config.config_path, &migrated).await?;
+                        let to = crate::config::migration::CURRENT_SCHEMA_VERSION;
+                        println!("Backed up to {}", backup_path.display());
+                        println!(
+                            "Migrated {} to schema version {to}.",
+                            config.config_path.display()
+                        );
+                    }
+                    None => {
+                        println!("Config already at current schema version.");
+                    }
+                }
+                Ok(())
+            }
+            ConfigCommands::Complete { partial } => {
                 let prefix = partial.as_deref().unwrap_or("");
                 for entry in config.prop_fields() {
                     if entry.name.starts_with(prefix) {
@@ -1819,6 +2035,13 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+
+        Commands::Props { .. } => {
+            anyhow::bail!(
+                "`zeroclaw props` has been renamed to `zeroclaw config`. \
+                 Replace `props` with `config` in your command and try again."
+            );
+        }
 
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
@@ -1872,6 +2095,224 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Build wizard callbacks that wire downstream crate functionality into the onboarding wizard.
+#[cfg(feature = "agent-runtime")]
+fn build_wizard_callbacks() -> onboard::WizardCallbacks {
+    onboard::WizardCallbacks {
+        #[cfg(feature = "hardware")]
+        hardware_setup: Some(Box::new(|| {
+            use console::style;
+            use dialoguer::{Confirm, Select};
+
+            println!(
+                "  {} {}",
+                style("ℹ").dim(),
+                style("ZeroClaw can talk to physical hardware (LEDs, sensors, motors).").dim()
+            );
+            println!(
+                "  {} {}",
+                style("ℹ").dim(),
+                style("Scanning for connected devices...").dim()
+            );
+            println!();
+
+            let devices = zeroclaw_hardware::discover_hardware();
+
+            if devices.is_empty() {
+                println!(
+                    "  {} {}",
+                    style("ℹ").dim(),
+                    style("No hardware devices detected on this system.").dim()
+                );
+                println!(
+                    "  {} {}",
+                    style("ℹ").dim(),
+                    style("You can enable hardware later in config.toml under [hardware].").dim()
+                );
+            } else {
+                println!(
+                    "  {} {} device(s) found:",
+                    style("✓").green().bold(),
+                    devices.len()
+                );
+                for device in &devices {
+                    let detail = device
+                        .detail
+                        .as_deref()
+                        .map(|d| format!(" ({d})"))
+                        .unwrap_or_default();
+                    let path = device
+                        .device_path
+                        .as_deref()
+                        .map(|p| format!(" → {p}"))
+                        .unwrap_or_default();
+                    println!(
+                        "    {} {}{}{} [{}]",
+                        style("›").cyan(),
+                        style(&device.name).green(),
+                        style(&detail).dim(),
+                        style(&path).dim(),
+                        style(device.transport.to_string()).cyan()
+                    );
+                }
+            }
+            println!();
+
+            let options = vec![
+                "🚀 Native — direct GPIO on this Linux board (Raspberry Pi, Orange Pi, etc.)",
+                "🔌 Tethered — control an Arduino/ESP32/Nucleo plugged into USB",
+                "🔬 Debug Probe — flash/read MCUs via SWD/JTAG (probe-rs)",
+                "☁️  Software Only — no hardware access (default)",
+            ];
+
+            let recommended = zeroclaw_hardware::recommended_wizard_default(&devices);
+
+            let choice = Select::new()
+                .with_prompt("  How should ZeroClaw interact with the physical world?")
+                .items(&options)
+                .default(recommended)
+                .interact()?;
+
+            let mut hw_config = zeroclaw_hardware::config_from_wizard_choice(choice, &devices);
+
+            use zeroclaw_config::schema::HardwareTransport;
+
+            // Serial: pick a port if multiple found
+            if hw_config.transport_mode() == HardwareTransport::Serial {
+                let serial_devices: Vec<&zeroclaw_hardware::DiscoveredDevice> = devices
+                    .iter()
+                    .filter(|d| d.transport == HardwareTransport::Serial)
+                    .collect();
+
+                if serial_devices.len() > 1 {
+                    let port_labels: Vec<String> = serial_devices
+                        .iter()
+                        .map(|d| {
+                            format!(
+                                "{} ({})",
+                                d.device_path.as_deref().unwrap_or("unknown"),
+                                d.name
+                            )
+                        })
+                        .collect();
+
+                    let port_idx = Select::new()
+                        .with_prompt("  Multiple serial devices found — select one")
+                        .items(&port_labels)
+                        .default(0)
+                        .interact()?;
+
+                    hw_config.serial_port = serial_devices[port_idx].device_path.clone();
+                } else if serial_devices.is_empty() {
+                    let manual_port: String = dialoguer::Input::new()
+                        .with_prompt("  Serial port path (e.g. /dev/ttyUSB0)")
+                        .default("/dev/ttyUSB0".into())
+                        .interact_text()?;
+                    hw_config.serial_port = Some(manual_port);
+                }
+
+                // Baud rate
+                let baud_options = vec![
+                    "115200 (default, recommended)",
+                    "9600 (legacy Arduino)",
+                    "57600",
+                    "230400",
+                    "Custom",
+                ];
+                let baud_idx = Select::new()
+                    .with_prompt("  Serial baud rate")
+                    .items(&baud_options)
+                    .default(0)
+                    .interact()?;
+
+                hw_config.baud_rate = match baud_idx {
+                    1 => 9600,
+                    2 => 57600,
+                    3 => 230_400,
+                    4 => {
+                        let custom: String = dialoguer::Input::new()
+                            .with_prompt("  Custom baud rate")
+                            .default("115200".into())
+                            .interact_text()?;
+                        custom.parse::<u32>().unwrap_or(115_200)
+                    }
+                    _ => 115_200,
+                };
+            }
+
+            // Probe: ask for target chip
+            if hw_config.transport_mode() == HardwareTransport::Probe
+                && hw_config.probe_target.is_none()
+            {
+                let target: String = dialoguer::Input::new()
+                    .with_prompt("  Target MCU chip (e.g. STM32F411CEUx, nRF52840_xxAA)")
+                    .default("STM32F411CEUx".into())
+                    .interact_text()?;
+                hw_config.probe_target = Some(target);
+            }
+
+            // Datasheet RAG
+            if hw_config.enabled {
+                let datasheets = Confirm::new()
+                    .with_prompt(
+                        "  Enable datasheet RAG? (index PDF schematics for AI pin lookups)",
+                    )
+                    .default(true)
+                    .interact()?;
+                hw_config.workspace_datasheets = datasheets;
+            }
+
+            // Summary
+            if hw_config.enabled {
+                let transport_label = match hw_config.transport_mode() {
+                    HardwareTransport::Native => "Native GPIO".to_string(),
+                    HardwareTransport::Serial => format!(
+                        "Serial → {} @ {} baud",
+                        hw_config.serial_port.as_deref().unwrap_or("?"),
+                        hw_config.baud_rate
+                    ),
+                    HardwareTransport::Probe => format!(
+                        "Probe (SWD/JTAG) → {}",
+                        hw_config.probe_target.as_deref().unwrap_or("?")
+                    ),
+                    HardwareTransport::None => "Software Only".to_string(),
+                };
+
+                println!(
+                    "  {} Hardware: {} | datasheets: {}",
+                    style("✓").green().bold(),
+                    style(&transport_label).green(),
+                    if hw_config.workspace_datasheets {
+                        style("on").green().to_string()
+                    } else {
+                        style("off").dim().to_string()
+                    }
+                );
+            } else {
+                println!(
+                    "  {} Hardware: {}",
+                    style("✓").green().bold(),
+                    style("disabled (software only)").dim()
+                );
+            }
+
+            Ok(hw_config)
+        })),
+        #[cfg(not(feature = "hardware"))]
+        hardware_setup: None,
+
+        #[cfg(feature = "channel-nostr")]
+        nostr_validate_key: Some(Box::new(|key: &str| {
+            let keys = nostr_sdk::Keys::parse(key)
+                .map_err(|e| anyhow::anyhow!("invalid nostr key: {e}"))?;
+            Ok(keys.public_key().to_hex())
+        })),
+
+        whatsapp_web_available: cfg!(feature = "whatsapp-web"),
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
 fn handle_estop_command(
     config: &Config,
     estop_command: Option<EstopSubcommands>,
@@ -1943,6 +2384,7 @@ fn handle_estop_command(
     }
 }
 
+#[cfg(feature = "agent-runtime")]
 fn build_engage_level(
     level: Option<EstopLevelArg>,
     domains: Vec<String>,
@@ -1983,6 +2425,7 @@ fn build_engage_level(
     }
 }
 
+#[cfg(feature = "agent-runtime")]
 fn build_resume_selector(
     network: bool,
     domains: Vec<String>,
@@ -2005,6 +2448,7 @@ fn build_resume_selector(
     Ok(security::ResumeSelector::KillAll)
 }
 
+#[cfg(feature = "agent-runtime")]
 fn print_estop_status(state: &security::EstopState) {
     println!("Estop status:");
     println!(
@@ -2048,17 +2492,17 @@ fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> R
     match shell {
         CompletionShell::Bash => {
             generate(shells::Bash, &mut cmd, bin_name.clone(), writer);
-            // Wrap clap's _zeroclaw to inject dynamic props path completion
+            // Wrap clap's _zeroclaw to inject dynamic config path completion
             writeln!(
                 writer,
                 r#"
-# Dynamic completion for zeroclaw props get/set paths
+# Dynamic completion for zeroclaw config get/set paths
 if type _zeroclaw &>/dev/null; then
     _zeroclaw_clap_orig() {{ _zeroclaw "$@"; }}
     _zeroclaw() {{
         local cur="${{COMP_WORDS[COMP_CWORD]}}"
-        if [[ "${{COMP_WORDS[*]}}" =~ "props "(get|set)" " ]]; then
-            COMPREPLY=($(compgen -W "$(zeroclaw props complete "$cur" 2>/dev/null)" -- "$cur"))
+        if [[ "${{COMP_WORDS[*]}}" =~ "config "(get|set)" " ]]; then
+            COMPREPLY=($(compgen -W "$(zeroclaw config complete "$cur" 2>/dev/null)" -- "$cur"))
             return
         fi
         _zeroclaw_clap_orig "$@"
@@ -2071,24 +2515,24 @@ fi"#
             writeln!(
                 writer,
                 r#"
-# Dynamic completion for zeroclaw props get/set paths
-complete -c zeroclaw -n '__fish_seen_subcommand_from props; and __fish_seen_subcommand_from get set' \
-    -a '(zeroclaw props complete (commandline -ct) 2>/dev/null)' -f"#
+# Dynamic completion for zeroclaw config get/set paths
+complete -c zeroclaw -n '__fish_seen_subcommand_from config; and __fish_seen_subcommand_from get set' \
+    -a '(zeroclaw config complete (commandline -ct) 2>/dev/null)' -f"#
             )?;
         }
         CompletionShell::Zsh => {
             generate(shells::Zsh, &mut cmd, bin_name.clone(), writer);
-            // Wrap clap's _zeroclaw to inject dynamic props path completion
+            // Wrap clap's _zeroclaw to inject dynamic config path completion
             writeln!(
                 writer,
                 r#"
-# Dynamic completion for zeroclaw props get/set paths
+# Dynamic completion for zeroclaw config get/set paths
 if (( $+functions[_zeroclaw] )); then
     functions[_zeroclaw_clap_orig]=$functions[_zeroclaw]
     _zeroclaw() {{
-        if [[ "${{words[*]}}" == *"props "(get|set)* ]] && (( CURRENT > 3 )); then
+        if [[ "${{words[*]}}" == *"config "(get|set)* ]] && (( CURRENT > 3 )); then
             local -a props
-            props=(${{(f)"$(zeroclaw props complete "$words[CURRENT]" 2>/dev/null)"}})
+            props=(${{(f)"$(zeroclaw config complete "$words[CURRENT]" 2>/dev/null)"}})
             compadd -a props
             return
         fi
@@ -2126,6 +2570,7 @@ fn log_gateway_start(host: &str, port: u16) {
 }
 
 /// Gracefully shutdown a running gateway via the admin endpoint.
+#[cfg(feature = "agent-runtime")]
 async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
     let url = format!("http://{host}:{port}/admin/shutdown");
     let client = reqwest::Client::new();
@@ -2147,6 +2592,7 @@ async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
 
 /// Fetch the current pairing code from a running gateway.
 /// If `new` is true, generates a fresh pairing code via POST request.
+#[cfg(feature = "agent-runtime")]
 async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<String>> {
     let client = reqwest::Client::new();
 
@@ -2217,11 +2663,13 @@ struct PendingOAuthLoginFile {
     created_at: String,
 }
 
+#[cfg(feature = "agent-runtime")]
 fn pending_oauth_login_path(config: &Config, provider: &str) -> std::path::PathBuf {
     let filename = format!("auth-{}-pending.json", provider);
     auth::state_dir_from_config(config).join(filename)
 }
 
+#[cfg(feature = "agent-runtime")]
 fn pending_oauth_secret_store(config: &Config) -> security::secrets::SecretStore {
     security::secrets::SecretStore::new(
         &auth::state_dir_from_config(config),
@@ -2241,6 +2689,7 @@ fn set_owner_only_permissions(_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "agent-runtime")]
 fn save_pending_oauth_login(config: &Config, pending: &PendingOAuthLogin) -> Result<()> {
     let path = pending_oauth_login_path(config, &pending.provider);
     if let Some(parent) = path.parent() {
@@ -2269,6 +2718,7 @@ fn save_pending_oauth_login(config: &Config, pending: &PendingOAuthLogin) -> Res
     Ok(())
 }
 
+#[cfg(feature = "agent-runtime")]
 fn load_pending_oauth_login(config: &Config, provider: &str) -> Result<Option<PendingOAuthLogin>> {
     let path = pending_oauth_login_path(config, provider);
     if !path.exists() {
@@ -2296,6 +2746,7 @@ fn load_pending_oauth_login(config: &Config, provider: &str) -> Result<Option<Pe
     }))
 }
 
+#[cfg(feature = "agent-runtime")]
 fn clear_pending_oauth_login(config: &Config, provider: &str) {
     let path = pending_oauth_login_path(config, provider);
     if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
@@ -2305,6 +2756,7 @@ fn clear_pending_oauth_login(config: &Config, provider: &str) {
     let _ = std::fs::remove_file(path);
 }
 
+#[cfg(feature = "agent-runtime")]
 fn read_auth_input(prompt: &str) -> Result<String> {
     let input = Password::new()
         .with_prompt(prompt)
@@ -2313,6 +2765,7 @@ fn read_auth_input(prompt: &str) -> Result<String> {
     Ok(input.trim().to_string())
 }
 
+#[cfg(feature = "agent-runtime")]
 fn read_plain_input(prompt: &str) -> Result<String> {
     let input: String = cli_input::Input::new()
         .with_prompt(prompt)
@@ -2320,6 +2773,7 @@ fn read_plain_input(prompt: &str) -> Result<String> {
     Ok(input.trim().to_string())
 }
 
+#[cfg(feature = "agent-runtime")]
 fn extract_openai_account_id_for_profile(access_token: &str) -> Option<String> {
     let account_id = auth::openai_oauth::extract_account_id_from_jwt(access_token);
     if account_id.is_none() {
@@ -2331,6 +2785,7 @@ fn extract_openai_account_id_for_profile(access_token: &str) -> Option<String> {
     account_id
 }
 
+#[cfg(feature = "agent-runtime")]
 async fn import_openai_codex_auth_profile(
     auth_service: &auth::AuthService,
     profile: &str,
@@ -2379,6 +2834,7 @@ async fn import_openai_codex_auth_profile(
     Ok(())
 }
 
+#[cfg(feature = "agent-runtime")]
 fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
     match profile
         .token_set
@@ -2399,6 +2855,7 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
+#[cfg(feature = "agent-runtime")]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
     let auth_service = auth::AuthService::from_config(config);
 
@@ -2872,17 +3329,45 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
     }
 }
 
+#[cfg(feature = "gateway")]
+async fn run_gateway_if_enabled(
+    host: &str,
+    port: u16,
+    config: zeroclaw::config::Config,
+    tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+) -> anyhow::Result<()> {
+    Box::pin(gateway::run_gateway(host, port, config, tx)).await
+}
+
+#[cfg(not(feature = "gateway"))]
+#[allow(clippy::unused_async)]
+async fn run_gateway_if_enabled(
+    _host: &str,
+    _port: u16,
+    _config: zeroclaw::config::Config,
+    _tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+) -> anyhow::Result<()> {
+    anyhow::bail!("Gateway feature is not enabled. Rebuild with --features gateway")
+}
+
+#[cfg(feature = "tui-onboarding")]
+async fn run_tui_if_enabled() -> anyhow::Result<()> {
+    Box::pin(tui::run_tui_onboarding()).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn cli_definition_has_no_flag_conflicts() {
         Cli::command().debug_assert();
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn onboard_help_includes_model_flag() {
         let cmd = Cli::command();
         let onboard = cmd
@@ -2901,6 +3386,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn onboard_cli_accepts_model_provider_and_api_key_in_quick_mode() {
         let cli = Cli::try_parse_from([
             "zeroclaw",
@@ -2934,6 +3420,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn completions_cli_parses_supported_shells() {
         for shell in ["bash", "fish", "zsh", "powershell", "elvish"] {
             let cli = Cli::try_parse_from(["zeroclaw", "completions", shell])
@@ -2946,6 +3433,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn completion_generation_mentions_binary_name() {
         let mut output = Vec::new();
         write_shell_completion(CompletionShell::Bash, &mut output)
@@ -2958,6 +3446,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn onboard_cli_accepts_force_flag() {
         let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--force"])
             .expect("onboard --force should parse");
@@ -2969,12 +3458,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn onboard_cli_rejects_removed_interactive_flag() {
         // --interactive was removed; onboard auto-detects TTY instead.
         assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"]).is_err());
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn onboard_cli_parses_quick_flag() {
         let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--quick"])
             .expect("onboard --quick should parse");
@@ -2986,6 +3477,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn onboard_cli_quick_and_channels_only_conflict() {
         // --quick and --channels-only should both parse at the CLI level
         // (the conflict is checked at runtime), but we verify both flags parse.
@@ -2997,6 +3489,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn onboard_cli_bare_parses() {
         let cli = Cli::try_parse_from(["zeroclaw", "onboard"]).expect("bare onboard should parse");
 
@@ -3007,6 +3500,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn cli_parses_estop_default_engage() {
         let cli = Cli::try_parse_from(["zeroclaw", "estop"]).expect("estop command should parse");
 
@@ -3027,6 +3521,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn cli_parses_estop_resume_domain() {
         let cli = Cli::try_parse_from(["zeroclaw", "estop", "resume", "--domain", "*.chase.com"])
             .expect("estop resume command should parse");
@@ -3041,6 +3536,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn agent_command_parses_with_temperature() {
         let cli = Cli::try_parse_from(["zeroclaw", "agent", "--temperature", "0.5"])
             .expect("agent command with temperature should parse");
@@ -3054,6 +3550,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn agent_command_parses_without_temperature() {
         let cli = Cli::try_parse_from(["zeroclaw", "agent", "--message", "hello"])
             .expect("agent command without temperature should parse");
@@ -3067,6 +3564,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn agent_command_parses_session_state_file() {
         let cli =
             Cli::try_parse_from(["zeroclaw", "agent", "--session-state-file", "session.json"])
@@ -3083,28 +3581,48 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn agent_fallback_uses_config_default_temperature() {
         // Test that when user doesn't provide --temperature,
         // the fallback logic works correctly
-        let mut config = Config::default(); // default_temperature = 0.7
-        config.default_temperature = 1.5;
+        let mut config = Config::default();
+        config.ensure_fallback_provider().temperature = Some(1.5);
 
         // Simulate None temperature (user didn't provide --temperature)
         let user_temperature: Option<f64> = std::hint::black_box(None);
-        let final_temperature = user_temperature.unwrap_or(config.default_temperature);
+        let final_temperature = user_temperature.unwrap_or_else(|| {
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.temperature)
+                .unwrap_or(0.7)
+        });
 
         assert!((final_temperature - 1.5).abs() < f64::EPSILON);
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn agent_fallback_uses_hardcoded_when_config_uses_default() {
         // Test that when config uses default value (0.7), fallback still works
-        let config = Config::default(); // default_temperature = 0.7
+        let config = Config::default();
 
         // Simulate None temperature (user didn't provide --temperature)
         let user_temperature: Option<f64> = std::hint::black_box(None);
-        let final_temperature = user_temperature.unwrap_or(config.default_temperature);
+        let final_temperature = user_temperature.unwrap_or_else(|| {
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.temperature)
+                .unwrap_or(0.7)
+        });
 
         assert!((final_temperature - 0.7).abs() < f64::EPSILON);
     }
+}
+
+#[cfg(not(feature = "tui-onboarding"))]
+#[allow(clippy::unused_async)]
+async fn run_tui_if_enabled() -> anyhow::Result<()> {
+    anyhow::bail!("TUI onboarding feature is not enabled. Rebuild with --features tui-onboarding")
 }

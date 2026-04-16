@@ -1,32 +1,32 @@
 # Default owner for all files
-* @theonlyhennygod @JordanTheJet @SimianAstronaut7
+* @theonlyhennygod @JordanTheJet
 
 # Important functional modules
-/src/agent/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/src/providers/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/src/channels/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/src/tools/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/src/gateway/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/src/runtime/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/src/memory/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/Cargo.toml @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/Cargo.lock @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/src/agent/** @theonlyhennygod @JordanTheJet
+/src/providers/** @theonlyhennygod @JordanTheJet
+/src/channels/** @theonlyhennygod @JordanTheJet
+/src/tools/** @theonlyhennygod @JordanTheJet
+/src/gateway/** @theonlyhennygod @JordanTheJet
+/src/runtime/** @theonlyhennygod @JordanTheJet
+/src/memory/** @theonlyhennygod @JordanTheJet
+/Cargo.toml @theonlyhennygod @JordanTheJet
+/Cargo.lock @theonlyhennygod @JordanTheJet
 
 # Security / tests / CI-CD ownership
-/src/security/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/tests/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/.github/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/.github/workflows/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/.github/codeql/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/.github/dependabot.yml @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/SECURITY.md @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/docs/actions-source-policy.md @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/docs/ci-map.md @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/src/security/** @theonlyhennygod @JordanTheJet
+/tests/** @theonlyhennygod @JordanTheJet
+/.github/** @theonlyhennygod @JordanTheJet
+/.github/workflows/** @theonlyhennygod @JordanTheJet
+/.github/codeql/** @theonlyhennygod @JordanTheJet
+/.github/dependabot.yml @theonlyhennygod @JordanTheJet
+/SECURITY.md @theonlyhennygod @JordanTheJet
+/docs/actions-source-policy.md @theonlyhennygod @JordanTheJet
+/docs/ci-map.md @theonlyhennygod @JordanTheJet
 
 # Docs & governance
-/docs/** @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/AGENTS.md @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/CLAUDE.md @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/CONTRIBUTING.md @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/docs/pr-workflow.md @theonlyhennygod @JordanTheJet @SimianAstronaut7
-/docs/reviewer-playbook.md @theonlyhennygod @JordanTheJet @SimianAstronaut7
+/docs/** @theonlyhennygod @JordanTheJet
+/AGENTS.md @theonlyhennygod @JordanTheJet
+/CLAUDE.md @theonlyhennygod @JordanTheJet
+/CONTRIBUTING.md @theonlyhennygod @JordanTheJet
+/docs/pr-workflow.md @theonlyhennygod @JordanTheJet
+/docs/reviewer-playbook.md @theonlyhennygod @JordanTheJet

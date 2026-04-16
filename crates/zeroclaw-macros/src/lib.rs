@@ -403,15 +403,24 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         // config enums in schema.rs via impl_enum_prop_kind!.
         let kind_token = quote! { <#inner_ty as crate::config::HasPropKind>::PROP_KIND };
         let enum_variants_expr = quote! {
-            if <#inner_ty as crate::config::HasPropKind>::PROP_KIND == crate::config::PropKind::Enum {
-                Some(|| {
-                    crate::config::enum_variants::<#inner_ty>()
-                        .split(", ")
-                        .map(|s| s.to_string())
-                        .collect()
-                })
-            } else {
-                None
+            {
+                #[cfg(feature = "schema-export")]
+                {
+                    if <#inner_ty as crate::config::HasPropKind>::PROP_KIND == crate::config::PropKind::Enum {
+                        Some(|| {
+                            crate::config::enum_variants::<#inner_ty>()
+                                .split(", ")
+                                .map(|s| s.to_string())
+                                .collect()
+                        })
+                    } else {
+                        None
+                    }
+                }
+                #[cfg(not(feature = "schema-export"))]
+                {
+                    None::<fn() -> Vec<String>>
+                }
             }
         };
 
