@@ -3761,7 +3761,7 @@ SourceType::ChatPaste char_count:
 | PR #6 아카이브 UI | ⏳ 후속 (프론트엔드) | — |
 | PR #7 r2d2 pool | ✅ (8-conn 읽기 풀) | `6bbd5f83` |
 | PR #7 HLC 스키마 마이그레이션 | ✅ (updated_at_hlc additive) | `1db6b714` |
-| PR #7 sync protocol version bump (HLC 정렬 전환) | ⏳ 후속 (프로토콜 호환성 작업) | — |
+| PR #7 sync protocol version bump (HLC 정렬 전환) | ✅ (v2: DeltaEntry.hlc_stamp + HLC-guarded upsert + v1↔v2 interop + 5min drift 테스트) | `aff2f11e` |
 | PR #8 코퍼스 확장 (ko 100 / en 50 / law 30) | ✅ 부분 (ko 50 / en 30 / law 30 — 스펙 중 법률 도메인만 목표 달성, ko/en은 50/30 도달 후 추가 커뮤니티 지식 필요) | `0fd1231d` |
 | PR #8 LLM judge | ✅ (subprocess-based, dry-run verified) | `67d959ed` |
 | PR #8 baseline diff CI | ✅ (action-download-artifact + 5% 회귀 가드) | `888f51b0` |
