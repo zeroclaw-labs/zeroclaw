@@ -22,7 +22,7 @@ jobs:
     name: Validate Release Readiness
     runs-on: ubuntu-latest
     env:
-      PAT: ${{ secrets.PAT }}
+      PAT: ${{ secrets.RELEASE_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -55,7 +55,7 @@ jobs:
         shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          CHECK_PAT: ${{ secrets.PAT }}
+          CHECK_PAT: ${{ secrets.RELEASE_TOKEN }}
           HOMEBREW_CORE_BOT_TOKEN: ${{ secrets.HOMEBREW_CORE_BOT_TOKEN }}
           HOMEBREW_UPSTREAM_PR_TOKEN: ${{ secrets.HOMEBREW_UPSTREAM_PR_TOKEN }}
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
@@ -107,7 +107,7 @@ jobs:
         if: env.PAT != ''
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.PAT }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           failed=0
 
