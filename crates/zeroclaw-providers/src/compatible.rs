@@ -12,7 +12,7 @@ use crate::traits::{
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use reqwest::{
-    Client,
+    Client, ClientBuilder,
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
@@ -70,6 +70,9 @@ pub struct OpenAiCompatibleModelProvider {
     /// without authentication. Keep the default credential-gated for hosted
     /// providers so missing credentials still fall through to catalog sources.
     unauthenticated_model_listing: bool,
+    /// Raw PEM bytes of a custom CA certificate for TLS connections.
+    /// Loaded from disk once at construction; no per-request I/O.
+    tls_ca_cert_pem: Option<Vec<u8>>,
 }
 
 /// How the model_provider expects the API key to be sent.
@@ -285,6 +288,7 @@ impl OpenAiCompatibleModelProvider {
             openrouter_vendor_prefix: None,
             local_model_tool_sanitize: false,
             unauthenticated_model_listing: false,
+            tls_ca_cert_pem: None,
         }
     }
     /// Opt this provider into per-model conservative tool-schema sanitization.
@@ -300,6 +304,21 @@ impl OpenAiCompatibleModelProvider {
 
     pub fn with_unauthenticated_model_listing(mut self) -> Self {
         self.unauthenticated_model_listing = true;
+        self
+    }
+
+    /// Set a custom CA certificate path for TLS connections.
+    /// Reads and stores the PEM bytes immediately so later HTTP clients
+    /// incur no per-request disk I/O.
+    pub fn with_tls_ca_cert_path(mut self, path: &str) -> Self {
+        match std::fs::read(path) {
+            Ok(bytes) => self.tls_ca_cert_pem = Some(bytes),
+            Err(e) => tracing::warn!(
+                path,
+                error = %e,
+                "Failed to read CA certificate file — TLS will use system roots"
+            ),
+        }
         self
     }
 
@@ -416,8 +435,24 @@ impl OpenAiCompatibleModelProvider {
         let timeout = self.timeout_secs;
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
+        let has_tls_cert = self.tls_ca_cert_pem.is_some();
 
-        if has_user_agent || has_extra_headers {
+        // Helper to add TLS certificate to builder. PEM bytes were loaded at
+        // construction time — no disk I/O here, just parse from memory.
+        let add_tls_cert = |builder: ClientBuilder| -> ClientBuilder {
+            if let Some(ref pem) = self.tls_ca_cert_pem {
+                match reqwest::Certificate::from_pem(pem) {
+                    Ok(cert) => return builder.add_root_certificate(cert),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "Failed to parse CA certificate — TLS will use system roots"
+                    ),
+                }
+            }
+            builder
+        };
+
+        if has_user_agent || has_extra_headers || has_tls_cert {
             let mut headers = HeaderMap::new();
             if let Some(ua) = self.user_agent.as_deref()
                 && let Ok(value) = HeaderValue::from_str(ua)
@@ -451,6 +486,7 @@ impl OpenAiCompatibleModelProvider {
                 .timeout(std::time::Duration::from_secs(timeout))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .default_headers(headers);
+            let builder = add_tls_cert(builder);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
                 builder,
                 "model_provider.compatible",

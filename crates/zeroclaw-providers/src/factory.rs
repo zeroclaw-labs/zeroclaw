@@ -147,6 +147,9 @@ pub fn apply_compat_options(
     if let Some(mt) = opts.provider_max_tokens {
         p = p.with_max_tokens(Some(mt));
     }
+    if let Some(ref cert_path) = opts.tls_ca_cert_path {
+        p = p.with_tls_ca_cert_path(cert_path);
+    }
     Box::new(p)
 }
 
