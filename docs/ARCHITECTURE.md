@@ -3878,6 +3878,147 @@ SourceType::ChatPaste char_count:
 
 ---
 
+#### §6E-9-A PR-by-PR 아키텍처 변경 상세
+
+이번 세션의 변경사항을 PR 단위로 정리. 각 PR은 (1) 추가된 모듈/메서드, (2) 데이터 흐름 변화, (3) 테스트 커버리지, (4) 운영자/개발자 영향 순서로 기술.
+
+##### PR #1 — On-device Embedding 완성 (실측 + UI + 디폴트 자동화)
+
+- **추가된 surface**:
+  - `benches/embedding_batch.rs` — feature-gated criterion 벤치 (32-batch BGE-M3 CPU 측정). 기본 빌드에서는 stub `main()` 출력 후 종료.
+  - `clients/tauri/src-tauri/src/embedding_status.rs` — 2 Tauri 커맨드 (`check_embedding_model`, `monitor_embedding_download`). `MOA_EMBEDDING_CACHE` env 우선, 폴백은 `~/.moa/embedding-models/`. fastembed의 HuggingFace cache 디렉토리(`models--BAAI--bge-m3`) 크기를 합산해 status payload 반환. 1.1 GB target 대비 ≥95%면 `installed: true`.
+  - `clients/tauri/src/components/EmbeddingStatus.tsx` — 30s 롤링 윈도우로 평균 다운로드 속도 + ETA 계산. ko/en 로케일 + Ready/Downloading/Not installed 배지 + 8px 진행률 바.
+  - `clients/tauri/src/lib/tauri-bridge.ts` — `EmbeddingModelStatus` 타입 + `checkEmbeddingModel`/`monitorEmbeddingDownload` typed wrappers (browser fallback null).
+  - Settings.tsx 통합: Tauri 모드일 때만 표시되는 "Embedding Model" 섹션이 `inTauri && platformInfo` 위에 삽입됨.
+- **데이터 흐름**:
+  1. fastembed 5.8 `TextEmbedding::try_new()`이 첫 호출 시 BGE-M3 ONNX (~1.1 GB)을 HuggingFace에서 다운로드 → cache 디렉토리에 stream write.
+  2. 프론트엔드는 2초 간격으로 `monitor_embedding_download` 폴링 → 디렉토리 크기 변화로 진행률/속도 추정.
+  3. 다운로드 완료 후 폴링 간격 10초로 자동 완화 (idle).
+- **config 디폴트 자동 전환** (`src/config/schema.rs`):
+  - `default_embedding_provider/model/dimensions`이 `#[cfg(feature = "embedding-local")]`로 분기.
+  - `embedding-local` ON → `local_fastembed` / `bge-m3` / 1024dim
+  - OFF → `none` / `text-embedding-3-small` / 1536dim
+  - 의도: 릴리즈 빌드가 `embedding-local`을 켜는 순간 사용자 설치는 별도 config 수정 없이 on-device 모드로 진입.
+- **테스트**: bench (수동 cargo bench) + 288 config 테스트 회귀 0 + Tauri Rust check 통과.
+
+##### PR #4 — Cross-Encoder Reranker 실측 + 모바일 degrade 계약 잠금
+
+- **`moa_eval` CLI 신규 플래그** (`src/bin/moa_eval.rs`):
+  - `--variations`: `recall_with_variations(q, &[], k, None)` 강제 라우팅. A/B 측정에서 OFF/ON이 동일 경로를 거치도록 함 (legacy `recall()` 경로 제외).
+  - `--enable-rerank`: `BgeReranker` attach + `RerankConfig { enabled: true, top_k_before: 50, top_k_after }` 활성화. `--variations`를 자동 함의. feature OFF 빌드에서 stub reranker 감지 시 명시 에러.
+- **`SqliteMemory::recall_with_variations` short-circuit 수정** (`src/memory/sqlite.rs`):
+  - **이전**: `if variations.len() <= 1 { return self.recall(...) }` — reranker가 attach되어도 우회됨.
+  - **수정**: `if variations.len() <= 1 && !rerank_attached { return self.recall(...) }` + 빈 variations일 때 `original_query`를 `queries_owned`에 자동 inject. 이 수정 없이는 `--enable-rerank`가 무측정 항등 결과만 반환.
+- **A/B 측정 결과** (180 코퍼스, top-k=5):
+  - 영어/법률 도메인 개선 (en +1.7pt, law +3.3pt MRR)
+  - 한국어 도메인 회귀 (ko -10.3pt MRR, -20pt recall) → ⚠️ `project_korean_reranker_regression.md`에 상세
+- **벤치 — `benches/recall_latency.rs`**:
+  - 180-엔트리 코퍼스 + 20-쿼리 representative 스프레드 (ko/en/law).
+  - 50 sample, criterion percentile 분석.
+  - 결과: 22.15 ms / 20-query iteration → ~1.1 ms/query (버짓 500ms 대비 ~450× 여유).
+- **모바일 degrade 계약**:
+  - 단위 테스트 `mobile_degrade_recall_still_functional_without_reranker_or_embedder` (sqlite.rs 내부): 3-시나리오 (plain recall / 빈-variations recall_with_variations / multi-variation RRF)에서 reranker·embedder 모두 미장착 상태 통과 확인.
+  - 통합 테스트 `tests/mobile_degrade_integration.rs`: SyncedMemory 래퍼로 같은 계약을 외부 trait 경계에서 검증. SyncEngine은 disabled로 설정 (mobile 디폴트).
+
+##### PR #6 — Archive UI Full-Stack
+
+- **백엔드** (`src/memory/sqlite.rs`):
+  - `pub fn list_archived(&self) -> anyhow::Result<Vec<ArchivedMemoryInfo>>` — `memories` LEFT JOIN `consolidated_memories ON cm.source_ids LIKE '%' || m.id || '%'`. 통합 요약 메타가 같이 반환되어 UI가 "이 메모리는 community X로 합쳐짐"을 표시 가능.
+  - `pub fn restore_archived(&self, memory_id: &str) -> anyhow::Result<bool>` — `UPDATE memories SET archived = 0 WHERE id = ?1 AND archived = 1`. 이미 active이면 false 반환.
+  - `pub struct ArchivedMemoryInfo` — serde::Serialize, 7개 필드 (id/key/content/category/updated_at/consolidated_summary/consolidated_fact_type).
+- **Tauri 커맨드** (`clients/tauri/src-tauri/src/lib.rs`):
+  - `list_archived_memories` / `restore_archived_memory` — `~/.moa/memory/brain.db`에 raw `rusqlite::Connection`으로 직접 접근 (document 명령과 동일 패턴, 의존성 entanglement 회피).
+- **프론트엔드** (`clients/tauri/src/components/ArchiveList.tsx`):
+  - 페이지 단위 컴포넌트 (Sidebar nav + App.tsx routing 'archive').
+  - 행별 "복구" 버튼 + 복구 중 disabled 상태 + 로컬 optimistic 제거.
+  - 통합 요약 배지 (consolidated_summary 있을 때만 표시).
+  - ko/en 로케일.
+
+##### PR #7 — Sync Protocol HLC v2
+
+- **상수 추가** (`src/memory/sync.rs`):
+  - `pub const SYNC_PROTOCOL_VERSION: u32 = 2;` — wire 포맷 버전 명시. v1=wall-clock only, v2=hlc_stamp 추가.
+- **`DeltaEntry` 확장**:
+  - `pub hlc_stamp: Option<String>` — `#[serde(default, skip_serializing_if = "Option::is_none")]`. v1 피어는 omit, v2 피어는 stamp 포함. 양방향 호환.
+- **`SyncEngine` HLC 통합**:
+  - `attach_hlc(HlcClock)` — 출고 delta마다 clock tick.
+  - `current_hlc_stamp() -> Option<String>` — 외부 진단용.
+  - `apply_deltas_with_stamps(...)` — 신규 v2 path. operation + hlc_stamp 튜플로 반환해 caller가 HLC 라우팅 결정 가능.
+  - `apply_deltas(...)` — `apply_deltas_with_stamps`로 위임 (v1 캐스케이드 호환).
+- **`SqliteMemory::attach_sync` 자동 wiring**:
+  - SyncEngine이 HLC 미설정이면 `device_id`를 node_id로 한 `HlcClock` 자동 부착. 별도 위어링 코드 불필요.
+- **Memory trait 확장** (`src/memory/traits.rs`):
+  - `accept_remote_store_if_newer(key, content, category, &remote_hlc) -> Result<bool>` — 디폴트는 plain `store()` fallback (HLC 미지원 백엔드 호환).
+  - SqliteMemory 오버라이드: `SELECT updated_at_hlc → Hlc::parse → 비교 → INSERT/UPDATE iff remote > local`. 로컬 stamp 없으면 (v1 row) 무조건 수락.
+- **`SyncedMemory::apply_remote_deltas` 라우팅** (`src/memory/synced.rs`):
+  - Store delta에 `hlc_stamp.is_some()`이면 `accept_remote_store_if_newer`로 라우팅, 없으면 plain `store()`. v1↔v2 자동 transparent.
+- **스키마 마이그레이션**: `sync_journal.hlc_stamp TEXT` 컬럼 additive ALTER. PRAGMA table_info 프로브로 idempotent.
+- **테스트**:
+  - `accept_remote_store_if_newer_respects_hlc_ordering_under_drift` — 5분 wall-clock 드리프트 시뮬레이션 (node_a wall=1000ms vs node_b wall=300_000ms). HLC 순서대로 winner 결정 검증.
+
+##### PR #8 — Eval Corpus Expansion
+
+- **추가 데이터**:
+  - `tests/evals/corpus.jsonl`: 110 → 180 (ko 50→100 / en 30→50 / law 30 unchanged).
+  - `tests/evals/golden_ko.jsonl`: 50 → 100.
+  - `tests/evals/golden_en.jsonl`: 30 → 50.
+- **페르소나 일관성**: 한국어는 부동산 임대차 전담 변호사 페르소나(법률 실무 + 가족·건강·취미·사무실 운영 등 비즈니스/개인 라이프). 영어는 엔지니어링 팀 프로세스(릴리즈 cadence, 에러 버짓, RFC, 의존성 정책 등).
+- **threshold 통과 확인** (top-k=10, FTS-only baseline):
+  - en: recall=1.000 / mrr=0.990
+  - ko: recall=1.000 / mrr=0.881
+  - law: recall=1.000 / mrr=0.967
+- **CI 영향**: `tests/evals/thresholds.toml` 변경 없이 통과. baseline diff 회귀 가드 (5%) 안에서 안정적.
+
+##### PR #9 — Community Detection 성능 게이트
+
+- **`benches/community_detection.rs`** 신설:
+  - splitmix64 PRNG로 deterministic 그래프 생성 (외부 dev-dep 추가 없이 재현성).
+  - 두 측정: 100 노드 / 200 엣지 (acceptance) + 1000 노드 / 3000 엣지 (헤드룸 스폿체크).
+  - 결과: 100n·200e ~101 µs / 1000n·3000e ~1.8 ms.
+- **Leiden 교체 의도적 deferral**:
+  - LPA가 100 노드 0.0001s, 1000 노드 0.002s — 코퍼스가 low-thousands를 넘기 전까지 modularity 차이 미미.
+  - `community.rs::detect_communities` 시그니처 유지, 내부 알고리즘만 mechanical하게 swap 가능.
+
+##### 보너스 — Hermes 접목 4개 서브시스템 통합 (`5dfcbd99`)
+
+병렬 인스턴스가 작성한 ~4670 LOC을 단일 원자 commit으로 본 브랜치에 통합. 4개 서브시스템이 brain.db를 공유하고 Dream Cycle weekly tick에서 함께 decay.
+
+| 서브시스템 | 역할 | DeltaOperation | 신규 tools |
+|---|---|---|---|
+| `src/skills/procedural/` | 자가 생성 SKILL.md (versioning + progressive loading + auto-create + self-improve) | `SkillUpsert` (version-LWW) | `skill_view`, `skill_manage` |
+| `src/skills/correction/` | 편집 관찰 → 패턴 마이닝 → applier (grammar + recommender) | `CorrectionPattern` (confidence decay) | `correction_recommend` |
+| `src/user_model/` | 크로스세션 행동 모델링 + stale conclusion decay | `UserProfileConclusion` (evidence-weighted LWW) | (직접 노출 없음, 프롬프트 inject) |
+| `src/session_search/` | 과거 세션 FTS5 검색 + lifecycle indexing | (해당 없음 — local only) | `session_search_tool` |
+
+- **공유 wiring**:
+  - `SqliteMemory::workspace_dir() -> Option<&Path>` — db_path의 grandparent. 4개 서브시스템이 같은 SQLite 파일에 별도 schema로 co-locate.
+  - `run_dream_cycle_with_ontology` Task 7 — skill archive 후보 스캔 + profile decay + correction decay (전부 non-fatal, errors 필드에 누적).
+- **테스트**: 신규 모듈 223개 + 회귀 0.
+
+#### §6E-9-B 운영자 / 개발자 영향 요약
+
+- **운영자**:
+  - Tauri 앱 사용자: Settings에서 임베딩 모델 다운로드 진행률을 실시간으로 볼 수 있음 (이전엔 "fastembed가 뭔가 다운받는 중인 것 같다"만 가능).
+  - 메모리 정리: Sidebar에 "아카이브" 진입점이 추가됨. dream_cycle decay로 archived된 메모리를 클릭 한 번에 복구 가능.
+  - 멀티-디바이스: clock drift가 있어도 (예: NTP 미설정 모바일 vs 정확한 데스크탑) 메모리 동기화 충돌이 HLC 순서로 결정됨.
+- **개발자**:
+  - `--enable-rerank`로 reranker 효과 측정 가능. 단, 한국어 도메인 회귀로 디폴트 OFF 권장.
+  - `cargo bench` 게이트 3개 추가 (`community_detection`, `embedding_batch`, `recall_latency`). PR이 알고리즘/모델을 바꿀 때 회귀 자동 감지.
+  - `embedding-local` feature ON으로 빌드하면 디폴트 임베더가 자동으로 BGE-M3로 전환. 별도 config.toml 수정 불필요.
+  - 새 trait method `Memory::accept_remote_store_if_newer` — 백엔드 추가 시 디폴트 구현으로도 동작 (HLC 미지원 시 fallback).
+
+#### §6E-9-C 후속 트랙 (이번 세션 외)
+
+- **한국어 reranker 회귀 해소** (project memory: `project_korean_reranker_regression.md`):
+  1. `jina-reranker-v2-base-multilingual` 시도 (`resolve_model`에서 인식됨)
+  2. ko golden 코퍼스 100→200 확장 후 재측정 (분해능 부족 가능성)
+  3. 도메인별 reranker 활성화 — config에 `rerank_domains` 옵션 추가
+- **Leiden 알고리즘 swap**: 코퍼스가 low-thousands 객체 넘는 시점에 트리거.
+- **iOS/Android 디바이스-랩 실기 테스트**: Tauri 모바일 빌드 트랙 시작 시 통합.
+- **r2d2 pool 확장**: 현재 SqliteMemory만 적용 (PR #7). vault_store/billing/phone 순차 도입 예정.
+
+---
+
 ## 6F. Self-Learning Skill System — Hermes Agent 접목 (v6.1, 2026-04-16)
 
 > **Date**: 2026-04-16
