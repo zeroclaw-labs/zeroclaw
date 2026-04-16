@@ -14,7 +14,7 @@ Requires `gh` CLI ≥ 2.17.0 (for `--subject` and `--body` flags on `gh pr merge
 gh --version
 ```
 
-If the version is older, stop and tell the user to upgrade: `gh upgrade` or install from https://cli.github.com.
+If the version is older, stop and tell the user to upgrade: `gh upgrade` or install from [cli.github.com](https://cli.github.com).
 
 ## Instructions
 
@@ -120,7 +120,7 @@ gh pr merge $NUMBER --repo zeroclaw-labs/zeroclaw --squash \
   $COMMITS
   ```
 
-**Run this command? (yes/no)**
+Run this command? (yes/no)
 
 ---
 
