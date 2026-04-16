@@ -91,6 +91,30 @@ ZeroClaw 是一个运行在你自己设备上的个人AI助手。它在你已经
 
 运行时：Rust stable 工具链。单一二进制文件，无运行时依赖。
 
+### cargo binstall（macOS/Linux/Windows）
+
+无需从源码编译即可获取最新预编译二进制文件的最快方式：
+
+```bash
+cargo binstall zeroclaw
+```
+
+如果你还没有安装 `cargo-binstall`，请先安装：
+
+```bash
+cargo install cargo-binstall
+```
+
+### Nix
+
+无需安装即可直接运行：
+
+```bash
+nix run github:zeroclaw-labs/zeroclaw
+```
+
+或者将其添加到你的 flake 输入中，以获得可复现的开发环境。
+
 ### Homebrew（macOS/Linuxbrew）
 
 ```bash

@@ -91,6 +91,30 @@ Rotation des profils d'authentification (OAuth vs clés API) + failover : [Failo
 
 Prérequis : toolchain Rust stable. Un seul binaire, aucune dépendance d'exécution.
 
+### cargo binstall (macOS/Linux/Windows)
+
+Le moyen le plus rapide d'obtenir la dernière version précompilée sans compilation :
+
+```bash
+cargo binstall zeroclaw
+```
+
+Si vous n'avez pas encore `cargo-binstall`, installez-le d'abord :
+
+```bash
+cargo install cargo-binstall
+```
+
+### Nix
+
+Exécution directe sans installation :
+
+```bash
+nix run github:zeroclaw-labs/zeroclaw
+```
+
+Ou ajoutez-le aux entrées de votre flake pour un environnement de développement reproductible.
+
 ### Homebrew (macOS/Linuxbrew)
 
 ```bash
