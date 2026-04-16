@@ -87,6 +87,6 @@ Both suites must pass before the defence can be considered in force on any given
 
 ## References
 
-- Jiang et al. 2023, *Text Embeddings Reveal Almost as Much as Text* (EMNLP 2023). https://arxiv.org/abs/2310.06816
+- Jiang et al. 2023, *Text Embeddings Reveal Almost as Much as Text* (EMNLP 2023). <https://arxiv.org/abs/2310.06816>
 - `docs/ARCHITECTURE.md` §3 — patent claim for server-non-storage E2E encrypted memory sync.
 - `docs/ARCHITECTURE.md` §6E-7 — PR #5 roadmap entry (status + deferred items).

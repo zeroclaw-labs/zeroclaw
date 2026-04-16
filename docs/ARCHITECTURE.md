@@ -3658,33 +3658,40 @@ SourceType::ChatPaste char_count:
 #### 후속 세션 실행 스펙 (PR #1 실데이터 검증 · #4 · #5 · #6 · #7 나머지 · #8 · #9)
 
 ##### PR #1 (실데이터 검증 / 다운로드 UI)
+
 - **완료 범위 요약**: 모듈 구조, trait 확장, feature flag (`embedding-local`), config 검증 — 전부 ✅ . 기본 빌드 518→524 pass / 0 fail.
 - **남은 작업**: (a) `cargo test --features embedding-local` 실제 BGE-M3 다운로드 + 결정론 테스트 (동일 입력 → 동일 벡터). (b) `config.toml` 기본값을 `"local_fastembed"`으로 승격하는 건은 `embedding-local` 피처가 릴리즈 기본으로 켜진 뒤에 바꾼다 — 현재 기본은 `"none"` 유지(회귀 0). (c) Tauri 다운로드 진행률 이벤트 UI. (d) CPU 32배치 < 2s 성능 검증.
 - **주의**: `fastembed = "5"`는 `ort` 2.x(ONNX Runtime)를 끌어오므로 nightly-all-features 레인에서 처음 빌드 시 플랫폼 라이브러리(libonnxruntime)가 필요할 수 있음. `.github/workflows/nightly-all-features.yml`의 Linux deps 단계 확인 필요.
 
 ##### PR #4 (잔여 실측) — Reranker 실데이터 벤치
+
 - **완료 범위 요약**: `k_way_rrf` 구현 + 11 unit test / `Reranker` trait + `BgeReranker` (feature-gated) + 4 rerank test / `[memory.rerank]` config / `SqliteMemory::recall_with_variations` 일원화. 기본 빌드 522→552 pass, 0 회귀.
 - **남은 작업**: (a) `cargo build --features embedding-local` 후 BGE-reranker-v2-m3 다운로드 + 실제 쿼리로 on/off 정확도 비교 (수락 기준: ≥5 point 개선). (b) p95 latency <500ms 실측(상위 50 후보 × 560MB 모델). (c) 저사양 모바일 빌드에서 `enabled=false`로 `vault::normalize::adaptive_weights` degrade가 의도대로 동작하는지 확인.
 
 ##### PR #5 (잔여) — SQLCipher at-rest + 송신측 embedding 첨부
+
 - **완료 범위 요약**: 수신측 드리프트 방어 + wire 포맷 + `EmbeddingBlob` + `embedding_backfill_queue` + 보안 문서. 기본 빌드 552→569 pass / 0 회귀.
 - **남은 작업**: (a) `embedding_cache` at-rest 암호화 — SQLCipher 의존성 추가 + Keychain 파생 키 관리 설계. 현재 완화책: FS-level 암호화(FileVault/LUKS). (b) 송신측 `SyncEngine::record_store()`에 `Arc<dyn EmbeddingProvider>` 주입 — 캐시에 이미 있는 벡터를 blob으로 변환해 첨부. 수신측 방어는 이미 작동하므로 시기 조정 가능. (c) 백필 큐 처리 스케줄러(PR #6 consolidation에 합류 가능).
 
 ##### PR #6 (잔여) — Dream cycle 통합 + recall 경로 archived 필터
+
 - **완료 범위 요약**: 순수 알고리즘(decay 12 / consolidate 8 / SqliteMemory 6 통합 테스트) + 스키마 마이그레이션 + LLM-주입형 `Summarizer` trait. 회귀 0.
 - **남은 작업**: (a) `dream_cycle::run_dream_cycle`에 두 신규 작업 등록 — `consolidate_candidates(min_recall=1) → Gemini Flash Summarizer 구현 → apply_consolidation_outcome` 루프 + `run_decay_sweep` 호출. (b) `recall()` / `recall_with_variations()` 의 SQL WHERE에 `AND archived = 0` 필터 추가 (현재 archived 메모리도 검색됨). (c) 아카이브 복구 UI(`memories WHERE archived = 1` 표시 + 단일 행 unarchive 액션). (d) `bump_recall_metrics`를 SqliteMemory의 recall 호출 직후 자동 호출 — 현재는 호출자 책임.
 
 ##### PR #7 (잔여) — r2d2 pool + HLC 통합
+
 - **완료 범위** (별도 커밋): HLC 모듈 (`src/sync/hlc.rs`, 13 테스트) + Credit 예약 원자성 (reserve/commit/cancel, 10 테스트 · 10스레드 fuzz). 두 수락 기준 모두 충족.
 - **잔여 1 — r2d2 pool**: Cargo에 `r2d2 = "0.8"` + `r2d2_sqlite`. 현재 `Arc<Mutex<Connection>>` 패턴이 `src/memory/{sqlite,document_store}.rs` · `src/vault/store.rs` · `src/billing/*` · `src/phone/*` 등 10+ 크레이트 경계에 퍼져 있음. 단일 커밋 범위로는 너무 커서 별도 sprint 권장. 이행 순서: (1) 내부 핫패스부터 pool 도입(SqliteMemory), (2) vault_store, (3) 나머지. 각 단계에서 `r2d2 pool size=8` + 읽기 병렬화 벤치마크 필요.
 - **잔여 2 — HLC 스키마 통합**: `memories.updated_at` / `vault_documents.updated_at` / sync delta 타임스탬프를 `TEXT NOT NULL` HLC 문자열로 교체. 스키마 마이그레이션 + sync protocol version bump 동반 필요 — 장애 복구 경로 검증 후 진행.
 - **수락 기준 (잔여분)**: r2d2 8스레드 읽기 데드락 없음, 마이그레이션 후 기존 시간 비교 API 호환.
 
 ##### PR #8 (잔여 확장) — Golden 코퍼스 확장 + LLM judge
+
 - **완료 범위 요약**: Rust-native `moa_eval` 바이너리 + JSONL goldens(20 cases) + `tests/evals/thresholds.toml` + CI 워크플로우 (PR 코멘트 + artifact). 회귀 0.
 - **남은 작업**: (a) 코퍼스 확장 — 스펙 목표(ko 100 / en 50 / law 30)까지 큐레이션. 사용자/팀의 도메인 데이터 입력 필요. (b) `scripts/eval_rag_llm.py` 추가 — RAGAS 파이썬 + LLM judge로 faithfulness/answer_relevance 계산. CI에서는 옵션 잡으로 두고 코퍼스가 충분히 커진 뒤 합류. (c) baseline 비교 — `eval-report.json`을 main 브랜치 artifact로 보관 + 회귀 5% 시 PR 차단(`thresholds.toml::overall.max_regression_fraction` 활용). (d) 임계값 점진 강화 — 코퍼스 30+/도메인 도달 시 law `context_recall_min`을 0.6 → 0.9.
 
 ##### PR #9 (잔여) — VaultScheduler 통합 + Phase 5 wire-up + Leiden 스왑
+
 - **완료 범위 요약**: LPA 알고리즘 + 그래프 도메인 모델 + 스키마 + repo 메서드 + 14 테스트(10 algo + 4 repo). 회귀 0. 외부 의존성 없음.
 - **남은 작업**: (a) `VaultScheduler`에 weekly 잡 등록 — `repo.load_graph_view() → detect_communities → Gemini Flash로 each cluster 요약 → replace_communities_level_zero → 임베딩 backfill로 set_community_embedding`. (b) `src/agent/loop_/context.rs`에 Phase 5 호출부 추가 — `repo.list_communities_level_zero() → rank_communities_for_query(query_emb, summaries, 3)` → 상위 3 요약을 prompt에 주입. (c) 100 객체+200 링크 벤치 (<1s 수락 기준 검증). (d) 코퍼스가 큰 사용자(>1000 객체)에서 LPA 품질이 부족해질 때 Leiden 스왑 — `community.rs::detect_communities` 시그니처 유지 가능.
 
@@ -4408,7 +4415,7 @@ the same `verify_webhook_signature()` pattern as Kakao.
 > **Status**: Active. Extracted 2026-04-11 from the unfinished SOP engine
 > per the option-A partial-extraction plan.
 
-#### Why this exists
+#### Why the PDF pipeline exists
 
 Commit `1a0e5547` (2026) introduced an 8,997-line SOP (Standard Operating
 Procedure) engine in `src/sop/` plus five agent-callable LLM tools, but the

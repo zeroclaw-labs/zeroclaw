@@ -92,15 +92,18 @@ chat_retrieval_logs(id INTEGER PK, chat_msg_id TEXT, query TEXT,
 | 6. 어휘 학습 | `vocabulary.rs` | 확정 키워드 집합 | co_pairs upsert, synonym→vocabulary_relations | ❌ |
 
 ### §3.1 복합 토큰 regex (한국어 법률, P1 범위)
+
 - 판례번호: `대법원 YYYY\. ?M{1,2}\. ?D{1,2}\. 선고 YYYY다\d+ 판결` (variants: 선고, 자, 결정)
 - 사건번호: `\d{4}(가합|가단|가소|고합|고단|구합|구단|재가합)\d+`
 - 법조문: `(민법|형법|상법|민사소송법|형사소송법|행정소송법) 제\d+조(의\d+)?( 제\d+항)?`
 - 기관명: `㈜[\w가-힣]+`, `법무법인(\(유한\))?\s*[\w가-힣]+`
 
 ### §3.2 분량 상한
+
 - ≤500자: 5개, ≤2000자: 10개, ≤5000자: 15개, >5000자: 20개
 
 ### §3.3 AIEngine trait (§6 의존성)
+
 ```rust
 pub trait AIEngine: Send + Sync {
     async fn extract_key_concepts(&self, markdown: &str, compounds: &[CompoundToken])

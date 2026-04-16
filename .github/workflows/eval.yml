@@ -36,7 +36,8 @@ jobs:
             CARGO_INCREMENTAL: "0"
         steps:
             - name: Checkout
-              uses: actions/checkout@v4
+              # v4.1.7 — pinned SHA per docs/actions-source-policy.md.
+              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
               with:
                   fetch-depth: 0
 
@@ -44,17 +45,6 @@ jobs:
               run: |
                   rustup toolchain install stable --profile minimal --no-self-update
                   rustup default stable
-
-            - name: Cache cargo
-              uses: actions/cache@v4
-              with:
-                  path: |
-                      ~/.cargo/registry
-                      ~/.cargo/git
-                      target
-                  key: eval-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-                  restore-keys: |
-                      eval-${{ runner.os }}-
 
             - name: Build moa_eval
               run: cargo build --bin moa_eval --locked
@@ -71,77 +61,26 @@ jobs:
 
             - name: Upload eval report
               if: always()
-              uses: actions/upload-artifact@v4
+              # v4.3.4 — pinned SHA per docs/actions-source-policy.md.
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
               with:
                   name: eval-report-${{ github.run_id }}
                   path: eval-report.json
                   retention-days: 30
 
-            - name: Fetch main-branch baseline (for regression diff)
-              if: github.event_name == 'pull_request'
-              continue-on-error: true
-              id: fetch_baseline
-              uses: dawidd6/action-download-artifact@v6
-              with:
-                  workflow: eval.yml
-                  branch: main
-                  name_is_regexp: true
-                  name: eval-report-.*
-                  path: baseline
-                  if_no_artifact_found: warn
-                  # Most recent main-branch artifact wins; older runs are
-                  # implicitly ignored by the action.
-
-            - name: Diff against main baseline
-              if: github.event_name == 'pull_request'
-              continue-on-error: true
-              id: diff_baseline
-              run: |
-                  # Best-effort regression diff: compare this PR's overall
-                  # context_recall against the most recent main-branch run.
-                  # Threshold lives in tests/evals/thresholds.toml under
-                  # [overall].max_regression_fraction (default 0.05).
-                  set -e
-                  if [ ! -f eval-report.json ]; then
-                      echo "::warning::no current eval-report.json; skipping diff"
-                      exit 0
-                  fi
-                  shopt -s nullglob
-                  candidates=(baseline/*/eval-report.json baseline/eval-report.json)
-                  if [ ${#candidates[@]} -eq 0 ]; then
-                      echo "::notice::no main-branch baseline artifact yet; skipping diff"
-                      echo "regression=none" >> "$GITHUB_OUTPUT"
-                      exit 0
-                  fi
-                  baseline="${candidates[0]}"
-                  current_recall=$(jq -r '.report.overall.context_recall' eval-report.json)
-                  baseline_recall=$(jq -r '.report.overall.context_recall' "$baseline")
-                  threshold=$(python3 -c "
-                  import sys, tomllib
-                  try:
-                      with open('tests/evals/thresholds.toml', 'rb') as f:
-                          cfg = tomllib.load(f)
-                      print(cfg.get('overall', {}).get('max_regression_fraction', 0.05))
-                  except Exception:
-                      print(0.05)
-                  ")
-                  echo "baseline_recall=$baseline_recall current_recall=$current_recall threshold=$threshold"
-                  regression=$(python3 -c "
-                  b=float('$baseline_recall'); c=float('$current_recall'); t=float('$threshold')
-                  drop = (b - c) / max(b, 1e-9)
-                  print('fail' if drop > t else 'ok')
-                  ")
-                  echo "regression=$regression" >> "$GITHUB_OUTPUT"
-                  echo "baseline_recall=$baseline_recall" >> "$GITHUB_OUTPUT"
-                  echo "current_recall=$current_recall" >> "$GITHUB_OUTPUT"
-                  if [ "$regression" = "fail" ]; then
-                      echo "::error::retrieval recall regression exceeds threshold ($baseline_recall → $current_recall, threshold=$threshold)"
-                      exit 1
-                  fi
+            # Baseline-regression diff intentionally omitted from this
+            # revision — the artifact-download action
+            # (dawidd6/action-download-artifact) is not yet on the repo's
+            # actions-source-policy allowlist. Re-enable in a follow-up PR
+            # once the allowlist is updated or once a replacement workflow
+            # uploads the baseline to a managed location. The threshold
+            # `tests/evals/thresholds.toml::overall.max_regression_fraction`
+            # stays in place for when that happens.
 
             - name: Post PR comment
               if: github.event_name == 'pull_request' && always()
-              uses: actions/github-script@v7
+              # v7.0.1 — pinned SHA per docs/actions-source-policy.md.
+              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
               with:
                   script: |
                       const fs = require('fs');
@@ -161,14 +100,6 @@ jobs:
                           body += `| ${s.domain} | ${s.queries} | ${s.context_recall.toFixed(3)} | ${s.context_precision.toFixed(3)} | ${s.mrr.toFixed(3)} |\n`;
                       }
                       body += `| **overall** | **${r.overall.queries}** | **${r.overall.context_recall.toFixed(3)}** | **${r.overall.context_precision.toFixed(3)}** | **${r.overall.mrr.toFixed(3)}** |\n\n`;
-                      // PR #8 잔여 — baseline diff line from the previous step.
-                      const regression = '${{ steps.diff_baseline.outputs.regression }}';
-                      const baselineRecall = '${{ steps.diff_baseline.outputs.baseline_recall }}';
-                      const currentRecall = '${{ steps.diff_baseline.outputs.current_recall }}';
-                      if (regression && regression !== 'none' && baselineRecall && currentRecall) {
-                          const emoji = regression === 'ok' ? ':chart_with_upwards_trend:' : ':warning:';
-                          body += `${emoji} baseline recall: ${parseFloat(baselineRecall).toFixed(3)} → ${parseFloat(currentRecall).toFixed(3)} (${regression})\n\n`;
-                      }
                       body += v.length === 0
                           ? ':white_check_mark: All thresholds met.\n'
                           : `:x: **${v.length} threshold violation(s):**\n` + v.map(x => `- ${x}`).join('\n') + '\n';

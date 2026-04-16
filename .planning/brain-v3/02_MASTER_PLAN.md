@@ -9,11 +9,13 @@
 
 ### A-1. 제안 1 — Compiled Truth + Timeline 이중 구조
 
-**동기**
+### 동기
+
 - gbrain 의 핵심 패턴. 한 주제(page)를 "현재 최선의 요약(compiled_truth)" + "append-only 증거(timeline)" 로 분리.
 - 변호사 업무에 직결: "의뢰인 A 현황"을 요약 + 원본 상담/통화 기록 인용으로 답변 → 할루시네이션 방지 + 법적 감사 가능.
 
-**MoA 통합 방식**
+### MoA 통합 방식
+
 - 기존 `memories` 테이블에 **컬럼 추가** (삭제 없음)
   - `compiled_truth TEXT NULL`
   - `truth_version INTEGER DEFAULT 0`
@@ -23,7 +25,8 @@
 - 기존 `content` 필드는 하위호환 유지.
 - 온톨로지(`ontology_objects/links/actions`)는 그대로 유지 → **양방향 교차참조 특허 불변**.
 
-**동기화 통합**
+### 동기화 통합
+
 - `memory_timeline` 을 델타 저널(`src/sync/journal.rs`)의 대상 테이블에 추가.
 - append-only 특성상 LWW 충돌 없음 → 기존에 지적된 "LWW 데이터 손실" 리스크 자연 완화.
 
@@ -36,12 +39,14 @@
 **현재**: `score = 0.7 * vector_score + 0.3 * keyword_score`
 **문제**: BM25 점수와 cosine 유사도 스케일이 달라 한쪽 편향.
 
-**RRF 공식**
+### RRF 공식
+
 ```
 rrf(doc) = Σ_{i ∈ rankers}  1 / (k + rank_i(doc))    (k = 60 표준)
 ```
 
-**도입 전략 — Feature Flag A/B**
+### 도입 전략 — Feature Flag A/B
+
 - 신규 config: `memory.search_mode ∈ {"weighted", "rrf"}`, 기본값 `"weighted"`
 - 플래그 `"rrf"` 로 전환 시 RRF 경로 사용
 - 벤치마크 harness 통과 (변호사 질의 50개, recall@10 향상 ≥ 5%) 시 기본값 전환
@@ -52,18 +57,21 @@ rrf(doc) = Σ_{i ∈ rankers}  1 / (k + rank_i(doc))    (k = 60 표준)
 
 ### A-3. 제안 3 — Multi-Query Expansion + Semantic Chunking
 
-**Multi-Query Expansion**
+### Multi-Query Expansion
+
 - Phase 1 검색 진입 전 Claude Haiku 호출 → 질의를 3~5개 변형으로 확장
 - 예: "이혼 소송" → {"이혼 절차", "협의이혼", "재산분할 기준", "위자료 판례"}
 - 각 변형을 병렬 검색, 결과를 **RRF 로 최종 융합**
 - 캐시: 최근 24h 동일 질의는 재사용
 
-**Semantic Chunking (선택 적용)**
+### Semantic Chunking (선택 적용)
+
 - `>2000자` 문서에만 적용
 - Savitzky-Golay 필터로 임베딩 거리 변화를 smoothing → 주제 경계 감지
 - 짧은 대화/메모리는 기존 재귀 청킹 유지 (속도 우선)
 
-**구현 위치**
+### 구현 위치
+
 - `src/memory/query_expand.rs` (신규)
 - `src/memory/chunk_semantic.rs` (신규)
 
@@ -78,7 +86,8 @@ rrf(doc) = Σ_{i ∈ rankers}  1 / (k + rank_i(doc))    (k = 60 표준)
 
 **리더 선출**: 동일 사용자의 모든 디바이스 중 `device_id` 최솟값 1대만 실행. 델타 저널로 결과 전파.
 
-**작업 목록**
+### 작업 목록
+
 1. `needs_recompile = 1` 인 메모리의 `memory_timeline` → `compiled_truth` 재작성
 2. 온톨로지 `Object` 속성 강화 (`recall_count` 상위 N개 LLM 재정리)
 3. 핫 캐시 재계산 (최근 실제 호출 패턴 기반) — 기존 5분 TTL 이슈 해결
@@ -109,7 +118,8 @@ rrf(doc) = Σ_{i ∈ rankers}  1 / (k + rank_i(doc))    (k = 60 표준)
 
 ### B-2. 중복 제거 결과 — 최종 기능 목록
 
-**유지 (MoA 고유 특허 기능)**
+### 유지 (MoA 고유 특허 기능)
+
 1. 위스퍼 디렉팅 (통화 중 작은 소리 지시 → 유창한 원어민 발화)
 2. 멀티스레드 동시 수신 (스팸 자동종료 / VIP 응대 / 토스트 알림)
 3. 스마트 부재중 응대
@@ -120,13 +130,15 @@ rrf(doc) = Σ_{i ∈ rankers}  1 / (k + rank_i(doc))    (k = 60 표준)
 8. 24h 포그라운드 상시 실행 + 배터리 최적화 예외
 9. 하이브리드 모드 (클라우드/온디바이스 자동 전환)
 
-**신규 (gbrain 차용)**
+### 신규 (gbrain 차용)
+
 10. 발신번호 → 온톨로지 Object 자동 매칭
 11. 매칭된 Object 의 `compiled_truth` → 시스템 프롬프트 주입
 12. 통화 종료 → `memory_timeline` append + `phone_calls` 메타 + 온톨로지 `Action` 생성
 13. Dream Cycle 에서 자동 요약 재작성
 
-**강화 (기존 기능의 Brain Layer 활용)**
+### 강화 (기존 기능의 Brain Layer 활용)
+
 14. 자연어 검색 "지난주 김철수 통화 찾아줘" → RRF 검색 + timeline 출처 인용
 15. "신규 의뢰인 접수 대본" 같은 **전화비서 워크플로우** 자동 실행 (Part D)
 
@@ -232,7 +244,8 @@ pub enum SeedCategory {
 
 ### C-3. Custom 카테고리
 
-**UI 동작**
+### UI 동작
+
 - 카테고리 그리드 우하단에 `＋` 버튼
 - 터치 → 모달: (이름, 아이콘 선택, 상위 Seed 선택 optional)
 - 음성: "일상업무 아래에 '건강관리' 카테고리 추가" → 즉시 생성
@@ -241,7 +254,8 @@ pub enum SeedCategory {
 
 **동기화**: 델타 저널에 포함 → 모든 기기에 E2E 암호화 후 전파
 
-**제약**
+### 제약
+
 - Seed 키와 이름 충돌 금지 (validation)
 - 삭제 시 하위 워크플로우 있으면 "이동할 카테고리" 선택 강제
 - 최대 100개 (스팸 방지)
@@ -299,13 +313,15 @@ pub enum SeedCategory {
 
 ### D-4. 실행 경로 (Trigger → Run)
 
-**트리거 타입**
+### 트리거 타입
+
 - `voice`: 핫워드 ("모아, 상담일지 작성") → FTS 매칭 → 실행
 - `schedule`: cron 표현식 → `src/scheduler/` 가 기동
 - `event`: 시스템 이벤트 (`phone_call_ended`, `memory_stored`, `calendar_event_added`)
 - `manual`: 카테고리 화면에서 탭
 
-**실행 흐름**
+### 실행 흐름
+
 ```
 Trigger → workflow_engine.exec(workflow, inputs)
   ├─ workflow_runs INSERT (status=running, input_sha256)
@@ -366,4 +382,5 @@ FOR each workflow WHERE usage_count >= 5:
 
 ---
 
-**끝. 본 문서는 Claude Code 가 구현 중 모호한 부분을 판단할 때 기준이 된다.**
+### 끝. 본 문서는 Claude Code 가 구현 중 모호한 부분을 판단할 때 기준이 된다.
+
