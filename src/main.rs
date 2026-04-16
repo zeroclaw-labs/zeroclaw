@@ -721,6 +721,8 @@ enum ConfigCommands {
         /// Section prefix (e.g. channels.matrix). Omit to init all.
         section: Option<String>,
     },
+    /// Migrate config.toml to the current schema version on disk (preserves comments)
+    Migrate,
     /// Print matching property paths for shell completion (hidden)
     #[command(hide = true)]
     Complete {
@@ -960,11 +962,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO
+    // Initialize logging - respects RUST_LOG env var, defaults to INFO.
+    // matrix_sdk crates are suppressed to warn because they are extremely
+    // noisy at info level. To restore SDK-level output for Matrix debugging:
+    //   RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info
     let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn")
+        }))
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
@@ -1140,26 +1145,34 @@ async fn main() -> Result<()> {
                 temperature,
                 ..
             } => {
-                let final_temperature = temperature.unwrap_or(config.default_temperature);
+                let fallback = config.providers.fallback_provider();
+                let final_temperature = temperature
+                    .unwrap_or_else(|| fallback.and_then(|e| e.temperature).unwrap_or(0.7));
                 if let Some(p) = &provider {
-                    config.default_provider = Some(p.clone());
+                    config.providers.fallback = Some(p.clone());
                 }
                 if let Some(m) = &model {
-                    config.default_model = Some(m.clone());
+                    config.ensure_fallback_provider().model = Some(m.clone());
                 }
-                config.default_temperature = final_temperature;
+                config.ensure_fallback_provider().temperature = Some(final_temperature);
 
-                let provider_name = config.default_provider.as_deref().unwrap_or("openai");
-                let provider =
-                    zeroclaw::providers::create_provider(provider_name, config.api_key.as_deref())?;
+                let provider_name = config.providers.fallback.as_deref().unwrap_or("openai");
+                let provider = zeroclaw::providers::create_provider(
+                    provider_name,
+                    config
+                        .providers
+                        .fallback_provider()
+                        .and_then(|e| e.api_key.as_deref()),
+                )?;
+                let model_name = config
+                    .providers
+                    .fallback_provider()
+                    .and_then(|e| e.model.as_deref())
+                    .unwrap_or("default");
                 match message {
                     Some(msg) => {
                         let response = provider
-                            .simple_chat(
-                                &msg,
-                                config.default_model.as_deref().unwrap_or("default"),
-                                final_temperature,
-                            )
+                            .simple_chat(&msg, model_name, final_temperature)
                             .await?;
                         println!("{response}");
                     }
@@ -1174,11 +1187,7 @@ async fn main() -> Result<()> {
                                 break;
                             }
                             let response = provider
-                                .simple_chat(
-                                    line.trim(),
-                                    config.default_model.as_deref().unwrap_or("default"),
-                                    final_temperature,
-                                )
+                                .simple_chat(line.trim(), model_name, final_temperature)
                                 .await?;
                             println!("{response}");
                         }
@@ -1207,7 +1216,13 @@ async fn main() -> Result<()> {
             temperature,
             peripheral,
         } => {
-            let final_temperature = temperature.unwrap_or(config.default_temperature);
+            let final_temperature = temperature.unwrap_or_else(|| {
+                config
+                    .providers
+                    .fallback_provider()
+                    .and_then(|e| e.temperature)
+                    .unwrap_or(0.7)
+            });
 
             Box::pin(agent::run(
                 config,
@@ -1451,11 +1466,15 @@ async fn main() -> Result<()> {
             println!();
             println!(
                 "🤖 Provider:      {}",
-                config.default_provider.as_deref().unwrap_or("openrouter")
+                config.providers.fallback.as_deref().unwrap_or("openrouter")
             );
             println!(
                 "   Model:         {}",
-                config.default_model.as_deref().unwrap_or("(default)")
+                config
+                    .providers
+                    .fallback_provider()
+                    .and_then(|e| e.model.as_deref())
+                    .unwrap_or("(default)")
             );
             println!("📊 Observability:  {}", config.observability.backend);
             println!(
@@ -1543,7 +1562,7 @@ async fn main() -> Result<()> {
             println!();
             println!("Channels:");
             println!("  CLI:      ✅ always");
-            for (channel, configured) in config.channels_config.channels() {
+            for (channel, configured) in config.channels.channels() {
                 println!(
                     "  {:9} {}",
                     channel.name(),
@@ -1605,7 +1624,8 @@ async fn main() -> Result<()> {
         Commands::Providers => {
             let providers = providers::list_providers();
             let current = config
-                .default_provider
+                .providers
+                .fallback
                 .as_deref()
                 .unwrap_or("openrouter")
                 .trim()
@@ -1978,6 +1998,30 @@ async fn main() -> Result<()> {
                     }
                     config.save().await?;
                     println!("\nRun `zeroclaw config list` to review, then set required fields.");
+                }
+                Ok(())
+            }
+            ConfigCommands::Migrate => {
+                let raw = tokio::fs::read_to_string(&config.config_path)
+                    .await
+                    .context("Failed to read config file")?;
+                match crate::config::migration::migrate_file(&raw)? {
+                    Some(migrated) => {
+                        let backup_path = config.config_path.with_extension("toml.bak");
+                        tokio::fs::copy(&config.config_path, &backup_path)
+                            .await
+                            .context("Failed to create config backup")?;
+                        tokio::fs::write(&config.config_path, &migrated).await?;
+                        let to = crate::config::migration::CURRENT_SCHEMA_VERSION;
+                        println!("Backed up to {}", backup_path.display());
+                        println!(
+                            "Migrated {} to schema version {to}.",
+                            config.config_path.display()
+                        );
+                    }
+                    None => {
+                        println!("Config already at current schema version.");
+                    }
                 }
                 Ok(())
             }
@@ -3541,12 +3585,18 @@ mod tests {
     fn agent_fallback_uses_config_default_temperature() {
         // Test that when user doesn't provide --temperature,
         // the fallback logic works correctly
-        let mut config = Config::default(); // default_temperature = 0.7
-        config.default_temperature = 1.5;
+        let mut config = Config::default();
+        config.ensure_fallback_provider().temperature = Some(1.5);
 
         // Simulate None temperature (user didn't provide --temperature)
         let user_temperature: Option<f64> = std::hint::black_box(None);
-        let final_temperature = user_temperature.unwrap_or(config.default_temperature);
+        let final_temperature = user_temperature.unwrap_or_else(|| {
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.temperature)
+                .unwrap_or(0.7)
+        });
 
         assert!((final_temperature - 1.5).abs() < f64::EPSILON);
     }
@@ -3555,11 +3605,17 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     fn agent_fallback_uses_hardcoded_when_config_uses_default() {
         // Test that when config uses default value (0.7), fallback still works
-        let config = Config::default(); // default_temperature = 0.7
+        let config = Config::default();
 
         // Simulate None temperature (user didn't provide --temperature)
         let user_temperature: Option<f64> = std::hint::black_box(None);
-        let final_temperature = user_temperature.unwrap_or(config.default_temperature);
+        let final_temperature = user_temperature.unwrap_or_else(|| {
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.temperature)
+                .unwrap_or(0.7)
+        });
 
         assert!((final_temperature - 0.7).abs() < f64::EPSILON);
     }

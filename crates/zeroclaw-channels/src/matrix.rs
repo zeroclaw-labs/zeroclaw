@@ -3,6 +3,7 @@ use matrix_sdk::{
     Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
     authentication::matrix::MatrixSession,
     config::SyncSettings,
+    media::{MediaFormat, MediaRequestParameters},
     ruma::{
         OwnedEventId, OwnedRoomId, OwnedUserId,
         api::client::receipt::create_receipt,
@@ -13,7 +14,7 @@ use matrix_sdk::{
         events::room::member::StrippedRoomMemberEvent,
         events::room::message::{
             MessageType, OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata,
-            RoomMessageEventContent,
+            ReplyWithinThread, RoomMessageEventContent,
         },
     },
 };
@@ -45,6 +46,9 @@ pub struct MatrixChannel {
     voice_mode: Arc<AtomicBool>,
     otk_conflict_detected: Arc<AtomicBool>,
     recovery_key: Option<String>,
+    /// When true, only respond to messages that @-mention the bot in group rooms.
+    /// Direct messages (rooms with ≤2 joined members) bypass this gate.
+    mention_only: bool,
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
     stream_mode: zeroclaw_config::schema::StreamMode,
@@ -153,6 +157,7 @@ impl MatrixChannel {
         access_token: String,
         room_id: String,
         allowed_users: Vec<String>,
+        mention_only: bool,
     ) -> Self {
         Self::new_full(
             homeserver,
@@ -164,6 +169,7 @@ impl MatrixChannel {
             None,
             None,
             None,
+            mention_only,
         )
     }
 
@@ -185,6 +191,7 @@ impl MatrixChannel {
             device_id_hint,
             None,
             None,
+            false,
         )
     }
 
@@ -207,6 +214,7 @@ impl MatrixChannel {
             device_id_hint,
             zeroclaw_dir,
             None,
+            false,
         )
     }
 
@@ -220,6 +228,7 @@ impl MatrixChannel {
         device_id_hint: Option<String>,
         zeroclaw_dir: Option<PathBuf>,
         recovery_key: Option<String>,
+        mention_only: bool,
     ) -> Self {
         let homeserver = homeserver.trim_end_matches('/').to_string();
         let access_token = access_token.trim().to_string();
@@ -251,6 +260,7 @@ impl MatrixChannel {
             voice_mode: Arc::new(AtomicBool::new(false)),
             otk_conflict_detected: Arc::new(AtomicBool::new(false)),
             recovery_key,
+            mention_only,
             transcription: None,
             transcription_manager: None,
             stream_mode: zeroclaw_config::schema::StreamMode::Off,
@@ -262,8 +272,61 @@ impl MatrixChannel {
         }
     }
 
+    /// Extract body text and media source from a message type.
+    /// Returns `(body_text, Option<(MediaSource, filename)>)`.
+    fn extract_media_info(msgtype: &MessageType) -> (String, Option<(MediaSource, String)>) {
+        match msgtype {
+            MessageType::Text(content) => (content.body.clone(), None),
+            MessageType::Notice(content) => (content.body.clone(), None),
+            MessageType::Image(content) => (
+                format!("[IMAGE:{}]", content.body),
+                Some((content.source.clone(), content.body.clone())),
+            ),
+            MessageType::File(content) => (
+                format!("[FILE:{}]", content.body),
+                Some((content.source.clone(), content.body.clone())),
+            ),
+            MessageType::Audio(content) => (
+                format!("[AUDIO:{}]", content.body),
+                Some((content.source.clone(), content.body.clone())),
+            ),
+            MessageType::Video(content) => (
+                format!("[VIDEO:{}]", content.body),
+                Some((content.source.clone(), content.body.clone())),
+            ),
+            _ => (String::new(), None),
+        }
+    }
+
     /// Configure streaming mode for progressive draft updates or
-    /// paragraph-split multi-message delivery.
+    /// Check whether a message body contains a mention of the bot's user ID.
+    fn body_contains_mention(body: &str, bot_user_id: &str) -> bool {
+        body.contains(bot_user_id)
+    }
+
+    /// Determine whether a message should be filtered (dropped) by the mention gate.
+    /// Returns `true` if the message should be dropped, `false` if it should pass through.
+    ///
+    /// Text messages require an @-mention of the bot. Media messages (image, file,
+    /// audio, video) pass through because they have no text body to check and the
+    /// sender is already validated by allowed_users.
+    fn should_filter_by_mention(is_text_message: bool, body: &str, bot_user_id: &str) -> bool {
+        if !is_text_message {
+            return false;
+        }
+        !Self::body_contains_mention(body, bot_user_id)
+    }
+
+    /// Strip the bot's user ID mention from the message body.
+    fn strip_mention(body: &str, bot_user_id: &str) -> String {
+        body.replace(bot_user_id, "").trim().to_string()
+    }
+
+    /// Determine if a room is a DM (≤2 joined members).
+    fn is_dm_room(joined_member_count: u64) -> bool {
+        joined_member_count <= 2
+    }
+
     pub fn with_streaming(
         mut self,
         stream_mode: zeroclaw_config::schema::StreamMode,
@@ -842,18 +905,49 @@ impl Channel for MatrixChannel {
             tracing::warn!("Matrix failed to stop typing notification: {error}");
         }
 
-        let mut content = RoomMessageEventContent::text_markdown(&message.content);
+        let (cleaned_text, attachments) = crate::util::parse_attachment_markers(&message.content);
 
-        if let Some(ref thread_ts) = message.thread_ts
-            && let Ok(thread_root) = thread_ts.parse::<OwnedEventId>()
-        {
-            content.relates_to = Some(Relation::Thread(Thread::plain(
-                thread_root.clone(),
-                thread_root,
-            )));
+        if !cleaned_text.trim().is_empty() {
+            let mut content = RoomMessageEventContent::text_markdown(&cleaned_text);
+            if let Some(ref thread_ts) = message.thread_ts
+                && let Ok(thread_root) = thread_ts.parse::<OwnedEventId>()
+            {
+                content.relates_to = Some(Relation::Thread(Thread::plain(
+                    thread_root.clone(),
+                    thread_root,
+                )));
+            }
+            room.send(content).await?;
         }
 
-        room.send(content).await?;
+        for (_kind, target) in &attachments {
+            let path = std::path::Path::new(target.as_str());
+            if let Ok(data) = tokio::fs::read(path).await {
+                let mime = mime_guess::from_path(path).first_or_octet_stream();
+                let name = path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy();
+                let mut attachment_config = matrix_sdk::attachment::AttachmentConfig::new();
+                if let Some(ref thread_ts) = message.thread_ts
+                    && let Ok(event_id) = thread_ts.parse::<OwnedEventId>()
+                {
+                    attachment_config =
+                        attachment_config.reply(Some(matrix_sdk::room::reply::Reply {
+                            event_id,
+                            enforce_thread: matrix_sdk::room::reply::EnforceThread::Threaded(
+                                ReplyWithinThread::Yes,
+                            ),
+                        }));
+                }
+                if let Err(e) = room
+                    .send_attachment(&*name, &mime, data, attachment_config)
+                    .await
+                {
+                    tracing::warn!(file = %name, err = %e, "Matrix: attachment upload failed");
+                }
+            }
+        }
 
         // Voice reply: generate TTS audio and send as m.audio when voice_mode is active
         if self.voice_mode.load(Ordering::Relaxed) {
@@ -984,10 +1078,10 @@ impl Channel for MatrixChannel {
         let allowed_users_for_handler = self.allowed_users.clone();
         let allowed_rooms_for_handler = self.allowed_rooms.clone();
         let dedupe_for_handler = Arc::clone(&recent_event_cache);
-        let homeserver_for_handler = self.homeserver.clone();
-        let access_token_for_handler = self.access_token.clone();
+        let sdk_client_for_handler = client.clone();
         let voice_mode_for_handler = Arc::clone(&self.voice_mode);
         let transcription_mgr_for_handler = self.transcription_manager.clone();
+        let mention_only_for_handler = self.mention_only;
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
@@ -996,10 +1090,10 @@ impl Channel for MatrixChannel {
             let allowed_users = allowed_users_for_handler.clone();
             let allowed_rooms = allowed_rooms_for_handler.clone();
             let dedupe = Arc::clone(&dedupe_for_handler);
-            let homeserver = homeserver_for_handler.clone();
-            let access_token = access_token_for_handler.clone();
+            let sdk_client = sdk_client_for_handler.clone();
             let voice_mode = Arc::clone(&voice_mode_for_handler);
             let transcription_mgr = transcription_mgr_for_handler.clone();
+            let mention_only = mention_only_for_handler;
 
             async move {
                 // Room filtering: use allowed_rooms if set, otherwise fall back to single room_id
@@ -1039,43 +1133,40 @@ impl Channel for MatrixChannel {
                     return;
                 }
 
-                // Helper: extract mxc:// download URL and filename for media types
-                let media_info = |source: &MediaSource, name: &str| -> Option<(String, String)> {
-                    match source {
-                        MediaSource::Plain(mxc) => {
-                            let rest = mxc.as_str().strip_prefix("mxc://")?;
-                            let url =
-                                format!("{}/_matrix/client/v1/media/download/{}", homeserver, rest);
-                            Some((url, name.to_string()))
-                        }
-                        MediaSource::Encrypted(_) => None,
+                // Mention gate: in group rooms, require @-mention when mention_only is enabled.
+                // DMs (rooms with ≤2 joined members) bypass this gate.
+                // Media messages (image, file, audio, video) pass through because they
+                // have no text body to check for mentions.
+                if mention_only
+                    && !MatrixChannel::is_dm_room(room.joined_members_count())
+                {
+                    let bot_id_str = my_user_id.as_str();
+                    let is_text_message = matches!(
+                        &event.content.msgtype,
+                        MessageType::Text(_) | MessageType::Notice(_)
+                    );
+                    let body_text = match &event.content.msgtype {
+                        MessageType::Text(c) => c.body.as_str(),
+                        MessageType::Notice(c) => c.body.as_str(),
+                        _ => "",
+                    };
+                    if MatrixChannel::should_filter_by_mention(is_text_message, body_text, bot_id_str) {
+                        tracing::debug!(
+                            "Matrix: ignoring message (mention_only enabled, no mention of {})",
+                            bot_id_str
+                        );
+                        return;
                     }
-                };
+                }
 
-                let (body, media_download) = match &event.content.msgtype {
-                    MessageType::Text(content) => (content.body.clone(), None),
-                    MessageType::Notice(content) => (content.body.clone(), None),
-                    MessageType::Image(content) => {
-                        let dl = media_info(&content.source, &content.body);
-                        (format!("[IMAGE:{}]", content.body), dl)
-                    }
-                    MessageType::File(content) => {
-                        let dl = media_info(&content.source, &content.body);
-                        (format!("[file: {}]", content.body), dl)
-                    }
-                    MessageType::Audio(content) => {
-                        let dl = media_info(&content.source, &content.body);
-                        (format!("[audio: {}]", content.body), dl)
-                    }
-                    MessageType::Video(content) => {
-                        let dl = media_info(&content.source, &content.body);
-                        (format!("[video: {}]", content.body), dl)
-                    }
-                    _ => return,
-                };
+                let (body, media_download) =
+                    MatrixChannel::extract_media_info(&event.content.msgtype);
+                if body.is_empty() {
+                    return;
+                }
 
-                // Download media to workspace if present
-                let body = if let Some((url, filename)) = media_download {
+                // Download media to workspace via SDK (handles both plain and encrypted)
+                let body = if let Some((source, filename)) = media_download {
                     let workspace = std::path::PathBuf::from(
                         shellexpand::tilde(
                             &std::env::var("ZEROCLAW_WORKSPACE")
@@ -1085,34 +1176,36 @@ impl Channel for MatrixChannel {
                     );
                     let _ = tokio::fs::create_dir_all(&workspace).await;
                     let dest = workspace.join(&filename);
-                    let client = reqwest::Client::new();
-                    match client
-                        .get(&url)
-                        .header("Authorization", format!("Bearer {}", access_token))
-                        .send()
-                        .await
-                    {
-                        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                            Ok(bytes) => match tokio::fs::write(&dest, &bytes).await {
-                                Ok(()) => {
-                                    if body.starts_with("[IMAGE:") {
-                                        format!("[IMAGE:{}]", dest.display())
-                                    } else {
-                                        format!("{} — saved to {}", body, dest.display())
-                                    }
+                    let request = MediaRequestParameters {
+                        source,
+                        format: MediaFormat::File,
+                    };
+                    match sdk_client.media().get_media_content(&request, true).await {
+                        Ok(bytes) => match tokio::fs::write(&dest, &bytes).await {
+                            Ok(()) => {
+                                if body.starts_with("[IMAGE:") {
+                                    format!("[IMAGE:{}]", dest.display())
+                                } else {
+                                    format!("{} — saved to {}", body, dest.display())
                                 }
-                                Err(_) => format!("{} — failed to write to disk", body),
-                            },
-                            Err(_) => format!("{} — download failed", body),
+                            }
+                            Err(e) => {
+                                tracing::warn!("Matrix media write failed: {e}");
+                                format!("{} — failed to write to disk", body)
+                            }
                         },
-                        _ => format!("{} — download failed (auth error?)", body),
+                        Err(e) => {
+                            tracing::warn!("Matrix media download failed: {e}");
+                            let prefix_end = body.find(':').unwrap_or(body.len());
+                            format!("[{}-failed:{}", &body[1..prefix_end], &body[prefix_end..])
+                        }
                     }
                 } else {
                     body
                 };
 
                 // Voice transcription: if this was an audio message, transcribe it
-                let body = if body.starts_with("[audio:") {
+                let body = if body.starts_with("[AUDIO:") {
                     if let (Some(path_start), Some(manager)) = (body.find("saved to "), &transcription_mgr) {
                         let audio_path = body[path_start + 9..].to_string();
                         let file_name = audio_path
@@ -1147,6 +1240,13 @@ impl Channel for MatrixChannel {
                     } else {
                         body
                     }
+                } else {
+                    body
+                };
+
+                // Strip bot mention from body when mention_only is active
+                let body = if mention_only {
+                    MatrixChannel::strip_mention(&body, my_user_id.as_str())
                 } else {
                     body
                 };
@@ -1782,6 +1882,7 @@ mod tests {
             "syt_test_token".to_string(),
             "!room:matrix.org".to_string(),
             vec!["@user:matrix.org".to_string()],
+            false,
         )
     }
 
@@ -1801,6 +1902,7 @@ mod tests {
             "tok".to_string(),
             "!r:m".to_string(),
             vec![],
+            false,
         );
         assert_eq!(ch.homeserver, "https://matrix.org");
     }
@@ -1812,6 +1914,7 @@ mod tests {
             "tok".to_string(),
             "!r:m".to_string(),
             vec![],
+            false,
         );
         assert_eq!(ch.homeserver, "https://matrix.org");
     }
@@ -1823,6 +1926,7 @@ mod tests {
             "tok".to_string(),
             "!r:m".to_string(),
             vec![],
+            false,
         );
         assert_eq!(ch.homeserver, "https://matrix.org");
     }
@@ -1834,6 +1938,7 @@ mod tests {
             "  syt_test_token  ".to_string(),
             "!r:m".to_string(),
             vec![],
+            false,
         );
         assert_eq!(ch.access_token, "syt_test_token");
     }
@@ -2008,6 +2113,7 @@ mod tests {
                 "   ".to_string(),
                 "@other:matrix.org".to_string(),
             ],
+            false,
         );
 
         assert_eq!(ch.room_id, "!room:matrix.org");
@@ -2023,6 +2129,7 @@ mod tests {
             "tok".to_string(),
             "!r:m".to_string(),
             vec!["*".to_string()],
+            false,
         );
         assert!(ch.is_user_allowed("@anyone:matrix.org"));
         assert!(ch.is_user_allowed("@hacker:evil.org"));
@@ -2048,6 +2155,7 @@ mod tests {
             "tok".to_string(),
             "!r:m".to_string(),
             vec!["@User:Matrix.org".to_string()],
+            false,
         );
         assert!(ch.is_user_allowed("@user:matrix.org"));
         assert!(ch.is_user_allowed("@USER:MATRIX.ORG"));
@@ -2060,6 +2168,7 @@ mod tests {
             "tok".to_string(),
             "!r:m".to_string(),
             vec![],
+            false,
         );
         assert!(!ch.is_user_allowed("@anyone:matrix.org"));
     }
@@ -2183,6 +2292,7 @@ mod tests {
             "tok".to_string(),
             "room_without_prefix".to_string(),
             vec![],
+            false,
         );
 
         let err = ch.resolve_room_id().await.unwrap_err();
@@ -2199,6 +2309,7 @@ mod tests {
             "tok".to_string(),
             "!canonical:matrix.org".to_string(),
             vec![],
+            false,
         );
 
         let room_id = ch.target_room_id().await.unwrap();
@@ -2212,6 +2323,7 @@ mod tests {
             "tok".to_string(),
             "#ops:matrix.org".to_string(),
             vec![],
+            false,
         );
 
         *ch.resolved_room_id_cache.write().await = Some("!cached:matrix.org".to_string());
@@ -2245,6 +2357,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(ch.is_room_allowed("!allowed:matrix.org"));
         assert!(!ch.is_room_allowed("!forbidden:matrix.org"));
@@ -2265,6 +2378,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(ch.is_room_allowed("!direct:matrix.org"));
         assert!(ch.is_room_allowed("#ops:matrix.org"));
@@ -2283,6 +2397,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(ch.is_room_allowed("!room:matrix.org"));
         assert!(ch.is_room_allowed("!ROOM:MATRIX.ORG"));
@@ -2300,6 +2415,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(ch.allowed_rooms.len(), 1);
         assert!(ch.is_room_allowed("!room:matrix.org"));
@@ -2326,5 +2442,187 @@ mod tests {
         let sanitized = MatrixChannel::sanitize_error_for_log(&"auth failed: sk-proj-abc123xyz");
         assert!(!sanitized.contains("sk-proj-abc123xyz"));
         assert!(sanitized.contains("[REDACTED]"));
+    }
+
+    // ── mention_only tests ──────────────────────────────────────────
+
+    #[test]
+    fn mention_detected_with_full_user_id() {
+        assert!(MatrixChannel::body_contains_mention(
+            "@bot:matrix.org hello there",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn mention_detected_mid_message() {
+        assert!(MatrixChannel::body_contains_mention(
+            "hey @bot:matrix.org what do you think?",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn mention_not_detected_when_absent() {
+        assert!(!MatrixChannel::body_contains_mention(
+            "hello there",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn mention_not_detected_partial_match() {
+        assert!(!MatrixChannel::body_contains_mention(
+            "@bot:other.org hello",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn strip_mention_from_start() {
+        let result =
+            MatrixChannel::strip_mention("@bot:matrix.org what is rust?", "@bot:matrix.org");
+        assert_eq!(result, "what is rust?");
+    }
+
+    #[test]
+    fn strip_mention_from_middle() {
+        let result =
+            MatrixChannel::strip_mention("hey @bot:matrix.org explain this", "@bot:matrix.org");
+        assert_eq!(result, "hey  explain this");
+    }
+
+    #[test]
+    fn strip_mention_only_mention_yields_empty() {
+        let result = MatrixChannel::strip_mention("@bot:matrix.org", "@bot:matrix.org");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn strip_mention_no_mention_unchanged() {
+        let result = MatrixChannel::strip_mention("hello world", "@bot:matrix.org");
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn is_dm_room_two_members() {
+        assert!(MatrixChannel::is_dm_room(2));
+    }
+
+    #[test]
+    fn is_dm_room_one_member() {
+        assert!(MatrixChannel::is_dm_room(1));
+    }
+
+    #[test]
+    fn is_dm_room_group() {
+        assert!(!MatrixChannel::is_dm_room(3));
+        assert!(!MatrixChannel::is_dm_room(50));
+    }
+
+    #[test]
+    fn mention_gate_allows_media_in_group_room() {
+        // Media messages (image, file, audio, video) have no text body.
+        // They should pass through the mention gate in group rooms
+        // because the sender is already validated by allowed_users.
+        assert!(!MatrixChannel::should_filter_by_mention(
+            false, // not a text message (media)
+            "",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn mention_gate_filters_empty_text_message() {
+        // An empty text message with no mention should still be filtered
+        assert!(MatrixChannel::should_filter_by_mention(
+            true,
+            "",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn mention_gate_filters_text_without_mention() {
+        assert!(MatrixChannel::should_filter_by_mention(
+            true,
+            "hello world",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn mention_gate_passes_text_with_mention() {
+        assert!(!MatrixChannel::should_filter_by_mention(
+            true,
+            "hey @bot:matrix.org what's up",
+            "@bot:matrix.org"
+        ));
+    }
+
+    // ── extract_media_info tests ────────────────────────────────────
+
+    fn make_encrypted_file() -> matrix_sdk::ruma::events::room::EncryptedFile {
+        serde_json::from_value(serde_json::json!({
+            "url": "mxc://matrix.org/encrypted123",
+            "key": {
+                "kty": "oct",
+                "key_ops": ["encrypt", "decrypt"],
+                "alg": "A256CTR",
+                "k": "b50ACIv6LMn9AfMCFD1POJI_UAFWIclxAN1kWrEO2X8",
+                "ext": true,
+            },
+            "iv": "AK1wyzigZtQAAAABAAAAKK",
+            "hashes": {
+                "sha256": "foobar",
+            },
+            "v": "v2",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn extract_media_info_plain_image_returns_source() {
+        use matrix_sdk::ruma::events::room::message::ImageMessageEventContent;
+        use matrix_sdk::ruma::owned_mxc_uri;
+
+        let content = ImageMessageEventContent::plain(
+            "photo.jpg".to_string(),
+            owned_mxc_uri!("mxc://matrix.org/plain123"),
+        );
+        let msgtype = MessageType::Image(content);
+        let (body, media) = MatrixChannel::extract_media_info(&msgtype);
+        assert_eq!(body, "[IMAGE:photo.jpg]");
+        assert!(media.is_some(), "plain image must return Some media source");
+        let (_, filename) = media.unwrap();
+        assert_eq!(filename, "photo.jpg");
+    }
+
+    #[test]
+    fn extract_media_info_encrypted_image_returns_source() {
+        use matrix_sdk::ruma::events::room::message::ImageMessageEventContent;
+
+        let content =
+            ImageMessageEventContent::encrypted("9637.jpg".to_string(), make_encrypted_file());
+        let msgtype = MessageType::Image(content);
+        let (body, media) = MatrixChannel::extract_media_info(&msgtype);
+        assert_eq!(body, "[IMAGE:9637.jpg]");
+        assert!(
+            media.is_some(),
+            "encrypted image must return Some media source — not None"
+        );
+        let (_, filename) = media.unwrap();
+        assert_eq!(filename, "9637.jpg");
+    }
+
+    #[test]
+    fn extract_media_info_text_returns_none() {
+        use matrix_sdk::ruma::events::room::message::TextMessageEventContent;
+
+        let content = TextMessageEventContent::plain("hello world");
+        let msgtype = MessageType::Text(content);
+        let (body, media) = MatrixChannel::extract_media_info(&msgtype);
+        assert_eq!(body, "hello world");
+        assert!(media.is_none());
     }
 }

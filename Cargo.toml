@@ -92,6 +92,7 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 # Config
 directories = "6.0"
 toml = "1.0"
+toml_edit = "0.25"  # already a transitive dep via toml — zero added compile/binary cost
 shellexpand = "3.1"
 
 # JSON Schema generation for config export
@@ -111,7 +112,7 @@ urlencoding = "2.1"
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"
 
-rumqttc = "0.24"
+rumqttc = "0.25"
 
 # Tarball extraction for binary updates
 flate2 = "1"
