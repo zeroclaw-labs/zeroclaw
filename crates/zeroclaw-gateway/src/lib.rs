@@ -1509,6 +1509,7 @@ async fn handle_webhook(
             provider: provider_label.clone(),
             model: model_label.clone(),
             messages_count: 1,
+            prompt_content: None,
         },
     );
 
@@ -1524,6 +1525,7 @@ async fn handle_webhook(
                     error_message: None,
                     input_tokens: None,
                     output_tokens: None,
+                    response_content: None,
                 },
             );
             state.observer.record_metric(
@@ -1555,6 +1557,7 @@ async fn handle_webhook(
                     error_message: Some(sanitized.clone()),
                     input_tokens: None,
                     output_tokens: None,
+                    response_content: None,
                 },
             );
             state.observer.record_metric(

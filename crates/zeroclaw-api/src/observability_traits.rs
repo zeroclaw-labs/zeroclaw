@@ -18,6 +18,8 @@ pub enum ObserverEvent {
         provider: String,
         model: String,
         messages_count: usize,
+        /// Serialised prompt content (opt-in via `ZEROCLAW_OTEL_TRACE_CONTENT`).
+        prompt_content: Option<String>,
     },
     /// Result of a single LLM provider call.
     LlmResponse {
@@ -28,6 +30,8 @@ pub enum ObserverEvent {
         error_message: Option<String>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        /// LLM response content (opt-in via `ZEROCLAW_OTEL_TRACE_CONTENT`).
+        response_content: Option<String>,
     },
     /// The agent session has finished.
     ///
@@ -49,6 +53,8 @@ pub enum ObserverEvent {
         tool: String,
         duration: Duration,
         success: bool,
+        /// Tool execution output (opt-in via `ZEROCLAW_OTEL_TRACE_CONTENT`).
+        output: Option<String>,
     },
     /// The agent produced a final answer for the current user message.
     TurnComplete,
@@ -249,6 +255,7 @@ mod tests {
             tool: "shell".into(),
             duration: Duration::from_millis(10),
             success: true,
+            output: None,
         };
         let metric = ObserverMetric::RequestLatency(Duration::from_millis(8));
 
