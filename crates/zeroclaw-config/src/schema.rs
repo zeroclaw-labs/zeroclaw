@@ -534,6 +534,9 @@ pub struct ModelProviderConfig {
     /// Extra HTTP headers for API requests.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub extra_headers: HashMap<String, String>,
+    /// Extra fields to add to the API request body (e.g., to force stream=true).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub provider_extra_body: HashMap<String, serde_json::Value>,
     /// Provider protocol variant ("responses" or "chat_completions").
     #[serde(default)]
     pub wire_api: Option<String>,

@@ -272,6 +272,27 @@ default_provider = "custom:https://your-api.example.com"
 default_provider = "anthropic-custom:https://your-api.example.com"
 ```
 
+### Forcing `stream=true` for Custom Providers
+
+Some OpenAI-compatible providers require `stream=true` in the request body and will return a 400 error if streaming is not enabled. To force streaming for these providers, use the `provider_extra_body` configuration option:
+
+```toml
+[provider_extra_body]
+stream = true
+```
+
+This adds the specified fields to every API request body sent to the provider. The most common use case is forcing streaming mode for APIs that require it.
+
+Example configuration for a provider that requires streaming:
+
+```toml
+default_provider = "custom:https://api.example.com/v1"
+api_key = "your-api-key"
+
+[provider_extra_body]
+stream = true
+```
+
 ## MiniMax OAuth Setup (config.toml)
 
 Set the MiniMax provider and OAuth placeholder in config:
