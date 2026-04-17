@@ -72,6 +72,244 @@ struct GroupInfo {
     group_id: Option<String>,
 }
 
+// ── markdown → signal textStyles ─────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SignalStyle {
+    Bold,
+    Italic,
+    Strikethrough,
+    Spoiler,
+    Monospace,
+}
+
+impl SignalStyle {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bold => "BOLD",
+            Self::Italic => "ITALIC",
+            Self::Strikethrough => "STRIKETHROUGH",
+            Self::Spoiler => "SPOILER",
+            Self::Monospace => "MONOSPACE",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DelimKind {
+    StarStar,
+    Tilde,
+    Pipe,
+    Star,
+    Underscore,
+    Backtick,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Marker {
+    byte_pos: usize,
+    delim_len: usize,
+    delim_kind: DelimKind,
+    style: SignalStyle,
+}
+
+/// Scan input for markdown delimiter positions and `\` escape positions.
+///
+/// Returns `(markers, escape_positions)` where `escape_positions[i]` is true
+/// when byte `i` is the leading `\` of an `\<delim>` escape sequence (the
+/// backslash should be dropped, the following char emitted literally).
+fn scan_markers(input: &str) -> (Vec<Marker>, Vec<bool>) {
+    let bytes = input.as_bytes();
+    let mut markers: Vec<Marker> = Vec::new();
+    let mut escapes = vec![false; bytes.len()];
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if b == b'\\'
+            && let Some(&next) = bytes.get(i + 1)
+            && matches!(next, b'*' | b'_' | b'~' | b'|' | b'`' | b'\\')
+        {
+            escapes[i] = true;
+            i += 2;
+            continue;
+        }
+
+        let (kind, style, len) = if b == b'*' && bytes.get(i + 1) == Some(&b'*') {
+            (DelimKind::StarStar, SignalStyle::Bold, 2)
+        } else if b == b'~' && bytes.get(i + 1) == Some(&b'~') {
+            (DelimKind::Tilde, SignalStyle::Strikethrough, 2)
+        } else if b == b'|' && bytes.get(i + 1) == Some(&b'|') {
+            (DelimKind::Pipe, SignalStyle::Spoiler, 2)
+        } else if b == b'*' {
+            (DelimKind::Star, SignalStyle::Italic, 1)
+        } else if b == b'_' {
+            (DelimKind::Underscore, SignalStyle::Italic, 1)
+        } else if b == b'`' {
+            (DelimKind::Backtick, SignalStyle::Monospace, 1)
+        } else {
+            let ch_len = input[i..].chars().next().map_or(1, |c| c.len_utf8());
+            i += ch_len;
+            continue;
+        };
+
+        markers.push(Marker {
+            byte_pos: i,
+            delim_len: len,
+            delim_kind: kind,
+            style,
+        });
+        i += len;
+    }
+    (markers, escapes)
+}
+
+/// Pair markers into open/close ranges using a stack with flanking heuristics.
+///
+/// Returned tuples are `(open_idx, close_idx, style)` indexing into `markers`.
+fn pair_markers(markers: &[Marker], input: &str) -> Vec<(usize, usize, SignalStyle)> {
+    let bytes = input.as_bytes();
+    let mut paired: Vec<(usize, usize, SignalStyle)> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+
+    for (k, m) in markers.iter().enumerate() {
+        // Inside a backtick span, only another backtick is meaningful.
+        let in_mono = stack
+            .iter()
+            .any(|&j| markers[j].delim_kind == DelimKind::Backtick);
+        if in_mono && m.delim_kind != DelimKind::Backtick {
+            continue;
+        }
+
+        let single = matches!(
+            m.delim_kind,
+            DelimKind::Star | DelimKind::Underscore | DelimKind::Backtick
+        );
+        let prev_byte = if m.byte_pos == 0 {
+            None
+        } else {
+            bytes.get(m.byte_pos - 1).copied()
+        };
+        let next_byte = bytes.get(m.byte_pos + m.delim_len).copied();
+
+        let top_match = stack
+            .last()
+            .copied()
+            .filter(|&j| markers[j].delim_kind == m.delim_kind);
+        if let Some(top_idx) = top_match {
+            let prev_ok = matches!(prev_byte, Some(b) if !b.is_ascii_whitespace());
+            let next_ok = if single {
+                !matches!(next_byte, Some(b) if b.is_ascii_alphanumeric())
+            } else {
+                true
+            };
+            if prev_ok && next_ok {
+                stack.pop();
+                paired.push((top_idx, k, markers[top_idx].style));
+                continue;
+            }
+        }
+
+        let next_ok = matches!(next_byte, Some(b) if !b.is_ascii_whitespace());
+        let prev_ok = if single {
+            !matches!(prev_byte, Some(b) if b.is_ascii_alphanumeric())
+        } else {
+            true
+        };
+        if prev_ok && next_ok {
+            stack.push(k);
+        }
+    }
+
+    paired
+}
+
+/// Walk `input`, emit plain text, and resolve UTF-16 offsets for each paired
+/// marker pair. Skipped: paired marker bytes and `\` escape leading bytes.
+fn emit_with_offsets(
+    input: &str,
+    markers: &[Marker],
+    paired: &[(usize, usize, SignalStyle)],
+    escapes: &[bool],
+) -> (String, Vec<String>) {
+    use std::collections::{HashMap, HashSet};
+
+    let bytes = input.as_bytes();
+
+    let mut paired_set: HashSet<usize> = HashSet::new();
+    for (a, b, _) in paired {
+        paired_set.insert(*a);
+        paired_set.insert(*b);
+    }
+
+    let mut skip_at: HashMap<usize, usize> = HashMap::new();
+    let mut marker_pos_to_idx: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (k, m) in markers.iter().enumerate() {
+        marker_pos_to_idx.entry(m.byte_pos).or_default().push(k);
+        if paired_set.contains(&k) {
+            skip_at.insert(m.byte_pos, m.byte_pos + m.delim_len);
+        }
+    }
+
+    let mut marker_utf16: HashMap<usize, usize> = HashMap::new();
+    let mut out = String::new();
+    let mut utf16: usize = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(mks) = marker_pos_to_idx.get(&i) {
+            for &k in mks {
+                if paired_set.contains(&k) {
+                    marker_utf16.insert(k, utf16);
+                }
+            }
+        }
+        if let Some(&end) = skip_at.get(&i) {
+            i = end;
+            continue;
+        }
+        if escapes[i] {
+            i += 1;
+            continue;
+        }
+        let ch = input[i..].chars().next().expect("char boundary");
+        out.push(ch);
+        utf16 += ch.len_utf16();
+        i += ch.len_utf8();
+    }
+    if let Some(mks) = marker_pos_to_idx.get(&i) {
+        for &k in mks {
+            if paired_set.contains(&k) {
+                marker_utf16.insert(k, utf16);
+            }
+        }
+    }
+
+    let mut style_strings: Vec<String> = Vec::new();
+    for (open_k, close_k, style) in paired {
+        let start = marker_utf16[open_k];
+        let end = marker_utf16[close_k];
+        if end > start {
+            style_strings.push(format!("{}:{}:{}", start, end - start, style.as_str()));
+        }
+    }
+    style_strings.sort();
+
+    (out, style_strings)
+}
+
+/// Convert markdown-flavored text into plain text plus signal-cli textStyle
+/// range strings (`"start:length:STYLE"`, UTF-16 offsets).
+///
+/// Supported syntax: `**bold**`, `*italic*` / `_italic_`, `~~strikethrough~~`,
+/// `||spoiler||`, `` `monospace` ``. Use `\` to escape a delimiter literally
+/// (e.g. `\*` → literal `*`). Inside a backtick span all other delimiters
+/// are taken literally (code semantics).
+pub(crate) fn markdown_to_signal_text(input: &str) -> (String, Vec<String>) {
+    let (markers, escapes) = scan_markers(input);
+    let paired = pair_markers(&markers, input);
+    emit_with_offsets(input, &markers, &paired, &escapes)
+}
+
 impl SignalChannel {
     pub fn new(
         http_url: String,
@@ -228,6 +466,37 @@ impl SignalChannel {
         Ok(parsed.get("result").cloned())
     }
 
+    /// Build JSON-RPC `send` params for a single outbound message.
+    ///
+    /// Markdown in `message.content` is converted to plain text plus
+    /// signal-cli `textStyles` ranges with UTF-16 offsets.
+    fn build_send_params(&self, message: &SendMessage) -> serde_json::Value {
+        let (text, text_styles) = markdown_to_signal_text(&message.content);
+
+        let mut base = match Self::parse_recipient_target(&message.recipient) {
+            RecipientTarget::Direct(number) => serde_json::json!({
+                "recipient": [number],
+                "account": &self.account,
+            }),
+            RecipientTarget::Group(group_id) => serde_json::json!({
+                "groupId": group_id,
+                "account": &self.account,
+            }),
+        };
+
+        let obj = base
+            .as_object_mut()
+            .expect("send params constructed as object");
+        if !text.is_empty() {
+            obj.insert("message".into(), serde_json::Value::String(text));
+        }
+        if !text_styles.is_empty() {
+            obj.insert("textStyles".into(), serde_json::json!(text_styles));
+        }
+
+        base
+    }
+
     /// Process a single SSE envelope, returning a ChannelMessage if valid.
     fn process_envelope(&self, envelope: &Envelope) -> Option<ChannelMessage> {
         // Skip story messages when configured
@@ -292,19 +561,7 @@ impl Channel for SignalChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let params = match Self::parse_recipient_target(&message.recipient) {
-            RecipientTarget::Direct(number) => serde_json::json!({
-                "recipient": [number],
-                "message": &message.content,
-                "account": &self.account,
-            }),
-            RecipientTarget::Group(group_id) => serde_json::json!({
-                "groupId": group_id,
-                "message": &message.content,
-                "account": &self.account,
-            }),
-        };
-
+        let params = self.build_send_params(message);
         self.rpc_request("send", params).await?;
         Ok(())
     }
@@ -920,5 +1177,178 @@ mod tests {
         assert!(env.data_message.is_none());
         assert!(env.story_message.is_none());
         assert!(env.timestamp.is_none());
+    }
+
+    // ── markdown → textStyles ────────────────────────────────────
+
+    #[test]
+    fn markdown_plain_text_unchanged() {
+        let (text, styles) = markdown_to_signal_text("hello world");
+        assert_eq!(text, "hello world");
+        assert!(styles.is_empty());
+    }
+
+    #[test]
+    fn markdown_bold() {
+        let (text, styles) = markdown_to_signal_text("**hi**");
+        assert_eq!(text, "hi");
+        assert_eq!(styles, vec!["0:2:BOLD".to_string()]);
+    }
+
+    #[test]
+    fn markdown_italic_asterisk() {
+        let (text, styles) = markdown_to_signal_text("*hi*");
+        assert_eq!(text, "hi");
+        assert_eq!(styles, vec!["0:2:ITALIC".to_string()]);
+    }
+
+    #[test]
+    fn markdown_italic_underscore() {
+        let (text, styles) = markdown_to_signal_text("_hi_");
+        assert_eq!(text, "hi");
+        assert_eq!(styles, vec!["0:2:ITALIC".to_string()]);
+    }
+
+    #[test]
+    fn markdown_strikethrough() {
+        let (text, styles) = markdown_to_signal_text("~~hi~~");
+        assert_eq!(text, "hi");
+        assert_eq!(styles, vec!["0:2:STRIKETHROUGH".to_string()]);
+    }
+
+    #[test]
+    fn markdown_spoiler() {
+        let (text, styles) = markdown_to_signal_text("||hi||");
+        assert_eq!(text, "hi");
+        assert_eq!(styles, vec!["0:2:SPOILER".to_string()]);
+    }
+
+    #[test]
+    fn markdown_monospace() {
+        let (text, styles) = markdown_to_signal_text("`hi`");
+        assert_eq!(text, "hi");
+        assert_eq!(styles, vec!["0:2:MONOSPACE".to_string()]);
+    }
+
+    #[test]
+    fn markdown_offset_in_middle() {
+        let (text, styles) = markdown_to_signal_text("Hello **world**!");
+        assert_eq!(text, "Hello world!");
+        assert_eq!(styles, vec!["6:5:BOLD".to_string()]);
+    }
+
+    #[test]
+    fn markdown_nested_bold_italic() {
+        let (text, styles) = markdown_to_signal_text("**a _b_ c**");
+        assert_eq!(text, "a b c");
+        assert_eq!(
+            styles,
+            vec!["0:5:BOLD".to_string(), "2:1:ITALIC".to_string()]
+        );
+    }
+
+    #[test]
+    fn markdown_multiple_spans() {
+        let (text, styles) = markdown_to_signal_text("**bold** then *italic*");
+        assert_eq!(text, "bold then italic");
+        assert_eq!(
+            styles,
+            vec!["0:4:BOLD".to_string(), "10:6:ITALIC".to_string()]
+        );
+    }
+
+    #[test]
+    fn markdown_utf16_offsets_with_accent() {
+        // 'é' is 1 UTF-16 code unit (BMP), so offsets stay 0..4.
+        let (text, styles) = markdown_to_signal_text("**café**");
+        assert_eq!(text, "café");
+        assert_eq!(styles, vec!["0:4:BOLD".to_string()]);
+    }
+
+    #[test]
+    fn markdown_utf16_offsets_with_emoji_surrogate_pair() {
+        // '👋' (U+1F44B) is 2 UTF-16 code units (surrogate pair).
+        let (text, styles) = markdown_to_signal_text("**👋**");
+        assert_eq!(text, "👋");
+        assert_eq!(styles, vec!["0:2:BOLD".to_string()]);
+    }
+
+    #[test]
+    fn markdown_unmatched_opener_kept_literal() {
+        let (text, styles) = markdown_to_signal_text("**hi");
+        assert_eq!(text, "**hi");
+        assert!(styles.is_empty());
+    }
+
+    #[test]
+    fn markdown_arithmetic_star_not_treated_as_italic() {
+        let (text, styles) = markdown_to_signal_text("5*5=25");
+        assert_eq!(text, "5*5=25");
+        assert!(styles.is_empty());
+    }
+
+    #[test]
+    fn markdown_backslash_escape_star() {
+        let (text, styles) = markdown_to_signal_text("\\*not italic\\*");
+        assert_eq!(text, "*not italic*");
+        assert!(styles.is_empty());
+    }
+
+    #[test]
+    fn markdown_backslash_escape_backslash() {
+        let (text, styles) = markdown_to_signal_text("a\\\\b");
+        assert_eq!(text, "a\\b");
+        assert!(styles.is_empty());
+    }
+
+    #[test]
+    fn markdown_inside_monospace_is_literal() {
+        let (text, styles) = markdown_to_signal_text("`**not bold**`");
+        assert_eq!(text, "**not bold**");
+        assert_eq!(styles, vec!["0:12:MONOSPACE".to_string()]);
+    }
+
+    // ── build_send_params ────────────────────────────────────────
+
+    #[test]
+    fn send_params_direct_plain_text() {
+        let ch = make_channel();
+        let msg = SendMessage::new("hello", "+1111111111");
+        let params = ch.build_send_params(&msg);
+        assert_eq!(params["recipient"], serde_json::json!(["+1111111111"]));
+        assert_eq!(params["account"], serde_json::json!("+1234567890"));
+        assert_eq!(params["message"], serde_json::json!("hello"));
+        assert!(params.get("textStyles").is_none());
+        assert!(params.get("groupId").is_none());
+    }
+
+    #[test]
+    fn send_params_group() {
+        let ch = make_channel();
+        let msg = SendMessage::new("hi", "group:abc123");
+        let params = ch.build_send_params(&msg);
+        assert_eq!(params["groupId"], serde_json::json!("abc123"));
+        assert!(params.get("recipient").is_none());
+    }
+
+    #[test]
+    fn send_params_with_markdown_formatting() {
+        let ch = make_channel();
+        let msg = SendMessage::new("**hi** _there_", "+1111111111");
+        let params = ch.build_send_params(&msg);
+        assert_eq!(params["message"], serde_json::json!("hi there"));
+        let styles = params["textStyles"].as_array().unwrap();
+        assert_eq!(styles.len(), 2);
+        assert!(styles.contains(&serde_json::json!("0:2:BOLD")));
+        assert!(styles.contains(&serde_json::json!("3:5:ITALIC")));
+    }
+
+    #[test]
+    fn send_params_empty_content_omits_message_field() {
+        let ch = make_channel();
+        let msg = SendMessage::new("", "+1111111111");
+        let params = ch.build_send_params(&msg);
+        assert!(params.get("message").is_none());
+        assert!(params.get("textStyles").is_none());
     }
 }
