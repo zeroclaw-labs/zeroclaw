@@ -736,16 +736,16 @@ impl Default for ProviderRuntimeOptions {
 pub fn provider_runtime_options_from_config(
     config: &zeroclaw_config::schema::Config,
 ) -> ProviderRuntimeOptions {
+    let fallback = config.providers.fallback_provider();
     // Resolve merge_system_into_user from the active model provider profile by
     // matching api_url — apply_named_model_provider_profile() has already run
-    // and rewritten default_provider, but model_providers retains all profiles.
-    let merge_system_into_user = config
-        .api_url
-        .as_deref()
+    // and rewritten providers.fallback, but providers.models retains all profiles.
+    let merge_system_into_user = fallback
+        .and_then(|e| e.base_url.as_deref())
         .map(str::trim)
         .filter(|u| !u.is_empty())
         .and_then(|active_url| {
-            config.model_providers.values().find(|p| {
+            config.providers.models.values().find(|p| {
                 p.base_url
                     .as_deref()
                     .map(str::trim)
@@ -759,15 +759,17 @@ pub fn provider_runtime_options_from_config(
 
     ProviderRuntimeOptions {
         auth_profile_override: None,
-        provider_api_url: config.api_url.clone(),
+        provider_api_url: fallback.and_then(|e| e.base_url.clone()),
         zeroclaw_dir: config.config_path.parent().map(PathBuf::from),
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_effort: config.runtime.reasoning_effort.clone(),
-        provider_timeout_secs: Some(config.provider_timeout_secs),
-        extra_headers: config.extra_headers.clone(),
-        api_path: config.api_path.clone(),
-        provider_max_tokens: config.provider_max_tokens,
+        provider_timeout_secs: Some(fallback.and_then(|e| e.timeout_secs).unwrap_or(120)),
+        extra_headers: fallback
+            .map(|e| e.extra_headers.clone())
+            .unwrap_or_default(),
+        api_path: fallback.and_then(|e| e.api_path.clone()),
+        provider_max_tokens: fallback.and_then(|e| e.max_tokens),
         merge_system_into_user,
     }
 }
@@ -924,6 +926,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "fireworks" | "fireworks-ai" => vec!["FIREWORKS_API_KEY"],
         "novita" => vec!["NOVITA_API_KEY"],
         "perplexity" => vec!["PERPLEXITY_API_KEY"],
+        "copilot" | "github-copilot" => vec!["GITHUB_TOKEN"],
         "cohere" => vec!["COHERE_API_KEY"],
         name if is_moonshot_alias(name) => vec!["MOONSHOT_API_KEY"],
         "kimi-code" | "kimi_coding" | "kimi_for_coding" => {

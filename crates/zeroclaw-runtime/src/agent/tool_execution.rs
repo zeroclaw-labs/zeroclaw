@@ -90,8 +90,13 @@ pub async fn execute_one_tool(
                 success: r.success,
             });
             if r.success {
+                let normalized_output = if r.output.is_empty() {
+                    "(no output)"
+                } else {
+                    &r.output
+                };
                 Ok(ToolExecutionOutcome {
-                    output: scrub_credentials(&r.output),
+                    output: scrub_credentials(normalized_output),
                     success: true,
                     error_reason: None,
                     duration,

@@ -340,6 +340,20 @@ pub struct TelegramChannel {
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    /// Pending approval requests: callback_data key → oneshot sender.
+    /// `listen()` resolves these when a matching `callback_query` arrives.
+    pending_approvals: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
+            >,
+        >,
+    >,
+    /// Seconds to wait for the operator to tap an inline-keyboard button on a
+    /// tool approval prompt before auto-denying. Configurable via
+    /// `channels.telegram.approval_timeout_secs`. Default: 120.
+    approval_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,7 +398,15 @@ impl TelegramChannel {
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
+            pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            approval_timeout_secs: 120,
         }
+    }
+
+    /// Override the approval prompt timeout (default 120s).
+    pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
+        self.approval_timeout_secs = secs;
+        self
     }
 
     /// Configure whether Telegram-native acknowledgement reactions are sent.
@@ -541,7 +563,7 @@ impl TelegramChannel {
 
     async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
         let mut config = Self::load_config_without_env().await?;
-        let Some(telegram) = config.channels_config.telegram.as_mut() else {
+        let Some(telegram) = config.channels.telegram.as_mut() else {
             anyhow::bail!(
                 "Missing [channels.telegram] section in config.toml. \
                 Add bot_token and allowed_users under [channels.telegram], \
@@ -2796,7 +2818,7 @@ impl Channel for TelegramChannel {
             let probe = serde_json::json!({
                 "offset": offset,
                 "timeout": 0,
-                "allowed_updates": ["message"]
+                "allowed_updates": ["message", "callback_query"]
             });
             match self.http_client().post(&url).json(&probe).send().await {
                 Err(e) => {
@@ -2869,7 +2891,7 @@ impl Channel for TelegramChannel {
             let body = serde_json::json!({
                 "offset": offset,
                 "timeout": 30,
-                "allowed_updates": ["message"]
+                "allowed_updates": ["message", "callback_query"]
             });
 
             let resp = match self.http_client().post(&url).json(&body).send().await {
@@ -2928,6 +2950,68 @@ Ensure only one `zeroclaw` process is using this bot token."
                     // Advance offset past this update
                     if let Some(uid) = update.get("update_id").and_then(serde_json::Value::as_i64) {
                         offset = uid + 1;
+                    }
+
+                    // ── Handle callback_query (inline keyboard taps) ──
+                    if let Some(cb) = update.get("callback_query") {
+                        let cb_id = cb
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        let cb_data = cb
+                            .get("data")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+
+                        if let Some(rest) = cb_data.strip_prefix("approval:")
+                            && let Some((approval_id, action)) = rest.rsplit_once(':')
+                        {
+                            let response = match action {
+                                "approve" => {
+                                    Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve)
+                                }
+                                "always" => Some(
+                                    zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
+                                ),
+                                "deny" => {
+                                    Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny)
+                                }
+                                other => {
+                                    tracing::warn!("Unknown approval callback action: {other}");
+                                    None
+                                }
+                            };
+
+                            if let Some(resp) = response
+                                && let Some(sender) =
+                                    self.pending_approvals.lock().await.remove(approval_id)
+                            {
+                                let _ = sender.send(resp);
+                            }
+
+                            // Answer the callback query to dismiss the spinner.
+                            let answer_text = match action {
+                                "approve" => "✅ Approved",
+                                "always" => "✅✅ Always approved",
+                                "deny" => "❌ Denied",
+                                _ => "⚠️ Unknown action",
+                            };
+                            let answer_body = serde_json::json!({
+                                "callback_query_id": cb_id,
+                                "text": answer_text,
+                            });
+                            if let Err(e) = self
+                                .http_client()
+                                .post(self.api_url("answerCallbackQuery"))
+                                .json(&answer_body)
+                                .send()
+                                .await
+                            {
+                                tracing::warn!("answerCallbackQuery failed: {e}");
+                            }
+                        }
+
+                        continue; // callback_query is not a regular message
                     }
 
                     let msg = if let Some(m) = self.parse_update_message(update) {
@@ -3023,6 +3107,87 @@ Ensure only one `zeroclaw` process is using this bot token."
             handle.abort();
         }
         Ok(())
+    }
+
+    async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        // Parse recipient for chat_id (may contain ":thread_id" suffix).
+        let chat_id = recipient.split_once(':').map_or(recipient, |(c, _)| c);
+
+        // Unique key embedded in callback_data so listen() can route the tap.
+        let approval_id = uuid::Uuid::new_v4().to_string();
+
+        let tool = Self::escape_html(&request.tool_name);
+        let args = Self::escape_html(&request.arguments_summary);
+        let text = format!(
+            "\u{1f527} <b>Tool approval required</b>\n\n\
+             Tool: <code>{tool}</code>\n\
+             {args}\n\n\
+             Tap a button below:",
+        );
+
+        let reply_markup = serde_json::json!({
+            "inline_keyboard": [[
+                { "text": "✅ Approve",  "callback_data": format!("approval:{}:approve", approval_id) },
+                { "text": "❌ Deny",     "callback_data": format!("approval:{}:deny", approval_id) },
+                { "text": "✅✅ Always", "callback_data": format!("approval:{}:always", approval_id) },
+            ]]
+        });
+
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "reply_markup": reply_markup,
+        });
+
+        // Register the oneshot BEFORE sending the message to avoid a race
+        // where the user taps the button before the sender is in the map.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_approvals
+            .lock()
+            .await
+            .insert(approval_id.clone(), tx);
+
+        let resp = self
+            .http_client()
+            .post(self.api_url("sendMessage"))
+            .json(&body)
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => {
+                self.pending_approvals.lock().await.remove(&approval_id);
+                let status = r.status();
+                let err = r.text().await.unwrap_or_default();
+                anyhow::bail!("Telegram sendMessage (approval) failed ({status}): {err}");
+            }
+            Err(e) => {
+                self.pending_approvals.lock().await.remove(&approval_id);
+                return Err(e.into());
+            }
+        }
+
+        // Wait for the user to tap a button. Timeout is configurable via
+        // `channels.telegram.approval_timeout_secs` (default 120s).
+        let result =
+            match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
+                Ok(Ok(response)) => Some(response),
+                _ => {
+                    // Timeout or sender dropped — clean up and deny.
+                    self.pending_approvals.lock().await.remove(&approval_id);
+                    Some(ChannelApprovalResponse::Deny)
+                }
+            };
+
+        Ok(result)
     }
 }
 
@@ -5118,5 +5283,89 @@ mod tests {
         let photo_content = "[IMAGE:/tmp/photo.jpg]".to_string();
         let content = format!("{attr}{photo_content}");
         assert_eq!(content, "[Forwarded from @bob] [IMAGE:/tmp/photo.jpg]");
+    }
+
+    // ── Approval inline keyboard tests ────────────────────────
+
+    #[test]
+    fn pending_approvals_map_is_initially_empty() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let map = ch.pending_approvals.lock().await;
+            assert!(map.is_empty());
+        });
+    }
+
+    #[test]
+    fn approval_timeout_defaults_to_120_and_is_overridable() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        assert_eq!(ch.approval_timeout_secs, 120);
+        let ch = ch.with_approval_timeout_secs(30);
+        assert_eq!(ch.approval_timeout_secs, 30);
+    }
+
+    #[tokio::test]
+    async fn pending_approval_oneshot_delivers_response() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let approval_id = "test-approval-123".to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert(approval_id.clone(), tx);
+
+        // Simulate what listen() does when a callback_query arrives
+        if let Some(sender) = ch.pending_approvals.lock().await.remove(&approval_id) {
+            sender.send(ChannelApprovalResponse::Approve).unwrap();
+        }
+
+        let result = rx.await.unwrap();
+        assert_eq!(result, ChannelApprovalResponse::Approve);
+    }
+
+    #[test]
+    fn callback_data_format_parses_correctly() {
+        // Verify the callback_data format used by request_approval
+        let cb_data = "approval:abc-123:approve";
+        let rest = cb_data.strip_prefix("approval:").unwrap();
+        let (id, action) = rest.rsplit_once(':').unwrap();
+        assert_eq!(id, "abc-123");
+        assert_eq!(action, "approve");
+
+        let cb_data = "approval:abc-123:deny";
+        let rest = cb_data.strip_prefix("approval:").unwrap();
+        let (id, action) = rest.rsplit_once(':').unwrap();
+        assert_eq!(id, "abc-123");
+        assert_eq!(action, "deny");
+
+        let cb_data = "approval:abc-123:always";
+        let rest = cb_data.strip_prefix("approval:").unwrap();
+        let (id, action) = rest.rsplit_once(':').unwrap();
+        assert_eq!(id, "abc-123");
+        assert_eq!(action, "always");
+    }
+
+    #[test]
+    fn callback_data_with_uuid_parses_correctly() {
+        // UUIDs contain hyphens — rsplit_once(':') must split at the LAST colon
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let cb_data = format!("approval:{uuid}:approve");
+        let rest = cb_data.strip_prefix("approval:").unwrap();
+        let (id, action) = rest.rsplit_once(':').unwrap();
+        assert_eq!(id, uuid);
+        assert_eq!(action, "approve");
+    }
+
+    #[test]
+    fn non_approval_callback_data_is_ignored() {
+        let cb_data = "some_other_action:data";
+        assert!(cb_data.strip_prefix("approval:").is_none());
     }
 }

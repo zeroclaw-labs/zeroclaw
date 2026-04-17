@@ -29,12 +29,14 @@ impl ModelRoutingConfigTool {
             )
         })?;
 
-        let mut parsed: Config = toml::from_str(&contents).map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to parse config file {}: {error}",
-                self.config.config_path.display()
-            )
-        })?;
+        let compat: zeroclaw_config::migration::V1Compat =
+            toml::from_str(&contents).map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to parse config file {}: {error}",
+                    self.config.config_path.display()
+                )
+            })?;
+        let mut parsed = compat.into_config();
         parsed.config_path = self.config.config_path.clone();
         parsed.workspace_dir = self.config.workspace_dir.clone();
         Ok(parsed)
@@ -225,7 +227,7 @@ impl ModelRoutingConfigTool {
     }
 
     fn snapshot(cfg: &Config) -> Value {
-        let mut routes = cfg.model_routes.clone();
+        let mut routes = cfg.providers.model_routes.clone();
         routes.sort_by(|a, b| a.hint.cmp(&b.hint));
 
         let mut rules = cfg.query_classification.rules.clone();
@@ -279,9 +281,9 @@ impl ModelRoutingConfigTool {
 
         json!({
             "default": {
-                "provider": cfg.default_provider,
-                "model": cfg.default_model,
-                "temperature": cfg.default_temperature,
+                "provider": cfg.providers.fallback,
+                "model": cfg.providers.fallback_provider().and_then(|e| e.model.as_deref()),
+                "temperature": cfg.providers.fallback_provider().and_then(|e| e.temperature).unwrap_or(0.7),
             },
             "query_classification": {
                 "enabled": cfg.query_classification.enabled,
@@ -331,8 +333,12 @@ impl ModelRoutingConfigTool {
 
     fn handle_list_hints(&self) -> anyhow::Result<ToolResult> {
         let cfg = self.load_config_without_env()?;
-        let mut route_hints: Vec<String> =
-            cfg.model_routes.iter().map(|r| r.hint.clone()).collect();
+        let mut route_hints: Vec<String> = cfg
+            .providers
+            .model_routes
+            .iter()
+            .map(|r| r.hint.clone())
+            .collect();
         route_hints.sort();
         route_hints.dedup();
 
@@ -390,19 +396,35 @@ impl ModelRoutingConfigTool {
         let mut cfg = self.load_config_without_env()?;
 
         // Capture previous values for rollback on probe failure.
-        let previous_provider = cfg.default_provider.clone();
-        let previous_model = cfg.default_model.clone();
-        let previous_temperature = cfg.default_temperature;
+        let previous_provider = cfg.providers.fallback.clone();
+        let previous_fallback_provider = cfg
+            .providers
+            .fallback
+            .as_deref()
+            .and_then(|name| cfg.providers.models.get(name))
+            .cloned();
 
-        match provider_update {
-            MaybeSet::Set(provider) => cfg.default_provider = Some(provider),
-            MaybeSet::Null => cfg.default_provider = None,
-            MaybeSet::Unset => {}
-        }
+        let fallback_name = match &provider_update {
+            MaybeSet::Set(provider) => {
+                cfg.providers.fallback = Some(provider.clone());
+                provider.clone()
+            }
+            MaybeSet::Null => {
+                cfg.providers.fallback = None;
+                "default".to_string()
+            }
+            MaybeSet::Unset => cfg.providers.fallback.clone().unwrap_or_else(|| {
+                let name = "default".to_string();
+                cfg.providers.fallback = Some(name.clone());
+                name
+            }),
+        };
+
+        let entry = cfg.providers.models.entry(fallback_name).or_default();
 
         match model_update {
-            MaybeSet::Set(model) => cfg.default_model = Some(model),
-            MaybeSet::Null => cfg.default_model = None,
+            MaybeSet::Set(model) => entry.model = Some(model),
+            MaybeSet::Null => entry.model = None,
             MaybeSet::Unset => {}
         }
 
@@ -411,10 +433,10 @@ impl ModelRoutingConfigTool {
                 if !(0.0..=2.0).contains(&temperature) {
                     anyhow::bail!("'temperature' must be between 0.0 and 2.0");
                 }
-                cfg.default_temperature = temperature;
+                entry.temperature = Some(temperature);
             }
             MaybeSet::Null => {
-                cfg.default_temperature = Config::default().default_temperature;
+                entry.temperature = None;
             }
             MaybeSet::Unset => {}
         }
@@ -423,17 +445,28 @@ impl ModelRoutingConfigTool {
 
         // Probe the new model with a minimal API call to catch invalid model IDs
         // before the channel hot-reload picks up the change.
-        if let (Some(provider_name), Some(model_name)) =
-            (cfg.default_provider.clone(), cfg.default_model.clone())
+        let current_provider = cfg.providers.fallback.clone();
+        let current_model = cfg
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.model.clone());
+        if let (Some(provider_name), Some(model_name)) = (current_provider, current_model)
             && let Err(probe_err) = self.probe_model(&provider_name, &model_name).await
         {
             if zeroclaw_providers::reliable::is_non_retryable(&probe_err) {
-                let reverted_model = previous_model.as_deref().unwrap_or("(none)").to_string();
+                let reverted_model = previous_fallback_provider
+                    .as_ref()
+                    .and_then(|e| e.model.as_deref())
+                    .unwrap_or("(none)")
+                    .to_string();
 
                 // Rollback to previous config.
-                cfg.default_provider = previous_provider;
-                cfg.default_model = previous_model;
-                cfg.default_temperature = previous_temperature;
+                cfg.providers.fallback = previous_provider;
+                if let Some(prev_entry) = previous_fallback_provider
+                    && let Some(fb) = cfg.providers.fallback.as_deref()
+                {
+                    cfg.providers.models.insert(fb.to_string(), prev_entry);
+                }
                 cfg.save().await?;
 
                 return Ok(ToolResult {
@@ -469,7 +502,11 @@ impl ModelRoutingConfigTool {
     async fn probe_model(&self, provider_name: &str, model: &str) -> anyhow::Result<()> {
         // Use the runtime config's API key (which includes env-sourced keys),
         // not the on-disk config (which may have no key at all).
-        let api_key = self.config.api_key.as_deref();
+        let api_key = self
+            .config
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.api_key.as_deref());
         if api_key.is_none_or(|k| k.trim().is_empty()) {
             return Ok(());
         }
@@ -477,7 +514,10 @@ impl ModelRoutingConfigTool {
         let provider = match zeroclaw_providers::create_provider_with_url(
             provider_name,
             api_key,
-            self.config.api_url.as_deref(),
+            self.config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.base_url.as_deref()),
         ) {
             Ok(p) => p,
             Err(_) => return Ok(()),
@@ -521,6 +561,7 @@ impl ModelRoutingConfigTool {
         let mut cfg = self.load_config_without_env()?;
 
         let existing_route = cfg
+            .providers
             .model_routes
             .iter()
             .find(|route| route.hint == hint)
@@ -543,9 +584,11 @@ impl ModelRoutingConfigTool {
             MaybeSet::Unset => {}
         }
 
-        cfg.model_routes.retain(|route| route.hint != hint);
-        cfg.model_routes.push(next_route);
-        Self::normalize_and_sort_routes(&mut cfg.model_routes);
+        cfg.providers
+            .model_routes
+            .retain(|route| route.hint != hint);
+        cfg.providers.model_routes.push(next_route);
+        Self::normalize_and_sort_routes(&mut cfg.providers.model_routes);
 
         if should_touch_rule {
             if matches!(classification_enabled, Some(false)) {
@@ -632,9 +675,11 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
-        let before_routes = cfg.model_routes.len();
-        cfg.model_routes.retain(|route| route.hint != hint);
-        let routes_removed = before_routes.saturating_sub(cfg.model_routes.len());
+        let before_routes = cfg.providers.model_routes.len();
+        cfg.providers
+            .model_routes
+            .retain(|route| route.hint != hint);
+        let routes_removed = before_routes.saturating_sub(cfg.providers.model_routes.len());
 
         let mut rules_removed = 0usize;
         if remove_classification {
@@ -649,7 +694,7 @@ impl ModelRoutingConfigTool {
             anyhow::bail!("No scenario found for hint '{hint}'");
         }
 
-        Self::normalize_and_sort_routes(&mut cfg.model_routes);
+        Self::normalize_and_sort_routes(&mut cfg.providers.model_routes);
         Self::normalize_and_sort_rules(&mut cfg.query_classification.rules);
         cfg.query_classification.enabled = !cfg.query_classification.rules.is_empty();
 

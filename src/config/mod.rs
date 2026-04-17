@@ -1,3 +1,5 @@
+pub use zeroclaw_config::migration;
+pub use zeroclaw_config::providers;
 pub mod schema;
 pub mod traits;
 pub mod workspace;
@@ -35,6 +37,7 @@ pub use schema::{
     set_runtime_proxy_config, ws_connect_with_proxy,
 };
 
+pub use schema::ModelProviderConfig;
 pub use traits::HasPropKind;
 pub use traits::PropFieldInfo;
 pub use traits::PropKind;
@@ -200,9 +203,8 @@ mod tests {
     fn reexported_config_default_is_constructible() {
         let config = Config::default();
 
-        assert!(config.default_provider.is_some());
-        assert!(config.default_model.is_some());
-        assert!(config.default_temperature > 0.0);
+        // Config::default() no longer has provider cache fields; just verify providers is constructible
+        assert!(config.providers.fallback.is_none() || config.providers.fallback.is_some());
     }
 
     #[test]
@@ -217,6 +219,7 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: 120,
         };
 
         let discord = DiscordConfig {

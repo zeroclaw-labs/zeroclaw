@@ -94,7 +94,7 @@ const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 
 fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
-    channels.channels_except_webhook().iter().any(|(_, ok)| *ok)
+    channels.channels().iter().any(|(_, ok)| *ok)
 }
 
 // ── Main wizard entry point ──────────────────────────────────────
@@ -133,7 +133,7 @@ pub async fn run_wizard(force: bool, callbacks: WizardCallbacks) -> Result<Confi
     let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir).await?;
 
     print_step(3, 9, "Channels (How You Talk to ZeroClaw)");
-    let channels_config = setup_channels(None, &callbacks)?;
+    let channels = setup_channels(None, &callbacks)?;
 
     print_step(4, 9, "Tunnel (Expose to Internet)");
     let tunnel_config = setup_tunnel()?;
@@ -162,20 +162,25 @@ pub async fn run_wizard(force: bool, callbacks: WizardCallbacks) -> Result<Confi
     let config = Config {
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
-        api_key: if api_key.is_empty() {
-            None
-        } else {
-            Some(api_key)
+        schema_version: zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
+        providers: {
+            let entry = zeroclaw_config::schema::ModelProviderConfig {
+                api_key: if api_key.is_empty() {
+                    None
+                } else {
+                    Some(api_key)
+                },
+                base_url: provider_api_url,
+                model: Some(model),
+                temperature: Some(0.7),
+                timeout_secs: Some(120),
+                ..Default::default()
+            };
+            let mut p = zeroclaw_config::providers::ProvidersConfig::default();
+            p.models.insert(provider.clone(), entry);
+            p.fallback = Some(provider);
+            p
         },
-        api_url: provider_api_url,
-        api_path: None,
-        default_provider: Some(provider),
-        default_model: Some(model),
-        model_providers: std::collections::HashMap::new(),
-        default_temperature: 0.7,
-        provider_timeout_secs: 120,
-        provider_max_tokens: None,
-        extra_headers: std::collections::HashMap::new(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         trust: crate::trust::TrustConfig::default(),
@@ -192,11 +197,9 @@ pub async fn run_wizard(force: bool, callbacks: WizardCallbacks) -> Result<Confi
         pacing: zeroclaw_config::schema::PacingConfig::default(),
         skills: zeroclaw_config::schema::SkillsConfig::default(),
         pipeline: zeroclaw_config::schema::PipelineConfig::default(),
-        model_routes: Vec::new(),
-        embedding_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
         cron: zeroclaw_config::schema::CronConfig::default(),
-        channels_config,
+        channels,
         memory: memory_config, // User-selected memory backend
         storage: StorageConfig::default(),
         tunnel: tunnel_config,
@@ -267,9 +270,15 @@ pub async fn run_wizard(force: bool, callbacks: WizardCallbacks) -> Result<Confi
     print_summary(&config);
 
     // ── Offer to launch channels immediately ─────────────────────
-    let has_channels = has_launchable_channels(&config.channels_config);
+    let has_channels = has_launchable_channels(&config.channels);
 
-    if has_channels && config.api_key.is_some() {
+    if has_channels
+        && config
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.api_key.as_deref())
+            .is_some()
+    {
         let launch: bool = Confirm::new()
             .with_prompt(format!(
                 "  {} Launch channels now? (connected channels → AI → reply)",
@@ -309,7 +318,7 @@ pub async fn run_channels_repair_wizard(callbacks: WizardCallbacks) -> Result<Co
     let mut config = Box::pin(Config::load_or_init()).await?;
 
     print_step(1, 1, "Channels (How You Talk to ZeroClaw)");
-    config.channels_config = setup_channels(Some(config.channels_config.clone()), &callbacks)?;
+    config.channels = setup_channels(Some(config.channels.clone()), &callbacks)?;
     config.save().await?;
     persist_workspace_selection(&config.config_path).await?;
 
@@ -320,9 +329,15 @@ pub async fn run_channels_repair_wizard(callbacks: WizardCallbacks) -> Result<Co
         style(config.config_path.display()).green()
     );
 
-    let has_channels = has_launchable_channels(&config.channels_config);
+    let has_channels = has_launchable_channels(&config.channels);
 
-    if has_channels && config.api_key.is_some() {
+    if has_channels
+        && config
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.api_key.as_deref())
+            .is_some()
+    {
         let launch: bool = Confirm::new()
             .with_prompt(format!(
                 "  {} Launch channels now? (connected channels → AI → reply)",
@@ -385,8 +400,14 @@ async fn run_provider_update_wizard(workspace_dir: &Path, config_path: &Path) ->
     );
     print_summary(&config);
 
-    let has_channels = has_launchable_channels(&config.channels_config);
-    if has_channels && config.api_key.is_some() {
+    let has_channels = has_launchable_channels(&config.channels);
+    if has_channels
+        && config
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.api_key.as_deref())
+            .is_some()
+    {
         let launch: bool = Confirm::new()
             .with_prompt(format!(
                 "  {} Launch channels now? (connected channels → AI → reply)",
@@ -418,14 +439,15 @@ fn apply_provider_update(
     model: String,
     provider_api_url: Option<String>,
 ) {
-    config.default_provider = Some(provider);
-    config.default_model = Some(model);
-    config.api_url = provider_api_url;
-    config.api_key = if api_key.trim().is_empty() {
+    let entry = config.providers.models.entry(provider.clone()).or_default();
+    entry.model = Some(model);
+    entry.base_url = provider_api_url;
+    entry.api_key = if api_key.trim().is_empty() {
         None
     } else {
         Some(api_key)
     };
+    config.providers.fallback = Some(provider);
 }
 
 // ── Quick setup (zero prompts) ───────────────────────────────────
@@ -620,20 +642,24 @@ async fn run_quick_setup_with_home(
     let config = Config {
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
-        api_key: credential_override.map(|c| {
-            let mut s = String::with_capacity(c.len());
-            s.push_str(c);
-            s
-        }),
-        api_url: None,
-        api_path: None,
-        default_provider: Some(provider_name.clone()),
-        default_model: Some(model.clone()),
-        model_providers: std::collections::HashMap::new(),
-        default_temperature: 0.7,
-        provider_timeout_secs: 120,
-        provider_max_tokens: None,
-        extra_headers: std::collections::HashMap::new(),
+        schema_version: zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
+        providers: {
+            let entry = zeroclaw_config::schema::ModelProviderConfig {
+                api_key: credential_override.map(|c| {
+                    let mut s = String::with_capacity(c.len());
+                    s.push_str(c);
+                    s
+                }),
+                model: Some(model.clone()),
+                temperature: Some(0.7),
+                timeout_secs: Some(120),
+                ..Default::default()
+            };
+            let mut p = zeroclaw_config::providers::ProvidersConfig::default();
+            p.models.insert(provider_name.clone(), entry);
+            p.fallback = Some(provider_name.clone());
+            p
+        },
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         trust: crate::trust::TrustConfig::default(),
@@ -650,11 +676,9 @@ async fn run_quick_setup_with_home(
         pacing: zeroclaw_config::schema::PacingConfig::default(),
         skills: zeroclaw_config::schema::SkillsConfig::default(),
         pipeline: zeroclaw_config::schema::PipelineConfig::default(),
-        model_routes: Vec::new(),
-        embedding_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
         cron: zeroclaw_config::schema::CronConfig::default(),
-        channels_config: ChannelsConfig::default(),
+        channels: ChannelsConfig::default(),
         memory: memory_config,
         storage: StorageConfig::default(),
         tunnel: zeroclaw_config::schema::TunnelConfig::default(),
@@ -898,6 +922,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
         "avian" => "deepseek/deepseek-v3.2".into(),
+        "copilot" => "gpt-4o".into(),
         _ => "anthropic/claude-sonnet-4.6".into(),
     }
 }
@@ -976,6 +1001,17 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "GPT-5.2 Codex (agentic coding)".to_string(),
             ),
             ("o4-mini".to_string(), "o4-mini (fallback)".to_string()),
+        ],
+        "copilot" => vec![
+            ("gpt-4o".to_string(), "GPT-4o".to_string()),
+            ("gpt-4.1".to_string(), "GPT-4.1".to_string()),
+            ("gpt-5-mini".to_string(), "GPT-5 mini".to_string()),
+            (
+                "claude-sonnet-4.6".to_string(),
+                "Claude Sonnet 4.6".to_string(),
+            ),
+            ("gpt-5.3-codex".to_string(), "GPT-5.3 Codex".to_string()),
+            ("claude-opus-4.6".to_string(), "Claude Opus 4.6".to_string()),
         ],
         "venice" => vec![
             (
@@ -1948,7 +1984,7 @@ pub async fn run_models_refresh(
     force: bool,
 ) -> Result<()> {
     let provider_name = provider_override
-        .or(config.default_provider.as_deref())
+        .or(config.providers.fallback.as_deref())
         .unwrap_or("openrouter")
         .trim()
         .to_string();
@@ -1983,9 +2019,21 @@ pub async fn run_models_refresh(
         return Ok(());
     }
 
-    let api_key = config.api_key.clone().unwrap_or_default();
+    let api_key = config
+        .providers
+        .fallback_provider()
+        .and_then(|e| e.api_key.clone())
+        .unwrap_or_default();
 
-    match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()).await
+    match fetch_live_models_for_provider(
+        &provider_name,
+        &api_key,
+        config
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.base_url.as_deref()),
+    )
+    .await
     {
         Ok(models) if !models.is_empty() => {
             cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models).await?;
@@ -2032,7 +2080,7 @@ pub async fn run_models_refresh(
 
 pub async fn run_models_list(config: &Config, provider_override: Option<&str>) -> Result<()> {
     let provider_name = provider_override
-        .or(config.default_provider.as_deref())
+        .or(config.providers.fallback.as_deref())
         .unwrap_or("openrouter");
 
     let cached = load_any_cached_models_for_provider(&config.workspace_dir, provider_name).await?;
@@ -2055,7 +2103,12 @@ pub async fn run_models_list(config: &Config, provider_override: Option<&str>) -
     );
     println!();
     for model in &cached.models {
-        let marker = if config.default_model.as_deref() == Some(model.as_str()) {
+        let marker = if config
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.model.as_deref())
+            == Some(model.as_str())
+        {
             "* "
         } else {
             "  "
@@ -2073,7 +2126,7 @@ pub async fn run_models_set(config: &Config, model: &str) -> Result<()> {
     }
 
     let mut updated = config.clone();
-    updated.default_model = Some(model.to_string());
+    updated.ensure_fallback_provider().model = Some(model.to_string());
     updated.save().await?;
 
     println!();
@@ -2083,15 +2136,27 @@ pub async fn run_models_set(config: &Config, model: &str) -> Result<()> {
 }
 
 pub async fn run_models_status(config: &Config) -> Result<()> {
-    let provider = config.default_provider.as_deref().unwrap_or("openrouter");
-    let model = config.default_model.as_deref().unwrap_or("(not set)");
+    let provider = config.providers.fallback.as_deref().unwrap_or("openrouter");
+    let model = config
+        .providers
+        .fallback_provider()
+        .and_then(|e| e.model.as_deref())
+        .unwrap_or("(not set)");
 
     println!();
     println!("  Provider:  {}", style(provider).cyan());
     println!("  Model:     {}", style(model).cyan());
     println!(
         "  Temp:      {}",
-        style(format!("{:.1}", config.default_temperature)).cyan()
+        style(format!(
+            "{:.1}",
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.temperature)
+                .unwrap_or(0.7)
+        ))
+        .cyan()
     );
 
     match load_any_cached_models_for_provider(&config.workspace_dir, provider).await? {
@@ -2348,7 +2413,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
         "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
-        "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
+        "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere, GitHub Copilot)",
         "🏠 Local / private (Ollama, llama.cpp server, vLLM — no API key needed)",
         "🔧 Custom — bring your own OpenAI-compatible API",
     ];
@@ -2432,6 +2497,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             ("opencode", "OpenCode Zen — code-focused AI"),
             ("opencode-go", "OpenCode Go — Subsidized code-focused AI"),
             ("cohere", "Cohere — Command R+ & embeddings"),
+            ("copilot", "GitHub Copilot"),
         ],
         4 => local_provider_choices(),
         _ => vec![], // Custom — handled below
@@ -2786,6 +2852,25 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 key
             }
         }
+    } else if canonical_provider_name(provider_name) == "copilot" {
+        // GitHub Copilot uses OAuth device flow — no API key needed during setup.
+        // Check if a GITHUB_TOKEN is already available in the environment.
+        if std::env::var("GITHUB_TOKEN").is_ok() {
+            print_bullet(&format!(
+                "{} GITHUB_TOKEN environment variable detected!",
+                style("✓").green().bold()
+            ));
+            print_bullet("ZeroClaw will use it for GitHub Copilot authentication.");
+        } else {
+            print_bullet("GitHub Copilot uses OAuth device-flow authentication.");
+            print_bullet("No API key is needed — you'll be prompted to authorize on first run.");
+            print_bullet(&format!(
+                "Or set {} to use a pre-existing GitHub personal access token.",
+                style("GITHUB_TOKEN").yellow()
+            ));
+        }
+        println!();
+        String::new()
     } else {
         let key_url = if is_moonshot_alias(provider_name)
             || canonical_provider_name(provider_name) == "kimi-code"
@@ -3125,6 +3210,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => "NVIDIA_API_KEY",
         "astrai" => "ASTRAI_API_KEY",
         "avian" => "AVIAN_API_KEY",
+        "copilot" => "GITHUB_TOKEN",
         _ => "API_KEY",
     }
 }
@@ -3704,6 +3790,9 @@ fn setup_channels(
                     mention_only: existing_tg.map(|t| t.mention_only).unwrap_or(false),
                     ack_reactions: existing_tg.and_then(|t| t.ack_reactions),
                     proxy_url: existing_tg.and_then(|t| t.proxy_url.clone()),
+                    approval_timeout_secs: existing_tg
+                        .map(|t| t.approval_timeout_secs)
+                        .unwrap_or(120),
                 });
             }
             ChannelMenuChoice::Discord => {
@@ -3943,7 +4032,7 @@ fn setup_channels(
                 let sl_channel_default = config
                     .slack
                     .as_ref()
-                    .and_then(|sl| sl.channel_id.clone())
+                    .and_then(|sl| sl.channel_ids.first().cloned())
                     .unwrap_or_default();
                 let channel: String = Input::new()
                     .with_prompt(
@@ -3998,14 +4087,19 @@ fn setup_channels(
                     } else {
                         Some(app_token)
                     },
-                    channel_id: if channel.is_empty() {
-                        None
+                    channel_ids: if channel.is_empty() {
+                        existing_sl
+                            .map(|s| s.channel_ids.clone())
+                            .unwrap_or_default()
                     } else {
-                        Some(channel)
+                        let mut ids = existing_sl
+                            .map(|s| s.channel_ids.clone())
+                            .unwrap_or_default();
+                        if !ids.contains(&channel) {
+                            ids.insert(0, channel);
+                        }
+                        ids
                     },
-                    channel_ids: existing_sl
-                        .map(|s| s.channel_ids.clone())
-                        .unwrap_or_default(),
                     allowed_users,
                     interrupt_on_new_message: existing_sl
                         .map(|s| s.interrupt_on_new_message)
@@ -4176,7 +4270,7 @@ fn setup_channels(
                 let room_id: String = if let Some(ref mx) = config.matrix {
                     Input::new()
                         .with_prompt("  Room ID (e.g. !abc123:matrix.org)")
-                        .default(mx.room_id.clone())
+                        .default(mx.allowed_rooms.first().cloned().unwrap_or_default())
                         .interact_text()?
                 } else {
                     Input::new()
@@ -4221,18 +4315,23 @@ fn setup_channels(
                 };
 
                 let existing_mx = config.matrix.as_ref();
+                // Merge the prompted room_id into allowed_rooms
+                let mut allowed_rooms = existing_mx
+                    .map(|m| m.allowed_rooms.clone())
+                    .unwrap_or_default();
+                if !room_id.is_empty() && !allowed_rooms.contains(&room_id) {
+                    allowed_rooms.insert(0, room_id);
+                }
+
                 config.matrix = Some(MatrixConfig {
                     enabled: true,
                     homeserver: homeserver.trim_end_matches('/').to_string(),
                     access_token,
                     user_id: detected_user_id,
                     device_id: detected_device_id,
-                    room_id,
                     allowed_users,
                     // Preserve non-prompted fields from existing config (#4655)
-                    allowed_rooms: existing_mx
-                        .map(|m| m.allowed_rooms.clone())
-                        .unwrap_or_default(),
+                    allowed_rooms,
                     interrupt_on_new_message: existing_mx
                         .map(|m| m.interrupt_on_new_message)
                         .unwrap_or(false),
@@ -5358,6 +5457,7 @@ fn setup_channels(
                 }
 
                 config.nostr = Some(NostrConfig {
+                    enabled: true,
                     private_key: private_key.trim().to_string(),
                     relays: relays.clone(),
                     allowed_pubkeys,
@@ -5852,7 +5952,7 @@ async fn scaffold_workspace(
 
 #[allow(clippy::too_many_lines)]
 fn print_summary(config: &Config) {
-    let has_channels = has_launchable_channels(&config.channels_config);
+    let has_channels = has_launchable_channels(&config.channels);
 
     println!();
     println!(
@@ -5878,12 +5978,16 @@ fn print_summary(config: &Config) {
     println!(
         "    {} Provider:      {}",
         style("🤖").cyan(),
-        config.default_provider.as_deref().unwrap_or("openrouter")
+        config.providers.fallback.as_deref().unwrap_or("openrouter")
     );
     println!(
         "    {} Model:         {}",
         style("🧠").cyan(),
-        config.default_model.as_deref().unwrap_or("(default)")
+        config
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.model.as_deref())
+            .unwrap_or("(default)")
     );
     println!(
         "    {} Autonomy:      {:?}",
@@ -5898,7 +6002,7 @@ fn print_summary(config: &Config) {
     );
 
     // Channels summary
-    let channels = config.channels_config.channels();
+    let channels = config.channels.channels();
     let channels = channels
         .iter()
         .filter_map(|(channel, ok)| ok.then_some(channel.name()));
@@ -5913,7 +6017,12 @@ fn print_summary(config: &Config) {
     println!(
         "    {} API Key:       {}",
         style("🔑").cyan(),
-        if config.api_key.is_some() {
+        if config
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.api_key.as_deref())
+            .is_some()
+        {
             style("configured").green().to_string()
         } else {
             style("not set (set via env var or config)")
@@ -5996,8 +6105,14 @@ fn print_summary(config: &Config) {
 
     let mut step = 1u8;
 
-    let provider = config.default_provider.as_deref().unwrap_or("openrouter");
-    if config.api_key.is_none() && !provider_supports_keyless_local_usage(provider) {
+    let provider = config.providers.fallback.as_deref().unwrap_or("openrouter");
+    if config
+        .providers
+        .fallback_provider()
+        .and_then(|e| e.api_key.as_deref())
+        .is_none()
+        && !provider_supports_keyless_local_usage(provider)
+    {
         if provider == "openai-codex" {
             println!(
                 "    {} Authenticate OpenAI Codex:",
@@ -6143,13 +6258,10 @@ mod tests {
 
     #[test]
     fn apply_provider_update_preserves_non_provider_settings() {
-        let mut config = Config {
-            default_temperature: 1.23,
-            ..Config::default()
-        };
+        let mut config = Config::default();
         config.memory.backend = "markdown".to_string();
         config.skills.open_skills_enabled = true;
-        config.channels_config.cli = false;
+        config.channels.cli = false;
 
         apply_provider_update(
             &mut config,
@@ -6159,25 +6271,44 @@ mod tests {
             Some("https://openrouter.ai/api/v1".to_string()),
         );
 
-        assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
-        assert_eq!(config.default_model.as_deref(), Some("openai/gpt-5.2"));
-        assert_eq!(config.api_key.as_deref(), Some("sk-updated"));
+        // V2 canonical location.
+        assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
+        let entry = &config.providers.models["openrouter"];
+        assert_eq!(entry.api_key.as_deref(), Some("sk-updated"));
+        assert_eq!(entry.model.as_deref(), Some("openai/gpt-5.2"));
         assert_eq!(
-            config.api_url.as_deref(),
+            entry.base_url.as_deref(),
             Some("https://openrouter.ai/api/v1")
         );
-        assert_eq!(config.default_temperature, 1.23);
+
+        // Resolved through providers.
+        assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
+        assert_eq!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.api_key.as_deref()),
+            Some("sk-updated")
+        );
+
+        // Non-provider settings untouched.
         assert_eq!(config.memory.backend, "markdown");
         assert!(config.skills.open_skills_enabled);
-        assert!(!config.channels_config.cli);
+        assert!(!config.channels.cli);
     }
 
     #[test]
     fn apply_provider_update_clears_api_key_when_empty() {
-        let mut config = Config {
-            api_key: Some("sk-old".to_string()),
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        // Set up an existing provider entry.
+        config.providers.fallback = Some("anthropic".into());
+        config.providers.models.insert(
+            "anthropic".into(),
+            zeroclaw_config::schema::ModelProviderConfig {
+                api_key: Some("sk-old".into()),
+                ..Default::default()
+            },
+        );
 
         apply_provider_update(
             &mut config,
@@ -6187,13 +6318,28 @@ mod tests {
             None,
         );
 
-        assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
-        assert_eq!(
-            config.default_model.as_deref(),
-            Some("claude-sonnet-4-5-20250929")
+        // V2 canonical location.
+        assert_eq!(config.providers.fallback.as_deref(), Some("anthropic"));
+        let entry = &config.providers.models["anthropic"];
+        assert_eq!(entry.model.as_deref(), Some("claude-sonnet-4-5-20250929"));
+        assert!(entry.api_key.is_none());
+        assert!(entry.base_url.is_none());
+
+        // Resolved through providers.
+        assert!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.api_key.as_deref())
+                .is_none()
         );
-        assert!(config.api_key.is_none());
-        assert!(config.api_url.is_none());
+        assert!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.base_url.as_deref())
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -6214,13 +6360,31 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
-        assert_eq!(config.default_model.as_deref(), Some("custom-model-946"));
-        assert_eq!(config.api_key.as_deref(), Some("sk-issue946"));
+        // V2 canonical locations.
+        assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
+        assert_eq!(
+            config.providers.models["openrouter"].model.as_deref(),
+            Some("custom-model-946")
+        );
+        assert_eq!(
+            config.providers.models["openrouter"].api_key.as_deref(),
+            Some("sk-issue946")
+        );
 
+        // Resolved through providers.
+        assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
+        assert_eq!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.model.as_deref()),
+            Some("custom-model-946")
+        );
+
+        // Serialized TOML uses V2 layout.
         let config_raw = tokio::fs::read_to_string(config.config_path).await.unwrap();
-        assert!(config_raw.contains("default_provider = \"openrouter\""));
-        assert!(config_raw.contains("default_model = \"custom-model-946\""));
+        assert!(config_raw.contains("[providers.models.openrouter]"));
+        assert!(config_raw.contains("model = \"custom-model-946\""));
     }
 
     #[tokio::test]
@@ -6242,8 +6406,14 @@ mod tests {
         .unwrap();
 
         let expected = default_model_for_provider("anthropic");
-        assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
-        assert_eq!(config.default_model.as_deref(), Some(expected.as_str()));
+        assert_eq!(config.providers.fallback.as_deref(), Some("anthropic"));
+        assert_eq!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.model.as_deref()),
+            Some(expected.as_str())
+        );
     }
 
     #[tokio::test]
@@ -6304,13 +6474,25 @@ mod tests {
         .await
         .expect("quick setup should overwrite existing config with --force");
 
-        assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
-        assert_eq!(config.default_model.as_deref(), Some("custom-model-fresh"));
-        assert_eq!(config.api_key.as_deref(), Some("sk-force"));
+        assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
+        assert_eq!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.model.as_deref()),
+            Some("custom-model-fresh")
+        );
+        assert_eq!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.api_key.as_deref()),
+            Some("sk-force")
+        );
 
         let config_raw = tokio::fs::read_to_string(config.config_path).await.unwrap();
-        assert!(config_raw.contains("default_provider = \"openrouter\""));
-        assert!(config_raw.contains("default_model = \"custom-model-fresh\""));
+        assert!(config_raw.contains("fallback = \"openrouter\""));
+        assert!(config_raw.contains("model = \"custom-model-fresh\""));
     }
 
     #[tokio::test]
@@ -6920,6 +7102,8 @@ mod tests {
         );
         assert_eq!(default_model_for_provider("openai"), "gpt-5.2");
         assert_eq!(default_model_for_provider("openai-codex"), "gpt-5-codex");
+        assert_eq!(default_model_for_provider("copilot"), "gpt-4o");
+        assert_eq!(default_model_for_provider("github-copilot"), "gpt-4o");
         assert_eq!(
             default_model_for_provider("anthropic"),
             "claude-sonnet-4-5-20250929"
@@ -6988,6 +7172,8 @@ mod tests {
         assert_eq!(canonical_provider_name("aws-bedrock"), "bedrock");
         assert_eq!(canonical_provider_name("build.nvidia.com"), "nvidia");
         assert_eq!(canonical_provider_name("llama.cpp"), "llamacpp");
+        assert_eq!(canonical_provider_name("github-copilot"), "copilot");
+        assert_eq!(canonical_provider_name("copilot"), "copilot");
     }
 
     #[test]
@@ -7024,6 +7210,21 @@ mod tests {
 
         assert!(ids.contains(&"gpt-5-codex".to_string()));
         assert!(ids.contains(&"gpt-5.2-codex".to_string()));
+    }
+
+    #[test]
+    fn curated_models_for_copilot_include_expected_models() {
+        let ids: Vec<String> = curated_models_for_provider("copilot")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"gpt-4o".to_string()));
+        assert!(ids.contains(&"gpt-4.1".to_string()));
+        assert!(ids.contains(&"gpt-5-mini".to_string()));
+        assert!(ids.contains(&"claude-sonnet-4.6".to_string()));
+        assert!(ids.contains(&"gpt-5.3-codex".to_string()));
+        assert!(ids.contains(&"claude-opus-4.6".to_string()));
     }
 
     #[test]
@@ -7479,11 +7680,11 @@ mod tests {
             .await
             .unwrap();
 
-        let config = Config {
+        let mut config = Config {
             workspace_dir: tmp.path().to_path_buf(),
-            default_provider: Some("openai".to_string()),
-            ..Config::default()
+            ..Default::default()
         };
+        config.providers.fallback = Some("openai".to_string());
 
         run_models_refresh(&config, None, false).await.unwrap();
     }
@@ -7492,12 +7693,12 @@ mod tests {
     async fn run_models_refresh_rejects_unsupported_provider() {
         let tmp = TempDir::new().unwrap();
 
-        let config = Config {
+        let mut config = Config {
             workspace_dir: tmp.path().to_path_buf(),
-            // Use a non-provider channel key to keep this test deterministic and offline.
-            default_provider: Some("imessage".to_string()),
-            ..Config::default()
+            ..Default::default()
         };
+        // Use a non-provider channel key to keep this test deterministic and offline.
+        config.providers.fallback = Some("imessage".to_string());
 
         let err = run_models_refresh(&config, None, true).await.unwrap_err();
         assert!(
@@ -7514,6 +7715,8 @@ mod tests {
         assert_eq!(provider_env_var("anthropic"), "ANTHROPIC_API_KEY");
         assert_eq!(provider_env_var("openai-codex"), "OPENAI_API_KEY");
         assert_eq!(provider_env_var("openai"), "OPENAI_API_KEY");
+        assert_eq!(provider_env_var("copilot"), "GITHUB_TOKEN");
+        assert_eq!(provider_env_var("github-copilot"), "GITHUB_TOKEN"); // alias
         assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
         assert_eq!(provider_env_var("llamacpp"), "LLAMACPP_API_KEY");
         assert_eq!(provider_env_var("llama.cpp"), "LLAMACPP_API_KEY");
@@ -7708,6 +7911,23 @@ mod tests {
     }
 
     #[test]
+    fn webhook_only_config_is_launchable() {
+        let channels = ChannelsConfig {
+            webhook: Some(zeroclaw_config::schema::WebhookConfig {
+                enabled: true,
+                port: 8080,
+                listen_path: None,
+                send_url: None,
+                send_method: None,
+                auth_header: None,
+                secret: None,
+            }),
+            ..Default::default()
+        };
+        assert!(has_launchable_channels(&channels));
+    }
+
+    #[test]
     fn channels_repair_preserves_unmodified_channels() {
         use zeroclaw_config::schema::{DiscordConfig, MatrixConfig, StreamMode};
 
@@ -7732,9 +7952,8 @@ mod tests {
                 access_token: "old-token".into(),
                 user_id: None,
                 device_id: None,
-                room_id: "!r:m".into(),
                 allowed_users: vec![],
-                allowed_rooms: vec![],
+                allowed_rooms: vec!["!r:m".into()],
                 interrupt_on_new_message: false,
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: 1500,
@@ -7743,7 +7962,7 @@ mod tests {
                 mention_only: false,
                 password: None,
             }),
-            ..ChannelsConfig::default()
+            ..Default::default()
         };
 
         // Simulate the wizard starting from existing config and only updating Matrix
@@ -7769,9 +7988,8 @@ mod tests {
                 access_token: "tok".into(),
                 user_id: None,
                 device_id: Some("ZEROCLAW".into()),
-                room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
-                allowed_rooms: vec!["!keep:m.org".into()],
+                allowed_rooms: vec!["!r:m".into(), "!keep:m.org".into()],
                 interrupt_on_new_message: true,
                 stream_mode: StreamMode::Partial,
                 draft_update_interval_ms: 2000,
@@ -7780,7 +7998,7 @@ mod tests {
                 mention_only: false,
                 password: None,
             }),
-            ..ChannelsConfig::default()
+            ..Default::default()
         };
 
         // Simulate re-configure: wizard preserves non-prompted fields
@@ -7799,7 +8017,10 @@ mod tests {
             .unwrap_or(1500);
         let preserved_multi_ms = existing_mx.map(|m| m.multi_message_delay_ms).unwrap_or(800);
 
-        assert_eq!(preserved_rooms, vec!["!keep:m.org".to_string()]);
+        assert_eq!(
+            preserved_rooms,
+            vec!["!r:m".to_string(), "!keep:m.org".to_string()]
+        );
         assert!(preserved_interrupt);
         assert!(matches!(preserved_stream, StreamMode::Partial));
         assert_eq!(preserved_draft_ms, 2000);
