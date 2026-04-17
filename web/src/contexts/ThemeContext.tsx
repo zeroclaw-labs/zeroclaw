@@ -256,9 +256,10 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   const setTheme = useCallback((t: ThemeMode) => {
     // Auto-select a color theme matching the new scheme so explicit mode choices apply correctly.
     const currentCt = colorThemeMap[colorTheme];
-    const targetScheme = t === 'oled' ? 'dark' : t;
+    const targetScheme = t === 'oled' ? 'dark' : t === 'system' ? null : t;
     const newColorTheme: ColorThemeId =
-      (currentCt && currentCt.scheme === targetScheme) ? colorTheme : (
+      // System mode should preserve the user's current palette and defer scheme resolution to OS preference.
+      targetScheme === null || (currentCt && currentCt.scheme === targetScheme) ? colorTheme : (
         t === 'oled' ? 'oled-black' :
         t === 'light' ? DEFAULT_LIGHT_THEME :
         DEFAULT_DARK_THEME
