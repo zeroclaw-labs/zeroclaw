@@ -4,7 +4,7 @@ use crate::cron::{
     sync_declarative_jobs, update_job,
 };
 use crate::security::SecurityPolicy;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use std::process::Stdio;
@@ -495,12 +495,22 @@ pub async fn deliver_announcement(
         )
         .await
     } else {
+        // Returning `Ok(())` here would make `cron_run` report `status: "ok"`
+        // for a job that never delivered — the caller has no way to
+        // distinguish "executed + delivered" from "executed + silently
+        // dropped". The existing `best_effort` flag on `CronDelivery` is the
+        // operator-facing knob for "delivery failure is non-fatal", so we
+        // return a real error and let that flag decide how to route it.
         tracing::warn!(
             channel = %channel,
             target = %target,
             "Cron delivery skipped: no delivery handler registered"
         );
-        Ok(())
+        Err(anyhow!(
+            "cron delivery handler not registered for channel '{channel}' \
+             (register_delivery_fn was not called; set delivery.best_effort=true \
+             on the job if this configuration is intentional)"
+        ))
     }
 }
 
@@ -1244,7 +1254,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_if_configured_announce_stub_returns_ok() {
+    async fn deliver_if_configured_announce_returns_err_when_no_handler() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let mut job = test_job("echo ok");
@@ -1255,10 +1265,36 @@ mod tests {
             best_effort: true,
         };
 
-        // deliver_announcement is a stub that logs a warning and returns Ok.
-        // Once delivery is wired through the orchestrator callback, these
-        // tests should be updated to verify actual delivery behaviour.
-        assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
+        // `best_effort` controls whether cron_run surfaces this as a failed
+        // run — but `deliver_announcement` itself must return an error when
+        // no delivery handler is registered so callers can distinguish
+        // "executed + delivered" from "executed + silently dropped".
+        let err = deliver_if_configured(&config, &job, "x")
+            .await
+            .expect_err("expected Err when DELIVERY_FN is not registered");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("delivery handler not registered"),
+            "error message should explain the missing handler: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_announcement_errors_with_unregistered_handler() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let err = deliver_announcement(&config, "telegram", "chat-id", "payload")
+            .await
+            .expect_err("expected Err when DELIVERY_FN is not registered");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("delivery handler not registered"),
+            "error must clearly state the missing handler: {msg}"
+        );
+        assert!(
+            msg.contains("telegram"),
+            "error must reference the requested channel: {msg}"
+        );
     }
 
     #[test]
