@@ -299,7 +299,10 @@ impl OpenAiCompatibleProvider {
     /// Collect all `system` role messages, concatenate their content,
     /// and prepend to the first `user` message. Drop all system messages.
     /// Used for providers (e.g. MiniMax) that reject `role: system`.
-    fn flatten_system_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    fn flatten_system_messages(messages: &[ChatMessage], merge: bool) -> Vec<ChatMessage> {
+        if !merge {
+            return messages.to_vec();
+        }
         let system_content: String = messages
             .iter()
             .filter(|m| m.role == "system")
@@ -1132,7 +1135,7 @@ fn sse_bytes_to_chunks(
 }
 
 /// Convert SSE byte stream to structured streaming events.
-fn sse_bytes_to_events(
+pub(crate) fn sse_bytes_to_events(
     response: reqwest::Response,
     count_tokens: bool,
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
@@ -1570,6 +1573,49 @@ impl OpenAiCompatibleProvider {
             .collect()
     }
 
+    /// Strip native tool-calling constructs from messages for providers that
+    /// do not support native tool calling (e.g. MiniMax).
+    ///
+    /// Conversation history may contain tool-role messages and assistant
+    /// messages with `tool_calls` JSON from previous sessions or from
+    /// provider switches.  Sending these to a non-native-tool provider
+    /// causes hard API errors like MiniMax's
+    /// "tool result's tool id not found" (#5743).
+    ///
+    /// - **tool-role messages** are dropped entirely.
+    /// - **assistant messages with `tool_calls`** are converted to plain
+    ///   text by extracting only the `content` field (or dropped when the
+    ///   content is empty).
+    fn strip_native_tool_messages(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        if self.native_tool_calling {
+            return messages.to_vec();
+        }
+        messages
+            .iter()
+            .filter_map(|msg| {
+                if msg.role == "tool" {
+                    return None;
+                }
+                if msg.role == "assistant"
+                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content)
+                    && value.get("tool_calls").is_some()
+                {
+                    let text = value
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    return if text.is_empty() {
+                        None
+                    } else {
+                        Some(ChatMessage::assistant(&text))
+                    };
+                }
+                Some(msg.clone())
+            })
+            .collect()
+    }
+
     fn with_prompt_guided_tool_instructions(
         messages: &[ChatMessage],
         tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
@@ -1721,11 +1767,7 @@ impl Provider for OpenAiCompatibleProvider {
             fallback_messages.push(ChatMessage::system(system_prompt));
         }
         fallback_messages.push(ChatMessage::user(message));
-        let fallback_messages = if merge {
-            Self::flatten_system_messages(&fallback_messages)
-        } else {
-            fallback_messages
-        };
+        let fallback_messages = Self::flatten_system_messages(&fallback_messages, merge);
 
         let response = match self
             .apply_auth_header(self.http_client().post(&url).json(&request), credential)
@@ -1803,11 +1845,9 @@ impl Provider for OpenAiCompatibleProvider {
         let credential = self.credential.as_deref();
 
         let merge = self.effective_merge_system(model);
-        let effective_messages = if merge {
-            Self::flatten_system_messages(messages)
-        } else {
-            messages.to_vec()
-        };
+        let effective_messages = Self::flatten_system_messages(messages, merge);
+        // Strip native tool constructs for non-native-tool providers (#5743).
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
         let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
@@ -1905,11 +1945,8 @@ impl Provider for OpenAiCompatibleProvider {
         let credential = self.credential.as_deref();
 
         let merge = self.effective_merge_system(model);
-        let effective_messages = if merge {
-            Self::flatten_system_messages(messages)
-        } else {
-            messages.to_vec()
-        };
+        let effective_messages = Self::flatten_system_messages(messages, merge);
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
         let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
@@ -2014,11 +2051,8 @@ impl Provider for OpenAiCompatibleProvider {
 
         let merge = self.effective_merge_system(model);
         let tools = Self::convert_tool_specs(request.tools);
-        let effective_messages = if merge {
-            Self::flatten_system_messages(request.messages)
-        } else {
-            request.messages.to_vec()
-        };
+        let effective_messages = Self::flatten_system_messages(request.messages, merge);
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages_for_native(&effective_messages, !merge),
@@ -2151,11 +2185,8 @@ impl Provider for OpenAiCompatibleProvider {
 
         let merge = self.effective_merge_system(model);
         let has_tools = request.tools.is_some_and(|tools| !tools.is_empty());
-        let effective_messages = if merge {
-            Self::flatten_system_messages(request.messages)
-        } else {
-            request.messages.to_vec()
-        };
+        let effective_messages = Self::flatten_system_messages(request.messages, merge);
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
 
         let tools = Self::convert_tool_specs(request.tools);
         let payload = if has_tools {
@@ -2357,11 +2388,8 @@ impl Provider for OpenAiCompatibleProvider {
         let credential = self.credential.clone();
 
         let merge = self.effective_merge_system(model);
-        let effective_messages = if merge {
-            Self::flatten_system_messages(messages)
-        } else {
-            messages.to_vec()
-        };
+        let effective_messages = Self::flatten_system_messages(messages, merge);
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
         let api_messages: Vec<Message> = effective_messages
             .iter()
             .map(|m| Message {
@@ -3093,7 +3121,7 @@ mod tests {
             ChatMessage::assistant("post-user"),
         ];
 
-        let output = OpenAiCompatibleProvider::flatten_system_messages(&input);
+        let output = OpenAiCompatibleProvider::flatten_system_messages(&input, false);
         assert_eq!(output.len(), 3);
         assert_eq!(output[0].role, "assistant");
         assert_eq!(output[0].content, "ack");
@@ -3111,7 +3139,7 @@ mod tests {
             ChatMessage::assistant("ack"),
         ];
 
-        let output = OpenAiCompatibleProvider::flatten_system_messages(&input);
+        let output = OpenAiCompatibleProvider::flatten_system_messages(&input, false);
         assert_eq!(output.len(), 2);
         assert_eq!(output[0].role, "user");
         assert_eq!(output[0].content, "core policy");
@@ -3238,6 +3266,128 @@ mod tests {
             "MiniMax should use prompt-guided tool calling, not native"
         );
         assert!(!caps.vision);
+    }
+
+    /// Regression test for #5743: native tool messages must be stripped for
+    /// providers that don't support native tool calling (e.g. MiniMax).
+    #[test]
+    fn strip_native_tool_messages_removes_tool_and_tool_calls() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("search for cats"),
+            ChatMessage::assistant(
+                r#"{"content":"I'll search","tool_calls":[{"id":"chatcmpl-tool-abc","name":"web_search","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(
+                r#"{"tool_call_id":"chatcmpl-tool-abc","content":"Found 10 results"}"#,
+            ),
+            ChatMessage::assistant("Here are the results about cats"),
+            ChatMessage::user("thanks"),
+        ];
+        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "MiniMax",
+            "https://api.minimax.chat/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let stripped = p.strip_native_tool_messages(&messages);
+        assert_eq!(stripped.len(), 5);
+        assert_eq!(stripped[0].role, "system");
+        assert_eq!(stripped[1].role, "user");
+        assert_eq!(stripped[1].content, "search for cats");
+        // Assistant with tool_calls → plain text with only content
+        assert_eq!(stripped[2].role, "assistant");
+        assert_eq!(stripped[2].content, "I'll search");
+        assert!(
+            !stripped[2].content.contains("tool_calls"),
+            "tool_calls structure must be stripped"
+        );
+        // tool message → dropped
+        assert_eq!(stripped[3].role, "assistant");
+        assert_eq!(stripped[3].content, "Here are the results about cats");
+        assert_eq!(stripped[4].role, "user");
+    }
+
+    #[test]
+    fn strip_native_tool_messages_drops_empty_assistant_tool_calls() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("do it"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"tc1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"tc1","content":"ok"}"#),
+            ChatMessage::assistant("Done"),
+        ];
+        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "MiniMax",
+            "https://api.minimax.chat/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let stripped = p.strip_native_tool_messages(&messages);
+        // assistant with empty content + tool_calls → dropped; tool → dropped
+        assert_eq!(stripped.len(), 3);
+        assert_eq!(stripped[0].role, "system");
+        assert_eq!(stripped[1].role, "user");
+        assert_eq!(stripped[2].role, "assistant");
+        assert_eq!(stripped[2].content, "Done");
+    }
+
+    #[test]
+    fn strip_native_tool_messages_preserves_regular_messages() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi there"),
+            ChatMessage::user("bye"),
+        ];
+        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+            "MiniMax",
+            "https://api.minimax.chat/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let stripped = p.strip_native_tool_messages(&messages);
+        assert_eq!(stripped.len(), 4);
+        for (orig, result) in messages.iter().zip(stripped.iter()) {
+            assert_eq!(orig.role, result.role);
+            assert_eq!(orig.content, result.content);
+        }
+    }
+
+    /// Confirm that `strip_native_tool_messages` is a no-op when the provider
+    /// has `native_tool_calling = true` — tool-role and assistant-with-tool-calls
+    /// messages must pass through unchanged.
+    #[test]
+    fn strip_native_tool_messages_passthrough_when_native_tool_calling_enabled() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("search for cats"),
+            ChatMessage::assistant(
+                r#"{"content":"I'll search","tool_calls":[{"id":"chatcmpl-tool-abc","name":"web_search","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(
+                r#"{"tool_call_id":"chatcmpl-tool-abc","content":"Found 10 results"}"#,
+            ),
+            ChatMessage::assistant("Here are the results about cats"),
+        ];
+        let p = OpenAiCompatibleProvider::new(
+            "NativeToolProvider",
+            "https://api.example.com/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        assert!(
+            <OpenAiCompatibleProvider as Provider>::capabilities(&p).native_tool_calling,
+            "provider must have native_tool_calling enabled for this test"
+        );
+        let result = p.strip_native_tool_messages(&messages);
+        assert_eq!(result.len(), messages.len());
+        for (orig, out) in messages.iter().zip(result.iter()) {
+            assert_eq!(orig.role, out.role);
+            assert_eq!(orig.content, out.content);
+        }
     }
 
     #[test]
@@ -3575,7 +3725,7 @@ mod tests {
             ChatMessage::tool(r#"{"ok":true}"#),
         ];
 
-        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages);
+        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages, false);
         assert_eq!(flattened.len(), 3);
         assert_eq!(flattened[0].role, "assistant");
         assert_eq!(
@@ -3594,7 +3744,7 @@ mod tests {
             ChatMessage::system("Synthetic system"),
         ];
 
-        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages);
+        let flattened = OpenAiCompatibleProvider::flatten_system_messages(&messages, false);
         assert_eq!(flattened.len(), 2);
         assert_eq!(flattened[0].role, "user");
         assert_eq!(flattened[0].content, "Synthetic system");
