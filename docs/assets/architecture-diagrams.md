@@ -829,4 +829,4 @@ mindmap
 
 ---
 
-*Generated for ZeroClaw v0.1.0 - Architecture Documentation*
+Generated for ZeroClaw v0.6.9 - Architecture Documentation
