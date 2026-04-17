@@ -67,4 +67,8 @@ playground/
 rust_out
 
 # Auto-generated Tauri schemas
-apps/tauri/gen/schemas/
+apps/tauri/gen/schemas/linux-schema.json
+
+# IDE / AI-agent per-machine state
+.cursor/
+.claude/
