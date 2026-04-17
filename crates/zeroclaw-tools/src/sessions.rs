@@ -354,34 +354,23 @@ impl Tool for SessionResetTool {
             return Ok(result);
         }
 
-        // TOCTOU: a message appended between load() and the last remove_last()
-        // will also be removed. Acceptable until clear_messages lands (#5701).
-        let messages = self.backend.load(session_id);
-        if messages.is_empty() {
-            return Ok(ToolResult {
+        match self.backend.clear_messages(session_id) {
+            Ok(0) => Ok(ToolResult {
                 success: true,
                 output: format!("Session '{session_id}' is already empty."),
                 error: None,
-            });
+            }),
+            Ok(count) => Ok(ToolResult {
+                success: true,
+                output: format!("Session '{session_id}' reset ({count} messages cleared)."),
+                error: None,
+            }),
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Failed to reset session: {e}")),
+            }),
         }
-
-        // Remove messages one by one via remove_last until empty
-        let msg_count = messages.len();
-        for _ in 0..msg_count {
-            if let Err(e) = self.backend.remove_last(session_id) {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to reset session: {e}")),
-                });
-            }
-        }
-
-        Ok(ToolResult {
-            success: true,
-            output: format!("Session '{session_id}' reset ({msg_count} messages cleared)."),
-            error: None,
-        })
     }
 }
 

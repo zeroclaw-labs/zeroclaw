@@ -361,6 +361,38 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(count)
     }
 
+    fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+        let conn = self.conn.lock();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if count == 0 {
+            return Ok(0);
+        }
+
+        conn.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+
+        // Keep metadata row alive but reset message count
+        conn.execute(
+            "UPDATE session_metadata SET message_count = 0, last_activity = ?1 WHERE session_key = ?2",
+            params![Utc::now().to_rfc3339(), session_key],
+        )
+        .map_err(std::io::Error::other)?;
+
+        #[allow(clippy::cast_sign_loss)]
+        Ok(count as usize)
+    }
+
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let conn = self.conn.lock();
 
@@ -763,6 +795,62 @@ mod tests {
         let sessions = backend.list_sessions();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0], "new_session");
+    }
+
+    #[test]
+    fn clear_messages_removes_rows_keeps_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.append("s1", &ChatMessage::assistant("hi")).unwrap();
+        backend.set_session_name("s1", "My Session").unwrap();
+
+        let cleared = backend.clear_messages("s1").unwrap();
+        assert_eq!(cleared, 2);
+        assert!(backend.load("s1").is_empty());
+        // Session still exists in metadata with name preserved
+        let meta = backend.list_sessions_with_metadata();
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].message_count, 0);
+        assert_eq!(meta[0].name.as_deref(), Some("My Session"));
+    }
+
+    #[test]
+    fn clear_messages_empty_returns_zero() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(backend.clear_messages("nonexistent").unwrap(), 0);
+    }
+
+    #[test]
+    fn clear_messages_does_not_affect_other_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.append("s2", &ChatMessage::user("world")).unwrap();
+
+        backend.clear_messages("s1").unwrap();
+        assert!(backend.load("s1").is_empty());
+        assert_eq!(backend.load("s2").len(), 1);
+    }
+
+    #[test]
+    fn clear_messages_then_append_works() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("old")).unwrap();
+        backend.clear_messages("s1").unwrap();
+        backend.append("s1", &ChatMessage::user("new")).unwrap();
+
+        let messages = backend.load("s1");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "new");
+        // Metadata count should reflect the new message
+        let meta = backend.list_sessions_with_metadata();
+        assert_eq!(meta[0].message_count, 1);
     }
 
     #[test]

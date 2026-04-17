@@ -110,6 +110,16 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Clear all messages from a session by truncating its JSONL file.
+    /// The file is preserved (empty) so the session key remains in `list_sessions`.
+    pub fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+        let count = self.load(session_key).len();
+        if count > 0 {
+            self.rewrite(session_key, &[])?;
+        }
+        Ok(count)
+    }
+
     /// Delete a session's JSONL file. Returns `true` if the file existed.
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let path = self.session_path(session_key);
@@ -163,6 +173,10 @@ impl SessionBackend for SessionStore {
 
     fn compact(&self, session_key: &str) -> std::io::Result<()> {
         self.compact(session_key)
+    }
+
+    fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+        self.clear_messages(session_key)
     }
 
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
@@ -328,6 +342,59 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "hello");
         assert_eq!(messages[1].content, "world");
+    }
+
+    #[test]
+    fn clear_messages_truncates_file() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "clear_test";
+
+        store.append(key, &ChatMessage::user("hello")).unwrap();
+        store.append(key, &ChatMessage::assistant("world")).unwrap();
+
+        let cleared = store.clear_messages(key).unwrap();
+        assert_eq!(cleared, 2);
+        assert!(store.load(key).is_empty());
+        // File still exists — session key remains in list_sessions
+        assert!(store.session_path(key).exists());
+    }
+
+    #[test]
+    fn clear_messages_empty_returns_zero() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        assert_eq!(store.clear_messages("nonexistent").unwrap(), 0);
+    }
+
+    #[test]
+    fn clear_messages_does_not_affect_other_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+
+        store
+            .append("alice", &ChatMessage::user("alice msg"))
+            .unwrap();
+        store.append("bob", &ChatMessage::user("bob msg")).unwrap();
+
+        store.clear_messages("alice").unwrap();
+        assert!(store.load("alice").is_empty());
+        assert_eq!(store.load("bob").len(), 1);
+    }
+
+    #[test]
+    fn clear_messages_then_append_works() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "reuse_test";
+
+        store.append(key, &ChatMessage::user("old")).unwrap();
+        store.clear_messages(key).unwrap();
+        store.append(key, &ChatMessage::user("new")).unwrap();
+
+        let messages = store.load(key);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "new");
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! Trait abstraction for session persistence backends.
 //!
 //! Backends store per-sender conversation histories. The trait is intentionally
-//! minimal — load, append, remove_last, list — so that JSONL and SQLite (and
-//! future backends) share a common interface.
+//! minimal — load, append, remove_last, clear_messages, list — so that JSONL
+//! and SQLite (and future backends) share a common interface.
 
 use chrono::{DateTime, Utc};
 use zeroclaw_api::provider::ChatMessage;
@@ -92,6 +92,17 @@ pub trait SessionBackend: Send + Sync {
     /// Search sessions by keyword. Default returns empty (backends with FTS override).
     fn search(&self, _query: &SessionQuery) -> Vec<SessionMetadata> {
         Vec::new()
+    }
+
+    /// Clear all messages from a session, keeping the session itself alive.
+    /// Returns the number of messages removed. Backends should override for
+    /// O(1) bulk clearing; the default falls back to iterative `remove_last`.
+    fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+        let count = self.load(session_key).len();
+        for _ in 0..count {
+            self.remove_last(session_key)?;
+        }
+        Ok(count)
     }
 
     /// Delete all messages for a session. Returns `true` if the session existed.
