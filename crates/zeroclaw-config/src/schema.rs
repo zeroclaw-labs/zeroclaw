@@ -3916,8 +3916,17 @@ pub struct CodexCliConfig {
     /// Extra env vars passed to the codex subprocess (e.g. OPENAI_API_KEY)
     #[serde(default)]
     pub env_passthrough: Vec<String>,
-    /// Extra CLI arguments appended to `codex exec`
-    /// (e.g. `["--sandbox=danger-full-access", "--skip-git-repo-check"]`)
+    /// Extra CLI arguments appended to `codex exec` before the prompt.
+    ///
+    /// Values come from operator-controlled config (same trust level as
+    /// `env_passthrough`) and are not validated — the operator is responsible
+    /// for understanding the implications of flags passed here.
+    ///
+    /// **Warning:** `--sandbox=danger-full-access` disables Codex's bubblewrap
+    /// isolation; only use in environments where the container itself provides
+    /// isolation (e.g. Kubernetes pods with restricted PSS).
+    ///
+    /// Example: `["--sandbox=danger-full-access", "--skip-git-repo-check"]`
     #[serde(default)]
     pub extra_args: Vec<String>,
 }
