@@ -62,7 +62,7 @@ fn protected_indices(messages: &[ChatMessage], keep_recent: usize) -> Vec<bool> 
 /// The Anthropic API (and others) reject these with a 400 error.
 ///
 /// Returns the number of messages removed.
-pub(crate) fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
+pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
     // Pass 1: Remove assistant(tool_calls) + their tool_results when the
     // assistant is preceded by another assistant. Normalization would merge
     // them, destroying structured tool_use blocks and orphaning the results.
@@ -753,5 +753,29 @@ mod tests {
             messages.iter().any(|m| m.content.contains("toolu_recent")),
             "Protected tool message was dropped by Phase 2 budget enforcement"
         );
+    }
+
+    /// Regression test for issue #5743: MiniMax rejects orphaned tool-role
+    /// messages whose assistant (with `tool_calls`) was trimmed by the
+    /// channel orchestrator's proactive history trimming.
+    #[test]
+    fn orphan_tool_from_trimmed_channel_history() {
+        // Simulates the scenario: channel history was trimmed and the
+        // assistant message containing tool_calls was dropped, leaving
+        // orphaned tool results with MiniMax-style IDs.
+        let tool_result =
+            r#"{"content":"search results","tool_call_id":"chatcmpl-tool-92a12a15c14f3b36"}"#;
+        let mut messages = vec![
+            msg("system", "You are a helpful assistant"),
+            msg("tool", tool_result),
+            msg("assistant", "Here are the search results"),
+            msg("user", "Thanks, now summarize them"),
+        ];
+        let removed = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(removed, 1, "orphaned tool message should be removed");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[2].role, "user");
     }
 }
