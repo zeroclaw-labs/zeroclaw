@@ -1896,6 +1896,12 @@ fn ollama_endpoint_is_local(endpoint_url: &str) -> bool {
 
     // Kubernetes/internal service names (HTTP only):
     // e.g., "ollama", "ollama.default.svc", "ollama.default.svc.cluster.local"
+    //
+    // Any dotless hostname over HTTP is treated as a local K8s/internal
+    // service name. This classification only affects model-list filtering
+    // (the `:cloud` suffix visibility) and is not used as a security
+    // boundary. HTTPS with bare hostnames is deliberately excluded above
+    // to preserve remote-Ollama semantics.
     if !host_clean.contains('.') {
         return true; // Simple service name like "ollama"
     }
