@@ -145,8 +145,17 @@ echo
 # ── Step 2: ACR login ─────────────────────────────────────────────
 if [[ $SKIP_PUSH -eq 0 ]]; then
   echo "▶ [2/5] ACR login"
-  if docker system info 2>/dev/null | grep -q "Server Address:.*${ACR_REGISTRY}"; then
+  # Detection order:
+  #   1. `~/.docker/config.json` has an `auths` entry for the registry.
+  #      This is where Docker Desktop (credsStore=desktop / osxkeychain)
+  #      lists registries whose creds live in the keychain — `docker
+  #      system info` does NOT surface them.
+  #   2. ALICLOUD_ACCESS_KEY / ALICLOUD_SECRET_KEY env vars (CI path).
+  DOCKER_CFG="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
+  if [[ -f "$DOCKER_CFG" ]] && grep -q "\"${ACR_REGISTRY}\"" "$DOCKER_CFG"; then
     echo "   ✓ already logged in to $ACR_REGISTRY (cached)"
+  elif docker system info 2>/dev/null | grep -q "Server Address:.*${ACR_REGISTRY}"; then
+    echo "   ✓ already logged in to $ACR_REGISTRY (docker-info)"
   elif [[ -n "${ALICLOUD_ACCESS_KEY:-}" && -n "${ALICLOUD_SECRET_KEY:-}" ]]; then
     echo "   using ALICLOUD_ACCESS_KEY / ALICLOUD_SECRET_KEY from env"
     echo "$ALICLOUD_SECRET_KEY" | docker login "$ACR_REGISTRY" \
@@ -213,27 +222,82 @@ Deployed via scripts/deploy-sg-dev.sh from zeroclaw commit $(git -C "$ZC_ROOT" r
 fi
 echo
 
-# ── Step 5: kubectl apply + rollout restart ───────────────────────
+# ── Step 5: trigger ArgoCD sync + wait ────────────────────────────
+#
+# This cluster is managed by ArgoCD. Running `kubectl apply` directly
+# creates a race: our `apply` mutates the live spec, ArgoCD sees drift
+# against the last-known-good git SHA, and reverts. The correct GitOps
+# path is:
+#
+#   1. Push manifest change to git (step 4 already did this).
+#   2. Ask ArgoCD to sync *to HEAD*, overriding any latency it has.
+#   3. Wait for rollout.
+#
+# Fallback when ArgoCD isn't reachable (e.g. the `argocd` namespace
+# doesn't exist on this context): fall back to direct `kubectl apply`.
+ARGO_APP_NAME="${ARGO_APP_NAME:-zeroclaw-dev}"
 if [[ $NO_APPLY -eq 0 ]]; then
-  echo "▶ [5/5] kubectl apply + rollout"
-  kubectl --context "$K8S_CONTEXT" apply -f "$MANIFEST_PATH"
-  kubectl --context "$K8S_CONTEXT" -n "$K8S_NAMESPACE" \
-    rollout restart deployment/agent-orchestrator
+  echo "▶ [5/5] ArgoCD sync + rollout"
 
-  echo "   waiting for rollout..."
+  if kubectl --context "$K8S_CONTEXT" -n argocd \
+       get application "$ARGO_APP_NAME" >/dev/null 2>&1; then
+    echo "   triggering ArgoCD sync on application/$ARGO_APP_NAME to HEAD"
+    kubectl --context "$K8S_CONTEXT" -n argocd patch application "$ARGO_APP_NAME" \
+      --type=merge \
+      -p '{"operation":{"initiatedBy":{"username":"deploy-sg-dev.sh"},"sync":{"revision":"HEAD","prune":true,"syncStrategy":{"hook":{}}}}}' \
+      >/dev/null
+    # Small pause to let ArgoCD pick up the operation request.
+    sleep 3
+    # Poll until sync status is Synced with our target revision OR timeout.
+    SYNC_DEADLINE=$(( $(date +%s) + 120 ))
+    while true; do
+      SYNC_STATUS=$(kubectl --context "$K8S_CONTEXT" -n argocd \
+        get application "$ARGO_APP_NAME" \
+        -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "")
+      SYNC_REV=$(kubectl --context "$K8S_CONTEXT" -n argocd \
+        get application "$ARGO_APP_NAME" \
+        -o jsonpath='{.status.sync.revision}' 2>/dev/null || echo "")
+      if [[ "$SYNC_STATUS" == "Synced" ]]; then
+        echo "   ✓ ArgoCD Synced at ${SYNC_REV:0:12}"
+        break
+      fi
+      if (( $(date +%s) > SYNC_DEADLINE )); then
+        echo "   ⚠ ArgoCD didn't reach Synced within 120s (current: $SYNC_STATUS); continuing anyway"
+        break
+      fi
+      sleep 3
+    done
+  else
+    echo "   ArgoCD not found on this cluster — falling back to kubectl apply"
+    kubectl --context "$K8S_CONTEXT" apply -f "$MANIFEST_PATH"
+  fi
+
+  echo "   waiting for deployment rollout..."
   if kubectl --context "$K8S_CONTEXT" -n "$K8S_NAMESPACE" \
        rollout status deployment/agent-orchestrator --timeout=300s; then
     echo "   ✓ agent-orchestrator rollout complete"
   else
-    echo "   ❌ rollout timed out — check kubectl describe"
+    echo "   ❌ rollout timed out — check \`kubectl describe deployment agent-orchestrator -n $K8S_NAMESPACE\`"
     exit 1
+  fi
+
+  # Verify ZEROCLAW_IMAGE env var actually reflects our new tag. If ArgoCD
+  # raced us (rare), this will be visibly wrong instead of silently OK.
+  LIVE_IMAGE=$(kubectl --context "$K8S_CONTEXT" -n "$K8S_NAMESPACE" \
+    get deployment agent-orchestrator \
+    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ZEROCLAW_IMAGE")].value}' 2>/dev/null || echo "")
+  if [[ "$LIVE_IMAGE" == "$FULL_IMAGE" ]]; then
+    echo "   ✓ cluster ZEROCLAW_IMAGE matches target: $TAG"
+  else
+    echo "   ⚠ cluster ZEROCLAW_IMAGE drift: expected $FULL_IMAGE, got $LIVE_IMAGE"
+    echo "     (Re-run this script, or check ArgoCD in the UI.)"
   fi
 
   echo
   echo "Current pods in $K8S_NAMESPACE:"
   kubectl --context "$K8S_CONTEXT" -n "$K8S_NAMESPACE" get pods
 else
-  echo "▶ [5/5] kubectl apply (SKIPPED via --no-apply)"
+  echo "▶ [5/5] ArgoCD sync (SKIPPED via --no-apply)"
 fi
 echo
 

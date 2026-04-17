@@ -34,10 +34,17 @@ Replicates the CI pipeline 1:1:
 4. Pushes the image
 5. Updates `videoclaw-ops/apps/zeroclaw/dev/manifests.yaml` in-place
 6. Commits + pushes `videoclaw-ops` (skippable via `--no-gitops`)
-7. `kubectl apply` to `sg-dev` namespace `zeroclaw-dev`
-8. `kubectl rollout restart deployment/agent-orchestrator` so it picks up
-   the new `ZEROCLAW_IMAGE` env var
-9. Waits for rollout to complete
+7. **Triggers ArgoCD sync on `application/zeroclaw-dev` to HEAD** (or falls
+   back to direct `kubectl apply` if ArgoCD isn't on the cluster)
+8. Waits for `deployment/agent-orchestrator` rollout to complete
+9. Verifies the cluster's live `ZEROCLAW_IMAGE` env matches the target tag
+
+> **Why ArgoCD sync instead of `kubectl apply`?**
+>
+> sg-dev is a GitOps-managed cluster. Running `kubectl apply` directly
+> creates a race: the apply mutates the live spec, ArgoCD sees drift
+> against the last-known-good git SHA, and *reverts*. The script uses
+> the ArgoCD sync API to point the app at HEAD, so there's no drift.
 
 ### Prerequisites
 
