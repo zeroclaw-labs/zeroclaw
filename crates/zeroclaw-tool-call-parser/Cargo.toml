@@ -1,0 +1,13 @@
+[package]
+name = "zeroclaw-tool-call-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tool call parsing for LLM responses — handles JSON, XML, GLM, MiniMax, Perl-style, and more."
+publish = false
+
+[dependencies]
+regex = "1.10"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+tracing = { version = "0.1", default-features = false }

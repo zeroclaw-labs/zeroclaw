@@ -37,6 +37,8 @@ All PRs must target **`master`**. PRs targeting `main` will be rejected.
 > 3. Open a PR targeting `master`
 >
 > Do **not** create or push to a `main` branch. There is no `main` branch — it will not work.
+>
+> **Recommended:** keep "Allow edits from maintainers" enabled on your PRs. This is the default for PRs from personal forks and lets maintainers push small fixups directly rather than superseding your PR. See [`docs/contributing/pr-discipline.md`](docs/contributing/pr-discipline.md).
 
 ## First-Time Contributors
 
@@ -387,6 +389,56 @@ Use these quick examples to align implementation choices before opening a PR.
 - **Bad**: config key changes without migration notes.
 - **Good**: config/schema changes include defaults, compatibility impact, migration steps, and rollback guidance.
 
+## Config Schema Versioning and Migrations
+
+ZeroClaw uses a forward-only schema versioning system for `config.toml`. This section
+explains when and how to create a migration.
+
+### When a migration IS needed
+
+A schema version bump is required when you **rename, move, or remove** an existing
+config prop. Examples:
+
+- Renaming `room_id` to something else
+- Moving a prop from one section to another
+- Removing a deprecated prop entirely
+
+### When a migration is NOT needed
+
+Adding a new config prop does **not** require a schema version bump. Use
+`#[serde(default)]` on the new field and it will be filled with its default value
+when loading older config files. This is the common case.
+
+### How the migration system works
+
+1. `crates/zeroclaw-config/src/migration.rs` contains `V1Compat`, a wrapper struct
+   that uses `#[serde(flatten)]` to deserialize both old-format and current-format
+   TOML into a single pass. Old fields live on `V1Compat`; current fields land on
+   `Config`.
+2. `V1Compat::into_config()` moves old field values into their new locations on
+   `Config` using typed field access — no string-based key manipulation. All call
+   sites use `config.providers.*` directly.
+3. For schema versions beyond V2, add `fn vN_to_vM(&mut Config)` functions that
+   mutate the `Config` struct directly.
+
+### How to add a new migration step
+
+1. Bump `CURRENT_SCHEMA_VERSION` in `crates/zeroclaw-config/src/migration.rs`.
+2. If the old field was on `V1Compat`, update the `migrate_providers()` or similar
+   method. If the change is between V2+ layouts, add a new `fn vN_to_vM(&mut Config)`
+   and call it from `into_config()` after the schema version check.
+3. Add tests in `tests/component/config_migration.rs` that:
+   - Deserialize a TOML string with the old layout
+   - Assert the migrated `Config` has values in the new locations
+   - Assert the old locations are empty/cleared
+4. Run `cargo test --test component -- config_migration` to verify.
+
+### `zeroclaw config migrate`
+
+Users can run `zeroclaw config migrate` to rewrite their on-disk `config.toml` to the
+current schema version. This command uses `toml_edit` to preserve comments and
+formatting while making structural changes.
+
 ## How to Add a New Provider
 
 Create `src/providers/your_provider.rs`:
@@ -493,8 +545,8 @@ pub struct ChannelsConfig {
 ```
 
 That's it. The `#[secret]` annotation automatically:
-- Includes the field in `zeroclaw props list --secrets`
-- Makes it settable via `zeroclaw props set channels.your-channel.bot-token`
+- Includes the field in `zeroclaw config list --secrets`
+- Makes it settable via `zeroclaw config set channels.your-channel.bot-token`
 - Encrypts it on config save and decrypts on load
 - Converts the field name from `snake_case` to `kebab-case` in the CLI
 

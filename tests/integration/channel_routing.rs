@@ -8,7 +8,7 @@
 //! Verifies sender/reply_target field contracts to prevent field swaps.
 
 use async_trait::async_trait;
-use zeroclaw::channels::traits::{Channel, ChannelMessage, SendMessage};
+use zeroclaw::channels::{Channel, ChannelMessage, SendMessage};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ChannelMessage construction and field semantics

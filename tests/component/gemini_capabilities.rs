@@ -55,7 +55,7 @@ fn gemini_supports_vision_returns_true() {
 #[test]
 fn gemini_convert_tools_returns_prompt_guided() {
     use zeroclaw::providers::traits::ToolsPayload;
-    use zeroclaw::tools::traits::ToolSpec;
+    use zeroclaw::tools::ToolSpec;
 
     let provider = gemini_provider();
     let tools = vec![ToolSpec {

@@ -254,20 +254,19 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const setTheme = useCallback((t: ThemeMode) => {
+    // Auto-select a color theme matching the new scheme so explicit mode choices apply correctly.
+    const currentCt = colorThemeMap[colorTheme];
+    const targetScheme = t === 'oled' ? 'dark' : t === 'system' ? null : t;
+    const newColorTheme: ColorThemeId =
+      // System mode should preserve the user's current palette and defer scheme resolution to OS preference.
+      targetScheme === null || (currentCt && currentCt.scheme === targetScheme) ? colorTheme : (
+        t === 'oled' ? 'oled-black' :
+        t === 'light' ? DEFAULT_LIGHT_THEME :
+        DEFAULT_DARK_THEME
+      );
     setThemeState(t);
-    // Sync colorTheme to match the new mode when switching between light/dark/oled
-    let newColorTheme = colorTheme;
-    if (t !== 'system') {
-      const ct = colorThemeMap[colorTheme];
-      const modeScheme = t === 'oled' ? 'dark' : t;
-      if (t === 'oled') {
-        newColorTheme = 'oled-black';
-      } else if (!ct || ct.scheme !== modeScheme) {
-        newColorTheme = t === 'light' ? DEFAULT_LIGHT_THEME : DEFAULT_DARK_THEME;
-      }
-      if (newColorTheme !== colorTheme) setColorThemeState(newColorTheme);
-    }
-    const next: StoredTheme = { theme: t, accent, colorTheme: newColorTheme, uiFont, monoFont, uiFontSize, monoFontSize };
+    setColorThemeState(newColorTheme);
+    const next = { theme: t, accent, colorTheme: newColorTheme, uiFont, monoFont, uiFontSize, monoFontSize };
     applyAll(next);
     persist(next);
   }, [accent, colorTheme, uiFont, monoFont, uiFontSize, monoFontSize, applyAll, persist]);
@@ -281,17 +280,9 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   const setColorTheme = useCallback((c: ColorThemeId) => {
     setColorThemeState(c);
-    const ct = colorThemeMap[c];
-    let newMode = theme;
-    if (ct && theme !== 'system') {
-      if (c === 'oled-black') {
-        newMode = 'oled';
-      } else {
-        newMode = ct.scheme;
-      }
-      setThemeState(newMode);
-    }
-    const next: StoredTheme = { theme: newMode, accent, colorTheme: c, uiFont, monoFont, uiFontSize, monoFontSize };
+    // Only update the color theme — do NOT override the user's explicit theme mode.
+    // setTheme handles syncing colorTheme when the mode changes.
+    const next: StoredTheme = { theme, accent, colorTheme: c, uiFont, monoFont, uiFontSize, monoFontSize };
     applyAll(next);
     persist(next);
   }, [theme, accent, uiFont, monoFont, uiFontSize, monoFontSize, applyAll, persist]);

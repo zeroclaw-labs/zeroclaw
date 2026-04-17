@@ -15,7 +15,6 @@
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-edition%202024-orange?logo=rust" alt="Rust Edition 2024" /></a>
   <a href="https://github.com/zeroclaw-labs/zeroclaw/releases/latest"><img src="https://img.shields.io/badge/version-v0.6.9-blue" alt="Version v0.6.9" /></a>
   <a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors"><img src="https://img.shields.io/github/contributors/zeroclaw-labs/zeroclaw?color=green" alt="Contributors" /></a>
-  <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
   <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
   <a href="https://discord.com/invite/wDshRVqRjx"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
   <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
@@ -113,7 +112,7 @@ Full beginner guide (auth, pairing, channels): [Getting started](docs/setup-guid
 
 ```bash
 # Install + onboard
-./install.sh --api-key "sk-..." --provider openrouter
+./install.sh
 
 # Start the gateway (webhook server + web dashboard)
 zeroclaw gateway                # default: 127.0.0.1:42617
@@ -564,32 +563,22 @@ Full commands reference: [docs/reference/cli/commands-reference.md](docs/referen
 
 #### One-Line Installer
 
-Or skip the steps above and install everything (system deps, Rust, ZeroClaw) in a single command:
+Or skip the steps above and install everything (Rust, ZeroClaw) in a single command:
 
 ```bash
 curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
-#### Compilation resource requirements
-
-Building from source needs more resources than running the resulting binary:
-
-| Resource       | Minimum | Recommended |
-| -------------- | ------- | ----------- |
-| **RAM + swap** | 2 GB    | 4 GB+       |
-| **Free disk**  | 6 GB    | 10 GB+      |
-
-If your host is below the minimum, use pre-built binaries:
+#### Build profiles
 
 ```bash
-./install.sh --prefer-prebuilt
+./install.sh                                          # full (default features)
+./install.sh --minimal                                # kernel only (~6.6MB)
+./install.sh --minimal --features agent-runtime,channel-discord  # custom
+./install.sh --list-features                          # see all available features
 ```
 
-To require binary-only install with no source fallback:
-
-```bash
-./install.sh --prebuilt-only
-```
+For pre-built binaries, see [GitHub Releases](https://github.com/zeroclaw-labs/zeroclaw/releases/latest).
 
 #### Optional
 
@@ -656,10 +645,6 @@ ZeroClaw was built for the smooth crab 🦀, a fast and efficient AI assistant. 
 - [@zeroclawlabs](https://x.com/zeroclawlabs)
 
 ## Support ZeroClaw
-
-If ZeroClaw helps your work and you want to support ongoing development, you can donate here:
-
-<a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
 
 ### 🙏 Special Thanks
 

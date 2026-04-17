@@ -96,17 +96,18 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
   const [displayCode, setDisplayCode] = useState<string | null>(null);
   const [codeLoading, setCodeLoading] = useState(true);
 
-  // Fetch the current pairing code from the admin endpoint (localhost only)
+  // Fetch the current pairing code (public endpoint works in Docker too)
   useEffect(() => {
     let cancelled = false;
     getAdminPairCode()
       .then((data) => {
         if (!cancelled && data.pairing_code) {
           setDisplayCode(data.pairing_code);
+          setCode(data.pairing_code); // auto-fill so user just clicks "Pair"
         }
       })
       .catch(() => {
-        // Admin endpoint not reachable (non-localhost) — user must check terminal
+        // Endpoint not reachable — user must check terminal / docker logs
       })
       .finally(() => {
         if (!cancelled) setCodeLoading(false);
@@ -141,7 +142,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
           />
           <h1 className="text-2xl font-bold mb-2 text-gradient-blue">ZeroClaw</h1>
           <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
-            {displayCode ? 'Your pairing code' : 'Enter the pairing code from your terminal'}
+            {displayCode ? 'Your pairing code — click Pair to connect' : 'Enter the pairing code from your terminal'}
           </p>
         </div>
 

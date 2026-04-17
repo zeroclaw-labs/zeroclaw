@@ -36,8 +36,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
+
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings
 
   bench-compile:
     name: Verify Benchmarks Compile
