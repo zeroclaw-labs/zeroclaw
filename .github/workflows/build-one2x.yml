@@ -9,7 +9,9 @@ on:
       - "web/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "Dockerfile.ci"
       - "Dockerfile.debian"
+      - "Dockerfile.debian.ci"
       - ".github/workflows/build-one2x.yml"
   workflow_dispatch:
     inputs:

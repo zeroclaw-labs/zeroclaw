@@ -12,6 +12,10 @@ __pycache__/
 *.pyc
 docker-compose.override.yml
 
+# Local build artifact produced by videoclaw-ops/tooling/hot-swap.sh
+# (binary-extract stage dumps the zeroclaw binary here).
+.hotswap-out/
+
 # Environment files (may contain secrets)
 .env
 

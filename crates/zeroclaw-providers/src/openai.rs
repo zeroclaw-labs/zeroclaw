@@ -17,7 +17,8 @@ pub struct OpenAiProvider {
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
 }
@@ -60,7 +61,8 @@ impl ResponseMessage {
 struct NativeChatRequest {
     model: String,
     messages: Vec<NativeMessage>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -230,6 +232,23 @@ impl OpenAiProvider {
         }
     }
 
+    /// Some OpenAI-compatible Anthropic routes reject the temperature field
+    /// entirely, so omit it rather than trying to coerce the value.
+    fn should_omit_temperature_for_model(model: &str) -> bool {
+        model.contains("claude-opus-4-7")
+    }
+
+    fn request_temperature_for_model(model: &str, requested_temperature: f64) -> Option<f64> {
+        if Self::should_omit_temperature_for_model(model) {
+            None
+        } else {
+            Some(Self::adjust_temperature_for_model(
+                model,
+                requested_temperature,
+            ))
+        }
+    }
+
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
         tools.map(|items| {
             items
@@ -359,7 +378,7 @@ impl Provider for OpenAiProvider {
             anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
-        let adjusted_temperature = Self::adjust_temperature_for_model(model, temperature);
+        let request_temperature = Self::request_temperature_for_model(model, temperature);
 
         let mut messages = Vec::new();
 
@@ -378,7 +397,7 @@ impl Provider for OpenAiProvider {
         let request = ChatRequest {
             model: model.to_string(),
             messages,
-            temperature: adjusted_temperature,
+            temperature: request_temperature,
             max_tokens: self.max_tokens,
         };
 
@@ -414,13 +433,13 @@ impl Provider for OpenAiProvider {
             anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
-        let adjusted_temperature = Self::adjust_temperature_for_model(model, temperature);
+        let request_temperature = Self::request_temperature_for_model(model, temperature);
 
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
-            temperature: adjusted_temperature,
+            temperature: request_temperature,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
             max_tokens: self.max_tokens,
@@ -470,7 +489,7 @@ impl Provider for OpenAiProvider {
             anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
-        let adjusted_temperature = Self::adjust_temperature_for_model(model, temperature);
+        let request_temperature = Self::request_temperature_for_model(model, temperature);
 
         let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
             None
@@ -487,7 +506,7 @@ impl Provider for OpenAiProvider {
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages(messages),
-            temperature: adjusted_temperature,
+            temperature: request_temperature,
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
             max_tokens: self.max_tokens,
@@ -588,7 +607,7 @@ mod tests {
                     content: "hello".to_string(),
                 },
             ],
-            temperature: 0.7,
+            temperature: Some(0.7),
             max_tokens: None,
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -605,12 +624,27 @@ mod tests {
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
-            temperature: 0.0,
+            temperature: Some(0.0),
             max_tokens: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("system"));
         assert!(json.contains("\"temperature\":0.0"));
+    }
+
+    #[test]
+    fn request_serializes_without_temperature_when_none() {
+        let req = ChatRequest {
+            model: "bedrock/global.anthropic.claude-opus-4-7".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            temperature: None,
+            max_tokens: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("temperature"));
     }
 
     #[test]
@@ -1013,6 +1047,40 @@ mod tests {
         assert_eq!(
             OpenAiProvider::adjust_temperature_for_model("gpt-4o", 1.0),
             1.0
+        );
+    }
+
+    #[test]
+    fn request_temperature_omits_for_claude_opus_4_7_models() {
+        assert_eq!(
+            OpenAiProvider::request_temperature_for_model(
+                "bedrock/global.anthropic.claude-opus-4-7",
+                0.7
+            ),
+            None
+        );
+        assert_eq!(
+            OpenAiProvider::request_temperature_for_model(
+                "bedrock/us.anthropic.claude-opus-4-7",
+                0.3
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn request_temperature_preserves_standard_models() {
+        assert_eq!(
+            OpenAiProvider::request_temperature_for_model("gpt-4o", 0.7),
+            Some(0.7)
+        );
+    }
+
+    #[test]
+    fn request_temperature_still_adjusts_models_that_require_one() {
+        assert_eq!(
+            OpenAiProvider::request_temperature_for_model("o3", 0.3),
+            Some(1.0)
         );
     }
 }

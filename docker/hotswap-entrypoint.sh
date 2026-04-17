@@ -29,6 +29,11 @@
 #   - If the hot-swap binary is broken, each iteration restarts in 2s.
 #     Kubelet's liveness probe (10s period, 3 failures) will restart the
 #     pod after ~30s of /health being unreachable.
+#   - CIRCUIT BREAKER (default on): if the child exits <10s N times in
+#     a row (N=5 by default, configurable via HOTSWAP_MAX_FAST_FAILS),
+#     supervisor exits PID 1 so kubelet escalates to CrashLoopBackoff —
+#     otherwise a truly-broken binary stays hidden behind Ready=1/1. Any
+#     successful >=10s run resets the counter. A value of 0 disables.
 
 set -u
 
@@ -37,11 +42,16 @@ HOTSWAP_BIN="${HOTSWAP_DIR}/zeroclaw"
 STOCK_BIN="/usr/local/bin/zeroclaw"
 PID_FILE="${HOTSWAP_DIR}/child.pid"
 
+# Circuit breaker tunables (overridable via env for tests / ops override).
+MAX_FAST_FAILS="${HOTSWAP_MAX_FAST_FAILS:-5}"
+FAST_FAIL_SECS="${HOTSWAP_FAST_FAIL_SECS:-10}"
+
 mkdir -p "${HOTSWAP_DIR}" 2>/dev/null || true
 
 log() { printf '[hotswap-supervisor] %s\n' "$*" ; }
 
 CHILD_PID=""
+FAST_FAIL_STREAK=0
 
 shutdown() {
     sig="$1"
@@ -58,8 +68,13 @@ trap 'shutdown TERM' TERM
 trap 'shutdown INT'  INT
 
 log "starting; PID=$$"
-log "stock binary  = ${STOCK_BIN}"
-log "hot-swap path = ${HOTSWAP_BIN}"
+log "stock binary   = ${STOCK_BIN}"
+log "hot-swap path  = ${HOTSWAP_BIN}"
+if [ "${MAX_FAST_FAILS}" -gt 0 ] ; then
+    log "circuit breaker: ${MAX_FAST_FAILS} consecutive runs shorter than ${FAST_FAIL_SECS}s will crash the pod"
+else
+    log "circuit breaker: DISABLED (HOTSWAP_MAX_FAST_FAILS=0)"
+fi
 
 while true ; do
     if [ -x "${HOTSWAP_BIN}" ] ; then
@@ -70,6 +85,9 @@ while true ; do
         log "using stock image binary (${BIN})"
     fi
 
+    # Record start time so we can detect fast-fail.
+    START_EPOCH=$(date +%s 2>/dev/null || echo 0)
+
     "${BIN}" "$@" &
     CHILD_PID=$!
     printf '%s\n' "${CHILD_PID}" > "${PID_FILE}" 2>/dev/null || true
@@ -77,8 +95,29 @@ while true ; do
 
     wait "${CHILD_PID}"
     RC=$?
-    log "child PID=${CHILD_PID} exited rc=${RC}; restarting in 2s"
+    END_EPOCH=$(date +%s 2>/dev/null || echo 0)
+    RAN_FOR=$(( END_EPOCH - START_EPOCH ))
+    log "child PID=${CHILD_PID} exited rc=${RC} ran_for=${RAN_FOR}s; restarting in 2s"
     CHILD_PID=""
     rm -f "${PID_FILE}" 2>/dev/null || true
+
+    # Circuit breaker: count consecutive fast fails; reset on any long run.
+    if [ "${MAX_FAST_FAILS}" -gt 0 ] ; then
+        if [ "${RAN_FOR}" -lt "${FAST_FAIL_SECS}" ] ; then
+            FAST_FAIL_STREAK=$(( FAST_FAIL_STREAK + 1 ))
+            log "fast-fail streak = ${FAST_FAIL_STREAK}/${MAX_FAST_FAILS}"
+            if [ "${FAST_FAIL_STREAK}" -ge "${MAX_FAST_FAILS}" ] ; then
+                log "CIRCUIT BREAKER TRIPPED: ${FAST_FAIL_STREAK} consecutive fast-fails (<${FAST_FAIL_SECS}s each)"
+                log "exiting PID 1 so kubelet can surface CrashLoopBackoff and fire alerts"
+                exit 1
+            fi
+        else
+            if [ "${FAST_FAIL_STREAK}" -gt 0 ] ; then
+                log "run stayed up ${RAN_FOR}s; resetting fast-fail streak (was ${FAST_FAIL_STREAK})"
+            fi
+            FAST_FAIL_STREAK=0
+        fi
+    fi
+
     sleep 2
 done
