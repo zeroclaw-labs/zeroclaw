@@ -1,0 +1,47 @@
+---
+description: zeroclaw Rust conventions - extracted from AGENTS.md for Cursor context
+alwaysApply: true
+---
+
+# zeroclaw Conventions
+
+## Stack
+- Rust (Cargo workspace with multiple crates)
+- Trait-driven, modular architecture
+- Extension via traits: Provider, Channel, Tool, Memory, Observer, Peripheral
+
+## Key Commands
+- Format check: `cargo fmt --all -- --check`
+- Lint: `cargo clippy --all-targets -- -D warnings`
+- Test: `cargo test`
+- Full CI validation: `./dev/ci.sh all`
+
+## Crate Map
+- `zeroclaw-api` — public trait definitions (Provider, Channel, Tool, Memory, Observer, Peripheral)
+- `zeroclaw-config` — schema, config loading/merging
+- `zeroclaw-providers` — model providers and resilient wrapper
+- `zeroclaw-channels` — messaging platform integrations (30+ channels)
+- `zeroclaw-tools` — tool execution surface (shell, file, memory, browser)
+- `zeroclaw-runtime` — agent loop, security, cron, SOP, skills, observability
+- `zeroclaw-memory` — memory backends (markdown, sqlite, embeddings, vector merge)
+- `zeroclaw-gateway` — webhook/gateway server (separate binary)
+- `zeroclaw-hardware` — USB discovery, peripherals, serial, GPIO
+- `zeroclaw-plugins` — WASM plugin system
+
+## Rust Conventions
+- Ownership and borrowing: follow Rust idioms strictly; do not fight the borrow checker.
+- Error handling: use `Result<T, E>` with `?` propagation; avoid `unwrap()` in production code.
+- Use `thiserror` for library error types, `anyhow` sparingly in binary/CLI code.
+- All code must pass `clippy` with `-D warnings` (zero warnings policy).
+- Prefer `impl Trait` for function parameters when the concrete type is not needed by callers.
+
+## Risk Tiers
+- High risk: `zeroclaw-runtime/src/` (especially security), `zeroclaw-gateway/src/`, `zeroclaw-tools/src/`, `.github/workflows/`
+- Medium risk: most `crates/*/src/**` behavior changes
+- Low risk: docs, chore, tests-only changes
+
+## Workflow
+- Read before write — inspect existing module, factory wiring, and adjacent tests.
+- One concern per PR — no mixed feature+refactor patches.
+- Implement minimal patch — no speculative abstractions.
+- Work from a non-`master` branch; open a PR to `master`.
