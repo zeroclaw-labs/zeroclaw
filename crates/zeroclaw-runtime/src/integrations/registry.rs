@@ -293,13 +293,28 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Hugging Face",
             description: "Open-source models",
             category: IntegrationCategory::AiModel,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |c| {
+                if matches!(c.providers.fallback.as_deref(), Some("huggingface" | "hf")) {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         IntegrationEntry {
             name: "LM Studio",
             description: "Local model server",
             category: IntegrationCategory::AiModel,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |c| {
+                if matches!(
+                    c.providers.fallback.as_deref(),
+                    Some("lmstudio" | "lm-studio")
+                ) {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         IntegrationEntry {
             name: "Venice",
