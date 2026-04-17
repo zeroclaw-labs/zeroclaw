@@ -270,7 +270,6 @@ app_secret = "your-app-secret"     # optional but recommended
 allowed_numbers = ["*"]
 dm_mention_patterns = []           # optional: regex patterns for DM mention gating
 group_mention_patterns = []        # optional: regex patterns for group-chat mention gating
-interrupt_on_new_message = false   # optional: cancel in-flight same-sender same-chat request
 ```
 
 WhatsApp Web mode:
