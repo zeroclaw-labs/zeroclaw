@@ -3966,14 +3966,17 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .signal
                 .as_ref()
                 .context("Signal channel is not configured")?;
-            Ok(Arc::new(SignalChannel::new(
-                sg.http_url.clone(),
-                sg.account.clone(),
-                sg.group_id.clone(),
-                sg.allowed_from.clone(),
-                sg.ignore_attachments,
-                sg.ignore_stories,
-            )))
+            Ok(Arc::new(
+                SignalChannel::new(
+                    sg.http_url.clone(),
+                    sg.account.clone(),
+                    sg.group_id.clone(),
+                    sg.allowed_from.clone(),
+                    sg.ignore_attachments,
+                    sg.ignore_stories,
+                )
+                .with_workspace_dir(config.workspace_dir.clone()),
+            ))
         }
         "matrix" => {
             #[cfg(feature = "channel-matrix")]
@@ -4505,7 +4508,8 @@ fn collect_configured_channels(
                         sig.ignore_attachments,
                         sig.ignore_stories,
                     )
-                    .with_proxy_url(sig.proxy_url.clone()),
+                    .with_proxy_url(sig.proxy_url.clone())
+                    .with_workspace_dir(config.workspace_dir.clone()),
                 ),
             });
         } else {
@@ -5671,7 +5675,8 @@ pub async fn deliver_announcement(
                 sg.allowed_from.clone(),
                 sg.ignore_attachments,
                 sg.ignore_stories,
-            );
+            )
+            .with_workspace_dir(config.workspace_dir.clone());
             zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
                 .await?;
         }
