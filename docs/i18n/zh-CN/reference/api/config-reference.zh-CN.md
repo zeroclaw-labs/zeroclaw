@@ -222,6 +222,7 @@ temperature = 0.2
 
 - 向后兼容性：旧版 `enable = true` 被接受为 `enabled = true` 的别名。
 - 如果 `enabled = false` 或缺少 `api_key`，则不会注册 `composio` 工具。
+- 环境变量覆盖：`ZEROCLAW_COMPOSIO_API_KEY` 或 `COMPOSIO_API_KEY` 设置 API 密钥（非空时自动启用集成）；`ZEROCLAW_COMPOSIO_ENTITY_ID` 或 `COMPOSIO_ENTITY_ID` 覆盖 `entity_id`。带前缀的 `ZEROCLAW_*` 变体优先级更高。
 - ZeroClaw 请求 Composio v3 工具时使用 `toolkit_versions=latest`，并使用 `version=\"latest\"` 执行工具，以避免过时的默认工具版本。
 - 典型流程：调用 `connect`，完成浏览器 OAuth，然后为所需工具操作运行 `execute`。
 - 如果 Composio 返回缺少连接账户引用错误，请调用 `list_accounts`（可选带 `app`）并将返回的 `connected_account_id` 传递给 `execute`。

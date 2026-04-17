@@ -10771,6 +10771,29 @@ impl Config {
             }
         }
 
+        // Composio API key: ZEROCLAW_COMPOSIO_API_KEY or COMPOSIO_API_KEY.
+        // Setting a non-empty key also enables the integration (mirrors how
+        // provider API-key env vars activate their providers).
+        if let Ok(api_key) = std::env::var("ZEROCLAW_COMPOSIO_API_KEY")
+            .or_else(|_| std::env::var("COMPOSIO_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.composio.api_key = Some(api_key.to_string());
+                self.composio.enabled = true;
+            }
+        }
+
+        // Composio entity id: ZEROCLAW_COMPOSIO_ENTITY_ID or COMPOSIO_ENTITY_ID
+        if let Ok(entity_id) = std::env::var("ZEROCLAW_COMPOSIO_ENTITY_ID")
+            .or_else(|_| std::env::var("COMPOSIO_ENTITY_ID"))
+        {
+            let entity_id = entity_id.trim();
+            if !entity_id.is_empty() {
+                self.composio.entity_id = entity_id.to_string();
+            }
+        }
+
         // SearXNG instance URL: ZEROCLAW_SEARXNG_INSTANCE_URL or SEARXNG_INSTANCE_URL
         if let Ok(instance_url) = std::env::var("ZEROCLAW_SEARXNG_INSTANCE_URL")
             .or_else(|_| std::env::var("SEARXNG_INSTANCE_URL"))
@@ -14913,6 +14936,69 @@ default_model = "persisted-profile"
         unsafe { std::env::remove_var("WEB_SEARCH_TIMEOUT_SECS") };
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("BRAVE_API_KEY") };
+    }
+
+    #[test]
+    async fn env_override_composio_api_key_sets_and_enables() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        assert!(!config.composio.enabled);
+        assert!(config.composio.api_key.is_none());
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("COMPOSIO_API_KEY", "comp-env-key-123") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("COMPOSIO_ENTITY_ID", "env-entity") };
+
+        config.apply_env_overrides();
+
+        assert!(config.composio.enabled);
+        assert_eq!(config.composio.api_key.as_deref(), Some("comp-env-key-123"));
+        assert_eq!(config.composio.entity_id, "env-entity");
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("COMPOSIO_API_KEY") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("COMPOSIO_ENTITY_ID") };
+    }
+
+    #[test]
+    async fn env_override_composio_api_key_prefixed_variant_wins() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_COMPOSIO_API_KEY", "prefixed-key") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("COMPOSIO_API_KEY", "plain-key") };
+
+        config.apply_env_overrides();
+
+        assert_eq!(config.composio.api_key.as_deref(), Some("prefixed-key"));
+        assert!(config.composio.enabled);
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_COMPOSIO_API_KEY") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("COMPOSIO_API_KEY") };
+    }
+
+    #[test]
+    async fn env_override_composio_empty_key_ignored() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        assert!(!config.composio.enabled);
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("COMPOSIO_API_KEY", "   ") };
+
+        config.apply_env_overrides();
+
+        assert!(!config.composio.enabled, "empty key must not enable");
+        assert!(config.composio.api_key.is_none());
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("COMPOSIO_API_KEY") };
     }
 
     #[test]

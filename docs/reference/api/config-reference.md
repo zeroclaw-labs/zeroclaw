@@ -359,6 +359,7 @@ Notes:
 
 - Backward compatibility: legacy `enable = true` is accepted as an alias for `enabled = true`.
 - If `enabled = false` or `api_key` is missing, the `composio` tool is not registered.
+- Environment overrides: `ZEROCLAW_COMPOSIO_API_KEY` or `COMPOSIO_API_KEY` set the API key (and auto-enable the integration when non-empty); `ZEROCLAW_COMPOSIO_ENTITY_ID` or `COMPOSIO_ENTITY_ID` override `entity_id`. The prefixed (`ZEROCLAW_*`) variants take precedence.
 - ZeroClaw requests Composio v3 tools with `toolkit_versions=latest` and executes tools with `version="latest"` to avoid stale default tool revisions.
 - Typical flow: call `connect`, complete browser OAuth, then run `execute` for the desired tool action.
 - If Composio returns a missing connected-account reference error, call `list_accounts` (optionally with `app`) and pass the returned `connected_account_id` to `execute`.

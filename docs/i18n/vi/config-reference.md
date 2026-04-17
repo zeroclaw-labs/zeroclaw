@@ -161,6 +161,7 @@ Lưu ý:
 
 - Tương thích ngược: `enable = true` kiểu cũ được chấp nhận như bí danh cho `enabled = true`.
 - Nếu `enabled = false` hoặc thiếu `api_key`, tool `composio` không được đăng ký.
+- Ghi đè qua biến môi trường: `ZEROCLAW_COMPOSIO_API_KEY` hoặc `COMPOSIO_API_KEY` đặt API key (tự động bật tích hợp khi không rỗng); `ZEROCLAW_COMPOSIO_ENTITY_ID` hoặc `COMPOSIO_ENTITY_ID` ghi đè `entity_id`. Biến có tiền tố `ZEROCLAW_*` có ưu tiên cao hơn.
 - ZeroClaw yêu cầu Composio v3 tools với `toolkit_versions=latest` và thực thi với `version="latest"` để tránh bản tool mặc định cũ.
 - Luồng thông thường: gọi `connect`, hoàn tất OAuth trên trình duyệt, rồi chạy `execute` cho hành động mong muốn.
 - Nếu Composio trả lỗi thiếu connected-account, gọi `list_accounts` (tùy chọn với `app`) và truyền `connected_account_id` trả về cho `execute`.
