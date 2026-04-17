@@ -896,6 +896,12 @@ pub async fn run_tool_call_loop(
             }
         }
 
+        // Remove orphaned tool-role messages whose assistant (tool_calls)
+        // counterpart was dropped by proactive trimming, context compression,
+        // or session history reloading.  Without this, providers like MiniMax
+        // reject the request with "tool result's tool id not found" (bug #5743).
+        crate::agent::history_pruner::remove_orphaned_tool_messages(history);
+
         // Check if model switch was requested via model_switch tool
         if let Some(ref callback) = model_switch_callback
             && let Ok(guard) = callback.lock()

@@ -94,7 +94,7 @@ const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 
 fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
-    channels.channels_except_webhook().iter().any(|(_, ok)| *ok)
+    channels.channels().iter().any(|(_, ok)| *ok)
 }
 
 // ── Main wizard entry point ──────────────────────────────────────
@@ -7853,6 +7853,23 @@ mod tests {
             port: None,
             proxy_url: None,
         });
+        assert!(has_launchable_channels(&channels));
+    }
+
+    #[test]
+    fn webhook_only_config_is_launchable() {
+        let channels = ChannelsConfig {
+            webhook: Some(zeroclaw_config::schema::WebhookConfig {
+                enabled: true,
+                port: 8080,
+                listen_path: None,
+                send_url: None,
+                send_method: None,
+                auth_header: None,
+                secret: None,
+            }),
+            ..Default::default()
+        };
         assert!(has_launchable_channels(&channels));
     }
 
