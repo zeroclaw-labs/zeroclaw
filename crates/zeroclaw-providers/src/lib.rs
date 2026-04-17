@@ -1389,12 +1389,15 @@ fn create_provider_with_url_and_options(
         }
 
         // ── Extended ecosystem (community favorites) ─────────
-        "groq" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Groq",
-            "https://api.groq.com/openai/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        "groq" => Ok(compat(
+            OpenAiCompatibleProvider::new(
+                "Groq",
+                "https://api.groq.com/openai/v1",
+                key,
+                AuthStyle::Bearer,
+            )
+            .without_native_tools(),
+        )),
         "mistral" => Ok(compat(OpenAiCompatibleProvider::new(
             "Mistral",
             "https://api.mistral.ai/v1",
