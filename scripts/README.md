@@ -1,15 +1,109 @@
-# scripts/ — Raspberry Pi Deployment Guide
+# scripts/ — Deployment Guides
 
-This directory contains everything needed to cross-compile ZeroClaw and deploy it to a Raspberry Pi over SSH.
+This directory contains one-shot scripts for deploying ZeroClaw to different
+targets. Each script is idempotent and safe to re-run.
 
 ## Contents
 
 | File | Purpose |
 |------|---------|
-| `deploy-rpi.sh` | One-shot cross-compile and deploy script |
-| `rpi-config.toml` | Production config template deployed to `~/.zeroclaw/config.toml` |
+| `deploy-rpi.sh` | Cross-compile and deploy to Raspberry Pi over SSH (see below) |
+| `deploy-sg-dev.sh` | Build Docker image, push to Aliyun ACR, and deploy to `sg-dev` k8s cluster (see [sg-dev deploy](#sg-dev-cluster-deploy)) |
+| `rpi-config.toml` | Production config template deployed to `~/.zeroclaw/config.toml` on Pi |
 | `zeroclaw.service` | systemd unit file installed on the Pi |
 | `99-act-led.rules` | udev rule for ACT LED sysfs access without sudo |
+
+---
+
+## sg-dev cluster deploy
+
+`scripts/deploy-sg-dev.sh` is the **local fallback** for the
+`.github/workflows/build-one2x.yml` GitHub Actions workflow. Use it when:
+
+- GitHub Actions isn't running (account rate-limited, offline, etc.)
+- You want a faster edit→verify loop than CI
+- You need to deploy a specific un-pushed commit
+
+### What it does
+
+Replicates the CI pipeline 1:1:
+
+1. Computes image tag from `git HEAD` (`v6.3.0-<short-sha>`)
+2. `docker buildx` for `linux/amd64` from `Dockerfile.ci`
+3. Logs into ACR EE (`loveops-prod-acr-registry.ap-southeast-1.cr.aliyuncs.com`)
+4. Pushes the image
+5. Updates `videoclaw-ops/apps/zeroclaw/dev/manifests.yaml` in-place
+6. Commits + pushes `videoclaw-ops` (skippable via `--no-gitops`)
+7. `kubectl apply` to `sg-dev` namespace `zeroclaw-dev`
+8. `kubectl rollout restart deployment/agent-orchestrator` so it picks up
+   the new `ZEROCLAW_IMAGE` env var
+9. Waits for rollout to complete
+
+### Prerequisites
+
+- Docker Desktop running (with `buildx` — default in modern versions)
+- `kubectl` configured with the `sg-dev` context
+- `videoclaw-ops` repo cloned alongside `zeroclaw`:
+
+  ```text
+  ~/GitHub/
+  ├── zeroclaw/
+  └── videoclaw-ops/
+  ```
+
+  Override with `VIDEOCLAW_OPS=/custom/path ./scripts/deploy-sg-dev.sh`.
+
+- ACR login (one of):
+
+  ```bash
+  # Option A: one-time interactive login (preferred; cached in ~/.docker/config.json)
+  docker login loveops-prod-acr-registry.ap-southeast-1.cr.aliyuncs.com
+
+  # Option B: env vars (useful for automation)
+  export ALICLOUD_ACCESS_KEY=...
+  export ALICLOUD_SECRET_KEY=...
+  ```
+
+### Typical usage
+
+```bash
+# Standard flow: build → push → update ops → apply → wait for pod
+./scripts/deploy-sg-dev.sh
+
+# Only rebuild + reapply; assume image already pushed
+./scripts/deploy-sg-dev.sh --skip-build --skip-push
+
+# Explicit tag (bypass git HEAD-based default)
+./scripts/deploy-sg-dev.sh --tag v6.3.1-hotfix
+
+# GitOps-only: update manifest but don't commit/push ops (for testing)
+./scripts/deploy-sg-dev.sh --no-gitops --no-apply
+
+# Build + push, but leave cluster untouched
+./scripts/deploy-sg-dev.sh --no-apply --no-gitops
+```
+
+### Flags
+
+| Flag | Meaning |
+|------|---------|
+| `--tag <VALUE>` | Use explicit tag instead of `v6.3.0-<git-sha>` |
+| `--skip-build` | Don't rebuild; assume image is already available locally/remote |
+| `--skip-push` | Skip login + push (also skips build cost if `--skip-build`) |
+| `--no-gitops` | Edit manifest but don't commit/push `videoclaw-ops` |
+| `--no-apply` | Don't `kubectl apply` or restart agent-orchestrator |
+
+### Safety notes
+
+- Refuses to proceed if `zeroclaw` working tree is dirty (prompts to Enter).
+  The image reflects `HEAD`, NOT unstaged changes.
+- `kubectl rollout` has a 5-minute timeout. If it fails, check:
+  ```bash
+  kubectl --context sg-dev -n zeroclaw-dev describe pods
+  kubectl --context sg-dev -n zeroclaw-dev logs -l app.kubernetes.io/name=agent-orchestrator --tail=50
+  ```
+- Image pushed to ACR is **immutable by tag**. If you re-run with the
+  same git SHA and different local changes, use `--tag <custom>`.
 
 ---
 
