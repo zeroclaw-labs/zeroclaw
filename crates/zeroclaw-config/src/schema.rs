@@ -13715,6 +13715,43 @@ bot_token = "xoxb-tok"
         assert_eq!(parsed.port, 8080);
     }
 
+    #[test]
+    async fn webhook_config_retry_fields_default_to_none() {
+        let json = r#"{"port":8080}"#;
+        let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.max_retries.is_none());
+        assert!(parsed.retry_base_delay_ms.is_none());
+        assert!(parsed.retry_max_delay_ms.is_none());
+    }
+
+    #[test]
+    async fn webhook_config_retry_fields_roundtrip() {
+        let wc = WebhookConfig {
+            enabled: true,
+            port: 8080,
+            listen_path: None,
+            send_url: Some("https://example.com/cb".into()),
+            send_method: None,
+            auth_header: None,
+            secret: None,
+            max_retries: Some(5),
+            retry_base_delay_ms: Some(250),
+            retry_max_delay_ms: Some(10_000),
+        };
+
+        let json = serde_json::to_string(&wc).unwrap();
+        let parsed: WebhookConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.max_retries, Some(5));
+        assert_eq!(parsed.retry_base_delay_ms, Some(250));
+        assert_eq!(parsed.retry_max_delay_ms, Some(10_000));
+
+        let toml_str = toml::to_string(&wc).unwrap();
+        let parsed: WebhookConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.max_retries, Some(5));
+        assert_eq!(parsed.retry_base_delay_ms, Some(250));
+        assert_eq!(parsed.retry_max_delay_ms, Some(10_000));
+    }
+
     // ── WhatsApp config ──────────────────────────────────────
 
     #[test]

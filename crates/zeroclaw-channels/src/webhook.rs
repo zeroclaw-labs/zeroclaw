@@ -83,7 +83,8 @@ impl WebhookChannel {
     }
 
     /// Compute the backoff delay for a given attempt, bounded by `retry_max_delay_ms`
-    /// and with ±25% jitter applied.
+    /// and with ±25% jitter applied. The cap is approximate: jitter is applied after
+    /// capping, so the returned delay may exceed `retry_max_delay_ms` by up to 25%.
     fn compute_backoff(&self, attempt: u32) -> Duration {
         let multiplier = 1_u64.checked_shl(attempt).unwrap_or(u64::MAX);
         let base = self.retry_base_delay_ms.saturating_mul(multiplier);
@@ -182,7 +183,6 @@ impl Channel for WebhookChannel {
             },
         };
 
-        let mut last_err: Option<String> = None;
         let total_attempts = self.max_retries.saturating_add(1);
 
         for attempt in 0..total_attempts {
@@ -207,7 +207,6 @@ impl Channel for WebhookChannel {
                     tokio::time::sleep(capped).await;
                 }
                 AttemptOutcome::Retry(err_msg) => {
-                    last_err = Some(err_msg.clone());
                     if attempt + 1 >= total_attempts {
                         bail!(
                             "Webhook send failed after {total_attempts} attempt(s); last error: {err_msg}"
@@ -226,11 +225,7 @@ impl Channel for WebhookChannel {
             }
         }
 
-        // Unreachable in practice: loop always returns or bails on the last attempt.
-        bail!(
-            "Webhook send failed after {total_attempts} attempt(s){}",
-            last_err.map(|e| format!(": {e}")).unwrap_or_default()
-        )
+        unreachable!("send loop exits via return or bail on the final attempt")
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
@@ -402,7 +397,9 @@ impl WebhookChannel {
             .await
             .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
 
-        // 429 and 503 may include Retry-After; honor it if present.
+        // 429 and 503 may include Retry-After; honor it if present. 429 appears here
+        // *and* in the branch below: here we take the server-supplied delay, below we
+        // fall back to exponential backoff when no Retry-After header was sent.
         if (code == 429 || code == 503)
             && let Some(ms) = retry_after
         {
@@ -783,6 +780,49 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(900),
             "expected to wait ~1s for Retry-After, elapsed = {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn send_honors_retry_after_on_503() {
+        use std::time::Instant;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cb"))
+            .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "1"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/cb"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let ch = WebhookChannel::new(
+            8080,
+            None,
+            Some(format!("{}/cb", mock.uri())),
+            None,
+            None,
+            None,
+            Some(2),
+            Some(10),
+            Some(2_000),
+        );
+
+        let start = Instant::now();
+        ch.send(&test_message()).await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "expected to wait ~1s for Retry-After on 503, elapsed = {:?}",
             elapsed
         );
     }
