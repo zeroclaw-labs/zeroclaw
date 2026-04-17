@@ -666,8 +666,7 @@ mod tests {
         // ApprovalResponse::Always and keep audit logs consistent.
         let json = serde_json::to_string(&ChannelApprovalResponse::AlwaysApprove).unwrap();
         assert_eq!(json, "\"always\"");
-        let parsed: ChannelApprovalResponse =
-            serde_json::from_str("\"always\"").unwrap();
+        let parsed: ChannelApprovalResponse = serde_json::from_str("\"always\"").unwrap();
         assert_eq!(parsed, ChannelApprovalResponse::AlwaysApprove);
         let parsed: ChannelApprovalResponse = serde_json::from_str("\"deny\"").unwrap();
         assert_eq!(parsed, ChannelApprovalResponse::Deny);

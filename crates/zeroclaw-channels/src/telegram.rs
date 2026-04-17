@@ -3177,19 +3177,15 @@ Ensure only one `zeroclaw` process is using this bot token."
 
         // Wait for the user to tap a button. Timeout is configurable via
         // `channels.telegram.approval_timeout_secs` (default 120s).
-        let result = match tokio::time::timeout(
-            Duration::from_secs(self.approval_timeout_secs),
-            rx,
-        )
-        .await
-        {
-            Ok(Ok(response)) => Some(response),
-            _ => {
-                // Timeout or sender dropped — clean up and deny.
-                self.pending_approvals.lock().await.remove(&approval_id);
-                Some(ChannelApprovalResponse::Deny)
-            }
-        };
+        let result =
+            match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
+                Ok(Ok(response)) => Some(response),
+                _ => {
+                    // Timeout or sender dropped — clean up and deny.
+                    self.pending_approvals.lock().await.remove(&approval_id);
+                    Some(ChannelApprovalResponse::Deny)
+                }
+            };
 
         Ok(result)
     }
