@@ -11,6 +11,7 @@ For encrypted Matrix rooms, also read the dedicated runbook:
 - Need a no-response diagnosis flow: jump to [Troubleshooting Checklist](#6-troubleshooting-checklist).
 - Need Matrix encrypted-room help: use [Matrix E2EE Guide](../../security/matrix-e2ee-guide.md).
 - Need Nextcloud Talk bot setup: use [Nextcloud Talk Setup](../../setup-guides/nextcloud-talk-setup.md).
+- Need LINE Messaging API setup: use [LINE Setup](../../setup-guides/line-setup.md).
 - Need deployment/network assumptions (polling vs webhook): use [Network Deployment](../../ops/network-deployment.md).
 
 ## FAQ: Matrix setup passes but no reply
@@ -117,6 +118,7 @@ If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.fe
 | IRC | IRC socket | No |
 | Lark | websocket (default) or webhook | Webhook mode only |
 | Feishu | websocket (default) or webhook | Webhook mode only |
+| LINE | webhook (`/webhook`) | Yes (public HTTPS callback) |
 | DingTalk | stream mode | No |
 | QQ | bot gateway | No |
 | Linq | webhook (`/linq`) | Yes (public HTTPS callback) |
@@ -135,7 +137,7 @@ For channels with inbound sender allowlists:
 
 Field names differ by channel:
 
-- `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/Feishu/DingTalk/QQ/Nextcloud Talk)
+- `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/Feishu/DingTalk/QQ/Nextcloud Talk/LINE)
 - `allowed_from` (Signal)
 - `allowed_numbers` (WhatsApp)
 - `allowed_senders` (Email/Linq)
@@ -416,7 +418,32 @@ app_secret = "qq-app-secret"
 allowed_users = ["*"]
 ```
 
-### 4.16 Nextcloud Talk
+### 4.16 LINE
+
+```toml
+[channels_config.line]
+enabled = true
+channel_access_token = "your-channel-access-token"  # or LINE_CHANNEL_ACCESS_TOKEN env var
+channel_secret = "your-channel-secret"               # or LINE_CHANNEL_SECRET env var
+dm_policy = "pairing"    # open | pairing (default) | allowlist
+group_policy = "mention" # open | mention (default) | disabled
+webhook_port = 8443
+# allowed_users = ["Uabc123"]  # used when dm_policy = allowlist
+# proxy_url = "socks5://127.0.0.1:1080"
+```
+
+Notes:
+
+- Inbound webhook endpoint: `POST /webhook`.
+- Signature verification uses `X-Line-Signature` (HMAC-SHA256 of the raw request body). Invalid signatures are rejected before any payload parsing.
+- `dm_policy = pairing` requires the user to send `/bind <code>` before the bot responds. The pairing code is printed in the log at startup.
+- `dm_policy = allowlist` restricts DMs to LINE user IDs in `allowed_users`. Use `["*"]` to allow everyone.
+- `group_policy = mention` responds only when the bot is @mentioned in a group. The @mention token is stripped before the message is sent to the model.
+- Reply tokens (~30 s window) are consumed once. If expired, the bot falls back to the Push API automatically.
+- Audio messages require `[transcription]` to be configured; without it they are silently skipped.
+- See [LINE Setup Guide](../../setup-guides/line-setup.md) for a full runbook.
+
+### 4.17 Nextcloud Talk
 
 ```toml
 [channels_config.nextcloud_talk]
@@ -435,7 +462,7 @@ Notes:
 - `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` overrides config secret.
 - See [nextcloud-talk-setup.md](../../setup-guides/nextcloud-talk-setup.md) for a full runbook.
 
-### 4.16 Linq
+### 4.18 Linq
 
 ```toml
 [channels_config.linq]
@@ -454,7 +481,7 @@ Notes:
 - `ZEROCLAW_LINQ_SIGNING_SECRET` overrides config secret.
 - `allowed_senders` uses E.164 phone number format (e.g. `+1234567890`).
 
-### 4.17 iMessage
+### 4.19 iMessage
 
 ```toml
 [channels_config.imessage]
@@ -531,6 +558,7 @@ rg -n "Matrix|Telegram|Discord|Slack|Mattermost|Signal|WhatsApp|Email|IRC|Lark|D
 | QQ | `QQ: connected and identified` | `QQ: ignoring C2C message from unauthorized user:` / `QQ: ignoring group message from unauthorized user:` | `QQ: received Reconnect (op 7)` / `QQ: received Invalid Session (op 9)` / `QQ: message channel closed` |
 | Nextcloud Talk (gateway) | `POST /nextcloud-talk — Nextcloud Talk bot webhook` | `Nextcloud Talk webhook signature verification failed` / `Nextcloud Talk: ignoring message from unauthorized actor:` | `Nextcloud Talk send failed:` / `LLM error for Nextcloud Talk message:` |
 | iMessage | `iMessage channel listening (AppleScript bridge)...` | (contact allowlist enforced by `allowed_contacts`) | `iMessage poll error:` |
+| LINE | `LINE webhook server listening on 0.0.0.0:<port>` | `LINE: DM from <userId> rejected by policy` / `LINE: unpaired user <userId>; ignoring until /bind` | `LINE: invalid X-Line-Signature` / `LINE: audio download failed for <messageId>:` |
 | Nostr | `Nostr channel listening as npub1...` | `Nostr: ignoring NIP-04 message from unauthorized pubkey:` / `Nostr: ignoring NIP-17 message from unauthorized pubkey:` | `Failed to decrypt NIP-04 message:` / `Failed to unwrap NIP-17 gift wrap:` / `Nostr relay pool shut down` |
 
 ### 7.3 Runtime supervisor keywords
