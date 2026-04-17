@@ -5383,6 +5383,15 @@ pub struct ObservabilityConfig {
     #[serde(default)]
     pub otel_service_name: Option<String>,
 
+    /// Optional HTTP headers sent with every OTLP export request (e.g. authorization).
+    /// Specified as key-value pairs in TOML:
+    /// ```toml
+    /// [observability.otel_headers]
+    /// Authorization = "Bearer sk-..."
+    /// ```
+    #[serde(default)]
+    pub otel_headers: Option<std::collections::HashMap<String, String>>,
+
     /// Runtime trace storage mode: "none" | "rolling" | "full".
     /// Controls whether model replies and tool-call diagnostics are persisted.
     #[serde(default = "default_runtime_trace_mode")]
@@ -5403,6 +5412,7 @@ impl Default for ObservabilityConfig {
             backend: "none".into(),
             otel_endpoint: None,
             otel_service_name: None,
+            otel_headers: None,
             runtime_trace_mode: default_runtime_trace_mode(),
             runtime_trace_path: default_runtime_trace_path(),
             runtime_trace_max_entries: default_runtime_trace_max_entries(),
@@ -6799,6 +6809,10 @@ fn default_multi_message_delay_ms() -> u64 {
     800
 }
 
+fn default_telegram_approval_timeout_secs() -> u64 {
+    120
+}
+
 fn default_matrix_draft_update_interval_ms() -> u64 {
     1500
 }
@@ -6839,6 +6853,10 @@ pub struct TelegramConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// How long (seconds) to wait for the operator to tap an inline-keyboard
+    /// button on a tool approval prompt before auto-denying. Default: 120.
+    #[serde(default = "default_telegram_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -11662,6 +11680,7 @@ auto_save = true
                     mention_only: false,
                     ack_reactions: None,
                     proxy_url: None,
+                    approval_timeout_secs: default_telegram_approval_timeout_secs(),
                 }),
                 discord: None,
                 discord_history: None,
@@ -12551,6 +12570,7 @@ default_temperature = 0.7
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: 120,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -15731,6 +15751,7 @@ require_otp_to_resume = true
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: default_telegram_approval_timeout_secs(),
         });
 
         // Save (triggers encryption)

@@ -1051,6 +1051,7 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: 120,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -1196,6 +1197,7 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: 120,
         });
 
         let target = resolve_heartbeat_delivery(&config).unwrap();
@@ -1215,6 +1217,7 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: 120,
         });
 
         let target = resolve_heartbeat_delivery(&config).unwrap();

@@ -18,6 +18,25 @@ Treat privacy and neutrality as merge gates, not best-effort guidelines.
 - If reproducing external incidents, redact and anonymize all payloads before committing.
 - Before push, review `git diff --cached` specifically for accidental sensitive strings and identity leakage.
 
+## When to Supersede (Required)
+
+Superseding a contributor PR is appropriate in a limited set of situations. Before opening a superseding PR, consider the alternatives in this order:
+
+1. **Push fixups to the contributor's branch.** If the contributor PR has `maintainerCanModify: true` (the default for PRs from personal forks — check with `gh pr view <number> --json maintainerCanModify`), push small fixes directly to their branch and merge the contributor's PR. This preserves full attribution in `git log`, `git blame`, and the contributor's GitHub profile. Coordinate with the contributor if the fix isn't trivial — pushing to their branch while they have unpushed local work creates conflicts they'll need to resolve. If the contributor is actively iterating, prefer option 2 below.
+
+2. **Leave a review with specific requested changes.** If the contributor is active and the fix is within their scope (e.g., a single clippy lint, an edge case, a test addition), request the change and give them an opportunity to push a fixup commit. Single-line fixes are usually better handled by requesting the change or pushing a fixup directly.
+
+3. **Open a follow-up PR after merging.** If the contributor PR is correct as-is and additional hardening is needed, merge the contributor PR first, then open a separate hardening PR. Preserves attribution; the cost is a brief window with known issues on master.
+
+Supersede when one or more of the following apply:
+
+- The contributor is unresponsive (no reply within the project's review SLA).
+- The change requires substantially more work than the contributor's original scope.
+- Multiple related contributor PRs need to be unified into a single coherent change.
+- The contributor has opted out of maintainer edits (`maintainerCanModify: false`) and a follow-up PR is impractical.
+
+When superseding is the right choice, follow the attribution rules in the next section. Always include `Co-authored-by` trailers for materially incorporated contributors, regardless of the circumstances that led to the supersede.
+
 ## Superseded-PR Attribution (Required)
 
 When a PR supersedes another contributor's PR and carries forward substantive code or design decisions, preserve authorship explicitly.

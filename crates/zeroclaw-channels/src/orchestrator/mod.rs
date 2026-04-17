@@ -3055,6 +3055,7 @@ async fn process_channel_message(
                         ctx.max_tool_result_chars,
                         ctx.context_token_budget,
                         None, // shared_budget
+                        target_channel.as_deref(),
                     ),
                     ),
                     ),
@@ -3917,7 +3918,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
                 .with_tts(config.tts.clone())
-                .with_workspace_dir(config.workspace_dir.clone()),
+                .with_workspace_dir(config.workspace_dir.clone())
+                .with_approval_timeout_secs(tg.approval_timeout_secs),
             ))
         }
         "discord" => {
@@ -4349,7 +4351,8 @@ fn collect_configured_channels(
                     .with_tts(config.tts.clone())
                     .with_workspace_dir(config.workspace_dir.clone())
                     .with_proxy_url(tg.proxy_url.clone())
-                    .with_tool_command_specs(tool_specs.to_vec()),
+                    .with_tool_command_specs(tool_specs.to_vec())
+                    .with_approval_timeout_secs(tg.approval_timeout_secs),
                 ),
             });
         } else {
@@ -11523,6 +11526,7 @@ This is an example JSON object for profile settings."#;
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: 120,
         });
         match build_channel_by_id(&config, "telegram") {
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
