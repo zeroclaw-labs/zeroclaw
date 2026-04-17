@@ -7335,9 +7335,11 @@ pub struct WebhookConfig {
     #[serde(default)]
     pub max_retries: Option<u32>,
     /// Base delay in milliseconds for exponential backoff between retries. Default: `500`.
+    /// Values below `1` are clamped to `1ms` at runtime to avoid busy-retry loops.
     #[serde(default)]
     pub retry_base_delay_ms: Option<u64>,
     /// Maximum delay cap in milliseconds for any single retry wait. Default: `30000` (30s).
+    /// Values below `1` are clamped to `1ms` at runtime to avoid busy-retry loops.
     #[serde(default)]
     pub retry_max_delay_ms: Option<u64>,
 }

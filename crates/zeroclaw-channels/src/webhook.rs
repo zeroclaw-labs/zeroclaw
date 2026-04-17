@@ -73,8 +73,13 @@ impl WebhookChannel {
             auth_header,
             secret,
             max_retries: max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
-            retry_base_delay_ms: retry_base_delay_ms.unwrap_or(DEFAULT_RETRY_BASE_DELAY_MS),
-            retry_max_delay_ms: retry_max_delay_ms.unwrap_or(DEFAULT_RETRY_MAX_DELAY_MS),
+            // Clamp delays to >=1ms so a misconfigured `0` does not busy-retry without yielding.
+            retry_base_delay_ms: retry_base_delay_ms
+                .unwrap_or(DEFAULT_RETRY_BASE_DELAY_MS)
+                .max(1),
+            retry_max_delay_ms: retry_max_delay_ms
+                .unwrap_or(DEFAULT_RETRY_MAX_DELAY_MS)
+                .max(1),
         }
     }
 
@@ -121,6 +126,63 @@ impl WebhookChannel {
         };
 
         mac.verify_slice(&expected).is_ok()
+    }
+
+    async fn attempt_send(
+        &self,
+        client: &reqwest::Client,
+        send_url: &str,
+        payload: &OutgoingWebhook,
+    ) -> AttemptOutcome {
+        let mut request = match self.send_method.as_str() {
+            "PUT" => client.put(send_url),
+            _ => client.post(send_url),
+        };
+
+        if let Some(ref auth) = self.auth_header {
+            request = request.header("Authorization", auth);
+        }
+
+        let resp = match request.json(payload).send().await {
+            Ok(r) => r,
+            Err(e) => return AttemptOutcome::Retry(format!("network error: {e}")),
+        };
+
+        let status = resp.status();
+        if status.is_success() {
+            return AttemptOutcome::Success;
+        }
+
+        let code = status.as_u16();
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after_ms);
+
+        // 429 and 503 may include Retry-After; honor it if present. 429 appears here
+        // *and* in the branch below: here we take the server-supplied delay, below we
+        // fall back to exponential backoff when no Retry-After header was sent.
+        // Reading the body is deferred until after this early-return so hot 429 loops
+        // against large pages don't pay the I/O cost.
+        if (code == 429 || code == 503)
+            && let Some(ms) = retry_after
+        {
+            return AttemptOutcome::RetryAfter(Duration::from_millis(ms));
+        }
+
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
+
+        // Retry 429 (rate limit) and 5xx (server errors).
+        if code == 429 || (500..600).contains(&code) {
+            return AttemptOutcome::Retry(format!("Webhook send failed ({status}): {body}"));
+        }
+
+        // Other 4xx → do not retry.
+        AttemptOutcome::Fatal(anyhow::anyhow!("Webhook send failed ({status}): {body}"))
     }
 }
 
@@ -356,63 +418,6 @@ impl Channel for WebhookChannel {
         // Webhook channel is healthy if the port can be bound (basic check).
         // In practice, once listen() starts the server is running.
         true
-    }
-}
-
-impl WebhookChannel {
-    async fn attempt_send(
-        &self,
-        client: &reqwest::Client,
-        send_url: &str,
-        payload: &OutgoingWebhook,
-    ) -> AttemptOutcome {
-        let mut request = match self.send_method.as_str() {
-            "PUT" => client.put(send_url),
-            _ => client.post(send_url),
-        };
-
-        if let Some(ref auth) = self.auth_header {
-            request = request.header("Authorization", auth);
-        }
-
-        let resp = match request.json(payload).send().await {
-            Ok(r) => r,
-            Err(e) => return AttemptOutcome::Retry(format!("network error: {e}")),
-        };
-
-        let status = resp.status();
-        if status.is_success() {
-            return AttemptOutcome::Success;
-        }
-
-        let code = status.as_u16();
-        let retry_after = resp
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_retry_after_ms);
-
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-
-        // 429 and 503 may include Retry-After; honor it if present. 429 appears here
-        // *and* in the branch below: here we take the server-supplied delay, below we
-        // fall back to exponential backoff when no Retry-After header was sent.
-        if (code == 429 || code == 503)
-            && let Some(ms) = retry_after
-        {
-            return AttemptOutcome::RetryAfter(Duration::from_millis(ms));
-        }
-
-        // Retry 429 (rate limit) and 5xx (server errors).
-        if code == 429 || (500..600).contains(&code) {
-            return AttemptOutcome::Retry(format!("Webhook send failed ({status}): {body}"));
-        }
-
-        // Other 4xx → do not retry.
-        AttemptOutcome::Fatal(anyhow::anyhow!("Webhook send failed ({status}): {body}"))
     }
 }
 
