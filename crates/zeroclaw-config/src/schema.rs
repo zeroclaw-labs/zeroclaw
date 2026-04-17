@@ -10662,6 +10662,17 @@ pub struct WebhookConfig {
     /// are not exposed to the model when responding via this channel.
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Maximum number of retry attempts for outbound sends on transient failures
+    /// (network errors, 429, 5xx). Set to `0` to disable retries. Default: `3`.
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+    /// Base delay in milliseconds for exponential backoff between retries. Default: `500`.
+    #[serde(default)]
+    pub retry_base_delay_ms: Option<u64>,
+    /// Maximum delay cap in milliseconds for any single retry wait. Default: `30000` (30s).
+    #[serde(default)]
+    pub retry_max_delay_ms: Option<u64>,
 }
 
 impl ChannelConfig for WebhookConfig {
