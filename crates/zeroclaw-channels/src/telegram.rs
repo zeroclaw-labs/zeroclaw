@@ -5394,7 +5394,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_bot_commands_includes_skills() {
-        use wiremock::matchers::{method, path_regex};
+        use wiremock::matchers::{body_json, method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let workspace = tempfile::tempdir().unwrap();
@@ -5408,8 +5408,20 @@ mod tests {
 
         let mock_server = MockServer::start().await;
 
+        let expected_body = serde_json::json!({
+            "commands": [
+                { "command": "new",     "description": "Start a new conversation session" },
+                { "command": "stop",    "description": "Cancel the current in-flight task" },
+                { "command": "model",   "description": "Show or switch the current model" },
+                { "command": "models",  "description": "List available providers or switch provider" },
+                { "command": "config",  "description": "Show current configuration" },
+                { "command": "weather", "description": "Check the weather forecast" },
+            ]
+        });
+
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .and(body_json(&expected_body))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({ "ok": true, "result": true })),
@@ -5423,9 +5435,6 @@ mod tests {
             .with_workspace_dir(workspace.path().to_path_buf());
 
         ch.register_bot_commands().await;
-
-        // Verify the mock was called (expectations checked on drop).
-        // The request should contain 5 built-in + 1 skill command = 6 total.
     }
 
     #[tokio::test]
