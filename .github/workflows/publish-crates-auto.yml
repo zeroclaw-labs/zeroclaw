@@ -86,13 +86,8 @@ jobs:
 
   publish:
     name: Publish to crates.io
-    # BLOCKED by #5811 — after the microkernel workspace split (#5559), the
-    # root `zeroclawlabs` crate cannot publish because its 14 workspace
-    # sub-crates are all `publish = false` and therefore unresolvable on
-    # crates.io. Gated off until the multi-crate publish topology is
-    # designed (see #5811 and RFC #5579).
     needs: [detect-version-change, check-registry]
-    if: false && needs.check-registry.outputs.should_publish == 'true'
+    if: needs.check-registry.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

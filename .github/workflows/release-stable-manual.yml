@@ -10,11 +10,6 @@ on:
         description: "Stable version to release (e.g. 0.2.0)"
         required: true
         type: string
-      publish_crates_io:
-        description: "Publish to crates.io (BLOCKED by #5811 — must be opted-in explicitly)"
-        required: false
-        type: boolean
-        default: false
 
 concurrency:
   group: promote-release
@@ -456,18 +451,6 @@ jobs:
 
   crates-io:
     name: Publish to crates.io
-    # BLOCKED by #5811 — after the microkernel workspace split (#5559), the
-    # root `zeroclawlabs` crate depends on 14 workspace sub-crates that are all
-    # `publish = false`. `cargo publish` on the root fails with "no matching
-    # package named `zeroclaw-api` found" because the sub-crate versions are
-    # never pushed to crates.io.
-    #
-    # This job is gated off by default until the multi-crate publish topology
-    # is designed and implemented (tracked in #5811 and RFC #5579). Set the
-    # `publish_crates_io` input to `true` on a manual workflow_dispatch only
-    # after the root crate is verified to publish cleanly via
-    # `cargo publish --dry-run --locked --allow-dirty --no-verify`.
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_crates_io }}
     needs: [validate, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 30
