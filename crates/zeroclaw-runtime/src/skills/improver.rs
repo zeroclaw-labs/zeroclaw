@@ -13,7 +13,7 @@ use zeroclaw_config::schema::SkillImprovementConfig;
 pub struct SkillImprover {
     workspace_dir: PathBuf,
     config: SkillImprovementConfig,
-    cooldowns: HashMap<String, Instant>,
+    pub(crate) cooldowns: HashMap<String, Instant>,
 }
 
 impl SkillImprover {
@@ -109,6 +109,26 @@ impl SkillImprover {
                     toml_path.display()
                 )
             })?;
+
+        // Post-write security audit: ensure the improved skill directory
+        // still passes the security audit. If not, restore the original.
+        match super::audit::audit_skill_directory(&skill_dir) {
+            Ok(report) if !report.is_clean() => {
+                tracing::warn!(
+                    slug,
+                    findings = %report.summary(),
+                    "Improved skill failed security audit — restoring original"
+                );
+                tokio::fs::write(&toml_path, existing.as_bytes()).await?;
+                bail!("Improved skill failed security audit: {}", report.summary());
+            }
+            Err(e) => {
+                tracing::warn!(slug, error = %e, "Skill audit error after improvement — restoring original");
+                tokio::fs::write(&toml_path, existing.as_bytes()).await?;
+                bail!("Skill audit error after improvement: {e}");
+            }
+            Ok(_) => {}
+        }
 
         // Record cooldown.
         self.cooldowns.insert(slug.to_string(), Instant::now());

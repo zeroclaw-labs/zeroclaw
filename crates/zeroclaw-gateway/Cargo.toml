@@ -67,8 +67,10 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 [dev-dependencies]
 rand = "0.10"
 rcgen = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "stream"] }
 tempfile = "3.26"
-tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "net"] }
+futures-util = { version = "0.3", default-features = false }
 
 [features]
 default = []

@@ -1386,6 +1386,11 @@ async fn main() -> Result<()> {
                 Box::new(zeroclaw_channels::cli::CliChannel::new())
             }));
 
+            // Wire One2X custom gateway routes (F-04 web channel WS, F-05 agent SSE)
+            // before the gateway thread starts. This is idempotent thanks to OnceLock.
+            #[cfg(all(feature = "one2x", feature = "gateway"))]
+            crate::one2x::register_gateway_routes();
+
             // Wire peripheral tools from zeroclaw-hardware
             #[cfg(feature = "hardware")]
             zeroclaw_runtime::agent::loop_::register_peripheral_tools_fn(Box::new(|config| {

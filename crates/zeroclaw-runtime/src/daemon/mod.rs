@@ -306,11 +306,31 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
     let observer: std::sync::Arc<dyn crate::observability::Observer> =
         std::sync::Arc::from(crate::observability::create_observer(&config.observability));
-    let engine = HeartbeatEngine::new(
+    let mut engine = HeartbeatEngine::new(
         config.heartbeat.clone(),
         config.workspace_dir.clone(),
         observer,
     );
+
+    // Wire SkillForge into heartbeat for periodic skill discovery. Config
+    // comes from `[skills.skill_forge]` in zeroclaw.toml; defaults have
+    // `enabled = false`, so this is a no-op unless the user opts in.
+    let forge_config: crate::skillforge::SkillForgeConfig =
+        config.skills.skill_forge.clone().into();
+    if forge_config.enabled {
+        engine = engine.with_skillforge(forge_config);
+    }
+
+    // Wire the P3-1 confidence evaluator: marks chronically-failing skills as
+    // deprecated. Config comes from `[skills.skill_confidence]`.
+    if config.skills.skill_confidence.enabled {
+        let confidence_policy =
+            crate::skills::confidence::ConfidencePolicy::from(&config.skills.skill_confidence);
+        let scan_interval = std::time::Duration::from_secs(
+            config.skills.skill_confidence.scan_interval_hours.max(1) * 3600,
+        );
+        engine = engine.with_confidence_evaluator(confidence_policy, scan_interval);
+    }
     let metrics = engine.metrics();
     let delivery = resolve_heartbeat_delivery(&config)?;
     let two_phase = config.heartbeat.two_phase;

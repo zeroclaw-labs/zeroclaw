@@ -1922,25 +1922,52 @@ mod tests {
         );
     }
 
+    // NOTE on jitter: `compute_backoff` intentionally adds ±25% jitter
+    // from `SystemTime::now().subsec_nanos()` to prevent thundering-herd
+    // retries. The earlier version of these three tests used `assert_eq!`
+    // against the un-jittered nominal value, which made them pass only
+    // by luck (sub-1% of the time). Assert on the documented ±25% band.
+
+    /// Given `base ± 25%`, returns `(lo, hi)` inclusive bounds.
+    fn jitter_bounds(nominal: u64) -> (u64, u64) {
+        let q = nominal / 4;
+        (nominal.saturating_sub(q), nominal.saturating_add(q))
+    }
+
     #[test]
     fn compute_backoff_uses_retry_after() {
         let provider = ReliableProvider::new(vec![], 0, 500);
         let err = anyhow::anyhow!("429 Retry-After: 3");
-        assert_eq!(provider.compute_backoff(500, &err), 3_000);
+        let got = provider.compute_backoff(500, &err);
+        let (lo, hi) = jitter_bounds(3_000);
+        assert!(
+            got >= lo && got <= hi,
+            "expected {lo}..={hi} (nominal 3000 ±25% jitter), got {got}"
+        );
     }
 
     #[test]
     fn compute_backoff_caps_at_30s() {
         let provider = ReliableProvider::new(vec![], 0, 500);
         let err = anyhow::anyhow!("429 Retry-After: 120");
-        assert_eq!(provider.compute_backoff(500, &err), 30_000);
+        let got = provider.compute_backoff(500, &err);
+        let (lo, hi) = jitter_bounds(30_000);
+        assert!(
+            got >= lo && got <= hi,
+            "expected {lo}..={hi} (cap 30000 ±25% jitter), got {got}"
+        );
     }
 
     #[test]
     fn compute_backoff_falls_back_to_base() {
         let provider = ReliableProvider::new(vec![], 0, 500);
         let err = anyhow::anyhow!("500 Server Error");
-        assert_eq!(provider.compute_backoff(500, &err), 500);
+        let got = provider.compute_backoff(500, &err);
+        let (lo, hi) = jitter_bounds(500);
+        assert!(
+            got >= lo && got <= hi,
+            "expected {lo}..={hi} (base 500 ±25% jitter), got {got}"
+        );
     }
 
     // ── §2.1 API auth error (401/403) tests ──────────────────

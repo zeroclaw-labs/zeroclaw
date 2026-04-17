@@ -3,7 +3,7 @@ use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TEST_FILE_NAME: &str = "TEST.sh";
+pub const TEST_FILE_NAME: &str = "TEST.sh";
 
 /// Result of running all tests for a single skill.
 #[derive(Debug, Clone)]
@@ -26,16 +26,16 @@ pub struct TestFailure {
 
 /// A parsed test case from a TEST.sh line.
 #[derive(Debug, Clone)]
-struct TestCase {
-    command: String,
-    expected_exit: i32,
-    expected_pattern: String,
+pub struct TestCase {
+    pub command: String,
+    pub expected_exit: i32,
+    pub expected_pattern: String,
 }
 
 /// Parse a single TEST.sh line into a `TestCase`.
 ///
 /// Expected format: `command | expected_exit_code | expected_output_pattern`
-fn parse_test_line(line: &str) -> Option<TestCase> {
+pub fn parse_test_line(line: &str) -> Option<TestCase> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return None;
@@ -78,7 +78,7 @@ fn parse_test_line(line: &str) -> Option<TestCase> {
 /// If the pattern looks like a regex (contains regex metacharacters beyond a
 /// simple `/` path), we attempt a regex match. Otherwise we fall back to a
 /// simple substring check.
-fn pattern_matches(output: &str, pattern: &str) -> bool {
+pub fn pattern_matches(output: &str, pattern: &str) -> bool {
     if pattern.is_empty() {
         return true;
     }

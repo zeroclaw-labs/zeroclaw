@@ -25,7 +25,7 @@ pub mod tls;
 pub mod ws;
 
 #[cfg(feature = "one2x")]
-pub(crate) mod one2x;
+pub mod one2x;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -1169,6 +1169,10 @@ pub async fn run_gateway(
             tracing::info!("🦀 ZeroClaw Gateway shutting down...");
         })
         .await?;
+    }
+
+    if let Some(ref hooks) = hooks {
+        hooks.fire_gateway_stop().await;
     }
 
     Ok(())

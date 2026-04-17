@@ -40,6 +40,9 @@ credentials.json
 # Claude Code agent worktrees (temporary isolated workspaces)
 .claude/worktrees/
 
+# Project-local Claude Code runtime state
+.claude/state/
+
 # Local state backups
 .local-state-backups/
 *.local-state-backup/

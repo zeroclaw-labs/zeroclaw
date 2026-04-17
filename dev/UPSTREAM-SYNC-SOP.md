@@ -8,17 +8,38 @@
 
 ## Architecture
 
+### Root crate (`src/one2x/`) — v6 layout
+
+v6 把大部分 one2x 代码搬到了子 crate。根 crate 下只剩真正依赖根 crate 类型
+（`approval`、`tools`、`gateway::AppState`）的那部分：
+
 ```
 src/one2x/
-├── mod.rs              # 协调中心：extend_router() + extend_channels()
-├── web_channel.rs      # WebSocket 实时通道 (从 channels/web.rs 迁移)
-├── agent_sse.rs        # SSE Agent 端点 (从 gateway/agent_sse.rs 迁移)
-├── gateway_ext.rs      # WS channel handler (从 gateway/mod.rs 提取)
-├── config.rs           # WebChannelConfig (从 config/schema.rs 提取)
-├── session_hygiene.rs  # Session JSONL bloat 防护 (trim/truncate/repair)
-├── compaction.rs       # 多阶段分块压缩 + 质量验证 (替换单次 compress_once)
-└── agent_hooks.rs      # planning 检测 + fast approval 优化
+├── mod.rs              # 协调中心：register_gateway_routes() 注册 IoC 路由闭包
+├── web_channel.rs      # WebSocket 实时通道 (F-04)
+├── agent_sse.rs        # SSE Agent 端点 (F-05)
+└── gateway_ext.rs      # pairing-aware WS handler 包装
 ```
+
+### Sub-crate one2x 模块 — canonical v6 实现位置
+
+| 功能 | 位置 |
+|------|------|
+| Runtime-side tool pairing / fast-approval / planning detection | `crates/zeroclaw-runtime/src/one2x.rs` |
+| 多阶段分块压缩 + 质量验证 | `crates/zeroclaw-runtime/src/one2x/compaction.rs` |
+| Channel-side session hygiene（trim / truncate / repair） | `crates/zeroclaw-channels/src/one2x.rs` |
+| Gateway 路由 IoC 钩子 | `crates/zeroclaw-gateway/src/one2x.rs` |
+| `WebChannelConfig` 定义 | `crates/zeroclaw-config/src/scattered_types.rs`（`#[cfg(feature = "one2x")]`） |
+
+### 历史（2026-04-16 清理）
+
+根 crate 曾经有 `agent_hooks.rs` / `session_hygiene.rs` / `tool_pairing.rs` /
+`compaction.rs` / `config.rs` 五个文件，都是 v5 时代的实现。v6 拆 crate 后它们
+已经和对应子 crate 的 canonical 版本分叉，且没有任何活的 `mod` 声明引用它们。
+2026-04-16 的 polish 阶段把这五个死文件从磁盘上删了 —— git 历史保留完整，
+需要回溯可以 `git log --all -- src/one2x/{agent_hooks,session_hygiene,tool_pairing,compaction,config}.rs`。
+遇到上游合并冲突时，请去上面那张表对应的子 crate 位置查看 canonical 实现，
+**不要**尝试复活根 crate 的 v5 副本。
 
 ### Upstream Integration Points
 
@@ -315,7 +336,8 @@ git cherry-pick <commit-1> <commit-2> ...  # 逐个应用，逐个解决
 
 ### 当前保留功能
 
-完整列表见 `dev/custom-features.md`，当前有 8 个活跃功能（F-01 至 F-08）。
+完整列表见 `dev/custom-features.md`，当前有 19 个活跃功能（F-01 至 F-19）。
+其中 F-16 至 F-19 为自进化 Phase 0 改动（2026-04-16），无 feature flag，直接改进上游代码。
 运行 `./dev/check-parity.sh` 查看实时状态。
 
 ## Bedrock Compatibility Fixes (custom patches)

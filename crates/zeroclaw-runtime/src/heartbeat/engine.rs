@@ -165,12 +165,22 @@ pub fn compute_adaptive_interval(
 
 // ── Engine ───────────────────────────────────────────────────────
 
-/// Heartbeat engine — reads HEARTBEAT.md and executes tasks periodically
+/// Heartbeat engine — reads HEARTBEAT.md and executes tasks periodically.
+/// Optionally runs SkillForge scans on a configured interval.
 pub struct HeartbeatEngine {
     config: HeartbeatConfig,
     workspace_dir: std::path::PathBuf,
     observer: Arc<dyn Observer>,
     metrics: Arc<ParkingMutex<HeartbeatMetrics>>,
+    hooks: Option<Arc<crate::hooks::HookRunner>>,
+    skillforge: Option<crate::skillforge::SkillForge>,
+    last_forge_scan: ParkingMutex<Option<std::time::Instant>>,
+    forge_interval: Duration,
+    /// When set, each heartbeat tick runs the confidence evaluator if enough
+    /// time has elapsed since the last run.
+    confidence_policy: Option<crate::skills::confidence::ConfidencePolicy>,
+    last_confidence_scan: ParkingMutex<Option<std::time::Instant>>,
+    confidence_interval: Duration,
 }
 
 impl HeartbeatEngine {
@@ -184,7 +194,39 @@ impl HeartbeatEngine {
             workspace_dir,
             observer,
             metrics: Arc::new(ParkingMutex::new(HeartbeatMetrics::default())),
+            hooks: None,
+            skillforge: None,
+            last_forge_scan: ParkingMutex::new(None),
+            forge_interval: Duration::from_secs(24 * 3600),
+            confidence_policy: None,
+            last_confidence_scan: ParkingMutex::new(None),
+            confidence_interval: Duration::from_secs(6 * 3600),
         }
+    }
+
+    pub fn with_hooks(mut self, hooks: Arc<crate::hooks::HookRunner>) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
+    pub fn with_skillforge(mut self, forge_config: crate::skillforge::SkillForgeConfig) -> Self {
+        let interval_secs = forge_config.scan_interval_hours.max(1) * 3600;
+        self.forge_interval = Duration::from_secs(interval_secs);
+        self.skillforge = Some(crate::skillforge::SkillForge::new(forge_config));
+        self
+    }
+
+    /// Enable the P3-1 confidence evaluator on this heartbeat. When set, each
+    /// tick will run [`crate::skills::confidence::evaluate_and_deprecate`] at
+    /// most once per `interval`, marking low-confidence skills as deprecated.
+    pub fn with_confidence_evaluator(
+        mut self,
+        policy: crate::skills::confidence::ConfidencePolicy,
+        interval: Duration,
+    ) -> Self {
+        self.confidence_policy = Some(policy);
+        self.confidence_interval = interval;
+        self
     }
 
     /// Get a shared handle to the live heartbeat metrics.
@@ -208,6 +250,10 @@ impl HeartbeatEngine {
             interval.tick().await;
             self.observer.record_event(&ObserverEvent::HeartbeatTick);
 
+            if let Some(ref hooks) = self.hooks {
+                hooks.fire_heartbeat_tick().await;
+            }
+
             match self.tick().await {
                 Ok(tasks) => {
                     if tasks > 0 {
@@ -225,9 +271,111 @@ impl HeartbeatEngine {
         }
     }
 
-    /// Single heartbeat tick — read HEARTBEAT.md and return task count
+    /// Single heartbeat tick — read HEARTBEAT.md, run SkillForge if due,
+    /// and return task count.
     async fn tick(&self) -> Result<usize> {
+        self.try_forge_scan().await;
+        self.try_confidence_scan();
         Ok(self.collect_tasks().await?.len())
+    }
+
+    /// Run the P3-1 confidence evaluator if configured and the interval has
+    /// elapsed. Low-confidence skills get a `DEPRECATED` sidecar file in
+    /// their directory. Errors are logged but do not fail the tick.
+    fn try_confidence_scan(&self) {
+        let Some(ref policy) = self.confidence_policy else {
+            return;
+        };
+
+        let should_scan = {
+            let last = self.last_confidence_scan.lock();
+            match *last {
+                Some(t) => t.elapsed() >= self.confidence_interval,
+                None => true,
+            }
+        };
+        if !should_scan {
+            return;
+        }
+
+        let store = crate::skills::confidence::JsonlTraceStore::new(
+            crate::skills::confidence::default_trace_store_path(&self.workspace_dir),
+        );
+        let skills_dir = self.workspace_dir.join("skills");
+
+        // Pass 1 — deprecate newly-flaky skills.
+        match crate::skills::confidence::evaluate_and_deprecate(&store, &skills_dir, policy) {
+            Ok(deprecated) if !deprecated.is_empty() => {
+                info!(
+                    deprecated = ?deprecated,
+                    "🧹 Confidence scan deprecated {} skill(s)",
+                    deprecated.len()
+                );
+            }
+            Ok(_) => {
+                tracing::debug!("Confidence scan: no skills deprecated");
+            }
+            Err(e) => {
+                warn!("Confidence scan failed: {e}");
+            }
+        }
+
+        // Pass 2 — reinstate previously-deprecated skills whose recent
+        // traces show recovery (closes the self-evolution loop).
+        match crate::skills::confidence::reevaluate_deprecations(&store, &skills_dir, policy) {
+            Ok(reinstated) if !reinstated.is_empty() => {
+                info!(
+                    reinstated = ?reinstated,
+                    "♻️  Confidence scan reinstated {} skill(s)",
+                    reinstated.len()
+                );
+            }
+            Ok(_) => {
+                tracing::debug!("Confidence scan: no skills reinstated");
+            }
+            Err(e) => {
+                warn!("Confidence reinstatement pass failed: {e}");
+            }
+        }
+
+        *self.last_confidence_scan.lock() = Some(std::time::Instant::now());
+    }
+
+    /// Run SkillForge discovery pipeline if configured and the scan interval
+    /// has elapsed. Errors are logged but do not fail the tick.
+    async fn try_forge_scan(&self) {
+        let Some(ref forge) = self.skillforge else {
+            return;
+        };
+
+        let should_scan = {
+            let last = self.last_forge_scan.lock();
+            match *last {
+                Some(t) => t.elapsed() >= self.forge_interval,
+                None => true,
+            }
+        };
+
+        if !should_scan {
+            return;
+        }
+
+        info!("🔨 SkillForge: starting periodic scan");
+        match forge.forge().await {
+            Ok(report) => {
+                info!(
+                    discovered = report.discovered,
+                    integrated = report.auto_integrated,
+                    review = report.manual_review,
+                    skipped = report.skipped,
+                    "🔨 SkillForge scan complete"
+                );
+                *self.last_forge_scan.lock() = Some(std::time::Instant::now());
+            }
+            Err(e) => {
+                warn!(error = %e, "🔨 SkillForge scan failed");
+            }
+        }
     }
 
     /// Read HEARTBEAT.md and return all parsed structured tasks.
@@ -849,5 +997,203 @@ mod tests {
             HeartbeatEngine::new(HeartbeatConfig::default(), std::env::temp_dir(), observer);
         let metrics = engine.metrics();
         assert_eq!(metrics.lock().total_ticks, 0);
+    }
+
+    // ── SkillForge integration ──────────────────────────────────
+
+    #[test]
+    fn with_skillforge_sets_interval() {
+        let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
+        let forge_config = crate::skillforge::SkillForgeConfig {
+            enabled: true,
+            scan_interval_hours: 12,
+            ..Default::default()
+        };
+        let engine = HeartbeatEngine::new(
+            HeartbeatConfig::default(),
+            std::env::temp_dir(),
+            observer,
+        )
+        .with_skillforge(forge_config);
+
+        assert!(engine.skillforge.is_some());
+        assert_eq!(engine.forge_interval, Duration::from_secs(12 * 3600));
+    }
+
+    #[tokio::test]
+    async fn try_forge_scan_skips_when_not_configured() {
+        let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
+        let engine =
+            HeartbeatEngine::new(HeartbeatConfig::default(), std::env::temp_dir(), observer);
+
+        // Should not panic or error when no SkillForge is configured.
+        engine.try_forge_scan().await;
+        assert!(engine.last_forge_scan.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn try_forge_scan_runs_disabled_forge() {
+        let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
+        let forge_config = crate::skillforge::SkillForgeConfig {
+            enabled: false,
+            scan_interval_hours: 1,
+            ..Default::default()
+        };
+        let engine = HeartbeatEngine::new(
+            HeartbeatConfig::default(),
+            std::env::temp_dir(),
+            observer,
+        )
+        .with_skillforge(forge_config);
+
+        // Forge is disabled, so the scan returns an empty report but still records the timestamp.
+        engine.try_forge_scan().await;
+        assert!(engine.last_forge_scan.lock().is_some());
+    }
+
+    #[tokio::test]
+    async fn try_forge_scan_respects_interval() {
+        let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
+        let forge_config = crate::skillforge::SkillForgeConfig {
+            enabled: false,
+            scan_interval_hours: 99999,
+            ..Default::default()
+        };
+        let engine = HeartbeatEngine::new(
+            HeartbeatConfig::default(),
+            std::env::temp_dir(),
+            observer,
+        )
+        .with_skillforge(forge_config);
+
+        // First scan should run.
+        engine.try_forge_scan().await;
+        let first = *engine.last_forge_scan.lock();
+        assert!(first.is_some());
+
+        // Second scan should be skipped (interval not elapsed).
+        engine.try_forge_scan().await;
+        let second = *engine.last_forge_scan.lock();
+        assert_eq!(
+            first.unwrap().elapsed().as_secs(),
+            second.unwrap().elapsed().as_secs(),
+            "Timestamp should not have changed"
+        );
+    }
+
+    // ── Confidence evaluator integration (P3-1) ────────────────
+
+    #[test]
+    fn with_confidence_evaluator_sets_interval() {
+        let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
+        let engine = HeartbeatEngine::new(
+            HeartbeatConfig::default(),
+            std::env::temp_dir(),
+            observer,
+        )
+        .with_confidence_evaluator(
+            crate::skills::confidence::ConfidencePolicy::default(),
+            Duration::from_secs(1234),
+        );
+
+        assert!(engine.confidence_policy.is_some());
+        assert_eq!(engine.confidence_interval, Duration::from_secs(1234));
+    }
+
+    #[test]
+    fn try_confidence_scan_skips_when_not_configured() {
+        let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
+        let engine =
+            HeartbeatEngine::new(HeartbeatConfig::default(), std::env::temp_dir(), observer);
+
+        engine.try_confidence_scan();
+        assert!(engine.last_confidence_scan.lock().is_none());
+    }
+
+    #[test]
+    fn try_confidence_scan_runs_and_records_timestamp() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("skills")).unwrap();
+
+        let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
+        let engine = HeartbeatEngine::new(
+            HeartbeatConfig::default(),
+            tmp.path().to_path_buf(),
+            observer,
+        )
+        .with_confidence_evaluator(
+            crate::skills::confidence::ConfidencePolicy::default(),
+            Duration::from_secs(60),
+        );
+
+        engine.try_confidence_scan();
+        assert!(engine.last_confidence_scan.lock().is_some());
+    }
+
+    #[test]
+    fn try_confidence_scan_respects_interval() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("skills")).unwrap();
+
+        let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
+        let engine = HeartbeatEngine::new(
+            HeartbeatConfig::default(),
+            tmp.path().to_path_buf(),
+            observer,
+        )
+        .with_confidence_evaluator(
+            crate::skills::confidence::ConfidencePolicy::default(),
+            Duration::from_secs(9_999_999),
+        );
+
+        engine.try_confidence_scan();
+        let first = *engine.last_confidence_scan.lock();
+        assert!(first.is_some());
+
+        engine.try_confidence_scan();
+        let second = *engine.last_confidence_scan.lock();
+        assert_eq!(
+            first.unwrap().elapsed().as_secs(),
+            second.unwrap().elapsed().as_secs(),
+            "timestamp should not advance when interval has not elapsed"
+        );
+    }
+
+    #[test]
+    fn try_confidence_scan_marks_flaky_skill() {
+        use crate::skills::confidence::{
+            ConfidencePolicy, JsonlTraceStore, SkillTrace, TraceStore,
+            default_trace_store_path, is_skill_deprecated,
+        };
+        use chrono::Utc;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        std::fs::create_dir_all(workspace.join("skills").join("flaky")).unwrap();
+
+        // Seed traces that guarantee deprecation.
+        let store = JsonlTraceStore::new(default_trace_store_path(&workspace));
+        for _ in 0..20 {
+            store
+                .append(&SkillTrace {
+                    skill_slug: "flaky".into(),
+                    timestamp: Utc::now(),
+                    success: false,
+                    duration_ms: 100,
+                    tool_calls: 1,
+                })
+                .unwrap();
+        }
+
+        let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
+        let engine = HeartbeatEngine::new(HeartbeatConfig::default(), workspace.clone(), observer)
+            .with_confidence_evaluator(ConfidencePolicy::default(), Duration::from_secs(60));
+
+        engine.try_confidence_scan();
+
+        assert!(is_skill_deprecated(&workspace.join("skills").join("flaky")));
     }
 }

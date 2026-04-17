@@ -437,3 +437,150 @@ jitter.*backoff | backoff.*jitter | retry.*jitter | random.*backoff
 # providers/reliable.rs: 删除 compute_backoff 中的 jitter 计算（3 行）
 # providers/reliable.rs: 删除顶部 use rand::RngExt as _; import
 ```
+
+---
+
+## F-16: Skill Creation 安全审计 (Phase 0 - C5)
+
+**状态**: 保留中（改动在上游文件，无 feature flag — 安全防御改进）  
+**上游文件改动**: `skills/creator.rs` — `create_from_execution()` 写入 SKILL.toml 后  
+**添加时间**: 2026-04-16 (自进化 Phase 0)
+
+### 功能说明
+自动创建的 skill 在写入磁盘后立即过安全审计（`audit_skill_directory`）。
+审计不通过则删除 skill 目录并返回 `None`，防止注入、路径遍历等恶意 skill 进入运行时。
+
+### 上游观察条件
+```
+audit.*skill.*creat | creator.*audit | post.*create.*audit | skill.*security.*create
+```
+
+### 等价性标准（满足即可删除）
+- [ ] 上游 `create_from_execution` 写入后调用 `audit_skill_directory` 或等效审计
+- [ ] 审计不通过时自动清理
+
+### 删除步骤
+```bash
+# skills/creator.rs: 删除 create_from_execution 中 audit_skill_directory 调用块（约 14 行，在 tokio::fs::write 之后）
+```
+
+---
+
+## F-17: AuditedMemory 工厂接入 (Phase 0 - C3)
+
+**状态**: 保留中（改动在上游文件，无 feature flag — 安全基础设施）  
+**上游文件改动**: `memory/lib.rs` — 新增 `create_audited_memory_with_builders` 函数 + 修改 `create_memory_with_storage_and_routes` 末尾  
+**添加时间**: 2026-04-16 (自进化 Phase 0)
+
+### 功能说明
+当 `[memory] audit_enabled = true` 时，`create_memory` 工厂自动用 `AuditedMemory<M>` 装饰器包装后端，
+所有 memory 操作（store/recall/forget 等）留审计轨迹到 `memory/audit.db`。
+此前 `AuditedMemory` 只在测试中使用，生产环境从未接入。
+
+### 上游观察条件
+```
+AuditedMemory.*create_memory | create_memory.*audit | factory.*audit.*memory
+```
+
+### 等价性标准（满足即可删除）
+- [ ] 上游 `create_memory` 工厂在 `audit_enabled` 时用 `AuditedMemory` 包装
+- [ ] 覆盖 Sqlite、Lucid、Markdown 等后端
+
+### 删除步骤
+```bash
+# memory/lib.rs: 删除 create_audited_memory_with_builders 函数（约 30 行）
+# memory/lib.rs: 在 create_memory_with_storage_and_routes 末尾删除 audit_enabled 分支（约 8 行），恢复直接调 create_memory_with_builders
+```
+
+---
+
+## F-18: 所有路径触发 Skill 创建 (Phase 0 - C1)
+
+**状态**: 保留中（改动在上游文件，无 feature flag — 功能完善）  
+**上游文件改动**:
+- `agent/loop_.rs` — `process_message()` 末尾新增 skill 创建逻辑
+- `channels/orchestrator/mod.rs` — memory consolidation 后新增 fire-and-forget skill 创建  
+**添加时间**: 2026-04-16 (自进化 Phase 0)
+
+### 功能说明
+上游 skill 自动创建仅在 `run()` 的单次执行路径（CLI）中触发。
+`process_message()`（daemon/channel 路径）和 orchestrator（Telegram/Discord/Slack 等）完全不触发 skill 创建，
+意味着生产流量（占总量 >95%）零覆盖。此改动将 skill 创建扩展到所有消息处理路径。
+
+### 上游观察条件
+```
+process_message.*skill.*creat | orchestrator.*skill.*creat | channel.*skill.*creat | daemon.*skill.*creat
+```
+
+### 等价性标准（满足即可删除）
+- [ ] 上游 `process_message` 中有 skill 创建逻辑
+- [ ] 上游 orchestrator 路径有 skill 创建逻辑
+- [ ] 均使用 `extract_tool_calls_from_history` + `create_from_execution`
+
+### 删除步骤
+```bash
+# agent/loop_.rs: 删除 process_message 末尾的 skill creation 块（约 20 行，`let response = agent_turn` 改回 `agent_turn(...).await`）
+# channels/orchestrator/mod.rs: 删除 memory consolidation 后的 skill creation tokio::spawn 块（约 20 行）
+```
+
+---
+
+## F-19: 激活未调用的 Hook 触发点 (Phase 0 - C2)
+
+**状态**: 保留中（改动在上游文件，无 feature flag — bug fix）  
+**上游文件改动**:
+- `agent/loop_.rs` — `run_tool_call_loop` 中 LLM 响应后新增 `fire_llm_output`
+- `channels/orchestrator/mod.rs` — 新增 `fire_session_start`（新 session 时）、`fire_session_end`（`/new` 命令时）、`fire_message_sent`（消息成功发送后）
+- `gateway/lib.rs` — 关闭前新增 `fire_gateway_stop`
+- `heartbeat/engine.rs` — `HeartbeatEngine` 新增 `hooks` 字段 + `with_hooks()` builder + tick 时 `fire_heartbeat_tick`  
+**添加时间**: 2026-04-16 (自进化 Phase 0)
+
+### 功能说明
+上游定义了完整的 hook trait（`on_session_start/end`、`on_llm_output`、`on_message_sent`、`on_gateway_stop`、`on_heartbeat_tick`）
+和对应的 `HookRunner::fire_*` 分发方法，但 **从未在生产代码中调用**（仅在 runner.rs 测试中出现）。
+hook handler 注册了也不会被触发。此改动激活所有已定义的 void hook 触发点。
+
+### 上游观察条件
+```
+fire_session_start | fire_session_end | fire_llm_output | fire_message_sent | fire_gateway_stop | fire_heartbeat_tick
+```
+
+### 等价性标准（满足即可删除）
+- [ ] 上游在对应位置调用了这 6 个 `fire_*` 方法
+- [ ] `HeartbeatEngine` 支持 hook 注入
+
+### 删除步骤
+```bash
+# agent/loop_.rs: 删除 fire_llm_output 调用块（3 行，在 ObserverEvent::LlmResponse 后）
+# channels/orchestrator/mod.rs: 删除 fire_session_start 块（5 行）、fire_session_end 块（4 行）、fire_message_sent 块（8 行）
+# gateway/lib.rs: 删除 fire_gateway_stop 块（3 行，在 Ok(()) 前）
+# heartbeat/engine.rs: 删除 hooks 字段、with_hooks() 方法、tick 中的 fire_heartbeat_tick 块
+```
+
+---
+
+## 审计发现：现有 fork 代码问题
+
+### 问题 1: 同逻辑多份拷贝（高风险）
+
+`session_hygiene` 和 `agent_hooks` 在三个位置有重复实现：
+- `src/one2x/session_hygiene.rs` (479 行)
+- `crates/zeroclaw-channels/src/one2x.rs` (247 行，含 session_hygiene + tool_pairing)
+- `crates/zeroclaw-runtime/src/one2x.rs` (245 行，含 session_hygiene + agent_hooks)
+
+v6 将代码拆分为 workspace crate 后产生的副本。长期易漂移，合并时三处都要改。
+
+**建议**: 将共享逻辑统一到一个 crate（如 `zeroclaw-runtime`），其他 crate 引用而非拷贝。
+
+### 问题 2: TODO(v6) 未完成项
+
+`src/one2x/mod.rs` 中两个模块被注释：
+- `agent_sse` — SSE Agent 端点，v6 crate 路径未适配
+- `compaction` — 多阶段压缩，v6 crate 路径未适配
+
+这意味着 F-02（Multi-Stage Compaction）和 F-05（Agent SSE）在 v6 上实际 **不可用**。
+
+### 问题 3: Gateway extend_router 为空实现
+
+`crates/zeroclaw-gateway/src/one2x.rs` 的 `extend_router` 直接返回传入的 router，
+F-04（Web Channel）和 F-05（Agent SSE）在 gateway 侧 **未实际注册**。

@@ -433,9 +433,12 @@ mod tests {
         assert!(output.contains("<available_skills>"));
         assert!(output.contains("<name>deploy</name>"));
         assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
-        // Registered tools (shell kind) appear under <callable_tools> with prefixed names
+        // Registered tools (shell kind) appear under <callable_tools> with prefixed
+        // names. The canonical separator is `__` (double underscore) — matching
+        // both the tool-dispatch machinery and SkillUsageTracker::extract_skill_name.
+        // Dots and hyphens in either component get normalized to underscores too.
         assert!(output.contains("<callable_tools"));
-        assert!(output.contains("<name>deploy.release_checklist</name>"));
+        assert!(output.contains("<name>deploy__release_checklist</name>"));
     }
 
     #[test]
@@ -478,9 +481,10 @@ mod tests {
         assert!(output.contains("read_skill(name)"));
         assert!(!output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
         // Compact mode should still include tools so the LLM knows about them.
-        // Registered tools (shell kind) appear under <callable_tools> with prefixed names.
+        // Registered tools (shell kind) appear under <callable_tools> with prefixed
+        // names joined by `__` (see skills/mod.rs::skills_to_prompt_with_mode).
         assert!(output.contains("<callable_tools"));
-        assert!(output.contains("<name>deploy.release_checklist</name>"));
+        assert!(output.contains("<name>deploy__release_checklist</name>"));
     }
 
     #[test]

@@ -334,6 +334,20 @@ impl ContextCompressor {
             }
         }
 
+        #[cfg(feature = "one2x")]
+        if let Some(result) = crate::one2x::compaction::try_multi_stage_compress(
+            &self.config,
+            self.context_window,
+            &self.memory,
+            history,
+            provider,
+            model,
+        )
+        .await?
+        {
+            return Ok(result);
+        }
+
         let mut passes_used = 0;
         for _ in 0..self.config.max_passes {
             let did_compress = self.compress_once(history, provider, model).await?;
@@ -594,7 +608,7 @@ fn align_boundary_backward(messages: &[ChatMessage], idx: usize) -> usize {
 /// summarized away, and vice versa. This function cleans up the history
 /// so every tool_result has a matching assistant message and every
 /// tool_call-bearing assistant message has results.
-fn repair_tool_pairs(messages: &mut Vec<ChatMessage>) {
+pub(crate) fn repair_tool_pairs(messages: &mut Vec<ChatMessage>) {
     // Heuristic: tool messages whose content references a call ID that no longer
     // exists in any assistant message should be removed. Since ChatMessage is a
     // simple role+content struct (no structured tool_call_id field), we use a

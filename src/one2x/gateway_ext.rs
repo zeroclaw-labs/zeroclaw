@@ -6,11 +6,11 @@ use axum::{
 };
 
 #[derive(serde::Deserialize)]
-pub(crate) struct WebChannelWsQuery {
+pub struct WebChannelWsQuery {
     token: Option<String>,
 }
 
-pub(crate) async fn handle_ws_channel(
+pub async fn handle_ws_channel(
     State(state): State<AppState>,
     Query(params): Query<WebChannelWsQuery>,
     headers: HeaderMap,

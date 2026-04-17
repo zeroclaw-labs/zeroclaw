@@ -9,6 +9,8 @@ pub mod decay;
 pub mod embeddings;
 pub mod hygiene;
 pub mod importance;
+pub mod injection_guard;
+pub mod knowledge_extraction;
 pub mod knowledge_graph;
 pub mod lucid;
 pub mod markdown;
@@ -78,6 +80,40 @@ where
     }
 }
 
+fn create_audited_memory_with_builders<F>(
+    backend_name: &str,
+    workspace_dir: &Path,
+    mut sqlite_builder: F,
+    unknown_context: &str,
+) -> anyhow::Result<Box<dyn Memory>>
+where
+    F: FnMut() -> anyhow::Result<SqliteMemory>,
+{
+    match classify_memory_backend(backend_name) {
+        MemoryBackendKind::Sqlite => {
+            let inner = sqlite_builder()?;
+            Ok(Box::new(AuditedMemory::new(inner, workspace_dir)?))
+        }
+        MemoryBackendKind::Lucid => {
+            let local = sqlite_builder()?;
+            let inner = LucidMemory::new(workspace_dir, local);
+            Ok(Box::new(AuditedMemory::new(inner, workspace_dir)?))
+        }
+        MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
+            let inner = MarkdownMemory::new(workspace_dir);
+            Ok(Box::new(AuditedMemory::new(inner, workspace_dir)?))
+        }
+        MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
+        MemoryBackendKind::Unknown => {
+            tracing::warn!(
+                "Unknown memory backend '{backend_name}'{unknown_context}, falling back to markdown"
+            );
+            let inner = MarkdownMemory::new(workspace_dir);
+            Ok(Box::new(AuditedMemory::new(inner, workspace_dir)?))
+        }
+    }
+}
+
 pub fn effective_memory_backend_name(
     memory_backend: &str,
     storage_provider: Option<&StorageProviderConfig>,
@@ -116,11 +152,11 @@ pub fn should_skip_autosave_content(content: &str) -> bool {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct ResolvedEmbeddingConfig {
-    provider: String,
-    model: String,
-    dimensions: usize,
-    api_key: Option<String>,
+pub struct ResolvedEmbeddingConfig {
+    pub provider: String,
+    pub model: String,
+    pub dimensions: usize,
+    pub api_key: Option<String>,
 }
 
 impl std::fmt::Debug for ResolvedEmbeddingConfig {
@@ -149,7 +185,7 @@ fn embedding_provider_env_key(provider: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-fn resolve_embedding_config(
+pub fn resolve_embedding_config(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
     api_key: Option<&str>,
@@ -351,6 +387,16 @@ pub fn create_memory_with_storage_and_routes(
             qdrant_api_key,
             embedder,
         )));
+    }
+
+    if config.audit_enabled {
+        tracing::info!("🔒 Wrapping memory backend with AuditedMemory");
+        return create_audited_memory_with_builders(
+            &backend_name,
+            workspace_dir,
+            || build_sqlite_memory(config, workspace_dir, &resolved_embedding),
+            "",
+        );
     }
 
     create_memory_with_builders(
@@ -664,5 +710,79 @@ mod tests {
             Some("gemini-key-must-not-be-used"),
             "default_provider key must not leak to the embedding provider"
         );
+    }
+
+    // ── C3: AuditedMemory factory integration tests ──────────────
+
+    #[test]
+    fn factory_sqlite_with_audit_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            audit_enabled: true,
+            ..MemoryConfig::default()
+        };
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        assert_eq!(mem.name(), "sqlite", "AuditedMemory should delegate name() to inner backend");
+    }
+
+    #[test]
+    fn factory_markdown_with_audit_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "markdown".into(),
+            audit_enabled: true,
+            ..MemoryConfig::default()
+        };
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        assert_eq!(mem.name(), "markdown");
+    }
+
+    #[test]
+    fn factory_lucid_with_audit_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "lucid".into(),
+            audit_enabled: true,
+            ..MemoryConfig::default()
+        };
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        assert_eq!(mem.name(), "lucid");
+    }
+
+    #[test]
+    fn factory_none_skips_audit_wrapper() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "none".into(),
+            audit_enabled: true,
+            ..MemoryConfig::default()
+        };
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        assert_eq!(mem.name(), "none");
+    }
+
+    #[test]
+    fn factory_unknown_with_audit_enabled_falls_back_to_markdown() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "redis".into(),
+            audit_enabled: true,
+            ..MemoryConfig::default()
+        };
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        assert_eq!(mem.name(), "markdown");
+    }
+
+    #[test]
+    fn factory_audit_disabled_returns_plain_backend() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            audit_enabled: false,
+            ..MemoryConfig::default()
+        };
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        assert_eq!(mem.name(), "sqlite");
     }
 }

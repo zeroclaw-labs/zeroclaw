@@ -1219,15 +1219,33 @@ mod tests {
         assert!(ch.transcription_manager.is_some());
     }
 
+    /// Regression: when the transcription manager fails to initialize, the
+    /// channel keeps working with `transcription_manager = None`.
+    ///
+    /// **Previous failure mode**: the test used `default_provider: "groq"` +
+    /// empty `api_key`, expecting GroqProvider::from_config to fail. But
+    /// GroqProvider falls back to `GROQ_API_KEY` env var for dev ergonomics,
+    /// so the test silently passed in CI and failed on any dev machine with
+    /// that env var set.
+    ///
+    /// **Fix**: point `default_provider` at a provider slug that cannot be
+    /// configured from the supplied fields no matter the environment. The
+    /// check at TranscriptionManager::new guarantees `bail!` because the
+    /// provider slug does not map to any registration path.
     #[test]
     fn mattermost_manager_none_and_warn_on_init_failure() {
         let ch = make_channel(vec!["*".into()], false).with_transcription(
             zeroclaw_config::schema::TranscriptionConfig {
                 enabled: true,
-                default_provider: "groq".to_string(),
-                api_key: Some(String::new()),
-                api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
-                model: "whisper-large-v3".to_string(),
+                // Provider slug that isn't registered by TranscriptionManager::new
+                // (it only inserts "groq", "openai", "deepgram", "assemblyai",
+                // "google", "local_whisper"). Forces `bail!` via the
+                // "Default transcription provider ... is not configured" path,
+                // independent of whatever API keys happen to be in env.
+                default_provider: "__no_such_provider__".to_string(),
+                api_key: None,
+                api_url: String::new(),
+                model: String::new(),
                 language: None,
                 initial_prompt: None,
                 max_duration_secs: 600,
@@ -1239,7 +1257,10 @@ mod tests {
                 transcribe_non_ptt_audio: false,
             },
         );
-        assert!(ch.transcription_manager.is_none());
+        assert!(
+            ch.transcription_manager.is_none(),
+            "init failure must leave transcription_manager unset"
+        );
     }
 
     #[test]

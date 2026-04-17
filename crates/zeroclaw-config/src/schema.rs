@@ -1672,6 +1672,14 @@ pub struct SkillsConfig {
     #[serde(default)]
     #[nested]
     pub skill_improvement: SkillImprovementConfig,
+    /// SkillForge external-source discovery + sandbox verification (P1-4, P3-2).
+    #[serde(default)]
+    #[nested]
+    pub skill_forge: SkillForgeConfig,
+    /// Confidence scoring + auto-deprecation of flaky skills (P3-1).
+    #[serde(default)]
+    #[nested]
+    pub skill_confidence: SkillConfidenceConfig,
 }
 
 /// Autonomous skill creation configuration (`[skills.skill_creation]` section).
@@ -1725,6 +1733,188 @@ impl Default for SkillImprovementConfig {
         Self {
             enabled: true,
             cooldown_secs: 3600,
+        }
+    }
+}
+
+/// SkillForge — external skill discovery, evaluation, integration, and sandbox
+/// verification (`[skills.skill_forge]` section).
+///
+/// Mirrors the runtime-side `zeroclaw_runtime::skillforge::SkillForgeConfig`.
+/// Runtime code reads from here via a `From` conversion at daemon startup.
+///
+/// NOTE: `Debug` is hand-written (below) to redact `github_token`. Do not
+/// `#[derive(Debug)]` — doing so would leak the PAT into every trace/error.
+#[derive(Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "skills.skill-forge"]
+pub struct SkillForgeConfig {
+    /// Enable periodic SkillForge discovery runs. Default: `false` (opt-in).
+    #[serde(default)]
+    pub enabled: bool,
+    /// When `true`, candidates that meet `min_score` are auto-written to
+    /// `output_dir`. When `false`, they are recorded for manual review.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub auto_integrate: bool,
+    /// Sources to scout. Supported: `github`, `clawhub`, `huggingface`.
+    /// Default: `["github", "clawhub"]`.
+    #[serde(default = "default_forge_sources")]
+    pub sources: Vec<String>,
+    /// Hours between scheduled scans (heartbeat-driven). Default: `24`.
+    #[serde(default = "default_forge_scan_interval")]
+    pub scan_interval_hours: u64,
+    /// Minimum evaluator score (0.0..=1.0) for auto-integration. Default: `0.7`.
+    #[serde(default = "default_forge_min_score")]
+    pub min_score: f64,
+    /// Optional GitHub personal-access token for higher API rate limits.
+    #[serde(default)]
+    pub github_token: Option<String>,
+    /// Directory to write integrated SKILL.toml/SKILL.md bundles. Relative
+    /// paths are resolved against workspace_dir. Default: `./skills`.
+    #[serde(default = "default_forge_output_dir")]
+    pub output_dir: String,
+    /// Run `TEST.sh` in a sandbox after integration (P3-2). Skills that fail
+    /// their tests are rolled back. Skills without `TEST.sh` pass with a
+    /// warning. Default: `true`.
+    #[serde(default = "default_true")]
+    pub sandbox_verify: bool,
+    /// Per-test timeout in seconds during sandbox verification. Default: `30`.
+    #[serde(default = "default_forge_sandbox_timeout")]
+    pub sandbox_timeout_secs: u64,
+}
+
+fn default_forge_sources() -> Vec<String> {
+    vec!["github".into(), "clawhub".into()]
+}
+fn default_forge_scan_interval() -> u64 {
+    24
+}
+fn default_forge_min_score() -> f64 {
+    0.7
+}
+fn default_forge_output_dir() -> String {
+    "./skills".into()
+}
+fn default_forge_sandbox_timeout() -> u64 {
+    30
+}
+
+impl Default for SkillForgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_integrate: true,
+            sources: default_forge_sources(),
+            scan_interval_hours: default_forge_scan_interval(),
+            min_score: default_forge_min_score(),
+            github_token: None,
+            output_dir: default_forge_output_dir(),
+            sandbox_verify: true,
+            sandbox_timeout_secs: default_forge_sandbox_timeout(),
+        }
+    }
+}
+
+/// Hand-written `Debug` redacts `github_token`. A derived `Debug` would
+/// leak the PAT into any `{:?}`-formatted log, error, or panic message.
+impl std::fmt::Debug for SkillForgeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SkillForgeConfig")
+            .field("enabled", &self.enabled)
+            .field("auto_integrate", &self.auto_integrate)
+            .field("sources", &self.sources)
+            .field("scan_interval_hours", &self.scan_interval_hours)
+            .field("min_score", &self.min_score)
+            .field(
+                "github_token",
+                &self.github_token.as_ref().map(|_| "***"),
+            )
+            .field("output_dir", &self.output_dir)
+            .field("sandbox_verify", &self.sandbox_verify)
+            .field("sandbox_timeout_secs", &self.sandbox_timeout_secs)
+            .finish()
+    }
+}
+
+/// Skill confidence scoring + deprecation policy (`[skills.skill_confidence]`).
+///
+/// Mirrors the runtime-side `zeroclaw_runtime::skills::confidence::ConfidencePolicy`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "skills.skill-confidence"]
+pub struct SkillConfidenceConfig {
+    /// Enable periodic confidence evaluation and auto-deprecation of flaky
+    /// skills. When `false`, traces are still recorded but no skills are
+    /// ever marked deprecated. Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Hours between confidence scans (heartbeat-driven). Default: `6`.
+    #[serde(default = "default_confidence_interval")]
+    pub scan_interval_hours: u64,
+    /// Call count at which the `usage_frequency` component saturates at 1.0.
+    /// Skills used fewer times than this are penalized. Default: `20`.
+    #[serde(default = "default_confidence_saturation")]
+    pub saturation_calls: u32,
+    /// Half-life for recency decay, in hours. Default: `720` (30 days).
+    #[serde(default = "default_confidence_half_life")]
+    pub recency_half_life_hours: f64,
+    /// Minimum trace count before deprecation is considered. A transient
+    /// failure spike (e.g. provider outage for 5 minutes) can easily cause
+    /// 5 failures, which is why the default was raised from 5 to 15 —
+    /// permanent removal should require more evidence than short-term
+    /// noise. Default: `15`.
+    #[serde(default = "default_confidence_min_samples")]
+    pub min_samples_for_deprecation: usize,
+    /// Confidence score at/below which a skill is auto-deprecated. Default: `0.3`.
+    #[serde(default = "default_confidence_threshold")]
+    pub deprecation_threshold: f64,
+    /// Hours after deprecation before a skill is reconsidered. Set to `0`
+    /// to disable automatic reinstatement. When > 0, the heartbeat scan
+    /// re-scores deprecated skills and may clear the `DEPRECATED` marker
+    /// if recent traces show recovery. Default: `168` (7 days).
+    #[serde(default = "default_confidence_review_window")]
+    pub review_window_hours: u64,
+    /// Confidence score *above* which a deprecated skill is re-enabled.
+    /// Must be strictly greater than `deprecation_threshold` — the gap is
+    /// hysteresis that prevents flapping. Default: `0.5`.
+    #[serde(default = "default_confidence_reinstate_threshold")]
+    pub reinstate_threshold: f64,
+}
+
+fn default_confidence_interval() -> u64 {
+    6
+}
+fn default_confidence_saturation() -> u32 {
+    20
+}
+fn default_confidence_half_life() -> f64 {
+    24.0 * 30.0
+}
+fn default_confidence_min_samples() -> usize {
+    15
+}
+fn default_confidence_threshold() -> f64 {
+    0.3
+}
+fn default_confidence_review_window() -> u64 {
+    24 * 7
+}
+fn default_confidence_reinstate_threshold() -> f64 {
+    0.5
+}
+
+impl Default for SkillConfidenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scan_interval_hours: default_confidence_interval(),
+            saturation_calls: default_confidence_saturation(),
+            recency_half_life_hours: default_confidence_half_life(),
+            min_samples_for_deprecation: default_confidence_min_samples(),
+            deprecation_threshold: default_confidence_threshold(),
+            review_window_hours: default_confidence_review_window(),
+            reinstate_threshold: default_confidence_reinstate_threshold(),
         }
     }
 }
@@ -17385,4 +17575,11 @@ allowed_users = ["@u:m"]
             "backfill should activate channel even when config has comments"
         );
     }
+
+    // NOTE: SkillForgeConfig + SkillConfidenceConfig tests live in
+    // `crates/zeroclaw-config/tests/skill_configs.rs` as integration tests.
+    // The inline `tests` module here has a pre-existing compile issue (it
+    // uses `tokio-stream/fs` features that are not enabled), so we cannot
+    // add new tests to it until that is fixed. The standalone integration
+    // test file compiles independently.
 }

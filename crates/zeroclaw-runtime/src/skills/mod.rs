@@ -13,9 +13,11 @@ use std::time::{Duration, SystemTime};
 use zip::ZipArchive;
 
 pub mod audit;
+pub mod confidence;
 pub mod creator;
 pub mod improver;
 pub mod testing;
+pub mod tracker;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
@@ -192,6 +194,17 @@ pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
+            continue;
+        }
+
+        // P3-1: skip skills that have been marked deprecated by the
+        // confidence evaluator. Operators can re-enable by deleting
+        // the DEPRECATED sidecar file.
+        if confidence::is_skill_deprecated(&path) {
+            tracing::debug!(
+                "skipping deprecated skill directory {} (DEPRECATED marker present)",
+                path.display()
+            );
             continue;
         }
 

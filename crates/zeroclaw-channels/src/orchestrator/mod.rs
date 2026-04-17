@@ -1831,6 +1831,11 @@ async fn handle_runtime_command_if_needed(
             }
         }
         ChannelRuntimeCommand::NewSession => {
+            if let Some(hooks) = &ctx.hooks {
+                hooks
+                    .fire_session_end(&sender_key, &msg.channel)
+                    .await;
+            }
             clear_sender_history(ctx, &sender_key);
             if let Some(ref store) = ctx.session_store
                 && let Err(e) = store.delete_session(&sender_key)
@@ -1855,7 +1860,7 @@ async fn handle_runtime_command_if_needed(
     true
 }
 
-async fn build_memory_context(
+pub async fn build_memory_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
@@ -2093,7 +2098,7 @@ fn strip_think_tags_inline(s: &str) -> String {
     result.trim().to_string()
 }
 
-fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+pub fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
@@ -2631,6 +2636,14 @@ async fn process_channel_message(
             .peek(&history_key)
             .is_some_and(|turns| !turns.is_empty())
     };
+
+    if !had_prior_history {
+        if let Some(hooks) = &ctx.hooks {
+            hooks
+                .fire_session_start(&history_key, &msg.channel)
+                .await;
+        }
+    }
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
     append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
@@ -3354,34 +3367,105 @@ async fn process_channel_message(
                 });
             }
 
+            // Fire-and-forget autonomous skill creation/improvement from orchestrator path.
+            if ctx.prompt_config.skills.skill_creation.enabled {
+                let tool_calls =
+                    zeroclaw_runtime::skills::creator::extract_tool_calls_from_history(&history);
+                if tool_calls.len() >= 2 {
+                    let workspace_dir = ctx.workspace_dir.as_ref().clone();
+                    let skill_config = ctx.prompt_config.skills.skill_creation.clone();
+                    let improve_config = ctx.prompt_config.skills.skill_improvement.clone();
+                    let memory_config = ctx.prompt_config.memory.clone();
+                    let embedding_routes = ctx.prompt_config.embedding_routes.clone();
+                    let api_key = ctx.api_key.clone();
+                    let user_msg = msg.content.clone();
+                    let channel = msg.channel.clone();
+                    tokio::spawn(async move {
+                        let resolved = zeroclaw_memory::resolve_embedding_config(
+                            &memory_config,
+                            &embedding_routes,
+                            api_key.as_deref(),
+                        );
+                        let embedder: std::sync::Arc<
+                            dyn zeroclaw_memory::embeddings::EmbeddingProvider,
+                        > = std::sync::Arc::from(
+                            zeroclaw_memory::embeddings::create_embedding_provider(
+                                &resolved.provider,
+                                resolved.api_key.as_deref(),
+                                &resolved.model,
+                                resolved.dimensions,
+                            ),
+                        );
+                        let creator =
+                            zeroclaw_runtime::skills::creator::SkillCreator::new(
+                                workspace_dir,
+                                skill_config,
+                            )
+                            .with_embedding_provider(embedder)
+                            .with_improver(improve_config);
+                        match creator.create_from_execution(&user_msg, &tool_calls, None).await {
+                            Ok(Some(slug)) => {
+                                tracing::info!(slug, channel = %channel, "Auto-created or improved skill from orchestrator");
+                            }
+                            Ok(None) => {
+                                tracing::debug!("Skill creation/improvement skipped in orchestrator path");
+                            }
+                            Err(e) => tracing::warn!("Skill creation/improvement failed in orchestrator: {e}"),
+                        }
+                    });
+                }
+            }
+
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
                 truncate_with_ellipsis(&delivered_response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
+                let mut send_ok = false;
                 if let Some(ref draft_id) = draft_message_id {
                     if let Err(e) = channel
                         .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
                         .await
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
-                        let _ = channel
+                        if channel
                             .send(
                                 &SendMessage::new(&delivered_response, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
-                            .await;
+                            .await
+                            .is_ok()
+                        {
+                            send_ok = true;
+                        }
+                    } else {
+                        send_ok = true;
                     }
-                } else if let Err(e) = channel
+                } else if channel
                     .send(
                         &SendMessage::new(&delivered_response, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone())
                             .with_cancellation(cancellation_token.clone()),
                     )
                     .await
+                    .is_ok()
                 {
-                    eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                    send_ok = true;
+                } else {
+                    eprintln!("  ❌ Failed to reply on {}: channel send error", channel.name());
+                }
+
+                if send_ok {
+                    if let Some(hooks) = &ctx.hooks {
+                        hooks
+                            .fire_message_sent(
+                                &msg.channel,
+                                &msg.reply_target,
+                                &delivered_response,
+                            )
+                            .await;
+                    }
                 }
             }
         }
@@ -9072,9 +9156,12 @@ BTC is currently around $65,000 based on latest tool output."#
                 "<instruction>Always run cargo test before final response.</instruction>"
             )
         );
-        // Registered tools (shell kind) appear under <callable_tools> with prefixed names
+        // Registered tools (shell kind) appear under <callable_tools> with
+        // prefixed names. The canonical separator is `__` and both
+        // hyphens and dots in the component names get normalized to `_`,
+        // so `code-review` + `lint` becomes `code_review__lint`.
         assert!(prompt.contains("<callable_tools"));
-        assert!(prompt.contains("<name>code-review.lint</name>"));
+        assert!(prompt.contains("<name>code_review__lint</name>"));
         assert!(!prompt.contains("loaded on demand"));
     }
 
@@ -9121,9 +9208,10 @@ BTC is currently around $65,000 based on latest tool output."#
             )
         );
         // Compact mode should still include tools so the LLM knows about them.
-        // Registered tools (shell kind) appear under <callable_tools> with prefixed names.
+        // Registered tools (shell kind) appear under <callable_tools> with
+        // prefixed names using the `__` separator (see note in the Full-mode test).
         assert!(prompt.contains("<callable_tools"));
-        assert!(prompt.contains("<name>code-review.lint</name>"));
+        assert!(prompt.contains("<name>code_review__lint</name>"));
     }
 
     #[test]
@@ -11525,6 +11613,13 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    // Telegram tests only make sense when the `channel-telegram` feature is
+    // enabled — without it, `build_channel_by_id` short-circuits to
+    // "Unknown channel" before reaching the configured/unconfigured branch.
+    // `channel-telegram` is intentionally NOT in the default feature set
+    // (it pulls `image` as a heavy transitive dep), so these tests must
+    // gate accordingly to run clean on both default and full feature sets.
+    #[cfg(feature = "channel-telegram")]
     #[test]
     fn build_channel_by_id_unconfigured_telegram_returns_error() {
         let config = Config::default();
@@ -11540,6 +11635,7 @@ This is an example JSON object for profile settings."#;
         }
     }
 
+    #[cfg(feature = "channel-telegram")]
     #[test]
     fn build_channel_by_id_configured_telegram_succeeds() {
         let mut config = Config::default();

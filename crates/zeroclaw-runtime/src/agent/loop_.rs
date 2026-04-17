@@ -1246,6 +1246,10 @@ pub async fn run_tool_call_loop(
                     output_tokens: resp_output_tokens,
                 });
 
+                if let Some(hooks) = hooks {
+                    hooks.fire_llm_output(&resp).await;
+                }
+
                 // Record cost via task-local tracker (no-op when not scoped)
                 let _ = resp
                     .usage
@@ -2098,6 +2102,21 @@ pub async fn run(
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
+    // Shared embedding provider for skill deduplication.
+    let skill_embedder: std::sync::Arc<dyn zeroclaw_memory::embeddings::EmbeddingProvider> = {
+        let resolved = zeroclaw_memory::resolve_embedding_config(
+            &config.memory,
+            &config.embedding_routes,
+            config.api_key.as_deref(),
+        );
+        std::sync::Arc::from(zeroclaw_memory::embeddings::create_embedding_provider(
+            &resolved.provider,
+            resolved.api_key.as_deref(),
+            &resolved.model,
+            resolved.dimensions,
+        ))
+    };
+
     // ── Peripherals (merge peripheral tools into registry) ─
     if !peripheral_overrides.is_empty() {
         tracing::info!(
@@ -2561,6 +2580,10 @@ pub async fn run(
             );
         }
 
+        // P3-1: capture session start so we can record real wall-clock
+        // duration in SkillTrace entries (both success and error branches).
+        let session_start_time = std::time::Instant::now();
+
         // Compute per-turn excluded MCP tools from tool_filter_groups.
         let excluded_tools = compute_excluded_mcp_tools(
             &tools_registry,
@@ -2735,27 +2758,62 @@ pub async fn run(
                         }
                     }
 
+                    // P3-1: record a failing session trace so confidence
+                    // scoring sees both successes and failures. Without this
+                    // the deprecation threshold is never reachable.
+                    crate::skills::confidence::record_session_traces_async(
+                        config.workspace_dir.clone(),
+                        history.clone(),
+                        false,
+                        session_start_time,
+                    );
+
                     return Err(e);
                 }
             }
         }
 
-        // After successful multi-step execution, attempt autonomous skill creation.
-        if config.skills.skill_creation.enabled {
+        // After successful multi-step execution, track skill usage and attempt
+        // autonomous skill creation or improvement.
+        {
             let tool_calls = crate::skills::creator::extract_tool_calls_from_history(&history);
-            if tool_calls.len() >= 2 {
+            let mut tracker = crate::skills::tracker::SkillUsageTracker::new();
+            tracker.record_from_history(&tool_calls);
+
+            if !tracker.is_empty() {
+                tracing::info!(
+                    skills_used = tracker.distinct_skills(),
+                    total_skill_calls = tracker.total_calls(),
+                    "Session skill usage summary"
+                );
+
+                // P3-1: persist per-session traces so the confidence scorer
+                // can deprecate chronically-failing skills over time. Uses
+                // spawn_blocking so file I/O doesn't stall the tokio worker.
+                // Real wall-clock duration is captured from session_start_time.
+                crate::skills::confidence::record_session_traces_async(
+                    config.workspace_dir.clone(),
+                    history.clone(),
+                    true,
+                    session_start_time,
+                );
+            }
+
+            if config.skills.skill_creation.enabled && tool_calls.len() >= 2 {
                 let creator = crate::skills::creator::SkillCreator::new(
                     config.workspace_dir.clone(),
                     config.skills.skill_creation.clone(),
-                );
+                )
+                .with_embedding_provider(skill_embedder.clone())
+                .with_improver(config.skills.skill_improvement.clone());
                 match creator.create_from_execution(&msg, &tool_calls, None).await {
                     Ok(Some(slug)) => {
-                        tracing::info!(slug, "Auto-created skill from execution");
+                        tracing::info!(slug, "Auto-created or improved skill from execution");
                     }
                     Ok(None) => {
-                        tracing::debug!("Skill creation skipped (duplicate or disabled)");
+                        tracing::debug!("Skill creation/improvement skipped");
                     }
-                    Err(e) => tracing::warn!("Skill creation failed: {e}"),
+                    Err(e) => tracing::warn!("Skill creation/improvement failed: {e}"),
                 }
             }
         }
@@ -3193,6 +3251,20 @@ pub async fn process_message(
         fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
     )?);
 
+    let skill_embedder: std::sync::Arc<dyn zeroclaw_memory::embeddings::EmbeddingProvider> = {
+        let resolved = zeroclaw_memory::resolve_embedding_config(
+            &config.memory,
+            &config.embedding_routes,
+            config.api_key.as_deref(),
+        );
+        std::sync::Arc::from(zeroclaw_memory::embeddings::create_embedding_provider(
+            &resolved.provider,
+            resolved.api_key.as_deref(),
+            &resolved.model,
+            resolved.dimensions,
+        ))
+    };
+
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
             config.composio.api_key.as_deref(),
@@ -3499,7 +3571,11 @@ pub async fn process_message(
         excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
     }
 
-    agent_turn(
+    // P3-1: capture session start so SkillTrace entries carry real duration,
+    // and we can record both success and failure outcomes below.
+    let session_start_time = std::time::Instant::now();
+
+    let response = match agent_turn(
         provider.as_ref(),
         &mut history,
         &tools_registry,
@@ -3520,6 +3596,66 @@ pub async fn process_message(
         None, // channel: process_message path has no channel ref
     )
     .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // P3-1: record a failing trace before propagating so the
+            // confidence scorer observes genuine failures.
+            crate::skills::confidence::record_session_traces_async(
+                config.workspace_dir.clone(),
+                history.clone(),
+                false,
+                session_start_time,
+            );
+            return Err(e);
+        }
+    };
+
+    {
+        let tool_calls = crate::skills::creator::extract_tool_calls_from_history(&history);
+        let mut tracker = crate::skills::tracker::SkillUsageTracker::new();
+        tracker.record_from_history(&tool_calls);
+
+        if !tracker.is_empty() {
+            tracing::info!(
+                skills_used = tracker.distinct_skills(),
+                total_skill_calls = tracker.total_calls(),
+                channel = "daemon",
+                "Session skill usage summary"
+            );
+
+            // P3-1: persist per-session success trace. See CLI path above.
+            crate::skills::confidence::record_session_traces_async(
+                config.workspace_dir.clone(),
+                history.clone(),
+                true,
+                session_start_time,
+            );
+        }
+
+        if config.skills.skill_creation.enabled && tool_calls.len() >= 2 {
+            let creator = crate::skills::creator::SkillCreator::new(
+                config.workspace_dir.clone(),
+                config.skills.skill_creation.clone(),
+            )
+            .with_embedding_provider(skill_embedder)
+            .with_improver(config.skills.skill_improvement.clone());
+            match creator
+                .create_from_execution(message, &tool_calls, None)
+                .await
+            {
+                Ok(Some(slug)) => {
+                    tracing::info!(slug, channel = "daemon", "Auto-created or improved skill from process_message");
+                }
+                Ok(None) => {
+                    tracing::debug!("Skill creation/improvement skipped in process_message path");
+                }
+                Err(e) => tracing::warn!("Skill creation/improvement failed in process_message: {e}"),
+            }
+        }
+    }
+
+    Ok(response)
 }
 
 #[cfg(test)]

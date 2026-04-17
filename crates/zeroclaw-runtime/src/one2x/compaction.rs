@@ -19,11 +19,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::agent::context_compressor::{
-    estimate_tokens, CompressionResult, ContextCompressionConfig,
-};
-use crate::memory::traits::Memory;
-use crate::providers::traits::{ChatMessage, Provider};
+use crate::agent::context_compressor::{estimate_tokens, CompressionResult, ContextCompressionConfig};
+use zeroclaw_memory::Memory;
+use zeroclaw_providers::{ChatMessage, Provider};
 use std::sync::Arc;
 
 /// System prompt for pre-compaction key-facts extraction.
@@ -153,7 +151,7 @@ pub async fn try_multi_stage_compress(
                         .store(
                             &date_key,
                             &facts,
-                            crate::memory::traits::MemoryCategory::Daily,
+                            zeroclaw_memory::MemoryCategory::Daily,
                             None,
                         )
                         .await
@@ -305,7 +303,7 @@ pub async fn try_multi_stage_compress(
             .store(
                 &key,
                 &final_summary,
-                crate::memory::traits::MemoryCategory::Daily,
+                zeroclaw_memory::MemoryCategory::Daily,
                 None,
             )
             .await

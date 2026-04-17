@@ -486,4 +486,172 @@ mod tests {
             HookResult::Cancel(_) => panic!("should not cancel"),
         }
     }
+
+    // ── C2: Void hook dispatch tests for all Phase 0 hooks ──────
+
+    struct AllEventsHook {
+        name: String,
+        session_start: Arc<AtomicU32>,
+        session_end: Arc<AtomicU32>,
+        llm_output: Arc<AtomicU32>,
+        message_sent: Arc<AtomicU32>,
+        gateway_stop: Arc<AtomicU32>,
+        heartbeat: Arc<AtomicU32>,
+    }
+
+    impl AllEventsHook {
+        fn new(
+            name: &str,
+        ) -> (
+            Self,
+            Arc<AtomicU32>,
+            Arc<AtomicU32>,
+            Arc<AtomicU32>,
+            Arc<AtomicU32>,
+            Arc<AtomicU32>,
+            Arc<AtomicU32>,
+        ) {
+            let ss = Arc::new(AtomicU32::new(0));
+            let se = Arc::new(AtomicU32::new(0));
+            let lo = Arc::new(AtomicU32::new(0));
+            let ms = Arc::new(AtomicU32::new(0));
+            let gs = Arc::new(AtomicU32::new(0));
+            let hb = Arc::new(AtomicU32::new(0));
+            (
+                Self {
+                    name: name.to_string(),
+                    session_start: ss.clone(),
+                    session_end: se.clone(),
+                    llm_output: lo.clone(),
+                    message_sent: ms.clone(),
+                    gateway_stop: gs.clone(),
+                    heartbeat: hb.clone(),
+                },
+                ss,
+                se,
+                lo,
+                ms,
+                gs,
+                hb,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl HookHandler for AllEventsHook {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn priority(&self) -> i32 {
+            0
+        }
+        async fn on_session_start(&self, _session_id: &str, _channel: &str) {
+            self.session_start.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn on_session_end(&self, _session_id: &str, _channel: &str) {
+            self.session_end.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn on_llm_output(&self, _response: &ChatResponse) {
+            self.llm_output.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn on_message_sent(&self, _channel: &str, _recipient: &str, _content: &str) {
+            self.message_sent.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn on_gateway_stop(&self) {
+            self.gateway_stop.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn on_heartbeat_tick(&self) {
+            self.heartbeat.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn fire_session_start_dispatches_to_all_handlers() {
+        let mut runner = HookRunner::new();
+        let (hook, ss, _, _, _, _, _) = AllEventsHook::new("test");
+        runner.register(Box::new(hook));
+
+        runner.fire_session_start("sess-1", "telegram").await;
+
+        assert_eq!(ss.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fire_session_end_dispatches_to_all_handlers() {
+        let mut runner = HookRunner::new();
+        let (hook, _, se, _, _, _, _) = AllEventsHook::new("test");
+        runner.register(Box::new(hook));
+
+        runner.fire_session_end("sess-1", "telegram").await;
+
+        assert_eq!(se.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fire_llm_output_dispatches_to_all_handlers() {
+        let mut runner = HookRunner::new();
+        let (hook, _, _, lo, _, _, _) = AllEventsHook::new("test");
+        runner.register(Box::new(hook));
+
+        let response = ChatResponse {
+            text: Some("Hello".to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
+        };
+        runner.fire_llm_output(&response).await;
+
+        assert_eq!(lo.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fire_message_sent_dispatches_to_all_handlers() {
+        let mut runner = HookRunner::new();
+        let (hook, _, _, _, ms, _, _) = AllEventsHook::new("test");
+        runner.register(Box::new(hook));
+
+        runner
+            .fire_message_sent("telegram", "user123", "Reply text")
+            .await;
+
+        assert_eq!(ms.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fire_gateway_stop_dispatches_to_all_handlers() {
+        let mut runner = HookRunner::new();
+        let (hook, _, _, _, _, gs, _) = AllEventsHook::new("test");
+        runner.register(Box::new(hook));
+
+        runner.fire_gateway_stop().await;
+
+        assert_eq!(gs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn all_phase0_hooks_fire_independently() {
+        let mut runner = HookRunner::new();
+        let (hook, ss, se, lo, ms, gs, hb) = AllEventsHook::new("all-events");
+        runner.register(Box::new(hook));
+
+        runner.fire_session_start("s1", "discord").await;
+        runner.fire_session_end("s1", "discord").await;
+        let response = ChatResponse {
+            text: Some("test".to_string()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
+        };
+        runner.fire_llm_output(&response).await;
+        runner.fire_message_sent("discord", "user", "hi").await;
+        runner.fire_gateway_stop().await;
+        runner.fire_heartbeat_tick().await;
+
+        assert_eq!(ss.load(Ordering::SeqCst), 1, "session_start");
+        assert_eq!(se.load(Ordering::SeqCst), 1, "session_end");
+        assert_eq!(lo.load(Ordering::SeqCst), 1, "llm_output");
+        assert_eq!(ms.load(Ordering::SeqCst), 1, "message_sent");
+        assert_eq!(gs.load(Ordering::SeqCst), 1, "gateway_stop");
+        assert_eq!(hb.load(Ordering::SeqCst), 1, "heartbeat_tick");
+    }
 }

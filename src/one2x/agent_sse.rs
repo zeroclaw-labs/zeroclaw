@@ -317,8 +317,8 @@ pub async fn handle_agent_sse(
             .unwrap_or_else(|| "unknown".to_string());
         let max_history = config.agent.max_history_messages;
 
-        let runtime: Arc<dyn crate::runtime::RuntimeAdapter> =
-            match crate::runtime::create_runtime(&config.runtime) {
+        let runtime: Arc<dyn crate::platform::RuntimeAdapter> =
+            match crate::platform::create_runtime(&config.runtime) {
                 Ok(runtime) => Arc::from(runtime),
                 Err(e) => {
                     let _ = event_tx

@@ -1,5 +1,7 @@
 //! One2X hooks for the runtime crate.
 
+pub mod compaction;
+
 pub mod session_hygiene {
     use std::collections::HashSet;
     use zeroclaw_api::provider::ChatMessage;
@@ -139,7 +141,7 @@ pub mod session_hygiene {
             }
             let total = msg.content.len();
             let head_budget = dynamic_cap.saturating_sub(TAIL_CHARS);
-            let omitted = total - head_budget - TAIL_CHARS;
+            let omitted = total.saturating_sub(head_budget).saturating_sub(TAIL_CHARS);
 
             let mut head_end = head_budget;
             while head_end > 0 && !msg.content.is_char_boundary(head_end) {
