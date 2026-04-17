@@ -33,6 +33,7 @@ ZeroClaw 在启动时以 `INFO` 级别记录解析后的配置：
 | `backend` | `none` | 可观测性后端：`none`、`noop`、`log`、`prometheus`、`otel`、`opentelemetry` 或 `otlp` |
 | `otel_endpoint` | `http://localhost:4318` | 当后端为 `otel` 时使用的 OTLP HTTP 端点 |
 | `otel_service_name` | `zeroclaw` | 发送到 OTLP 收集器的服务名称 |
+| `otel_headers` | _(无)_ | OTLP 导出的可选 HTTP 头（例如授权）。以 TOML 表 `[observability.otel_headers]` 指定。直接编辑 `config.toml` — 无法通过 `zeroclaw config set` 设置。值以明文存储；请用 `chmod 600` 保护 `config.toml`。 |
 | `runtime_trace_mode` | `none` | 运行时跟踪存储模式：`none`、`rolling` 或 `full` |
 | `runtime_trace_path` | `state/runtime-trace.jsonl` | 运行时跟踪 JSONL 路径（除非绝对路径，否则相对于工作区） |
 | `runtime_trace_max_entries` | `200` | 当 `runtime_trace_mode = \"rolling\"` 时保留的最大事件数 |
@@ -57,6 +58,9 @@ otel_service_name = \"zeroclaw\"
 runtime_trace_mode = \"rolling\"
 runtime_trace_path = \"state/runtime-trace.jsonl\"
 runtime_trace_max_entries = 200
+
+[observability.otel_headers]
+Authorization = \"Bearer <your-token>\"
 ```
 
 ## 环境提供商覆盖

@@ -1,0 +1,51 @@
+[package]
+name = "zeroclaw-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Configuration schema, secrets, and related types for ZeroClaw."
+publish = false
+
+[dependencies]
+zeroclaw-api.workspace = true
+zeroclaw-macros.workspace = true
+anyhow = "1.0"
+chacha20poly1305 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+directories = "6.0"
+hex = "0.4"
+hostname = "0.4.2"
+parking_lot = "0.12"
+rand = "0.10"
+regex = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+schemars = { version = "1.2", optional = true }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha2 = "0.10"
+shellexpand = "3.1"
+thiserror = "2.0"
+tokio = { version = "1.50", default-features = false, features = ["fs", "io-util", "sync"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
+tokio-socks = "0.5"
+tokio-stream = { version = "0.1.18", default-features = false }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+rustls-pki-types = "1.14.0"
+toml = "1.0"
+toml_edit = "0.25"
+tracing = { version = "0.1", default-features = false }
+url = "2.5"
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+webpki-roots = "1.0.6"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
+tempfile = "3.26"
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+
+[features]
+default = ["schema-export"]
+schema-export = ["dep:schemars"]
+channel-nostr = []
+voice-wake = []

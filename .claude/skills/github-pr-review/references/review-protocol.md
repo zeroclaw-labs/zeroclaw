@@ -1,4 +1,4 @@
-# PR Review Protocol — Full Reference
+  # PR Review Protocol — Full Reference
 
 This is the detailed, phase-by-phase review protocol. The SKILL.md provides the quick reference; this document is the authoritative procedure.
 
@@ -149,6 +149,8 @@ Review the diff for:
 - Consistency with existing codebase patterns and conventions.
 - Correctness, edge cases, and potential regressions.
 - AI model name accuracy — if the PR references model names, verify them against the provider's current documentation.
+- **Generated artifact integrity — per R2 (§3.8).** If the diff touches code that produces user-facing artifacts (shell completions, JSON schemas, derive macros, build templates, any code-gen), source inspection alone is insufficient. Build the artifact and inspect its output.
+- **Deprecation and rename stubs — per R4 (§3.8).** If the PR renames or deprecates a user-facing CLI command, subcommand, flag, or API surface, stress-test every renamed/deprecated entry point with the five-probe template.
 
 **Comment on issues. Do not push code fixes.** The agent is a reviewer, not a contributor.
 
@@ -187,14 +189,84 @@ Include this assessment in your final verdict comment (§4.2). This makes your r
 ### 3.6 — i18n Follow-Through
 
 - **IF** the PR modifies docs or navigation → Verify updates across all supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`) per `docs/contributing/docs-contract.md`.
+- **Before issuing a parity finding**, apply **R5 (§3.8):** grep the relevant locale files to confirm the identifier or section being changed actually exists in that locale. Pre-existing locale drift is not this PR's responsibility.
 - **IF** locale parity is missing → Comment with specific locales that need updates.
 
 ### 3.7 — Testing & Validation
 
-- Run `cargo test` (or `./dev/ci.sh test` for full validation).
-- Confirm all existing tests pass.
-- Assess whether new functionality has appropriate test coverage — comment if not.
-- Confirm no regressions.
+Run the full local validation battery — not just a subset:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo build
+cargo test --quiet 2>&1 | tee /tmp/pr-<number>-test.log
+```
+
+Do not substitute `cargo check` for `cargo build`. Do not substitute `cargo test --lib` for full `cargo test` — the integration, component, and system test binaries catch regressions that `--lib` alone misses. CI runs the full battery on merge; running it locally gives you direct access to log lines and warnings that CI UI hides, and it is cheap.
+
+For every WARN / ERROR / `warning:` line captured during this phase, apply **R3 (§3.8):** investigate or explicitly root-cause as pre-existing. "Noise in the test output" is not an acceptable dismissal.
+
+After the validation battery passes, execute the contributor's stated test plan per **R1 (§3.8).** Every checkbox in the PR body's "## Test plan" section must be executed, or explicitly labeled:
+- `needs-manual` — interactive command (e.g. wizard UI)
+- `needs-credentials` — requires live credentials the agent does not hold
+- `platform-blocked` — cannot run on the current OS/arch (e.g. Linux-only crate on macOS)
+
+"Not run" is never a valid final state for a test plan checkbox.
+
+Assess whether new functionality has appropriate test coverage — comment if not. Confirm no regressions.
+
+---
+
+### 3.8 — Verification Discipline Rules
+
+These rules codify reviewer failure modes observed in prior sessions. They are non-negotiable checks that must be satisfied before issuing a verdict. Each rule names the phase where it fires and the failure it prevents.
+
+**R1 — Execute the contributor's test plan.** If the PR body contains a "## Test plan" section (or equivalent checkbox list), every checkbox must be executed or explicitly labeled `needs-manual`, `needs-credentials`, or `platform-blocked`.
+- **Fires during:** §3.7.
+- **Prevents:** Verdicts that skip the contributor's stated acceptance criteria. The contributor wrote those checkboxes as the definition of done; running fewer is both rude and unreliable.
+- **Failure mode it addresses:** Reviewer runs 3 of 6 test plan commands and assumes the rest are fine.
+
+**R2 — Inspect generated artifacts, not just the code that generates them.** If the diff touches code that produces user-facing artifacts (shell completions, JSON schemas, derive macros, build templates, code-gen), build the artifact and inspect its output. Grep the generated output for removed, renamed, or deprecated symbols.
+- **Fires during:** §3.2, §3.7.
+- **Prevents:** Stale references leaking into artifacts that users consume.
+- **Failure mode it addresses:** Reviewer reads the completion-wrapper source code, sees it was retargeted to the new command name, and never runs the binary to produce the actual completion script — missing a clap auto-describe line that still references the old name.
+
+**R3 — Investigate every WARN / ERROR line emitted during validation.** Every `WARN`, `ERROR`, or `warning:` line captured during build/test/test-plan execution must be either:
+- (a) confirmed as pre-existing on master with a documented root cause (file:line + one-sentence explanation), or
+- (b) flagged as a review finding.
+
+"Pre-existing" without evidence is not a valid dismissal. "Not related to this PR" without verification is not a valid dismissal.
+- **Fires during:** §3.7.
+- **Prevents:** Latent bugs hidden in noise. If a warning appears during manual verification, it is a signal, not noise.
+- **Failure mode it addresses:** Reviewer sees two `backfill_enabled: failed to set channels.email.enabled` warnings in their own test output, dismisses them as unrelated, and misses that the PR makes those warnings user-visible for the first time.
+
+**R4 — Stress-test deprecation and rename stubs.** For any PR that renames or deprecates a user-facing CLI command, subcommand, flag, or API surface, run the five-probe template against every renamed or deprecated entry point:
+
+1. `--help` — verify help text reflects the deprecation.
+2. Bare invocation with no subcommand args — verify the deprecation handler fires *before* clap errors on missing required args.
+3. Invocation with a missing required positional — verify the deprecation handler still fires, not a raw framework error.
+4. Invocation with an unknown flag — verify the deprecation message still surfaces.
+5. Invocation with valid syntax — verify the friendly error message.
+
+- **Fires during:** §3.2, §3.7.
+- **Prevents:** Rename stubs that only fire on the happy path, leaving muscle-memory users with raw framework errors instead of a friendly "this command moved" message.
+- **Failure mode it addresses:** Reviewer verifies `zeroclaw props list` produces the deprecation error, concludes the stub works, and never tries `zeroclaw props get` (no positional) — missing that clap rejects with a raw arg-missing error before the handler can fire.
+
+**R5 — Grep locale files before flagging i18n parity gaps.** Before issuing a finding that a PR breaks locale parity, grep the relevant locale files in `docs/i18n/**` for the identifier or section being changed. If the identifier does not exist in that locale, the gap is pre-existing drift and is not this PR's responsibility.
+- **Fires during:** §3.6.
+- **Prevents:** Over-reach findings that ask contributors to fix unrelated locale drift.
+- **Failure mode it addresses:** Reviewer flags `docs/i18n/zh-CN/reference/cli/commands-reference.zh-CN.md` for missing the new `config` section, when that locale never had the old `props` section either.
+
+**Discipline principles underlying these rules:**
+
+1. **Execute, don't infer.** If you can run the command, run it. Inference from source is strictly inferior to direct observation.
+2. **Quote verbatim, don't paraphrase.** When a finding cites an error message, warning, or generated line, use the exact string. "Looks like a warning about channels" is not actionable; `WARN backfill_enabled: failed to set channels.email.enabled: Unknown property` is.
+3. **Investigate signals, don't dismiss them.** Every log line you see during manual verification is evidence. The cost of investigating is one grep; the cost of missing is a latent bug in master.
+4. **Verify before flagging.** Before issuing any finding that claims "X does not exist" or "Y breaks Z", grep for X and read Y. Inference from filenames or naming conventions produces false positives.
+5. **Stub stress is cheap.** Deprecation and rename surfaces have small surface areas and well-defined expected behavior. Five probes take thirty seconds and catch the kinds of bugs that ship to users otherwise.
+
+When a reviewer discovers a new failure mode that belongs in this list, add it here rather than keeping it as tribal knowledge. Rules earn their place by preventing a specific, observed failure.
 
 ---
 
@@ -220,6 +292,7 @@ Before marking ready, re-read the PR page for:
 Use one of three outcomes per `reviewer-playbook.md` §3.4. Every verdict comment must open with the **PR comprehension summary** from §1.2 (what, why, blast radius) and include the **security/performance assessment** from §3.4.
 
 **Ready to merge:**
+- **Gate:** Only use this verdict when there are **zero** `[blocking]` findings AND **zero** `[suggestion]` findings. If there are any suggestions — even non-blocking ones — use "Needs author action" instead. The `agent-approved` label means "nothing left to do, just merge." Any outstanding feedback, however minor, means the PR is not ready.
 - Leave a comment that:
   - Thanks the contributor.
   - Opens with the comprehension summary (what this PR does and why).
@@ -231,11 +304,12 @@ Use one of three outcomes per `reviewer-playbook.md` §3.4. Every verdict commen
 - **Do NOT merge. Do NOT rebase and merge. A human maintainer will do this.**
 
 **Needs author action:**
+- **Gate:** Use this verdict when there are ANY findings — `[blocking]`, `[suggestion]`, or `[question]`. Even a single suggestion means the PR is not ready for blind merge.
 - Leave a comment that:
   - Thanks the contributor.
   - Opens with the comprehension summary.
   - Notes what is already good (avoid demoralizing contributors).
-  - Lists blocking issues in priority order, each with a severity tag (`[blocking]` or `[suggestion]`).
+  - Lists all issues in priority order, each with a severity tag (`[blocking]` or `[suggestion]`).
   - States clearly what must change before re-review.
 - Do not apply `agent-approved`.
 
@@ -285,16 +359,17 @@ Be specific. "Looks good" is not a valid entry.
 2. **Draft check is continuous.** Check at every phase boundary.
 3. **Comprehend before you critique.** Summarize what the PR does and why before issuing any judgments.
 4. **Review, don't rewrite.** Comment on issues. Do not push code to contributor branches.
-5. **The only hard stop is malicious content.** Everything else is within your judgment.
-6. **Repository docs are authoritative.** Follow `reviewer-playbook.md`, `pr-workflow.md`, and `pr-discipline.md`. This prompt adds agent-specific behavior on top of those processes.
-7. **Thin is sacred.** We are above our <5MB target and fighting to get back. Every PR either helps or hurts — there is no neutral.
-8. **Edge is the floor, cloud is welcome.** If it doesn't work on a $10 board, it doesn't ship in core.
-9. **Traits are the architecture.** Hardcoded implementations bypass the design. Don't allow it.
-10. **Security is the baseline, not a feature.** Never weaken it.
-11. **Privacy is a merge gate.** No PII, no real identities, no credentials in diffs.
-12. **CI must pass first.** Don't invest review effort in code that doesn't compile.
-13. **Route by risk, not intuition.** Use labels and changed paths to determine review depth.
-14. **Respect contributors.** Always thank. Always explain. Never close without a clear reason.
-15. **Your report is your accountability.** If it's not in the report, it didn't happen.
-16. **English only** unless it's i18n/translation content.
-17. **Clean workspace always.** Isolated worktree, cleaned up after.
+5. **Execute, don't infer.** Follow the verification discipline rules in §3.8 (R1–R5). Run the contributor's test plan. Inspect generated artifacts. Investigate every warning. Stress-test stubs. Grep before flagging.
+6. **The only hard stop is malicious content.** Everything else is within your judgment.
+7. **Repository docs are authoritative.** Follow `reviewer-playbook.md`, `pr-workflow.md`, and `pr-discipline.md`. This prompt adds agent-specific behavior on top of those processes.
+8. **Thin is sacred.** We are above our <5MB target and fighting to get back. Every PR either helps or hurts — there is no neutral.
+9. **Edge is the floor, cloud is welcome.** If it doesn't work on a $10 board, it doesn't ship in core.
+10. **Traits are the architecture.** Hardcoded implementations bypass the design. Don't allow it.
+11. **Security is the baseline, not a feature.** Never weaken it.
+12. **Privacy is a merge gate.** No PII, no real identities, no credentials in diffs.
+13. **CI must pass first.** Don't invest review effort in code that doesn't compile.
+14. **Route by risk, not intuition.** Use labels and changed paths to determine review depth.
+15. **Respect contributors.** Always thank. Always explain. Never close without a clear reason.
+16. **Your report is your accountability.** If it's not in the report, it didn't happen.
+17. **English only** unless it's i18n/translation content.
+18. **Clean workspace always.** Isolated worktree, cleaned up after.

@@ -33,6 +33,7 @@ Lệnh xuất schema:
 | `backend` | `none` | Backend quan sát: `none`, `noop`, `log`, `prometheus`, `otel`, `opentelemetry` hoặc `otlp` |
 | `otel_endpoint` | `http://localhost:4318` | Endpoint OTLP HTTP khi backend là `otel` |
 | `otel_service_name` | `zeroclaw` | Tên dịch vụ gửi đến OTLP collector |
+| `otel_headers` | _(không)_ | Header HTTP tùy chọn cho OTLP export (ví dụ: authorization). Chỉ định dưới dạng bảng TOML `[observability.otel_headers]`. Chỉnh sửa trực tiếp trong `config.toml` — không thể đặt qua `zeroclaw config set`. Giá trị được lưu dạng plaintext; bảo vệ `config.toml` bằng `chmod 600`. |
 
 Lưu ý:
 
@@ -46,6 +47,9 @@ Ví dụ:
 backend = "otel"
 otel_endpoint = "http://localhost:4318"
 otel_service_name = "zeroclaw"
+
+[observability.otel_headers]
+Authorization = "Bearer <your-token>"
 ```
 
 ## Ghi đè provider qua biến môi trường
