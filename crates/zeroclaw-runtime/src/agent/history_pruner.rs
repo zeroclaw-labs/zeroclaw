@@ -176,20 +176,32 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
     // forms an atomic group (tool_use + tool_result pairing). Collapsing only
     // part of the group would orphan tool_use blocks, causing API 400 errors
     // from providers that enforce pairing (e.g., Anthropic). See #4810.
+    //
+    // The group is collapsed only when *every* tool in it is unprotected —
+    // the same all-or-nothing rule Phase 2 uses. If `keep_recent` protects
+    // any tool in the group we skip the whole group. Partial collapse would
+    // leave a protected tool behind whose parent assistant has been
+    // rewritten to a summary with no "tool_calls" marker, which Phase 3's
+    // orphan sweep then evicts — silently violating `keep_recent`. See
+    // #5823.
     if config.collapse_tool_results {
         let mut i = 0;
         while i < messages.len() {
             let protected = protected_indices(messages, config.keep_recent);
             if messages[i].role == "assistant" && !protected[i] {
                 // Count consecutive tool messages following this assistant
+                // and remember whether any of them is protected.
                 let mut tool_count = 0;
+                let mut any_tool_protected = false;
                 while i + 1 + tool_count < messages.len()
                     && messages[i + 1 + tool_count].role == "tool"
-                    && !protected[i + 1 + tool_count]
                 {
+                    if protected[i + 1 + tool_count] {
+                        any_tool_protected = true;
+                    }
                     tool_count += 1;
                 }
-                if tool_count > 0 {
+                if tool_count > 0 && !any_tool_protected {
                     let summary =
                         format!("[Tool exchange: {tool_count} tool call(s) — results collapsed]");
                     messages[i] = ChatMessage {
@@ -200,6 +212,13 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
                         messages.remove(i + 1);
                     }
                     collapsed_pairs += tool_count;
+                    continue;
+                }
+                if tool_count > 0 {
+                    // Protected tool inside the group → skip the whole
+                    // group intact so Phase 3's orphan sweep has no
+                    // pretext to remove those tools.
+                    i += 1 + tool_count;
                     continue;
                 }
             }
@@ -777,5 +796,60 @@ mod tests {
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[2].role, "user");
+    }
+
+    /// Regression for #5823:
+    ///
+    /// When `keep_recent` protects the *tail* of a multi-tool group but not
+    /// the preceding assistant, Phase 1 used to collapse the unprotected
+    /// tools and rewrite the assistant to a summary that no longer contained
+    /// `"tool_calls"`. Phase 3's orphan sweep then classified the still-live
+    /// protected tool as an orphan (because the new summary does not contain
+    /// `"tool_calls"`) and removed it — silently violating `keep_recent`.
+    ///
+    /// After the fix Phase 1 treats the group as atomic: if any tool in it
+    /// is protected, the entire group is left intact.
+    #[test]
+    fn prune_does_not_evict_protected_tool_when_group_straddles_keep_recent() {
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("user", "query"),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[
+                    {"id":"t1","name":"shell","arguments":"{}"},
+                    {"id":"t2","name":"web","arguments":"{}"}
+                ]}"#,
+            ),
+            msg("tool", r#"{"tool_call_id":"t1","content":"first"}"#),
+            msg(
+                "tool",
+                r#"{"tool_call_id":"t2","content":"PROTECTED second"}"#,
+            ),
+            msg("user", "follow up"),
+            msg("assistant", "final"),
+        ];
+
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            // Budget is well above the estimated token cost so Phase 2 does
+            // not drop anything; this test isolates the Phase 1 / Phase 3
+            // interaction.
+            max_tokens: 100_000,
+            keep_recent: 3,
+            collapse_tool_results: true,
+        };
+
+        let stats = prune_history(&mut messages, &config);
+
+        assert_eq!(stats.messages_before, 7);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.content.contains("PROTECTED second")),
+            "a tool message protected by keep_recent must survive; \
+             got roles {:?}",
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+        );
     }
 }
