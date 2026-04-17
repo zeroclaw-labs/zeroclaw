@@ -662,8 +662,13 @@ mod tests {
     #[test]
     fn channel_approval_response_serde_roundtrip() {
         use zeroclaw_api::channel::ChannelApprovalResponse;
+        // AlwaysApprove serializes to "always" to match the CLI-side
+        // ApprovalResponse::Always and keep audit logs consistent.
         let json = serde_json::to_string(&ChannelApprovalResponse::AlwaysApprove).unwrap();
-        assert_eq!(json, "\"alwaysapprove\"");
+        assert_eq!(json, "\"always\"");
+        let parsed: ChannelApprovalResponse =
+            serde_json::from_str("\"always\"").unwrap();
+        assert_eq!(parsed, ChannelApprovalResponse::AlwaysApprove);
         let parsed: ChannelApprovalResponse = serde_json::from_str("\"deny\"").unwrap();
         assert_eq!(parsed, ChannelApprovalResponse::Deny);
     }

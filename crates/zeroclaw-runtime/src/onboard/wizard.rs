@@ -3757,6 +3757,9 @@ fn setup_channels(
                     mention_only: existing_tg.map(|t| t.mention_only).unwrap_or(false),
                     ack_reactions: existing_tg.and_then(|t| t.ack_reactions),
                     proxy_url: existing_tg.and_then(|t| t.proxy_url.clone()),
+                    approval_timeout_secs: existing_tg
+                        .map(|t| t.approval_timeout_secs)
+                        .unwrap_or(120),
                 });
             }
             ChannelMenuChoice::Discord => {

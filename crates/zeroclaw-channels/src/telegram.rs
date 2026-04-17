@@ -350,6 +350,10 @@ pub struct TelegramChannel {
             >,
         >,
     >,
+    /// Seconds to wait for the operator to tap an inline-keyboard button on a
+    /// tool approval prompt before auto-denying. Configurable via
+    /// `channels.telegram.approval_timeout_secs`. Default: 120.
+    approval_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,7 +399,14 @@ impl TelegramChannel {
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            approval_timeout_secs: 120,
         }
+    }
+
+    /// Override the approval prompt timeout (default 120s).
+    pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
+        self.approval_timeout_secs = secs;
+        self
     }
 
     /// Configure whether Telegram-native acknowledgement reactions are sent.
@@ -3164,8 +3175,14 @@ Ensure only one `zeroclaw` process is using this bot token."
             }
         }
 
-        // Wait up to 120 seconds for the user to tap a button.
-        let result = match tokio::time::timeout(Duration::from_secs(120), rx).await {
+        // Wait for the user to tap a button. Timeout is configurable via
+        // `channels.telegram.approval_timeout_secs` (default 120s).
+        let result = match tokio::time::timeout(
+            Duration::from_secs(self.approval_timeout_secs),
+            rx,
+        )
+        .await
+        {
             Ok(Ok(response)) => Some(response),
             _ => {
                 // Timeout or sender dropped — clean up and deny.
@@ -5285,6 +5302,14 @@ mod tests {
             let map = ch.pending_approvals.lock().await;
             assert!(map.is_empty());
         });
+    }
+
+    #[test]
+    fn approval_timeout_defaults_to_120_and_is_overridable() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        assert_eq!(ch.approval_timeout_secs, 120);
+        let ch = ch.with_approval_timeout_secs(30);
+        assert_eq!(ch.approval_timeout_secs, 30);
     }
 
     #[tokio::test]

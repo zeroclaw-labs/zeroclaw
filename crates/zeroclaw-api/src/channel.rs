@@ -22,6 +22,7 @@ pub enum ChannelApprovalResponse {
     /// Deny this call.
     Deny,
     /// Execute and add tool to session-scoped allowlist.
+    #[serde(rename = "always")]
     AlwaysApprove,
 }
 
