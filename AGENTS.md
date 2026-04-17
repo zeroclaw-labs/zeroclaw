@@ -115,8 +115,39 @@ Branch/commit/PR rules:
 - Do not hide behavior-changing side effects in refactor commits.
 - Do not include personal identity or sensitive information in test data, examples, docs, or commits.
 
+## Multi-Agent Handoff Protocol
+
+This repository is worked on concurrently by multiple AI assistants
+(Claude Code, Cursor, Codex, Aider, ...). Each has its own
+conversation history that doesn't cross-pollinate. Without a shared
+surface, sessions re-derive context and can clobber in-flight work.
+
+**Shared coordination surface**: [`.agent-state/`](./.agent-state/)
+
+On session start:
+
+1. `git status` — if working tree is dirty, read the top entry in
+   `.agent-state/CURRENT-WORK.md` to know whose work that is.
+2. Read `.agent-state/HANDOFF.md` — if `STATUS: in-progress`, another
+   agent paused mid-task. Either finish their checklist or stash their
+   work to a branch before starting something new.
+3. For architectural questions, skim `.agent-state/DECISIONS.md`.
+
+On session end:
+
+1. Append one block to `.agent-state/CURRENT-WORK.md` with branch,
+   files touched, validation results, next step. Prepend above the
+   existing entries (reverse-chronological).
+2. If pausing mid-task, overwrite `.agent-state/HANDOFF.md`.
+3. If you made a lasting architectural choice (e.g. "we chose pattern
+   X over Y because Z"), append to `.agent-state/DECISIONS.md`.
+
+This protocol is not optional for non-trivial work — it's how the
+team (human + N AI assistants) stays in sync.
+
 ## Linked References
 
 - `@docs/contributing/change-playbooks.md` — adding providers, channels, tools, peripherals; security/gateway changes; architecture boundaries
 - `@docs/contributing/pr-discipline.md` — privacy rules, superseded-PR attribution/templates, handoff template
 - `@docs/contributing/docs-contract.md` — docs system contract, i18n rules, locale parity
+- `@.agent-state/README.md` — multi-agent coordination protocol (read by ALL AI assistants)
