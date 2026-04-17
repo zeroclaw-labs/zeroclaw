@@ -354,7 +354,8 @@ impl Tool for SessionResetTool {
             return Ok(result);
         }
 
-        // Check if session exists before attempting reset
+        // TOCTOU: a message appended between load() and the last remove_last()
+        // will also be removed. Acceptable until clear_messages lands (#5701).
         let messages = self.backend.load(session_id);
         if messages.is_empty() {
             return Ok(ToolResult {
@@ -443,18 +444,28 @@ impl Tool for SessionDeleteTool {
             return Ok(result);
         }
 
+        let existed = !self.backend.load(session_id).is_empty();
+
         match self.backend.delete_session(session_id) {
             Ok(true) => Ok(ToolResult {
                 success: true,
                 output: format!("Session '{session_id}' deleted."),
                 error: None,
             }),
-            Ok(false) => Ok(ToolResult {
+            Ok(false) if !existed => Ok(ToolResult {
                 success: true,
                 output: format!(
                     "Session '{session_id}' not found (may have already been deleted)."
                 ),
                 error: None,
+            }),
+            Ok(false) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Session '{session_id}' exists but could not be deleted \
+                     — the storage backend may not support this operation."
+                )),
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
@@ -878,5 +889,39 @@ mod tests {
                 .unwrap()
                 .contains(&json!("session_id"))
         );
+    }
+
+    // ── NoOpDeleteBackend (test helper) ────────────────────────────
+
+    /// Delegates everything except delete_session, which uses the trait
+    /// default (returns Ok(false) without deleting anything).
+    struct NoOpDeleteBackend(Arc<dyn SessionBackend>);
+
+    impl SessionBackend for NoOpDeleteBackend {
+        fn load(&self, key: &str) -> Vec<ChatMessage> {
+            self.0.load(key)
+        }
+        fn append(&self, key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            self.0.append(key, msg)
+        }
+        fn remove_last(&self, key: &str) -> std::io::Result<bool> {
+            self.0.remove_last(key)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            self.0.list_sessions()
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_detects_noop_backend() {
+        let (_tmp, inner) = seeded_backend();
+        let backend: Arc<dyn SessionBackend> = Arc::new(NoOpDeleteBackend(inner));
+        let tool = SessionDeleteTool::new(backend, test_security());
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("could not be deleted"));
     }
 }
