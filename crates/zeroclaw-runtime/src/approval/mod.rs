@@ -610,4 +610,65 @@ mod tests {
             "always_ask must override auto_approve"
         );
     }
+
+    // ── ChannelApprovalResponse → ApprovalResponse mapping ──────
+
+    #[test]
+    fn channel_approve_maps_to_yes() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        let mapped = match ChannelApprovalResponse::Approve {
+            ChannelApprovalResponse::Approve => ApprovalResponse::Yes,
+            ChannelApprovalResponse::AlwaysApprove => ApprovalResponse::Always,
+            ChannelApprovalResponse::Deny => ApprovalResponse::No,
+        };
+        assert_eq!(mapped, ApprovalResponse::Yes);
+    }
+
+    #[test]
+    fn channel_always_approve_maps_to_always() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        let mapped = match ChannelApprovalResponse::AlwaysApprove {
+            ChannelApprovalResponse::Approve => ApprovalResponse::Yes,
+            ChannelApprovalResponse::AlwaysApprove => ApprovalResponse::Always,
+            ChannelApprovalResponse::Deny => ApprovalResponse::No,
+        };
+        assert_eq!(mapped, ApprovalResponse::Always);
+    }
+
+    #[test]
+    fn channel_deny_maps_to_no() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        let mapped = match ChannelApprovalResponse::Deny {
+            ChannelApprovalResponse::Approve => ApprovalResponse::Yes,
+            ChannelApprovalResponse::AlwaysApprove => ApprovalResponse::Always,
+            ChannelApprovalResponse::Deny => ApprovalResponse::No,
+        };
+        assert_eq!(mapped, ApprovalResponse::No);
+    }
+
+    #[test]
+    fn channel_approval_request_serde_roundtrip() {
+        use zeroclaw_api::channel::ChannelApprovalRequest;
+        let req = ChannelApprovalRequest {
+            tool_name: "shell".into(),
+            arguments_summary: "command: ls -la".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: ChannelApprovalRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tool_name, "shell");
+        assert_eq!(parsed.arguments_summary, "command: ls -la");
+    }
+
+    #[test]
+    fn channel_approval_response_serde_roundtrip() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        // AlwaysApprove serializes to "always" to match the CLI-side
+        // ApprovalResponse::Always and keep audit logs consistent.
+        let json = serde_json::to_string(&ChannelApprovalResponse::AlwaysApprove).unwrap();
+        assert_eq!(json, "\"always\"");
+        let parsed: ChannelApprovalResponse = serde_json::from_str("\"always\"").unwrap();
+        assert_eq!(parsed, ChannelApprovalResponse::AlwaysApprove);
+        let parsed: ChannelApprovalResponse = serde_json::from_str("\"deny\"").unwrap();
+        assert_eq!(parsed, ChannelApprovalResponse::Deny);
+    }
 }

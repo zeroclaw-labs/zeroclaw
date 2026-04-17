@@ -6,11 +6,11 @@ import type { AccentColor, UiFont, MonoFont, ThemeMode } from '@/contexts/ThemeC
 import { uiFontStacks, monoFontStacks } from '@/contexts/ThemeContext';
 import { colorThemes } from '@/contexts/colorThemes';
 
-const themeOptions: { value: ThemeMode; icon: typeof Sun; labelKey: string }[] = [
-  { value: 'system', icon: Laptop, labelKey: 'theme.system' },
-  { value: 'dark', icon: Moon, labelKey: 'theme.dark' },
-  { value: 'light', icon: Sun, labelKey: 'theme.light' },
-  { value: 'oled', icon: Monitor, labelKey: 'theme.oled' },
+const themeOptions: { value: ThemeMode; icon: typeof Sun; labelKey: string; previewBg: string; previewFg: string }[] = [
+  { value: 'system', icon: Laptop, labelKey: 'theme.system', previewBg: 'linear-gradient(135deg, #1e1e24 50%, #f4f4f5 50%)', previewFg: '#d4d4d8' },
+  { value: 'dark', icon: Moon, labelKey: 'theme.dark', previewBg: '#1e1e24', previewFg: '#d4d4d8' },
+  { value: 'light', icon: Sun, labelKey: 'theme.light', previewBg: '#f4f4f5', previewFg: '#18181b' },
+  { value: 'oled', icon: Monitor, labelKey: 'theme.oled', previewBg: '#000000', previewFg: '#d4d4d8' },
 ];
 
 const accentOptions: { value: AccentColor; color: string }[] = [
@@ -224,7 +224,7 @@ export function SettingsModal({ open, onClose }: Props) {
                         key={opt.value}
                         onClick={() => setTheme(opt.value)}
                         aria-pressed={active}
-                        className="flex-1 flex flex-col items-center gap-1 py-2 rounded-xl border text-xs transition-all"
+                        className="flex-1 flex flex-col items-center gap-1.5 py-2 rounded-xl border text-xs transition-all"
                         style={active
                           ? { borderColor: 'var(--pc-accent-dim)', background: 'var(--pc-accent-glow)', color: 'var(--pc-accent-light)' }
                           : { borderColor: 'var(--pc-border)', color: 'var(--pc-text-muted)', background: 'transparent' }
@@ -232,7 +232,18 @@ export function SettingsModal({ open, onClose }: Props) {
                         onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'var(--pc-hover)'; }}
                         onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}
                       >
-                        <Icon size={16} />
+                        {/* Theme preview swatch */}
+                        <div
+                          className="w-8 h-5 rounded-md border"
+                          style={{
+                            background: opt.previewBg,
+                            borderColor: opt.value === 'light' ? 'rgba(0,0,0,0.12)' : 'rgba(255,255,255,0.12)',
+                          }}
+                        >
+                          <div className="flex items-center justify-center h-full">
+                            <Icon size={10} style={{ color: opt.previewFg }} />
+                          </div>
+                        </div>
                         <span>{t(opt.labelKey)}</span>
                       </button>
                     );
