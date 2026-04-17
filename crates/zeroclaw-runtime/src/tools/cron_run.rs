@@ -115,10 +115,29 @@ impl Tool for CronRunTool {
         }
 
         let started_at = Utc::now();
-        let (success, output) =
+        let (mut success, output) =
             Box::pin(cron::scheduler::execute_job_now(&self.config, &job)).await;
         let finished_at = Utc::now();
         let duration_ms = (finished_at - started_at).num_milliseconds();
+
+        if job.delivery.mode.eq_ignore_ascii_case("announce")
+            && let (Some(channel), Some(target)) =
+                (job.delivery.channel.as_deref(), job.delivery.to.as_deref())
+            && let Err(e) =
+                cron::scheduler::deliver_announcement(&self.config, channel, target, &output).await
+        {
+            if job.delivery.best_effort {
+                tracing::warn!(
+                    job_id = %job.id,
+                    error = %e,
+                    "cron_run delivery failed (best_effort)"
+                );
+            } else {
+                tracing::warn!(job_id = %job.id, error = %e, "cron_run delivery failed");
+                success = false;
+            }
+        }
+
         let status = if success { "ok" } else { "error" };
 
         let _ = cron::record_run(
