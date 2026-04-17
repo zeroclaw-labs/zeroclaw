@@ -5159,6 +5159,9 @@ fn collect_configured_channels(
                     wh.send_method.clone(),
                     wh.auth_header.clone(),
                     wh.secret.clone(),
+                    wh.max_retries,
+                    wh.retry_base_delay_ms,
+                    wh.retry_max_delay_ms,
                 )),
             });
         } else {
