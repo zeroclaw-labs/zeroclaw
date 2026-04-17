@@ -435,26 +435,30 @@ jobs:
           NOTES: ${{ needs.release-notes.outputs.notes }}
         run: printf '%s\n' "$NOTES" > release-notes.md
 
-      - name: Create tag if manual dispatch
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          TAG: ${{ needs.validate.outputs.tag }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "zeroclaw $TAG"
-          git push origin "$TAG"
-
-      - name: Create GitHub Release
+      - name: Create tag and release
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           TAG: ${{ needs.validate.outputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
-          gh release create "$TAG" release-assets/* \
-            --repo "${{ github.repository }}" \
-            --title "$TAG" \
-            --notes-file release-notes.md \
-            --latest
+          # For manual dispatch, use --target to create tag + release atomically
+          # via RELEASE_TOKEN (admin PAT) which bypasses tag protection rules.
+          # For tag push, the tag already exists — just create the release.
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            gh release create "$TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --notes-file release-notes.md \
+              --target "$COMMIT_SHA" \
+              --latest
+          else
+            gh release create "$TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --notes-file release-notes.md \
+              --latest
+          fi
 
       - name: Remove CHANGELOG-next.md after stable release
         shell: bash
