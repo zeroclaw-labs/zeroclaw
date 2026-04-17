@@ -112,7 +112,7 @@ urlencoding = "2.1"
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"
 
-rumqttc = "0.24"
+rumqttc = "0.25"
 
 # Tarball extraction for binary updates
 flate2 = "1"
@@ -294,7 +294,10 @@ whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
 voice-wake = ["zeroclaw-channels/voice-wake"]
 
 # Backends and platform flags — each forwards to ONE crate
-observability-prometheus = ["zeroclaw-runtime/observability-prometheus"]
+observability-prometheus = [
+    "zeroclaw-runtime/observability-prometheus",
+    "zeroclaw-gateway/observability-prometheus",
+]
 observability-otel = ["zeroclaw-runtime/observability-otel"]
 hardware = ["dep:zeroclaw-hardware", "zeroclaw-hardware/hardware"]
 peripheral-rpi = ["dep:zeroclaw-hardware", "zeroclaw-hardware/peripheral-rpi"]
