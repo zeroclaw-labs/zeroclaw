@@ -1459,6 +1459,7 @@ pub async fn handle_ws_voice(
 enum VoiceSessionHandle {
     Gemini(crate::voice::simul_session::SimulSession),
     Deepgram(crate::voice::deepgram_simul::DeepgramSimulSession),
+    Gemma(crate::voice::gemma_simul::GemmaSimulSession),
     TypecastPipeline(crate::voice::typecast_interp::TypecastInterpSession),
 }
 
@@ -1467,6 +1468,7 @@ impl VoiceSessionHandle {
         match self {
             Self::Gemini(s) => s.send_audio(pcm_data).await,
             Self::Deepgram(s) => s.send_audio(pcm_data).await,
+            Self::Gemma(s) => s.send_audio(pcm_data).await,
             Self::TypecastPipeline(s) => s.send_audio(pcm_data).await,
         }
     }
@@ -1478,6 +1480,7 @@ impl VoiceSessionHandle {
         match self {
             Self::Gemini(s) => s.event_rx.clone(),
             Self::Deepgram(s) => s.event_rx.clone(),
+            Self::Gemma(s) => s.event_rx.clone(),
             Self::TypecastPipeline(s) => s.event_rx.clone(),
         }
     }
@@ -1486,6 +1489,7 @@ impl VoiceSessionHandle {
         match self {
             Self::Gemini(s) => s.stop().await,
             Self::Deepgram(s) => s.stop().await,
+            Self::Gemma(s) => s.stop().await,
             Self::TypecastPipeline(s) => s.stop().await,
         }
     }
@@ -1495,6 +1499,7 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
     use crate::voice::{
         deepgram_simul::{DeepgramSimulConfig, DeepgramSimulSession},
         events::{ClientMessage, ServerMessage},
+        gemma_simul::{GemmaSimulConfig, GemmaSimulSession},
         pipeline::{Domain, Formality, LanguageCode, VoiceAge, VoiceGender},
         simul::SegmentationConfig,
         simul_session::{SimulSession, SimulSessionConfig},
@@ -1651,6 +1656,28 @@ async fn handle_voice_socket(mut socket: WebSocket, state: AppState) {
                         DeepgramSimulSession::start(dg_config)
                             .await
                             .map(VoiceSessionHandle::Deepgram)
+                    }
+
+                    "gemma" => {
+                        // PR #6: on-device STT via Gemma 4 E4B (replaces Deepgram).
+                        // Reads Ollama base URL + model from env so config layout
+                        // can stay frozen until the broader voice config refactor.
+                        let base_url = std::env::var("OLLAMA_BASE_URL")
+                            .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+                        let model = std::env::var("GEMMA_ASR_MODEL")
+                            .unwrap_or_else(|_| "gemma4:e4b".to_string());
+                        let cfg = GemmaSimulConfig {
+                            session_id: session_id.clone(),
+                            source_lang: src_lang,
+                            base_url,
+                            model,
+                        };
+                        // segmentation engine and Deepgram api_key are not needed
+                        // here — Gemma utterance-segments internally via VAD.
+                        let _ = (segmentation, api_key);
+                        GemmaSimulSession::start(cfg)
+                            .await
+                            .map(VoiceSessionHandle::Gemma)
                     }
 
                     "typecast_pipeline" => {
