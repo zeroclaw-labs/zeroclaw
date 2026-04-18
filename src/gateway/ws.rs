@@ -1410,14 +1410,62 @@ async fn handle_socket(
             }
         }
 
+        // ── Phase 3 — SLM executor attempt (WS) ──
+        // Symmetric to handle_api_chat: try the on-device SLM executor
+        // first for Medium / tool-hinted tasks. On success, short-circuit
+        // the cloud agent loop and hand the SLM's answer to the advisor
+        // REVIEW checkpoint downstream. On exceeded-iterations / error,
+        // fall through to `run_gateway_chat_with_tools` exactly as before.
+        let mut ws_slm_reply: Option<String> = None;
+        let mut ws_slm_tools: Vec<String> = Vec::new();
+        if let (Some(executor), Some(decision)) = (
+            state.slm_executor.as_ref(),
+            ws_gatekeeper_decision.as_ref(),
+        ) {
+            let eligible = matches!(
+                decision.category,
+                crate::gatekeeper::router::TaskCategory::Medium
+            ) || decision.tool_needed.is_some();
+            if eligible {
+                let tool_refs: Vec<&dyn crate::tools::Tool> = state
+                    .tools_registry_exec
+                    .as_ref()
+                    .iter()
+                    .map(|boxed| boxed.as_ref())
+                    .collect();
+                match executor.run(&enriched_content, &tool_refs).await {
+                    Ok(outcome) if !outcome.exceeded_iterations => {
+                        tracing::info!(
+                            iterations = outcome.iterations,
+                            tools = outcome.tools_invoked.len(),
+                            "WS SLM executor closed the task locally"
+                        );
+                        ws_slm_tools = outcome.tools_invoked;
+                        ws_slm_reply = Some(outcome.reply);
+                    }
+                    Ok(_) => tracing::info!(
+                        "WS SLM executor exceeded iteration budget — falling back to cloud LLM"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "WS SLM executor errored — falling back to cloud LLM"
+                    ),
+                }
+            }
+        }
+
         // Full agentic loop with tools (includes WASM skills, shell, memory, etc.)
-        match Box::pin(super::run_gateway_chat_with_tools(
-            &state,
-            &enriched_content,
-            Some(&ws_session_id),
-        ))
-        .await
-        {
+        let agent_outcome = if let Some(r) = ws_slm_reply.clone() {
+            Ok(r)
+        } else {
+            Box::pin(super::run_gateway_chat_with_tools(
+                &state,
+                &enriched_content,
+                Some(&ws_session_id),
+            ))
+            .await
+        };
+        match agent_outcome {
             Ok(response) => {
                 let leak_guard_cfg = { state.config.lock().security.outbound_leak_guard.clone() };
                 let safe_response = finalize_ws_response(
@@ -1512,15 +1560,24 @@ async fn handle_socket(
                     })
                 });
 
+                let slm_meta = ws_slm_reply.as_ref().map(|_| {
+                    serde_json::json!({
+                        "used": true,
+                        "model": state.slm_executor.as_ref().map(|e| e.model().to_string()),
+                        "tools_invoked": ws_slm_tools,
+                    })
+                });
+
                 // Send the full response as a done message
                 let done = serde_json::json!({
                     "type": "done",
                     "full_response": safe_response,
-                    "active_provider": provider_label,
+                    "active_provider": if ws_slm_reply.is_some() { "ollama" } else { provider_label.as_str() },
                     "active_model": state.model,
-                    "is_local_path": is_local_path,
+                    "is_local_path": is_local_path || ws_slm_reply.is_some(),
                     "network_status": if net_online { "online" } else { "offline" },
                     "advisor": advisor_meta,
+                    "slm_executor": slm_meta,
                 });
                 let _ = socket.send(Message::Text(done.to_string().into())).await;
 

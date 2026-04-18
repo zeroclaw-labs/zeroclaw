@@ -36,6 +36,7 @@
 //! encoded in [`AdvisorPolicy::for_category`].
 
 pub mod prompts;
+pub mod slm_executor;
 pub mod types;
 
 use std::sync::Arc;
@@ -50,6 +51,8 @@ use crate::providers::Provider;
 // Some of these are only consumed by callers we haven't wired yet
 // (WS gatekeeper, richer telemetry). Keep the re-export set stable so
 // downstream consumers don't have to touch this line as integrations land.
+#[allow(unused_imports)]
+pub use slm_executor::{RunOutcome as SlmRunOutcome, SlmExecutor};
 #[allow(unused_imports)]
 pub use types::{AdvisorCheckpoint, AdvisorRequest, PlanOutput, ReviewOutput, ReviewVerdict, TaskKind};
 

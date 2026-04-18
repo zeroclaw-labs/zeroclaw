@@ -416,6 +416,14 @@ pub struct AppState {
     /// operator-key (2.2× credit) routing as every other LLM call, so
     /// billing semantics are unchanged.
     pub advisor: Option<Arc<crate::advisor::AdvisorClient>>,
+    /// SLM-as-executor loop (Phase 3). When present, non-trivial chat
+    /// messages that the gatekeeper routes to the cloud path first
+    /// attempt a local Gemma-4 agent loop with prompt-guided tool
+    /// calling; only when that loop fails or exceeds its iteration
+    /// budget do we fall back to the cloud LLM agent loop. Shares
+    /// `tools_registry_exec` as the tool surface so every tool the
+    /// cloud LLM can call is also available to the SLM executor.
+    pub slm_executor: Option<Arc<crate::advisor::SlmExecutor>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -620,6 +628,46 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         }
     } else {
         tracing::debug!("Advisor LLM disabled in config — skipping");
+        None
+    };
+
+    // ── SLM executor (Phase 3) ──
+    //
+    // When the gatekeeper is enabled we can also drive on-device Gemma 4
+    // as the *executor* (not just the classifier) via a prompt-guided
+    // tool-calling loop. The executor tries to close the task locally
+    // using the same tool registry the cloud LLM would use; if it stalls
+    // we fall back to the cloud LLM agent loop without the user noticing.
+    //
+    // The Ollama URL in `GatekeeperConfig` carries the OpenAI-compat
+    // `/v1` suffix for the gatekeeper's own HTTP client. `OllamaProvider`
+    // expects a root URL, so strip it.
+    let slm_executor = if config.gatekeeper.enabled {
+        let base = config
+            .gatekeeper
+            .ollama_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .to_string();
+        let ollama: Arc<dyn crate::providers::Provider> = Arc::new(
+            crate::providers::ollama::OllamaProvider::new(Some(&base), None),
+        );
+        let executor = crate::advisor::SlmExecutor::new(
+            ollama,
+            config.gatekeeper.model.clone(),
+            0.3,
+            8,
+        );
+        tracing::info!(
+            model = executor.model(),
+            url = base.as_str(),
+            "SLM executor initialized (Phase 3 — prompt-guided tool calling)"
+        );
+        Some(Arc::new(executor))
+    } else {
+        tracing::debug!(
+            "SLM executor disabled (gatekeeper off) — cloud LLM agent loop handles all non-trivial tasks"
+        );
         None
     };
     // Create memory backend, optionally with cross-device sync support.
@@ -1220,6 +1268,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         pricing_registry: crate::billing::SharedPricingRegistry::new(&config.workspace_dir),
         gatekeeper,
         advisor,
+        slm_executor,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -4017,6 +4066,7 @@ mod tests {
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -4093,6 +4143,7 @@ mod tests {
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -4152,6 +4203,7 @@ mod tests {
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_metrics(State(state), test_public_connect_info(), HeaderMap::new())
@@ -4212,6 +4264,7 @@ mod tests {
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let unauthorized =
@@ -4716,6 +4769,7 @@ Reminder set successfully."#;
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4804,6 +4858,7 @@ Reminder set successfully."#;
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_webhook(
@@ -4873,6 +4928,7 @@ Reminder set successfully."#;
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_webhook(
@@ -4943,6 +4999,7 @@ Reminder set successfully."#;
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_webhook(
@@ -5022,6 +5079,7 @@ Reminder set successfully."#;
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_node_control(
@@ -5093,6 +5151,7 @@ Reminder set successfully."#;
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_node_control(
@@ -5169,6 +5228,7 @@ Reminder set successfully."#;
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let headers = HeaderMap::new();
@@ -5271,6 +5331,7 @@ Reminder set successfully."#;
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_webhook(
@@ -5343,6 +5404,7 @@ Reminder set successfully."#;
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -5420,6 +5482,7 @@ Reminder set successfully."#;
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -5511,6 +5574,7 @@ Reminder set successfully."#;
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_github_webhook(
@@ -5581,6 +5645,7 @@ Reminder set successfully."#;
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let body = r#"{
@@ -5662,6 +5727,7 @@ Reminder set successfully."#;
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let body = r#"{
@@ -5748,6 +5814,7 @@ Reminder set successfully."#;
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -5824,6 +5891,7 @@ Reminder set successfully."#;
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -5893,6 +5961,7 @@ Reminder set successfully."#;
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_qq_webhook(
@@ -5961,6 +6030,7 @@ Reminder set successfully."#;
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
             advisor: None,
+            slm_executor: None,
         };
 
         let mut headers = HeaderMap::new();

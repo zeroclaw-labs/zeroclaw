@@ -641,8 +641,76 @@ pub async fn handle_api_chat(
         }
     }
 
+    // ── Phase 3 — SLM executor attempt ──
+    //
+    // Before falling through to the full cloud agent loop, try letting
+    // the on-device SLM close the task via its own prompt-guided tool
+    // loop. The executor shares `tools_registry_exec` so every tool the
+    // cloud LLM would call is equally available here. We only attempt
+    // this when:
+    //   - `state.slm_executor` is wired (requires gatekeeper enabled),
+    //   - the gatekeeper flagged `Medium` or a concrete `tool_needed`
+    //     (Simple was already answered above; Complex/Specialized tend
+    //     to need stronger reasoning than a 4B model provides and we
+    //     route them straight to the cloud).
+    //
+    // On success, we record the SLM output, skip the cloud agent loop,
+    // and still pass through the advisor REVIEW checkpoint downstream.
+    // On exceeded-iterations / error, we silently fall through to the
+    // cloud path — the user gets an answer regardless.
+    let mut slm_produced_reply: Option<String> = None;
+    let mut slm_tools_invoked: Vec<String> = Vec::new();
+    if let (Some(executor), Some(decision)) =
+        (state.slm_executor.as_ref(), gatekeeper_decision.as_ref())
+    {
+        let eligible = matches!(
+            decision.category,
+            crate::gatekeeper::router::TaskCategory::Medium
+        ) || decision.tool_needed.is_some();
+        if eligible {
+            // Borrow the registered executable tools without reallocating.
+            // `tools_registry_exec: Arc<Vec<Box<dyn Tool>>>` maps cleanly
+            // to `&[&dyn Tool]` which is what the SLM executor accepts.
+            let tool_refs: Vec<&dyn crate::tools::Tool> = state
+                .tools_registry_exec
+                .as_ref()
+                .iter()
+                .map(|boxed| boxed.as_ref())
+                .collect();
+            match executor.run(&enriched_message, &tool_refs).await {
+                Ok(outcome) if !outcome.exceeded_iterations => {
+                    tracing::info!(
+                        iterations = outcome.iterations,
+                        tools = outcome.tools_invoked.len(),
+                        "SLM executor closed the task locally — skipping cloud LLM"
+                    );
+                    slm_tools_invoked = outcome.tools_invoked;
+                    slm_produced_reply = Some(outcome.reply);
+                }
+                Ok(outcome) => {
+                    tracing::info!(
+                        iterations = outcome.iterations,
+                        "SLM executor exceeded iteration budget — falling back to cloud LLM"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "SLM executor errored — falling back to cloud LLM"
+                    );
+                }
+            }
+        }
+    }
+
     // ── Run the full agent loop ──
-    match crate::agent::process_message_with_session(config, &enriched_message, session_id).await {
+    let agent_outcome = if let Some(reply) = slm_produced_reply.clone() {
+        // SLM already answered — short-circuit.
+        Ok(reply)
+    } else {
+        crate::agent::process_message_with_session(config, &enriched_message, session_id).await
+    };
+    match agent_outcome {
         Ok(response) => {
             let leak_guard_cfg = state.config.lock().security.outbound_leak_guard.clone();
             let safe_response = sanitize_gateway_response(
@@ -867,15 +935,24 @@ pub async fn handle_api_chat(
                 })
             });
 
+            let slm_meta = slm_produced_reply.as_ref().map(|_| {
+                serde_json::json!({
+                    "used": true,
+                    "model": state.slm_executor.as_ref().map(|e| e.model().to_string()),
+                    "tools_invoked": slm_tools_invoked,
+                })
+            });
+
             let body = serde_json::json!({
                 "reply": final_reply,
                 "model": executor_model_for_revision,
                 "session_id": chat_body.session_id,
-                "active_provider": provider_label,
+                "active_provider": if slm_produced_reply.is_some() { "ollama" } else { provider_label.as_str() },
                 "active_model": model_label,
-                "is_local_path": is_local_path,
+                "is_local_path": is_local_path || slm_produced_reply.is_some(),
                 "network_status": if net_online { "online" } else { "offline" },
                 "advisor": advisor_meta,
+                "slm_executor": slm_meta,
             });
             (StatusCode::OK, Json(body))
         }
