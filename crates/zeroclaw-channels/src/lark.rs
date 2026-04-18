@@ -1314,9 +1314,13 @@ impl LarkChannel {
         };
 
         if !resp.status().is_success() {
+            // Drain the body so the operator can see Feishu's `{code, msg}`
+            // explanation (e.g. missing `im:resource` scope, expired token).
+            let status = resp.status();
+            let body_snippet = resp.text().await.unwrap_or_default();
+            let body_snippet = body_snippet.chars().take(512).collect::<String>();
             tracing::warn!(
-                "Lark: image download failed for {image_key}: status={}",
-                resp.status()
+                "Lark: image download failed for {image_key}: status={status} url={url} body={body_snippet}"
             );
             return None;
         }
