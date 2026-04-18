@@ -2036,7 +2036,9 @@ async fn classify_channel_reply_intent(
          Rules:\n- Follow the workspace and channel instructions in the system prompt.\n- If the \
          latest message is not clearly addressed to the assistant, prefer `NO_REPLY`.\n- In DMs \
          or direct conversations, prefer `REPLY` unless the instructions explicitly say \
-         otherwise.\n- Do not answer the user. Only classify.\n\nConversation:\n",
+         otherwise.\n- If the latest user message includes attachments (images, files), treat it \
+         as a request for the assistant's attention and prefer `REPLY` unless the instructions \
+         explicitly say otherwise.\n- Do not answer the user. Only classify.\n\nConversation:\n",
     );
 
     for msg in history.iter().filter(|m| m.role != "system") {
@@ -2049,9 +2051,15 @@ async fn classify_channel_reply_intent(
         let summary = if image_refs.is_empty() {
             cleaned
         } else if cleaned.is_empty() {
-            format!("[{} image(s) attached]", image_refs.len())
+            format!(
+                "<attached {} image(s) for the assistant to view>",
+                image_refs.len()
+            )
         } else {
-            format!("{cleaned} [{} image(s) attached]", image_refs.len())
+            format!(
+                "{cleaned} <attached {} image(s) for the assistant to view>",
+                image_refs.len()
+            )
         };
         let _ = writeln!(convo, "[{role}] {summary}");
     }
