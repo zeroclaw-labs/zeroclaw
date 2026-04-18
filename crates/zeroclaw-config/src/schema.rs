@@ -1683,20 +1683,51 @@ pub struct SkillCreationConfig {
     /// Enable automatic skill creation after successful multi-step tasks.
     /// Default: `false`.
     pub enabled: bool,
+    /// Minimum tool-call count before attempting skill creation (Hermes-style workflows often use 5+).
+    /// Default: `2` (legacy behavior).
+    #[serde(default = "default_skill_creation_min_tool_calls")]
+    pub min_tool_calls: usize,
     /// Maximum number of auto-generated skills to keep.
     /// When exceeded, the oldest auto-generated skill is removed (LRU eviction).
     pub max_skills: usize,
     /// Embedding similarity threshold for deduplication.
     /// Skills with descriptions more similar than this value are skipped.
     pub similarity_threshold: f64,
+    /// When `true`, run an LLM **reflection** pass to write a `SKILL.md` (agentskills-style)
+    /// from the task, tool trace, and final answer — similar to Hermes `skill_manage` narratives.
+    /// Default: `false` (only serialized `SKILL.toml` from tool calls).
+    pub reflection_enabled: bool,
+    /// When `true` and `reflection_enabled`, run a second LLM pass to refine the draft (evolver).
+    /// Default: `false`.
+    pub evolver_enabled: bool,
+    /// Temperature for reflection/evolver LLM calls (keep low for stable procedures).
+    #[serde(default = "default_skill_reflection_temperature")]
+    pub reflection_temperature: f64,
+    /// When reflection produced `SKILL.md`, also write the legacy serialized `SKILL.toml` tool list.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub also_write_serialized_toml: bool,
+}
+
+fn default_skill_creation_min_tool_calls() -> usize {
+    2
+}
+
+fn default_skill_reflection_temperature() -> f64 {
+    0.2
 }
 
 impl Default for SkillCreationConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            min_tool_calls: default_skill_creation_min_tool_calls(),
             max_skills: 500,
             similarity_threshold: 0.85,
+            reflection_enabled: false,
+            evolver_enabled: false,
+            reflection_temperature: default_skill_reflection_temperature(),
+            also_write_serialized_toml: true,
         }
     }
 }
