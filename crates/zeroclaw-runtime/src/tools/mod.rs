@@ -431,6 +431,20 @@ pub fn all_tools_with_runtime(
         )));
     }
 
+    let workspace_skills = crate::skills::load_skills_with_config(workspace_dir, root_config);
+    let mut existing_tool_names: std::collections::HashSet<String> = tool_arcs
+        .iter()
+        .map(|tool| tool.name().to_string())
+        .collect();
+    for tool in crate::skills::skills_to_tool_arcs(&workspace_skills, security.clone()) {
+        let tool_name = tool.name().to_string();
+        if existing_tool_names.insert(tool_name.clone()) {
+            tool_arcs.push(tool);
+        } else {
+            tracing::warn!("Skill tool '{}' shadows built-in tool, skipping", tool_name);
+        }
+    }
+
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
         tool_arcs.push(Arc::new(BrowserOpenTool::new(
@@ -1333,5 +1347,59 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"read_skill"));
+    }
+
+    #[test]
+    fn all_tools_includes_callable_skill_tools_from_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        let skill_dir = workspace_dir.join("skills/viral-clone");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            r#"[skill]
+name = "viral-clone"
+description = "Analyze and clone viral videos"
+
+[[tools]]
+name = "analyze_video"
+description = "Analyze a direct video URL"
+kind = "shell"
+command = "echo ok"
+"#,
+        )
+        .unwrap();
+
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, &workspace_dir, None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.workspace_dir = workspace_dir.clone();
+        cfg.skills.allow_scripts = true;
+
+        let (tools, _, _, _, _, _) = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            &workspace_dir,
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"viral_clone__analyze_video"));
     }
 }

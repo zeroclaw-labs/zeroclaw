@@ -71,14 +71,13 @@ impl SkillCreator {
             return Ok(None);
         }
 
-        let effective_provider: Option<&dyn EmbeddingProvider> = embedding_provider
-            .or_else(|| self.embedding_provider.as_deref());
+        let effective_provider: Option<&dyn EmbeddingProvider> =
+            embedding_provider.or_else(|| self.embedding_provider.as_deref());
 
         if let Some(provider) = effective_provider
             && provider.name() != "none"
         {
-            if let Some(existing_slug) =
-                self.find_similar_skill(task_description, provider).await?
+            if let Some(existing_slug) = self.find_similar_skill(task_description, provider).await?
             {
                 return self
                     .try_improve_existing(&existing_slug, task_description, tool_calls)
@@ -111,7 +110,11 @@ impl SkillCreator {
 
         let toml_content = Self::generate_skill_toml(&slug, task_description, tool_calls);
         if let Err(reason) = validate_generated_content(&toml_content) {
-            tracing::warn!(slug, reason, "Generated skill content rejected by write guard");
+            tracing::warn!(
+                slug,
+                reason,
+                "Generated skill content rejected by write guard"
+            );
             let _ = tokio::fs::remove_dir_all(&skill_dir).await;
             return Ok(None);
         }
@@ -158,8 +161,7 @@ impl SkillCreator {
             return Ok(None);
         };
 
-        let improved_toml =
-            Self::generate_skill_toml(existing_slug, task_description, tool_calls);
+        let improved_toml = Self::generate_skill_toml(existing_slug, task_description, tool_calls);
         if let Err(reason) = validate_generated_content(&improved_toml) {
             tracing::warn!(
                 slug = existing_slug,
@@ -316,11 +318,7 @@ impl SkillCreator {
                 continue;
             }
 
-            let slug = entry
-                .file_name()
-                .to_str()
-                .unwrap_or_default()
-                .to_string();
+            let slug = entry.file_name().to_str().unwrap_or_default().to_string();
 
             let content = tokio::fs::read_to_string(&toml_path).await?;
             if let Some(desc) = extract_description_from_toml(&content) {
@@ -329,8 +327,7 @@ impl SkillCreator {
                     #[allow(clippy::cast_possible_truncation)]
                     let similarity =
                         f64::from(cosine_similarity(&new_embedding, &existing_embedding));
-                    if similarity > self.config.similarity_threshold
-                        && similarity > best_similarity
+                    if similarity > self.config.similarity_threshold && similarity > best_similarity
                     {
                         best_similarity = similarity;
                         best_slug = Some(slug);
@@ -1183,10 +1180,7 @@ tags = ["auto-generated"]
     fn extract_tool_calls_xml_format() {
         let history = vec![
             make_msg("user", "Check files"),
-            make_msg(
-                "assistant",
-                r#"<shell>{"command": "ls -la"}</shell>"#,
-            ),
+            make_msg("assistant", r#"<shell>{"command": "ls -la"}</shell>"#),
         ];
 
         let calls = extract_tool_calls_from_history(&history);
@@ -1197,9 +1191,7 @@ tags = ["auto-generated"]
 
     #[test]
     fn extract_tool_calls_skips_user_messages() {
-        let history = vec![
-            make_msg("user", r#"<shell>{"command": "ls"}</shell>"#),
-        ];
+        let history = vec![make_msg("user", r#"<shell>{"command": "ls"}</shell>"#)];
 
         let calls = extract_tool_calls_from_history(&history);
         assert!(calls.is_empty());
@@ -1289,12 +1281,9 @@ tags = ["auto-generated"]
         assert_eq!(result, Some("build-project".to_string()));
 
         // Verify the file was updated with improvement metadata.
-        let content = tokio::fs::read_to_string(
-            dir.path()
-                .join("skills/build-project/SKILL.toml"),
-        )
-        .await
-        .unwrap();
+        let content = tokio::fs::read_to_string(dir.path().join("skills/build-project/SKILL.toml"))
+            .await
+            .unwrap();
         assert!(content.contains("updated_at"), "Should contain updated_at");
         assert!(
             content.contains("improvement_reason"),
@@ -1352,8 +1341,8 @@ tags = ["auto-generated"]
 
         // No .with_improver() call — improver is None.
         let provider = Arc::new(MockEmbeddingProvider::new(0.95));
-        let creator = SkillCreator::new(dir.path().to_path_buf(), config)
-            .with_embedding_provider(provider);
+        let creator =
+            SkillCreator::new(dir.path().to_path_buf(), config).with_embedding_provider(provider);
 
         let result = creator
             .create_from_execution("Build the project", &sample_tool_calls(), None)
@@ -1394,11 +1383,14 @@ tags = ["auto-generated"]
         // Second call should be blocked by cooldown. Need a fresh provider
         // because MockEmbeddingProvider's call_count is exhausted.
         let provider2 = Arc::new(MockEmbeddingProvider::new(0.95));
-        let creator2 = SkillCreator::new(dir.path().to_path_buf(), SkillCreationConfig {
-            enabled: true,
-            max_skills: 500,
-            similarity_threshold: 0.85,
-        })
+        let creator2 = SkillCreator::new(
+            dir.path().to_path_buf(),
+            SkillCreationConfig {
+                enabled: true,
+                max_skills: 500,
+                similarity_threshold: 0.85,
+            },
+        )
         .with_embedding_provider(provider2)
         .with_improver(zeroclaw_config::schema::SkillImprovementConfig {
             enabled: true,

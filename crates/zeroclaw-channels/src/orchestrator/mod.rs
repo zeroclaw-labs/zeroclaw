@@ -1832,9 +1832,7 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::NewSession => {
             if let Some(hooks) = &ctx.hooks {
-                hooks
-                    .fire_session_end(&sender_key, &msg.channel)
-                    .await;
+                hooks.fire_session_end(&sender_key, &msg.channel).await;
             }
             clear_sender_history(ctx, &sender_key);
             if let Some(ref store) = ctx.session_store
@@ -2639,9 +2637,7 @@ async fn process_channel_message(
 
     if !had_prior_history {
         if let Some(hooks) = &ctx.hooks {
-            hooks
-                .fire_session_start(&history_key, &msg.channel)
-                .await;
+            hooks.fire_session_start(&history_key, &msg.channel).await;
         }
     }
 
@@ -2819,7 +2815,9 @@ async fn process_channel_message(
                 #[cfg(feature = "one2x")]
                 if let Some(ref store) = ctx.session_store {
                     let path = store.session_path(&history_key);
-                    if let Err(e) = crate::one2x::session_hygiene::truncate_session_file(&path, history.len()) {
+                    if let Err(e) =
+                        crate::one2x::session_hygiene::truncate_session_file(&path, history.len())
+                    {
                         tracing::debug!("Session truncation after compaction failed: {e}");
                     }
                 }
@@ -3327,7 +3325,8 @@ async fn process_channel_message(
                 let tool_messages: Vec<ChatMessage> = extract_current_turn_tool_messages(&history);
                 for tool_msg in tool_messages {
                     #[cfg(feature = "one2x")]
-                    let tool_msg = crate::one2x::session_hygiene::trim_tool_result_for_session(&tool_msg);
+                    let tool_msg =
+                        crate::one2x::session_hygiene::trim_tool_result_for_session(&tool_msg);
                     append_sender_turn(ctx.as_ref(), &history_key, tool_msg);
                 }
             }
@@ -3396,21 +3395,27 @@ async fn process_channel_message(
                                 resolved.dimensions,
                             ),
                         );
-                        let creator =
-                            zeroclaw_runtime::skills::creator::SkillCreator::new(
-                                workspace_dir,
-                                skill_config,
-                            )
-                            .with_embedding_provider(embedder)
-                            .with_improver(improve_config);
-                        match creator.create_from_execution(&user_msg, &tool_calls, None).await {
+                        let creator = zeroclaw_runtime::skills::creator::SkillCreator::new(
+                            workspace_dir,
+                            skill_config,
+                        )
+                        .with_embedding_provider(embedder)
+                        .with_improver(improve_config);
+                        match creator
+                            .create_from_execution(&user_msg, &tool_calls, None)
+                            .await
+                        {
                             Ok(Some(slug)) => {
                                 tracing::info!(slug, channel = %channel, "Auto-created or improved skill from orchestrator");
                             }
                             Ok(None) => {
-                                tracing::debug!("Skill creation/improvement skipped in orchestrator path");
+                                tracing::debug!(
+                                    "Skill creation/improvement skipped in orchestrator path"
+                                );
                             }
-                            Err(e) => tracing::warn!("Skill creation/improvement failed in orchestrator: {e}"),
+                            Err(e) => tracing::warn!(
+                                "Skill creation/improvement failed in orchestrator: {e}"
+                            ),
                         }
                     });
                 }
@@ -3453,17 +3458,16 @@ async fn process_channel_message(
                 {
                     send_ok = true;
                 } else {
-                    eprintln!("  ❌ Failed to reply on {}: channel send error", channel.name());
+                    eprintln!(
+                        "  ❌ Failed to reply on {}: channel send error",
+                        channel.name()
+                    );
                 }
 
                 if send_ok {
                     if let Some(hooks) = &ctx.hooks {
                         hooks
-                            .fire_message_sent(
-                                &msg.channel,
-                                &msg.reply_target,
-                                &delivered_response,
-                            )
+                            .fire_message_sent(&msg.channel, &msg.reply_target, &delivered_response)
                             .await;
                     }
                 }
@@ -5070,15 +5074,20 @@ fn collect_configured_channels(
     }
 
     #[cfg(feature = "one2x")]
-    if config
-        .channels
-        .web
-        .as_ref()
-        .is_some_and(|w| w.enabled)
-    {
+    if config.channels.web.as_ref().is_some_and(|w| w.enabled) {
         tracing::info!("One2X web channel enabled");
-        // WebChannel registration is handled via the root crate's one2x module
-        // which provides extend_channels() — the channel instance is created there.
+        let extra_channels = crate::one2x::extra_channels(config);
+        if extra_channels.is_empty() && !crate::one2x::hooks_registered() {
+            tracing::warn!(
+                "One2X web channel is configured but no root-crate channel hooks are registered"
+            );
+        }
+        for extra in extra_channels {
+            channels.push(ConfiguredChannel {
+                display_name: extra.display_name,
+                channel: extra.channel,
+            });
+        }
     }
 
     channels
@@ -5514,6 +5523,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
             max_backoff_secs,
         ));
     }
+
+    #[cfg(feature = "one2x")]
+    crate::one2x::notify_message_bus_ready(&config, tx.clone());
     drop(tx); // Drop our copy so rx closes when all channels stop
 
     let channels_by_name = Arc::new(
@@ -9139,6 +9151,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
@@ -9180,6 +9193,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
@@ -9229,6 +9243,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 kind: "shell&exec".into(),
                 command: "cargo clippy".into(),
                 args: HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,

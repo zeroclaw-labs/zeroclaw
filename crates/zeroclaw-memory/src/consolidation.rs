@@ -191,8 +191,11 @@ pub async fn consolidate_turn_with_kg(
     // well-known prefixes (Lesson:, Decision:, Pattern:, …) and ingests
     // surviving candidates into the graph.
     if let Some(graph) = kg {
-        let inserted =
-            crate::knowledge_extraction::extract_and_ingest(graph, assistant_response, source_project);
+        let inserted = crate::knowledge_extraction::extract_and_ingest(
+            graph,
+            assistant_response,
+            source_project,
+        );
         if inserted > 0 {
             tracing::info!(
                 kg_nodes_inserted = inserted,
@@ -469,11 +472,9 @@ mod tests {
         mem.seed_core("the quick brown fox jumps over the lazy dog");
 
         // Same tokens in slightly different order → Jaccard = 1.0, duplicate.
-        let is_dup = super::is_duplicate_core_memory(
-            &mem,
-            "the lazy dog quick brown fox jumps over the",
-        )
-        .await;
+        let is_dup =
+            super::is_duplicate_core_memory(&mem, "the lazy dog quick brown fox jumps over the")
+                .await;
         assert!(is_dup);
     }
 
@@ -528,7 +529,10 @@ mod tests {
         let is_dup =
             super::is_duplicate_core_memory(&mem, "User prefers Rust for systems programming")
                 .await;
-        assert!(!is_dup, "daily-category matches should not block Core write");
+        assert!(
+            !is_dup,
+            "daily-category matches should not block Core write"
+        );
     }
 
     // --- Injection-guard integration: verify consolidate_turn early-exits.

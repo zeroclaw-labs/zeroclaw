@@ -723,7 +723,11 @@ mod tests {
             ..MemoryConfig::default()
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
-        assert_eq!(mem.name(), "sqlite", "AuditedMemory should delegate name() to inner backend");
+        assert_eq!(
+            mem.name(),
+            "sqlite",
+            "AuditedMemory should delegate name() to inner backend"
+        );
     }
 
     #[test]

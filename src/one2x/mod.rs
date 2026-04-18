@@ -62,6 +62,40 @@ pub mod gateway_ext;
 #[allow(dead_code)]
 pub mod web_channel;
 
+#[cfg(feature = "agent-runtime")]
+fn register_channel_hooks() {
+    use zeroclaw_channels::one2x::{ChannelHooks, InjectedChannel};
+
+    zeroclaw_channels::one2x::register_channel_hooks(ChannelHooks {
+        extra_channels: Box::new(|config| {
+            let mut channels = Vec::new();
+            if config.channels.web.as_ref().is_some_and(|web| web.enabled) {
+                let channel: std::sync::Arc<dyn zeroclaw_api::channel::Channel> =
+                    web_channel::get_or_init_web_channel();
+                channels.push(InjectedChannel {
+                    display_name: "Web",
+                    channel,
+                });
+            }
+            channels
+        }),
+        on_message_bus_ready: Box::new(|config, tx| {
+            if config.channels.web.as_ref().is_some_and(|web| web.enabled) {
+                web_channel::set_web_channel_tx(tx);
+            }
+        }),
+    });
+}
+
+/// Register all One2X integration hooks once at process startup.
+#[cfg(feature = "agent-runtime")]
+#[allow(dead_code)]
+pub fn register_integrations() {
+    #[cfg(feature = "gateway")]
+    register_gateway_routes();
+    register_channel_hooks();
+}
+
 /// Register all One2X gateway routes with the gateway crate's IoC hook.
 ///
 /// Must be called once at process startup, before [`zeroclaw_gateway::run_gateway`].

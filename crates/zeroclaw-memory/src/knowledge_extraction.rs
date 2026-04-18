@@ -71,7 +71,9 @@ pub fn extract_candidates(assistant_response: &str) -> Vec<KnowledgeCandidate> {
         }
 
         if let Some(cand) = classify_line(trimmed)
-            && !out.iter().any(|c| c.title.eq_ignore_ascii_case(&cand.title))
+            && !out
+                .iter()
+                .any(|c| c.title.eq_ignore_ascii_case(&cand.title))
         {
             out.push(cand);
             if out.len() >= MAX_CANDIDATES_PER_TURN {
@@ -243,11 +245,7 @@ fn strip_prefix_ci<'a>(line: &'a str, line_lower: &str, prefix_lower: &str) -> O
 }
 
 /// Build a bounded candidate from raw extracted text.
-fn build_candidate(
-    node_type: NodeType,
-    raw: &str,
-    extra_tags: &[&str],
-) -> KnowledgeCandidate {
+fn build_candidate(node_type: NodeType, raw: &str, extra_tags: &[&str]) -> KnowledgeCandidate {
     let raw = raw.trim();
 
     // Title: first sentence / line, up to MAX_TITLE_LEN bytes, truncated on a
@@ -328,9 +326,7 @@ fn is_duplicate_title(
     // Use the FTS-backed search for a cheap title check. We ask for up to 5
     // results and see if any has an exact (case-insensitive) title match of
     // the same type.
-    let results = graph
-        .query_by_similarity(title, 5)
-        .unwrap_or_default();
+    let results = graph.query_by_similarity(title, 5).unwrap_or_default();
     Ok(results
         .into_iter()
         .any(|r| r.node.title.eq_ignore_ascii_case(title) && r.node.node_type == *node_type))

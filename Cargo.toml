@@ -334,8 +334,32 @@ ci-all = [
 ]
 
 [profile.dev]
-incremental = true
+incremental = false           # Disabled to keep target/ from growing unbounded
+                              # (target/incremental/ routinely hits 30+ GB).
+                              # .cargo/config.toml also forces CARGO_INCREMENTAL=0.
 opt-level = 0
+debug = "line-tables-only"    # Keep line numbers for backtraces, drop full
+                              # debug info. Cuts target/debug/ size ~50%
+                              # without hurting day-to-day debugging. Use
+                              # `cargo build --profile dev-full` (below) when
+                              # stepping through code in a debugger.
+split-debuginfo = "unpacked"  # macOS-default; puts debug info in .dSYM dirs
+                              # so the main binaries stay small and strippable.
+
+# Opt-in full debug info profile — use when you actually need to set
+# breakpoints, inspect locals, or read core dumps.
+# Invoke with: cargo build --profile dev-full
+[profile.dev-full]
+inherits = "dev"
+debug = "full"
+split-debuginfo = "unpacked"
+
+# Optimize dependencies even in dev builds. Compiling deps with opt-level=1
+# is a well-known Rust trick: tiny one-time compile cost, but debug-mode
+# test/run performance improves dramatically (often 5-10x for crypto/parsing
+# heavy deps like `ring`, `serde`, `regex`).
+[profile.dev.package."*"]
+opt-level = 1
 
 [profile.release]
 opt-level = "z"      # Optimize for size

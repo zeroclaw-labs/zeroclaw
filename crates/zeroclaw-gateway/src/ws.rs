@@ -281,7 +281,9 @@ async fn handle_socket(
                             "type": "session",
                             "session_id": session_id,
                         });
-                        let _ = sender.send(Message::Text(session_ack.to_string().into())).await;
+                        let _ = sender
+                            .send(Message::Text(session_ack.to_string().into()))
+                            .await;
                     } else {
                         // Not a connect/init message — fall through to normal processing
                         first_msg_fallback = Some(text.to_string());

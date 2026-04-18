@@ -21,8 +21,8 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
@@ -66,7 +66,11 @@ async fn test_agent_sse_handler() -> impl IntoResponse {
     tokio::spawn(async move {
         for chunk in ["hello ", "from ", "sse"] {
             let _ = tx
-                .send(Event::default().event("chunk").data(json!({ "content": chunk }).to_string()))
+                .send(
+                    Event::default()
+                        .event("chunk")
+                        .data(json!({ "content": chunk }).to_string()),
+                )
                 .await;
         }
         let _ = tx
@@ -81,9 +85,7 @@ async fn test_agent_sse_handler() -> impl IntoResponse {
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-async fn test_agent_clear_handler(
-    Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+async fn test_agent_clear_handler(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
     Json(json!({ "cleared": body["session_id"] }))
 }
 

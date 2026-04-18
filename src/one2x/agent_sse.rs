@@ -365,7 +365,10 @@ pub async fn handle_agent_sse(
             &config.web_fetch,
             &config.workspace_dir,
             &config.agents,
-            config.providers.fallback_provider().and_then(|p| p.api_key.as_deref()),
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|p| p.api_key.as_deref()),
             &config,
             Some(state_for_task.canvas_store.clone()),
         );

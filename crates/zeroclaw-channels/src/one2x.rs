@@ -3,6 +3,62 @@
 //! Contains session hygiene, tool pairing repair, and agent hooks adapted
 //! for the workspace crate architecture.
 
+use std::sync::{Arc, OnceLock};
+
+use zeroclaw_api::channel::{Channel, ChannelMessage};
+use zeroclaw_config::schema::Config;
+
+/// Root-crate injected channel descriptor.
+///
+/// The channels crate cannot depend on the root crate, so One2X-specific
+/// channels (such as the Web channel that lives in `src/one2x/web_channel.rs`)
+/// cross this boundary through a small IoC hook.
+pub struct InjectedChannel {
+    pub display_name: &'static str,
+    pub channel: Arc<dyn Channel>,
+}
+
+type ExtraChannelsFn = Box<dyn Fn(&Config) -> Vec<InjectedChannel> + Send + Sync + 'static>;
+type MessageBusReadyFn =
+    Box<dyn Fn(&Config, tokio::sync::mpsc::Sender<ChannelMessage>) + Send + Sync + 'static>;
+
+/// Root-crate hooks for extending the channel orchestrator.
+pub struct ChannelHooks {
+    pub extra_channels: ExtraChannelsFn,
+    pub on_message_bus_ready: MessageBusReadyFn,
+}
+
+static CHANNEL_HOOKS: OnceLock<ChannelHooks> = OnceLock::new();
+
+/// Register root-crate channel hooks exactly once at process startup.
+pub fn register_channel_hooks(hooks: ChannelHooks) {
+    if CHANNEL_HOOKS.set(hooks).is_err() {
+        tracing::warn!(
+            "one2x::register_channel_hooks called more than once; only the first registration is active"
+        );
+    }
+}
+
+/// Return extra channels injected by the root crate.
+pub fn extra_channels(config: &Config) -> Vec<InjectedChannel> {
+    CHANNEL_HOOKS
+        .get()
+        .map(|hooks| (hooks.extra_channels)(config))
+        .unwrap_or_default()
+}
+
+/// Notify the root crate that the channel message bus is ready.
+pub fn notify_message_bus_ready(config: &Config, tx: tokio::sync::mpsc::Sender<ChannelMessage>) {
+    if let Some(hooks) = CHANNEL_HOOKS.get() {
+        (hooks.on_message_bus_ready)(config, tx);
+    }
+}
+
+/// Whether One2X root-crate hooks have been registered.
+pub fn hooks_registered() -> bool {
+    CHANNEL_HOOKS.get().is_some()
+}
+
 pub mod session_hygiene {
     use std::fs;
     use std::io::{BufRead, BufReader, Write};
@@ -190,8 +246,7 @@ pub mod tool_pairing {
                 tool_use_ids.iter().cloned().collect();
             while i < history.len() && history[i].role == "tool" {
                 if let Some(result_id) = extract_tool_result_id(&history[i].content) {
-                    if tool_use_id_set.contains(&result_id)
-                        && !seen_result_ids.contains(&result_id)
+                    if tool_use_id_set.contains(&result_id) && !seen_result_ids.contains(&result_id)
                     {
                         matched_ids.insert(result_id.clone());
                         seen_result_ids.insert(result_id);
@@ -231,9 +286,27 @@ pub mod agent_hooks {
     pub fn detect_fast_approval(user_message: &str) -> Option<&'static str> {
         let trimmed = user_message.trim().to_lowercase();
         let approvals = [
-            "ok", "好", "好的", "可以", "行", "执行", "做吧", "开始", "确认", "go", "yes",
-            "do it", "proceed", "continue", "sure", "yep", "yeah", "confirmed", "approve",
-            "agreed", "lgtm",
+            "ok",
+            "好",
+            "好的",
+            "可以",
+            "行",
+            "执行",
+            "做吧",
+            "开始",
+            "确认",
+            "go",
+            "yes",
+            "do it",
+            "proceed",
+            "continue",
+            "sure",
+            "yep",
+            "yeah",
+            "confirmed",
+            "approve",
+            "agreed",
+            "lgtm",
         ];
         if approvals.iter().any(|a| trimmed == *a) {
             Some(
@@ -243,5 +316,40 @@ pub mod agent_hooks {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::CliChannel;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static MESSAGE_BUS_READY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn registered_channel_hooks_expose_channels_and_message_bus_callback() {
+        MESSAGE_BUS_READY_CALLS.store(0, Ordering::Relaxed);
+
+        register_channel_hooks(ChannelHooks {
+            extra_channels: Box::new(|_| {
+                vec![InjectedChannel {
+                    display_name: "CLI",
+                    channel: Arc::new(CliChannel::new()),
+                }]
+            }),
+            on_message_bus_ready: Box::new(|_, _| {
+                MESSAGE_BUS_READY_CALLS.fetch_add(1, Ordering::Relaxed);
+            }),
+        });
+
+        let extras = extra_channels(&Config::default());
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0].display_name, "CLI");
+        assert!(hooks_registered());
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ChannelMessage>(1);
+        notify_message_bus_ready(&Config::default(), tx);
+        assert_eq!(MESSAGE_BUS_READY_CALLS.load(Ordering::Relaxed), 1);
     }
 }

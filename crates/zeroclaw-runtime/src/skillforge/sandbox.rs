@@ -21,8 +21,7 @@
 //! the forge.
 
 use crate::skills::testing::{
-    self, SkillTestResult, TEST_FILE_NAME, TestCase, TestFailure,
-    parse_test_line, pattern_matches,
+    self, SkillTestResult, TEST_FILE_NAME, TestCase, TestFailure, parse_test_line, pattern_matches,
 };
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -99,7 +98,10 @@ pub struct SandboxVerification {
 
 impl SandboxVerification {
     pub fn is_pass(&self) -> bool {
-        matches!(self.verdict, SandboxVerdict::Passed | SandboxVerdict::NoTests)
+        matches!(
+            self.verdict,
+            SandboxVerdict::Passed | SandboxVerdict::NoTests
+        )
     }
 }
 
@@ -174,7 +176,10 @@ pub async fn verify_skill_sandbox(
         "Sandbox verification complete"
     );
 
-    Ok(SandboxVerification { verdict, results: result })
+    Ok(SandboxVerification {
+        verdict,
+        results: result,
+    })
 }
 
 /// Run a single test case with timeout + env isolation. Returns `Ok(())` on
@@ -217,10 +222,7 @@ async fn run_case_sandboxed(
                 expected_exit: case.expected_exit,
                 actual_exit: -1,
                 expected_pattern: case.expected_pattern.clone(),
-                actual_output: format!(
-                    "timeout after {}s",
-                    policy.timeout_per_test.as_secs()
-                ),
+                actual_output: format!("timeout after {}s", policy.timeout_per_test.as_secs()),
             });
         }
     };
@@ -314,7 +316,9 @@ mod tests {
             ..SandboxPolicy::strict()
         };
 
-        let v = verify_skill_sandbox(&skill_dir, "hang", &policy).await.unwrap();
+        let v = verify_skill_sandbox(&skill_dir, "hang", &policy)
+            .await
+            .unwrap();
         assert_eq!(v.verdict, SandboxVerdict::Failed);
         assert_eq!(v.results.failures.len(), 1);
         assert!(v.results.failures[0].actual_output.contains("timeout"));
@@ -339,7 +343,9 @@ mod tests {
         // With strict isolation (SECRET not in allowlist), the variable is
         // unset inside the sandbox and the test passes.
         let strict = SandboxPolicy::strict();
-        let v = verify_skill_sandbox(&skill_dir, "env", &strict).await.unwrap();
+        let v = verify_skill_sandbox(&skill_dir, "env", &strict)
+            .await
+            .unwrap();
         assert_eq!(
             v.verdict,
             SandboxVerdict::Passed,
@@ -393,7 +399,9 @@ mod tests {
             max_tests: 2,
             ..SandboxPolicy::strict()
         };
-        let v = verify_skill_sandbox(&skill_dir, "many", &policy).await.unwrap();
+        let v = verify_skill_sandbox(&skill_dir, "many", &policy)
+            .await
+            .unwrap();
         assert_eq!(v.verdict, SandboxVerdict::Passed);
         assert_eq!(v.results.tests_run, 2, "should be capped");
     }

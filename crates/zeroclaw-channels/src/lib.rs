@@ -4,7 +4,7 @@ pub mod orchestrator;
 pub mod util;
 
 #[cfg(feature = "one2x")]
-pub(crate) mod one2x;
+pub mod one2x;
 
 // Always-compiled channels and utilities (no feature gate)
 pub mod cli;

@@ -977,6 +977,9 @@ async fn main() -> Result<()> {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
+    #[cfg(all(feature = "agent-runtime", feature = "one2x"))]
+    crate::one2x::register_integrations();
+
     // Onboard auto-detects the environment: if stdin/stdout are a TTY and no
     // provider flags were given, it runs the full interactive wizard; otherwise
     // it runs the quick (scriptable) setup.  Use --quick to force quick setup,
@@ -1385,11 +1388,6 @@ async fn main() -> Result<()> {
             zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
                 Box::new(zeroclaw_channels::cli::CliChannel::new())
             }));
-
-            // Wire One2X custom gateway routes (F-04 web channel WS, F-05 agent SSE)
-            // before the gateway thread starts. This is idempotent thanks to OnceLock.
-            #[cfg(all(feature = "one2x", feature = "gateway"))]
-            crate::one2x::register_gateway_routes();
 
             // Wire peripheral tools from zeroclaw-hardware
             #[cfg(feature = "hardware")]

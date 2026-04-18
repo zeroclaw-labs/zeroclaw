@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
@@ -9,15 +8,14 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{RwLock, broadcast};
+use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 /// Global WebChannel instance shared between gateway and channel system.
 /// Initialized once when web channel is enabled in config.
 static WEB_CHANNEL_INSTANCE: OnceLock<Arc<WebChannel>> = OnceLock::new();
 
 /// Channel message sender, set by `start_channels` when the web channel is active.
-static WEB_CHANNEL_TX: OnceLock<
-    tokio::sync::mpsc::Sender<ChannelMessage>,
-> = OnceLock::new();
+static WEB_CHANNEL_TX: OnceLock<tokio::sync::mpsc::Sender<ChannelMessage>> = OnceLock::new();
 
 /// Get or create the global WebChannel instance.
 pub fn get_or_init_web_channel() -> Arc<WebChannel> {
@@ -35,8 +33,7 @@ pub fn set_web_channel_tx(tx: tokio::sync::mpsc::Sender<ChannelMessage>) {
 }
 
 /// Get the channel message sender.
-pub fn get_web_channel_tx()
--> Option<tokio::sync::mpsc::Sender<ChannelMessage>> {
+pub fn get_web_channel_tx() -> Option<tokio::sync::mpsc::Sender<ChannelMessage>> {
     WEB_CHANNEL_TX.get().cloned()
 }
 

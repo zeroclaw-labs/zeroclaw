@@ -116,7 +116,9 @@ pub mod session_hygiene {
         let mut cleared = 0usize;
 
         for msg in history[..cutoff_idx].iter_mut() {
-            if msg.role == "tool" && msg.content.len() > 200 && !msg.content.starts_with(CLEARED_MSG)
+            if msg.role == "tool"
+                && msg.content.len() > 200
+                && !msg.content.starts_with(CLEARED_MSG)
             {
                 msg.content = CLEARED_MSG.to_string();
                 cleared += 1;
@@ -124,11 +126,18 @@ pub mod session_hygiene {
         }
 
         if cleared > 0 {
-            tracing::debug!(cleared, cutoff_idx, "micro_compact: cleared old tool results");
+            tracing::debug!(
+                cleared,
+                cutoff_idx,
+                "micro_compact: cleared old tool results"
+            );
         }
     }
 
-    pub fn limit_tool_result_sizes_with_budget(history: &mut Vec<ChatMessage>, context_window: usize) {
+    pub fn limit_tool_result_sizes_with_budget(
+        history: &mut Vec<ChatMessage>,
+        context_window: usize,
+    ) {
         const TAIL_CHARS: usize = 2_000;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let dynamic_cap = ((context_window as f64 * MAX_TOOL_RESULT_CONTEXT_SHARE) as usize * 4)
@@ -310,7 +319,7 @@ mod agent_hooks_tests {
     #[test]
     fn english_planning_triggers_nudge() {
         let mut msgs = vec![asst(
-            "Sure, I will first read the file, then I'll update the config, and finally I'd recommend running the tests to verify."
+            "Sure, I will first read the file, then I'll update the config, and finally I'd recommend running the tests to verify.",
         )];
         assert!(check_planning_without_execution(&mut msgs));
         assert_eq!(msgs.len(), 2);

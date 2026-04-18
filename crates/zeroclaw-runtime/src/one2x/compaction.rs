@@ -19,10 +19,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::agent::context_compressor::{estimate_tokens, CompressionResult, ContextCompressionConfig};
+use crate::agent::context_compressor::{
+    CompressionResult, ContextCompressionConfig, estimate_tokens,
+};
+use std::sync::Arc;
 use zeroclaw_memory::Memory;
 use zeroclaw_providers::{ChatMessage, Provider};
-use std::sync::Arc;
 
 /// System prompt for pre-compaction key-facts extraction.
 /// Runs before chunking so facts survive even if later stages fail.
@@ -143,10 +145,7 @@ pub async fn try_multi_stage_compress(
             .await
             {
                 Ok(Ok(facts)) if !facts.trim().is_empty() => {
-                    let date_key = format!(
-                        "key_facts_{}",
-                        chrono::Utc::now().format("%Y-%m-%d")
-                    );
+                    let date_key = format!("key_facts_{}", chrono::Utc::now().format("%Y-%m-%d"));
                     if let Err(e) = mem
                         .store(
                             &date_key,
@@ -158,7 +157,10 @@ pub async fn try_multi_stage_compress(
                     {
                         tracing::debug!(error = %e, "Pre-compaction key-facts flush failed (non-fatal)");
                     } else {
-                        tracing::info!(key = date_key, "Pre-compaction key facts flushed to memory");
+                        tracing::info!(
+                            key = date_key,
+                            "Pre-compaction key facts flushed to memory"
+                        );
                     }
                 }
                 Ok(Err(e)) => {

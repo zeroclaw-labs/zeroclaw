@@ -47,7 +47,12 @@ pub struct SkillTrace {
 }
 
 impl SkillTrace {
-    pub fn new(skill_slug: impl Into<String>, success: bool, duration_ms: u64, tool_calls: u32) -> Self {
+    pub fn new(
+        skill_slug: impl Into<String>,
+        success: bool,
+        duration_ms: u64,
+        tool_calls: u32,
+    ) -> Self {
         Self {
             skill_slug: skill_slug.into(),
             timestamp: Utc::now(),
@@ -174,8 +179,7 @@ pub fn compute_confidence(traces: &[SkillTrace], policy: &ConfidencePolicy) -> C
     let successes = traces.iter().filter(|t| t.success).count();
     let success_rate = successes as f64 / n as f64;
 
-    let usage_frequency =
-        (n as f64 / policy.saturation_calls as f64).clamp(0.0, 1.0);
+    let usage_frequency = (n as f64 / policy.saturation_calls as f64).clamp(0.0, 1.0);
 
     let recency_decay = compute_recency_decay(traces, policy.recency_half_life_hours, Utc::now());
 
@@ -194,11 +198,7 @@ pub fn compute_confidence(traces: &[SkillTrace], policy: &ConfidencePolicy) -> C
 ///
 /// Uses the timestamp of the most recent trace. Older skills decay faster.
 /// Factored out so tests can inject a deterministic `now`.
-fn compute_recency_decay(
-    traces: &[SkillTrace],
-    half_life_hours: f64,
-    now: DateTime<Utc>,
-) -> f64 {
+fn compute_recency_decay(traces: &[SkillTrace], half_life_hours: f64, now: DateTime<Utc>) -> f64 {
     if half_life_hours <= 0.0 {
         return 1.0;
     }
@@ -263,7 +263,10 @@ impl JsonlTraceStore {
     fn ensure_parent(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create trace store parent dir {}", parent.display())
+                format!(
+                    "failed to create trace store parent dir {}",
+                    parent.display()
+                )
             })?;
         }
         Ok(())
@@ -320,7 +323,10 @@ impl TraceStore for JsonlTraceStore {
 
     fn load_for(&self, skill_slug: &str) -> Result<Vec<SkillTrace>> {
         let all = self.load_all()?;
-        Ok(all.into_iter().filter(|t| t.skill_slug == skill_slug).collect())
+        Ok(all
+            .into_iter()
+            .filter(|t| t.skill_slug == skill_slug)
+            .collect())
     }
 
     fn load_all(&self) -> Result<Vec<SkillTrace>> {
@@ -735,7 +741,11 @@ mod tests {
         policy.recency_half_life_hours = 24.0;
         let now = Utc::now();
         let old = now - Duration::hours(24);
-        let decay = compute_recency_decay(&[trace("s", true, old)], policy.recency_half_life_hours, now);
+        let decay = compute_recency_decay(
+            &[trace("s", true, old)],
+            policy.recency_half_life_hours,
+            now,
+        );
         assert!((decay - 0.5).abs() < 1e-3, "got {decay}");
     }
 
@@ -952,8 +962,9 @@ this is not json
         let deprecated =
             evaluate_and_deprecate(&store, &skills_dir, &ConfidencePolicy::default()).unwrap();
         assert!(deprecated.is_empty());
-        let marker = std::fs::read_to_string(skills_dir.join("flaky").join(DEPRECATION_MARKER_FILE))
-            .unwrap();
+        let marker =
+            std::fs::read_to_string(skills_dir.join("flaky").join(DEPRECATION_MARKER_FILE))
+                .unwrap();
         assert_eq!(marker, "manual", "existing marker should be untouched");
     }
 
@@ -1142,8 +1153,7 @@ this is not json
             via_config.min_samples_for_deprecation
         );
         assert!(
-            (runtime.deprecation_threshold - via_config.deprecation_threshold).abs()
-                < f64::EPSILON
+            (runtime.deprecation_threshold - via_config.deprecation_threshold).abs() < f64::EPSILON
         );
         // C-2: new reinstate fields must also round-trip.
         assert_eq!(runtime.review_window_hours, via_config.review_window_hours);
@@ -1228,8 +1238,7 @@ this is not json
         }
 
         let policy = ConfidencePolicy::default();
-        let reinstated =
-            reevaluate_deprecations(&store, &skills_dir, &policy).unwrap();
+        let reinstated = reevaluate_deprecations(&store, &skills_dir, &policy).unwrap();
         assert_eq!(reinstated, vec!["recovered".to_string()]);
         assert!(!is_skill_deprecated(&skill_dir));
     }
@@ -1251,8 +1260,7 @@ this is not json
         }
 
         let policy = ConfidencePolicy::default();
-        let reinstated =
-            reevaluate_deprecations(&store, &skills_dir, &policy).unwrap();
+        let reinstated = reevaluate_deprecations(&store, &skills_dir, &policy).unwrap();
         assert!(reinstated.is_empty());
         assert!(
             is_skill_deprecated(&skill_dir),
@@ -1279,8 +1287,7 @@ this is not json
         }
 
         let policy = ConfidencePolicy::default();
-        let reinstated =
-            reevaluate_deprecations(&store, &skills_dir, &policy).unwrap();
+        let reinstated = reevaluate_deprecations(&store, &skills_dir, &policy).unwrap();
         assert!(reinstated.is_empty());
         assert!(is_skill_deprecated(&skill_dir));
     }
@@ -1303,8 +1310,7 @@ this is not json
             review_window_hours: 0,
             ..ConfidencePolicy::default()
         };
-        let reinstated =
-            reevaluate_deprecations(&store, &skills_dir, &policy).unwrap();
+        let reinstated = reevaluate_deprecations(&store, &skills_dir, &policy).unwrap();
         assert!(reinstated.is_empty());
         assert!(
             is_skill_deprecated(&skill_dir),
@@ -1330,8 +1336,7 @@ this is not json
         }
 
         let policy = ConfidencePolicy::default();
-        let reinstated =
-            reevaluate_deprecations(&store, &skills_dir, &policy).unwrap();
+        let reinstated = reevaluate_deprecations(&store, &skills_dir, &policy).unwrap();
         assert!(
             reinstated.is_empty(),
             "no post-marker traces → cannot reinstate even with perfect old record"

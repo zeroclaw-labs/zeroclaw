@@ -79,7 +79,6 @@ const INJECTION_NEEDLES: &[(&str, &str)] = &[
     ("以前の指示を無視", "prompt override"),
     ("これまでの指示を忘れ", "prompt override"),
     ("新しい指示：", "prompt override"),
-
     // ── Role hijacking (EN) ──
     ("you are now", "role hijack"),
     ("you are no longer", "role hijack"),
@@ -98,7 +97,6 @@ const INJECTION_NEEDLES: &[(&str, &str)] = &[
     ("あなたは今", "role hijack"),
     ("あなたは以降", "role hijack"),
     ("～のふりをして", "role hijack"),
-
     // ── System prompt extraction (EN) ──
     ("reveal your system prompt", "system prompt extraction"),
     ("print your system prompt", "system prompt extraction"),
@@ -112,7 +110,6 @@ const INJECTION_NEEDLES: &[(&str, &str)] = &[
     // ── System prompt extraction (ja) ──
     ("システムプロンプトを表示", "system prompt extraction"),
     ("システムプロンプトを教えて", "system prompt extraction"),
-
     // ── Memory / tool abuse (EN) ──
     ("remember this forever", "forced memory write"),
     ("save this to memory", "forced memory write"),
@@ -127,14 +124,12 @@ const INJECTION_NEEDLES: &[(&str, &str)] = &[
     // ── Memory / tool abuse (ja) ──
     ("永久に記憶して", "forced memory write"),
     ("メモリに保存", "forced memory write"),
-
     // ── Structured injection markers (universal) ──
     ("<|im_start|>", "control token injection"),
     ("<|im_end|>", "control token injection"),
     ("<|system|>", "control token injection"),
     ("[system]:", "control token injection"),
     ("###system###", "control token injection"),
-
     // ── JSON-break attempts targeting consolidation parser (universal) ──
     ("\"memory_update\":", "consolidation schema injection"),
     ("\"history_entry\":", "consolidation schema injection"),

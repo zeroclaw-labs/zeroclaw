@@ -1009,12 +1009,9 @@ mod tests {
             scan_interval_hours: 12,
             ..Default::default()
         };
-        let engine = HeartbeatEngine::new(
-            HeartbeatConfig::default(),
-            std::env::temp_dir(),
-            observer,
-        )
-        .with_skillforge(forge_config);
+        let engine =
+            HeartbeatEngine::new(HeartbeatConfig::default(), std::env::temp_dir(), observer)
+                .with_skillforge(forge_config);
 
         assert!(engine.skillforge.is_some());
         assert_eq!(engine.forge_interval, Duration::from_secs(12 * 3600));
@@ -1039,12 +1036,9 @@ mod tests {
             scan_interval_hours: 1,
             ..Default::default()
         };
-        let engine = HeartbeatEngine::new(
-            HeartbeatConfig::default(),
-            std::env::temp_dir(),
-            observer,
-        )
-        .with_skillforge(forge_config);
+        let engine =
+            HeartbeatEngine::new(HeartbeatConfig::default(), std::env::temp_dir(), observer)
+                .with_skillforge(forge_config);
 
         // Forge is disabled, so the scan returns an empty report but still records the timestamp.
         engine.try_forge_scan().await;
@@ -1059,12 +1053,9 @@ mod tests {
             scan_interval_hours: 99999,
             ..Default::default()
         };
-        let engine = HeartbeatEngine::new(
-            HeartbeatConfig::default(),
-            std::env::temp_dir(),
-            observer,
-        )
-        .with_skillforge(forge_config);
+        let engine =
+            HeartbeatEngine::new(HeartbeatConfig::default(), std::env::temp_dir(), observer)
+                .with_skillforge(forge_config);
 
         // First scan should run.
         engine.try_forge_scan().await;
@@ -1086,15 +1077,12 @@ mod tests {
     #[test]
     fn with_confidence_evaluator_sets_interval() {
         let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
-        let engine = HeartbeatEngine::new(
-            HeartbeatConfig::default(),
-            std::env::temp_dir(),
-            observer,
-        )
-        .with_confidence_evaluator(
-            crate::skills::confidence::ConfidencePolicy::default(),
-            Duration::from_secs(1234),
-        );
+        let engine =
+            HeartbeatEngine::new(HeartbeatConfig::default(), std::env::temp_dir(), observer)
+                .with_confidence_evaluator(
+                    crate::skills::confidence::ConfidencePolicy::default(),
+                    Duration::from_secs(1234),
+                );
 
         assert!(engine.confidence_policy.is_some());
         assert_eq!(engine.confidence_interval, Duration::from_secs(1234));
@@ -1164,8 +1152,8 @@ mod tests {
     #[test]
     fn try_confidence_scan_marks_flaky_skill() {
         use crate::skills::confidence::{
-            ConfidencePolicy, JsonlTraceStore, SkillTrace, TraceStore,
-            default_trace_store_path, is_skill_deprecated,
+            ConfidencePolicy, JsonlTraceStore, SkillTrace, TraceStore, default_trace_store_path,
+            is_skill_deprecated,
         };
         use chrono::Utc;
         use tempfile::TempDir;

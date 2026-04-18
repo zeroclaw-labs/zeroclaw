@@ -172,6 +172,7 @@ mod tests {
             kind: "http".to_string(),
             command: "https://api.example.com/weather?city={{city}}".to_string(),
             args,
+            timeout_secs: None,
         }
     }
 
@@ -221,6 +222,7 @@ mod tests {
             kind: "http".to_string(),
             command: "https://api.example.com/ping".to_string(),
             args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillHttpTool::new("s", &st);
         let schema = tool.parameters_schema();

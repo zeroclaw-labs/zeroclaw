@@ -6,16 +6,24 @@
 //! with built-in tools.
 
 use crate::security::SecurityPolicy;
+use crate::tools::shell::collect_allowed_shell_env_vars;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
-/// Maximum execution time for a skill shell command (seconds).
-const SKILL_SHELL_TIMEOUT_SECS: u64 = 60;
+/// Default maximum execution time for a skill shell command (seconds).
+const DEFAULT_SKILL_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1 MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellQuoteState {
+    None,
+    Single,
+    Double,
+}
 
 /// A tool derived from a skill's `[[tools]]` section that executes shell commands.
 pub struct SkillShellTool {
@@ -24,6 +32,7 @@ pub struct SkillShellTool {
     command_template: String,
     args: HashMap<String, String>,
     security: Arc<SecurityPolicy>,
+    timeout_secs: u64,
 }
 
 impl SkillShellTool {
@@ -48,6 +57,10 @@ impl SkillShellTool {
             command_template: tool.command.clone(),
             args: tool.args.clone(),
             security,
+            timeout_secs: tool
+                .timeout_secs
+                .unwrap_or(DEFAULT_SKILL_SHELL_TIMEOUT_SECS)
+                .max(1),
         }
     }
 
@@ -76,15 +89,105 @@ impl SkillShellTool {
     /// Substitute `{{arg_name}}` placeholders in the command template with
     /// the provided argument values. Unknown placeholders are left as-is.
     fn substitute_args(&self, args: &serde_json::Value) -> String {
-        let mut command = self.command_template.clone();
-        if let Some(obj) = args.as_object() {
-            for (key, value) in obj {
-                let placeholder = format!("{{{{{}}}}}", key);
-                let replacement = value.as_str().unwrap_or_default();
-                command = command.replace(&placeholder, replacement);
+        let Some(obj) = args.as_object() else {
+            return self.command_template.clone();
+        };
+
+        let template = self.command_template.as_str();
+        let mut rendered = String::with_capacity(template.len());
+        let mut i = 0usize;
+        let mut quote = ShellQuoteState::None;
+        let mut escaped = false;
+
+        while i < template.len() {
+            if template[i..].starts_with("{{") {
+                if let Some(close_rel) = template[i + 2..].find("}}") {
+                    let end = i + 2 + close_rel;
+                    let key = &template[i + 2..end];
+                    if let Some(value) = obj.get(key).and_then(serde_json::Value::as_str) {
+                        rendered.push_str(&Self::escape_placeholder_value(value, quote));
+                    } else {
+                        rendered.push_str(&template[i..end + 2]);
+                    }
+                    i = end + 2;
+                    continue;
+                }
+            }
+
+            let ch = template[i..]
+                .chars()
+                .next()
+                .expect("template slicing should always align to char boundary");
+            rendered.push(ch);
+
+            match quote {
+                ShellQuoteState::Single => {
+                    if ch == '\'' {
+                        quote = ShellQuoteState::None;
+                    }
+                }
+                ShellQuoteState::Double => {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        quote = ShellQuoteState::None;
+                    }
+                }
+                ShellQuoteState::None => {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '\'' {
+                        quote = ShellQuoteState::Single;
+                    } else if ch == '"' {
+                        quote = ShellQuoteState::Double;
+                    }
+                }
+            }
+
+            i += ch.len_utf8();
+        }
+
+        rendered
+    }
+
+    fn escape_placeholder_value(value: &str, quote: ShellQuoteState) -> String {
+        match quote {
+            ShellQuoteState::Double => Self::escape_for_double_quotes(value),
+            ShellQuoteState::Single => value.replace('\'', "'\\''"),
+            ShellQuoteState::None => Self::shell_single_quote(value),
+        }
+    }
+
+    fn escape_for_double_quotes(value: &str) -> String {
+        let mut escaped = String::with_capacity(value.len());
+        for ch in value.chars() {
+            match ch {
+                '\\' | '"' | '$' | '`' => {
+                    escaped.push('\\');
+                    escaped.push(ch);
+                }
+                _ => escaped.push(ch),
             }
         }
-        command
+        escaped
+    }
+
+    fn shell_single_quote(value: &str) -> String {
+        let mut quoted = String::with_capacity(value.len() + 2);
+        quoted.push('\'');
+        for ch in value.chars() {
+            if ch == '\'' {
+                quoted.push_str("'\"'\"'");
+            } else {
+                quoted.push(ch);
+            }
+        }
+        quoted.push('\'');
+        quoted
     }
 }
 
@@ -154,17 +257,23 @@ impl Tool for SkillShellTool {
         cmd.current_dir(&self.security.workspace_dir);
         cmd.env_clear();
 
-        // Only pass safe environment variables
-        for var in &[
-            "PATH", "HOME", "TERM", "LANG", "LC_ALL", "USER", "SHELL", "TMPDIR",
-        ] {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
+        // Match the built-in shell tool's env policy so skill subprocesses
+        // can access explicitly-allowlisted runtime settings (provider auth,
+        // skill-proxy endpoints, session IDs, etc.) without inheriting the
+        // full parent environment.
+        for var in collect_allowed_shell_env_vars(&self.security) {
+            if let Ok(val) = std::env::var(&var) {
+                cmd.env(&var, val);
             }
         }
 
+        #[cfg(feature = "one2x")]
+        if let Ok(sid) = std::env::var("ZEROCLAW_SESSION_ID") {
+            cmd.env("ZEROCLAW_SESSION_ID", &sid);
+        }
+
         let result =
-            tokio::time::timeout(Duration::from_secs(SKILL_SHELL_TIMEOUT_SECS), cmd.output()).await;
+            tokio::time::timeout(Duration::from_secs(self.timeout_secs), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -207,7 +316,8 @@ impl Tool for SkillShellTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Command timed out after {SKILL_SHELL_TIMEOUT_SECS}s and was killed"
+                    "Command timed out after {}s and was killed",
+                    self.timeout_secs
                 )),
             }),
         }
@@ -228,6 +338,38 @@ mod tests {
         })
     }
 
+    fn test_security_with_env_passthrough(vars: &[&str]) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["env".into()],
+            shell_env_passthrough: vars.iter().map(|v| (*v).to_string()).collect(),
+            ..SecurityPolicy::default()
+        })
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(val) => unsafe { std::env::set_var(self.key, val) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
     fn sample_skill_tool() -> SkillTool {
         let mut args = HashMap::new();
         args.insert("file".to_string(), "The file to lint".to_string());
@@ -242,6 +384,7 @@ mod tests {
             kind: "shell".to_string(),
             command: "lint --file {{file}} --format {{format}}".to_string(),
             args,
+            timeout_secs: None,
         }
     }
 
@@ -280,7 +423,7 @@ mod tests {
             "file": "src/main.rs",
             "format": "json"
         }));
-        assert_eq!(result, "lint --file src/main.rs --format json");
+        assert_eq!(result, "lint --file 'src/main.rs' --format 'json'");
     }
 
     #[test]
@@ -293,6 +436,40 @@ mod tests {
     }
 
     #[test]
+    fn skill_shell_tool_substitute_args_inside_double_quotes() {
+        let st = SkillTool {
+            name: "echo_message".to_string(),
+            description: "Echo a message".to_string(),
+            kind: "shell".to_string(),
+            command: "echo \"{{message}}\"".to_string(),
+            args: HashMap::from([("message".to_string(), "Message".to_string())]),
+            timeout_secs: None,
+        };
+        let tool = SkillShellTool::new("test", &st, test_security());
+        let result = tool.substitute_args(&serde_json::json!({
+            "message": "he said \"ship it\" & $HOME"
+        }));
+        assert_eq!(result, "echo \"he said \\\"ship it\\\" & \\$HOME\"");
+    }
+
+    #[test]
+    fn skill_shell_tool_substitute_args_inside_single_quotes() {
+        let st = SkillTool {
+            name: "echo_message".to_string(),
+            description: "Echo a message".to_string(),
+            kind: "shell".to_string(),
+            command: "echo '{{message}}'".to_string(),
+            args: HashMap::from([("message".to_string(), "Message".to_string())]),
+            timeout_secs: None,
+        };
+        let tool = SkillShellTool::new("test", &st, test_security());
+        let result = tool.substitute_args(&serde_json::json!({
+            "message": "it's safe & literal"
+        }));
+        assert_eq!(result, "echo 'it'\\''s safe & literal'");
+    }
+
+    #[test]
     fn skill_shell_tool_empty_args_schema() {
         let st = SkillTool {
             name: "simple".to_string(),
@@ -300,6 +477,7 @@ mod tests {
             kind: "shell".to_string(),
             command: "echo hello".to_string(),
             args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillShellTool::new("s", &st, test_security());
         let schema = tool.parameters_schema();
@@ -316,11 +494,62 @@ mod tests {
             kind: "shell".to_string(),
             command: "echo hello-skill".to_string(),
             args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillShellTool::new("test", &st, test_security());
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_executes_special_chars_inside_quoted_placeholder() {
+        let st = SkillTool {
+            name: "echo_message".to_string(),
+            description: "Echo a message".to_string(),
+            kind: "shell".to_string(),
+            command: "echo \"{{message}}\"".to_string(),
+            args: HashMap::from([("message".to_string(), "Message".to_string())]),
+            timeout_secs: None,
+        };
+        let tool = SkillShellTool::new("test", &st, test_security());
+        let result = tool
+            .execute(serde_json::json!({
+                "message": "Translate & Auto-Cut says \"ship it\""
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(
+            result
+                .output
+                .contains("Translate & Auto-Cut says \"ship it\"")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn skill_shell_tool_allows_configured_env_passthrough() {
+        let _guard = EnvGuard::set("ZEROCLAW_TEST_PASSTHROUGH", "db://unit-test");
+        let st = SkillTool {
+            name: "print_env".to_string(),
+            description: "Print env".to_string(),
+            kind: "shell".to_string(),
+            command: "env".to_string(),
+            args: HashMap::new(),
+            timeout_secs: None,
+        };
+        let tool = SkillShellTool::new(
+            "test",
+            &st,
+            test_security_with_env_passthrough(&["ZEROCLAW_TEST_PASSTHROUGH"]),
+        );
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(result.success);
+        assert!(
+            result
+                .output
+                .contains("ZEROCLAW_TEST_PASSTHROUGH=db://unit-test")
+        );
     }
 
     #[test]
@@ -330,5 +559,32 @@ mod tests {
         assert_eq!(spec.name, "my_skill__run_lint");
         assert_eq!(spec.description, "Run the linter on a file");
         assert_eq!(spec.parameters["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_respects_custom_timeout() {
+        let st = SkillTool {
+            name: "slow".to_string(),
+            description: "Sleep briefly".to_string(),
+            kind: "shell".to_string(),
+            command: "sleep 2".to_string(),
+            args: HashMap::new(),
+            timeout_secs: Some(1),
+        };
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["sleep".into()],
+            ..SecurityPolicy::default()
+        });
+        let tool = SkillShellTool::new("test", &st, security);
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Command timed out after 1s and was killed")
+        );
     }
 }

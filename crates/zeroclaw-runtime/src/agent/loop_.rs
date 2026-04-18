@@ -993,7 +993,10 @@ pub async fn run_tool_call_loop(
         {
             crate::one2x::session_hygiene::repair_full_tool_pairing(history);
             crate::one2x::session_hygiene::micro_compact_old_tool_results(history);
-            crate::one2x::session_hygiene::limit_tool_result_sizes_with_budget(history, context_token_budget);
+            crate::one2x::session_hygiene::limit_tool_result_sizes_with_budget(
+                history,
+                context_token_budget,
+            );
         }
 
         let prepared_messages =
@@ -2608,7 +2611,11 @@ pub async fn run(
                     );
                     let saved = compressor.fast_trim_tool_results_pub(&mut history);
                     if saved > 0 {
-                        tracing::info!(saved, "Preemptive: tool-only truncation freed {} chars", saved);
+                        tracing::info!(
+                            saved,
+                            "Preemptive: tool-only truncation freed {} chars",
+                            saved
+                        );
                     }
                 } else {
                     // Hard zone: full compaction
@@ -2722,11 +2729,14 @@ pub async fn run(
                     {
                         const MAX_OVERFLOW_RECOVERY_ATTEMPTS: u32 = 3;
                         let err_str = format!("{e}");
-                        let is_overflow = zeroclaw_providers::reliable::is_context_window_exceeded(&e)
-                            || err_str.contains("504")
-                            || err_str.contains("Gateway Timeout");
+                        let is_overflow =
+                            zeroclaw_providers::reliable::is_context_window_exceeded(&e)
+                                || err_str.contains("504")
+                                || err_str.contains("Gateway Timeout");
 
-                        if is_overflow && overflow_recovery_attempts < MAX_OVERFLOW_RECOVERY_ATTEMPTS {
+                        if is_overflow
+                            && overflow_recovery_attempts < MAX_OVERFLOW_RECOVERY_ATTEMPTS
+                        {
                             overflow_recovery_attempts += 1;
                             tracing::warn!(
                                 attempt = overflow_recovery_attempts,
@@ -2740,15 +2750,26 @@ pub async fn run(
                                 )
                                 .with_memory(mem.clone());
                             match compressor
-                                .compress_on_error(&mut history, provider.as_ref(), &model_name, &err_str)
+                                .compress_on_error(
+                                    &mut history,
+                                    provider.as_ref(),
+                                    &model_name,
+                                    &err_str,
+                                )
                                 .await
                             {
                                 Ok(true) => {
-                                    tracing::info!("Channel loop: context recovered via compaction, retrying");
+                                    tracing::info!(
+                                        "Channel loop: context recovered via compaction, retrying"
+                                    );
                                     continue;
                                 }
-                                Ok(false) => tracing::warn!("Channel loop: compaction ran but couldn't reduce enough"),
-                                Err(ce) => tracing::warn!(error = %ce, "Channel loop: compaction itself failed"),
+                                Ok(false) => tracing::warn!(
+                                    "Channel loop: compaction ran but couldn't reduce enough"
+                                ),
+                                Err(ce) => {
+                                    tracing::warn!(error = %ce, "Channel loop: compaction itself failed")
+                                }
                             }
                         } else if is_overflow {
                             tracing::error!(
@@ -3645,12 +3666,18 @@ pub async fn process_message(
                 .await
             {
                 Ok(Some(slug)) => {
-                    tracing::info!(slug, channel = "daemon", "Auto-created or improved skill from process_message");
+                    tracing::info!(
+                        slug,
+                        channel = "daemon",
+                        "Auto-created or improved skill from process_message"
+                    );
                 }
                 Ok(None) => {
                     tracing::debug!("Skill creation/improvement skipped in process_message path");
                 }
-                Err(e) => tracing::warn!("Skill creation/improvement failed in process_message: {e}"),
+                Err(e) => {
+                    tracing::warn!("Skill creation/improvement failed in process_message: {e}")
+                }
             }
         }
     }

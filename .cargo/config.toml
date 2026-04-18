@@ -1,3 +1,23 @@
+# =============================================================================
+# Workspace build behavior
+# =============================================================================
+# Disable incremental compilation. The `target/incremental/` directory is the
+# #1 cause of target/ bloat (observed: ~31 GB out of 58 GB). Env vars take
+# precedence over [profile.dev] in Cargo.toml, so this forces it off for every
+# contributor without editing profile settings.
+[env]
+CARGO_INCREMENTAL = "0"
+
+# Prefer the system `git` binary for registry/git dependency fetches. More
+# reliable on flaky networks and behind corporate proxies than cargo's
+# built-in libgit2.
+[net]
+git-fetch-with-cli = true
+
+# =============================================================================
+# Cross-compile targets
+# =============================================================================
+
 [target.x86_64-unknown-linux-musl]
 rustflags = ["-C", "link-arg=-static"]
 

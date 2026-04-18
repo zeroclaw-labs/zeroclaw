@@ -60,6 +60,8 @@ pub struct SkillTool {
     pub command: String,
     #[serde(default)]
     pub args: HashMap<String, String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Skill manifest parsed from SKILL.toml
@@ -913,6 +915,47 @@ pub fn skills_to_tools(
                         &skill.name,
                         tool,
                     )));
+                }
+                other => {
+                    tracing::warn!(
+                        "Unknown skill tool kind '{}' for {}.{}, skipping",
+                        other,
+                        skill.name,
+                        tool.name
+                    );
+                }
+            }
+        }
+    }
+    tools
+}
+
+/// Convert skill tools into callable `Arc<dyn Tool>` values.
+///
+/// This is used by tool registries that are assembled from `Arc` handles first
+/// (gateway, daemon, agent SSE) so skill tools are available everywhere, not
+/// only in loop paths that manually re-register them later.
+pub fn skills_to_tool_arcs(
+    skills: &[Skill],
+    security: std::sync::Arc<crate::security::SecurityPolicy>,
+) -> Vec<std::sync::Arc<dyn zeroclaw_api::tool::Tool>> {
+    let mut tools: Vec<std::sync::Arc<dyn zeroclaw_api::tool::Tool>> = Vec::new();
+    for skill in skills {
+        for tool in &skill.tools {
+            match tool.kind.as_str() {
+                "shell" | "script" => {
+                    tools.push(std::sync::Arc::new(
+                        crate::skills::skill_tool::SkillShellTool::new(
+                            &skill.name,
+                            tool,
+                            security.clone(),
+                        ),
+                    ));
+                }
+                "http" => {
+                    tools.push(std::sync::Arc::new(
+                        crate::skills::skill_http::SkillHttpTool::new(&skill.name, tool),
+                    ));
                 }
                 other => {
                     tracing::warn!(

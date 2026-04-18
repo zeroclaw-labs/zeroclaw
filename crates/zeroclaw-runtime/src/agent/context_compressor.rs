@@ -301,7 +301,8 @@ impl ContextCompressor {
                 if !transcript.is_empty() {
                     let facts_prompt = format!(
                         "Extract key persistent facts from this conversation ({} messages):\n\n{}",
-                        end - start, transcript
+                        end - start,
+                        transcript
                     );
                     match tokio::time::timeout(
                         Duration::from_secs(20),
@@ -311,22 +312,32 @@ impl ContextCompressor {
                             self.config.summary_model.as_deref().unwrap_or(model),
                             0.1,
                         ),
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(Ok(facts)) if !facts.trim().is_empty() => {
-                            let date_key = format!(
-                                "key_facts_{}",
-                                chrono::Utc::now().format("%Y-%m-%d")
-                            );
-                            if let Err(e) = mem.store(
-                                &date_key, &facts,
-                                zeroclaw_memory::traits::MemoryCategory::Daily, None,
-                            ).await {
+                            let date_key =
+                                format!("key_facts_{}", chrono::Utc::now().format("%Y-%m-%d"));
+                            if let Err(e) = mem
+                                .store(
+                                    &date_key,
+                                    &facts,
+                                    zeroclaw_memory::traits::MemoryCategory::Daily,
+                                    None,
+                                )
+                                .await
+                            {
                                 tracing::debug!(error = %e, "Key-facts flush failed (non-fatal)");
                             } else {
-                                tracing::info!(key = date_key, "Pre-compaction key facts flushed to memory");
+                                tracing::info!(
+                                    key = date_key,
+                                    "Pre-compaction key facts flushed to memory"
+                                );
                             }
                         }
-                        Ok(Err(e)) => tracing::debug!(error = %e, "Key-facts extraction failed (non-fatal)"),
+                        Ok(Err(e)) => {
+                            tracing::debug!(error = %e, "Key-facts extraction failed (non-fatal)")
+                        }
                         Err(_) => tracing::debug!("Key-facts extraction timed out (non-fatal)"),
                         _ => {}
                     }
@@ -542,7 +553,11 @@ impl ContextCompressor {
             for path in &["SOUL.md", "AGENTS.md", ".zeroclaw/identity.md"] {
                 let full = std::path::Path::new("/zeroclaw-data/workspace").join(path);
                 if let Ok(content) = std::fs::read_to_string(&full) {
-                    let truncated = if content.len() > 2000 { &content[..2000] } else { &content };
+                    let truncated = if content.len() > 2000 {
+                        &content[..2000]
+                    } else {
+                        &content
+                    };
                     sections.push_str(&format!("\n[Re-injected from {}]\n{}\n", path, truncated));
                     break;
                 }
@@ -550,7 +565,8 @@ impl ContextCompressor {
             sections
         };
 
-        let post_compact_context = format!("\n\n\
+        let post_compact_context = format!(
+            "\n\n\
 [POST-COMPACTION CONTEXT REFRESH]\n\
 The conversation above has been automatically compressed.\n\n\
 INSTRUCTIONS:\n\
@@ -558,7 +574,8 @@ INSTRUCTIONS:\n\
 - Do NOT ask the user to repeat their request\n\
 - Do NOT announce that compression happened\n\
 - Re-read files mentioned in the summary before editing them\n\
-- If debugging, continue the investigation{identity_refresh}");
+- If debugging, continue the investigation{identity_refresh}"
+        );
 
         let summary_msg = ChatMessage::assistant(format!(
             "[CONTEXT SUMMARY \u{2014} {message_count} earlier messages compressed]\n\n{summary}\n{post_compact_context}"

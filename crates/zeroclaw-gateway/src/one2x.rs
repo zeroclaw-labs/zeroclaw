@@ -26,8 +26,7 @@ use axum::Router;
 use crate::AppState;
 
 /// Closure type for registering one2x routes from outside the gateway crate.
-pub type RouteExtender =
-    Box<dyn Fn(Router<AppState>) -> Router<AppState> + Send + Sync + 'static>;
+pub type RouteExtender = Box<dyn Fn(Router<AppState>) -> Router<AppState> + Send + Sync + 'static>;
 
 static EXTRA_ROUTES: OnceLock<RouteExtender> = OnceLock::new();
 

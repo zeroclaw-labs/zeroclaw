@@ -1826,10 +1826,7 @@ impl std::fmt::Debug for SkillForgeConfig {
             .field("sources", &self.sources)
             .field("scan_interval_hours", &self.scan_interval_hours)
             .field("min_score", &self.min_score)
-            .field(
-                "github_token",
-                &self.github_token.as_ref().map(|_| "***"),
-            )
+            .field("github_token", &self.github_token.as_ref().map(|_| "***"))
             .field("output_dir", &self.output_dir)
             .field("sandbox_verify", &self.sandbox_verify)
             .field("sandbox_timeout_secs", &self.sandbox_timeout_secs)
