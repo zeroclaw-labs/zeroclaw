@@ -280,6 +280,22 @@ fn build_approval_card_body(
     args_summary: &str,
     approval_id: &str,
 ) -> serde_json::Value {
+    // Card schema 2.0 dropped the `action` container tag (Feishu error 200861).
+    // Buttons must be top-level elements; for a horizontal row we wrap them in
+    // a `column_set` and move the click payload under `behaviors[].value`.
+    // Inbound `card.action.trigger` events still expose the payload at
+    // `/action/value`, so `parse_card_action_trigger` keeps working.
+    let make_button = |label: &str, ty: &str, action: &str| {
+        serde_json::json!({
+            "tag": "button",
+            "type": ty,
+            "text": { "tag": "plain_text", "content": label },
+            "behaviors": [{
+                "type": "callback",
+                "value": { "approval_id": approval_id, "action": action }
+            }]
+        })
+    };
     let card = serde_json::json!({
         "schema": "2.0",
         "body": {
@@ -291,22 +307,21 @@ fn build_approval_card_body(
                     )
                 },
                 {
-                    "tag": "action",
-                    "actions": [
+                    "tag": "column_set",
+                    "flex_mode": "trisect",
+                    "horizontal_spacing": "small",
+                    "columns": [
                         {
-                            "tag": "button", "type": "primary",
-                            "text": { "tag": "plain_text", "content": "✅ 批准" },
-                            "value": { "approval_id": approval_id, "action": "approve" }
+                            "tag": "column", "width": "weighted", "weight": 1,
+                            "elements": [make_button("✅ 批准", "primary", "approve")]
                         },
                         {
-                            "tag": "button", "type": "danger",
-                            "text": { "tag": "plain_text", "content": "❌ 拒绝" },
-                            "value": { "approval_id": approval_id, "action": "deny" }
+                            "tag": "column", "width": "weighted", "weight": 1,
+                            "elements": [make_button("❌ 拒绝", "danger", "deny")]
                         },
                         {
-                            "tag": "button", "type": "default",
-                            "text": { "tag": "plain_text", "content": "✅✅ 始终批准" },
-                            "value": { "approval_id": approval_id, "action": "always" }
+                            "tag": "column", "width": "weighted", "weight": 1,
+                            "elements": [make_button("✅✅ 始终批准", "default", "always")]
                         }
                     ]
                 }
@@ -4226,21 +4241,28 @@ mod tests {
 
         let content: serde_json::Value =
             serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
+        assert_eq!(content["schema"], "2.0");
         let elements = content["body"]["elements"].as_array().unwrap();
         assert_eq!(elements.len(), 2);
 
-        let actions = elements[1]["actions"].as_array().unwrap();
-        assert_eq!(actions.len(), 3);
+        // V2: buttons live inside a column_set, one button per column.
+        let column_set = &elements[1];
+        assert_eq!(column_set["tag"], "column_set");
+        let columns = column_set["columns"].as_array().unwrap();
+        assert_eq!(columns.len(), 3);
 
-        // All buttons carry the same approval_id
-        for action in actions {
-            assert_eq!(action["value"]["approval_id"], "uuid-abc");
+        let buttons: Vec<&serde_json::Value> = columns.iter().map(|c| &c["elements"][0]).collect();
+        for btn in &buttons {
+            assert_eq!(btn["tag"], "button");
+            // V2 click payload lives under behaviors[0].value (callback type).
+            let behavior = &btn["behaviors"][0];
+            assert_eq!(behavior["type"], "callback");
+            assert_eq!(behavior["value"]["approval_id"], "uuid-abc");
         }
 
-        // All three action strings are present
-        let action_strs: Vec<_> = actions
+        let action_strs: Vec<_> = buttons
             .iter()
-            .map(|a| a["value"]["action"].as_str().unwrap())
+            .map(|b| b["behaviors"][0]["value"]["action"].as_str().unwrap())
             .collect();
         assert!(action_strs.contains(&"approve"));
         assert!(action_strs.contains(&"deny"));
