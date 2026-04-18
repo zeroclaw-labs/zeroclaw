@@ -170,21 +170,54 @@ impl Tool for FileWriteTool {
         match tokio::fs::write(&resolved_target, content).await {
             Ok(()) => {
                 let mut output = format!("Written {} bytes to {path}", content.len());
-                if let Some(ref dl) = self.download {
-                    // Always sign the relative path from workspace_dir so gateway routing works stably.
-                    let relative_path = resolved_target
-                        .strip_prefix(&self.security.workspace_dir)
-                        .unwrap_or(&resolved_target);
-                    let rel_str = relative_path.to_string_lossy();
-                    
-                    let url = crate::gateway::signed_url::sign_download_url(
+                // Always sign the relative path from workspace_dir so gateway routing works stably.
+                //
+                // macOS note: `canonicalize(parent)` above resolves symlinks like
+                // `/var/folders/...` → `/private/var/folders/...`, so stripping
+                // against the RAW workspace_dir fails and falls back to an
+                // absolute path (which then gets percent-encoded into a broken
+                // signed URL like `/download/%2Fprivate%2F...`). We canonicalize
+                // the workspace path here to match.
+                let canonical_workspace =
+                    tokio::fs::canonicalize(&self.security.workspace_dir)
+                        .await
+                        .unwrap_or_else(|_| self.security.workspace_dir.clone());
+                let relative_path = resolved_target
+                    .strip_prefix(&canonical_workspace)
+                    .unwrap_or(&resolved_target);
+                let rel_str = relative_path.to_string_lossy().to_string();
+                let download_url = self.download.as_ref().map(|dl| {
+                    crate::gateway::signed_url::sign_download_url(
                         &dl.base_url,
                         &rel_str,
                         &dl.secret,
                         crate::gateway::signed_url::DEFAULT_TTL_SECS,
-                    );
+                    )
+                });
+                // Legacy `Download:` line — kept for the regex-based fallback in
+                // `channels/mod.rs::extract_download_urls_from_history` and
+                // `lark::extract_download_links` until PR 2 wires structured
+                // artifacts through the channel pipeline.
+                if let Some(url) = download_url.as_deref() {
                     use std::fmt::Write;
                     let _ = write!(output, "\nDownload: {url}");
+                }
+                // Structured artifact (new contract). Only emitted when
+                // `download` is configured, mirroring the legacy `Download:`
+                // line behaviour — installations without a public gateway
+                // URL stay byte-identical to pre-PR-1 output. PR 3 may
+                // revisit this to support native channel upload without
+                // gateway URLs.
+                if download_url.is_some() {
+                    let artifacts: Vec<crate::tools::artifact::Artifact> =
+                        crate::tools::artifact::Artifact::from_workspace_path(
+                            &canonical_workspace,
+                            &rel_str,
+                            download_url,
+                        )
+                        .into_iter()
+                        .collect();
+                    crate::tools::artifact::append_artifacts(&mut output, &artifacts);
                 }
                 Ok(ToolResult {
                     success: true,
@@ -502,6 +535,78 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success, "paths with null bytes must be blocked");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// PR 1 contract: when `with_download` is configured, file_write must
+    /// emit BOTH (a) the legacy `Download:` text line for backward
+    /// compatibility with the regex-based pipeline in `channels/mod.rs` and
+    /// `lark::extract_download_links`, AND (b) a structured artifact via
+    /// the sentinel codec for PR 2 consumers.
+    #[tokio::test]
+    async fn file_write_with_download_emits_both_legacy_and_artifact() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_artifact");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::with_download(
+            test_security(dir.clone()),
+            DownloadUrlConfig {
+                base_url: "https://gw.example".into(),
+                secret: b"test-secret".to_vec(),
+            },
+        );
+        let result = tool
+            .execute(json!({"path": "report.md", "content": "# hi"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        // Legacy line still present
+        assert!(
+            result.output.contains("\nDownload: https://gw.example/download/report.md?expires="),
+            "legacy Download: line missing — would break Lark/channel regex pipeline before PR 2: {:?}",
+            result.output
+        );
+
+        // Structured artifact recoverable
+        let (cleaned, artifacts) = crate::tools::artifact::extract_artifacts(&result.output);
+        assert!(!cleaned.contains("zeroclaw-artifacts"));
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].path, "report.md");
+        assert_eq!(artifacts[0].name, "report.md");
+        assert_eq!(artifacts[0].size_bytes, 4);
+        assert_eq!(
+            artifacts[0].mime.as_deref(),
+            Some("text/markdown; charset=utf-8")
+        );
+        assert!(artifacts[0]
+            .download_url
+            .as_deref()
+            .unwrap_or("")
+            .contains("/download/report.md?expires="));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Without `with_download`, no sentinel and no `Download:` line — keeps
+    /// behaviour identical to pre-PR-1 for minimal-config deployments.
+    #[tokio::test]
+    async fn file_write_without_download_emits_no_artifact() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_no_artifact");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({"path": "x.md", "content": "z"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(!result.output.contains("Download:"));
+        let (_, artifacts) = crate::tools::artifact::extract_artifacts(&result.output);
+        assert!(artifacts.is_empty());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

@@ -1,11 +1,14 @@
+use super::artifact::{append_artifacts, is_artifact_extension, Artifact};
+use super::file_write::DownloadUrlConfig;
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// Maximum shell command execution time before kill.
 const SHELL_TIMEOUT_SECS: u64 = 60;
@@ -17,16 +20,189 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
-/// Shell command execution tool with sandboxing
+/// Maximum recursion depth when scanning workspace for artifacts.
+/// Bounded to keep snapshot cheap on deep skill checkouts.
+const ARTIFACT_SCAN_MAX_DEPTH: usize = 8;
+/// Hard cap on entries scanned per workspace pass — protects against
+/// pathological trees (huge `node_modules`, model checkpoints, etc.) that
+/// somehow slipped past `ARTIFACT_SCAN_SKIP_DIRS`.
+const ARTIFACT_SCAN_MAX_ENTRIES: usize = 5_000;
+/// Maximum number of artifacts surfaced per shell call. Skills like `unzip` or
+/// `pandoc -t docx --extract-media` can produce dozens of files; surfacing all
+/// of them as download buttons is noise — keep the most recent few.
+const ARTIFACT_MAX_PER_CALL: usize = 5;
+/// Directories never worth scanning for downloadable artifacts. Conservative
+/// list — anything matching SCM, package-manager, or build caches.
+const ARTIFACT_SCAN_SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "target",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    "dist",
+    "build",
+    ".next",
+    ".cache",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".idea",
+    ".vscode",
+];
+
+/// Shell command execution tool with sandboxing.
+///
+/// When `download` is configured, post-execution the workspace is scanned for
+/// newly-created or modified files matching [`SHELL_ARTIFACT_EXTENSIONS`] and
+/// the resulting [`Artifact`] list is appended to the tool output via the
+/// sentinel codec ([`append_artifacts`]). This is how skills that produce
+/// `.docx`/`.pptx`/`.xlsx`/`.pdf` via `node`/`python`/`pandoc` get picked up
+/// — they never touch `file_write` so the legacy `Download:` mechanism would
+/// otherwise miss them entirely.
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    download: Option<DownloadUrlConfig>,
 }
 
 impl ShellTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
-        Self { security, runtime }
+        Self {
+            security,
+            runtime,
+            download: None,
+        }
     }
+
+    /// Construct with download URL signing enabled. Required for shell-produced
+    /// files to surface as artifacts in chat clients.
+    pub fn with_download(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        download: DownloadUrlConfig,
+    ) -> Self {
+        Self {
+            security,
+            runtime,
+            download: Some(download),
+        }
+    }
+}
+
+/// Walk `workspace_dir` collecting `(relative_path, mtime)` for every file
+/// whose extension is in [`SHELL_ARTIFACT_EXTENSIONS`].
+///
+/// Bounded by [`ARTIFACT_SCAN_MAX_DEPTH`] and [`ARTIFACT_SCAN_MAX_ENTRIES`].
+/// Skips directories listed in [`ARTIFACT_SCAN_SKIP_DIRS`].
+///
+/// Errors are silently ignored — this is a best-effort attribution layer,
+/// not a critical-path operation. Returning a partial map is always
+/// preferable to failing the entire shell call.
+fn scan_workspace_artifact_mtimes(workspace_dir: &Path) -> HashMap<PathBuf, SystemTime> {
+    let mut out = HashMap::new();
+    let mut entries_seen: usize = 0;
+    let mut stack: Vec<(PathBuf, usize)> = vec![(workspace_dir.to_path_buf(), 0)];
+
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > ARTIFACT_SCAN_MAX_DEPTH || entries_seen >= ARTIFACT_SCAN_MAX_ENTRIES {
+            continue;
+        }
+        let read_dir = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in read_dir.flatten() {
+            entries_seen += 1;
+            if entries_seen >= ARTIFACT_SCAN_MAX_ENTRIES {
+                break;
+            }
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            // Defence in depth: never follow symlinks during scan — same
+            // principle as the symlink protection in file_write.
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if ARTIFACT_SCAN_SKIP_DIRS.contains(&name_str.as_ref()) {
+                    continue;
+                }
+                stack.push((path, depth + 1));
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let path_str = path.to_string_lossy();
+            if !is_artifact_extension(&path_str) {
+                continue;
+            }
+            let mtime = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            out.insert(path, mtime);
+        }
+    }
+    out
+}
+
+/// Diff two mtime snapshots: return paths that are new in `after` or whose
+/// mtime advanced relative to `before`.
+fn detect_new_or_modified(
+    before: &HashMap<PathBuf, SystemTime>,
+    after: &HashMap<PathBuf, SystemTime>,
+) -> Vec<(PathBuf, SystemTime)> {
+    let mut changed: Vec<(PathBuf, SystemTime)> = after
+        .iter()
+        .filter(|(path, mtime)| match before.get(*path) {
+            Some(prev) => mtime > &prev,
+            None => true,
+        })
+        .map(|(p, m)| (p.clone(), *m))
+        .collect();
+    // Newest-first so when we cap at ARTIFACT_MAX_PER_CALL we keep the most
+    // recent (typically the actual deliverable, not intermediate temp files).
+    changed.sort_by(|a, b| b.1.cmp(&a.1));
+    changed
+}
+
+/// Build [`Artifact`] objects from a list of changed workspace paths.
+/// Resolves them to workspace-relative form, signs download URLs if configured,
+/// and discards entries that fail to stat (e.g. deleted between scan and now).
+fn build_shell_artifacts(
+    workspace_dir: &Path,
+    changed: &[(PathBuf, SystemTime)],
+    download: Option<&DownloadUrlConfig>,
+) -> Vec<Artifact> {
+    changed
+        .iter()
+        .take(ARTIFACT_MAX_PER_CALL)
+        .filter_map(|(path, _mtime)| {
+            let rel = path.strip_prefix(workspace_dir).ok()?;
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let download_url = download.map(|dl| {
+                crate::gateway::signed_url::sign_download_url(
+                    &dl.base_url,
+                    &rel_str,
+                    &dl.secret,
+                    crate::gateway::signed_url::DEFAULT_TTL_SECS,
+                )
+            });
+            // `Artifact::from_workspace_path` handles size/mime resolution
+            // consistently with file_write/file_edit.
+            Artifact::from_workspace_path(workspace_dir, &rel_str, download_url)
+        })
+        .collect()
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -154,6 +330,14 @@ impl Tool for ShellTool {
             }
         }
 
+        // Pre-execution snapshot of artifact-extension files in the workspace.
+        // Skipped entirely when no download config is wired (typical in tests
+        // and minimal deployments) — there is no consumer for the artifacts.
+        let pre_snapshot = self
+            .download
+            .as_ref()
+            .map(|_| scan_workspace_artifact_mtimes(&self.security.workspace_dir));
+
         let result =
             tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
 
@@ -178,6 +362,25 @@ impl Tool for ShellTool {
                     }
                     stderr.truncate(b);
                     stderr.push_str("\n... [stderr truncated at 1MB]");
+                }
+
+                // Post-execution: detect new/modified artifact files and append
+                // them to stdout via the sentinel codec. Only runs when the
+                // command succeeded — failed commands likely produced partial
+                // or corrupt files we shouldn't surface as deliverables.
+                if output.status.success() {
+                    if let (Some(pre), Some(dl)) = (pre_snapshot, self.download.as_ref()) {
+                        let post = scan_workspace_artifact_mtimes(&self.security.workspace_dir);
+                        let changed = detect_new_or_modified(&pre, &post);
+                        if !changed.is_empty() {
+                            let artifacts = build_shell_artifacts(
+                                &self.security.workspace_dir,
+                                &changed,
+                                Some(dl),
+                            );
+                            append_artifacts(&mut stdout, &artifacts);
+                        }
+                    }
                 }
 
                 Ok(ToolResult {
@@ -666,5 +869,285 @@ mod tests {
             r2.error.as_deref().unwrap_or("").contains("Rate limit")
                 || r2.error.as_deref().unwrap_or("").contains("budget")
         );
+    }
+
+    // ── Artifact detection (workspace pre/post diff) ─────────────────────
+
+    /// Direct unit test of `scan_workspace_artifact_mtimes`: must include
+    /// extension-whitelisted files and skip everything else.
+    #[test]
+    fn scan_picks_only_whitelisted_extensions() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_shell_scan_whitelist");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("doc.docx"), b"x").unwrap();
+        std::fs::write(dir.join("script.py"), b"y").unwrap();
+        std::fs::write(dir.join("report.pdf"), b"z").unwrap();
+
+        let snap = scan_workspace_artifact_mtimes(&dir);
+        let names: HashSet<_> = snap
+            .keys()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        assert!(names.contains("doc.docx"));
+        assert!(names.contains("report.pdf"));
+        assert!(!names.contains("script.py"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Skip dirs (`node_modules`, `.git`, …) must not be descended into,
+    /// regardless of how many artifact files they contain.
+    #[test]
+    fn scan_skips_heavy_dirs() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_shell_scan_skip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("node_modules/dep")).unwrap();
+        std::fs::create_dir_all(dir.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("node_modules/dep/leak.docx"), b"x").unwrap();
+        std::fs::write(dir.join(".git/objects/leak.pdf"), b"x").unwrap();
+        std::fs::write(dir.join("src/legit.docx"), b"x").unwrap();
+
+        let snap = scan_workspace_artifact_mtimes(&dir);
+        let names: HashSet<_> = snap
+            .keys()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        assert!(names.contains("legit.docx"), "src/legit.docx must be found");
+        assert!(
+            !names.contains("leak.docx"),
+            "node_modules contents must be skipped"
+        );
+        assert!(!names.contains("leak.pdf"), ".git contents must be skipped");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `detect_new_or_modified` must surface both new files and bumped mtimes,
+    /// and order them newest-first so the per-call cap keeps the most recent.
+    #[test]
+    fn detect_orders_newest_first() {
+        let mut before: HashMap<PathBuf, SystemTime> = HashMap::new();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let t2 = SystemTime::UNIX_EPOCH + Duration::from_secs(300);
+        before.insert(PathBuf::from("/ws/old.docx"), t0);
+
+        let mut after: HashMap<PathBuf, SystemTime> = HashMap::new();
+        after.insert(PathBuf::from("/ws/old.docx"), t1); // bumped
+        after.insert(PathBuf::from("/ws/brand_new.pdf"), t2); // new
+
+        let changed = detect_new_or_modified(&before, &after);
+        assert_eq!(changed.len(), 2);
+        assert_eq!(changed[0].0, PathBuf::from("/ws/brand_new.pdf"));
+        assert_eq!(changed[1].0, PathBuf::from("/ws/old.docx"));
+    }
+
+    /// Files whose mtime is unchanged between snapshots must NOT be reported,
+    /// even if their content was overwritten with identical bytes (mtime is
+    /// the only signal we use, and that's intentional).
+    #[test]
+    fn detect_ignores_unchanged() {
+        let mut before: HashMap<PathBuf, SystemTime> = HashMap::new();
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(500);
+        before.insert(PathBuf::from("/ws/stable.docx"), t);
+
+        let mut after = before.clone();
+        after.insert(PathBuf::from("/ws/added.pdf"), t);
+
+        let changed = detect_new_or_modified(&before, &after);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].0, PathBuf::from("/ws/added.pdf"));
+    }
+
+    /// Per-call cap honoured — even with 20 changed files we never emit more
+    /// than `ARTIFACT_MAX_PER_CALL` artifacts (= 5).
+    #[test]
+    fn build_artifacts_caps_per_call() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_shell_artifact_cap");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut changed: Vec<(PathBuf, SystemTime)> = Vec::new();
+        for i in 0u64..20 {
+            let p = dir.join(format!("f{i}.docx"));
+            std::fs::write(&p, b"x").unwrap();
+            changed.push((p, SystemTime::UNIX_EPOCH + Duration::from_secs(1000 + i)));
+        }
+        // newest-first
+        changed.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let arts = build_shell_artifacts(&dir, &changed, None);
+        assert_eq!(
+            arts.len(),
+            ARTIFACT_MAX_PER_CALL,
+            "must not exceed the per-call cap"
+        );
+        // Confirm we kept the newest entries
+        assert!(arts[0].name.starts_with("f19"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `build_shell_artifacts` with download config must populate `download_url`.
+    #[test]
+    fn build_artifacts_signs_download_url_when_configured() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_shell_artifact_signed");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.docx");
+        std::fs::write(&path, b"hello").unwrap();
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+
+        let dl = DownloadUrlConfig {
+            base_url: "https://gw.example".into(),
+            secret: b"secret-key".to_vec(),
+        };
+        let arts = build_shell_artifacts(&dir, &[(path, mtime)], Some(&dl));
+        assert_eq!(arts.len(), 1);
+        let url = arts[0].download_url.as_deref().expect("url must be signed");
+        assert!(url.starts_with("https://gw.example/download/out.docx?expires="));
+        assert!(url.contains("&sig="));
+        assert_eq!(arts[0].size_bytes, 5);
+        assert_eq!(
+            arts[0].mime.as_deref(),
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end: `ShellTool::with_download` running an allowed command that
+    /// creates a `.docx` file emits the file as a structured artifact via the
+    /// sentinel codec, and the artifact carries a signed download URL.
+    ///
+    /// Uses `touch` (added to allowed_commands) which is the simplest way to
+    /// materialise a file via shell without needing redirect-capable commands.
+    #[tokio::test]
+    async fn shell_with_download_emits_artifact_for_new_docx() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_shell_e2e_artifact");
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.clone(),
+            allowed_commands: vec!["touch".into()],
+            require_approval_for_medium_risk: false,
+            ..SecurityPolicy::default()
+        });
+        let dl = DownloadUrlConfig {
+            base_url: "https://gw.example".into(),
+            secret: b"secret-key".to_vec(),
+        };
+        let tool = ShellTool::with_download(security, test_runtime(), dl);
+
+        let result = tool
+            .execute(json!({"command": "touch report.docx", "approved": true}))
+            .await
+            .expect("touch must succeed");
+        assert!(
+            result.success,
+            "shell call failed: {:?}",
+            result.error.as_deref()
+        );
+
+        let (cleaned, artifacts) = crate::tools::artifact::extract_artifacts(&result.output);
+        // Sentinel must be stripped from cleaned output
+        assert!(
+            !cleaned.contains("zeroclaw-artifacts"),
+            "sentinel must be removed from cleaned text"
+        );
+        assert_eq!(artifacts.len(), 1, "exactly one artifact for one new file");
+        let art = &artifacts[0];
+        assert_eq!(art.path, "report.docx");
+        assert_eq!(art.name, "report.docx");
+        assert_eq!(
+            art.mime.as_deref(),
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        );
+        assert!(art
+            .download_url
+            .as_deref()
+            .unwrap_or("")
+            .contains("/download/report.docx?expires="));
+
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+    }
+
+    /// Failed shell commands must NOT emit artifacts — partial/corrupt files
+    /// from a failing run shouldn't be surfaced as deliverables.
+    #[tokio::test]
+    async fn shell_failed_command_emits_no_artifacts() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_shell_e2e_failure");
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.clone(),
+            // Allow `find` but use an arg that makes find fail (nonexistent path).
+            allowed_commands: vec!["find".into()],
+            require_approval_for_medium_risk: false,
+            ..SecurityPolicy::default()
+        });
+        let dl = DownloadUrlConfig {
+            base_url: "https://gw.example".into(),
+            secret: b"secret-key".to_vec(),
+        };
+        let tool = ShellTool::with_download(security, test_runtime(), dl);
+
+        // Pre-create a docx so the workspace isn't empty (the artifact must
+        // not be picked up, since its mtime is older than the snapshot moment).
+        std::fs::write(workspace.join("preexisting.docx"), b"x").unwrap();
+
+        let result = tool
+            .execute(json!({"command": "find /nonexistent_path_zcw_test"}))
+            .await
+            .expect("execute must complete");
+        assert!(!result.success, "find on missing path should fail");
+
+        let (_, artifacts) = crate::tools::artifact::extract_artifacts(&result.output);
+        assert!(
+            artifacts.is_empty(),
+            "failed commands must not emit artifacts (got {:?})",
+            artifacts
+        );
+
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+    }
+
+    /// Without `with_download`, the scan is short-circuited entirely — no
+    /// performance cost when no consumer is configured.
+    #[tokio::test]
+    async fn shell_without_download_skips_scan() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_shell_no_download");
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.clone(),
+            allowed_commands: vec!["touch".into()],
+            require_approval_for_medium_risk: false,
+            ..SecurityPolicy::default()
+        });
+        // Note: ShellTool::new (NOT with_download)
+        let tool = ShellTool::new(security, test_runtime());
+
+        let result = tool
+            .execute(json!({"command": "touch should_not_surface.docx", "approved": true}))
+            .await
+            .expect("touch must succeed");
+        assert!(result.success);
+
+        let (_, artifacts) = crate::tools::artifact::extract_artifacts(&result.output);
+        assert!(
+            artifacts.is_empty(),
+            "no download config = no artifact scan"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
     }
 }

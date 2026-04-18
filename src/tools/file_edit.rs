@@ -223,18 +223,39 @@ impl Tool for FileEditTool {
                     "Edited {path}: replaced 1 occurrence ({} bytes)",
                     new_content.len()
                 );
-                if let Some(ref dl) = self.download {
-                    let relative_path = resolved_target
-                        .strip_prefix(&self.security.workspace_dir)
-                        .unwrap_or(&resolved_target);
-                    let rel_str = relative_path.to_string_lossy();
-                    let url = crate::gateway::signed_url::sign_download_url(
+                // See `file_write.rs` for why we canonicalize the workspace
+                // path before stripping — macOS symlink resolution breaks
+                // a naive `strip_prefix` otherwise.
+                let canonical_workspace = tokio::fs::canonicalize(&self.security.workspace_dir)
+                    .await
+                    .unwrap_or_else(|_| self.security.workspace_dir.clone());
+                let relative_path = resolved_target
+                    .strip_prefix(&canonical_workspace)
+                    .unwrap_or(&resolved_target);
+                let rel_str = relative_path.to_string_lossy().to_string();
+                let download_url = self.download.as_ref().map(|dl| {
+                    crate::gateway::signed_url::sign_download_url(
                         &dl.base_url,
                         &rel_str,
                         &dl.secret,
                         crate::gateway::signed_url::DEFAULT_TTL_SECS,
-                    );
+                    )
+                });
+                // Legacy `Download:` line for backward compat (see file_write.rs).
+                if let Some(url) = download_url.as_deref() {
                     let _ = write!(output, "\nDownload: {url}");
+                }
+                // See `file_write.rs` for why we gate on `download_url.is_some()`.
+                if download_url.is_some() {
+                    let artifacts: Vec<crate::tools::artifact::Artifact> =
+                        crate::tools::artifact::Artifact::from_workspace_path(
+                            &canonical_workspace,
+                            &rel_str,
+                            download_url,
+                        )
+                        .into_iter()
+                        .collect();
+                    crate::tools::artifact::append_artifacts(&mut output, &artifacts);
                 }
                 Ok(ToolResult {
                     success: true,
@@ -777,6 +798,44 @@ mod tests {
 
         assert!(result.success);
         assert!(!result.output.contains("Download:"), "no download URL without config");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// PR 1 contract: file_edit must surface the edited file as a structured
+    /// artifact via the sentinel codec, in addition to the legacy `Download:`
+    /// line.
+    #[tokio::test]
+    async fn file_edit_with_download_emits_artifact_via_sentinel() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_artifact");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("notes.md"), "alpha").await.unwrap();
+
+        let tool = FileEditTool::with_download(
+            test_security(dir.clone()),
+            DownloadUrlConfig {
+                base_url: "https://gw.example".into(),
+                secret: b"k".to_vec(),
+            },
+        );
+        let result = tool
+            .execute(json!({
+                "path": "notes.md",
+                "old_string": "alpha",
+                "new_string": "beta"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let (cleaned, artifacts) = crate::tools::artifact::extract_artifacts(&result.output);
+        assert!(!cleaned.contains("zeroclaw-artifacts"));
+        // Cleaned text retains the legacy `Download:` line for PR 2 backward compat
+        assert!(cleaned.contains("Download:"));
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].path, "notes.md");
+        assert_eq!(artifacts[0].size_bytes, 4); // "beta"
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

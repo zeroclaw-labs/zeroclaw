@@ -15,6 +15,7 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod artifact;
 pub mod browser;
 pub mod browser_open;
 pub mod cli_discovery;
@@ -55,6 +56,13 @@ pub mod traits;
 pub mod web_fetch;
 pub mod web_search_tool;
 
+// Artifact re-exports are intentionally behind #[allow(unused_imports)] — PR 1
+// only produces artifacts; PR 2 will wire the `extract_artifacts` consumer in
+// `channels/mod.rs` and the rest become part of the public downstream API.
+#[allow(unused_imports)]
+pub use artifact::{
+    append_artifacts, extract_artifacts, is_artifact_extension, mime_for_extension, Artifact,
+};
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
@@ -210,7 +218,20 @@ pub fn all_tools_with_runtime(
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new(security.clone(), runtime)),
+        Arc::new(
+            if let Some(gateway_url) = root_config.resolve_gateway_public_url() {
+                ShellTool::with_download(
+                    security.clone(),
+                    runtime,
+                    file_write::DownloadUrlConfig {
+                        base_url: gateway_url,
+                        secret: root_config.resolve_download_secret(),
+                    },
+                )
+            } else {
+                ShellTool::new(security.clone(), runtime)
+            },
+        ),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(
             if let Some(gateway_url) = root_config.resolve_gateway_public_url() {
