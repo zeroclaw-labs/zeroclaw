@@ -58,6 +58,7 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     Ok(t)
 }
 
+mod advisor;
 mod agent;
 mod approval;
 mod auth;

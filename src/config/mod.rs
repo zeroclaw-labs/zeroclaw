@@ -15,7 +15,7 @@ pub use schema::{
     ClassificationRule, CodingConfig, ComposioConfig, Config, CoordinationConfig, CostConfig,
     CronConfig, DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig, EconomicConfig,
     EconomicTokenPricing, ElevenLabsApiConfig, EmbeddingRouteConfig, EstopConfig, FeishuConfig,
-    FreepikApiConfig, GatekeeperConfig, GatewayConfig, GoogleCalendarConfig, GroupReplyConfig,
+    AdvisorConfig, FreepikApiConfig, GatekeeperConfig, GatewayConfig, GoogleCalendarConfig, GroupReplyConfig,
     GroupReplyMode, HardwareConfig, HardwareTransport, HeartbeatConfig, HooksConfig,
     HttpRequestConfig, HttpRequestCredentialProfile, IMessageConfig, IdentityConfig,
     KakaoCalendarConfig, LarkConfig, LiveKitConfig, MatrixConfig, MediaApiConfig, MemoryConfig, ModelRouteConfig,

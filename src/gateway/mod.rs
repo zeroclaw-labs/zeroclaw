@@ -409,6 +409,13 @@ pub struct AppState {
     /// summons the LLM using the user's own API key first, then the operator
     /// proxy with 2.2× credit deduction (see ARCHITECTURE.md §528 & §626).
     pub gatekeeper: Option<Arc<crate::gatekeeper::GatekeeperRouter>>,
+    /// Advisor LLM client (higher-tier model consulted at PLAN / REVIEW /
+    /// ADVISE checkpoints). Only invoked for tasks the SLM gatekeeper
+    /// classifies as Medium / Complex / Specialized — simple greetings and
+    /// short Q&A skip the advisor entirely. Shares the same user-key →
+    /// operator-key (2.2× credit) routing as every other LLM call, so
+    /// billing semantics are unchanged.
+    pub advisor: Option<Arc<crate::advisor::AdvisorClient>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -531,6 +538,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         None
     };
 
+    // Advisor init is deferred until after `provider` is built below —
+    // see the "── Advisor LLM" block following the provider construction.
+
     let config_state = Arc::new(Mutex::new(config.clone()));
 
     // ── Hooks ──────────────────────────────────────────────────────
@@ -564,6 +574,54 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let temperature = config.default_temperature;
+
+    // ── Advisor LLM: higher-tier model consulted at PLAN / REVIEW / ADVISE ──
+    //
+    // Only initialized when (a) the advisor layer is enabled in config AND
+    // (b) we know a top-tier model for the user's default provider. Reuses
+    // the same `provider` Arc that the agent loop already uses — so the
+    // existing user-key → operator-key (2.2× credit) resolution applies
+    // uniformly to advisor calls (see ARCHITECTURE.md §528 cost table).
+    //
+    // We only need the *model id* override here, not a separate provider
+    // instance — Provider::chat_with_system takes the model as a per-call
+    // parameter, so the same Anthropic/OpenAI/Gemini client can dispatch
+    // both the agent's default model and the advisor's top-tier model
+    // against whichever API key resolves (user's own → operator relay).
+    let advisor: Option<Arc<crate::advisor::AdvisorClient>> = if config.advisor.enabled {
+        let provider_name = config.default_provider.as_deref().unwrap_or("gemini");
+        let advisor_model = config
+            .advisor
+            .model
+            .clone()
+            .or_else(|| crate::advisor::top_tier_model_for(provider_name).map(str::to_string));
+        match advisor_model {
+            Some(m) => {
+                let client = crate::advisor::AdvisorClient::new(
+                    provider.clone(),
+                    m,
+                    config.advisor.temperature,
+                )
+                .with_timeout(std::time::Duration::from_secs(config.advisor.timeout_secs));
+                tracing::info!(
+                    model = client.model(),
+                    provider = provider_name,
+                    "Advisor LLM initialized"
+                );
+                Some(Arc::new(client))
+            }
+            None => {
+                tracing::warn!(
+                    provider = provider_name,
+                    "Advisor disabled — no top-tier model known for this provider; set [advisor].model in config.toml to override"
+                );
+                None
+            }
+        }
+    } else {
+        tracing::debug!("Advisor LLM disabled in config — skipping");
+        None
+    };
     // Create memory backend, optionally with cross-device sync support.
     // `sync_engine_for_ontology` is kept alive so the OntologyRepo can
     // record deltas for cross-device replication of the knowledge graph.
@@ -1161,6 +1219,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         r2_config: crate::storage::r2::R2Config::from_env(),
         pricing_registry: crate::billing::SharedPricingRegistry::new(&config.workspace_dir),
         gatekeeper,
+        advisor,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -3957,6 +4016,7 @@ mod tests {
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -4032,6 +4092,7 @@ mod tests {
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -4090,6 +4151,7 @@ mod tests {
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let response = handle_metrics(State(state), test_public_connect_info(), HeaderMap::new())
@@ -4149,6 +4211,7 @@ mod tests {
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let unauthorized =
@@ -4652,6 +4715,7 @@ Reminder set successfully."#;
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4739,6 +4803,7 @@ Reminder set successfully."#;
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let response = handle_webhook(
@@ -4807,6 +4872,7 @@ Reminder set successfully."#;
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let response = handle_webhook(
@@ -4876,6 +4942,7 @@ Reminder set successfully."#;
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let response = handle_webhook(
@@ -4954,6 +5021,7 @@ Reminder set successfully."#;
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let response = handle_node_control(
@@ -5024,6 +5092,7 @@ Reminder set successfully."#;
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let response = handle_node_control(
@@ -5099,6 +5168,7 @@ Reminder set successfully."#;
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let headers = HeaderMap::new();
@@ -5200,6 +5270,7 @@ Reminder set successfully."#;
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let response = handle_webhook(
@@ -5271,6 +5342,7 @@ Reminder set successfully."#;
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -5347,6 +5419,7 @@ Reminder set successfully."#;
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -5437,6 +5510,7 @@ Reminder set successfully."#;
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let response = handle_github_webhook(
@@ -5506,6 +5580,7 @@ Reminder set successfully."#;
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let body = r#"{
@@ -5586,6 +5661,7 @@ Reminder set successfully."#;
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let body = r#"{
@@ -5671,6 +5747,7 @@ Reminder set successfully."#;
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -5746,6 +5823,7 @@ Reminder set successfully."#;
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -5814,6 +5892,7 @@ Reminder set successfully."#;
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let response = handle_qq_webhook(
@@ -5881,6 +5960,7 @@ Reminder set successfully."#;
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
             gatekeeper: None,
+            advisor: None,
         };
 
         let mut headers = HeaderMap::new();

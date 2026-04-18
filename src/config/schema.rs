@@ -539,6 +539,11 @@ pub struct Config {
     #[serde(default)]
     pub gatekeeper: GatekeeperConfig,
 
+    /// Advisor LLM configuration (strategic consultation at PLAN/REVIEW/ADVISE
+    /// checkpoints when the SLM flags a task as non-trivial).
+    #[serde(default)]
+    pub advisor: AdvisorConfig,
+
     /// Admin telemetry configuration (usage analytics and suspicious activity alerts).
     #[serde(default)]
     pub telemetry: TelemetryConfig,
@@ -7849,6 +7854,7 @@ impl Default for Config {
             llm_proxy_token: None,
             wasm: WasmConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
+            advisor: AdvisorConfig::default(),
             telemetry: TelemetryConfig::default(),
             auth: AuthConfig::default(),
             sync: SyncConfig::default(),
@@ -12137,6 +12143,7 @@ ws_url = "ws://127.0.0.1:3002"
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
+            advisor: AdvisorConfig::default(),
             telemetry: TelemetryConfig::default(),
             auth: AuthConfig::default(),
             sync: SyncConfig::default(),
@@ -12530,6 +12537,7 @@ tool_dispatcher = "xml"
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
+            advisor: AdvisorConfig::default(),
             telemetry: TelemetryConfig::default(),
             auth: AuthConfig::default(),
             sync: SyncConfig::default(),
@@ -17102,6 +17110,49 @@ impl Default for GatekeeperConfig {
             // key is set.
             model: "qwen3:0.6b".to_string(),
             timeout_secs: 10,
+        }
+    }
+}
+
+// ── MoA: Advisor (strategic consultation at 3 checkpoints) ──────
+
+/// Advisor LLM configuration — the higher-tier model the on-device SLM
+/// consults at PLAN / REVIEW / ADVISE checkpoints for non-trivial tasks.
+///
+/// Key routing is identical to every other LLM surface in MoA: the
+/// underlying `Provider` first tries the user's own API key and, if
+/// absent, transparently falls back to the operator's Railway-stored
+/// key via the proxy-token path with 2.2× credit deduction. Advisor
+/// calls are not a separate billing bucket.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AdvisorConfig {
+    /// Master switch. When `false`, no advisor calls are issued even for
+    /// complex tasks — the SLM hands off to the cloud LLM directly as
+    /// before the advisor layer existed.
+    pub enabled: bool,
+    /// Explicit advisor model id. When `None`, the gateway picks the
+    /// top-tier model for whichever provider family the user's default
+    /// provider belongs to (e.g., `anthropic` → `claude-opus-4-7`).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Sampling temperature for advisor calls. Advisors generally want
+    /// low temperature (deterministic reasoning); default 0.2.
+    pub temperature: f64,
+    /// Per-call timeout in seconds. Bypasses the provider's own timeout
+    /// so a stuck advisor call cannot indefinitely block a user request.
+    pub timeout_secs: u64,
+}
+
+impl Default for AdvisorConfig {
+    fn default() -> Self {
+        Self {
+            // On by default — consistent with the SLM-first gatekeeper
+            // default (both off would defeat the point). Turning it off
+            // produces pre-advisor behaviour without any other changes.
+            enabled: true,
+            model: None,
+            temperature: 0.2,
+            timeout_secs: 60,
         }
     }
 }
