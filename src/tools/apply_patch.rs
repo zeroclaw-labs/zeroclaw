@@ -56,6 +56,13 @@ impl Tool for ApplyPatchTool {
         "apply_patch"
     }
 
+    // Patch application mutates the repo. Gemma 4 can produce *plausible*
+    // diffs but misses subtle merge-conflict / ordering issues that Opus/
+    // Sonnet handle reliably. Restrict to the cloud LLM path.
+    fn safe_for_slm(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Safely check/apply a unified diff to the current git repository, optionally staging and committing."
     }

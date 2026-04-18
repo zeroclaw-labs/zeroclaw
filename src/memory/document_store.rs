@@ -211,7 +211,7 @@ impl DocumentStore {
              LIMIT ?2"
         };
 
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare(sql)?;
         let rows: Vec<DocumentSearchHit> = if let Some(cat) = category_filter {
             stmt.query_map(params![sanitized, cat, limit as i64], Self::map_hit)?
                 .filter_map(|r| r.ok())

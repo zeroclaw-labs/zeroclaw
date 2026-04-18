@@ -229,7 +229,7 @@ impl EventHandler for AgentTriggerHandler {
         // try_send avoids blocking if the agent dispatcher is saturated;
         // dropped events are reported as Failed so the audit log surfaces them.
         match self.tx.try_send(msg) {
-            Ok(_) => Ok(HandlerOutcome::Handled {
+            Ok(()) => Ok(HandlerOutcome::Handled {
                 summary: "agent input enqueued".into(),
             }),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(HandlerOutcome::Failed {

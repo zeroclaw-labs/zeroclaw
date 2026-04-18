@@ -301,7 +301,10 @@ mod tests {
             .query_row(
                 "SELECT name, parent_category, created_by, length(spec_sha256) FROM workflows LIMIT 1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? as usize)),
+                |r| {
+                    let len = usize::try_from(r.get::<_, i64>(3)?.max(0)).unwrap_or(0);
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, len))
+                },
             )
             .unwrap();
         assert!(!name.is_empty());

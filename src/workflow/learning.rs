@@ -247,15 +247,22 @@ pub fn load_recent_runs(
          LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![workflow_id, limit as i64], |row| {
+        // SQLite stores these counters as INTEGER; writers (`save_run_result`
+        // below) come from u32 fields on WorkflowRunRecord. `try_from` on a
+        // clamped-non-negative i64 saturates both signs of the unlikely
+        // corrupt-row path (negative → 0 via `max(0)`, > u32::MAX → u32::MAX).
+        let tokens_in = u32::try_from(row.get::<_, i64>(5)?.max(0)).unwrap_or(u32::MAX);
+        let tokens_out = u32::try_from(row.get::<_, i64>(6)?.max(0)).unwrap_or(u32::MAX);
+        let llm_calls = u32::try_from(row.get::<_, i64>(7)?.max(0)).unwrap_or(u32::MAX);
         Ok(WorkflowRunRecord {
             run_uuid: row.get(0)?,
             workflow_id: row.get(1)?,
             status: row.get(2)?,
             input_json: row.get(3)?,
             error_message: row.get(4)?,
-            cost_tokens_in: row.get::<_, i64>(5)? as u32,
-            cost_tokens_out: row.get::<_, i64>(6)? as u32,
-            cost_llm_calls: row.get::<_, i64>(7)? as u32,
+            cost_tokens_in: tokens_in,
+            cost_tokens_out: tokens_out,
+            cost_llm_calls: llm_calls,
         })
     })?;
     let mut results = Vec::new();
@@ -276,11 +283,9 @@ pub fn load_active_workflows(
          ORDER BY usage_count DESC",
     )?;
     let rows = stmt.query_map(params![min_usage], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)? as u32,
-        ))
+        // `usage_count` is written as u32; saturating try_from mirrors `load_recent_runs`.
+        let usage_count = u32::try_from(row.get::<_, i64>(2)?.max(0)).unwrap_or(u32::MAX);
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, usage_count))
     })?;
     let mut results = Vec::new();
     for row in rows {

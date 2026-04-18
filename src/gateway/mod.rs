@@ -398,6 +398,32 @@ pub struct AppState {
     pub r2_config: Option<crate::storage::r2::R2Config>,
     /// Shared model pricing registry for accurate cost calculation and admin management.
     pub pricing_registry: crate::billing::SharedPricingRegistry,
+    /// SLM gatekeeper for local-first message classification and response.
+    ///
+    /// When configured (`config.gatekeeper.enabled = true`) and the local Ollama
+    /// daemon is reachable, every `/api/chat` and `/ws` message is classified
+    /// by this router **before** hitting the cloud LLM path. Messages the
+    /// router decides it can handle locally (greetings, simple queries) get
+    /// served directly from the on-device SLM; everything else (classified as
+    /// Complex/Specialized) falls through to the existing agent loop which
+    /// summons the LLM using the user's own API key first, then the operator
+    /// proxy with 2.2× credit deduction (see ARCHITECTURE.md §528 & §626).
+    pub gatekeeper: Option<Arc<crate::gatekeeper::GatekeeperRouter>>,
+    /// Advisor LLM client (higher-tier model consulted at PLAN / REVIEW /
+    /// ADVISE checkpoints). Only invoked for tasks the SLM gatekeeper
+    /// classifies as Medium / Complex / Specialized — simple greetings and
+    /// short Q&A skip the advisor entirely. Shares the same user-key →
+    /// operator-key (2.2× credit) routing as every other LLM call, so
+    /// billing semantics are unchanged.
+    pub advisor: Option<Arc<crate::advisor::AdvisorClient>>,
+    /// SLM-as-executor loop (Phase 3). When present, non-trivial chat
+    /// messages that the gatekeeper routes to the cloud path first
+    /// attempt a local Gemma-4 agent loop with prompt-guided tool
+    /// calling; only when that loop fails or exceeds its iteration
+    /// budget do we fall back to the cloud LLM agent loop. Shares
+    /// `tools_registry_exec` as the tool surface so every tool the
+    /// cloud LLM can call is also available to the SLM executor.
+    pub slm_executor: Option<Arc<crate::advisor::SlmExecutor>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -476,6 +502,53 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         "Armed local Gemma 4 fallback path"
     );
 
+    // ── SLM-first gatekeeper: classify every message before LLM ───────
+    // "로그인 후 무조건 SLM이 먼저 작동 → 고도의 작업이면 SLM이 스스로 LLM
+    // 소환" (user spec, 2026-04-18). host_probe::probe() picks the optimal
+    // Gemma 4 tier for this hardware on first boot; on subsequent boots we
+    // trust the persisted model choice in `config.gatekeeper.model`. If the
+    // daemon is unreachable at boot the router is still constructed with
+    // slm_available=false — `process_message` will then return
+    // local_response=None and handlers fall through to the cloud LLM path
+    // without any regression for users who don't have Ollama installed.
+    let gatekeeper = if config.gatekeeper.enabled {
+        // First-boot auto-pick of the Gemma 4 variant. We only override the
+        // model string when it's still the pre-Gemma default ("qwen3:0.6b")
+        // so that user-authored overrides in config.toml always win.
+        if config.gatekeeper.model == "qwen3:0.6b" {
+            match crate::host_probe::probe(true).await {
+                Ok(profile) => {
+                    let tag = profile.recommended_tier.ollama_tag();
+                    tracing::info!(
+                        tier = %profile.recommended_tier,
+                        tag,
+                        "host_probe picked Gemma 4 tier for SLM gatekeeper"
+                    );
+                    config.gatekeeper.model = tag.to_string();
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "host_probe failed — keeping default gatekeeper model"
+                ),
+            }
+        }
+        let mut router = crate::gatekeeper::GatekeeperRouter::from_config(&config.gatekeeper);
+        let healthy = router.check_slm_health().await;
+        tracing::info!(
+            healthy,
+            model = router.model(),
+            url = router.ollama_url(),
+            "SLM gatekeeper initialized"
+        );
+        Some(Arc::new(router))
+    } else {
+        tracing::debug!("SLM gatekeeper disabled in config — skipping");
+        None
+    };
+
+    // Advisor init is deferred until after `provider` is built below —
+    // see the "── Advisor LLM" block following the provider construction.
+
     let config_state = Arc::new(Mutex::new(config.clone()));
 
     // ── Hooks ──────────────────────────────────────────────────────
@@ -509,6 +582,94 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let temperature = config.default_temperature;
+
+    // ── Advisor LLM: higher-tier model consulted at PLAN / REVIEW / ADVISE ──
+    //
+    // Only initialized when (a) the advisor layer is enabled in config AND
+    // (b) we know a top-tier model for the user's default provider. Reuses
+    // the same `provider` Arc that the agent loop already uses — so the
+    // existing user-key → operator-key (2.2× credit) resolution applies
+    // uniformly to advisor calls (see ARCHITECTURE.md §528 cost table).
+    //
+    // We only need the *model id* override here, not a separate provider
+    // instance — Provider::chat_with_system takes the model as a per-call
+    // parameter, so the same Anthropic/OpenAI/Gemini client can dispatch
+    // both the agent's default model and the advisor's top-tier model
+    // against whichever API key resolves (user's own → operator relay).
+    let advisor: Option<Arc<crate::advisor::AdvisorClient>> = if config.advisor.enabled {
+        let provider_name = config.default_provider.as_deref().unwrap_or("gemini");
+        let advisor_model = config
+            .advisor
+            .model
+            .clone()
+            .or_else(|| crate::advisor::top_tier_model_for(provider_name).map(str::to_string));
+        match advisor_model {
+            Some(m) => {
+                let client = crate::advisor::AdvisorClient::new(
+                    provider.clone(),
+                    m,
+                    config.advisor.temperature,
+                )
+                .with_timeout(std::time::Duration::from_secs(config.advisor.timeout_secs));
+                tracing::info!(
+                    model = client.model(),
+                    provider = provider_name,
+                    "Advisor LLM initialized"
+                );
+                Some(Arc::new(client))
+            }
+            None => {
+                tracing::warn!(
+                    provider = provider_name,
+                    "Advisor disabled — no top-tier model known for this provider; set [advisor].model in config.toml to override"
+                );
+                None
+            }
+        }
+    } else {
+        tracing::debug!("Advisor LLM disabled in config — skipping");
+        None
+    };
+
+    // ── SLM executor (Phase 3) ──
+    //
+    // When the gatekeeper is enabled we can also drive on-device Gemma 4
+    // as the *executor* (not just the classifier) via a prompt-guided
+    // tool-calling loop. The executor tries to close the task locally
+    // using the same tool registry the cloud LLM would use; if it stalls
+    // we fall back to the cloud LLM agent loop without the user noticing.
+    //
+    // The Ollama URL in `GatekeeperConfig` carries the OpenAI-compat
+    // `/v1` suffix for the gatekeeper's own HTTP client. `OllamaProvider`
+    // expects a root URL, so strip it.
+    let slm_executor = if config.gatekeeper.enabled {
+        let base = config
+            .gatekeeper
+            .ollama_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .to_string();
+        let ollama: Arc<dyn crate::providers::Provider> = Arc::new(
+            crate::providers::ollama::OllamaProvider::new(Some(&base), None),
+        );
+        let executor = crate::advisor::SlmExecutor::new(
+            ollama,
+            config.gatekeeper.model.clone(),
+            0.3,
+            8,
+        );
+        tracing::info!(
+            model = executor.model(),
+            url = base.as_str(),
+            "SLM executor initialized (Phase 3 — prompt-guided tool calling)"
+        );
+        Some(Arc::new(executor))
+    } else {
+        tracing::debug!(
+            "SLM executor disabled (gatekeeper off) — cloud LLM agent loop handles all non-trivial tasks"
+        );
+        None
+    };
     // Create memory backend, optionally with cross-device sync support.
     // `sync_engine_for_ontology` is kept alive so the OntologyRepo can
     // record deltas for cross-device replication of the knowledge graph.
@@ -1105,6 +1266,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         supabase,
         r2_config: crate::storage::r2::R2Config::from_env(),
         pricing_registry: crate::billing::SharedPricingRegistry::new(&config.workspace_dir),
+        gatekeeper,
+        advisor,
+        slm_executor,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -3900,6 +4064,9 @@ mod tests {
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -3974,6 +4141,9 @@ mod tests {
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_metrics(State(state), test_connect_info(), HeaderMap::new())
@@ -4031,6 +4201,9 @@ mod tests {
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_metrics(State(state), test_public_connect_info(), HeaderMap::new())
@@ -4089,6 +4262,9 @@ mod tests {
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let unauthorized =
@@ -4591,6 +4767,9 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4677,6 +4856,9 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_webhook(
@@ -4744,6 +4926,9 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_webhook(
@@ -4812,6 +4997,9 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_webhook(
@@ -4889,6 +5077,9 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_node_control(
@@ -4958,6 +5149,9 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_node_control(
@@ -5032,6 +5226,9 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let headers = HeaderMap::new();
@@ -5132,6 +5329,9 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_webhook(
@@ -5202,6 +5402,9 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -5277,6 +5480,9 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -5366,6 +5572,9 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_github_webhook(
@@ -5434,6 +5643,9 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let body = r#"{
@@ -5513,6 +5725,9 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let body = r#"{
@@ -5597,6 +5812,9 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -5671,6 +5889,9 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -5738,6 +5959,9 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let response = handle_qq_webhook(
@@ -5804,6 +6028,9 @@ Reminder set successfully."#;
             supabase: None,
             r2_config: None,
             pricing_registry: crate::billing::SharedPricingRegistry::new(std::path::Path::new(".")),
+            gatekeeper: None,
+            advisor: None,
+            slm_executor: None,
         };
 
         let mut headers = HeaderMap::new();

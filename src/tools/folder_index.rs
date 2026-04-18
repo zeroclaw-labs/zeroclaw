@@ -363,8 +363,7 @@ impl Tool for FolderIndexTool {
         // the strings the previous tool call returned in `pending_consent`.
         let consent_allow: std::collections::HashSet<String> = parsed
             .consent_granted_image_pdfs
-            .iter()
-            .map(|s| s.clone())
+            .iter().cloned()
             .collect();
 
         let mut converted = 0usize;

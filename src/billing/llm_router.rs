@@ -85,6 +85,10 @@ pub enum TaskCategory {
 /// Default model assignment for each task category (Platform Default mode).
 ///
 /// These are used when the user has no API key and has not selected a model.
+// Tier members are grouped for cost documentation. Arms intentionally share
+// bodies today; diverging per-category models is an expected future change,
+// so keep one arm per TaskCategory rather than collapsing them.
+#[allow(clippy::match_same_arms)]
 pub fn default_model_for_task(task: TaskCategory) -> (&'static str, &'static str) {
     // Returns (provider, model_id)
     //

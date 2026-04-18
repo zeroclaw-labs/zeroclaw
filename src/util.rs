@@ -240,8 +240,7 @@ mod tests {
         let a = now_unix_secs();
         let b = now_unix_secs();
         assert!(b >= a);
-        // Sanity: should be after 2026-01-01 (1735689600).
-        assert!(a > 1_735_689_600);
+        assert!(a > 1_735_689_600, "expected timestamp after 2026-01-01");
     }
 }
 

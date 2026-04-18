@@ -2552,6 +2552,7 @@ async fn handle_runtime_command_if_needed(
     /// - Grant session and persistent runtime grants
     /// - Persist to config
     /// - Clear exclusions
+    ///
     /// Returns the approval success message.
     async fn handle_confirm_tool_approval_side_effects(
         ctx: &ChannelRuntimeContext,

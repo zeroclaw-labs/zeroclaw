@@ -347,19 +347,19 @@ mod tests {
 
         match &actions[0] {
             SandboxAction::NeedsFix { error_class, .. } => {
-                assert_eq!(*error_class, ErrorClass::Runtime)
+                assert_eq!(*error_class, ErrorClass::Runtime);
             }
             _ => panic!("Expected NeedsFix"),
         }
         match &actions[1] {
             SandboxAction::NeedsFix { error_class, .. } => {
-                assert_eq!(*error_class, ErrorClass::Type)
+                assert_eq!(*error_class, ErrorClass::Type);
             }
             _ => panic!("Expected NeedsFix"),
         }
         match &actions[2] {
             SandboxAction::NeedsFix { error_class, .. } => {
-                assert_eq!(*error_class, ErrorClass::Lint)
+                assert_eq!(*error_class, ErrorClass::Lint);
             }
             _ => panic!("Expected NeedsFix"),
         }

@@ -69,7 +69,11 @@ struct Thresholds {
     ko: DomainThreshold,
     #[serde(default)]
     en: DomainThreshold,
+    // Reserved for the CI workflow regression guard — deserialized from
+    // tests/evals/thresholds.toml but not yet read by the runner itself
+    // (see `OverallThreshold::max_regression_fraction` docstring below).
     #[serde(default)]
+    #[allow(dead_code)]
     overall: OverallThreshold,
 }
 

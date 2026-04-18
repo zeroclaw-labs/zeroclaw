@@ -67,7 +67,7 @@ impl QueryKind {
         use crate::vault::wikilink::tokens;
         let compounds = tokens::detect_compound_tokens(query);
         use crate::vault::wikilink::tokens::CompoundTokenKind;
-        for c in &compounds {
+        if let Some(c) = compounds.first() {
             match c.kind {
                 CompoundTokenKind::CaseNumber => return Self::CaseNumber,
                 CompoundTokenKind::StatuteArticle => return Self::StatuteArticle,
@@ -287,13 +287,14 @@ pub async fn unified_search(
     let first_hits: Vec<UnifiedHit> = first_result?;
 
     // Weighted RRF merge across 4 second-brain dimensions + first brain.
-    let mut second_weighted: Vec<(f32, Vec<UnifiedHit>)> = Vec::new();
     // FTS shares the "graph"-like weight if no hub; for now treat FTS as
     // concept vector secondary at weight=w_vector*0.5.
-    second_weighted.push((w_vector * 0.5, fts_hits));
-    second_weighted.push((w_vector, vector_hits));
-    second_weighted.push((w_graph, graph_hits));
-    second_weighted.push((w_meta, meta_hits));
+    let second_weighted: Vec<(f32, Vec<UnifiedHit>)> = vec![
+        (w_vector * 0.5, fts_hits),
+        (w_vector, vector_hits),
+        (w_graph, graph_hits),
+        (w_meta, meta_hits),
+    ];
 
     let merged = weighted_rrf_merge(&first_hits, &second_weighted, 60.0, top_k);
     let latency_ms = started.elapsed().as_millis() as i64;
@@ -489,6 +490,8 @@ mod tests {
         }
     }
 
+    // Async kept for signature symmetry with sibling test helpers.
+    #[allow(clippy::unused_async)]
     async fn setup() -> (tempfile::TempDir, std::sync::Arc<SqliteMemory>, VaultStore) {
         let tmp = tempfile::TempDir::new().unwrap();
         let mem = std::sync::Arc::new(SqliteMemory::new(tmp.path()).unwrap());

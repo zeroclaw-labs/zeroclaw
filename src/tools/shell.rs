@@ -123,6 +123,13 @@ impl Tool for ShellTool {
         "shell"
     }
 
+    // Shell executes arbitrary commands — far outside the SLM executor's
+    // trust envelope. Keep it cloud-LLM-only so the on-device loop can't
+    // run system commands it can't reason about.
+    fn safe_for_slm(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Execute a shell command in the workspace directory"
     }

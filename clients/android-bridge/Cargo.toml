@@ -28,18 +28,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
 
-# ============================================
-# BINARY SIZE OPTIMIZATION
-# ============================================
-# Target: <3MB native library per ABI
-
-[profile.release]
-# Optimize for size over speed
-opt-level = "z"          # Smallest binary (was "3" for speed)
-lto = true               # Link-time optimization - removes dead code
-codegen-units = 1        # Better optimization, slower compile
-panic = "abort"          # No unwinding = smaller binary
-strip = true             # Strip symbols
-
-[profile.release.package."*"]
-opt-level = "z"          # Apply to all dependencies too
+# Note: binary-size optimization (opt-level="z", lto, codegen-units=1,
+# panic="abort", strip) lives in the workspace root Cargo.toml's
+# [profile.release]. Workspace members inherit it, and cargo will emit
+# `profiles for the non root package will be ignored` if duplicated here.

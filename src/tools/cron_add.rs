@@ -55,6 +55,13 @@ impl Tool for CronAddTool {
         "cron_add"
     }
 
+    // Cron creates persistent scheduled side effects — a hallucinated
+    // cron expression by the SLM could fire arbitrarily often in the
+    // background. Cloud-LLM-only.
+    fn safe_for_slm(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
          Use job_type='agent' with a prompt to run the AI agent on schedule. \

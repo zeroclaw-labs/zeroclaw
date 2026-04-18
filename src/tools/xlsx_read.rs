@@ -703,8 +703,8 @@ mod tests {
         let mut all_values: Vec<String> = Vec::new();
         for row in rows {
             for cell in row {
-                if !all_values.contains(&cell.to_string()) {
-                    all_values.push(cell.to_string());
+                if !all_values.contains(&(*cell).to_string()) {
+                    all_values.push((*cell).to_string());
                 }
             }
         }
@@ -785,8 +785,8 @@ mod tests {
         for rows in [sheet1_rows, sheet2_rows] {
             for row in rows {
                 for cell in row {
-                    if !all_values.contains(&cell.to_string()) {
-                        all_values.push(cell.to_string());
+                    if !all_values.contains(&(*cell).to_string()) {
+                        all_values.push((*cell).to_string());
                     }
                 }
             }

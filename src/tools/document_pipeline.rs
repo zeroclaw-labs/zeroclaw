@@ -439,7 +439,7 @@ impl DocumentPipelineTool {
 
         // Try Hancom first, fall back to local parsing for supported formats
         match self.process_office_via_hancom(path, ext).await {
-            Ok(output) => return Ok(output),
+            Ok(output) => Ok(output),
             Err(e) => {
                 tracing::warn!("Hancom conversion failed: {e}, trying local fallback...");
 
@@ -454,24 +454,24 @@ impl DocumentPipelineTool {
                                 .collect::<Vec<_>>()
                                 .join("\n")
                         );
-                        return Ok(DocumentOutput {
+                        Ok(DocumentOutput {
                             markdown: text.clone(),
                             html,
                             doc_type: "office_docx".to_string(),
                             page_count: 0,
                             engine: "local_docx_parser".to_string(),
-                        });
+                        })
                     }
                     "xlsx" => {
                         let text = super::xlsx_read::extract_xlsx_text_from_path(path)?;
                         let html = format!("<pre>{}</pre>", html_escape(&text));
-                        return Ok(DocumentOutput {
+                        Ok(DocumentOutput {
                             markdown: text,
                             html,
                             doc_type: "office_xlsx".to_string(),
                             page_count: 0,
                             engine: "local_xlsx_parser".to_string(),
-                        });
+                        })
                     }
                     "pptx" => {
                         let text = super::pptx_read::extract_pptx_text_from_path(path)?;
@@ -482,13 +482,13 @@ impl DocumentPipelineTool {
                                 .collect::<Vec<_>>()
                                 .join("\n")
                         );
-                        return Ok(DocumentOutput {
+                        Ok(DocumentOutput {
                             markdown: text,
                             html,
                             doc_type: "office_pptx".to_string(),
                             page_count: 0,
                             engine: "local_pptx_parser".to_string(),
-                        });
+                        })
                     }
                     "hwp" | "hwpx" => {
                         // No local fallback for HWP — return error with guidance
@@ -498,7 +498,7 @@ impl DocumentPipelineTool {
                              원인: {e}"
                         );
                     }
-                    _ => return Err(e),
+                    _ => Err(e),
                 }
             }
         }

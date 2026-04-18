@@ -77,6 +77,7 @@ pub mod correction_recommend;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
+pub mod smart_search;
 pub mod session_search_tool;
 pub mod shell;
 pub mod skill_manage;
@@ -171,6 +172,11 @@ pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 pub use wasm_module::WasmModuleTool;
+// Consumed from src/tools/registry.rs once the smart_search cascade is
+// added to the default registry; re-exported now so the type is part
+// of the public surface regardless of wiring timing.
+#[allow(unused_imports)]
+pub use smart_search::SmartSearchTool;
 pub use web_access_config::WebAccessConfigTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_config::WebSearchConfigTool;
@@ -557,9 +563,18 @@ pub fn all_tools_with_runtime(
         ));
     }
 
+    // Keep side references to the free + Perplexity search tools so the
+    // SmartSearchTool cascade can wrap both without another allocation.
+    // We still register both individually — direct access is useful when
+    // the executor knows exactly which tier it wants (e.g. the advisor's
+    // PLAN output explicitly names `perplexity_search`). `smart_search`
+    // is the preferred entry point for "just search the web" intent.
+    let mut free_search_arc: Option<Arc<dyn Tool>> = None;
+    let mut perplexity_search_arc: Option<Arc<dyn Tool>> = None;
+
     // Web search tool (enabled by default for GLM and other models)
     if root_config.web_search.enabled {
-        tool_arcs.push(Arc::new(WebSearchTool::new_with_options(
+        let ws: Arc<dyn Tool> = Arc::new(WebSearchTool::new_with_options(
             security.clone(),
             root_config.web_search.provider.clone(),
             root_config.web_search.api_key.clone(),
@@ -583,7 +598,9 @@ pub fn all_tools_with_runtime(
             root_config.web_search.exa_search_type.clone(),
             root_config.web_search.exa_include_text,
             root_config.web_search.jina_site_filters.clone(),
-        )));
+        ));
+        free_search_arc = Some(Arc::clone(&ws));
+        tool_arcs.push(ws);
     }
 
     // Dedicated Perplexity Search API tool (pure retrieval, no LLM answer generation)
@@ -599,9 +616,21 @@ pub fn all_tools_with_runtime(
             recency_filter: root_config.perplexity_search.recency_filter.clone(),
             domain_filter: root_config.perplexity_search.domain_filter.clone(),
         };
-        tool_arcs.push(Arc::new(PerplexitySearchTool::new(
+        let pplx: Arc<dyn Tool> = Arc::new(PerplexitySearchTool::new(
             security.clone(),
             &pplx_config,
+        ));
+        perplexity_search_arc = Some(Arc::clone(&pplx));
+        tool_arcs.push(pplx);
+    }
+
+    // Smart cascade: free web search → Perplexity AI → reformulate retry.
+    // Registered whenever the free tier is available; Perplexity is optional
+    // and the cascade silently degrades to free-only when absent.
+    if let Some(free) = free_search_arc {
+        tool_arcs.push(Arc::new(SmartSearchTool::new(
+            free,
+            perplexity_search_arc,
         )));
     }
 
@@ -693,7 +722,7 @@ pub fn all_tools_with_runtime(
             if !key.is_empty() {
                 tool_arcs.push(Arc::new(ElevenLabsTtsTool::new_user_key(key)));
             }
-        } else if let Some(admin_key) = std::env::var("ADMIN_ELEVENLABS_API_KEY").ok() {
+        } else if let Ok(admin_key) = std::env::var("ADMIN_ELEVENLABS_API_KEY") {
             if !admin_key.is_empty() && media_cfg.elevenlabs.enabled {
                 tool_arcs.push(Arc::new(ElevenLabsTtsTool::new_platform_key(
                     admin_key,

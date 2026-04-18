@@ -53,6 +53,12 @@ impl Tool for CronUpdateTool {
         "cron_update"
     }
 
+    // Mutates an existing scheduled job's behaviour — same risk class as
+    // cron_add/cron_remove. Cloud-LLM-only.
+    fn safe_for_slm(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Patch an existing cron job (schedule, command, prompt, enabled, delivery, model, etc.)"
     }

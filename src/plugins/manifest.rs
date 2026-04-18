@@ -63,6 +63,11 @@ pub struct PluginManifest {
 }
 
 /// Result of attempting to load a manifest from a directory.
+// Ok variant is ~272B (PluginManifest is a large data struct) vs Err at ~48B.
+// Boxing the manifest would force an extra allocation on the common success
+// path and ripple through every caller's pattern-match. Manifests are loaded
+// once per plugin at boot — the size gap doesn't matter in practice.
+#[allow(clippy::large_enum_variant)]
 pub enum ManifestLoadResult {
     Ok {
         manifest: PluginManifest,

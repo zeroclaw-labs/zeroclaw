@@ -53,6 +53,11 @@ impl Tool for CronRemoveTool {
         "cron_remove"
     }
 
+    // Deletes scheduled jobs — destructive and hard to undo. Cloud-LLM-only.
+    fn safe_for_slm(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Remove a cron job by id"
     }

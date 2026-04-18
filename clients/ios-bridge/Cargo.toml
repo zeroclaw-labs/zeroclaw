@@ -20,17 +20,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Minimal tracing for mobile
 tracing = { version = "0.1", default-features = false }
 
-# ============================================
-# BINARY SIZE OPTIMIZATION
-# ============================================
-# Target: <5MB static library for ARM64
-
-[profile.release]
-opt-level = "z"          # Smallest binary
-lto = true               # Link-time optimization
-codegen-units = 1        # Better optimization
-panic = "abort"          # No unwinding = smaller binary
-strip = true             # Strip symbols
-
-[profile.release.package."*"]
-opt-level = "z"
+# Note: binary-size optimization (opt-level="z", lto, codegen-units=1,
+# panic="abort", strip) lives in the workspace root Cargo.toml's
+# [profile.release]. Workspace members inherit it, and cargo will emit
+# `profiles for the non root package will be ignored` if duplicated here.

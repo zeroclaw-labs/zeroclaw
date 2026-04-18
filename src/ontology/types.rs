@@ -202,9 +202,9 @@ pub struct OntologyAction {
     pub location: Option<String>,
     /// **Themes (주제)** — topic labels extracted from the action for fast
     /// categorization and retrieval. One action can have multiple themes.
-    /// Example: ["차용금반환청구", "물품대금청구", "소장"] for a lawsuit filing
+    /// Example: `["차용금반환청구", "물품대금청구", "소장"]` for a lawsuit filing
     /// that covered both loan recovery and goods payment claims.
-    /// Enables theme-based browsing ("show all 차용금반환청구 actions").
+    /// Enables theme-based browsing (“show all 차용금반환청구 actions”).
     #[serde(default)]
     pub themes: Vec<String>,
     pub status: ActionStatus,

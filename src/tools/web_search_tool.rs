@@ -883,7 +883,7 @@ impl WebSearchTool {
                             .and_then(|t| t.as_i64())
                             .or_else(|| j.get("tab_id").and_then(|t| t.as_i64()))
                         {
-                            tab_ids.push((name.to_string(), tid));
+                            tab_ids.push(((*name).to_string(), tid));
                         }
                     }
                 }

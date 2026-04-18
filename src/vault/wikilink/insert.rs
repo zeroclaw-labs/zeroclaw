@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn wraps_exact_matches() {
         let md = "이 사건은 민법 제750조에 근거합니다.";
-        let result = insert_wikilinks(md, &vec!["민법 제750조".into()], &HashMap::new());
+        let result = insert_wikilinks(md, &["민법 제750조".into()], &HashMap::new());
         assert!(result.content.contains("[[민법 제750조]]"));
         assert_eq!(result.links.len(), 1);
     }
@@ -165,14 +165,14 @@ mod tests {
         let md = "750조의 요건을 보자.";
         let mut synonyms = HashMap::new();
         synonyms.insert("750조".into(), "민법 제750조".into());
-        let result = insert_wikilinks(md, &vec!["민법 제750조".into()], &synonyms);
+        let result = insert_wikilinks(md, &["민법 제750조".into()], &synonyms);
         assert!(result.content.contains("[[민법 제750조|750조]]"));
     }
 
     #[test]
     fn existing_wikilinks_untouched() {
         let md = "이미 [[민법 제750조]]는 연결됨";
-        let result = insert_wikilinks(md, &vec!["민법 제750조".into()], &HashMap::new());
+        let result = insert_wikilinks(md, &["민법 제750조".into()], &HashMap::new());
         // Should not have [[[[…]]]]
         assert!(!result.content.contains("[[[["));
     }
@@ -180,14 +180,14 @@ mod tests {
     #[test]
     fn inline_code_skipped() {
         let md = "`민법 제750조` is a statute";
-        let result = insert_wikilinks(md, &vec!["민법 제750조".into()], &HashMap::new());
+        let result = insert_wikilinks(md, &["민법 제750조".into()], &HashMap::new());
         assert!(!result.content.contains("[[민법 제750조]]"));
     }
 
     #[test]
     fn multiple_occurrences_all_linked() {
         let md = "민법 제750조와 민법 제750조";
-        let result = insert_wikilinks(md, &vec!["민법 제750조".into()], &HashMap::new());
+        let result = insert_wikilinks(md, &["민법 제750조".into()], &HashMap::new());
         assert_eq!(result.links.len(), 2);
     }
 
@@ -198,7 +198,7 @@ mod tests {
         let mut syn = HashMap::new();
         syn.insert("750조".into(), "민법 제750조".into());
         let result =
-            insert_wikilinks(md, &vec!["민법 제750조".into()], &syn);
+            insert_wikilinks(md, &["민법 제750조".into()], &syn);
         // Expect full form wrapped, not a partial "제[[민법 제750조|750조]]".
         assert!(result.content.contains("[[민법 제750조]]"));
         assert!(!result.content.contains("[[민법 제750조|750조]]"));

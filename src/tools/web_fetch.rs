@@ -49,11 +49,9 @@ fn pdf_filename_from_url(url: &str) -> String {
     // Strip scheme + host so we are left with the path only. The host
     // must NOT be mistaken for a filename (e.g. `https://example.com/`
     // should not yield "example.com.pdf").
-    let after_scheme = path_only
-        .splitn(2, "://")
-        .nth(1)
+    let after_scheme = path_only.split_once("://").map(|x| x.1)
         .unwrap_or(path_only);
-    let path_only = after_scheme.splitn(2, '/').nth(1).unwrap_or("");
+    let path_only = after_scheme.split_once('/').map(|x| x.1).unwrap_or("");
 
     let last = path_only
         .rsplit('/')

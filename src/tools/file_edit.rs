@@ -44,6 +44,13 @@ impl Tool for FileEditTool {
         "file_edit"
     }
 
+    // Targeted edits require precise string-matching judgment — small SLMs
+    // occasionally off-by-one the exact-match boundary. Keep this on the
+    // cloud path until we have a hardening PR.
+    fn safe_for_slm(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Edit a file by replacing an exact string match with new content. Sensitive files (for example .env and key material) are blocked by default."
     }

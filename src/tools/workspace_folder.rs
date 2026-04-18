@@ -261,7 +261,7 @@ mod tests {
         let roots = security.allowed_roots_snapshot();
         let canonical = dir.canonicalize().unwrap();
         assert!(
-            roots.iter().any(|r| *r == canonical),
+            roots.contains(&canonical),
             "allowed_roots should contain the dir"
         );
 

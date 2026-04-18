@@ -480,7 +480,7 @@ fn build_attachment_memo(text: &str, kind: &AttachmentKind) -> String {
     let summary: String = text
         .lines()
         .filter(|l| {
-            !l.trim().is_empty() && !l.trim().starts_with("```") && !l.trim().starts_with(">")
+            !l.trim().is_empty() && !l.trim().starts_with("```") && !l.trim().starts_with('>')
         })
         .take(5)
         .flat_map(|l| l.chars().chain(std::iter::once(' ')))

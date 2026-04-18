@@ -82,7 +82,7 @@ impl Converter for MultiConverter {
         for c in &self.inner {
             match c.convert(path).await {
                 ConvertOutcome::Ok(v) => return ConvertOutcome::Ok(v),
-                ConvertOutcome::Unsupported => continue,
+                ConvertOutcome::Unsupported => {}
                 ConvertOutcome::Failed(e) => {
                     tracing::warn!(
                         converter = c.name(),

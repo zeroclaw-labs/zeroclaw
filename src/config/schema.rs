@@ -539,6 +539,11 @@ pub struct Config {
     #[serde(default)]
     pub gatekeeper: GatekeeperConfig,
 
+    /// Advisor LLM configuration (strategic consultation at PLAN/REVIEW/ADVISE
+    /// checkpoints when the SLM flags a task as non-trivial).
+    #[serde(default)]
+    pub advisor: AdvisorConfig,
+
     /// Admin telemetry configuration (usage analytics and suspicious activity alerts).
     #[serde(default)]
     pub telemetry: TelemetryConfig,
@@ -863,6 +868,7 @@ impl Default for TranscriptionConfig {
 
 /// Calendar integration configuration (`[calendar]`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Default)]
 pub struct CalendarConfig {
     #[serde(default)]
     pub google: GoogleCalendarConfig,
@@ -874,16 +880,6 @@ pub struct CalendarConfig {
     pub apple: AppleCalendarConfig,
 }
 
-impl Default for CalendarConfig {
-    fn default() -> Self {
-        Self {
-            google: GoogleCalendarConfig::default(),
-            outlook: OutlookCalendarConfig::default(),
-            kakao: KakaoCalendarConfig::default(),
-            apple: AppleCalendarConfig::default(),
-        }
-    }
-}
 
 /// Google Calendar API configuration (OAuth2).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -950,6 +946,7 @@ impl Default for OutlookCalendarConfig {
 /// Requires Kakao Developers business app registration for production use.
 /// API base: `https://kapi.kakao.com/v2/api/calendar`
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Default)]
 pub struct KakaoCalendarConfig {
     /// Enable KakaoTalk Calendar tools.
     #[serde(default)]
@@ -968,17 +965,6 @@ pub struct KakaoCalendarConfig {
     pub calendar_id: Option<String>,
 }
 
-impl Default for KakaoCalendarConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            rest_api_key: None,
-            access_token: None,
-            refresh_token: None,
-            calendar_id: None,
-        }
-    }
-}
 
 /// Apple Calendar (CalDAV) configuration.
 /// **Status: planned** — config schema ready, CalDAV implementation pending.
@@ -1018,6 +1004,7 @@ impl Default for AppleCalendarConfig {
 /// ElevenLabs (TTS voice) integrations. Each sub-section can be
 /// individually enabled and configured with API keys.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Default)]
 pub struct MediaApiConfig {
     /// Freepik API configuration for image generation, editing, upscaling,
     /// and simple image-to-video conversion.
@@ -1038,16 +1025,6 @@ pub struct MediaApiConfig {
     pub elevenlabs: ElevenLabsApiConfig,
 }
 
-impl Default for MediaApiConfig {
-    fn default() -> Self {
-        Self {
-            freepik: FreepikApiConfig::default(),
-            suno: SunoApiConfig::default(),
-            runway: RunwayApiConfig::default(),
-            elevenlabs: ElevenLabsApiConfig::default(),
-        }
-    }
-}
 
 /// Freepik API configuration.
 ///
@@ -7877,6 +7854,7 @@ impl Default for Config {
             llm_proxy_token: None,
             wasm: WasmConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
+            advisor: AdvisorConfig::default(),
             telemetry: TelemetryConfig::default(),
             auth: AuthConfig::default(),
             sync: SyncConfig::default(),
@@ -12165,6 +12143,7 @@ ws_url = "ws://127.0.0.1:3002"
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
+            advisor: AdvisorConfig::default(),
             telemetry: TelemetryConfig::default(),
             auth: AuthConfig::default(),
             sync: SyncConfig::default(),
@@ -12558,6 +12537,7 @@ tool_dispatcher = "xml"
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
+            advisor: AdvisorConfig::default(),
             telemetry: TelemetryConfig::default(),
             auth: AuthConfig::default(),
             sync: SyncConfig::default(),
@@ -17115,10 +17095,64 @@ pub struct GatekeeperConfig {
 impl Default for GatekeeperConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // SLM-first routing is on by default per product spec
+            // (ARCHITECTURE.md ★ MoA Core Workflow). When Ollama is not
+            // running at boot, the gatekeeper stays constructed but marked
+            // unhealthy and `process_message` returns local_response=None,
+            // letting the pipeline fall through to the cloud LLM without
+            // any visible regression.
+            enabled: true,
             ollama_url: "http://127.0.0.1:11434/v1".to_string(),
+            // Sentinel — first-boot hardware probe swaps this for the
+            // optimal Gemma 4 variant (T1 E2B … T4 31B Dense) before the
+            // router is constructed. Explicit user overrides in config.toml
+            // always take precedence since this default only fires when no
+            // key is set.
             model: "qwen3:0.6b".to_string(),
             timeout_secs: 10,
+        }
+    }
+}
+
+// ── MoA: Advisor (strategic consultation at 3 checkpoints) ──────
+
+/// Advisor LLM configuration — the higher-tier model the on-device SLM
+/// consults at PLAN / REVIEW / ADVISE checkpoints for non-trivial tasks.
+///
+/// Key routing is identical to every other LLM surface in MoA: the
+/// underlying `Provider` first tries the user's own API key and, if
+/// absent, transparently falls back to the operator's Railway-stored
+/// key via the proxy-token path with 2.2× credit deduction. Advisor
+/// calls are not a separate billing bucket.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AdvisorConfig {
+    /// Master switch. When `false`, no advisor calls are issued even for
+    /// complex tasks — the SLM hands off to the cloud LLM directly as
+    /// before the advisor layer existed.
+    pub enabled: bool,
+    /// Explicit advisor model id. When `None`, the gateway picks the
+    /// top-tier model for whichever provider family the user's default
+    /// provider belongs to (e.g., `anthropic` → `claude-opus-4-7`).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Sampling temperature for advisor calls. Advisors generally want
+    /// low temperature (deterministic reasoning); default 0.2.
+    pub temperature: f64,
+    /// Per-call timeout in seconds. Bypasses the provider's own timeout
+    /// so a stuck advisor call cannot indefinitely block a user request.
+    pub timeout_secs: u64,
+}
+
+impl Default for AdvisorConfig {
+    fn default() -> Self {
+        Self {
+            // On by default — consistent with the SLM-first gatekeeper
+            // default (both off would defeat the point). Turning it off
+            // produces pre-advisor behaviour without any other changes.
+            enabled: true,
+            model: None,
+            temperature: 0.2,
+            timeout_secs: 60,
         }
     }
 }

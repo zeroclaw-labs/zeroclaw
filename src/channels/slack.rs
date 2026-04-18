@@ -1212,7 +1212,7 @@ mod tests {
                 "U123".to_string(),
                 CachedSlackDisplayName {
                     display_name: "Expired Name".to_string(),
-                    expires_at: Instant::now() - Duration::from_secs(1),
+                    expires_at: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
                 },
             );
         }

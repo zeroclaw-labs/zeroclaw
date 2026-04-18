@@ -108,6 +108,34 @@ fn api_chat_memory_key() -> String {
     format!("api_chat_msg_{}", Uuid::new_v4())
 }
 
+/// Compress the advisor's categorized issue lists into a bullet block the
+/// executor can consume as a revision directive. Keeps the four concern
+/// dimensions (correctness / architecture / security / silent failures)
+/// labelled so the executor can prioritize correctness fixes over
+/// architecture tweaks when the message is long.
+fn collect_review_issues(review: &crate::advisor::ReviewOutput) -> String {
+    let mut out = String::new();
+    let sections: [(&str, &Vec<String>); 4] = [
+        ("Correctness", &review.correctness_issues),
+        ("Architecture", &review.architecture_concerns),
+        ("Security", &review.security_flags),
+        ("Silent failures", &review.silent_failures),
+    ];
+    for (label, items) in sections {
+        if items.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("{label}:\n"));
+        for item in items {
+            out.push_str(&format!("  - {item}\n"));
+        }
+    }
+    if out.is_empty() && !review.summary.is_empty() {
+        out.push_str(&format!("Summary: {}\n", review.summary));
+    }
+    out.trim_end().to_string()
+}
+
 /// `POST /api/chat` — full agent loop with tools and memory.
 ///
 /// Request:  `{ "message": "...", "session_id": "...", "context": [...] }`
@@ -209,6 +237,60 @@ pub async fn handle_api_chat(
             .mem
             .store(&key, message, MemoryCategory::Conversation, session_id)
             .await;
+    }
+
+    // ── SLM-first gatekeeper (★ MoA core workflow) ──
+    //
+    // Every post-login chat message is classified by the on-device SLM
+    // before the pipeline even looks at cloud credentials. The router's
+    // `process_message` returns:
+    //   * `local_response = Some(..)` → SLM judged the task simple enough
+    //     to answer on-device → short-circuit and return, no cloud cost.
+    //   * `local_response = None`     → SLM decided the task needs a
+    //     full LLM (advanced reasoning / document generation / tools) →
+    //     fall through to the agent loop, which in turn summons the LLM
+    //     using the user's own API key first, then the operator proxy
+    //     with 2.2× credit billing (see billing/llm_router.rs).
+    //
+    // If the gatekeeper is disabled or the Ollama daemon is unreachable,
+    // this block is a no-op — behaviour matches the pre-SLM pipeline.
+    //
+    // When the gatekeeper hands off to the cloud LLM, we preserve its
+    // `decision` in `gatekeeper_decision` so the advisor-policy block
+    // downstream can route PLAN/REVIEW checkpoints appropriately.
+    let mut gatekeeper_decision: Option<crate::gatekeeper::router::RoutingDecision> = None;
+    if let Some(router) = state.gatekeeper.as_ref() {
+        let result = router.process_message(message).await;
+        if let Some(local_reply) = result.local_response {
+            tracing::info!(
+                category = ?result.decision.category,
+                confidence = result.decision.confidence,
+                reason = %result.decision.reason,
+                "SLM gatekeeper answered locally — skipping LLM"
+            );
+            let body = serde_json::json!({
+                "reply": local_reply,
+                "model": router.model(),
+                "session_id": chat_body.session_id,
+                "active_provider": "ollama",
+                "active_model": router.model(),
+                "is_local_path": true,
+                "network_status": "local",
+                "gatekeeper": {
+                    "category": format!("{:?}", result.decision.category),
+                    "confidence": result.decision.confidence,
+                    "reason": result.decision.reason,
+                },
+            });
+            return (StatusCode::OK, Json(body));
+        }
+        tracing::debug!(
+            category = ?result.decision.category,
+            confidence = result.decision.confidence,
+            reason = %result.decision.reason,
+            "SLM gatekeeper summoning LLM for complex task"
+        );
+        gatekeeper_decision = Some(result.decision);
     }
 
     // ── Build enriched message with optional context ──
@@ -473,8 +555,170 @@ pub async fn handle_api_chat(
             messages_count: 1,
         });
 
+    // ── Advisor PLAN checkpoint ──
+    //
+    // Only fires for tasks the SLM gatekeeper classified as Medium+. For
+    // Simple / greeting / short-Q&A messages the gatekeeper already
+    // answered above and this handler returned early — so by the time we
+    // reach here, the task has been judged "SLM cannot handle alone" and
+    // the advisor is invited to shape the executor's plan.
+    //
+    // Plan output is prepended to `enriched_message` as a structured
+    // directive block so the downstream agent loop sees the advisor's
+    // end-state + critical path as high-priority system context.
+    let mut advisor_plan: Option<crate::advisor::PlanOutput> = None;
+    if let (Some(advisor), Some(decision)) = (state.advisor.as_ref(), gatekeeper_decision.as_ref())
+    {
+        let policy = crate::advisor::AdvisorPolicy::for_category(decision.category);
+        if policy.plan {
+            let kind = crate::advisor::TaskKind::infer(
+                decision.category,
+                decision.tool_needed.as_deref(),
+                message,
+            );
+            let req = crate::advisor::AdvisorRequest {
+                task_summary: message,
+                background: "",
+                recent_output: "",
+                question: "Produce a strategic plan for this user request before execution.",
+                kind,
+            };
+            match advisor.plan(&req).await {
+                Ok(plan) => {
+                    tracing::info!(
+                        model = advisor.model(),
+                        steps = plan.critical_path.len(),
+                        kind = kind.label(),
+                        "Advisor PLAN checkpoint completed"
+                    );
+                    let steps = plan
+                        .critical_path
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| format!("  {}. {}", i + 1, s))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let risks = if plan.risks.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "\nRisks:\n{}\n",
+                            plan.risks
+                                .iter()
+                                .map(|r| format!("  - {r}"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        )
+                    };
+                    let tools_hint = if plan.suggested_tools.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "\nSuggested Tools (use these first):\n{}\n",
+                            plan.suggested_tools
+                                .iter()
+                                .map(|t| format!("  - {t}"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        )
+                    };
+                    let plan_block = format!(
+                        "[Advisor Plan — follow this strategy]\n\
+                         End State: {}\n\
+                         First Move: {}\n\
+                         Critical Path:\n{}{}{}\n\
+                         ---\n\n",
+                        plan.end_state, plan.first_move, steps, risks, tools_hint,
+                    );
+                    enriched_message = format!("{plan_block}{enriched_message}");
+                    advisor_plan = Some(plan);
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "Advisor PLAN failed — proceeding without plan"
+                ),
+            }
+        }
+    }
+
+    // ── Phase 3 — SLM executor attempt ──
+    //
+    // Before falling through to the full cloud agent loop, try letting
+    // the on-device SLM close the task via its own prompt-guided tool
+    // loop. The executor shares `tools_registry_exec` so every tool the
+    // cloud LLM would call is equally available here. We only attempt
+    // this when:
+    //   - `state.slm_executor` is wired (requires gatekeeper enabled),
+    //   - the gatekeeper flagged `Medium` or a concrete `tool_needed`
+    //     (Simple was already answered above; Complex/Specialized tend
+    //     to need stronger reasoning than a 4B model provides and we
+    //     route them straight to the cloud).
+    //
+    // On success, we record the SLM output, skip the cloud agent loop,
+    // and still pass through the advisor REVIEW checkpoint downstream.
+    // On exceeded-iterations / error, we silently fall through to the
+    // cloud path — the user gets an answer regardless.
+    let mut slm_produced_reply: Option<String> = None;
+    let mut slm_tools_invoked: Vec<String> = Vec::new();
+    if let (Some(executor), Some(decision)) =
+        (state.slm_executor.as_ref(), gatekeeper_decision.as_ref())
+    {
+        let eligible = matches!(
+            decision.category,
+            crate::gatekeeper::router::TaskCategory::Medium
+        ) || decision.tool_needed.is_some();
+        if eligible {
+            // Borrow the registered executable tools without reallocating.
+            // `tools_registry_exec: Arc<Vec<Box<dyn Tool>>>` maps cleanly
+            // to `&[&dyn Tool]` which is what the SLM executor accepts.
+            // Filter out tools the individual impls have flagged as
+            // unsafe for the on-device SLM (Tool::safe_for_slm=false) —
+            // shell, delegate, file_write, file_edit, apply_patch, cron_*
+            // currently. The cloud LLM agent loop (fallback) still sees
+            // every tool.
+            let tool_refs: Vec<&dyn crate::tools::Tool> = state
+                .tools_registry_exec
+                .as_ref()
+                .iter()
+                .filter_map(|boxed| {
+                    let t = boxed.as_ref();
+                    t.safe_for_slm().then_some(t)
+                })
+                .collect();
+            match executor.run(&enriched_message, &tool_refs).await {
+                Ok(outcome) if !outcome.exceeded_iterations => {
+                    tracing::info!(
+                        iterations = outcome.iterations,
+                        tools = outcome.tools_invoked.len(),
+                        "SLM executor closed the task locally — skipping cloud LLM"
+                    );
+                    slm_tools_invoked = outcome.tools_invoked;
+                    slm_produced_reply = Some(outcome.reply);
+                }
+                Ok(outcome) => {
+                    tracing::info!(
+                        iterations = outcome.iterations,
+                        "SLM executor exceeded iteration budget — falling back to cloud LLM"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "SLM executor errored — falling back to cloud LLM"
+                    );
+                }
+            }
+        }
+    }
+
     // ── Run the full agent loop ──
-    match crate::agent::process_message_with_session(config, &enriched_message, session_id).await {
+    let agent_outcome = if let Some(reply) = slm_produced_reply.clone() {
+        // SLM already answered — short-circuit.
+        Ok(reply)
+    } else {
+        crate::agent::process_message_with_session(config, &enriched_message, session_id).await
+    };
+    match agent_outcome {
         Ok(response) => {
             let leak_guard_cfg = state.config.lock().security.outbound_leak_guard.clone();
             let safe_response = sanitize_gateway_response(
@@ -523,6 +767,145 @@ pub async fn handle_api_chat(
                 let _ = auth_store.record_usage(user_id, &category, chars);
             }
 
+            // ── Advisor REVIEW checkpoint (+ one revision pass if needed) ──
+            //
+            // Per user spec: "SLM은 어드바이저 LLM의 조언을 받아 실행한 후
+            // 결과를 이용자에게 반환하기 이전에 반드시 advisor의 리뷰를 받도록".
+            //
+            // If the first review verdict is `RevisionNeeded`, we run the
+            // executor one more time with the advisor's issues appended to
+            // the enriched message as a "[Advisor review — please revise]"
+            // directive block, then re-review the revised answer. The
+            // revised verdict is what gets attached to the response body.
+            //
+            // Revision is capped at a single pass so a pathological
+            // advisor-executor ping-pong cannot indefinitely burn credits.
+            // `Block` never triggers a revision — it's a hard stop that
+            // surfaces as a warning banner on the final reply.
+            let mut advisor_review: Option<crate::advisor::ReviewOutput> = None;
+            let mut revised_response: Option<String> = None;
+            let mut executor_model_for_revision = model_label.clone();
+            if let (Some(advisor), Some(decision)) =
+                (state.advisor.as_ref(), gatekeeper_decision.as_ref())
+            {
+                let policy = crate::advisor::AdvisorPolicy::for_category(decision.category);
+                if policy.review {
+                    let kind = crate::advisor::TaskKind::infer(
+                        decision.category,
+                        decision.tool_needed.as_deref(),
+                        message,
+                    );
+                    let plan_background = advisor_plan
+                        .as_ref()
+                        .map(|p| {
+                            format!("Plan end state: {}\nFirst move: {}", p.end_state, p.first_move)
+                        })
+                        .unwrap_or_default();
+                    let first_req = crate::advisor::AdvisorRequest {
+                        task_summary: message,
+                        background: plan_background.as_str(),
+                        recent_output: &safe_response,
+                        question: "Review the executor's answer above for correctness, architecture, security, and silent failures.",
+                        kind,
+                    };
+                    match advisor.review(&first_req).await {
+                        Ok(first_review) => {
+                            tracing::info!(
+                                verdict = ?first_review.verdict,
+                                correctness = first_review.correctness_issues.len(),
+                                security = first_review.security_flags.len(),
+                                kind = kind.label(),
+                                "Advisor REVIEW checkpoint completed (pass 1)"
+                            );
+
+                            if first_review.verdict == crate::advisor::ReviewVerdict::RevisionNeeded {
+                                // One revision pass: append the advisor's
+                                // specific issues as a directive block and
+                                // re-run the executor.
+                                let issues = collect_review_issues(&first_review);
+                                let revision_directive = format!(
+                                    "[Advisor review — please revise addressing these issues]\n{issues}\n\n\
+                                     Produce a corrected answer. Keep everything the prior answer got \
+                                     right, only change what the reviewer flagged.\n\n---\n\n\
+                                     {enriched_message}"
+                                );
+                                let revision_config = state.config.lock().clone();
+                                match crate::agent::process_message_with_session(
+                                    revision_config,
+                                    &revision_directive,
+                                    session_id,
+                                )
+                                .await
+                                {
+                                    Ok(revised_raw) => {
+                                        let leak_guard = state
+                                            .config
+                                            .lock()
+                                            .security
+                                            .outbound_leak_guard
+                                            .clone();
+                                        let safe_revised = sanitize_gateway_response(
+                                            &revised_raw,
+                                            state.tools_registry_exec.as_ref(),
+                                            &leak_guard,
+                                        );
+                                        tracing::info!(
+                                            revised_chars = safe_revised.len(),
+                                            "Executor produced revised answer — re-reviewing"
+                                        );
+                                        let second_req = crate::advisor::AdvisorRequest {
+                                            task_summary: message,
+                                            background: plan_background.as_str(),
+                                            recent_output: &safe_revised,
+                                            question: "Re-review the revised answer. Issues flagged in the prior review should now be fixed; raise only new blocking issues.",
+                                            kind,
+                                        };
+                                        match advisor.review(&second_req).await {
+                                            Ok(second_review) => {
+                                                tracing::info!(
+                                                    verdict = ?second_review.verdict,
+                                                    "Advisor REVIEW checkpoint completed (pass 2 — revised)"
+                                                );
+                                                advisor_review = Some(second_review);
+                                                revised_response = Some(safe_revised);
+                                                executor_model_for_revision = format!(
+                                                    "{} (+1 revision)",
+                                                    model_label
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "Advisor re-review after revision failed — returning revision with original verdict"
+                                                );
+                                                advisor_review = Some(first_review);
+                                                revised_response = Some(safe_revised);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "Revision pass failed — returning original answer with review notes"
+                                        );
+                                        advisor_review = Some(first_review);
+                                    }
+                                }
+                            } else {
+                                advisor_review = Some(first_review);
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "Advisor REVIEW failed — returning raw answer without review"
+                        ),
+                    }
+                }
+            }
+            let effective_response = revised_response
+                .clone()
+                .unwrap_or_else(|| safe_response.clone());
+
             // ── Active-provider metadata (PR #3.5) ──
             // Surfaces which provider/model actually served this request so
             // the UI can render a "via Gemma 4 (local)" badge when the
@@ -532,14 +915,52 @@ pub async fn handle_api_chat(
             let net_online = crate::local_llm::shared_health().is_online();
             let is_local_path = provider_label.eq_ignore_ascii_case("ollama");
 
+            // Prepend a visible warning when the advisor blocked the answer
+            // so the user is not silently served a flagged result. Uses the
+            // revised response when the revision pass ran, or the original
+            // executor output otherwise.
+            let final_reply = if advisor_review
+                .as_ref()
+                .is_some_and(|r| r.verdict == crate::advisor::ReviewVerdict::Block)
+            {
+                format!(
+                    "⚠️ Advisor flagged this answer — review before relying on it.\n\n{effective_response}"
+                )
+            } else {
+                effective_response.clone()
+            };
+
+            let advisor_meta = advisor_review.as_ref().map(|r| {
+                serde_json::json!({
+                    "verdict": format!("{:?}", r.verdict).to_ascii_lowercase(),
+                    "summary": r.summary,
+                    "correctness_issues": r.correctness_issues,
+                    "architecture_concerns": r.architecture_concerns,
+                    "security_flags": r.security_flags,
+                    "silent_failures": r.silent_failures,
+                    "revised": revised_response.is_some(),
+                    "model": state.advisor.as_ref().map(|a| a.model().to_string()),
+                })
+            });
+
+            let slm_meta = slm_produced_reply.as_ref().map(|_| {
+                serde_json::json!({
+                    "used": true,
+                    "model": state.slm_executor.as_ref().map(|e| e.model().to_string()),
+                    "tools_invoked": slm_tools_invoked,
+                })
+            });
+
             let body = serde_json::json!({
-                "reply": safe_response,
-                "model": model_label,
+                "reply": final_reply,
+                "model": executor_model_for_revision,
                 "session_id": chat_body.session_id,
-                "active_provider": provider_label,
+                "active_provider": if slm_produced_reply.is_some() { "ollama" } else { provider_label.as_str() },
                 "active_model": model_label,
-                "is_local_path": is_local_path,
+                "is_local_path": is_local_path || slm_produced_reply.is_some(),
                 "network_status": if net_online { "online" } else { "offline" },
+                "advisor": advisor_meta,
+                "slm_executor": slm_meta,
             });
             (StatusCode::OK, Json(body))
         }

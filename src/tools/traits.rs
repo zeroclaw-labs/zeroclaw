@@ -40,6 +40,22 @@ pub trait Tool: Send + Sync {
             parameters: self.parameters_schema(),
         }
     }
+
+    /// Whether this tool is safe to expose to the on-device SLM executor
+    /// (Phase 3 — `src/advisor/slm_executor.rs`).
+    ///
+    /// The SLM has less judgment than the cloud LLM — it's cheaper and
+    /// on-device, but prone to misapplying destructive or high-privilege
+    /// tools. Tools that can write/overwrite files, execute shell
+    /// commands, spawn subagents, or touch system-level config should
+    /// override this to `false` so the SLM executor's curated registry
+    /// excludes them. The cloud LLM agent loop still sees every tool —
+    /// only the SLM path is filtered.
+    ///
+    /// Default: `true` — most read-only / narrow-surface tools are safe.
+    fn safe_for_slm(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

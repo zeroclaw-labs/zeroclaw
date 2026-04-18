@@ -797,18 +797,18 @@ mod tests {
         // Initially no response channel
         // (Cannot directly access private field, but we can test via public API)
 
-        // Set response channel
+        // Verify channel can be set (no panic — the method is fire-and-forget
+        // and exposes no getter, so reaching the end of the block IS the check).
         channel.set_response_channel(mock_channel.clone());
-
-        // Verify channel can be set (no panic)
-        // This test mainly ensures the method exists and works
-        assert!(true);
     }
 
     // Note: More comprehensive tests would require mocking the OpenCode process
     // which is beyond the scope of basic unit tests.
 
+    // Async kept for signature symmetry with the other #[tokio::test] helpers,
+    // even though spawn+stdio setup doesn't await. Avoids rewriting all callers.
     #[cfg(unix)]
+    #[allow(clippy::unused_async)]
     async fn spawn_test_process(command: &str, args: &[&str]) -> AcpProcess {
         let mut child = Command::new(command)
             .args(args)

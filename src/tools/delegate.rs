@@ -174,6 +174,14 @@ impl Tool for DelegateTool {
         "delegate"
     }
 
+    // Delegation spawns a sub-agent loop; if the SLM executor calls it we
+    // risk an SLM-delegating-to-SLM fan-out that blows the iteration budget
+    // without producing useful work. The cloud LLM is better suited to
+    // deciding when delegation genuinely helps.
+    fn safe_for_slm(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model \
          (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single \

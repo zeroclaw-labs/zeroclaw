@@ -1466,7 +1466,7 @@ impl SqliteMemory {
                     transcript,
                     summary,
                     risk_level,
-                    sos_triggered as i32,
+                    i32::from(sos_triggered),
                     language,
                     memory_id,
                     device_id,
@@ -1674,27 +1674,7 @@ impl SqliteMemory {
 
             let merged: Vec<super::vector::ScoredResult> = match search_mode {
                 SearchMode::Rrf => {
-                    if !any_vec_hit {
-                        // FTS-only fallback: skip fusion when vectors are
-                        // unavailable (e.g. NoopEmbedding); preserve BM25
-                        // order directly.
-                        let flat = dedup_ranked_list(
-                            &per_ranker_lists
-                                .iter()
-                                .flatten()
-                                .cloned()
-                                .collect::<Vec<_>>(),
-                        );
-                        flat.into_iter()
-                            .take(fetch_limit)
-                            .map(|(id, score)| super::vector::ScoredResult {
-                                id,
-                                vector_score: None,
-                                keyword_score: Some(score),
-                                final_score: score,
-                            })
-                            .collect()
-                    } else {
+                    if any_vec_hit {
                         let ranker_refs: Vec<&[(String, f32)]> = per_ranker_lists
                             .iter()
                             .map(std::vec::Vec::as_slice)
@@ -1713,6 +1693,26 @@ impl SqliteMemory {
                                 vector_score: None,
                                 keyword_score: None,
                                 final_score: f.score,
+                            })
+                            .collect()
+                    } else {
+                        // FTS-only fallback: skip fusion when vectors are
+                        // unavailable (e.g. NoopEmbedding); preserve BM25
+                        // order directly.
+                        let flat = dedup_ranked_list(
+                            &per_ranker_lists
+                                .iter()
+                                .flatten()
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        );
+                        flat.into_iter()
+                            .take(fetch_limit)
+                            .map(|(id, score)| super::vector::ScoredResult {
+                                id,
+                                vector_score: None,
+                                keyword_score: Some(score),
+                                final_score: score,
                             })
                             .collect()
                     }
@@ -2273,7 +2273,7 @@ impl Memory for SqliteMemory {
                          truth_updated_at = ?3,
                          needs_recompile = 0
                      WHERE key = ?4 AND truth_version < ?2",
-                    params![compiled_truth, *truth_version as i64, now as i64, memory_key],
+                    params![compiled_truth, i64::from(*truth_version), now as i64, memory_key],
                 )?;
                 Ok(changed > 0)
             }
@@ -4000,7 +4000,7 @@ mod tests {
 
         // Initially no compiled truth
         let result = mem.get_compiled_truth("ct_test").unwrap();
-        assert!(result.is_none() || result.unwrap().0.is_empty() == false);
+        assert!(result.is_none() || !result.unwrap().0.is_empty());
 
         // Set compiled truth
         mem.set_compiled_truth("ct_test", "summarized truth v1").unwrap();
@@ -4150,9 +4150,9 @@ mod tests {
 
     #[tokio::test]
     async fn timeline_append_records_sync_delta_when_attached() {
-        let (_tmp, mem) = temp_sqlite();
+        let (tmp, mem) = temp_sqlite();
         let engine = Arc::new(Mutex::new(
-            super::super::sync::SyncEngine::new(_tmp.path(), true).unwrap(),
+            super::super::sync::SyncEngine::new(tmp.path(), true).unwrap(),
         ));
         mem.attach_sync(engine.clone());
 
@@ -4211,8 +4211,8 @@ mod tests {
             Some("010-0000-0000"),
             Some("+821000000000"),
             None,
-            1700000000,
-            Some(1700000300),
+            1_700_000_000,
+            Some(1_700_000_300),
             Some(300_000),
             None,
             None,
@@ -5026,7 +5026,7 @@ mod tests {
 
         // Single variation → falls back to recall()
         let r1 = mem
-            .recall_with_variations("apple pie", &vec!["apple pie".into()], 5, None)
+            .recall_with_variations("apple pie", &["apple pie".into()], 5, None)
             .await
             .unwrap();
         assert!(!r1.is_empty());

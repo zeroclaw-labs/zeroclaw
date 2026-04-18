@@ -471,7 +471,7 @@ mod tests {
     async fn parse_private_event_maps_to_channel_message() {
         let cfg = NapcatConfig {
             websocket_url: "ws://127.0.0.1:3001".into(),
-            api_base_url: "".into(),
+            api_base_url: String::new(),
             access_token: None,
             allowed_users: vec!["10001".into()],
         };
@@ -481,7 +481,7 @@ mod tests {
             "message_type": "private",
             "message_id": 99,
             "user_id": 10001,
-            "time": 1700000000,
+            "time": 1_700_000_000,
             "message": [{"type":"text","data":{"text":"hi"}}]
         });
 
@@ -497,7 +497,7 @@ mod tests {
     async fn parse_group_event_with_image_segment() {
         let cfg = NapcatConfig {
             websocket_url: "ws://127.0.0.1:3001".into(),
-            api_base_url: "".into(),
+            api_base_url: String::new(),
             access_token: None,
             allowed_users: vec!["*".into()],
         };

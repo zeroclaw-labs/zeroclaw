@@ -490,7 +490,7 @@ fn build_ws_system_prompt(
     );
 
     // Inject API key inventory so the agent knows which providers/tools are available
-    let api_key_inventory = crate::config::build_api_key_inventory(&config);
+    let api_key_inventory = crate::config::build_api_key_inventory(config);
     prompt.push_str(&api_key_inventory.to_prompt_section());
 
     if !native_tools {
@@ -1047,6 +1047,67 @@ async fn handle_socket(
             continue;
         }
 
+        // ── SLM-first gatekeeper (★ MoA core workflow) ──
+        //
+        // Symmetrical to the block in openclaw_compat::handle_api_chat.
+        // Runs BEFORE the device-relay attempts so the cheapest (on-device
+        // SLM) path short-circuits the network probe / proxy-token issuance
+        // whenever the router can answer locally. Only when SLM declines
+        // does the message enter the existing Smart API Key Routing
+        // (local-key → operator-key with 2.2× credit deduction).
+        //
+        // The decision is preserved in `ws_gatekeeper_decision` so the
+        // Advisor PLAN/REVIEW blocks downstream can route by the same
+        // `TaskCategory` the gatekeeper assigned.
+        let mut ws_gatekeeper_decision: Option<
+            crate::gatekeeper::router::RoutingDecision,
+        > = None;
+        if let Some(router) = state.gatekeeper.as_ref() {
+            let result = router.process_message(&content).await;
+            if let Some(local_reply) = result.local_response {
+                tracing::info!(
+                    category = ?result.decision.category,
+                    confidence = result.decision.confidence,
+                    reason = %result.decision.reason,
+                    "WS SLM gatekeeper answered locally — skipping LLM relay"
+                );
+                history.push(ChatMessage::user(&content));
+                history.push(ChatMessage::assistant(&local_reply));
+                persist_ws_history(&state, &session_id, &history).await;
+
+                let done = serde_json::json!({
+                    "type": "done",
+                    "full_response": local_reply,
+                    "session_id": session_id.as_str(),
+                    "active_provider": "ollama",
+                    "active_model": router.model(),
+                    "is_local_path": true,
+                    "network_status": "local",
+                    "gatekeeper": {
+                        "category": format!("{:?}", result.decision.category),
+                        "confidence": result.decision.confidence,
+                        "reason": result.decision.reason,
+                    },
+                });
+                let _ = socket.send(Message::Text(done.to_string().into())).await;
+                let _ = state.event_tx.send(serde_json::json!({
+                    "type": "agent_end",
+                    "provider": "ollama",
+                    "model": router.model(),
+                    "is_local_path": true,
+                    "network_status": "local",
+                }));
+                continue;
+            }
+            tracing::debug!(
+                category = ?result.decision.category,
+                confidence = result.decision.confidence,
+                reason = %result.decision.reason,
+                "WS SLM gatekeeper summoning LLM for complex task"
+            );
+            ws_gatekeeper_decision = Some(result.decision);
+        }
+
         // ── Apply client-provided overrides (provider, model) ──
         {
             let mut config_guard = state.config.lock();
@@ -1276,20 +1337,140 @@ async fn handle_socket(
         // The agent creates a fresh LLM history per request, so without this
         // context the model has no knowledge of prior turns in this session.
         let recent_context = build_recent_conversation_context(&history);
-        let enriched_content = if recent_context.is_empty() {
+        let mut enriched_content = if recent_context.is_empty() {
             content.clone()
         } else {
             format!("{recent_context}Current message:\n{content}")
         };
 
-        // Full agentic loop with tools (includes WASM skills, shell, memory, etc.)
-        match Box::pin(super::run_gateway_chat_with_tools(
-            &state,
-            &enriched_content,
-            Some(&ws_session_id),
-        ))
-        .await
+        // ── Advisor PLAN checkpoint (WS) ──
+        // Symmetric to handle_api_chat — runs only when the gatekeeper
+        // flagged the task as Complex/Specialized and the advisor is
+        // configured. Prepends the plan block to `enriched_content`.
+        let mut ws_advisor_plan: Option<crate::advisor::PlanOutput> = None;
+        if let (Some(advisor), Some(decision)) =
+            (state.advisor.as_ref(), ws_gatekeeper_decision.as_ref())
         {
+            let policy = crate::advisor::AdvisorPolicy::for_category(decision.category);
+            if policy.plan {
+                let kind = crate::advisor::TaskKind::infer(
+                    decision.category,
+                    decision.tool_needed.as_deref(),
+                    &content,
+                );
+                let req = crate::advisor::AdvisorRequest {
+                    task_summary: &content,
+                    background: "",
+                    recent_output: "",
+                    question: "Produce a strategic plan for this WS user request before execution.",
+                    kind,
+                };
+                match advisor.plan(&req).await {
+                    Ok(plan) => {
+                        let steps = plan
+                            .critical_path
+                            .iter()
+                            .enumerate()
+                            .map(|(i, s)| format!("  {}. {}", i + 1, s))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let tools_hint = if plan.suggested_tools.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "\nSuggested Tools (use these first):\n{}\n",
+                                plan.suggested_tools
+                                    .iter()
+                                    .map(|t| format!("  - {t}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            )
+                        };
+                        let plan_block = format!(
+                            "[Advisor Plan — follow this strategy]\n\
+                             End State: {}\n\
+                             First Move: {}\n\
+                             Critical Path:\n{}{}\n\
+                             ---\n\n",
+                            plan.end_state, plan.first_move, steps, tools_hint,
+                        );
+                        enriched_content = format!("{plan_block}{enriched_content}");
+                        ws_advisor_plan = Some(plan);
+                        tracing::info!(
+                            model = advisor.model(),
+                            kind = kind.label(),
+                            "WS Advisor PLAN checkpoint completed"
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "WS Advisor PLAN failed — proceeding without plan"
+                    ),
+                }
+            }
+        }
+
+        // ── Phase 3 — SLM executor attempt (WS) ──
+        // Symmetric to handle_api_chat: try the on-device SLM executor
+        // first for Medium / tool-hinted tasks. On success, short-circuit
+        // the cloud agent loop and hand the SLM's answer to the advisor
+        // REVIEW checkpoint downstream. On exceeded-iterations / error,
+        // fall through to `run_gateway_chat_with_tools` exactly as before.
+        let mut ws_slm_reply: Option<String> = None;
+        let mut ws_slm_tools: Vec<String> = Vec::new();
+        if let (Some(executor), Some(decision)) = (
+            state.slm_executor.as_ref(),
+            ws_gatekeeper_decision.as_ref(),
+        ) {
+            let eligible = matches!(
+                decision.category,
+                crate::gatekeeper::router::TaskCategory::Medium
+            ) || decision.tool_needed.is_some();
+            if eligible {
+                // Same safe_for_slm filtering as the REST path — the
+                // on-device SLM never sees shell/delegate/file_write etc.
+                let tool_refs: Vec<&dyn crate::tools::Tool> = state
+                    .tools_registry_exec
+                    .as_ref()
+                    .iter()
+                    .filter_map(|boxed| {
+                        let t = boxed.as_ref();
+                        t.safe_for_slm().then_some(t)
+                    })
+                    .collect();
+                match executor.run(&enriched_content, &tool_refs).await {
+                    Ok(outcome) if !outcome.exceeded_iterations => {
+                        tracing::info!(
+                            iterations = outcome.iterations,
+                            tools = outcome.tools_invoked.len(),
+                            "WS SLM executor closed the task locally"
+                        );
+                        ws_slm_tools = outcome.tools_invoked;
+                        ws_slm_reply = Some(outcome.reply);
+                    }
+                    Ok(_) => tracing::info!(
+                        "WS SLM executor exceeded iteration budget — falling back to cloud LLM"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "WS SLM executor errored — falling back to cloud LLM"
+                    ),
+                }
+            }
+        }
+
+        // Full agentic loop with tools (includes WASM skills, shell, memory, etc.)
+        let agent_outcome = if let Some(r) = ws_slm_reply.clone() {
+            Ok(r)
+        } else {
+            Box::pin(super::run_gateway_chat_with_tools(
+                &state,
+                &enriched_content,
+                Some(&ws_session_id),
+            ))
+            .await
+        };
+        match agent_outcome {
             Ok(response) => {
                 let leak_guard_cfg = { state.config.lock().security.outbound_leak_guard.clone() };
                 let safe_response = finalize_ws_response(
@@ -1298,6 +1479,67 @@ async fn handle_socket(
                     state.tools_registry_exec.as_ref(),
                     &leak_guard_cfg,
                 );
+
+                // ── Advisor REVIEW checkpoint (WS) ──
+                // No revision loop in WS path for now — the /ws pipeline
+                // streams partial tokens, so a silent rerun would confuse
+                // the client. When the advisor blocks or flags revision
+                // we surface the verdict in `done.advisor` and (on Block)
+                // prepend a warning banner to `full_response`.
+                let mut ws_advisor_review: Option<crate::advisor::ReviewOutput> = None;
+                if let (Some(advisor), Some(decision)) =
+                    (state.advisor.as_ref(), ws_gatekeeper_decision.as_ref())
+                {
+                    let policy = crate::advisor::AdvisorPolicy::for_category(decision.category);
+                    if policy.review {
+                        let kind = crate::advisor::TaskKind::infer(
+                            decision.category,
+                            decision.tool_needed.as_deref(),
+                            &content,
+                        );
+                        let plan_background = ws_advisor_plan
+                            .as_ref()
+                            .map(|p| {
+                                format!(
+                                    "Plan end state: {}\nFirst move: {}",
+                                    p.end_state, p.first_move
+                                )
+                            })
+                            .unwrap_or_default();
+                        let req = crate::advisor::AdvisorRequest {
+                            task_summary: &content,
+                            background: plan_background.as_str(),
+                            recent_output: &safe_response,
+                            question: "Review the executor's answer for correctness, architecture, security, and silent failures.",
+                            kind,
+                        };
+                        match advisor.review(&req).await {
+                            Ok(review) => {
+                                tracing::info!(
+                                    verdict = ?review.verdict,
+                                    "WS Advisor REVIEW checkpoint completed"
+                                );
+                                ws_advisor_review = Some(review);
+                            }
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "WS Advisor REVIEW failed — returning raw answer"
+                            ),
+                        }
+                    }
+                }
+
+                let safe_response = if ws_advisor_review
+                    .as_ref()
+                    .is_some_and(|r| r.verdict == crate::advisor::ReviewVerdict::Block)
+                {
+                    format!(
+                        "⚠️ Advisor flagged this answer — review before relying on it.\n\n{safe_response}"
+                    )
+                } else {
+                    safe_response
+                };
+
                 // Add assistant response to history
                 history.push(ChatMessage::assistant(&safe_response));
                 persist_ws_history(&state, &session_id, &history).await;
@@ -1308,14 +1550,39 @@ async fn handle_socket(
                 let net_online = crate::local_llm::shared_health().is_online();
                 let is_local_path = provider_label.eq_ignore_ascii_case("ollama");
 
+                // Attach advisor review metadata so the WS client can
+                // render a "reviewed / blocked / needs revision" badge
+                // matching the REST /api/chat response shape.
+                let advisor_meta = ws_advisor_review.as_ref().map(|r| {
+                    serde_json::json!({
+                        "verdict": format!("{:?}", r.verdict).to_ascii_lowercase(),
+                        "summary": r.summary,
+                        "correctness_issues": r.correctness_issues,
+                        "architecture_concerns": r.architecture_concerns,
+                        "security_flags": r.security_flags,
+                        "silent_failures": r.silent_failures,
+                        "model": state.advisor.as_ref().map(|a| a.model().to_string()),
+                    })
+                });
+
+                let slm_meta = ws_slm_reply.as_ref().map(|_| {
+                    serde_json::json!({
+                        "used": true,
+                        "model": state.slm_executor.as_ref().map(|e| e.model().to_string()),
+                        "tools_invoked": ws_slm_tools,
+                    })
+                });
+
                 // Send the full response as a done message
                 let done = serde_json::json!({
                     "type": "done",
                     "full_response": safe_response,
-                    "active_provider": provider_label,
+                    "active_provider": if ws_slm_reply.is_some() { "ollama" } else { provider_label.as_str() },
                     "active_model": state.model,
-                    "is_local_path": is_local_path,
+                    "is_local_path": is_local_path || ws_slm_reply.is_some(),
                     "network_status": if net_online { "online" } else { "offline" },
+                    "advisor": advisor_meta,
+                    "slm_executor": slm_meta,
                 });
                 let _ = socket.send(Message::Text(done.to_string().into())).await;
 
@@ -2076,20 +2343,15 @@ async fn handle_stt_socket(mut socket: WebSocket, state: AppState) {
     let dg_for_relay = std::sync::Arc::clone(&dg_session);
     let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<String>(256);
     tokio::spawn(async move {
-        loop {
-            match dg_for_relay.recv_event().await {
-                Some(event) => {
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        if relay_tx.send(json).await.is_err() {
-                            break;
-                        }
-                    }
-                    // Stop on session close
-                    if matches!(event, SttEvent::Closed) {
-                        break;
-                    }
+        while let Some(event) = dg_for_relay.recv_event().await {
+            if let Ok(json) = serde_json::to_string(&event) {
+                if relay_tx.send(json).await.is_err() {
+                    break;
                 }
-                None => break,
+            }
+            // Stop on session close
+            if matches!(event, SttEvent::Closed) {
+                break;
             }
         }
     });
@@ -2131,7 +2393,7 @@ async fn handle_stt_socket(mut socket: WebSocket, state: AppState) {
                         }
                     }
                     Ok(Message::Close(_)) | Err(_) => break,
-                    _ => continue,
+                    _ => {}
                 }
             }
         }

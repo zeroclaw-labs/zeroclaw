@@ -513,7 +513,7 @@ struct LlmConsolidator<'a> {
 }
 
 #[async_trait::async_trait]
-impl<'a> super::consolidate::Summarizer for LlmConsolidator<'a> {
+impl super::consolidate::Summarizer for LlmConsolidator<'_> {
     async fn summarise(
         &self,
         cluster: &[&super::consolidate::CandidateMemory],

@@ -358,10 +358,10 @@ fn try_phone_match(tail: &str) -> Option<(usize, String)> {
         if tail.starts_with(p) {
             // Consume p + remaining digits with optional separators
             let mut raw_len = p.len();
-            let mut matched = p.to_string();
+            let mut matched = (*p).to_string();
             let chars: Vec<char> = tail.chars().skip(p.len()).collect();
             let mut digit_count = 0;
-            for c in chars.iter() {
+            for c in &chars {
                 if c.is_ascii_digit() {
                     matched.push(*c);
                     raw_len += 1;

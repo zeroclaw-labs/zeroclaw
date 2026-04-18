@@ -119,7 +119,7 @@ pub fn run(vault: &VaultStore) -> Result<HealthReport> {
                 (health_score, orphan_count, unresolved_count, conflict_count, report_md)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                score as f64,
+                f64::from(score),
                 orphan_count,
                 unresolved_count,
                 conflict_count,

@@ -39,6 +39,14 @@ impl Tool for FileWriteTool {
         "file_write"
     }
 
+    // File creation / overwrite is a write-path side effect. The SLM
+    // executor focuses on Q&A-shaped tasks; file modifications almost
+    // always warrant the cloud LLM's judgment on naming, overwrite
+    // conflicts, and sensitive-file classification.
+    fn safe_for_slm(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Write contents to a file in the workspace. Sensitive files (for example .env and key material) are blocked by default."
     }

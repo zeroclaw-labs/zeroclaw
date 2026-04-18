@@ -268,17 +268,12 @@ struct CosyVoice2Request {
 // ── Reference index helpers ─────────────────────────────────────────────
 
 fn default_references_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    Some(home.join(".moa").join("voice_references"))
+    crate::util::home_dir().map(|h| h.join(".moa").join("voice_references"))
 }
 
-fn now_unix_secs() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+// Use the shared helper from src/util.rs (was duplicated here + #184's
+// network_health.rs on main — both converge on the single util impl).
+use crate::util::now_unix_secs;
 
 /// Synchronous variant for use during construction (we don't want to require
 /// async context just to load the index).

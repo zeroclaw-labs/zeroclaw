@@ -89,7 +89,7 @@ pub async fn handle_llm_proxy(
         }
     };
 
-    let user_id = match authenticate_user(&state, &token).await {
+    let user_id = match authenticate_user(&state, &token) {
         Some(id) => id,
         None => {
             return (
@@ -201,7 +201,7 @@ pub async fn handle_llm_proxy(
             );
             let base_credits = ((cost_usd / 0.007) * 1.0).ceil() as u32;
             // Operator markup: 2.2× the base cost for relay-mode LLM usage
-            let credits_to_deduct = ((base_credits as f64 * 2.2).ceil() as u32).max(1);
+            let credits_to_deduct = ((f64::from(base_credits) * 2.2).ceil() as u32).max(1);
 
             if let Some(pm) = &state.payment_manager {
                 let pm = pm.lock();
@@ -268,7 +268,7 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-async fn authenticate_user(state: &AppState, token: &str) -> Option<String> {
+fn authenticate_user(state: &AppState, token: &str) -> Option<String> {
     if let Some(auth_store) = &state.auth_store {
         if let Some(session) = auth_store.validate_session(token) {
             return Some(session.user_id);
@@ -338,7 +338,7 @@ pub async fn handle_document_upload_url(
         }
     };
 
-    let user_id = match authenticate_user(&state, &token).await {
+    let user_id = match authenticate_user(&state, &token) {
         Some(id) => id,
         None => {
             return (
@@ -431,7 +431,7 @@ pub async fn handle_document_process_r2(
         }
     };
 
-    let user_id = match authenticate_user(&state, &token).await {
+    let user_id = match authenticate_user(&state, &token) {
         Some(id) => id,
         None => {
             return (

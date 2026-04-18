@@ -181,7 +181,7 @@ mod tests {
         //   solo : 1 × 1/(60+1) ≈ 0.0164
         // No other id accumulates more than a single contribution, so none
         // of the rank-1 noise can overtake "broad".
-        let r_solo = vec![("solo".to_string(), 1.0f32)];
+        let r_solo = [("solo".to_string(), 1.0f32)];
         let r1 = mk(&["n1a", "n1b", "broad"]);
         let r2 = mk(&["n2a", "n2b", "broad"]);
         let r3 = mk(&["n3a", "n3b", "broad"]);

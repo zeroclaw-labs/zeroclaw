@@ -51,7 +51,7 @@ impl HubSubtype {
     /// on the entity name itself.
     pub fn classify(entity_name: &str) -> Self {
         let toks = detect_compound_tokens(entity_name);
-        for t in &toks {
+        if let Some(t) = toks.first() {
             match t.kind {
                 CompoundTokenKind::StatuteArticle => return Self::StatuteArticle,
                 CompoundTokenKind::CaseNumber | CompoundTokenKind::PrecedentCitation => {
@@ -466,7 +466,7 @@ pub fn classify_impact(vault: &VaultStore, entity_name: &str) -> Result<ImpactLe
             params![entity_name],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
         )
-        .unwrap_or_else(|_| ("".into(), 0))
+        .unwrap_or_else(|_| (String::new(), 0))
     };
 
     let expected_subtype = HubSubtype::classify(entity_name);
@@ -618,7 +618,7 @@ pub async fn compile_hub_with_ai(
     };
 
     let section_names = skeleton_for(subtype);
-    let section_refs: Vec<&str> = section_names.iter().copied().collect();
+    let section_refs: Vec<&str> = section_names.to_vec();
     let assignments = engine
         .assign_hub_sections(subtype.as_str(), &section_refs, &preview_docs)
         .await
@@ -1029,7 +1029,7 @@ mod tests {
                 doc_type: "판결문".into(),
                 source: "법원".into(),
                 doc_date: Some("2020-01-01".into()),
-                content_snippet: "".into(),
+                content_snippet: String::new(),
             },
             ConflictingClaim {
                 doc_id: 2,
@@ -1037,7 +1037,7 @@ mod tests {
                 doc_type: "준비서면".into(),
                 source: "상대방".into(),
                 doc_date: Some("2026-04-01".into()),
-                content_snippet: "".into(),
+                content_snippet: String::new(),
             },
             ConflictingClaim {
                 doc_id: 3,
@@ -1045,7 +1045,7 @@ mod tests {
                 doc_type: "판결문".into(),
                 source: "법원".into(),
                 doc_date: Some("2026-04-15".into()),
-                content_snippet: "".into(),
+                content_snippet: String::new(),
             },
         ];
         let order = resolve_conflict(&claims);

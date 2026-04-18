@@ -332,8 +332,8 @@ mod tests {
         let chunks = build_chunks(&segments, &[], 512);
         // All in one chunk (no boundaries, fits in limit)
         assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].content.contains("A"));
-        assert!(chunks[0].content.contains("C"));
+        assert!(chunks[0].content.contains('A'));
+        assert!(chunks[0].content.contains('C'));
     }
 
     #[test]
@@ -343,7 +343,7 @@ mod tests {
         // Boundary after segment 0 → [A] [B, C]
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].content, "A");
-        assert!(chunks[1].content.contains("B"));
+        assert!(chunks[1].content.contains('B'));
     }
 
     #[test]

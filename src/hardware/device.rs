@@ -693,7 +693,7 @@ mod tests {
         reg.register("pico", None, None, None, None);
         reg.register("arduino-uno", None, None, None, None);
         let mut aliases = reg.aliases();
-        aliases.sort();
+        aliases.sort_unstable();
         assert_eq!(aliases, vec!["arduino0", "pico0"]);
     }
 

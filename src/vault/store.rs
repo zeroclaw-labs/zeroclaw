@@ -232,7 +232,7 @@ non-knowledge (confidence {:.2}): {}",
                         link.link_type,
                         link.context,
                         link.line_number,
-                        target_doc_id.is_some() as i32,
+                        i32::from(target_doc_id.is_some()),
                     ],
                 )?;
             }
@@ -596,6 +596,10 @@ fn fts_escape(q: &str) -> String {
 mod tests {
     use super::*;
 
+    // Async kept for signature symmetry with other vault test helpers
+    // (vault/health.rs, vault/hub.rs, vault/briefing.rs) — avoids churn at
+    // every `mem_store().await` call site in this file.
+    #[allow(clippy::unused_async)]
     async fn mem_store() -> (VaultStore, Arc<Mutex<Connection>>) {
         let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
         let store = VaultStore::with_shared_connection(conn.clone()).unwrap();

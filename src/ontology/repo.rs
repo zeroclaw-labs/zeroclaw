@@ -1203,7 +1203,7 @@ impl OntologyRepo {
                 "INSERT INTO ontology_communities
                      (community_id, level, summary, object_ids, keywords)
                   VALUES (?1, 0, ?2, ?3, ?4)",
-                params![*cid as i64, summary, object_ids_json, keywords_json],
+                params![i64::from(*cid), summary, object_ids_json, keywords_json],
             )?;
             written += 1;
         }
@@ -1265,7 +1265,7 @@ impl OntologyRepo {
             "UPDATE ontology_communities
                 SET summary = ?1, keywords = ?2
               WHERE level = ?3 AND community_id = ?4",
-            params![summary, keywords_json, level as i64, community_id as i64],
+            params![summary, keywords_json, i64::from(level), i64::from(community_id)],
         )?;
         Ok(())
     }
@@ -1316,7 +1316,7 @@ impl OntologyRepo {
             "UPDATE ontology_communities
                 SET summary_embedding = ?1
               WHERE level = ?2 AND community_id = ?3",
-            params![bytes, level as i64, community_id as i64],
+            params![bytes, i64::from(level), i64::from(community_id)],
         )?;
         Ok(())
     }

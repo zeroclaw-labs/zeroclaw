@@ -1358,7 +1358,7 @@ mod tests {
         let remaining = verifier.get_balance("zeroclaw_user").unwrap();
 
         assert!(
-            won >= 1 && won <= 3,
+            (1..=3).contains(&won),
             "expected 1..=3 winners for 30-credit reservations against 100-credit balance, got {won}"
         );
         assert_eq!(

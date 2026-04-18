@@ -108,11 +108,11 @@ impl DeepgramConfig {
             format!("channels={}", self.channels),
         ];
 
-        if self.language != "multi" {
-            params.push(format!("language={}", self.language));
-        } else {
+        if self.language == "multi" {
             // Use the multilingual model — Deepgram auto-detects language
             params.push("language=multi".to_string());
+        } else {
+            params.push(format!("language={}", self.language));
         }
 
         if self.interim_results {

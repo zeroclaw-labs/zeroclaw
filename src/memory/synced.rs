@@ -445,7 +445,9 @@ impl Memory for SyncedMemory {
         // 2. Record the delta in the sync journal ONLY for long-term categories.
         //    Short-term (Conversation) memory is NOT synced across devices.
         //    Sync only triggers when data is promoted to Core/Daily or ontology.
-        if category != MemoryCategory::Conversation {
+        if category == MemoryCategory::Conversation {
+            tracing::trace!(key, %category, "Sync: skipped Conversation category (short-term only)");
+        } else {
             // PR #5 sender-side — fetch the embedding the inner backend
             // just cached so we can attach it to the outbound delta.
             // Returns None for NoopEmbedding or cache miss; receiver
@@ -459,8 +461,6 @@ impl Memory for SyncedMemory {
                 embedding_blob,
             );
             tracing::trace!(key, %category, "Sync: recorded store delta");
-        } else {
-            tracing::trace!(key, %category, "Sync: skipped Conversation category (short-term only)");
         }
 
         Ok(())

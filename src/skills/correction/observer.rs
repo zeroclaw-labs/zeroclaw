@@ -236,9 +236,9 @@ fn lcs_indices(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
 
     // DP table
     let mut dp = vec![vec![0usize; m + 1]; n + 1];
-    for i in 0..n {
-        for j in 0..m {
-            dp[i + 1][j + 1] = if a[i] == b[j] {
+    for (i, ai) in a.iter().enumerate() {
+        for (j, bj) in b.iter().enumerate() {
+            dp[i + 1][j + 1] = if ai == bj {
                 dp[i][j] + 1
             } else {
                 dp[i][j + 1].max(dp[i + 1][j])

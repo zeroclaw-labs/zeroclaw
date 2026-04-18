@@ -279,7 +279,9 @@ pub(super) async fn build_context(
             }
         }
 
-        if !trimmed_summaries.is_empty() {
+        if trimmed_summaries.is_empty() {
+            None
+        } else {
             context = new_context;
             Some(format!(
                 "\n💡 아래 과거 기억이 저장되어 있지만 컨텍스트 예산 초과로 \
@@ -287,8 +289,6 @@ pub(super) async fn build_context(
                  추가로 검색해드릴까요? (\"기억 검색해줘\"라고 말씀해주세요)",
                 trimmed_summaries.join("\n")
             ))
-        } else {
-            None
         }
     } else {
         None

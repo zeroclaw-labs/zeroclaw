@@ -149,21 +149,17 @@ fn extract_themes(entities: &[String], title: &str, category: &str) -> Vec<Strin
     };
 
     for indicator in indicators {
-        if source_text.contains(indicator) && !themes.contains(&indicator.to_string()) {
-            themes.push(indicator.to_string());
+        if source_text.contains(indicator) && !themes.contains(&(*indicator).to_string()) {
+            themes.push((*indicator).to_string());
         }
     }
 
     // Add entities that look like themes (contain "청구", "계약", etc.)
     for entity in entities {
-        if entity.ends_with("청구")
+        if (entity.ends_with("청구")
             || entity.ends_with("계약")
-            || entity.ends_with("소송")
-            || entity.ends_with("심판")
-        {
-            if !themes.contains(entity) {
-                themes.push(entity.clone());
-            }
+            || entity.ends_with("소송") || entity.ends_with("심판")) && !themes.contains(entity) {
+            themes.push(entity.clone());
         }
     }
 
