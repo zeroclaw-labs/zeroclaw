@@ -100,24 +100,49 @@ impl Artifact {
     }
 }
 
-/// File extensions worth surfacing as downloadable artifacts when produced
-/// by `shell`. Excludes source code, logs, and intermediate files that
-/// would just be noise in chat clients.
+/// File extensions considered **user-facing deliverables** — the final output
+/// a human user wants to see, as opposed to intermediate files (scripts,
+/// configs, schemas, logs, temp artifacts) generated during skill execution.
 ///
-/// Keep this list conservative — false positives spam the user; false
-/// negatives just fall back to "no attachment", which is the existing
-/// behaviour today.
-pub const SHELL_ARTIFACT_EXTENSIONS: &[&str] = &[
-    "docx", "doc", "pptx", "ppt", "xlsx", "xls", "csv", "pdf", "md", "html", "htm", "txt", "rtf",
-    "png", "jpg", "jpeg", "gif", "webp", "svg", "zip", "tar", "gz", "json", "xml", "yaml", "yml",
+/// ## Why this list is narrow
+///
+/// Skills frequently `file_write` a Python/JS/shell script, then `shell` runs
+/// it to produce the real deliverable. Before the narrowing done here, the
+/// intermediate script was surfaced to the chat client alongside the real
+/// deliverable — users saw two attachments (`generate.py` + `report.docx`)
+/// where they only wanted one.
+///
+/// ## Rules of thumb for what belongs
+///
+/// - Something a non-technical recipient (doctor, manager) would expect to
+///   open with Word/Excel/PDF viewer/image viewer.
+/// - NOT something another program is likely to consume (json/xml/yaml).
+/// - NOT something the chat client can already render inline (md/txt/html).
+/// - Archive formats only when the skill explicitly packages a deliverable
+///   (`zip` kept; `tar`/`gz` dropped — rarer and less portable).
+///
+/// False negatives here mean "no attachment appears" — users can always
+/// retrieve the file through other means (the workspace is still mounted
+/// on disk). False positives mean spammed chats and, historically, leaked
+/// internal scripts. Bias strongly toward false negatives.
+///
+/// ## Contents (grouped by purpose)
+///
+/// - Office documents: `docx`, `doc`, `pptx`, `ppt`, `xlsx`, `xls`
+/// - Reports: `pdf`
+/// - Data exports: `csv` (often the final deliverable for data-pipeline skills)
+/// - Images: `png`, `jpg`, `jpeg`, `webp`
+/// - Archives: `zip` (for skills that package multi-file deliverables)
+pub const USER_DELIVERABLE_EXTENSIONS: &[&str] = &[
+    "docx", "doc", "pptx", "ppt", "xlsx", "xls", "pdf", "csv", "png", "jpg", "jpeg", "webp", "zip",
 ];
 
-/// True if the path's lowercase extension is in [`SHELL_ARTIFACT_EXTENSIONS`].
+/// True if the path's lowercase extension is in [`USER_DELIVERABLE_EXTENSIONS`].
 pub fn is_artifact_extension(path: &str) -> bool {
     path.rsplit('.')
         .next()
         .map(str::to_ascii_lowercase)
-        .is_some_and(|ext| SHELL_ARTIFACT_EXTENSIONS.contains(&ext.as_str()))
+        .is_some_and(|ext| USER_DELIVERABLE_EXTENSIONS.contains(&ext.as_str()))
 }
 
 /// Best-effort MIME guess from extension. Mirrors `gateway::guess_content_type`
@@ -274,14 +299,44 @@ mod tests {
     }
 
     #[test]
-    fn shell_extension_whitelist_matches_common_office_formats() {
+    fn extension_whitelist_matches_user_deliverables() {
         assert!(is_artifact_extension("/tmp/foo.docx"));
         assert!(is_artifact_extension("a/b/c.PPTX")); // case-insensitive
         assert!(is_artifact_extension("report.pdf"));
         assert!(is_artifact_extension("data.csv"));
+        assert!(is_artifact_extension("chart.png"));
+        assert!(is_artifact_extension("bundle.zip"));
         assert!(!is_artifact_extension("script.py"));
         assert!(!is_artifact_extension("Cargo.lock"));
         assert!(!is_artifact_extension("no_extension_at_all"));
+    }
+
+    /// Regression guard: extensions removed from the whitelist during the
+    /// narrowing pass must STAY removed. If any of these come back, real
+    /// skill workflows immediately start spamming users with intermediate
+    /// files — that regression is both invisible (tests pass) and
+    /// high-impact (loud chat clients).
+    ///
+    /// Categories covered:
+    /// - source scripts: py, js, ts, mjs, cjs, sh, bash
+    /// - chat-renderable text: md, txt, html, htm
+    /// - config/data interchange: json, xml, yaml, yml
+    /// - execution logs: log
+    /// - uncommon office/image: rtf, svg, gif
+    /// - rare archive formats: tar, gz
+    /// - build/package manifests: lock, toml
+    #[test]
+    fn extension_whitelist_excludes_intermediate_formats() {
+        for ext in [
+            "py", "js", "ts", "mjs", "cjs", "sh", "bash", "md", "txt", "html", "htm", "json",
+            "xml", "yaml", "yml", "log", "rtf", "svg", "gif", "tar", "gz", "lock", "toml",
+        ] {
+            let path = format!("intermediate.{ext}");
+            assert!(
+                !is_artifact_extension(&path),
+                "`{ext}` must NOT be a user deliverable (regression: skill intermediates will leak)"
+            );
+        }
     }
 
     #[test]

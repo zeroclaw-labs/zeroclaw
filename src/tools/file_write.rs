@@ -178,37 +178,43 @@ impl Tool for FileWriteTool {
                 // absolute path (which then gets percent-encoded into a broken
                 // signed URL like `/download/%2Fprivate%2F...`). We canonicalize
                 // the workspace path here to match.
-                let canonical_workspace =
-                    tokio::fs::canonicalize(&self.security.workspace_dir)
-                        .await
-                        .unwrap_or_else(|_| self.security.workspace_dir.clone());
+                let canonical_workspace = tokio::fs::canonicalize(&self.security.workspace_dir)
+                    .await
+                    .unwrap_or_else(|_| self.security.workspace_dir.clone());
                 let relative_path = resolved_target
                     .strip_prefix(&canonical_workspace)
                     .unwrap_or(&resolved_target);
                 let rel_str = relative_path.to_string_lossy().to_string();
-                let download_url = self.download.as_ref().map(|dl| {
-                    crate::gateway::signed_url::sign_download_url(
-                        &dl.base_url,
-                        &rel_str,
-                        &dl.secret,
-                        crate::gateway::signed_url::DEFAULT_TTL_SECS,
-                    )
-                });
+                // Gate artifact + Download: URL emission on the user-deliverable
+                // whitelist. Skills routinely `file_write` intermediate scripts
+                // (`.py`/`.js`/`.sh`) before running them via `shell` — surfacing
+                // those as downloads spams chat clients with internals and, on
+                // Lark, results in a `.py` attachment next to the real `.docx`.
+                // Files outside the whitelist still succeed, just silently.
+                let is_deliverable = crate::tools::artifact::is_artifact_extension(&rel_str);
+                let download_url = if is_deliverable {
+                    self.download.as_ref().map(|dl| {
+                        crate::gateway::signed_url::sign_download_url(
+                            &dl.base_url,
+                            &rel_str,
+                            &dl.secret,
+                            crate::gateway::signed_url::DEFAULT_TTL_SECS,
+                        )
+                    })
+                } else {
+                    None
+                };
                 // Legacy `Download:` line — kept for the regex-based fallback in
                 // `channels/mod.rs::extract_download_urls_from_history` and
-                // `lark::extract_download_links` until PR 2 wires structured
-                // artifacts through the channel pipeline.
+                // `lark::extract_download_links`. Non-deliverable extensions
+                // skip this entirely.
                 if let Some(url) = download_url.as_deref() {
                     use std::fmt::Write;
                     let _ = write!(output, "\nDownload: {url}");
                 }
-                // Structured artifact (new contract). Only emitted when
-                // `download` is configured, mirroring the legacy `Download:`
-                // line behaviour — installations without a public gateway
-                // URL stay byte-identical to pre-PR-1 output. PR 3 may
-                // revisit this to support native channel upload without
-                // gateway URLs.
-                if download_url.is_some() {
+                // Structured artifact (new contract). Emitted only for deliverable
+                // extensions AND when `download` is configured.
+                if is_deliverable && download_url.is_some() {
                     let artifacts: Vec<crate::tools::artifact::Artifact> =
                         crate::tools::artifact::Artifact::from_workspace_path(
                             &canonical_workspace,
@@ -539,13 +545,12 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// PR 1 contract: when `with_download` is configured, file_write must
-    /// emit BOTH (a) the legacy `Download:` text line for backward
-    /// compatibility with the regex-based pipeline in `channels/mod.rs` and
-    /// `lark::extract_download_links`, AND (b) a structured artifact via
-    /// the sentinel codec for PR 2 consumers.
+    /// PR 1 contract: when `with_download` is configured AND the file is a
+    /// user deliverable (whitelisted extension), file_write emits BOTH
+    /// (a) the legacy `Download:` text line for the regex fallback pipeline
+    /// AND (b) a structured artifact via the sentinel codec.
     #[tokio::test]
-    async fn file_write_with_download_emits_both_legacy_and_artifact() {
+    async fn file_write_with_download_emits_both_legacy_and_artifact_for_deliverable() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_write_artifact");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
@@ -557,35 +562,63 @@ mod tests {
                 secret: b"test-secret".to_vec(),
             },
         );
+        // `.docx` is on the user-deliverable whitelist.
         let result = tool
-            .execute(json!({"path": "report.md", "content": "# hi"}))
+            .execute(json!({"path": "report.docx", "content": "PK\u{3}\u{4}"}))
             .await
             .unwrap();
         assert!(result.success);
 
-        // Legacy line still present
         assert!(
-            result.output.contains("\nDownload: https://gw.example/download/report.md?expires="),
-            "legacy Download: line missing — would break Lark/channel regex pipeline before PR 2: {:?}",
+            result
+                .output
+                .contains("\nDownload: https://gw.example/download/report.docx?expires="),
+            "legacy Download: line missing for a deliverable extension: {:?}",
             result.output
         );
 
-        // Structured artifact recoverable
         let (cleaned, artifacts) = crate::tools::artifact::extract_artifacts(&result.output);
         assert!(!cleaned.contains("zeroclaw-artifacts"));
         assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].path, "report.md");
-        assert_eq!(artifacts[0].name, "report.md");
-        assert_eq!(artifacts[0].size_bytes, 4);
-        assert_eq!(
-            artifacts[0].mime.as_deref(),
-            Some("text/markdown; charset=utf-8")
+        assert_eq!(artifacts[0].path, "report.docx");
+        assert_eq!(artifacts[0].name, "report.docx");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Regression guard for the spam-intermediates bug: writing a non-
+    /// deliverable file (e.g. a Python script a skill is about to run)
+    /// must NOT emit a Download: line or an artifact, even when download
+    /// config is wired. Otherwise chats get a `generate.py` attachment
+    /// next to the real deliverable.
+    #[tokio::test]
+    async fn file_write_suppresses_artifact_for_intermediate_extensions() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_intermediate");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = FileWriteTool::with_download(
+            test_security(dir.clone()),
+            DownloadUrlConfig {
+                base_url: "https://gw.example".into(),
+                secret: b"test-secret".to_vec(),
+            },
         );
-        assert!(artifacts[0]
-            .download_url
-            .as_deref()
-            .unwrap_or("")
-            .contains("/download/report.md?expires="));
+        // `.py` is intentionally NOT on the whitelist.
+        let result = tool
+            .execute(json!({"path": "generate_docx.py", "content": "print('hi')"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(
+            !result.output.contains("Download:"),
+            "intermediate .py must not emit Download: line — would spam chat clients"
+        );
+        let (_cleaned, artifacts) = crate::tools::artifact::extract_artifacts(&result.output);
+        assert!(
+            artifacts.is_empty(),
+            "intermediate .py must not emit a structured artifact"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

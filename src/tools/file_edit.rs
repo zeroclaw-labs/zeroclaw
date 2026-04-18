@@ -233,20 +233,25 @@ impl Tool for FileEditTool {
                     .strip_prefix(&canonical_workspace)
                     .unwrap_or(&resolved_target);
                 let rel_str = relative_path.to_string_lossy().to_string();
-                let download_url = self.download.as_ref().map(|dl| {
-                    crate::gateway::signed_url::sign_download_url(
-                        &dl.base_url,
-                        &rel_str,
-                        &dl.secret,
-                        crate::gateway::signed_url::DEFAULT_TTL_SECS,
-                    )
-                });
+                // See `file_write.rs` for the user-deliverable whitelist rationale.
+                let is_deliverable = crate::tools::artifact::is_artifact_extension(&rel_str);
+                let download_url = if is_deliverable {
+                    self.download.as_ref().map(|dl| {
+                        crate::gateway::signed_url::sign_download_url(
+                            &dl.base_url,
+                            &rel_str,
+                            &dl.secret,
+                            crate::gateway::signed_url::DEFAULT_TTL_SECS,
+                        )
+                    })
+                } else {
+                    None
+                };
                 // Legacy `Download:` line for backward compat (see file_write.rs).
                 if let Some(url) = download_url.as_deref() {
                     let _ = write!(output, "\nDownload: {url}");
                 }
-                // See `file_write.rs` for why we gate on `download_url.is_some()`.
-                if download_url.is_some() {
+                if is_deliverable && download_url.is_some() {
                     let artifacts: Vec<crate::tools::artifact::Artifact> =
                         crate::tools::artifact::Artifact::from_workspace_path(
                             &canonical_workspace,
@@ -742,7 +747,10 @@ mod tests {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_download_url");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("report.md"), "hello world")
+        // `.csv` is on the user-deliverable whitelist; `.md` is not (as of
+        // the narrowing pass) — keeping this test on a deliverable extension
+        // so it actually exercises the Download: emission path.
+        tokio::fs::write(dir.join("report.csv"), "a,b\nhello,world")
             .await
             .unwrap();
 
@@ -755,7 +763,7 @@ mod tests {
         );
         let result = tool
             .execute(json!({
-                "path": "report.md",
+                "path": "report.csv",
                 "old_string": "hello",
                 "new_string": "goodbye"
             }))
@@ -802,15 +810,16 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// PR 1 contract: file_edit must surface the edited file as a structured
-    /// artifact via the sentinel codec, in addition to the legacy `Download:`
-    /// line.
+    /// PR 1 contract: file_edit must surface a deliverable-extension edit
+    /// as a structured artifact via the sentinel codec, in addition to
+    /// the legacy `Download:` line.
     #[tokio::test]
-    async fn file_edit_with_download_emits_artifact_via_sentinel() {
+    async fn file_edit_with_download_emits_artifact_for_deliverable() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_artifact");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("notes.md"), "alpha").await.unwrap();
+        // `.csv` is on the user-deliverable whitelist.
+        tokio::fs::write(dir.join("data.csv"), "a,b\n1,alpha").await.unwrap();
 
         let tool = FileEditTool::with_download(
             test_security(dir.clone()),
@@ -821,7 +830,7 @@ mod tests {
         );
         let result = tool
             .execute(json!({
-                "path": "notes.md",
+                "path": "data.csv",
                 "old_string": "alpha",
                 "new_string": "beta"
             }))
@@ -834,8 +843,48 @@ mod tests {
         // Cleaned text retains the legacy `Download:` line for PR 2 backward compat
         assert!(cleaned.contains("Download:"));
         assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].path, "notes.md");
-        assert_eq!(artifacts[0].size_bytes, 4); // "beta"
+        assert_eq!(artifacts[0].path, "data.csv");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Regression guard: editing an intermediate file (`.py`/`.json`/etc)
+    /// must not emit a Download: line or artifact, matching `file_write`'s
+    /// behaviour. Prevents skill intermediates leaking into chat clients.
+    #[tokio::test]
+    async fn file_edit_suppresses_artifact_for_intermediate_extensions() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_intermediate");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("helper.py"), "print('a')")
+            .await
+            .unwrap();
+
+        let tool = FileEditTool::with_download(
+            test_security(dir.clone()),
+            DownloadUrlConfig {
+                base_url: "https://gw.example".into(),
+                secret: b"k".to_vec(),
+            },
+        );
+        let result = tool
+            .execute(json!({
+                "path": "helper.py",
+                "old_string": "'a'",
+                "new_string": "'b'"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(
+            !result.output.contains("Download:"),
+            "intermediate .py must not emit Download: line"
+        );
+        let (_, artifacts) = crate::tools::artifact::extract_artifacts(&result.output);
+        assert!(
+            artifacts.is_empty(),
+            "intermediate .py must not emit a structured artifact"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
