@@ -1,4 +1,4 @@
-# Changelog — v0.6.9 → next
+# Changelog — v0.6.9 → v0.7.1
 
 > Changes since the **v0.6.9** stable release. This release represents the largest
 > structural overhaul in ZeroClaw's history: the entire codebase has been split into a
