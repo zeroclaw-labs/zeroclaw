@@ -6,9 +6,18 @@
 
 | 文件 | 作用 | 面向 |
 |------|------|------|
-| `porting-rfc.md` | OpenClaw LCM 机制移植到 ZeroClaw 的 RFC（P1/P2/P3 三阶段） | 开发实现 |
-| `openclaw-deepdive.md` | OpenClaw 系统全景深度分析（16 章 + 2 附录） | 参考字典 |
-| `openclaw-lcm-deepdive.md` | LCM（lossless-claw 插件）源码级分析 | 参考字典 |
+| `openclaw-architecture-final.md` | **主入口**：OpenClaw 架构合并版，含 DAG/Memory/Porting 总览 | 阅读起点 |
+| `agent-intelligence-comparison.md` | OpenClaw / Hermes / ZeroClaw 三家对比（LCM 部分已修正） | 横向参考 |
+| `porting-rfc.md` | LCM 机制移植到 ZeroClaw 的 RFC（P1/P2/P3 三阶段） | 开发实现 |
+| `openclaw-deepdive.md` | OpenClaw 系统全景深度分析（16 章 + 2 附录） | 字典参考 |
+| `openclaw-lcm-deepdive.md` | LCM（lossless-claw 插件）源码级分析 | 字典参考 |
+
+## 阅读顺序
+
+1. `openclaw-architecture-final.md` —— 先看这个，理清四个角色（记忆后端 / 上下文引擎 / 工具注入 / 召回子代理）
+2. `agent-intelligence-comparison.md` —— 看三家差异，确认 ZeroClaw 缺什么
+3. `porting-rfc.md` —— 按 P1 → P2 → P3 落地
+4. 两个 deepdive —— 实现时遇到具体问题当字典查
 
 ## 背景
 
