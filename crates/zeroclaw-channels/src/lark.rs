@@ -3,6 +3,7 @@ use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -240,6 +241,47 @@ const LARK_SUPPORTED_IMAGE_MIMES: &[&str] = &[
     "image/webp",
     "image/bmp",
 ];
+
+/// Map an image MIME type to its conventional file extension.
+fn extension_for_image_mime(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        _ => "bin",
+    }
+}
+
+/// Compose the on-disk filename for a downloaded Lark image.
+fn filename_for_image(image_key: &str, mime: &str) -> String {
+    format!("{image_key}.{}", extension_for_image_mime(mime))
+}
+
+/// Strip a path segment to filename-safe characters, refusing traversal
+/// attempts.  Returns `None` if the segment is empty or reserved (`.`/`..`).
+fn sanitize_path_segment(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return None;
+    }
+    let cleaned: String = trimmed
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
 
 /// Returns true when the WebSocket frame indicates live traffic that should
 /// refresh the heartbeat watchdog.
@@ -494,6 +536,9 @@ pub struct LarkChannel {
         Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ChannelApprovalResponse>>>>,
     /// Seconds to wait for a user to tap an approval button before auto-denying (default 120).
     approval_timeout_secs: u64,
+    /// Workspace root for persisting downloaded images/files.
+    /// Layout: `{workspace_dir}/sessions/{chat_id}/files/<image_key>.<ext>`.
+    workspace_dir: Option<PathBuf>,
     #[cfg(test)]
     api_base_override: Option<String>,
 }
@@ -544,9 +589,18 @@ impl LarkChannel {
             transcription_manager: None,
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
             approval_timeout_secs: 120,
+            workspace_dir: None,
             #[cfg(test)]
             api_base_override: None,
         }
+    }
+
+    /// Set the workspace root used to persist downloaded images/files under
+    /// `{workspace_dir}/sessions/{chat_id}/files/`.  When unset, images are
+    /// inlined as base64 markers (legacy fallback).
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
     }
 
     /// Build from `LarkConfig` using legacy compatibility:
@@ -665,8 +719,17 @@ impl LarkChannel {
         format!("{}/im/v1/messages/{message_id}/reactions", self.api_base())
     }
 
-    fn image_download_url(&self, image_key: &str) -> String {
-        format!("{}/im/v1/images/{image_key}", self.api_base())
+    /// Download URL for an image attached to a user-sent message.
+    ///
+    /// Per the Feishu spec, the legacy `/im/v1/images/{image_key}` endpoint
+    /// only serves images uploaded by the bot itself; user-message images
+    /// (keys with `img_v3_*` prefix) MUST go through message resources.
+    /// See: https://open.feishu.cn/document/server-docs/im-v1/image/get
+    fn message_image_download_url(&self, message_id: &str, image_key: &str) -> String {
+        format!(
+            "{}/im/v1/messages/{message_id}/resources/{image_key}?type=image",
+            self.api_base()
+        )
     }
 
     fn file_download_url(&self, message_id: &str, file_key: &str) -> String {
@@ -1040,7 +1103,14 @@ impl LarkChannel {
                                 Some(k) => k.to_string(),
                                 None => { tracing::debug!("Lark WS: image message missing image_key"); continue; }
                             };
-                            match self.download_image_as_marker(&image_key).await {
+                            match self
+                                .download_image_as_marker(
+                                    &lark_msg.message_id,
+                                    &lark_msg.chat_id,
+                                    &image_key,
+                                )
+                                .await
+                            {
                                 Some(marker) => (marker, Vec::new()),
                                 None => {
                                     tracing::warn!("Lark WS: failed to download image {image_key}");
@@ -1207,8 +1277,19 @@ impl LarkChannel {
         *cached = None;
     }
 
-    /// Download an image from the Lark API and return an `[IMAGE:data:...]` marker string.
-    async fn download_image_as_marker(&self, image_key: &str) -> Option<String> {
+    /// Download an image attached to a user-sent message and return an
+    /// `[IMAGE:...]` marker the multimodal pipeline can consume.
+    ///
+    /// When `workspace_dir` is configured, the image is persisted to
+    /// `{workspace_dir}/sessions/{chat_id}/files/<image_key>.<ext>` and the
+    /// marker carries the absolute file path so downstream tools can re-open
+    /// the file.  Otherwise we fall back to an inline `data:` URI.
+    async fn download_image_as_marker(
+        &self,
+        message_id: &str,
+        chat_id: &str,
+        image_key: &str,
+    ) -> Option<String> {
         let token = match self.get_tenant_access_token().await {
             Ok(t) => t,
             Err(e) => {
@@ -1217,7 +1298,7 @@ impl LarkChannel {
             }
         };
 
-        let url = self.image_download_url(image_key);
+        let url = self.message_image_download_url(message_id, image_key);
         let resp = match self
             .http_client()
             .get(&url)
@@ -1275,8 +1356,61 @@ impl LarkChannel {
             return None;
         }
 
+        if let Some(workspace) = self.workspace_dir.as_ref() {
+            match Self::persist_session_file(
+                workspace,
+                chat_id,
+                &filename_for_image(image_key, &mime),
+                &bytes,
+            )
+            .await
+            {
+                Ok(path) => return Some(format!("[IMAGE:{}]", path.display())),
+                Err(e) => {
+                    tracing::warn!(
+                        "Lark: failed to persist image {image_key} to workspace: {e}; \
+                         falling back to inline base64"
+                    );
+                }
+            }
+        }
+
         let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
         Some(format!("[IMAGE:data:{mime};base64,{encoded}]"))
+    }
+
+    /// Write `bytes` to `{workspace}/sessions/{chat_id}/files/{file_name}`,
+    /// rejecting any path that would escape the workspace root.  Returns the
+    /// canonical path of the written file.
+    async fn persist_session_file(
+        workspace: &std::path::Path,
+        chat_id: &str,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> anyhow::Result<PathBuf> {
+        let safe_session = sanitize_path_segment(chat_id)
+            .ok_or_else(|| anyhow::anyhow!("invalid chat_id for session dir: {chat_id}"))?;
+        let safe_file = sanitize_path_segment(file_name)
+            .ok_or_else(|| anyhow::anyhow!("invalid filename: {file_name}"))?;
+
+        tokio::fs::create_dir_all(workspace).await?;
+        let workspace_root = tokio::fs::canonicalize(workspace)
+            .await
+            .unwrap_or_else(|_| workspace.to_path_buf());
+
+        let session_files_dir = workspace.join("sessions").join(&safe_session).join("files");
+        tokio::fs::create_dir_all(&session_files_dir).await?;
+        let resolved_dir = tokio::fs::canonicalize(&session_files_dir).await?;
+        if !resolved_dir.starts_with(&workspace_root) {
+            anyhow::bail!(
+                "session files directory escapes workspace: {}",
+                resolved_dir.display()
+            );
+        }
+
+        let target = resolved_dir.join(safe_file);
+        tokio::fs::write(&target, bytes).await?;
+        Ok(target)
     }
 
     /// Download a file from the Lark API and return a text content marker.
@@ -1745,6 +1879,11 @@ impl LarkChannel {
             .and_then(|m| m.as_str())
             .unwrap_or("");
 
+        let evt_chat_id = event
+            .pointer("/message/chat_id")
+            .and_then(|c| c.as_str())
+            .unwrap_or(open_id);
+
         let (text, post_mentioned_open_ids): (String, Vec<String>) = match msg_type {
             "text" => {
                 let extracted = serde_json::from_str::<serde_json::Value>(content_str)
@@ -1774,7 +1913,10 @@ impl LarkChannel {
                     });
                 match image_key {
                     Some(key) => {
-                        let marker = match self.download_image_as_marker(&key).await {
+                        let marker = match self
+                            .download_image_as_marker(evt_message_id, evt_chat_id, &key)
+                            .await
+                        {
                             Some(m) => m,
                             None => {
                                 tracing::warn!("Lark: failed to download image {key}");
@@ -1858,15 +2000,10 @@ impl LarkChannel {
                     .as_secs()
             });
 
-        let chat_id = event
-            .pointer("/message/chat_id")
-            .and_then(|c| c.as_str())
-            .unwrap_or(open_id);
-
         messages.push(ChannelMessage {
             id: Uuid::new_v4().to_string(),
-            sender: chat_id.to_string(),
-            reply_target: chat_id.to_string(),
+            sender: evt_chat_id.to_string(),
+            reply_target: evt_chat_id.to_string(),
             content: text,
             channel: self.channel_name().to_string(),
             timestamp,
@@ -3504,11 +3641,11 @@ mod tests {
     }
 
     #[test]
-    fn lark_image_download_url_matches_region() {
+    fn lark_message_image_download_url_matches_region() {
         let ch = make_channel();
         assert_eq!(
-            ch.image_download_url("img_abc123"),
-            "https://open.larksuite.com/open-apis/im/v1/images/img_abc123"
+            ch.message_image_download_url("om_msg_xyz", "img_abc123"),
+            "https://open.larksuite.com/open-apis/im/v1/messages/om_msg_xyz/resources/img_abc123?type=image"
         );
     }
 
@@ -4267,5 +4404,93 @@ mod tests {
         assert!(action_strs.contains(&"approve"));
         assert!(action_strs.contains(&"deny"));
         assert!(action_strs.contains(&"always"));
+    }
+
+    #[test]
+    fn lark_message_image_url_uses_message_resource_endpoint() {
+        // The legacy /im/v1/images/{key} endpoint cannot serve user-uploaded
+        // image messages (Feishu err 230099 / 234008). Confirm we build the
+        // message-resource URL with `?type=image`.
+        let ch = make_channel();
+        let url = ch.message_image_download_url("om_msg_abc", "img_v3_xyz");
+        assert!(
+            url.ends_with("/im/v1/messages/om_msg_abc/resources/img_v3_xyz?type=image"),
+            "unexpected URL: {url}"
+        );
+    }
+
+    #[test]
+    fn filename_for_image_uses_mime_extension() {
+        assert_eq!(
+            filename_for_image("img_v3_abc", "image/png"),
+            "img_v3_abc.png"
+        );
+        assert_eq!(
+            filename_for_image("img_v3_abc", "image/jpeg"),
+            "img_v3_abc.jpg"
+        );
+        assert_eq!(
+            filename_for_image("img_v3_abc", "image/webp"),
+            "img_v3_abc.webp"
+        );
+    }
+
+    #[test]
+    fn sanitize_path_segment_strips_traversal_and_unsafe_chars() {
+        assert_eq!(
+            sanitize_path_segment("oc_chat123"),
+            Some("oc_chat123".into())
+        );
+        // `.` is allowed inside a segment (filenames need extensions); slashes
+        // get rewritten so traversal sequences cannot reach a parent dir.
+        assert_eq!(
+            sanitize_path_segment("../etc/passwd"),
+            Some(".._etc_passwd".into())
+        );
+        assert_eq!(sanitize_path_segment("a/b\\c:d"), Some("a_b_c_d".into()));
+        assert_eq!(
+            sanitize_path_segment("img_v3_abc.png"),
+            Some("img_v3_abc.png".into())
+        );
+        assert_eq!(sanitize_path_segment(""), None);
+        assert_eq!(sanitize_path_segment("."), None);
+        assert_eq!(sanitize_path_segment(".."), None);
+    }
+
+    #[tokio::test]
+    async fn persist_session_file_writes_under_workspace_sessions_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+
+        let path = LarkChannel::persist_session_file(
+            &workspace,
+            "oc_chat_xyz",
+            "img_v3_abc.png",
+            b"fake-png-bytes",
+        )
+        .await
+        .expect("persist must succeed");
+
+        // File lives under {workspace}/sessions/{chat_id}/files/{name}.
+        let expected_suffix = std::path::Path::new("sessions")
+            .join("oc_chat_xyz")
+            .join("files")
+            .join("img_v3_abc.png");
+        assert!(
+            path.ends_with(&expected_suffix),
+            "path {path:?} does not end with {expected_suffix:?}"
+        );
+        let written = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(written, b"fake-png-bytes");
+    }
+
+    #[tokio::test]
+    async fn persist_session_file_rejects_traversal_in_chat_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+
+        // ".." gets rejected by sanitize_path_segment up front.
+        let err = LarkChannel::persist_session_file(&workspace, "..", "x.png", b"x").await;
+        assert!(err.is_err(), "must reject traversal session id");
     }
 }

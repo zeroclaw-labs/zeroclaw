@@ -4067,7 +4067,10 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     .lark
                     .as_ref()
                     .context("Lark channel is not configured")?;
-                Ok(Arc::new(LarkChannel::from_lark_config(lk)))
+                Ok(Arc::new(
+                    LarkChannel::from_lark_config(lk)
+                        .with_workspace_dir(config.workspace_dir.clone()),
+                ))
             }
             #[cfg(not(feature = "channel-lark"))]
             {
@@ -4078,7 +4081,10 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             #[cfg(feature = "channel-lark")]
             {
                 if let Some(ref fs) = config.channels.feishu {
-                    return Ok(Arc::new(LarkChannel::from_feishu_config(fs)));
+                    return Ok(Arc::new(
+                        LarkChannel::from_feishu_config(fs)
+                            .with_workspace_dir(config.workspace_dir.clone()),
+                    ));
                 }
                 // Legacy: [channels_config.lark] with use_feishu = true
                 let lk = config
@@ -4086,7 +4092,9 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     .lark
                     .as_ref()
                     .context("Feishu channel is not configured")?;
-                Ok(Arc::new(LarkChannel::from_config(lk)))
+                Ok(Arc::new(
+                    LarkChannel::from_config(lk).with_workspace_dir(config.workspace_dir.clone()),
+                ))
             }
             #[cfg(not(feature = "channel-lark"))]
             {
@@ -4726,7 +4734,8 @@ fn collect_configured_channels(
                         display_name: "Feishu",
                         channel: Arc::new(
                             LarkChannel::from_config(lk)
-                                .with_transcription(config.transcription.clone()),
+                                .with_transcription(config.transcription.clone())
+                                .with_workspace_dir(config.workspace_dir.clone()),
                         ),
                     });
                 }
@@ -4735,7 +4744,8 @@ fn collect_configured_channels(
                     display_name: "Lark",
                     channel: Arc::new(
                         LarkChannel::from_lark_config(lk)
-                            .with_transcription(config.transcription.clone()),
+                            .with_transcription(config.transcription.clone())
+                            .with_workspace_dir(config.workspace_dir.clone()),
                     ),
                 });
             }
@@ -4751,7 +4761,8 @@ fn collect_configured_channels(
                 display_name: "Feishu",
                 channel: Arc::new(
                     LarkChannel::from_feishu_config(fs)
-                        .with_transcription(config.transcription.clone()),
+                        .with_transcription(config.transcription.clone())
+                        .with_workspace_dir(config.workspace_dir.clone()),
                 ),
             });
         } else {
