@@ -681,9 +681,33 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
                 normalized.push(turn);
                 expecting_user = true;
             }
+            (true, "assistant") => {
+                // Multi-iteration agent loops persist consecutive assistants
+                // (e.g. text reply followed by a tool_calls JSON message).
+                // Merging structured tool_calls JSON with surrounding text
+                // produces invalid JSON, which downstream native conversion
+                // silently downgrades to plain text — dropping `tool_calls`
+                // and orphaning the next role=tool message (OpenAI 400).
+                // Preserve such turns as separate assistants instead.
+                let last_is_structured = normalized
+                    .last()
+                    .is_some_and(|t| looks_like_tool_calls_json(&t.content));
+                let new_is_structured = looks_like_tool_calls_json(&turn.content);
+
+                if last_is_structured || new_is_structured {
+                    normalized.push(turn);
+                } else if let Some(last_turn) = normalized.last_mut()
+                    && !turn.content.is_empty()
+                {
+                    if !last_turn.content.is_empty() {
+                        last_turn.content.push_str("\n\n");
+                    }
+                    last_turn.content.push_str(&turn.content);
+                }
+            }
             // Interrupted channel turns can produce consecutive user messages
             // (no assistant persisted yet). Merge instead of dropping.
-            (false, "user") | (true, "assistant") => {
+            (false, "user") => {
                 if let Some(last_turn) = normalized.last_mut()
                     && !turn.content.is_empty()
                 {
@@ -698,6 +722,11 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     }
 
     normalized
+}
+
+fn looks_like_tool_calls_json(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with('{') && trimmed.contains("\"tool_calls\"")
 }
 
 /// Remove `<tool_result …>…</tool_result>` blocks (and a leading `[Tool results]`
@@ -6000,6 +6029,46 @@ mod tests {
         assert_eq!(normalized[2].role, "user");
         assert!(normalized[1].content.contains("assistant part 1"));
         assert!(normalized[1].content.contains("assistant part 2"));
+    }
+
+    /// Multi-iteration agent loops persist a text reply followed by a
+    /// tool_calls JSON message. Merging those two assistants would corrupt
+    /// the JSON, downstream native conversion would fall back to plain text
+    /// (dropping `tool_calls`), and the next role=tool turn would be
+    /// orphaned — provoking an OpenAI 400 on the following request.
+    #[test]
+    fn normalize_cached_channel_turns_preserves_tool_calls_json_after_text() {
+        let tool_calls_json = r#"{"content":null,"tool_calls":[{"id":"call_FUzv","type":"function","function":{"name":"file_write","arguments":"{}"}}]}"#;
+        let turns = vec![
+            ChatMessage::user("write a file"),
+            ChatMessage::assistant("已记下，下次再试"),
+            ChatMessage::assistant(tool_calls_json),
+            ChatMessage::tool(r#"{"tool_call_id":"call_FUzv","content":"Denied by user"}"#),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        assert_eq!(normalized.len(), 4, "tool_calls assistant must not be merged");
+        assert_eq!(normalized[1].role, "assistant");
+        assert_eq!(normalized[1].content, "已记下，下次再试");
+        assert_eq!(normalized[2].role, "assistant");
+        assert_eq!(normalized[2].content, tool_calls_json);
+        assert_eq!(normalized[3].role, "tool");
+    }
+
+    /// Mirror of the above — tool_calls JSON first, then a text continuation.
+    #[test]
+    fn normalize_cached_channel_turns_preserves_text_after_tool_calls_json() {
+        let tool_calls_json = r#"{"content":null,"tool_calls":[{"id":"call_x","type":"function","function":{"name":"f","arguments":"{}"}}]}"#;
+        let turns = vec![
+            ChatMessage::user("u"),
+            ChatMessage::assistant(tool_calls_json),
+            ChatMessage::assistant("post-tool reflection"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[1].content, tool_calls_json);
+        assert_eq!(normalized[2].content, "post-tool reflection");
     }
 
     /// Verify that an orphan user turn followed by a failure-marker assistant
