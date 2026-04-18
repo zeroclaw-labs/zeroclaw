@@ -5,10 +5,12 @@ use prost::Message as ProstMessage;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+};
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
@@ -270,6 +272,75 @@ fn build_interactive_card_body(recipient: &str, markdown: &str) -> serde_json::V
     })
 }
 
+/// Build the message body for an interactive card with three approval buttons.
+/// Each button's `value` carries `{ "approval_id": ..., "action": "approve"|"deny"|"always" }`.
+fn build_approval_card_body(
+    recipient: &str,
+    tool_name: &str,
+    args_summary: &str,
+    approval_id: &str,
+) -> serde_json::Value {
+    let card = serde_json::json!({
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": format!(
+                        "🔧 **工具审批请求**\n\n工具：`{tool_name}`\n{args_summary}"
+                    )
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button", "type": "primary",
+                            "text": { "tag": "plain_text", "content": "✅ 批准" },
+                            "value": { "approval_id": approval_id, "action": "approve" }
+                        },
+                        {
+                            "tag": "button", "type": "danger",
+                            "text": { "tag": "plain_text", "content": "❌ 拒绝" },
+                            "value": { "approval_id": approval_id, "action": "deny" }
+                        },
+                        {
+                            "tag": "button", "type": "default",
+                            "text": { "tag": "plain_text", "content": "✅✅ 始终批准" },
+                            "value": { "approval_id": approval_id, "action": "always" }
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+    serde_json::json!({
+        "receive_id": recipient,
+        "msg_type": "interactive",
+        "content": card.to_string(),
+    })
+}
+
+/// Parse a `card.action.trigger` event payload into `(approval_id, response, operator_open_id)`.
+/// Returns `None` if the payload doesn't have the expected approval fields.
+/// `operator_open_id` is `None` when the event omits operator info — callers must treat
+/// such events as unauthorized.
+fn parse_card_action_trigger(
+    event: &serde_json::Value,
+) -> Option<(String, ChannelApprovalResponse, Option<String>)> {
+    let value = event.pointer("/action/value")?;
+    let approval_id = value.get("approval_id")?.as_str()?.to_string();
+    let response = match value.get("action")?.as_str()? {
+        "approve" => ChannelApprovalResponse::Approve,
+        "always" => ChannelApprovalResponse::AlwaysApprove,
+        _ => ChannelApprovalResponse::Deny,
+    };
+    let operator_open_id = event
+        .pointer("/operator/open_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    Some((approval_id, response, operator_open_id))
+}
+
 /// Split markdown content into chunks that fit within the card size limit.
 /// Splits on line boundaries to avoid breaking markdown syntax.
 fn split_markdown_chunks(text: &str, max_bytes: usize) -> Vec<&str> {
@@ -402,6 +473,12 @@ pub struct LarkChannel {
     proxy_url: Option<String>,
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    /// Pending approval requests: approval_id → oneshot sender.
+    /// `listen_ws()` resolves these when a matching `card.action.trigger` event arrives.
+    pending_approvals:
+        Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ChannelApprovalResponse>>>>,
+    /// Seconds to wait for a user to tap an approval button before auto-denying (default 120).
+    approval_timeout_secs: u64,
     #[cfg(test)]
     api_base_override: Option<String>,
 }
@@ -450,6 +527,8 @@ impl LarkChannel {
             proxy_url: None,
             transcription: None,
             transcription_manager: None,
+            pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+            approval_timeout_secs: 120,
             #[cfg(test)]
             api_base_override: None,
         }
@@ -882,7 +961,14 @@ impl LarkChannel {
                         Ok(e) => e,
                         Err(e) => { tracing::error!("Lark: event JSON: {e}"); continue; }
                     };
-                    if event.header.event_type != "im.message.receive_v1" { continue; }
+                    match event.header.event_type.as_str() {
+                        "card.action.trigger" => {
+                            self.dispatch_card_action_trigger(&event.event).await;
+                            continue;
+                        }
+                        "im.message.receive_v1" => {}
+                        _ => continue,
+                    }
 
                     let event_payload = event.event;
 
@@ -1776,6 +1862,33 @@ impl LarkChannel {
 
         messages
     }
+
+    /// Resolve a `card.action.trigger` event against the pending approvals map.
+    /// Drops events whose operator is not in `allowed_users` and logs them at warn level.
+    /// Sensitive payload (tool args, message content) is NOT logged.
+    async fn dispatch_card_action_trigger(&self, event: &serde_json::Value) {
+        let Some((id, response, operator)) = parse_card_action_trigger(event) else {
+            return;
+        };
+        let operator_str = operator.as_deref().unwrap_or("");
+        if !self.is_user_allowed(operator_str) {
+            tracing::warn!(
+                approval_id = %id,
+                operator = %operator_str,
+                "Lark: dropped approval action from unauthorized operator"
+            );
+            return;
+        }
+        tracing::info!(
+            approval_id = %id,
+            operator = %operator_str,
+            decision = ?response,
+            "Lark: approval decision received"
+        );
+        if let Some(tx) = self.pending_approvals.lock().await.remove(&id) {
+            let _ = tx.send(response);
+        }
+    }
 }
 
 #[async_trait]
@@ -1827,6 +1940,70 @@ impl Channel for LarkChannel {
     async fn health_check(&self) -> bool {
         self.get_tenant_access_token().await.is_ok()
     }
+
+    /// Render an approval card and wait for the operator's tap.
+    ///
+    /// **Limitation (TBD):** only `LarkReceiveMode::Websocket` resolves card actions
+    /// today; the HTTP webhook receive mode does not yet route `card.action.trigger`
+    /// events back to pending approvals (see `listen_http`). When the channel is
+    /// configured for webhook mode, every approval will time out and auto-deny.
+    ///
+    /// **Authorization:** only `open_id`s present in `allowed_users` may resolve an
+    /// approval. Taps from other group members are dropped with a `warn` log.
+    async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        let approval_id = uuid::Uuid::new_v4().to_string();
+        let body = build_approval_card_body(
+            recipient,
+            &request.tool_name,
+            &request.arguments_summary,
+            &approval_id,
+        );
+
+        // Register the sender before sending to avoid a race where the user
+        // taps the button before the entry is in the map.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_approvals
+            .lock()
+            .await
+            .insert(approval_id.clone(), tx);
+
+        let token = match self.get_tenant_access_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                self.pending_approvals.lock().await.remove(&approval_id);
+                return Err(e);
+            }
+        };
+
+        match self
+            .send_text_once(&self.send_message_url(), &token, &body)
+            .await
+        {
+            Ok((status, _)) if status.is_success() => {}
+            Ok((status, body_text)) => {
+                self.pending_approvals.lock().await.remove(&approval_id);
+                anyhow::bail!("Lark approval card send failed ({status}): {body_text}");
+            }
+            Err(e) => {
+                self.pending_approvals.lock().await.remove(&approval_id);
+                return Err(e);
+            }
+        }
+
+        Ok(
+            match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
+                Ok(Ok(response)) => Some(response),
+                _ => {
+                    self.pending_approvals.lock().await.remove(&approval_id);
+                    Some(ChannelApprovalResponse::Deny)
+                }
+            },
+        )
+    }
 }
 
 impl LarkChannel {
@@ -1868,6 +2045,14 @@ impl LarkChannel {
                 let resp = serde_json::json!({ "challenge": challenge });
                 return (StatusCode::OK, Json(resp)).into_response();
             }
+
+            // TBD: webhook receive mode does not yet route `card.action.trigger`
+            // events back to `pending_approvals`. Approval requests issued via
+            // `request_approval` will time out and auto-deny when this channel
+            // runs in webhook mode. WS mode (`listen_ws`) is the supported path.
+            // Future work: dispatch `card.action.trigger` here via
+            // `state.channel.dispatch_card_action_trigger(&payload["event"]).await`
+            // after verifying the verification_token.
 
             // Parse event messages
             let messages = state.channel.parse_event_payload_async(&payload).await;
@@ -3841,5 +4026,224 @@ mod tests {
         let (bytes, filename) = result.unwrap();
         assert_eq!(bytes.len(), 64);
         assert_eq!(filename, "voice.m4a");
+    }
+
+    // ── Approval (card.action.trigger) tests ─────────────────────────────────
+
+    #[test]
+    fn lark_pending_approvals_map_is_initially_empty() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ch = make_channel();
+            let map = ch.pending_approvals.lock().await;
+            assert!(map.is_empty());
+        });
+    }
+
+    #[test]
+    fn lark_approval_timeout_defaults_to_120() {
+        let ch = make_channel();
+        assert_eq!(ch.approval_timeout_secs, 120);
+    }
+
+    #[test]
+    fn lark_card_action_approve_parses_correctly() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        let event = serde_json::json!({
+            "action": { "value": { "approval_id": "abc-123", "action": "approve" } }
+        });
+        let result = parse_card_action_trigger(&event);
+        assert_eq!(
+            result,
+            Some((
+                "abc-123".to_string(),
+                ChannelApprovalResponse::Approve,
+                None
+            ))
+        );
+    }
+
+    #[test]
+    fn lark_card_action_deny_parses_correctly() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        let event = serde_json::json!({
+            "action": { "value": { "approval_id": "abc-123", "action": "deny" } }
+        });
+        let result = parse_card_action_trigger(&event);
+        assert_eq!(
+            result,
+            Some(("abc-123".to_string(), ChannelApprovalResponse::Deny, None))
+        );
+    }
+
+    #[test]
+    fn lark_card_action_always_parses_correctly() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        let event = serde_json::json!({
+            "action": { "value": { "approval_id": "abc-123", "action": "always" } }
+        });
+        let result = parse_card_action_trigger(&event);
+        assert_eq!(
+            result,
+            Some((
+                "abc-123".to_string(),
+                ChannelApprovalResponse::AlwaysApprove,
+                None,
+            ))
+        );
+    }
+
+    #[test]
+    fn lark_card_action_unknown_action_resolves_as_deny() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        let event = serde_json::json!({
+            "action": { "value": { "approval_id": "abc-123", "action": "something_else" } }
+        });
+        let result = parse_card_action_trigger(&event);
+        assert_eq!(
+            result,
+            Some(("abc-123".to_string(), ChannelApprovalResponse::Deny, None))
+        );
+    }
+
+    #[test]
+    fn lark_card_action_extracts_operator_open_id() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        let event = serde_json::json!({
+            "operator": { "open_id": "ou_testuser123" },
+            "action": { "value": { "approval_id": "abc-123", "action": "approve" } }
+        });
+        let result = parse_card_action_trigger(&event);
+        assert_eq!(
+            result,
+            Some((
+                "abc-123".to_string(),
+                ChannelApprovalResponse::Approve,
+                Some("ou_testuser123".to_string()),
+            ))
+        );
+    }
+
+    #[test]
+    fn lark_card_action_missing_approval_id_returns_none() {
+        let event = serde_json::json!({
+            "action": { "value": { "action": "approve" } }
+        });
+        assert!(parse_card_action_trigger(&event).is_none());
+    }
+
+    #[test]
+    fn lark_card_action_missing_value_returns_none() {
+        let event = serde_json::json!({ "action": {} });
+        assert!(parse_card_action_trigger(&event).is_none());
+    }
+
+    #[tokio::test]
+    async fn lark_dispatch_routes_authorized_operator() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        let ch = make_channel();
+        let approval_id = "test-id-456".to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert(approval_id.clone(), tx);
+
+        let event = serde_json::json!({
+            "operator": { "open_id": "ou_testuser123" },
+            "action": { "value": { "approval_id": &approval_id, "action": "approve" } }
+        });
+        ch.dispatch_card_action_trigger(&event).await;
+
+        let result = rx.await.unwrap();
+        assert_eq!(result, ChannelApprovalResponse::Approve);
+    }
+
+    #[tokio::test]
+    async fn lark_dispatch_drops_unauthorized_operator() {
+        let ch = make_channel();
+        let approval_id = "test-id-789".to_string();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert(approval_id.clone(), tx);
+
+        let event = serde_json::json!({
+            "operator": { "open_id": "ou_intruder999" },
+            "action": { "value": { "approval_id": &approval_id, "action": "approve" } }
+        });
+        ch.dispatch_card_action_trigger(&event).await;
+
+        // The pending entry must remain — sender was not consumed.
+        assert!(
+            ch.pending_approvals.lock().await.contains_key(&approval_id),
+            "unauthorized tap must not consume the pending sender"
+        );
+        // And rx must not have received a value.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn lark_dispatch_drops_event_with_missing_operator() {
+        let ch = make_channel();
+        let approval_id = "test-id-noop".to_string();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert(approval_id.clone(), tx);
+
+        let event = serde_json::json!({
+            "action": { "value": { "approval_id": &approval_id, "action": "approve" } }
+        });
+        ch.dispatch_card_action_trigger(&event).await;
+
+        assert!(ch.pending_approvals.lock().await.contains_key(&approval_id));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn lark_dispatch_unknown_approval_id_is_silently_ignored() {
+        let ch = make_channel();
+        let event = serde_json::json!({
+            "operator": { "open_id": "ou_testuser123" },
+            "action": { "value": { "approval_id": "nonexistent", "action": "approve" } }
+        });
+        // No panic, no pending entry to mutate.
+        ch.dispatch_card_action_trigger(&event).await;
+        assert!(ch.pending_approvals.lock().await.is_empty());
+    }
+
+    #[test]
+    fn lark_build_approval_card_body_has_three_buttons() {
+        let body = build_approval_card_body("oc_chat123", "shell", "command: ls -la", "uuid-abc");
+        assert_eq!(body["receive_id"], "oc_chat123");
+        assert_eq!(body["msg_type"], "interactive");
+
+        let content: serde_json::Value =
+            serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
+        let elements = content["body"]["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 2);
+
+        let actions = elements[1]["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 3);
+
+        // All buttons carry the same approval_id
+        for action in actions {
+            assert_eq!(action["value"]["approval_id"], "uuid-abc");
+        }
+
+        // All three action strings are present
+        let action_strs: Vec<_> = actions
+            .iter()
+            .map(|a| a["value"]["action"].as_str().unwrap())
+            .collect();
+        assert!(action_strs.contains(&"approve"));
+        assert!(action_strs.contains(&"deny"));
+        assert!(action_strs.contains(&"always"));
     }
 }
