@@ -3376,7 +3376,7 @@ async fn process_channel_message(
                     let skill_config = ctx.prompt_config.skills.skill_creation.clone();
                     let improve_config = ctx.prompt_config.skills.skill_improvement.clone();
                     let memory_config = ctx.prompt_config.memory.clone();
-                    let embedding_routes = ctx.prompt_config.embedding_routes.clone();
+                    let embedding_routes = ctx.prompt_config.providers.embedding_routes.clone();
                     let api_key = ctx.api_key.clone();
                     let user_msg = msg.content.clone();
                     let channel = msg.channel.clone();
@@ -5071,7 +5071,7 @@ fn collect_configured_channels(
 
     #[cfg(feature = "one2x")]
     if config
-        .channels_config
+        .channels
         .web
         .as_ref()
         .is_some_and(|w| w.enabled)

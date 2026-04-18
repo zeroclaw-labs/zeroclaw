@@ -312,7 +312,8 @@ pub async fn handle_agent_sse(
         let config = state_for_task.config.lock().clone();
         let approval_manager = ApprovalManager::from_config(&config.autonomy);
         let provider_label = config
-            .default_provider
+            .providers
+            .fallback
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
         let max_history = config.agent.max_history_messages;
@@ -364,7 +365,7 @@ pub async fn handle_agent_sse(
             &config.web_fetch,
             &config.workspace_dir,
             &config.agents,
-            config.api_key.as_deref(),
+            config.providers.fallback_provider().and_then(|p| p.api_key.as_deref()),
             &config,
             Some(state_for_task.canvas_store.clone()),
         );
@@ -386,8 +387,8 @@ pub async fn handle_agent_sse(
         tokio::spawn(async move {
             while let Some(delta) = delta_rx.recv().await {
                 match delta {
-                    DraftEvent::Clear | DraftEvent::Progress(_) => {}
-                    DraftEvent::Content(text) => {
+                    DraftEvent::Status(_) => {}
+                    DraftEvent::Text(text) => {
                         let _ = event_tx_delta.send(AgentEvent::chunk(text)).await;
                     }
                 }
@@ -429,6 +430,7 @@ pub async fn handle_agent_sse(
             &config.pacing,
             0,
             0,
+            None,
             None,
         )
         .await;

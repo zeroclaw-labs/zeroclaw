@@ -2106,8 +2106,8 @@ pub async fn run(
     let skill_embedder: std::sync::Arc<dyn zeroclaw_memory::embeddings::EmbeddingProvider> = {
         let resolved = zeroclaw_memory::resolve_embedding_config(
             &config.memory,
-            &config.embedding_routes,
-            config.api_key.as_deref(),
+            &config.providers.embedding_routes,
+            fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
         );
         std::sync::Arc::from(zeroclaw_memory::embeddings::create_embedding_provider(
             &resolved.provider,
@@ -3254,8 +3254,8 @@ pub async fn process_message(
     let skill_embedder: std::sync::Arc<dyn zeroclaw_memory::embeddings::EmbeddingProvider> = {
         let resolved = zeroclaw_memory::resolve_embedding_config(
             &config.memory,
-            &config.embedding_routes,
-            config.api_key.as_deref(),
+            &config.providers.embedding_routes,
+            fallback_provider_pm.and_then(|e| e.api_key.as_deref()),
         );
         std::sync::Arc::from(zeroclaw_memory::embeddings::create_embedding_provider(
             &resolved.provider,
