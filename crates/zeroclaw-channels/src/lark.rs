@@ -1128,7 +1128,10 @@ impl LarkChannel {
                                 Some(marker) => (marker, Vec::new()),
                                 None => {
                                     tracing::warn!("Lark WS: failed to download image {image_key}");
-                                    (format!("[IMAGE:{image_key} | download failed]"), Vec::new())
+                                    // Plain text fallback — must NOT be `[IMAGE:...]` or
+                                    // the multimodal pipeline will try to load this as a
+                                    // file path and crash the LLM call.
+                                    (format!("(image {image_key}: download failed)"), Vec::new())
                                 }
                             }
                         }
@@ -1929,7 +1932,9 @@ impl LarkChannel {
                             Some(m) => m,
                             None => {
                                 tracing::warn!("Lark: failed to download image {key}");
-                                format!("[IMAGE:{key} | download failed]")
+                                // Plain text fallback — must NOT be `[IMAGE:...]` or the
+                                // multimodal pipeline will try to load it as a file path.
+                                format!("(image {key}: download failed)")
                             }
                         };
                         (marker, Vec::new())

@@ -366,8 +366,26 @@ async fn normalize_remote_image(
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
 }
 
+/// Strip the Windows verbatim/extended-length prefix `\\?\` (or `\\?\UNC\`)
+/// from a path string.  Returns the original input on non-Windows or when
+/// there is no prefix to strip.  Borrows when possible to avoid allocations.
+fn strip_windows_verbatim_prefix(source: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = source.strip_prefix(r"\\?\UNC\") {
+        return std::borrow::Cow::Owned(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = source.strip_prefix(r"\\?\") {
+        return std::borrow::Cow::Borrowed(rest);
+    }
+    std::borrow::Cow::Borrowed(source)
+}
+
 async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result<String> {
-    let path = Path::new(source);
+    // Older session memory may contain Windows verbatim/extended-length paths
+    // (`\\?\C:\...`).  Strip the prefix before opening so historical markers
+    // resolve and so the data URI we build can be safely re-serialized by
+    // downstream HTTP clients.
+    let normalized_source = strip_windows_verbatim_prefix(source);
+    let path = Path::new(normalized_source.as_ref());
     if !path.exists() || !path.is_file() {
         return Err(MultimodalError::ImageSourceNotFound {
             input: source.to_string(),
@@ -506,6 +524,34 @@ mod tests {
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0], "/tmp/a.png");
         assert_eq!(refs[1], "https://example.com/b.jpg");
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_removes_dos_prefix() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\E:\Tools\img.png").as_ref(),
+            r"E:\Tools\img.png"
+        );
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_handles_unc_prefix() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\img.png").as_ref(),
+            r"\\server\share\img.png"
+        );
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_returns_input_when_absent() {
+        assert_eq!(
+            strip_windows_verbatim_prefix("/tmp/img.png").as_ref(),
+            "/tmp/img.png"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"C:\Users\img.png").as_ref(),
+            r"C:\Users\img.png"
+        );
     }
 
     #[test]
