@@ -1528,6 +1528,60 @@ pub async fn handle_api_session_state(
     }
 }
 
+// ── Channels endpoint ────────────────────────────────────────────
+
+/// GET /api/channels — per-channel detail for the dashboard Channels tab.
+pub async fn handle_api_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let health = zeroclaw_runtime::health::snapshot();
+    let stats = zeroclaw_runtime::channel_stats::get_stats();
+
+    let channels: Vec<serde_json::Value> = config
+        .channels
+        .channels()
+        .into_iter()
+        .filter(|(_, present)| *present)
+        .map(|(handle, _)| {
+            let display_name = handle.name();
+            let channel_type = display_name.to_lowercase();
+
+            // Match health component entry "channel:<type>"
+            let component_key = format!("channel:{channel_type}");
+            let component = health.components.get(&component_key);
+
+            let (status, health_state) = match component {
+                Some(c) if c.status == "ok" => ("active", "healthy"),
+                Some(c) if c.status == "error" => ("error", "down"),
+                Some(_) => ("inactive", "degraded"),
+                None => ("inactive", "degraded"),
+            };
+
+            let stat = stats.get(&channel_type);
+            let message_count = stat.map_or(0, |s| s.message_count);
+            let last_message_at = stat.and_then(|s| s.last_message_at.clone());
+
+            serde_json::json!({
+                "name": display_name,
+                "type": channel_type,
+                "enabled": true,
+                "status": status,
+                "health": health_state,
+                "message_count": message_count,
+                "last_message_at": last_message_at,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!(channels)).into_response()
+}
+
 // ── Claude Code hook endpoint ────────────────────────────────────
 
 /// POST /hooks/claude-code — receives HTTP hook events from Claude Code

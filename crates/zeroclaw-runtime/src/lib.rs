@@ -8,6 +8,7 @@ pub mod util;
 
 pub mod agent;
 pub mod approval;
+pub mod channel_stats;
 pub mod cost;
 pub mod cron;
 pub mod daemon;
