@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 
+pub use crate::tools::Artifact;
+
 /// A message received from or sent to a channel
 #[derive(Debug, Clone)]
 pub struct ChannelMessage {
@@ -71,6 +73,39 @@ pub trait Channel: Send + Sync {
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
         true
+    }
+
+    /// Send a message along with a list of tool-produced file artifacts.
+    ///
+    /// Default implementation ignores `artifacts` and falls back to
+    /// [`send`]. Channels that support native file attachments (Lark
+    /// `im/v1/files`, Telegram `sendDocument`, Slack `files.upload`, …)
+    /// should override this and upload each artifact inline so the user
+    /// sees a proper attachment card rather than a download link.
+    ///
+    /// The default implementation is intentionally a fallback rather than
+    /// a hard `unimplemented!`: this keeps the contract backward compatible
+    /// for every existing channel until PR 3 wires native uploads.
+    async fn send_with_artifacts(
+        &self,
+        message: &SendMessage,
+        _artifacts: &[Artifact],
+    ) -> anyhow::Result<()> {
+        self.send(message).await
+    }
+
+    /// Draft equivalent of [`send_with_artifacts`].
+    ///
+    /// Default implementation ignores `artifacts` and falls back to
+    /// [`finalize_draft`]. See `send_with_artifacts` for rationale.
+    async fn finalize_draft_with_artifacts(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        _artifacts: &[Artifact],
+    ) -> anyhow::Result<()> {
+        self.finalize_draft(recipient, message_id, text).await
     }
 
     /// Signal that the bot is processing a response (e.g. "typing" indicator).
@@ -220,6 +255,72 @@ mod tests {
             .send(&SendMessage::new("hello", "bob"))
             .await
             .is_ok());
+    }
+
+    /// PR 2: the default `send_with_artifacts` / `finalize_draft_with_artifacts`
+    /// impls must forward to `send` / `finalize_draft`, preserving pre-PR-2
+    /// behaviour for every channel that has not yet overridden them.
+    #[tokio::test]
+    async fn default_artifact_methods_fall_back_to_send() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct SendCountingChannel {
+            sends: Arc<AtomicUsize>,
+            finalize_drafts: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Channel for SendCountingChannel {
+            fn name(&self) -> &str {
+                "count"
+            }
+            async fn send(&self, _m: &SendMessage) -> anyhow::Result<()> {
+                self.sends.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn finalize_draft(
+                &self,
+                _r: &str,
+                _id: &str,
+                _t: &str,
+            ) -> anyhow::Result<()> {
+                self.finalize_drafts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        let finalizes = Arc::new(AtomicUsize::new(0));
+        let ch = SendCountingChannel {
+            sends: sends.clone(),
+            finalize_drafts: finalizes.clone(),
+        };
+
+        // Any artifact payload — default impl must ignore it and call send.
+        let art = Artifact {
+            path: "x.docx".into(),
+            name: "x.docx".into(),
+            mime: None,
+            size_bytes: 1,
+            download_url: None,
+        };
+
+        ch.send_with_artifacts(&SendMessage::new("hi", "bob"), std::slice::from_ref(&art))
+            .await
+            .unwrap();
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+
+        ch.finalize_draft_with_artifacts("bob", "m1", "text", &[art])
+            .await
+            .unwrap();
+        assert_eq!(finalizes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

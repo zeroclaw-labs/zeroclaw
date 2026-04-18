@@ -1355,6 +1355,50 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
+/// Scan tool result messages added during a turn and extract structured
+/// [`Artifact`](crate::tools::Artifact) entries produced by tools via the
+/// sentinel codec in `src/tools/artifact.rs`.
+///
+/// This is the PR 2 consumer side of the artifact contract: it lets channels
+/// that implement `send_with_artifacts` (PR 3: Lark native upload) surface
+/// tool-produced `.docx`/`.pdf`/etc. as real attachments rather than relying
+/// on the regex-based `extract_download_urls_from_history` fallback — which
+/// stays in place until every channel has a native implementation.
+///
+/// Deduplicates artifacts by `path` (same file written twice in one turn
+/// surfaces once) while preserving first-seen order so the UI order matches
+/// the tool-call order.
+fn extract_artifacts_from_history(
+    history: &[ChatMessage],
+    start_index: usize,
+) -> Vec<crate::tools::Artifact> {
+    let mut seen_paths: HashSet<String> = HashSet::new();
+    let mut out: Vec<crate::tools::Artifact> = Vec::new();
+    for msg in history.iter().skip(start_index) {
+        // Mirror the role-aware content extraction from `extract_download_urls_from_history`:
+        // native-mode tool results are a JSON envelope; prompt-mode results are the raw string.
+        let content = if msg.role == "tool" {
+            serde_json::from_str::<serde_json::Value>(&msg.content)
+                .ok()
+                .and_then(|v| {
+                    v.get("content")
+                        .and_then(|c| c.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_default()
+        } else {
+            msg.content.clone()
+        };
+        let (_cleaned, artifacts) = crate::tools::extract_artifacts(&content);
+        for art in artifacts {
+            if seen_paths.insert(art.path.clone()) {
+                out.push(art);
+            }
+        }
+    }
+    out
+}
+
 /// Scan tool result messages added during a turn and extract any signed
 /// download URLs (lines starting with "Download: http...").
 /// Used to guarantee download buttons appear in the outbound message even
@@ -2080,8 +2124,36 @@ async fn process_channel_message(
                 sanitized_response
             };
 
-            // Guarantee download URLs from file_write tool results appear in the
-            // outbound message even if the LLM omitted them from its final response.
+            // PR 2: collect structured artifacts produced by tools during this
+            // turn. They will be handed to the channel via `send_with_artifacts`
+            // (default impl ignores them, so pre-PR-3 behaviour is byte-identical).
+            //
+            // Order of operations intentionally:
+            //   1. Strip any sentinel that LLM may have imitated in its reply.
+            //      This is defence-in-depth: sentinels are HTML comments and
+            //      invisible in Markdown, but we do not want them in transit.
+            //   2. Merge artifacts from tool history and from LLM reply (if any).
+            //   3. Fall back to the legacy "append Download: URL" text path so
+            //      default-impl channels still surface downloads as before.
+            let (cleaned_reply, reply_side_artifacts) =
+                crate::tools::extract_artifacts(&delivered_response);
+            let delivered_response = cleaned_reply;
+            let turn_artifacts: Vec<crate::tools::Artifact> = {
+                let mut merged =
+                    extract_artifacts_from_history(&history, history_len_before_tools);
+                let mut seen: HashSet<String> =
+                    merged.iter().map(|a| a.path.clone()).collect();
+                for art in reply_side_artifacts {
+                    if seen.insert(art.path.clone()) {
+                        merged.push(art);
+                    }
+                }
+                merged
+            };
+
+            // Legacy URL-text fallback: still populate Download: lines so
+            // channels that do NOT yet override `send_with_artifacts` keep
+            // their current download-button rendering.
             let delivered_response = {
                 let tool_urls =
                     extract_download_urls_from_history(&history, history_len_before_tools);
@@ -2139,21 +2211,28 @@ async fn process_channel_message(
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     if let Err(e) = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
+                        .finalize_draft_with_artifacts(
+                            &msg.reply_target,
+                            draft_id,
+                            &delivered_response,
+                            &turn_artifacts,
+                        )
                         .await
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
                         let _ = channel
-                            .send(
+                            .send_with_artifacts(
                                 &SendMessage::new(&delivered_response, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
+                                &turn_artifacts,
                             )
                             .await;
                     }
                 } else if let Err(e) = channel
-                    .send(
+                    .send_with_artifacts(
                         &SendMessage::new(delivered_response, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone()),
+                        &turn_artifacts,
                     )
                     .await
                 {
@@ -7141,5 +7220,109 @@ This is an example JSON object for profile settings."#;
             content: "Written 10 bytes to file.md".to_string(),
         }];
         assert!(extract_download_urls_from_history(&history, 0).is_empty());
+    }
+
+    // ── extract_artifacts_from_history (PR 2) ─────────────────────────
+
+    fn artifact_for(path: &str, name: &str) -> crate::tools::Artifact {
+        crate::tools::Artifact {
+            path: path.into(),
+            name: name.into(),
+            mime: None,
+            size_bytes: 1,
+            download_url: None,
+        }
+    }
+
+    /// Tool output carrying a sentinel appended by `append_artifacts` must be
+    /// recovered as a structured artifact.
+    #[test]
+    fn extract_artifacts_from_history_prompt_mode() {
+        let art = artifact_for("report.docx", "report.docx");
+        let mut raw_output = "Written 100 bytes to report.docx".to_string();
+        crate::tools::append_artifacts(&mut raw_output, std::slice::from_ref(&art));
+        let tool_result_msg = ChatMessage {
+            role: "user".to_string(),
+            content: format!("[Tool results]\n<tool_result name=\"shell\">\n{raw_output}\n</tool_result>"),
+        };
+        let artifacts = extract_artifacts_from_history(&[tool_result_msg], 0);
+        assert_eq!(artifacts, vec![art]);
+    }
+
+    /// Native-mode tool results: sentinel lives inside the JSON envelope's
+    /// `content` field and must still be recovered.
+    #[test]
+    fn extract_artifacts_from_history_native_mode() {
+        let art = artifact_for("q1.pdf", "q1.pdf");
+        let mut raw = "Generated q1.pdf".to_string();
+        crate::tools::append_artifacts(&mut raw, std::slice::from_ref(&art));
+        let tool_result_msg = ChatMessage {
+            role: "tool".to_string(),
+            content: serde_json::json!({
+                "tool_call_id": "call_abc",
+                "content": raw,
+            })
+            .to_string(),
+        };
+        let artifacts = extract_artifacts_from_history(&[tool_result_msg], 0);
+        assert_eq!(artifacts, vec![art]);
+    }
+
+    /// Same `path` produced twice in one turn must collapse to one entry
+    /// (preserving first-seen order).
+    #[test]
+    fn extract_artifacts_from_history_deduplicates_by_path() {
+        let art1 = artifact_for("out.docx", "out.docx");
+        let art2 = artifact_for("out.docx", "out.docx"); // same path
+        let art3 = artifact_for("other.docx", "other.docx");
+
+        let mut m1 = String::from("first");
+        crate::tools::append_artifacts(&mut m1, std::slice::from_ref(&art1));
+        let mut m2 = String::from("second");
+        crate::tools::append_artifacts(&mut m2, &[art2, art3.clone()]);
+
+        let history = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: format!("[Tool results]\n<tool_result name=\"x\">\n{m1}\n</tool_result>"),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: format!("[Tool results]\n<tool_result name=\"x\">\n{m2}\n</tool_result>"),
+            },
+        ];
+        let artifacts = extract_artifacts_from_history(&history, 0);
+        assert_eq!(artifacts, vec![art1, art3]);
+    }
+
+    /// `start_index` must be honoured identically to the URL variant — used by
+    /// the turn-scoped collection in `process_channel_message`.
+    #[test]
+    fn extract_artifacts_from_history_respects_start_index() {
+        let art = artifact_for("skip_me.pdf", "skip_me.pdf");
+        let mut content = String::from("pre-turn");
+        crate::tools::append_artifacts(&mut content, &[art]);
+        let history = vec![ChatMessage {
+            role: "user".into(),
+            content,
+        }];
+        assert!(extract_artifacts_from_history(&history, 1).is_empty());
+    }
+
+    /// Messages without sentinels must produce no artifacts and must not
+    /// allocate needlessly.
+    #[test]
+    fn extract_artifacts_from_history_empty_when_no_sentinel() {
+        let history = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "[Tool results]\n<tool_result name=\"shell\">\nplain output\n</tool_result>".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "some reply".into(),
+            },
+        ];
+        assert!(extract_artifacts_from_history(&history, 0).is_empty());
     }
 }
