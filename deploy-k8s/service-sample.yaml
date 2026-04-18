@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: zeroclaw
+  namespace: zeroclaw
+  labels:
+    app.kubernetes.io/name: zeroclaw
+    app.kubernetes.io/part-of: zeroclaw
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: zeroclaw
+  ports:
+    - name: gateway
+      port: 42617
+      targetPort: gateway
+      protocol: TCP
