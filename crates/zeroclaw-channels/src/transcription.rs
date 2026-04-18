@@ -552,6 +552,306 @@ impl TranscriptionProvider for GoogleSttProvider {
     }
 }
 
+// ── LocalSttProvider (native whisper.cpp) ───────────────────────
+
+/// Native local STT provider — runs Whisper inference in-process via
+/// whisper.cpp (through `whisper-rs`). No external server, no API key.
+///
+/// The GGML model file is auto-downloaded from Hugging Face Hub on first
+/// `transcribe()` call and cached in `~/.zeroclaw/models/whisper/`.
+///
+/// Audio is decoded to 16 kHz mono f32 PCM via `ffmpeg` before inference.
+///
+/// Gated behind the `local-stt` cargo feature.
+#[cfg(feature = "local-stt")]
+pub struct LocalSttProvider {
+    model_size: String,
+    model_dir: std::path::PathBuf,
+    language: Option<String>,
+    max_audio_bytes: usize,
+    /// Cached model path after first download.
+    model_path: tokio::sync::OnceCell<std::path::PathBuf>,
+}
+
+#[cfg(feature = "local-stt")]
+impl LocalSttProvider {
+    /// HuggingFace repo that hosts the official GGML Whisper models.
+    const HF_REPO: &'static str = "ggerganov/whisper.cpp";
+
+    /// Map user-friendly model size to the GGML filename in the HF repo.
+    fn ggml_filename(model_size: &str) -> Result<&'static str> {
+        match model_size {
+            "tiny" => Ok("ggml-tiny.bin"),
+            "tiny.en" => Ok("ggml-tiny.en.bin"),
+            "base" => Ok("ggml-base.bin"),
+            "base.en" => Ok("ggml-base.en.bin"),
+            "small" => Ok("ggml-small.bin"),
+            "small.en" => Ok("ggml-small.en.bin"),
+            "medium" => Ok("ggml-medium.bin"),
+            "medium.en" => Ok("ggml-medium.en.bin"),
+            "large-v1" => Ok("ggml-large-v1.bin"),
+            "large-v2" => Ok("ggml-large-v2.bin"),
+            "large-v3" => Ok("ggml-large-v3.bin"),
+            "large-v3-turbo" => Ok("ggml-large-v3-turbo.bin"),
+            other => bail!(
+                "Unknown Whisper model size '{other}'. \
+                 Valid: tiny, tiny.en, base, base.en, small, small.en, \
+                 medium, medium.en, large-v1, large-v2, large-v3, large-v3-turbo"
+            ),
+        }
+    }
+
+    /// Resolve (and download if necessary) the GGML model file.
+    async fn ensure_model(
+        model_size: &str,
+        model_dir: &std::path::Path,
+    ) -> Result<std::path::PathBuf> {
+        let filename = Self::ggml_filename(model_size)?;
+        let dest = model_dir.join(filename);
+
+        // Fast path: model already cached.
+        if dest.is_file() {
+            tracing::debug!("Local STT model already cached: {}", dest.display());
+            return Ok(dest);
+        }
+
+        tracing::info!(
+            "Downloading Whisper model '{model_size}' from Hugging Face Hub \
+             to {} (first-time setup)…",
+            model_dir.display()
+        );
+        std::fs::create_dir_all(model_dir)
+            .with_context(|| format!("Failed to create model directory {}", model_dir.display()))?;
+
+        // Download via hf-hub (async/tokio).
+        let api = hf_hub::api::tokio::Api::new()
+            .context("Failed to initialise Hugging Face Hub client")?;
+        let repo = api.model(Self::HF_REPO.to_string());
+        let downloaded = repo
+            .get(filename)
+            .await
+            .with_context(|| format!("Failed to download {filename} from {}", Self::HF_REPO))?;
+
+        // hf-hub caches to its own directory — copy to our model_dir for a
+        // stable, user-visible location.
+        if downloaded != dest {
+            std::fs::copy(&downloaded, &dest).with_context(|| {
+                format!(
+                    "Failed to copy model from {} to {}",
+                    downloaded.display(),
+                    dest.display()
+                )
+            })?;
+        }
+
+        tracing::info!("Model ready: {}", dest.display());
+        Ok(dest)
+    }
+
+    /// Build from config (synchronous). Model download is deferred to first use.
+    pub fn from_config(config: &zeroclaw_config::schema::LocalSttConfig) -> Result<Self> {
+        // Validate model_size eagerly so typos fail at startup.
+        Self::ggml_filename(&config.model_size)?;
+
+        let model_dir = match config
+            .model_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(dir) => std::path::PathBuf::from(shellexpand::tilde(dir).as_ref()),
+            None => {
+                let base =
+                    directories::BaseDirs::new().context("Cannot determine home directory")?;
+                base.home_dir()
+                    .join(".zeroclaw")
+                    .join("models")
+                    .join("whisper")
+            }
+        };
+
+        anyhow::ensure!(
+            config.max_audio_bytes > 0,
+            "local: `max_audio_bytes` must be greater than zero"
+        );
+
+        Ok(Self {
+            model_size: config.model_size.clone(),
+            model_dir,
+            language: config.language.clone(),
+            max_audio_bytes: config.max_audio_bytes,
+            model_path: tokio::sync::OnceCell::new(),
+        })
+    }
+
+    /// Get or download the model path (lazy, thread-safe).
+    async fn get_model_path(&self) -> Result<&std::path::Path> {
+        self.model_path
+            .get_or_try_init(|| Self::ensure_model(&self.model_size, &self.model_dir))
+            .await
+            .map(|p| p.as_path())
+    }
+
+    /// Decode any audio file to 16 kHz mono f32 PCM samples via `ffmpeg`.
+    async fn decode_audio_to_pcm(audio_data: &[u8], file_name: &str) -> Result<Vec<f32>> {
+        use tokio::process::Command;
+
+        let ext = file_name
+            .rsplit_once('.')
+            .map(|(_, e)| format!(".{e}"))
+            .unwrap_or_else(|| ".ogg".to_string());
+
+        let tmp_dir = std::env::temp_dir();
+        let input_path = tmp_dir.join(format!("zc_stt_in_{}{ext}", uuid::Uuid::new_v4()));
+        let output_path = tmp_dir.join(format!("zc_stt_out_{}.wav", uuid::Uuid::new_v4()));
+
+        // Write input audio.
+        tokio::fs::write(&input_path, audio_data)
+            .await
+            .with_context(|| format!("Failed to write temp audio {}", input_path.display()))?;
+
+        // Run ffmpeg: convert to 16 kHz mono s16le WAV.
+        let ffmpeg_result = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-i",
+                input_path.to_str().unwrap_or("input"),
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-f",
+                "wav",
+                output_path.to_str().unwrap_or("output"),
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .context(
+                "Failed to run ffmpeg — ensure it is installed \
+                 (e.g. `sudo dnf install ffmpeg-free` or `sudo apt install ffmpeg`)",
+            )?;
+
+        let _ = tokio::fs::remove_file(&input_path).await;
+
+        if !ffmpeg_result.status.success() {
+            let _ = tokio::fs::remove_file(&output_path).await;
+            let stderr = String::from_utf8_lossy(&ffmpeg_result.stderr);
+            bail!(
+                "ffmpeg failed ({}): {}",
+                ffmpeg_result.status,
+                stderr.lines().last().unwrap_or("unknown error")
+            );
+        }
+
+        // Read WAV output and extract f32 samples.
+        let wav_bytes = tokio::fs::read(&output_path)
+            .await
+            .with_context(|| format!("Failed to read ffmpeg output {}", output_path.display()))?;
+        let _ = tokio::fs::remove_file(&output_path).await;
+
+        // Skip 44-byte WAV header, convert i16 LE samples to f32.
+        anyhow::ensure!(wav_bytes.len() >= 44, "ffmpeg produced an invalid WAV file");
+        let pcm_data = &wav_bytes[44..];
+        let samples: Vec<f32> = pcm_data
+            .chunks_exact(2)
+            .map(|chunk| {
+                let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+                sample as f32 / 32768.0
+            })
+            .collect();
+
+        anyhow::ensure!(
+            !samples.is_empty(),
+            "Audio produced no PCM samples after decoding"
+        );
+
+        Ok(samples)
+    }
+}
+
+#[cfg(feature = "local-stt")]
+#[async_trait]
+impl TranscriptionProvider for LocalSttProvider {
+    fn name(&self) -> &str {
+        "local"
+    }
+
+    async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
+        if audio_data.len() > self.max_audio_bytes {
+            bail!(
+                "Audio file too large ({} bytes, local max {})",
+                audio_data.len(),
+                self.max_audio_bytes
+            );
+        }
+
+        // Validate audio format.
+        let _ = resolve_audio_format(file_name)?;
+
+        // Ensure model is downloaded (lazy, first call only).
+        let model_path = self.get_model_path().await?.to_path_buf();
+
+        // Decode to 16 kHz mono f32 PCM.
+        let samples = Self::decode_audio_to_pcm(audio_data, file_name).await?;
+
+        // Run whisper.cpp inference on a blocking thread (CPU-bound).
+        let language = self.language.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let ctx = whisper_rs::WhisperContext::new_with_params(
+                model_path.to_str().unwrap_or("model.bin"),
+                whisper_rs::WhisperContextParameters::default(),
+            )
+            .context("Failed to load Whisper model")?;
+
+            let mut state = ctx
+                .create_state()
+                .context("Failed to create Whisper state")?;
+
+            let mut params =
+                whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
+
+            params.set_print_special(false);
+            params.set_print_progress(false);
+            params.set_print_realtime(false);
+            params.set_print_timestamps(false);
+            params.set_suppress_blank(true);
+
+            if let Some(ref lang) = language {
+                params.set_language(Some(lang));
+            }
+
+            state
+                .full(params, &samples)
+                .context("Whisper inference failed")?;
+
+            let n_segments = state.full_n_segments();
+            let mut text = String::new();
+            for i in 0..n_segments {
+                if let Some(segment) = state.get_segment(i) {
+                    if let Ok(s) = segment.to_str() {
+                        if !text.is_empty() {
+                            text.push(' ');
+                        }
+                        text.push_str(s.trim());
+                    }
+                }
+            }
+
+            if text.is_empty() {
+                text = "(no speech detected)".to_string();
+            }
+
+            Ok(text)
+        })
+        .await
+        .context("Whisper inference task panicked")?
+    }
+}
+
 // ── LocalWhisperProvider ────────────────────────────────────────
 
 /// Self-hosted faster-whisper-compatible STT provider.
@@ -734,6 +1034,18 @@ impl TranscriptionManager {
             }
         }
 
+        #[cfg(feature = "local-stt")]
+        if let Some(ref local_cfg) = config.local {
+            match LocalSttProvider::from_config(local_cfg) {
+                Ok(p) => {
+                    providers.insert("local".to_string(), Box::new(p));
+                }
+                Err(e) => {
+                    tracing::warn!("local STT config invalid, provider skipped: {e}");
+                }
+            }
+        }
+
         let default_provider = config.default_provider.clone();
 
         if config.enabled && !providers.contains_key(&default_provider) {
@@ -836,6 +1148,15 @@ pub async fn transcribe_audio(
             )?;
             let google = GoogleSttProvider::from_config(google_cfg)?;
             google.transcribe(&audio_data, file_name).await
+        }
+        #[cfg(feature = "local-stt")]
+        "local" => {
+            let local_cfg = config.local.as_ref().context(
+                "Default transcription provider 'local' is not configured. \
+                 Add [transcription.local] and build with --features local-stt",
+            )?;
+            let local = LocalSttProvider::from_config(local_cfg)?;
+            local.transcribe(&audio_data, file_name).await
         }
         other => bail!("Unsupported transcription provider '{other}'"),
     }
@@ -1135,6 +1456,7 @@ mod tests {
         assert!(config.assemblyai.is_none());
         assert!(config.google.is_none());
         assert!(config.local_whisper.is_none());
+        assert!(config.local.is_none());
         assert!(!config.transcribe_non_ptt_audio);
     }
 
@@ -1404,6 +1726,132 @@ mod tests {
         assert!(
             err.to_string().contains("Bad Gateway"),
             "expected plain-text body in error, got: {err}"
+        );
+    }
+
+    // ── LocalSttProvider tests (feature-gated) ──────────────────
+
+    #[test]
+    fn backward_compat_config_has_local_none() {
+        let config = TranscriptionConfig::default();
+        assert!(config.local.is_none());
+    }
+
+    #[cfg(feature = "local-stt")]
+    #[test]
+    fn local_stt_ggml_filename_maps_all_sizes() {
+        let cases = [
+            ("tiny", "ggml-tiny.bin"),
+            ("tiny.en", "ggml-tiny.en.bin"),
+            ("base", "ggml-base.bin"),
+            ("base.en", "ggml-base.en.bin"),
+            ("small", "ggml-small.bin"),
+            ("small.en", "ggml-small.en.bin"),
+            ("medium", "ggml-medium.bin"),
+            ("medium.en", "ggml-medium.en.bin"),
+            ("large-v1", "ggml-large-v1.bin"),
+            ("large-v2", "ggml-large-v2.bin"),
+            ("large-v3", "ggml-large-v3.bin"),
+            ("large-v3-turbo", "ggml-large-v3-turbo.bin"),
+        ];
+        for (size, expected) in cases {
+            assert_eq!(
+                LocalSttProvider::ggml_filename(size).unwrap(),
+                expected,
+                "failed for size: {size}"
+            );
+        }
+    }
+
+    #[cfg(feature = "local-stt")]
+    #[test]
+    fn local_stt_ggml_filename_rejects_unknown() {
+        let err = LocalSttProvider::ggml_filename("nonexistent").unwrap_err();
+        assert!(
+            err.to_string().contains("Unknown Whisper model size"),
+            "got: {err}"
+        );
+    }
+
+    #[cfg(feature = "local-stt")]
+    #[test]
+    fn local_stt_from_config_rejects_bad_model_size() {
+        let cfg = zeroclaw_config::schema::LocalSttConfig {
+            model_size: "nonexistent".to_string(),
+            ..zeroclaw_config::schema::LocalSttConfig::default()
+        };
+        let err = LocalSttProvider::from_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("Unknown Whisper model size"),
+            "got: {err}"
+        );
+    }
+
+    #[cfg(feature = "local-stt")]
+    #[test]
+    fn local_stt_from_config_rejects_zero_max_audio_bytes() {
+        let cfg = zeroclaw_config::schema::LocalSttConfig {
+            max_audio_bytes: 0,
+            ..zeroclaw_config::schema::LocalSttConfig::default()
+        };
+        let err = LocalSttProvider::from_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`max_audio_bytes` must be greater than zero"),
+            "got: {err}"
+        );
+    }
+
+    #[cfg(feature = "local-stt")]
+    #[test]
+    fn local_stt_from_config_accepts_defaults() {
+        let cfg = zeroclaw_config::schema::LocalSttConfig::default();
+        let provider = LocalSttProvider::from_config(&cfg).unwrap();
+        assert_eq!(provider.name(), "local");
+    }
+
+    #[cfg(feature = "local-stt")]
+    #[test]
+    fn local_stt_registered_when_config_present() {
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
+
+        let config = TranscriptionConfig {
+            local: Some(zeroclaw_config::schema::LocalSttConfig::default()),
+            default_provider: "local".to_string(),
+            ..TranscriptionConfig::default()
+        };
+
+        let manager = TranscriptionManager::new(&config).unwrap();
+        assert!(
+            manager.available_providers().contains(&"local"),
+            "expected 'local' in {:?}",
+            manager.available_providers()
+        );
+    }
+
+    #[cfg(feature = "local-stt")]
+    #[tokio::test]
+    async fn local_stt_rejects_oversized_audio() {
+        let cfg = zeroclaw_config::schema::LocalSttConfig::default();
+        let provider = LocalSttProvider::from_config(&cfg).unwrap();
+        let big = vec![0u8; cfg.max_audio_bytes + 1];
+        let err = provider.transcribe(&big, "voice.ogg").await.unwrap_err();
+        assert!(err.to_string().contains("too large"), "got: {err}");
+    }
+
+    #[cfg(feature = "local-stt")]
+    #[tokio::test]
+    async fn local_stt_rejects_unsupported_format() {
+        let cfg = zeroclaw_config::schema::LocalSttConfig::default();
+        let provider = LocalSttProvider::from_config(&cfg).unwrap();
+        let err = provider
+            .transcribe(&[0u8; 100], "voice.aac")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported audio format"),
+            "got: {err}"
         );
     }
 }

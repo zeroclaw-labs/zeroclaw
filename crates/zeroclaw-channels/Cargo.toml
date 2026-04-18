@@ -69,6 +69,10 @@ wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = f
 qrcode = { version = "0.14", optional = true }
 shellexpand = "3.1"
 
+# Local STT (whisper.cpp via whisper-rs)
+whisper-rs = { version = "0.16", optional = true }
+hf-hub = { version = "0.5", optional = true, default-features = false, features = ["tokio"] }
+
 [features]
 default = [
     "channel-discord", "channel-slack", "channel-signal", "channel-mattermost",
@@ -110,6 +114,7 @@ channel-voice-call = []
 channel-acp-server = []
 channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
 voice-wake = ["dep:cpal", "zeroclaw-config/voice-wake"]
+local-stt = ["dep:whisper-rs", "dep:hf-hub"]
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }

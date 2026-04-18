@@ -857,7 +857,7 @@ pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
     #[serde(default)]
     pub enabled: bool,
-    /// Default STT provider: "groq", "openai", "deepgram", "assemblyai", "google".
+    /// Default STT provider: "groq", "openai", "deepgram", "assemblyai", "google", "local".
     #[serde(default = "default_transcription_provider")]
     pub default_provider: String,
     /// API key used for transcription requests (Groq provider).
@@ -903,6 +903,11 @@ pub struct TranscriptionConfig {
     #[serde(default)]
     #[nested]
     pub local_whisper: Option<LocalWhisperConfig>,
+    /// Native local STT via whisper.cpp (no external server or API key required).
+    /// Requires the `local-stt` feature flag.
+    #[serde(default)]
+    #[nested]
+    pub local: Option<LocalSttConfig>,
     /// Also transcribe non-PTT (forwarded/regular) audio messages on WhatsApp,
     /// not just voice notes.  Default: `false` (preserves legacy behavior).
     #[serde(default)]
@@ -925,6 +930,7 @@ impl Default for TranscriptionConfig {
             assemblyai: None,
             google: None,
             local_whisper: None,
+            local: None,
             transcribe_non_ptt_audio: false,
         }
     }
@@ -1403,6 +1409,51 @@ fn default_local_whisper_max_audio_bytes() -> usize {
 
 fn default_local_whisper_timeout_secs() -> u64 {
     300
+}
+
+/// Native local STT configuration (`[transcription.local]`).
+///
+/// Runs Whisper inference directly in-process via whisper.cpp (no external server
+/// or API key required). The GGML model is auto-downloaded from Hugging Face Hub
+/// on first use and cached locally.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "transcription.local"]
+pub struct LocalSttConfig {
+    /// Whisper model size: `"tiny"`, `"base"`, `"small"`, `"medium"`,
+    /// `"large-v3"`, etc.  Defaults to `"base"`.
+    #[serde(default = "default_local_stt_model_size")]
+    pub model_size: String,
+    /// Optional language hint (ISO-639-1, e.g. `"en"`).  Auto-detected if omitted.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Override directory where GGML model files are cached.
+    /// Defaults to `~/.zeroclaw/models/whisper/`.
+    #[serde(default)]
+    pub model_dir: Option<String>,
+    /// Maximum audio file size in bytes. Defaults to 100 MB (local inference has
+    /// no cloud API cap).
+    #[serde(default = "default_local_stt_max_audio_bytes")]
+    pub max_audio_bytes: usize,
+}
+
+impl Default for LocalSttConfig {
+    fn default() -> Self {
+        Self {
+            model_size: default_local_stt_model_size(),
+            language: None,
+            model_dir: None,
+            max_audio_bytes: default_local_stt_max_audio_bytes(),
+        }
+    }
+}
+
+fn default_local_stt_model_size() -> String {
+    "base".to_string()
+}
+
+fn default_local_stt_max_audio_bytes() -> usize {
+    100 * 1024 * 1024
 }
 
 /// Agent orchestration configuration (`[agent]` section).
@@ -10488,10 +10539,11 @@ impl Config {
         {
             let dp = self.transcription.default_provider.trim();
             match dp {
-                "groq" | "openai" | "deepgram" | "assemblyai" | "google" | "local_whisper" => {}
+                "groq" | "openai" | "deepgram" | "assemblyai" | "google" | "local_whisper"
+                | "local" => {}
                 other => {
                     anyhow::bail!(
-                        "transcription.default_provider must be one of: groq, openai, deepgram, assemblyai, google, local_whisper (got '{other}')"
+                        "transcription.default_provider must be one of: groq, openai, deepgram, assemblyai, google, local_whisper, local (got '{other}')"
                     );
                 }
             }
@@ -15710,6 +15762,16 @@ require_otp_to_resume = true
         config.validate().expect(
             "local_whisper must be accepted by the transcription.default_provider allowlist",
         );
+    }
+
+    #[test]
+    async fn validate_accepts_local_as_transcription_default_provider() {
+        let mut config = Config::default();
+        config.transcription.default_provider = "local".to_string();
+
+        config
+            .validate()
+            .expect("local must be accepted by the transcription.default_provider allowlist");
     }
 
     #[test]
