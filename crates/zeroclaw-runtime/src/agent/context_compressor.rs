@@ -452,7 +452,24 @@ fn build_transcript(messages: &[ChatMessage], max_chars: usize) -> String {
     let mut transcript = String::new();
     for msg in messages {
         let role = msg.role.to_uppercase();
-        let _ = writeln!(transcript, "{role}: {}", msg.content.trim());
+        // Strip [IMAGE:...] markers so the summarizer (a text-only LLM call
+        // via chat_with_system) never sees raw filesystem paths or huge
+        // base64 data URIs. Replace each with an `[image attached]` token so
+        // the model still knows an image was present.
+        let (cleaned, image_refs) =
+            zeroclaw_providers::multimodal::parse_image_markers(&msg.content);
+        let body = if image_refs.is_empty() {
+            cleaned
+        } else if cleaned.trim().is_empty() {
+            format!("[{} image(s) attached]", image_refs.len())
+        } else {
+            format!(
+                "{} [{} image(s) attached]",
+                cleaned.trim(),
+                image_refs.len()
+            )
+        };
+        let _ = writeln!(transcript, "{role}: {}", body.trim());
     }
 
     if transcript.len() > max_chars {

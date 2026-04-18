@@ -2044,7 +2044,16 @@ async fn classify_channel_reply_intent(
             "assistant" => "assistant",
             _ => "user",
         };
-        let _ = writeln!(convo, "[{role}] {}", msg.content);
+        let (cleaned, image_refs) =
+            zeroclaw_providers::multimodal::parse_image_markers(&msg.content);
+        let summary = if image_refs.is_empty() {
+            cleaned
+        } else if cleaned.is_empty() {
+            format!("[{} image(s) attached]", image_refs.len())
+        } else {
+            format!("{cleaned} [{} image(s) attached]", image_refs.len())
+        };
+        let _ = writeln!(convo, "[{role}] {summary}");
     }
 
     let response = provider
