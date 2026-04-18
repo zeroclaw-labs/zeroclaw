@@ -558,8 +558,7 @@ impl TypecastInterpSession {
             Ok(pcm_data) => {
                 // Split into ~100ms chunks at 44100Hz 16-bit mono = 8820 bytes
                 let chunk_size = 8820;
-                let mut seq = 0u64;
-                for chunk in pcm_data.chunks(chunk_size) {
+                for (seq, chunk) in (0u64..).zip(pcm_data.chunks(chunk_size)) {
                     let b64 = base64::engine::general_purpose::STANDARD.encode(chunk);
                     let _ = event_tx
                         .send(ServerMessage::AudioOut {
@@ -568,7 +567,6 @@ impl TypecastInterpSession {
                             pcm16le: b64,
                         })
                         .await;
-                    seq += 1;
                 }
             }
             Err(e) => {

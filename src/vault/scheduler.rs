@@ -351,11 +351,14 @@ async fn fill_community_summaries(
             continue;
         }
 
-        let bullets: String = titles
+        let bullets = titles
             .iter()
             .enumerate()
-            .map(|(i, t)| format!("{}. {}\n", i + 1, t))
-            .collect();
+            .fold(String::new(), |mut acc, (i, t)| {
+                use std::fmt::Write as _;
+                let _ = writeln!(acc, "{}. {}", i + 1, t);
+                acc
+            });
         let user_msg = format!("Cluster objects:\n{bullets}");
 
         let resp = summariser

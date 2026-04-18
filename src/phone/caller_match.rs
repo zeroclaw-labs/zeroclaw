@@ -44,8 +44,8 @@ pub fn normalize_e164(number: &str, default_country_code: &str) -> String {
     }
 
     // Korean domestic format: starts with 0
-    if cleaned.starts_with('0') {
-        return format!("+{}{}", default_country_code, &cleaned[1..]);
+    if let Some(rest) = cleaned.strip_prefix('0') {
+        return format!("+{default_country_code}{rest}");
     }
 
     // Assume it needs the country code prepended

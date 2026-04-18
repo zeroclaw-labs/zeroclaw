@@ -2037,20 +2037,15 @@ async fn handle_stt_socket(mut socket: WebSocket, state: AppState) {
     let dg_for_relay = std::sync::Arc::clone(&dg_session);
     let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<String>(256);
     tokio::spawn(async move {
-        loop {
-            match dg_for_relay.recv_event().await {
-                Some(event) => {
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        if relay_tx.send(json).await.is_err() {
-                            break;
-                        }
-                    }
-                    // Stop on session close
-                    if matches!(event, SttEvent::Closed) {
-                        break;
-                    }
+        while let Some(event) = dg_for_relay.recv_event().await {
+            if let Ok(json) = serde_json::to_string(&event) {
+                if relay_tx.send(json).await.is_err() {
+                    break;
                 }
-                None => break,
+            }
+            // Stop on session close
+            if matches!(event, SttEvent::Closed) {
+                break;
             }
         }
     });
@@ -2092,7 +2087,7 @@ async fn handle_stt_socket(mut socket: WebSocket, state: AppState) {
                         }
                     }
                     Ok(Message::Close(_)) | Err(_) => break,
-                    _ => continue,
+                    _ => {}
                 }
             }
         }

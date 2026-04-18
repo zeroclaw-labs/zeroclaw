@@ -106,9 +106,7 @@ fn mask_spans(text: &str, compounds: &[CompoundToken]) -> String {
         }
         out.extend_from_slice(&bytes[idx..c.span_start]);
         // replace with space run of same byte length — preserves offsets for callers
-        for _ in 0..(c.span_end - c.span_start) {
-            out.push(b' ');
-        }
+        out.resize(out.len() + (c.span_end - c.span_start), b' ');
         idx = c.span_end;
     }
     out.extend_from_slice(&bytes[idx..]);
