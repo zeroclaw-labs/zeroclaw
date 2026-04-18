@@ -102,6 +102,10 @@ pub fn process_post_call(
                 "risk_level": data.risk_level,
             });
 
+            let location = match (data.gps_lat, data.gps_lon) {
+                (Some(lat), Some(lon)) => Some(format!("{lat:.5},{lon:.5}")),
+                _ => None,
+            };
             let uuid = memory.append_timeline(
                 memory_id,
                 "call",
@@ -110,6 +114,7 @@ pub fn process_post_call(
                 transcript,
                 Some(&metadata.to_string()),
                 &data.device_id,
+                location.as_deref(),
             )?;
             result.timeline_uuid = Some(uuid);
         }

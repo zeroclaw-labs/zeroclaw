@@ -302,7 +302,8 @@ impl SqliteMemory {
              PRAGMA busy_timeout = 5000;
              {mmap_pragma}
              PRAGMA cache_size   = -2000;
-             PRAGMA temp_store   = MEMORY;"
+             PRAGMA temp_store   = MEMORY;
+             PRAGMA foreign_keys = ON;"
         ))?;
 
         Self::init_schema(&conn)?;
@@ -328,7 +329,8 @@ impl SqliteMemory {
                  PRAGMA synchronous  = NORMAL;
                  PRAGMA busy_timeout = 5000;
                  PRAGMA cache_size   = -2000;
-                 PRAGMA temp_store   = MEMORY;",
+                 PRAGMA temp_store   = MEMORY;
+                 PRAGMA foreign_keys = ON;",
             )
         });
         let read_pool = Pool::builder()
@@ -808,7 +810,10 @@ impl SqliteMemory {
                 ON consolidated_memories(created_at DESC);",
         )?;
 
-        // memory_timeline — append-only evidence store
+        // memory_timeline — append-only evidence store.
+        // `location` (free text) is used by cross-search disambiguation to verify
+        // that an episode and an ontology action refer to the same event / same
+        // person when keywords alone are ambiguous (same time + same place ⇒ same event).
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS memory_timeline (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -823,6 +828,7 @@ impl SqliteMemory {
                 content_sha256  TEXT NOT NULL,
                 metadata_json   TEXT,
                 device_id       TEXT NOT NULL,
+                location        TEXT,
                 created_at      INTEGER NOT NULL DEFAULT (unixepoch()),
                 FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
             );
@@ -831,8 +837,22 @@ impl SqliteMemory {
             CREATE INDEX IF NOT EXISTS idx_timeline_source_ref
                 ON memory_timeline(source_ref);
             CREATE INDEX IF NOT EXISTS idx_timeline_event_type
-                ON memory_timeline(event_type, event_at DESC);",
+                ON memory_timeline(event_type, event_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_timeline_location
+                ON memory_timeline(location) WHERE location IS NOT NULL;",
         )?;
+
+        // Migration: add location column for pre-existing DBs created before this change.
+        let timeline_sql: String = conn
+            .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_timeline'")?
+            .query_row([], |row| row.get::<_, String>(0))?;
+        if !timeline_sql.contains("location") {
+            conn.execute_batch(
+                "ALTER TABLE memory_timeline ADD COLUMN location TEXT;
+                 CREATE INDEX IF NOT EXISTS idx_timeline_location
+                     ON memory_timeline(location) WHERE location IS NOT NULL;",
+            )?;
+        }
 
         // Append-only enforcement: block UPDATE on memory_timeline
         conn.execute_batch(
@@ -1370,6 +1390,10 @@ impl SqliteMemory {
     /// Append an evidence entry to `memory_timeline` (append-only).
     /// Returns the generated UUID for the entry.
     /// Auto-records a `TimelineAppend` delta if a sync engine is attached.
+    ///
+    /// `location` is optional free-text. Cross-search disambiguation uses it
+    /// alongside `event_at` to confirm that an episode and an ontology action
+    /// refer to the same real-world event.
     #[allow(clippy::too_many_arguments)]
     pub fn append_timeline(
         &self,
@@ -1380,6 +1404,7 @@ impl SqliteMemory {
         content: &str,
         metadata_json: Option<&str>,
         device_id: &str,
+        location: Option<&str>,
     ) -> anyhow::Result<String> {
         use sha2::{Digest, Sha256};
         let uuid = Uuid::new_v4().to_string();
@@ -1388,8 +1413,8 @@ impl SqliteMemory {
             let conn = self.conn.lock();
             conn.execute(
                 "INSERT INTO memory_timeline
-                    (uuid, memory_id, event_type, event_at, source_ref, content, content_sha256, metadata_json, device_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    (uuid, memory_id, event_type, event_at, source_ref, content, content_sha256, metadata_json, device_id, location)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     uuid,
                     memory_id,
@@ -1400,6 +1425,7 @@ impl SqliteMemory {
                     content_sha256,
                     metadata_json,
                     device_id,
+                    location,
                 ],
             )?;
         }
@@ -4049,7 +4075,9 @@ mod tests {
 
         // Append timeline entries
         let uuid1 = mem
-            .append_timeline(memory_id, "chat", 1000, "msg_001", "first evidence", None, "device_a")
+            .append_timeline(
+                memory_id, "chat", 1000, "msg_001", "first evidence", None, "device_a", None,
+            )
             .unwrap();
         let uuid2 = mem
             .append_timeline(
@@ -4060,6 +4088,7 @@ mod tests {
                 "second evidence from call",
                 Some(r#"{"duration":120}"#),
                 "device_a",
+                Some("Seoul office"),
             )
             .unwrap();
 
@@ -4075,6 +4104,58 @@ mod tests {
 
         // Content SHA256 should be populated
         assert!(!timeline[0].content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeline_location_persists() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("tl_loc_mem", "memory with location", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let entry = mem.get("tl_loc_mem").await.unwrap().unwrap();
+
+        mem.append_timeline(
+            &entry.id,
+            "chat",
+            1700000000,
+            "msg_golf",
+            "played 18 holes",
+            None,
+            "dev_a",
+            Some("Jeju ** Golf Course"),
+        )
+        .unwrap();
+        mem.append_timeline(
+            &entry.id,
+            "chat",
+            1700000100,
+            "msg_noloc",
+            "no location entry",
+            None,
+            "dev_a",
+            None,
+        )
+        .unwrap();
+
+        let conn = mem.conn.lock();
+        let rows: Vec<(String, Option<String>)> = conn
+            .prepare(
+                "SELECT source_ref, location FROM memory_timeline
+                 WHERE memory_id = ?1 ORDER BY event_at",
+            )
+            .unwrap()
+            .query_map([&entry.id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "msg_golf");
+        assert_eq!(rows[0].1.as_deref(), Some("Jeju ** Golf Course"));
+        assert_eq!(rows[1].0, "msg_noloc");
+        assert_eq!(rows[1].1, None);
     }
 
     #[test]
@@ -4118,7 +4199,7 @@ mod tests {
         }
 
         for i in 0..10 {
-            mem.append_timeline("m2", "chat", i * 100, &format!("ref_{i}"), &format!("content_{i}"), None, "dev1")
+            mem.append_timeline("m2", "chat", i * 100, &format!("ref_{i}"), &format!("content_{i}"), None, "dev1", None)
                 .unwrap();
         }
 
@@ -4162,7 +4243,7 @@ mod tests {
         let entry = mem.get("m_ts").await.unwrap().unwrap();
 
         let before = engine.lock().journal_len();
-        mem.append_timeline(&entry.id, "chat", 1000, "msg_sync_1", "evidence", None, "dev_local")
+        mem.append_timeline(&entry.id, "chat", 1000, "msg_sync_1", "evidence", None, "dev_local", None)
             .unwrap();
         let after = engine.lock().journal_len();
         assert_eq!(
@@ -5081,7 +5162,7 @@ mod tests {
         let entry = mem.get("m_nosync").await.unwrap().unwrap();
 
         // All three typed mutations must succeed without a sync engine.
-        mem.append_timeline(&entry.id, "chat", 1, "r", "c", None, "d").unwrap();
+        mem.append_timeline(&entry.id, "chat", 1, "r", "c", None, "d", None).unwrap();
         mem.set_compiled_truth("m_nosync", "summary").unwrap();
         mem.insert_phone_call(
             "call_nosync",
