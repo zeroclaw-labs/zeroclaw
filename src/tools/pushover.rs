@@ -255,6 +255,13 @@ impl Tool for PushoverTool {
 }
 
 #[cfg(test)]
+// Tests mutate process env vars (PUSHOVER_TOKEN, PUSHOVER_USER_KEY) and must
+// serialize. `ENV_LOCK` is a std::sync::Mutex rather than tokio::sync::Mutex
+// because env-var serialization is a sync concern. Holding a std MutexGuard
+// across .await is technically sound here — tests run on tokio's multi-thread
+// runtime but the lock scope covers purely sync env setup plus one awaited
+// future that does not recursively re-enter lock_env. Reviewed 2026-04-18.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::security::AutonomyLevel;
