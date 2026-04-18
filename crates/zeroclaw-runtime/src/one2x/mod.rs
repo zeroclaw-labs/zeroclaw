@@ -174,7 +174,11 @@ pub mod agent_hooks {
 
     pub const STEP_TIMEOUT_MAX_RETRIES: u32 = 2;
 
+    // Planning phrases — English (lowercased) + Chinese (case-insensitive by default).
+    // Chinese additions target the common AI-assistant "describe plan first" pattern
+    // that never fires with English-only keyword matching (e.g. Feishu DMs in Chinese).
     const PLANNING_PHRASES: &[&str] = &[
+        // English
         "i will ",
         "i'll ",
         "i would ",
@@ -193,9 +197,32 @@ pub mod agent_hooks {
         "here's what we need to do",
         "i propose ",
         "the strategy is",
+        // Chinese
+        "我会",
+        "我将",
+        "我打算",
+        "我准备",
+        "我的计划是",
+        "我的方案是",
+        "我的思路是",
+        "计划如下",
+        "方案如下",
+        "步骤如下",
+        "接下来我会",
+        "接下来要",
+        "下一步",
+        "首先我",
+        "第一步",
+        "第二步",
+        "建议先",
+        "建议的做法",
+        "推荐的方式",
+        "让我来",
+        "让我先",
     ];
 
     const EXECUTION_INDICATORS: &[&str] = &[
+        // English / universal
         "```",
         "tool_use",
         "tool_call",
@@ -210,18 +237,37 @@ pub mod agent_hooks {
         "updated successfully",
         "error:",
         "warning:",
+        // Chinese
+        "已完成",
+        "完成了",
+        "搞定",
+        "已执行",
+        "结果是",
+        "输出如下",
+        "报错",
+        "错误：",
+        "警告：",
     ];
+
+    /// Minimum character count to treat a reply as "substantive planning".
+    /// Uses `chars().count()` (not `.len()`) so Chinese (3 bytes/char in UTF-8)
+    /// and English share the same threshold. 50 chars ≈ 1-2 sentences.
+    const MIN_PLANNING_CHARS: usize = 50;
 
     const NUDGE_MESSAGE: &str = "\
 Do not describe what you will do — execute it now. \
 Use your tools to take the first concrete action immediately. \
-If multiple steps are needed, execute the first step now and report the result.";
+If multiple steps are needed, execute the first step now and report the result.\n\
+\n\
+请不要描述你将要做什么 — 现在就执行。立刻用工具采取第一个具体动作。如果需要多步，先执行第一步并汇报结果。";
 
     pub fn check_planning_without_execution(messages: &mut Vec<ChatMessage>) -> bool {
         let last = match messages.last() {
             Some(m) if m.role == "assistant" => m,
             _ => return false,
         };
+        // Lowercase only affects ASCII; Chinese chars are unchanged, which is fine
+        // because Chinese has no case. We still need this for English matches.
         let content_lower = last.content.to_lowercase();
         for indicator in EXECUTION_INDICATORS {
             if content_lower.contains(indicator) {
@@ -234,7 +280,10 @@ If multiple steps are needed, execute the first step now and report the result."
         if !has_planning {
             return false;
         }
-        if last.content.len() < 100 {
+        // Use chars().count(), NOT .len(). .len() returns byte count; Chinese is
+        // 3 bytes/char in UTF-8, so the old 100-byte threshold fired at ~33 Chinese
+        // chars (too eager) while English needed 100 chars (too lax). Unify both.
+        if last.content.chars().count() < MIN_PLANNING_CHARS {
             return false;
         }
         tracing::info!("Detected planning-without-execution, injecting execution nudge");
@@ -243,5 +292,94 @@ If multiple steps are needed, execute the first step now and report the result."
             content: NUDGE_MESSAGE.to_string(),
         });
         true
+    }
+}
+
+#[cfg(test)]
+mod agent_hooks_tests {
+    use super::agent_hooks::check_planning_without_execution;
+    use zeroclaw_api::provider::ChatMessage;
+
+    fn asst(s: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: s.to_string(),
+        }
+    }
+
+    #[test]
+    fn english_planning_triggers_nudge() {
+        let mut msgs = vec![asst(
+            "Sure, I will first read the file, then I'll update the config, and finally I'd recommend running the tests to verify."
+        )];
+        assert!(check_planning_without_execution(&mut msgs));
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1].role, "user");
+    }
+
+    #[test]
+    fn chinese_planning_triggers_nudge() {
+        // Chinese content > 50 chars with planning phrase, no execution indicator.
+        let mut msgs = vec![asst(
+            "好的，我的计划是先读取当前的配置文件，然后分析里面的字段结构，接下来我会根据需求更新相应的字段并保存结果。",
+        )];
+        assert!(
+            check_planning_without_execution(&mut msgs),
+            "Chinese planning should trigger nudge"
+        );
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn execution_indicator_blocks_nudge_even_with_planning() {
+        // Has planning phrase but also code fence → assumes real execution happened.
+        let mut msgs = vec![asst(
+            "I will update the config:\n```rust\nfn main() {}\n```\nand here's the output afterwards with more detail.",
+        )];
+        assert!(!check_planning_without_execution(&mut msgs));
+        assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn chinese_execution_indicator_blocks_nudge() {
+        let mut msgs = vec![asst(
+            "我的计划是更新配置文件，现在已完成相关改动，结果是配置已经生效，可以继续下一步的验证工作了，输出如下所示。",
+        )];
+        assert!(!check_planning_without_execution(&mut msgs));
+    }
+
+    #[test]
+    fn short_reply_does_not_trigger() {
+        // Under 50 chars, even with planning phrase.
+        let mut msgs = vec![asst("I will do it.")];
+        assert!(!check_planning_without_execution(&mut msgs));
+    }
+
+    #[test]
+    fn short_chinese_reply_does_not_trigger() {
+        // Previously the byte-based 100 threshold would have triggered on ~34 Chinese
+        // chars (100 bytes). With chars()-based 50 threshold, this 10-char reply
+        // must not trigger.
+        let mut msgs = vec![asst("我会处理这个问题")];
+        assert!(!check_planning_without_execution(&mut msgs));
+    }
+
+    #[test]
+    fn last_message_must_be_assistant() {
+        let mut msgs = vec![ChatMessage {
+            role: "user".to_string(),
+            content:
+                "我的计划是做一件非常复杂且需要多步骤的事情，总之字数要够长超过五十个字符才能满足阈值。"
+                    .to_string(),
+        }];
+        assert!(!check_planning_without_execution(&mut msgs));
+    }
+
+    #[test]
+    fn no_planning_phrase_no_trigger() {
+        let mut msgs = vec![asst(
+            "The configuration file has been successfully read and its contents appear well-formed for the next step.",
+        )];
+        assert!(!check_planning_without_execution(&mut msgs));
     }
 }
