@@ -511,7 +511,9 @@ impl Provider for OpenRouterProvider {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
             temperature,
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools,
             max_tokens: self.max_tokens,
             stream: None,
@@ -590,7 +592,9 @@ impl Provider for OpenRouterProvider {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
             temperature,
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools,
             max_tokens: self.max_tokens,
             stream: Some(true),
@@ -701,7 +705,9 @@ impl Provider for OpenRouterProvider {
             model: model.to_string(),
             messages: native_messages,
             temperature,
-            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice: native_tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools: native_tools,
             max_tokens: self.max_tokens,
             stream: None,

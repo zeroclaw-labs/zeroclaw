@@ -231,7 +231,11 @@ impl OpenAiProvider {
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
-        tools.map(|items| {
+        let items = tools?;
+        if items.is_empty() {
+            return None;
+        }
+        Some(
             items
                 .iter()
                 .map(|tool| NativeToolSpec {
@@ -242,8 +246,8 @@ impl OpenAiProvider {
                         parameters: tool.parameters.clone(),
                     },
                 })
-                .collect()
-        })
+                .collect(),
+        )
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
@@ -421,7 +425,9 @@ impl Provider for OpenAiProvider {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
             temperature: adjusted_temperature,
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools,
             max_tokens: self.max_tokens,
         };
@@ -488,7 +494,9 @@ impl Provider for OpenAiProvider {
             model: model.to_string(),
             messages: Self::convert_messages(messages),
             temperature: adjusted_temperature,
-            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice: native_tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools: native_tools,
             max_tokens: self.max_tokens,
         };
@@ -555,6 +563,56 @@ mod tests {
     fn creates_with_empty_key() {
         let p = OpenAiProvider::new(Some(""));
         assert_eq!(p.credential.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn request_omits_tool_choice_when_tools_none() {
+        // Regression for vLLM 0.19+ rejecting tool_choice without tools.
+        // Real call site passes request.tools=None; convert_tools returns None;
+        // the .and_then guard yields None for tool_choice. Neither appears in JSON.
+        let tools = OpenAiProvider::convert_tools(None);
+        let req = NativeChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![],
+            temperature: 0.7,
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
+            tools,
+            max_tokens: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("tool_choice"), "got: {}", json);
+        assert!(!json.contains("\"tools\""), "got: {}", json);
+    }
+
+    #[test]
+    fn request_omits_tool_choice_when_tools_empty() {
+        // Same as above but with an explicit empty slice (e.g. max_tool_iterations=0
+        // with an empty MCP server list).
+        let empty: &[zeroclaw_api::tool::ToolSpec] = &[];
+        let tools = OpenAiProvider::convert_tools(Some(empty));
+        let req = NativeChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![],
+            temperature: 0.7,
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
+            tools,
+            max_tokens: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("tool_choice"),
+            "tool_choice must not be emitted when tools is empty; got: {}",
+            json
+        );
+        assert!(
+            !json.contains("\"tools\""),
+            "tools must not be emitted when empty; got: {}",
+            json
+        );
     }
 
     #[tokio::test]
