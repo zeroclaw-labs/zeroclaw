@@ -1756,7 +1756,6 @@ src/
 ├── service/             # Service installer (systemd/launchd)
 ├── services/            # Long-running service impls (voice relay, etc.)
 ├── session_search/      # Past-conversation FTS5 search        ← MoA v6.1 addition
-├── skillforge/          # Skill authoring / scaffold
 ├── skills/              # Procedural (self-generated) + correction skills ← MoA v6.1 addition
 ├── storage/             # Low-level storage helpers
 ├── sync/                # E2E encrypted memory sync engine (patent impl)

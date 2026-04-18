@@ -106,7 +106,6 @@ mod security;
 mod service;
 mod services;
 mod session_search;
-mod skillforge;
 mod skills;
 mod storage;
 mod sync;
