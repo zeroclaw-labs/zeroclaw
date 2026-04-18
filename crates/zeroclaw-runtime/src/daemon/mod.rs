@@ -143,7 +143,7 @@ pub async fn run(
             ));
         } else {
             crate::health::mark_component_ok("channels");
-            tracing::info!("No real-time channels configured; channel supervisor disabled");
+            tracing::info!("No channels configured; channel supervisor disabled");
         }
     } else {
         crate::health::mark_component_ok("channels");
@@ -960,11 +960,7 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
-    config
-        .channels
-        .channels_except_webhook()
-        .iter()
-        .any(|(_, ok)| *ok)
+    config.channels.channels().iter().any(|(_, ok)| *ok)
 }
 
 // run_mqtt_sop_listener has been moved to zeroclaw-channels::orchestrator::mqtt.
@@ -1055,6 +1051,7 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: 120,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -1113,6 +1110,21 @@ mod tests {
             allowed_users: vec!["*".into()],
             proxy_url: None,
             bot_name: None,
+        });
+        assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn webhook_only_config_is_supervised() {
+        let mut config = Config::default();
+        config.channels.webhook = Some(zeroclaw_config::schema::WebhookConfig {
+            enabled: true,
+            port: 8080,
+            listen_path: None,
+            send_url: None,
+            send_method: None,
+            auth_header: None,
+            secret: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -1185,6 +1197,7 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: 120,
         });
 
         let target = resolve_heartbeat_delivery(&config).unwrap();
@@ -1204,6 +1217,7 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: 120,
         });
 
         let target = resolve_heartbeat_delivery(&config).unwrap();

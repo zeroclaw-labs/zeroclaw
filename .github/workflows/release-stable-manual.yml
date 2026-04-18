@@ -3,7 +3,7 @@ name: Release Stable
 on:
   push:
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"   # stable tags only (no -beta suffix)
+      - "v[0-9]+.[0-9]+.[0-9]+" # stable tags only (no -beta suffix)
   workflow_dispatch:
     inputs:
       version:
@@ -125,35 +125,41 @@ jobs:
             RANGE="${PREV_TAG}..HEAD"
           fi
 
-          # Extract features only — skip bug fixes for clean release notes
-          FEATURES=$(git log "$RANGE" --pretty=format:"%s" --no-merges \
-            | grep -iE '^feat(\(|:)' \
-            | sed 's/^feat(\([^)]*\)): /\1: /' \
-            | sed 's/^feat: //' \
-            | sed 's/ (#[0-9]*)$//' \
-            | sort -uf \
-            | while IFS= read -r line; do echo "- ${line}"; done || true)
+          # If a hand-written changelog exists, use it as the release body
+          # and skip the auto-generated notes entirely.
+          if [ -f "CHANGELOG-next.md" ]; then
+            echo "Using CHANGELOG-next.md as release notes"
+            BODY=$(cat CHANGELOG-next.md)
+          else
+            # Extract features only — skip bug fixes for clean release notes
+            FEATURES=$(git log "$RANGE" --pretty=format:"%s" --no-merges \
+              | grep -iE '^feat(\(|:)' \
+              | sed 's/^feat(\([^)]*\)): /\1: /' \
+              | sed 's/^feat: //' \
+              | sed 's/ (#[0-9]*)$//' \
+              | sort -uf \
+              | while IFS= read -r line; do echo "- ${line}"; done || true)
 
-          if [ -z "$FEATURES" ]; then
-            FEATURES="- Incremental improvements and polish"
-          fi
+            if [ -z "$FEATURES" ]; then
+              FEATURES="- Incremental improvements and polish"
+            fi
 
-          # Collect ALL unique contributors: git authors + Co-Authored-By
-          GIT_AUTHORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges | sort -uf || true)
-          CO_AUTHORS=$(git log "$RANGE" --pretty=format:"%b" --no-merges \
-            | grep -ioE 'Co-Authored-By: *[^<]+' \
-            | sed 's/Co-Authored-By: *//i' \
-            | sed 's/ *$//' \
-            | sort -uf || true)
+            # Collect ALL unique contributors: git authors + Co-Authored-By
+            GIT_AUTHORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges | sort -uf || true)
+            CO_AUTHORS=$(git log "$RANGE" --pretty=format:"%b" --no-merges \
+              | grep -ioE 'Co-Authored-By: *[^<]+' \
+              | sed 's/Co-Authored-By: *//i' \
+              | sed 's/ *$//' \
+              | sort -uf || true)
 
-          # Merge, deduplicate, and filter out bots
-          ALL_CONTRIBUTORS=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
-            | sort -uf \
-            | grep -v '^$' \
-            | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
-            | while IFS= read -r name; do echo "- ${name}"; done || true)
+            # Merge, deduplicate, and filter out bots
+            ALL_CONTRIBUTORS=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
+              | sort -uf \
+              | grep -v '^$' \
+              | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
+              | while IFS= read -r name; do echo "- ${name}"; done || true)
 
-          BODY=$(cat <<NOTES_EOF
+            BODY=$(cat <<NOTES_EOF
           ## What's New
 
           ${FEATURES}
@@ -165,7 +171,8 @@ jobs:
           ---
           *Full changelog: ${PREV_TAG}...v${INPUT_VERSION}*
           NOTES_EOF
-          )
+            )
+          fi
 
           {
             echo "body<<BODY_EOF"
@@ -279,7 +286,7 @@ jobs:
         shell: bash
         run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
         env:
-          BINARY_SIZE_HARD_LIMIT: "52428800"  # 50MB — release builds include all optional features
+          BINARY_SIZE_HARD_LIMIT: "52428800" # 50MB — release builds include all optional features
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -428,26 +435,44 @@ jobs:
           NOTES: ${{ needs.release-notes.outputs.notes }}
         run: printf '%s\n' "$NOTES" > release-notes.md
 
-      - name: Create tag if manual dispatch
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          TAG: ${{ needs.validate.outputs.tag }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "zeroclaw $TAG"
-          git push origin "$TAG"
-
-      - name: Create GitHub Release
+      - name: Create tag and release
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           TAG: ${{ needs.validate.outputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
-          gh release create "$TAG" release-assets/* \
-            --repo "${{ github.repository }}" \
-            --title "$TAG" \
-            --notes-file release-notes.md \
-            --latest
+          # For manual dispatch, use --target to create tag + release atomically
+          # via RELEASE_TOKEN (admin PAT) which bypasses tag protection rules.
+          # For tag push, the tag already exists — just create the release.
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            gh release create "$TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --notes-file release-notes.md \
+              --target "$COMMIT_SHA" \
+              --latest
+          else
+            gh release create "$TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --notes-file release-notes.md \
+              --latest
+          fi
+
+      - name: Remove CHANGELOG-next.md after stable release
+        shell: bash
+        run: |
+          if [ -f "CHANGELOG-next.md" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git rm CHANGELOG-next.md
+            git commit -m "chore: remove CHANGELOG-next.md after ${{ needs.validate.outputs.tag }} release"
+            git push origin HEAD:master
+            echo "CHANGELOG-next.md removed and committed."
+          else
+            echo "No CHANGELOG-next.md to clean up."
+          fi
 
   crates-io:
     name: Publish to crates.io
