@@ -80,6 +80,12 @@ mod heartbeat;
 mod hooks;
 mod identity;
 mod integrations;
+// local_llm (on-device Gemma 4 fallback: daemon health, model pull, config).
+// Must match lib.rs — shared modules (gateway/{mod,ws,openclaw_compat}.rs)
+// reference `crate::local_llm::…`, and with the dual-compilation layout
+// (main.rs declares `mod gateway` and lib.rs declares `pub mod gateway`)
+// the bin's crate root needs the same module registered.
+mod local_llm;
 mod memory;
 mod migration;
 mod multimodal;
