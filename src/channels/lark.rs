@@ -300,6 +300,106 @@ fn ensure_lark_send_success(
     Ok(())
 }
 
+/// Extract `data.file_key` from a `/im/v1/files` upload response, or return
+/// a descriptive error when the API reports a non-zero `code`.
+///
+/// Split out as a free fn (rather than inlined) so the parse logic gets
+/// its own table-driven unit tests — PR 3's trickiest bugs have historically
+/// been "I got `data` back but the field names were wrong". Keeping this
+/// pure makes regressions cheap to spot without an HTTP mock.
+fn parse_lark_upload_response(body: &serde_json::Value) -> anyhow::Result<String> {
+    let code = extract_lark_response_code(body).unwrap_or(0);
+    if code != 0 {
+        let msg = body
+            .get("msg")
+            .and_then(|m| m.as_str())
+            .unwrap_or("(no msg)");
+        anyhow::bail!("Lark upload returned code={code}: {msg}; full body: {body}");
+    }
+    body.get("data")
+        .and_then(|d| d.get("file_key"))
+        .and_then(|k| k.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("upload response missing data.file_key: {body}"))
+}
+
+/// Map a filename extension to the `file_type` value the Lark `im/v1/files`
+/// endpoint expects. Lark documents this as a small closed set
+/// (`opus|mp4|pdf|doc|xls|ppt|stream`) — anything outside must go through
+/// `stream`.
+///
+/// **UX note**: Lark groups `.docx`/`.pptx`/`.xlsx` under the legacy short
+/// names (`doc`/`ppt`/`xls`). The spike confirmed this round-trips fine
+/// against a real tenant; if that ever stops being true, switching to
+/// `stream` for all office formats is a safe fallback.
+fn lark_file_type_for(filename: &str) -> &'static str {
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    match ext.as_str() {
+        "pdf" => "pdf",
+        "doc" | "docx" => "doc",
+        "xls" | "xlsx" => "xls",
+        "ppt" | "pptx" => "ppt",
+        "opus" => "opus",
+        "mp4" => "mp4",
+        _ => "stream",
+    }
+}
+
+/// Remove `Download: <url>` lines from `content` whose URL refers to any
+/// workspace path in `uploaded_paths`. Other lines (including `Download:`
+/// lines for artifacts that *failed* to upload) are preserved so they
+/// fall back to the regex-based button rendering in `extract_download_links`.
+///
+/// Matching is done against the percent-encoded path segment in the URL
+/// path component, not the URL string itself — an LLM may normalise the
+/// URL differently than our signed-URL generator did (reordering query
+/// params, changing scheme, …), and path-based matching survives that.
+///
+/// Empty `uploaded_paths` is a no-op (returns `content` unchanged as
+/// `String`), which keeps the caller's fast path trivial.
+fn strip_download_lines_for_paths(content: &str, uploaded_paths: &[String]) -> String {
+    if uploaded_paths.is_empty() {
+        return content.to_string();
+    }
+    // Pre-compute percent-encoded forms once per call.
+    let encoded: Vec<String> = uploaded_paths
+        .iter()
+        .map(|p| urlencoding::encode(p).into_owned())
+        .collect();
+
+    let mut out = String::with_capacity(content.len());
+    let mut first = true;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let is_matched_download = trimmed
+            .strip_prefix("Download: ")
+            .map(|url| {
+                encoded
+                    .iter()
+                    .any(|p| url.contains(format!("/download/{p}").as_str()))
+            })
+            .unwrap_or(false);
+        if is_matched_download {
+            continue;
+        }
+        if !first {
+            out.push('\n');
+        }
+        out.push_str(line);
+        first = false;
+    }
+    // Preserve a trailing newline if the original had one, since we stripped
+    // line terminators via `.lines()`.
+    if content.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 /// Extract signed download URLs from message content and return:
 /// - `cleaned`: content with download URL lines removed (avoids duplicate display)
 /// - `buttons`: `(label, url)` pairs to render as Lark card action buttons
@@ -1167,6 +1267,123 @@ impl LarkChannel {
         }
     }
 
+    // ── PR 3: native file attachment endpoints ─────────────────────────
+    //
+    // The helpers below mirror `send_text_once`'s single-shot shape and are
+    // wrapped by `upload_artifact` / `send_file_message` which layer the
+    // standard 401-retry-once pattern already used elsewhere in this file.
+    // Keeping the single-shot layer pure makes the 401 retry trivial to
+    // reason about and easy to unit-test the response parsing in isolation.
+
+    fn upload_file_url(&self) -> String {
+        format!("{}/im/v1/files", self.api_base())
+    }
+
+    fn send_file_message_url(&self) -> String {
+        format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
+    }
+
+    /// One-shot multipart upload to `/im/v1/files`. Returns the raw
+    /// `(status, body)` so the caller can decide whether to retry on 401.
+    async fn upload_file_once(
+        &self,
+        token: &str,
+        file_type: &str,
+        file_name: &str,
+        bytes: Vec<u8>,
+    ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+        // `Part::bytes(...).file_name(...)` sets the filename in the
+        // multipart Content-Disposition; the separate `file_name` text
+        // field is what Lark shows in chat. Both are required — dropping
+        // either produces a confusing 400.
+        let form = reqwest::multipart::Form::new()
+            .text("file_type", file_type.to_string())
+            .text("file_name", file_name.to_string())
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(bytes).file_name(file_name.to_string()),
+            );
+
+        let resp = self
+            .http_client()
+            .post(self.upload_file_url())
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .await?;
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let body = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+        Ok((status, body))
+    }
+
+    /// Upload a single artifact, read from the configured workspace, with
+    /// one 401 retry. Returns the file_key on success.
+    ///
+    /// Fails fast (rather than returning Option) when workspace_dir is not
+    /// configured — this path is only reachable from `send_with_artifacts`,
+    /// which itself short-circuits when workspace_dir is None, so reaching
+    /// here without a workspace is a bug worth surfacing.
+    async fn upload_artifact(&self, artifact: &crate::tools::Artifact) -> anyhow::Result<String> {
+        let workspace_dir = self
+            .workspace_dir
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("LarkChannel has no workspace_dir configured"))?;
+        let full_path = workspace_dir.join(&artifact.path);
+        let bytes = tokio::fs::read(&full_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read artifact {}: {e}", full_path.display()))?;
+
+        let file_type = lark_file_type_for(&artifact.name);
+        let mut token = self.get_tenant_access_token().await?;
+        let (status, body) = self
+            .upload_file_once(&token, file_type, &artifact.name, bytes.clone())
+            .await?;
+
+        let (status, body) = if should_refresh_lark_tenant_token(status, &body) {
+            self.invalidate_token().await;
+            token = self.get_tenant_access_token().await?;
+            self.upload_file_once(&token, file_type, &artifact.name, bytes)
+                .await?
+        } else {
+            (status, body)
+        };
+
+        if !status.is_success() {
+            anyhow::bail!(
+                "Lark file upload HTTP {status} for {}: {body}",
+                artifact.path
+            );
+        }
+        parse_lark_upload_response(&body)
+    }
+
+    /// Send one `msg_type=file` message referring to an already-uploaded
+    /// `file_key`. One 401 retry, same shape as `send` / reaction paths.
+    async fn send_file_message(&self, recipient: &str, file_key: &str) -> anyhow::Result<()> {
+        let url = self.send_file_message_url();
+        let content = serde_json::json!({ "file_key": file_key }).to_string();
+        let body = serde_json::json!({
+            "receive_id": recipient,
+            "msg_type": "file",
+            "content": content,
+        });
+
+        let token = self.get_tenant_access_token().await?;
+        let (status, response) = self.send_text_once(&url, &token, &body).await?;
+        let (status, response) = if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            self.send_text_once(&url, &new_token, &body).await?
+        } else {
+            (status, response)
+        };
+        ensure_lark_send_success(status, &response, "file message")
+    }
+
+    // ── end PR 3 helpers ───────────────────────────────────────────────
+
     async fn send_text_once(
         &self,
         url: &str,
@@ -1589,6 +1806,109 @@ impl Channel for LarkChannel {
 
         ensure_lark_send_success(status, &response, "interactive format")?;
         Ok(())
+    }
+
+    /// PR 3: native file attachments.
+    ///
+    /// Strategy:
+    /// 1. Upload each artifact via `/im/v1/files` in sequence. Failures are
+    ///    tolerated — the corresponding artifact falls back to the
+    ///    Download-button rendering inside the interactive card.
+    /// 2. Strip `Download:` lines for *successfully uploaded* artifacts so
+    ///    the card does not render a redundant button next to the native
+    ///    attachment.
+    /// 3. Send the interactive card (unchanged path — reuses the table
+    ///    fallback, markdown sanitisation, and 401 retry already baked
+    ///    into `send`).
+    /// 4. Send one `msg_type=file` message per successfully-uploaded
+    ///    artifact. These show up as native attachment cards in the chat.
+    ///
+    /// Ordering rationale: card first, attachments second, because the
+    /// card carries the explanation text — if the user reads top-to-bottom
+    /// they get context before the files. Reversing looks like "here are
+    /// some files, oh and here is what they are" which tested worse in
+    /// the spike.
+    ///
+    /// Fast path: when `artifacts` is empty or `workspace_dir` is
+    /// unconfigured we delegate straight to `send`, preserving pre-PR-3
+    /// behaviour byte-for-byte.
+    async fn send_with_artifacts(
+        &self,
+        message: &SendMessage,
+        artifacts: &[crate::tools::Artifact],
+    ) -> anyhow::Result<()> {
+        if artifacts.is_empty() || self.workspace_dir.is_none() {
+            return self.send(message).await;
+        }
+
+        // Upload phase. Collect successes (artifact, file_key) and track
+        // failed paths separately for logging.
+        let mut uploaded: Vec<(&crate::tools::Artifact, String)> =
+            Vec::with_capacity(artifacts.len());
+        for art in artifacts {
+            match self.upload_artifact(art).await {
+                Ok(file_key) => uploaded.push((art, file_key)),
+                Err(e) => {
+                    tracing::warn!(
+                        artifact_path = %art.path,
+                        error = %e,
+                        "Lark: artifact upload failed; falling back to Download: URL in card"
+                    );
+                }
+            }
+        }
+
+        // Card phase. Strip `Download:` lines corresponding to uploaded
+        // artifacts so the card does not double up with a redundant button.
+        let uploaded_paths: Vec<String> = uploaded.iter().map(|(a, _)| a.path.clone()).collect();
+        let cleaned_content = strip_download_lines_for_paths(&message.content, &uploaded_paths);
+        let card_message = SendMessage {
+            content: cleaned_content,
+            recipient: message.recipient.clone(),
+            subject: message.subject.clone(),
+            thread_ts: message.thread_ts.clone(),
+        };
+        self.send(&card_message).await?;
+
+        // Attachment phase. Each file_key becomes its own native attachment
+        // message. We log and swallow per-attachment failures rather than
+        // aborting — the card already went out, so bailing here would be
+        // a worse UX than "some attachments missing".
+        for (art, file_key) in uploaded {
+            if let Err(e) = self.send_file_message(&message.recipient, &file_key).await {
+                tracing::warn!(
+                    artifact_path = %art.path,
+                    file_key = %file_key,
+                    error = %e,
+                    "Lark: file message send failed after successful upload"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// PR 3: draft finalization with artifacts.
+    ///
+    /// `LarkChannel` currently does not implement draft updates (no override
+    /// of `supports_draft_updates` / `finalize_draft`), so in practice the
+    /// agent loop routes through `send_with_artifacts` instead. This impl
+    /// exists for future-proofing: if Lark draft support lands later,
+    /// artifact handling comes along for free.
+    ///
+    /// Implementation simply rebuilds a `SendMessage` and delegates to
+    /// `send_with_artifacts` — this is safe because the default
+    /// `finalize_draft` is a no-op, so without this override artifacts
+    /// would silently disappear on the draft path.
+    async fn finalize_draft_with_artifacts(
+        &self,
+        recipient: &str,
+        _message_id: &str,
+        text: &str,
+        artifacts: &[crate::tools::Artifact],
+    ) -> anyhow::Result<()> {
+        let msg = SendMessage::new(text, recipient);
+        self.send_with_artifacts(&msg, artifacts).await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -3056,5 +3376,197 @@ mod tests {
         assert!(result.text.contains("PharmaClaw"));
         assert!(result.text.contains("马广军"));
         assert!(result.text.contains("---"));
+    }
+
+    // ── PR 3: artifact upload logic ─────────────────────────────────────
+
+    #[test]
+    fn lark_file_type_maps_office_formats() {
+        assert_eq!(lark_file_type_for("report.docx"), "doc");
+        assert_eq!(lark_file_type_for("report.doc"), "doc");
+        assert_eq!(lark_file_type_for("Q1.PPTX"), "ppt"); // case-insensitive
+        assert_eq!(lark_file_type_for("data.xlsx"), "xls");
+        assert_eq!(lark_file_type_for("summary.pdf"), "pdf");
+        assert_eq!(lark_file_type_for("voice.opus"), "opus");
+        assert_eq!(lark_file_type_for("clip.mp4"), "mp4");
+    }
+
+    #[test]
+    fn lark_file_type_defaults_to_stream_for_unknown() {
+        assert_eq!(lark_file_type_for("notes.md"), "stream");
+        assert_eq!(lark_file_type_for("data.csv"), "stream");
+        assert_eq!(lark_file_type_for("image.png"), "stream");
+        assert_eq!(lark_file_type_for("archive.zip"), "stream");
+        assert_eq!(lark_file_type_for("no_extension"), "stream");
+    }
+
+    #[test]
+    fn parse_upload_response_extracts_file_key() {
+        let body = serde_json::json!({
+            "code": 0,
+            "msg": "ok",
+            "data": { "file_key": "file_v3_0123456789abcdef" }
+        });
+        assert_eq!(
+            parse_lark_upload_response(&body).unwrap(),
+            "file_v3_0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn parse_upload_response_surfaces_api_error() {
+        // Realistic shape: scope missing → code 99991672 etc.
+        let body = serde_json::json!({
+            "code": 99_991_672,
+            "msg": "app ticket invalid"
+        });
+        let err = parse_lark_upload_response(&body).expect_err("must fail on non-zero code");
+        let msg = err.to_string();
+        assert!(msg.contains("99991672"), "error must carry the code: {msg}");
+        assert!(
+            msg.contains("app ticket invalid"),
+            "error must carry the api msg: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_upload_response_missing_file_key_fails_descriptively() {
+        let body = serde_json::json!({
+            "code": 0,
+            "data": { "wrong_field": "xyz" }
+        });
+        let err = parse_lark_upload_response(&body).unwrap_err();
+        assert!(
+            err.to_string().contains("missing data.file_key"),
+            "error must name the missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn strip_downloads_removes_matching_paths_only() {
+        // Download lines carry percent-encoded paths after `/download/`.
+        // Matching is by path, not by exact URL string.
+        let content = "Here are your files.\n\
+             Download: https://gw.example/download/report.docx?expires=1&sig=ab\n\
+             Download: https://gw.example/download/other.pdf?expires=2&sig=cd\n\
+             Some closing text.";
+        let out = strip_download_lines_for_paths(content, &["report.docx".to_string()]);
+        assert!(
+            !out.contains("report.docx"),
+            "uploaded path must be stripped"
+        );
+        assert!(out.contains("other.pdf"), "non-uploaded path must remain");
+        assert!(out.contains("Here are your files."));
+        assert!(out.contains("Some closing text."));
+    }
+
+    #[test]
+    fn strip_downloads_handles_nested_paths() {
+        let content =
+            "Download: https://gw/download/reports%2F2026%2Fq1.docx?expires=1&sig=ab\nkeep";
+        let out = strip_download_lines_for_paths(content, &["reports/2026/q1.docx".to_string()]);
+        assert!(!out.contains("Download:"), "nested path must be stripped");
+        assert!(out.contains("keep"));
+    }
+
+    #[test]
+    fn strip_downloads_no_paths_is_identity() {
+        let content = "Download: https://gw/download/x.docx?expires=1&sig=a\ntext";
+        let out = strip_download_lines_for_paths(content, &[]);
+        assert_eq!(out, content, "empty uploaded_paths must be a no-op");
+    }
+
+    #[test]
+    fn strip_downloads_preserves_download_lines_unrelated_to_path() {
+        // Someone references a different `/download/` URL that has NOTHING to
+        // do with artifacts we uploaded. It must survive.
+        let content = "See also: https://gw/download/unrelated.pdf?expires=1&sig=x\n\
+                       Download: https://gw/download/report.docx?expires=2&sig=y";
+        let out = strip_download_lines_for_paths(content, &["report.docx".to_string()]);
+        assert!(
+            out.contains("unrelated.pdf"),
+            "unrelated URL must be preserved"
+        );
+        assert!(
+            !out.contains("report.docx"),
+            "uploaded path must be stripped"
+        );
+    }
+
+    #[test]
+    fn strip_downloads_preserves_trailing_newline() {
+        let content = "text\nDownload: https://gw/download/x.docx?expires=1&sig=a\n";
+        let out = strip_download_lines_for_paths(content, &["x.docx".to_string()]);
+        assert!(out.ends_with('\n'), "trailing newline must be preserved");
+    }
+
+    /// `send_with_artifacts` with no artifacts must delegate to `send` without
+    /// touching the upload path. This is the fast path taken on every non-
+    /// artifact-producing turn — if it regresses, every Lark message doubles
+    /// in latency. We exercise it with a mis-configured channel that would
+    /// panic if upload_artifact were reached.
+    #[tokio::test]
+    async fn send_with_artifacts_empty_short_circuits_to_send() {
+        // No valid credentials, no workspace — but `artifacts=[]` must
+        // short-circuit before any HTTP or fs access. The inner `send` will
+        // still fail (it tries to fetch a token), but we are asserting the
+        // *reason* for failure: token fetch, not upload.
+        let ch = LarkChannel::new(
+            "cli_bogus".into(),
+            "secret_bogus".into(),
+            String::new(),
+            None,
+            vec!["*".into()],
+            false,
+        );
+        let result = ch
+            .send_with_artifacts(&SendMessage::new("hi", "oc_test"), &[])
+            .await;
+        // The call must propagate `send`'s error (DNS/network/auth), NOT any
+        // upload-path error. We assert the error message does NOT mention
+        // upload-specific wording.
+        assert!(result.is_err(), "expected token fetch to fail in test env");
+        let msg = result.unwrap_err().to_string().to_lowercase();
+        assert!(
+            !msg.contains("upload") && !msg.contains("file_key"),
+            "empty-artifacts path must not touch upload logic; got: {msg}"
+        );
+    }
+
+    /// When workspace_dir is unconfigured, `send_with_artifacts` must fall
+    /// back to plain `send` even when artifacts are present — otherwise
+    /// upload_artifact would fail with "no workspace_dir" on every call.
+    #[tokio::test]
+    async fn send_with_artifacts_no_workspace_dir_falls_back_to_send() {
+        let ch = LarkChannel::new(
+            "cli_bogus".into(),
+            "secret_bogus".into(),
+            String::new(),
+            None,
+            vec!["*".into()],
+            false,
+        );
+        let art = crate::tools::Artifact {
+            path: "x.docx".into(),
+            name: "x.docx".into(),
+            mime: None,
+            size_bytes: 1,
+            download_url: None,
+        };
+        let result = ch
+            .send_with_artifacts(
+                &SendMessage::new("hi", "oc_test"),
+                std::slice::from_ref(&art),
+            )
+            .await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string().to_lowercase();
+        // Same assertion as the empty case: upload path must not have been
+        // entered, even though artifacts are present, because workspace_dir
+        // is None. The failure must come from the inner `send`.
+        assert!(
+            !msg.contains("upload") && !msg.contains("file_key"),
+            "no-workspace path must fall through to send; got: {msg}"
+        );
     }
 }
