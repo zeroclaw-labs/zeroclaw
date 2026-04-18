@@ -1,4 +1,4 @@
-# Changelog — v0.6.9 → next
+# Changelog — v0.6.9 → v0.7.0
 
 > Changes since the **v0.6.9** stable release. This release represents the largest
 > structural overhaul in ZeroClaw's history: the entire codebase has been split into a
@@ -212,6 +212,7 @@ extension point — all other crates are Beta or Experimental.
 
 Thank you to everyone who contributed to this release:
 
+- @abhijeet117
 - @aliasliao
 - @ArgenisDLR
 - @Audacity88
@@ -223,7 +224,9 @@ Thank you to everyone who contributed to this release:
 - @JordanTheJet
 - @kunalk16
 - @markuman
+- @micookie
 - @nayrosk
+- @niedbalski
 - @ninenox
 - @singlerider
 - @theonlyhennygod
@@ -232,6 +235,7 @@ Thank you to everyone who contributed to this release:
 - @vernonstinebaker
 - @WareWolf-MoonWall
 - @wlh320
+- @zavertiaev
 
 ---
 
