@@ -67,13 +67,35 @@ impl OllamaTuning {
         }
     }
 
-    /// Battery-saver: unload immediately after each request, narrow context
+/// Battery-saver: unload immediately after each request, narrow context
     /// to minimize VRAM pressure.
     pub fn for_battery_saver() -> Self {
         Self {
             keep_alive: Some("0".to_string()),
             num_ctx: Some(4_096),
             num_predict: Some(-1),
+        }
+    }
+
+    /// Reactive swap: when the host is on battery below the configured
+    /// threshold, return a [`Self::for_battery_saver`] version; otherwise
+    /// return `self` unchanged.
+    ///
+    /// This is a pure function — it does NOT read the process-wide
+    /// battery monitor. Callers pass the snapshot so tests can drive
+    /// every branch without fiddling with OS state. The hot-path call
+    /// site in `gateway/openclaw_compat.rs` reads
+    /// [`crate::local_llm::battery::shared`] once per request and hands
+    /// the snapshot in.
+    pub fn with_battery_snapshot(
+        self,
+        snap: crate::local_llm::battery::BatterySnapshot,
+        low_threshold_pct: u8,
+    ) -> Self {
+        if snap.needs_battery_saver(low_threshold_pct) {
+            Self::for_battery_saver()
+        } else {
+            self
         }
     }
 }
@@ -856,6 +878,51 @@ mod tests {
         let t = OllamaTuning::for_battery_saver();
         assert_eq!(t.keep_alive.as_deref(), Some("0"));
         assert_eq!(t.num_ctx, Some(4_096));
+    }
+
+    // ── with_battery_snapshot: reactive swap to battery-saver ──
+
+    #[test]
+    fn battery_snapshot_unknown_keeps_original_tuning() {
+        let original = OllamaTuning::for_app_chat();
+        let effective = original
+            .clone()
+            .with_battery_snapshot(crate::local_llm::battery::BatterySnapshot::unknown(), 25);
+        assert_eq!(effective.keep_alive, original.keep_alive);
+        assert_eq!(effective.num_ctx, original.num_ctx);
+    }
+
+    #[test]
+    fn battery_snapshot_on_ac_keeps_original_tuning() {
+        let original = OllamaTuning::for_web_chat();
+        let snap = crate::local_llm::battery::BatterySnapshot {
+            percent: Some(5),
+            on_ac_power: Some(true),
+        };
+        let effective = original.clone().with_battery_snapshot(snap, 25);
+        assert_eq!(effective.num_ctx, original.num_ctx);
+    }
+
+    #[test]
+    fn battery_snapshot_on_battery_low_flips_to_saver() {
+        let snap = crate::local_llm::battery::BatterySnapshot {
+            percent: Some(15),
+            on_ac_power: Some(false),
+        };
+        let effective = OllamaTuning::for_channel_chat().with_battery_snapshot(snap, 25);
+        assert_eq!(effective.keep_alive.as_deref(), Some("0"));
+        assert_eq!(effective.num_ctx, Some(4_096));
+    }
+
+    #[test]
+    fn battery_snapshot_on_battery_but_above_threshold_keeps_original() {
+        let snap = crate::local_llm::battery::BatterySnapshot {
+            percent: Some(85),
+            on_ac_power: Some(false),
+        };
+        let original = OllamaTuning::for_app_chat();
+        let effective = original.clone().with_battery_snapshot(snap, 25);
+        assert_eq!(effective.keep_alive, original.keep_alive);
     }
 
     #[test]

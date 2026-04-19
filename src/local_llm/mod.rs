@@ -13,6 +13,7 @@
 //! The whole module assumes the caller's UI has obtained explicit user
 //! consent for each automated step (hardware detect → recommend → install).
 
+pub mod battery;
 pub mod fallback_registry;
 pub mod installer;
 pub mod network_health;
