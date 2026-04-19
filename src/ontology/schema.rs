@@ -22,11 +22,16 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
         );
 
         CREATE TABLE IF NOT EXISTS ontology_link_types (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            name          TEXT NOT NULL UNIQUE,
-            description   TEXT,
-            from_type_id  INTEGER NOT NULL DEFAULT 0,
-            to_type_id    INTEGER NOT NULL DEFAULT 0
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            name             TEXT NOT NULL UNIQUE,
+            description      TEXT,
+            from_type_id     INTEGER NOT NULL DEFAULT 0,
+            to_type_id       INTEGER NOT NULL DEFAULT 0,
+            cardinality      TEXT NOT NULL DEFAULT 'N:M'
+                               CHECK(cardinality IN ('1:1','1:N','N:1','N:M')),
+            is_bidirectional INTEGER NOT NULL DEFAULT 1
+                               CHECK(is_bidirectional IN (0, 1)),
+            inverse_name     TEXT
         );
 
         CREATE TABLE IF NOT EXISTS ontology_action_types (
@@ -82,16 +87,21 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
         -- ================================================================
 
         CREATE TABLE IF NOT EXISTS ontology_actions (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            action_type_id      INTEGER NOT NULL REFERENCES ontology_action_types(id),
-            actor_user_id       TEXT NOT NULL,
-            actor_kind          TEXT NOT NULL DEFAULT 'agent',
-            primary_object_id   INTEGER REFERENCES ontology_objects(id),
-            related_object_ids  TEXT,
-            params              TEXT NOT NULL DEFAULT '{}',
-            result              TEXT,
-            channel             TEXT,
-            context_id          INTEGER REFERENCES ontology_objects(id),
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            action_type_id       INTEGER NOT NULL REFERENCES ontology_action_types(id),
+            actor_user_id        TEXT NOT NULL,
+            actor_kind           TEXT NOT NULL DEFAULT 'agent',
+            primary_object_id    INTEGER REFERENCES ontology_objects(id),
+            related_object_ids   TEXT,
+            -- Palantir-style action metadata (Q1):
+            -- Explicit pointers to the typed schema so the cross-search
+            -- disambiguation layer can filter without scanning JSON.
+            target_type_id       INTEGER REFERENCES ontology_object_types(id),
+            relationship_type_id INTEGER REFERENCES ontology_link_types(id),
+            params               TEXT NOT NULL DEFAULT '{}',
+            result               TEXT,
+            channel              TEXT,
+            context_id           INTEGER REFERENCES ontology_objects(id),
             -- When (UTC): absolute UTC time (ISO-8601 ending in Z).
             -- PRIMARY SORT KEY for cross-device timeline ordering.
             occurred_at_utc     TEXT,
@@ -350,6 +360,16 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
     // Enables fast theme-based categorization and retrieval.
     migrate_add_column(conn, "ontology_actions", "themes", "TEXT")?;
     migrate_add_column(conn, "ontology_objects", "themes", "TEXT")?;
+    // ── Q1 Commit #4: link-type strengthening + action target/relationship ─
+    migrate_add_column(conn, "ontology_link_types", "cardinality",
+                       "TEXT NOT NULL DEFAULT 'N:M'")?;
+    migrate_add_column(conn, "ontology_link_types", "is_bidirectional",
+                       "INTEGER NOT NULL DEFAULT 1")?;
+    migrate_add_column(conn, "ontology_link_types", "inverse_name", "TEXT")?;
+    migrate_add_column(conn, "ontology_actions", "target_type_id",
+                       "INTEGER REFERENCES ontology_object_types(id)")?;
+    migrate_add_column(conn, "ontology_actions", "relationship_type_id",
+                       "INTEGER REFERENCES ontology_link_types(id)")?;
     // Legacy migration: rename old occurred_at → occurred_at_utc if present.
     migrate_add_column(conn, "ontology_actions", "occurred_at", "TEXT")?;
     // Copy legacy occurred_at data to occurred_at_utc (best-effort).
@@ -376,7 +396,15 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
          CREATE INDEX IF NOT EXISTS idx_onto_actions_themes
              ON ontology_actions(themes);
          CREATE INDEX IF NOT EXISTS idx_onto_objects_themes
-             ON ontology_objects(themes);",
+             ON ontology_objects(themes);
+         CREATE INDEX IF NOT EXISTS idx_onto_link_types_pair
+             ON ontology_link_types(from_type_id, to_type_id);
+         CREATE INDEX IF NOT EXISTS idx_onto_actions_target_type
+             ON ontology_actions(target_type_id)
+             WHERE target_type_id IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_onto_actions_relationship
+             ON ontology_actions(relationship_type_id)
+             WHERE relationship_type_id IS NOT NULL;",
     );
 
     Ok(())
@@ -692,6 +720,120 @@ mod tests {
             )
             .unwrap();
         assert_eq!(orphaned, 0, "ON DELETE CASCADE should clear detail rows");
+    }
+
+    /// Q1 Commit #4 — link types gain cardinality + bidirectional + inverse
+    /// metadata; actions gain explicit target_type / relationship_type pointers.
+    #[test]
+    fn link_type_strengthening_and_action_metadata_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_ontology_schema(&conn).unwrap();
+        seed_default_types(&conn).unwrap();
+
+        // Verify seeded link types default to the new columns safely.
+        let (default_card, default_bidir): (String, i64) = conn
+            .query_row(
+                "SELECT cardinality, is_bidirectional
+                 FROM ontology_link_types WHERE name = 'related_to'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(default_card, "N:M");
+        assert_eq!(default_bidir, 1);
+
+        // Define a tight 1:N link type: 'employed_by' (one Company employs many People).
+        let contact_type_id: i64 = conn
+            .query_row(
+                "SELECT id FROM ontology_object_types WHERE name = 'Contact'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO ontology_link_types
+                (name, description, from_type_id, to_type_id,
+                 cardinality, is_bidirectional, inverse_name)
+             VALUES ('boyfriend_of',
+                     'Dating relationship (symmetric)',
+                     ?1, ?1,
+                     '1:1', 1, 'girlfriend_of')",
+            rusqlite::params![contact_type_id],
+        )
+        .unwrap();
+        let boyfriend_link_id: i64 = conn.last_insert_rowid();
+
+        // CHECK constraint rejects an unknown cardinality value.
+        let bad = conn.execute(
+            "INSERT INTO ontology_link_types
+                (name, cardinality, is_bidirectional)
+             VALUES ('bogus', 'infinity', 1)",
+            [],
+        );
+        assert!(bad.is_err(), "cardinality CHECK should reject unknown value");
+
+        // CHECK constraint rejects an out-of-range bidirectional flag.
+        let bad = conn.execute(
+            "INSERT INTO ontology_link_types
+                (name, cardinality, is_bidirectional)
+             VALUES ('bogus2', 'N:M', 2)",
+            [],
+        );
+        assert!(
+            bad.is_err(),
+            "is_bidirectional CHECK should reject values outside {{0,1}}"
+        );
+
+        // Action metadata: log an action with explicit target_type_id + relationship_type_id.
+        conn.execute(
+            "INSERT INTO ontology_objects
+                (type_id, title, properties, owner_user_id, created_at, updated_at)
+             VALUES (?1, '김필순', '{}', 'user_test', 1000, 1000)",
+            rusqlite::params![contact_type_id],
+        )
+        .unwrap();
+        let girlfriend_id: i64 = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO ontology_actions
+                (action_type_id, actor_user_id,
+                 primary_object_id, target_type_id, relationship_type_id,
+                 params, created_at, updated_at)
+             VALUES (
+                (SELECT id FROM ontology_action_types WHERE name='RecordDecision'),
+                'user_test',
+                ?1, ?2, ?3,
+                '{}', 1000, 1000
+             )",
+            rusqlite::params![girlfriend_id, contact_type_id, boyfriend_link_id],
+        )
+        .unwrap();
+
+        // Confirm the action row carries both FK pointers and the partial
+        // indexes pick them up (verify by selecting through them).
+        let (tgt, rel): (i64, i64) = conn
+            .query_row(
+                "SELECT target_type_id, relationship_type_id
+                 FROM ontology_actions
+                 WHERE primary_object_id = ?1",
+                rusqlite::params![girlfriend_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tgt, contact_type_id);
+        assert_eq!(rel, boyfriend_link_id);
+
+        // Partial index usage — `target_type_id IS NOT NULL` filter works.
+        let count_with_target: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ontology_actions
+                 WHERE target_type_id = ?1",
+                rusqlite::params![contact_type_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_with_target, 1);
     }
 
     /// Typed property system: property types are defined per object type,
