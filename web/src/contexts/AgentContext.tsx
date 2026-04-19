@@ -7,6 +7,7 @@ import {
   useCallback,
   type ReactNode,
 } from 'react';
+import { parse as parseTOML, stringify as stringifyTOML } from 'smol-toml';
 import { WebSocketClient } from '@/lib/ws';
 import type { WsMessage } from '@/types/api';
 import { generateUUID } from '@/lib/uuid';
@@ -95,22 +96,37 @@ export function AgentProvider({ children }: Props) {
     try {
       const configText = await getConfig();
 
-      // Parse TOML to extract model list
-      const modelMatch = configText.match(/models\s*=\s*\[([^\]]+)\]/s);
-      if (modelMatch && modelMatch[1]) {
-        const modelsStr = modelMatch[1];
-        const models = modelsStr
-          .split(',')
-          .map((m: string) => m.trim().replace(/["']/g, ''))
-          .filter((m: string) => m.length > 0);
-        setAvailableModels(models);
+      // Parse TOML safely using smol-toml
+      const config = parseTOML(configText) as Record<string, unknown>;
+
+      // Extract current model from root-level default_model or its alias "model"
+      const currentModelValue = config.model ?? config.default_model;
+      if (typeof currentModelValue === 'string') {
+        setCurrentModel(currentModelValue);
       }
 
-      // Extract current model
-      const currentMatch = configText.match(/model\s*=\s*["']([^"']+)["']/);
-      if (currentMatch && currentMatch[1]) {
-        setCurrentModel(currentMatch[1]);
+      // Build available models list from model_routes if present
+      const models = new Set<string>();
+
+      // Add current model first
+      if (typeof currentModelValue === 'string') {
+        models.add(currentModelValue);
       }
+
+      // Extract models from model_routes array (if present)
+      const modelRoutes = config.model_routes;
+      if (Array.isArray(modelRoutes)) {
+        for (const route of modelRoutes) {
+          if (route && typeof route === 'object' && 'model' in route) {
+            const routeModel = (route as Record<string, unknown>).model;
+            if (typeof routeModel === 'string') {
+              models.add(routeModel);
+            }
+          }
+        }
+      }
+
+      setAvailableModels(Array.from(models));
     } catch (err) {
       console.error('Failed to fetch models:', err);
     } finally {
@@ -123,11 +139,22 @@ export function AgentProvider({ children }: Props) {
     try {
       const configText = await getConfig();
 
-      // Replace model in config
-      const newConfigText = configText.replace(
-        /model\s*=\s*["'][^"']+["']/,
-        `model = "${model}"`
-      );
+      // Parse TOML safely using smol-toml
+      const config = parseTOML(configText) as Record<string, unknown>;
+
+      // Update the model field - prefer "model" alias over "default_model"
+      // This ensures we write to the same key that was originally used
+      if ('model' in config) {
+        config.model = model;
+      } else if ('default_model' in config) {
+        config.default_model = model;
+      } else {
+        // If neither exists, add "model" (the more common alias)
+        config.model = model;
+      }
+
+      // Serialize back to TOML
+      const newConfigText = stringifyTOML(config);
 
       // Save config
       await putConfig(newConfigText);
