@@ -1,4 +1,4 @@
-# Changelog — v0.6.9 → v0.7.1
+# Changelog — v0.6.9 → v0.7.3
 
 > Changes since the **v0.6.9** stable release. This release represents the largest
 > structural overhaul in ZeroClaw's history: the entire codebase has been split into a
@@ -173,6 +173,12 @@
 - `rustls-webpki` and `rumqttc` bumped to resolve RUSTSEC-2026-0098 and
   RUSTSEC-2026-0099 (#5786).
 
+### Deployment
+
+- Sample Kubernetes and OpenShift deployment manifests added in `deploy-k8s/` with
+  hardened security context (`runAsNonRoot`, `readOnlyRootFilesystem`, `drop ALL` caps,
+  `seccompProfile: RuntimeDefault`) and pairing auth enabled by default (#5880).
+
 ---
 
 ## Bug Fixes (summary)
@@ -199,6 +205,8 @@
 | Install | install.sh broken after workspace split |
 | Runtime | Windows console window visible in background mode |
 | Distribution | Web dashboard missing from AUR and cargo install builds |
+| Docker | Workspace crate manifests missing from multi-stage build after workspace split (#5879) |
+| Agent | Streamed reasoning content lost during tool replay (#5606) |
 | Web | Theme mode switch not applying light/dark correctly |
 | Web | Theme mode selector missing visual preview swatches |
 
@@ -257,9 +265,11 @@ Thank you to everyone who contributed to this release:
 - @nayrosk
 - @niedbalski
 - @ninenox
+- @pavelanni
 - @singlerider
 - @theonlyhennygod
 - @titulus
+- @tompro
 - @UtopiaX
 - @vernonstinebaker
 - @WareWolf-MoonWall
