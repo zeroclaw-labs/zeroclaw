@@ -12,6 +12,7 @@ pub mod api;
 pub mod auth_api;
 pub mod channel_router;
 pub mod llm_proxy;
+pub mod local_llm_api;
 mod openai_compat;
 mod openclaw_compat;
 pub mod pair;
@@ -1421,6 +1422,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         )
         // ── Admin Dashboard ──
         .nest("/api/admin/dashboard", admin_api::admin_router())
+        // ── Local LLM (Gemma 4 via Ollama) admin endpoints for the
+        // Settings → "로컬 AI 모델" UI (spec §6). Intentionally not
+        // behind admin auth — these are user-level operations on the
+        // local device. ──
+        .nest("/api/local-llm", local_llm_api::router())
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
         .route("/api/voices/list", get(api::handle_api_voices_list))

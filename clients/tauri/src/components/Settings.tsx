@@ -3,6 +3,7 @@ import { t, type Locale } from "../lib/i18n";
 import { apiClient, type SyncStatus, type PlatformInfo, type DeviceInfo } from "../lib/api";
 import { isTauri } from "../lib/tauri-bridge";
 import { EmbeddingStatus } from "./EmbeddingStatus";
+import { SettingsLocalModel } from "./SettingsLocalModel";
 
 interface SettingsProps {
   locale: Locale;
@@ -741,6 +742,13 @@ export function Settings({ locale, isConnected, onLocaleChange, onBack, onLogout
               <EmbeddingStatus locale={locale} />
             </div>
           )}
+
+          {/* Local Gemma 4 (§6 controls) — always shown; the component
+              handles the "daemon down" and "not installed yet" states
+              itself so users get actionable guidance when Ollama is
+              missing. */}
+          <SettingsLocalModel locale={locale} />
+
 
           {inTauri && platformInfo && (
             <div className="settings-section">

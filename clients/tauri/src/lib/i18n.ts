@@ -188,7 +188,34 @@ type TranslationKey =
   | "connect_github_hint"
   | "connect_github_placeholder"
   | "workspace_connected"
-  | "repo_cloning";
+  | "repo_cloning"
+  // ── Settings → Local LLM (Gemma 4) panel ──
+  | "local_llm_section_title"
+  | "local_llm_loading"
+  | "local_llm_current_model"
+  | "local_llm_not_installed"
+  | "local_llm_status_ok"
+  | "local_llm_status_pull_pending"
+  | "local_llm_daemon_down"
+  | "local_llm_change_tier"
+  | "local_llm_pick_tier"
+  | "local_llm_mobile_cap"
+  | "local_llm_insufficient_vram"
+  | "local_llm_audio_native"
+  | "local_llm_hardware_summary"
+  | "local_llm_hardware_unknown"
+  | "local_llm_ram"
+  | "local_llm_disk_free"
+  | "local_llm_reprobe"
+  | "local_llm_reprobing"
+  | "local_llm_auto_upgrade_notify"
+  | "local_llm_offline_only"
+  | "local_llm_uninstall_label"
+  | "local_llm_uninstall"
+  | "local_llm_uninstalling"
+  | "local_llm_uninstall_confirm"
+  | "local_llm_installed_inventory"
+  | "local_llm_switch_manual_hint";
 
 const translations: Record<Locale, Record<TranslationKey, string>> = {
   en: {
@@ -365,6 +392,32 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     connect_github_placeholder: "https://github.com/user/repo",
     workspace_connected: "Workspace connected",
     repo_cloning: "Cloning repository...",
+    local_llm_section_title: "Local AI model (Gemma 4)",
+    local_llm_loading: "Loading local-LLM status…",
+    local_llm_current_model: "Installed model",
+    local_llm_not_installed: "Not installed yet",
+    local_llm_status_ok: "Ready",
+    local_llm_status_pull_pending: "Needs pull",
+    local_llm_daemon_down: "Ollama daemon offline",
+    local_llm_change_tier: "Change tier",
+    local_llm_pick_tier: "Pick a tier…",
+    local_llm_mobile_cap: "Not available on mobile",
+    local_llm_insufficient_vram: "Needs ~{need} GB VRAM",
+    local_llm_audio_native: "native audio",
+    local_llm_hardware_summary: "Detected hardware",
+    local_llm_hardware_unknown: "Unknown — run a hardware probe",
+    local_llm_ram: "RAM",
+    local_llm_disk_free: "Disk free",
+    local_llm_reprobe: "Re-scan hardware",
+    local_llm_reprobing: "Scanning hardware…",
+    local_llm_auto_upgrade_notify: "Notify me when better hardware unlocks a larger tier",
+    local_llm_offline_only: "Offline-only mode (never call the cloud even with an API key)",
+    local_llm_uninstall_label: "Remove the local model from disk",
+    local_llm_uninstall: "Uninstall",
+    local_llm_uninstalling: "Uninstalling…",
+    local_llm_uninstall_confirm: "Remove the local Gemma 4 model? You can reinstall later from this screen.",
+    local_llm_installed_inventory: "Installed models ({count})",
+    local_llm_switch_manual_hint: "Run this command to switch tiers:\n\n{command}",
   },
   ko: {
     app_title: "MoA",
@@ -540,6 +593,32 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     connect_github_placeholder: "https://github.com/user/repo",
     workspace_connected: "\uc791\uc5c5 \ud3f4\ub354\uac00 \uc5f0\uacb0\ub418\uc5c8\uc2b5\ub2c8\ub2e4",
     repo_cloning: "\uc800\uc7a5\uc18c \ud074\ub860 \uc911...",
+    local_llm_section_title: "로컬 AI 모델 (Gemma 4)",
+    local_llm_loading: "로컬 AI 상태를 불러오는 중…",
+    local_llm_current_model: "설치된 모델",
+    local_llm_not_installed: "아직 설치되지 않았습니다",
+    local_llm_status_ok: "정상",
+    local_llm_status_pull_pending: "다운로드 필요",
+    local_llm_daemon_down: "Ollama 데몬이 실행되고 있지 않습니다",
+    local_llm_change_tier: "모델 티어 변경",
+    local_llm_pick_tier: "티어를 선택하세요…",
+    local_llm_mobile_cap: "모바일에서는 사용할 수 없습니다",
+    local_llm_insufficient_vram: "약 {need} GB의 VRAM/메모리가 필요합니다",
+    local_llm_audio_native: "음성 입력 지원",
+    local_llm_hardware_summary: "감지된 하드웨어",
+    local_llm_hardware_unknown: "미확인 — 하드웨어 재검사를 실행하세요",
+    local_llm_ram: "RAM",
+    local_llm_disk_free: "디스크 여유",
+    local_llm_reprobe: "하드웨어 재검사",
+    local_llm_reprobing: "하드웨어를 검사하는 중…",
+    local_llm_auto_upgrade_notify: "하드웨어가 향상되면 더 큰 모델로 업그레이드를 알림",
+    local_llm_offline_only: "오프라인 전용 모드 (API 키가 있어도 클라우드를 호출하지 않음)",
+    local_llm_uninstall_label: "로컬 모델을 디스크에서 제거",
+    local_llm_uninstall: "제거",
+    local_llm_uninstalling: "제거 중…",
+    local_llm_uninstall_confirm: "로컬 Gemma 4 모델을 제거할까요? 이 화면에서 언제든 다시 설치할 수 있습니다.",
+    local_llm_installed_inventory: "설치된 모델 ({count}개)",
+    local_llm_switch_manual_hint: "다음 명령을 실행해 티어를 변경하세요:\n\n{command}",
   },
 };
 
