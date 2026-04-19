@@ -16,6 +16,7 @@
 pub mod fallback_registry;
 pub mod installer;
 pub mod network_health;
+pub mod setup;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

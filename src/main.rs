@@ -600,6 +600,23 @@ Examples:
         config_command: ConfigCommands,
     },
 
+    /// First-time setup flows (on-device LLM, hardware detection, …)
+    #[command(long_about = "\
+First-time setup flows.
+
+Currently supported:
+  setup local-llm   Detect host hardware, install Ollama if needed, pull the
+                    recommended Gemma 4 tier, and persist ~/.moa/ config.
+
+Examples:
+  zeroclaw setup local-llm
+  zeroclaw setup local-llm --tier e4b       # force a specific Gemma 4 tier
+  zeroclaw setup local-llm --dry-run        # probe and report, don't install")]
+    Setup {
+        #[command(subcommand)]
+        setup_command: SetupCommands,
+    },
+
     /// Generate shell completion script to stdout
     #[command(long_about = "\
 Generate shell completion scripts for `zeroclaw`.
@@ -614,6 +631,35 @@ Examples:
         /// Target shell
         #[arg(value_enum)]
         shell: CompletionShell,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SetupCommands {
+    /// Detect host, install Ollama, pull Gemma 4, save config.
+    LocalLlm {
+        /// Force a specific Gemma 4 tier instead of the auto-detected one.
+        /// Values: `e2b`, `e4b`, `26b`, `31b`.
+        #[arg(long)]
+        tier: Option<String>,
+
+        /// Override the Ollama HTTP endpoint (default http://127.0.0.1:11434).
+        #[arg(long)]
+        base_url: Option<String>,
+
+        /// Disable the conservative one-step downgrade when near a tier
+        /// boundary. Defaults to enabled.
+        #[arg(long)]
+        no_downgrade: bool,
+
+        /// Attempt to launch `ollama serve` in the background when the
+        /// daemon is not already running.
+        #[arg(long)]
+        start_daemon: bool,
+
+        /// Run the probe + plan only. Does not install Ollama or pull models.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -998,6 +1044,7 @@ async fn main() -> Result<()> {
             compact_context,
             memory_backend,
         } => {
+            maybe_auto_bootstrap_local_llm("agent").await;
             if let Some(level) = autonomy_level {
                 config.autonomy.level = level;
             }
@@ -1039,6 +1086,7 @@ async fn main() -> Result<()> {
             host,
             new_pairing,
         } => {
+            maybe_auto_bootstrap_local_llm("gateway").await;
             if new_pairing {
                 // Persist token reset from raw config so env-derived overrides are not written to disk.
                 let mut persisted_config = Config::load_or_init().await?;
@@ -1058,6 +1106,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Daemon { port, host } => {
+            maybe_auto_bootstrap_local_llm("daemon").await;
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
@@ -1412,6 +1461,258 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+
+        Commands::Setup { setup_command } => match setup_command {
+            SetupCommands::LocalLlm {
+                tier,
+                base_url,
+                no_downgrade,
+                start_daemon,
+                dry_run,
+            } => {
+                run_setup_local_llm(tier, base_url, no_downgrade, start_daemon, dry_run).await
+            }
+        },
+    }
+}
+
+/// Parse a user-supplied tier string (case-insensitive) into a [`Tier`].
+fn parse_tier_flag(s: &str) -> Result<host_probe::Tier> {
+    match s.to_ascii_lowercase().as_str() {
+        "e2b" | "t1" | "t1e2b" => Ok(host_probe::Tier::T1E2B),
+        "e4b" | "t2" | "t2e4b" => Ok(host_probe::Tier::T2E4B),
+        "26b" | "t3" | "t3moe26b" => Ok(host_probe::Tier::T3MoE26B),
+        "31b" | "t4" | "t4dense31b" => Ok(host_probe::Tier::T4Dense31B),
+        other => bail!("unknown tier `{other}`; valid: e2b, e4b, 26b, 31b"),
+    }
+}
+
+/// Handle `zeroclaw setup local-llm`. Kept in main.rs so the CLI stays
+/// thin — all actual logic lives in `local_llm::setup::run_setup`.
+async fn run_setup_local_llm(
+    tier_override: Option<String>,
+    base_url: Option<String>,
+    no_downgrade: bool,
+    start_daemon: bool,
+    dry_run: bool,
+) -> Result<()> {
+    use local_llm::setup::{run_setup, SetupCallbacks, SetupOptions, SetupStage};
+
+    let override_tier = tier_override.as_deref().map(parse_tier_flag).transpose()?;
+
+    if dry_run {
+        // Probe only: print the plan and exit without installing or pulling.
+        let profile = host_probe::probe(!no_downgrade)
+            .await
+            .context("host hardware probe failed")?;
+        let planned_tier = override_tier.unwrap_or(profile.recommended_tier);
+        println!("Host OS:          {}", profile.os);
+        println!(
+            "Total RAM:        {} MB",
+            profile.total_ram_mb
+        );
+        println!(
+            "GPU:              {}",
+            match &profile.gpu {
+                host_probe::GpuType::Nvidia { name, vram_mb } =>
+                    format!("NVIDIA {name} ({vram_mb} MB VRAM)"),
+                host_probe::GpuType::Amd { name, vram_mb } =>
+                    format!("AMD {name} ({vram_mb} MB VRAM)"),
+                host_probe::GpuType::AppleSilicon { chip } => format!("{chip} (unified memory)"),
+                host_probe::GpuType::Integrated => "Integrated GPU".to_string(),
+                host_probe::GpuType::None => "None detected".to_string(),
+            }
+        );
+        println!("Disk free:        {} MB", profile.disk_free_mb);
+        println!("Recommended tier: {}", profile.recommended_tier);
+        if planned_tier != profile.recommended_tier {
+            println!("Override tier:    {} (from --tier)", planned_tier);
+        }
+        println!(
+            "Would pull:       {}  (~{:.1} GB download, ~{:.1} GB resident)",
+            planned_tier.ollama_tag(),
+            planned_tier.download_size_gb(),
+            planned_tier.required_memory_gb()
+        );
+        println!("(dry-run — no changes made)");
+        return Ok(());
+    }
+
+    let mut last_pull_fraction: Option<f32> = None;
+    let mut on_stage = |stage: SetupStage| match &stage {
+        SetupStage::Probing => println!("[1/6] probing host hardware…"),
+        SetupStage::CheckingDisk => println!("[2/6] checking free disk space…"),
+        SetupStage::InstallingOllama => println!("[3/6] installing Ollama runtime…"),
+        SetupStage::WaitingForDaemon => println!("[4/6] waiting for Ollama daemon…"),
+        SetupStage::PullingModel { attempt } => {
+            println!("[5/6] pulling Gemma 4 model (attempt {attempt})…");
+        }
+        SetupStage::Persisting => println!("[6/6] saving ~/.moa/ config…"),
+        SetupStage::Done => println!("setup complete"),
+    };
+    let mut on_install = |p: local_llm::installer::InstallProgress| {
+        if let Some(line) = p.line {
+            println!("  ollama-install [{}] {line}", p.stage);
+        } else {
+            println!("  ollama-install [{}]", p.stage);
+        }
+    };
+    let mut on_pull = |p: local_llm::PullProgress| {
+        // Only print when the status changes or progress jumps by ≥ 5 %.
+        let frac = p.fraction();
+        let should_print = match (last_pull_fraction, frac) {
+            (Some(prev), Some(cur)) => (cur - prev).abs() >= 0.05,
+            _ => true,
+        };
+        if should_print {
+            match frac {
+                Some(f) => println!(
+                    "  pull [{}] {} {:>5.1}%",
+                    p.status,
+                    p.digest.as_deref().unwrap_or("-"),
+                    f * 100.0
+                ),
+                None => println!("  pull [{}]", p.status),
+            }
+            last_pull_fraction = frac;
+        }
+    };
+
+    let mut callbacks = SetupCallbacks {
+        on_stage: &mut on_stage,
+        on_install_progress: &mut on_install,
+        on_pull_progress: &mut on_pull,
+    };
+
+    let opts = SetupOptions {
+        override_tier,
+        base_url,
+        conservative_downgrade: !no_downgrade,
+        try_start_daemon: start_daemon,
+    };
+
+    let report = run_setup(opts, &mut callbacks).await?;
+
+    println!();
+    println!("Installed tier:         {}", report.installed_tier);
+    println!("Model tag:              {}", report.model_tag);
+    if report.ollama_installed_now {
+        println!("Ollama runtime:         installed during this run");
+    } else {
+        println!("Ollama runtime:         was already present");
+    }
+    println!("Pull attempts:          {}", report.pull_attempts);
+    println!(
+        "Hardware profile saved: {}",
+        report.hardware_profile_path.display()
+    );
+    println!(
+        "Local-LLM config saved: {}",
+        report.local_llm_config_path.display()
+    );
+    Ok(())
+}
+
+/// Environment variable consulted by [`maybe_auto_bootstrap_local_llm`].
+/// Set to a non-empty value (e.g. `1`, `true`) to skip the first-launch
+/// auto-install. Useful in CI and in tests that spin up the gateway
+/// without wanting to touch the network.
+const AUTO_BOOTSTRAP_SKIP_ENV: &str = "ZEROCLAW_SKIP_LOCAL_LLM_BOOTSTRAP";
+
+/// First-launch hook fired from every command that actually serves users
+/// (`agent`, `gateway`, `daemon`). Guarantees the on-device Gemma 4 path
+/// is ready — if it is already installed this returns fast, otherwise it
+/// runs the full installer + pull silently in the foreground so the user
+/// sees the app "take a minute on first start" rather than a cryptic
+/// routing failure later.
+///
+/// Non-fatal by design: if install/pull fails (e.g. offline, unsupported
+/// OS), we log a warning and let the command proceed. A user with a valid
+/// BYOK API key can still chat via the cloud path; the local fallback
+/// simply won't arm until the next launch succeeds.
+async fn maybe_auto_bootstrap_local_llm(command_name: &str) {
+    if std::env::var_os(AUTO_BOOTSTRAP_SKIP_ENV).is_some_and(|v| !v.is_empty()) {
+        tracing::debug!(
+            command = command_name,
+            env = AUTO_BOOTSTRAP_SKIP_ENV,
+            "skipping local-LLM auto-bootstrap (env opt-out set)"
+        );
+        return;
+    }
+
+    use local_llm::setup::{ensure_ready, EnsureOutcome, SetupCallbacks, SetupStage};
+    use local_llm::DEFAULT_OLLAMA_URL;
+
+    let mut stage_printed_header = false;
+    let mut on_stage = |stage: SetupStage| {
+        if !stage_printed_header {
+            eprintln!();
+            eprintln!("🦙 First-launch setup: preparing the on-device Gemma 4 model…");
+            eprintln!("   (this runs once; skip with {AUTO_BOOTSTRAP_SKIP_ENV}=1)");
+            stage_printed_header = true;
+        }
+        match stage {
+            SetupStage::Probing => eprintln!("   · probing hardware"),
+            SetupStage::CheckingDisk => eprintln!("   · checking free disk"),
+            SetupStage::InstallingOllama => eprintln!("   · installing Ollama runtime"),
+            SetupStage::WaitingForDaemon => eprintln!("   · waiting for Ollama daemon"),
+            SetupStage::PullingModel { attempt } => {
+                eprintln!("   · pulling Gemma 4 model (attempt {attempt})");
+            }
+            SetupStage::Persisting => eprintln!("   · saving local-LLM config"),
+            SetupStage::Done => {}
+        }
+    };
+    let mut on_install = |_: local_llm::installer::InstallProgress| {};
+    let mut on_pull = |p: local_llm::PullProgress| {
+        if let Some(frac) = p.fraction() {
+            // Only print the milestone every 25 % to keep stderr readable.
+            let pct = (frac * 100.0) as u32;
+            if pct == 25 || pct == 50 || pct == 75 {
+                eprintln!("   · pull progress: {pct}%");
+            }
+        }
+    };
+
+    let mut callbacks = SetupCallbacks {
+        on_stage: &mut on_stage,
+        on_install_progress: &mut on_install,
+        on_pull_progress: &mut on_pull,
+    };
+
+    match ensure_ready(DEFAULT_OLLAMA_URL, &mut callbacks).await {
+        Ok(EnsureOutcome::AlreadyReady { model }) => {
+            tracing::debug!(
+                command = command_name,
+                %model,
+                "local-LLM already installed — skipping bootstrap"
+            );
+        }
+        Ok(EnsureOutcome::ModelPulled { model }) => {
+            eprintln!("✅ Local Gemma 4 model is ready: {model}");
+        }
+        Ok(EnsureOutcome::Installed { report }) => {
+            eprintln!(
+                "✅ Local Gemma 4 model is ready: {}{}",
+                report.model_tag,
+                if report.probe_succeeded {
+                    ""
+                } else {
+                    " (hardware detection unavailable — default tier used)"
+                }
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                command = command_name,
+                error = %format!("{e:#}"),
+                "local-LLM auto-bootstrap failed; continuing without on-device fallback"
+            );
+            eprintln!(
+                "⚠️  Local Gemma 4 setup failed: {e:#}\n\
+                 (MoA will still work with a cloud API key; rerun `zeroclaw setup local-llm` to retry.)"
+            );
+        }
     }
 }
 
@@ -2677,6 +2978,78 @@ mod tests {
             }
             other => panic!("expected config set, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn setup_local_llm_cli_parses_flags() {
+        let bare = Cli::try_parse_from(["zeroclaw", "setup", "local-llm"])
+            .expect("bare setup local-llm should parse");
+        match bare.command {
+            Commands::Setup {
+                setup_command:
+                    SetupCommands::LocalLlm {
+                        tier,
+                        base_url,
+                        no_downgrade,
+                        start_daemon,
+                        dry_run,
+                    },
+            } => {
+                assert!(tier.is_none());
+                assert!(base_url.is_none());
+                assert!(!no_downgrade);
+                assert!(!start_daemon);
+                assert!(!dry_run);
+            }
+            other => panic!("expected setup local-llm, got {other:?}"),
+        }
+
+        let full = Cli::try_parse_from([
+            "zeroclaw",
+            "setup",
+            "local-llm",
+            "--tier",
+            "e4b",
+            "--base-url",
+            "http://127.0.0.1:22434",
+            "--no-downgrade",
+            "--start-daemon",
+            "--dry-run",
+        ])
+        .expect("fully flagged setup should parse");
+        match full.command {
+            Commands::Setup {
+                setup_command:
+                    SetupCommands::LocalLlm {
+                        tier,
+                        base_url,
+                        no_downgrade,
+                        start_daemon,
+                        dry_run,
+                    },
+            } => {
+                assert_eq!(tier.as_deref(), Some("e4b"));
+                assert_eq!(base_url.as_deref(), Some("http://127.0.0.1:22434"));
+                assert!(no_downgrade);
+                assert!(start_daemon);
+                assert!(dry_run);
+            }
+            other => panic!("expected fully-flagged setup local-llm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_tier_flag_accepts_all_documented_aliases() {
+        assert_eq!(parse_tier_flag("e2b").unwrap(), host_probe::Tier::T1E2B);
+        assert_eq!(parse_tier_flag("E2B").unwrap(), host_probe::Tier::T1E2B);
+        assert_eq!(parse_tier_flag("t1").unwrap(), host_probe::Tier::T1E2B);
+        assert_eq!(parse_tier_flag("e4b").unwrap(), host_probe::Tier::T2E4B);
+        assert_eq!(parse_tier_flag("t2").unwrap(), host_probe::Tier::T2E4B);
+        assert_eq!(parse_tier_flag("26b").unwrap(), host_probe::Tier::T3MoE26B);
+        assert_eq!(parse_tier_flag("t3").unwrap(), host_probe::Tier::T3MoE26B);
+        assert_eq!(parse_tier_flag("31b").unwrap(), host_probe::Tier::T4Dense31B);
+        assert_eq!(parse_tier_flag("t4").unwrap(), host_probe::Tier::T4Dense31B);
+        assert!(parse_tier_flag("bogus").is_err());
     }
 
     #[test]

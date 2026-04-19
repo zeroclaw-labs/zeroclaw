@@ -449,6 +449,14 @@ impl OllamaProvider {
         should_auth: bool,
         tools: Option<&[serde_json::Value]>,
     ) -> anyhow::Result<ApiChatResponse> {
+        // Gemma 4 (E2B/E4B especially) tends to leak English reasoning into
+        // Korean answers even when the user question is entirely in Korean —
+        // the model's "Thinking…" preamble is trained in English. Inject a
+        // MoA-wide system directive that pins the response language to the
+        // user's question language. Applied at the single send_request
+        // choke point so every chat entry path (system/history/tools/plain)
+        // picks it up without duplication.
+        let messages = ensure_language_match_system_prompt(messages);
         let request = self.build_chat_request(messages, model, temperature, tools);
 
         let url = format!("{}/api/chat", self.base_url);
@@ -817,11 +825,164 @@ impl Provider for OllamaProvider {
     }
 }
 
+// ─── Language-match system prompt ─────────────────────────────────────────────
+
+/// MoA-wide instruction prepended to every Ollama request.
+///
+/// Pins the response language to the user's question language so Gemma 4
+/// E2B/E4B stops leaking its English reasoning preamble into Korean
+/// answers (and vice versa). The rule is explicitly conditional on the
+/// user NOT asking otherwise, so a user who writes "Answer this in
+/// English, 아래 질문은 한국어로 적었지만…" still gets English.
+pub const LANGUAGE_MATCH_DIRECTIVE: &str = "\
+특별히 이용자가 지시하지 않으면 반드시 이용자가 질문하는 언어로 답변하세요. \
+한국어로 질문하면 한국어로만, 영어로 질문하면 영어로만 답변해야 합니다. \
+추론 과정을 출력해야 하는 경우에도 같은 언어 규칙을 적용합니다. \
+이 규칙은 반드시 지켜야 합니다.\n\
+\n\
+Unless the user explicitly asks otherwise, always reply in the language the \
+user wrote their question in: Korean in, Korean out; English in, English out. \
+This rule applies to any reasoning trace as well. You must follow this rule.";
+
+/// Ensure the outgoing message vector carries [`LANGUAGE_MATCH_DIRECTIVE`].
+///
+/// Behaviour:
+/// * No system message present → prepend one containing only the directive.
+/// * A system message exists but doesn't mention the directive → prepend
+///   the directive to its content with a blank-line separator so the
+///   caller-supplied instructions still apply afterwards.
+/// * Directive already present (caller or an earlier pass added it) →
+///   return unchanged.
+///
+/// Kept at module level (not as a method) so it can be unit-tested without
+/// constructing a full `OllamaProvider`.
+fn ensure_language_match_system_prompt(mut messages: Vec<Message>) -> Vec<Message> {
+    let first_is_system = messages
+        .first()
+        .is_some_and(|m| m.role == "system");
+
+    if first_is_system {
+        let already_has = messages[0]
+            .content
+            .as_deref()
+            .is_some_and(|c| c.contains(LANGUAGE_MATCH_DIRECTIVE));
+        if already_has {
+            return messages;
+        }
+        let existing = messages[0].content.take().unwrap_or_default();
+        messages[0].content = Some(if existing.trim().is_empty() {
+            LANGUAGE_MATCH_DIRECTIVE.to_string()
+        } else {
+            format!("{LANGUAGE_MATCH_DIRECTIVE}\n\n{existing}")
+        });
+        return messages;
+    }
+
+    // No system message → prepend one at the front.
+    messages.insert(
+        0,
+        Message {
+            role: "system".to_string(),
+            content: Some(LANGUAGE_MATCH_DIRECTIVE.to_string()),
+            images: None,
+            tool_calls: None,
+            tool_name: None,
+        },
+    );
+    messages
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn user_msg(content: &str) -> Message {
+        Message {
+            role: "user".to_string(),
+            content: Some(content.to_string()),
+            images: None,
+            tool_calls: None,
+            tool_name: None,
+        }
+    }
+
+    fn system_msg(content: &str) -> Message {
+        Message {
+            role: "system".to_string(),
+            content: Some(content.to_string()),
+            images: None,
+            tool_calls: None,
+            tool_name: None,
+        }
+    }
+
+    #[test]
+    fn language_directive_prepended_when_no_system_message() {
+        let out = ensure_language_match_system_prompt(vec![user_msg("안녕")]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].role, "system");
+        assert_eq!(
+            out[0].content.as_deref(),
+            Some(LANGUAGE_MATCH_DIRECTIVE),
+            "standalone directive must match the constant verbatim"
+        );
+        assert_eq!(out[1].role, "user");
+    }
+
+    #[test]
+    fn language_directive_merged_with_existing_system_message() {
+        let out = ensure_language_match_system_prompt(vec![
+            system_msg("You are a legal assistant."),
+            user_msg("Explain tort law."),
+        ]);
+        assert_eq!(out.len(), 2, "no new message should be inserted");
+        let sys = out[0].content.as_deref().unwrap();
+        assert!(sys.starts_with(LANGUAGE_MATCH_DIRECTIVE));
+        assert!(sys.contains("You are a legal assistant."));
+    }
+
+    #[test]
+    fn language_directive_not_duplicated_on_repeat_calls() {
+        // Rebuild equivalent inputs twice instead of cloning — Message is
+        // intentionally not Clone because images/tool_calls payloads can be
+        // large and an accidental clone in the hot path would regress
+        // tokens-per-second for long conversations.
+        let once = ensure_language_match_system_prompt(vec![user_msg("hi")]);
+        let first_sys = once[0].content.clone();
+        let first_user = once[1].content.clone();
+        let twice = ensure_language_match_system_prompt(vec![
+            Message {
+                role: "system".to_string(),
+                content: first_sys,
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: first_user,
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            },
+        ]);
+        assert_eq!(once.len(), twice.len());
+        let sys = twice[0].content.as_deref().unwrap();
+        assert_eq!(
+            sys.matches(LANGUAGE_MATCH_DIRECTIVE).count(),
+            1,
+            "directive duplicated on second pass: {sys:?}"
+        );
+    }
+
+    #[test]
+    fn language_directive_replaces_empty_system_content() {
+        // Empty system message: directive should become the sole content.
+        let out = ensure_language_match_system_prompt(vec![system_msg("   "), user_msg("hi")]);
+        assert_eq!(out[0].content.as_deref(), Some(LANGUAGE_MATCH_DIRECTIVE));
+    }
 
     #[test]
     fn default_url() {
