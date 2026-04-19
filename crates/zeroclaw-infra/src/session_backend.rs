@@ -98,9 +98,9 @@ pub trait SessionBackend: Send + Sync {
     /// Returns the number of messages removed. Backends should override for
     /// O(1) bulk clearing; the default falls back to iterative `remove_last`.
     fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
-        let count = self.load(session_key).len();
-        for _ in 0..count {
-            self.remove_last(session_key)?;
+        let mut count = 0;
+        while self.remove_last(session_key)? {
+            count += 1;
         }
         Ok(count)
     }

@@ -364,33 +364,23 @@ impl SessionBackend for SqliteSessionBackend {
     fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
         let conn = self.conn.lock();
 
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sessions WHERE session_key = ?1",
-                params![session_key],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        if count == 0 {
-            return Ok(0);
-        }
-
         conn.execute(
             "DELETE FROM sessions WHERE session_key = ?1",
             params![session_key],
         )
         .map_err(std::io::Error::other)?;
 
-        // Keep metadata row alive but reset message count
-        conn.execute(
-            "UPDATE session_metadata SET message_count = 0, last_activity = ?1 WHERE session_key = ?2",
-            params![Utc::now().to_rfc3339(), session_key],
-        )
-        .map_err(std::io::Error::other)?;
+        let count = conn.changes() as usize;
 
-        #[allow(clippy::cast_sign_loss)]
-        Ok(count as usize)
+        if count > 0 {
+            conn.execute(
+                "UPDATE session_metadata SET message_count = 0, last_activity = ?1 WHERE session_key = ?2",
+                params![Utc::now().to_rfc3339(), session_key],
+            )
+            .map_err(std::io::Error::other)?;
+        }
+
+        Ok(count)
     }
 
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
