@@ -2,9 +2,13 @@
 
 ## Overview
 
-本项目是 ZeroClaw 的 One2X 定制 fork。所有自定义功能封装在 `src/one2x/` 模块中，通过 `one2x` Cargo feature flag 控制编译。
+本项目是 ZeroClaw 的 One2X 定制 fork。One2X 代码通过 `one2x` Cargo feature flag 控制编译，但实现已经是 **hybrid layout**，不是“所有代码都在 `src/one2x/`”：
 
-**核心原则：自定义实现放 `one2x/`，上游文件只留注册调用。**
+- root crate 只保留必须依赖 root 类型的 handler / wiring
+- runtime、channels、gateway、config 各自保留自己的 canonical one2x 实现
+- upstream-owned 文件里尽量只留小型 hook / 注册调用
+
+**核心原则：业务实现放到最贴近所属 crate 的 `one2x` 模块；上游文件只留最小接线。**
 
 ## Architecture
 
@@ -25,10 +29,11 @@ src/one2x/
 
 | 功能 | 位置 |
 |------|------|
-| Runtime-side tool pairing / fast-approval / planning detection | `crates/zeroclaw-runtime/src/one2x.rs` |
-| 多阶段分块压缩 + 质量验证 | `crates/zeroclaw-runtime/src/one2x/compaction.rs` |
-| Channel-side session hygiene（trim / truncate / repair） | `crates/zeroclaw-channels/src/one2x.rs` |
+| Runtime-side pre-LLM hygiene / planning detection | `crates/zeroclaw-runtime/src/one2x/mod.rs` |
+| 多阶段分块压缩 + 质量验证 | `crates/zeroclaw-runtime/src/one2x/compaction.rs`（hook 在 `crates/zeroclaw-runtime/src/agent/context_compressor.rs`） |
+| Channel-side session hygiene / tool pairing / fast approval | `crates/zeroclaw-channels/src/one2x.rs` |
 | Gateway 路由 IoC 钩子 | `crates/zeroclaw-gateway/src/one2x.rs` |
+| Root-crate route/channel wiring | `src/one2x/mod.rs` |
 | `WebChannelConfig` 定义 | `crates/zeroclaw-config/src/scattered_types.rs`（`#[cfg(feature = "one2x")]`） |
 
 ### 历史（2026-04-16 清理）
@@ -48,22 +53,25 @@ src/one2x/
 | 文件 | 改动类型 | 行数 | 冲突风险 |
 |------|---------|------|---------|
 | `Cargo.toml` | feature 声明 | 2 | 极低 |
-| `lib.rs` | module 声明 | 2 | 极低 |
-| `main.rs` | module 声明 | 2 | 极低 |
+| `src/lib.rs` | module 声明 | 2 | 极低 |
+| `src/main.rs` | module 声明 + `register_integrations()` | 3 | 极低 |
 | `Dockerfile.debian` | feature 参数 | 1 | 极低 |
-| `channels/mod.rs` | `extend_channels()` + 3 session hygiene hooks + fast_approval hook | ~20 | 低 |
-| `channels/session_store.rs` | `session_path` visibility: `fn` → `pub fn` | 1 | 极低 |
-| `agent/loop_.rs` | planning_nudge 检测 hook + task-local helper | ~10 | 低 |
-| `config/schema.rs` | cfg-gated `web` field + defaults | 6 | 低 |
-| `gateway/mod.rs` | `extend_router()` 调用 | 3 | 低 |
-| `cron/scheduler.rs` | cfg-gated match arm | 2 | 低 |
-| `gateway/api.rs` | memory prefix/get 扩展 | ~50 | 中 |
-| `memory/traits.rs` | `list_by_prefix` default method | ~13 | 低 |
-| `memory/sqlite.rs` | `list_by_prefix` SQLite impl | ~43 | 低 |
-| `daemon/mod.rs` | heartbeat validation | ~22 | 低 |
-| `tools/cron_add.rs` | delivery enum values | 1 | 极低 |
-| `tools/shell.rs` | session ID env | ~9 | 低 |
-| `agent/loop_.rs` | task-local + helper | ~20 | 低 |
+| `crates/zeroclaw-channels/src/orchestrator/mod.rs` | injected web channel + 3 session hygiene hooks + fast approval + hooks firing | ~40 | 中 |
+| `crates/zeroclaw-infra/src/session_store.rs` | `session_path` visibility: `fn` → `pub fn` | 1 | 极低 |
+| `crates/zeroclaw-runtime/src/agent/loop_.rs` | planning_nudge + pre-LLM hygiene hooks + hooks firing + skill creation | ~40 | 中 |
+| `crates/zeroclaw-runtime/src/agent/context_compressor.rs` | context floor + key-facts flush + multi-stage compaction hook | ~50 | 中 |
+| `crates/zeroclaw-config/src/schema.rs` | cfg-gated `channels.web` 字段 + alias | 6 | 低 |
+| `crates/zeroclaw-gateway/src/lib.rs` | `extend_router()` 调用 + gateway stop hook | ~10 | 低 |
+| `crates/zeroclaw-api/src/memory_traits.rs` | `list_by_prefix` default method | ~13 | 低 |
+| `crates/zeroclaw-memory/src/sqlite.rs` | `list_by_prefix` SQLite impl | ~43 | 低 |
+| `crates/zeroclaw-memory/src/lib.rs` | audited memory 工厂接入 | ~40 | 低 |
+| `crates/zeroclaw-runtime/src/daemon/mod.rs` | heartbeat validation | ~22 | 低 |
+| `crates/zeroclaw-runtime/src/tools/shell.rs` | session ID env | ~9 | 低 |
+| `crates/zeroclaw-runtime/src/tools/skill_tool.rs` | session ID env | ~9 | 低 |
+| `crates/zeroclaw-providers/src/reliable.rs` | stream idle timeout + retry jitter | ~40 | 低 |
+| `crates/zeroclaw-runtime/src/agent/tool_execution.rs` | case-insensitive tool lookup | ~5 | 低 |
+| `crates/zeroclaw-runtime/src/skills/creator.rs` | post-create skill audit | ~14 | 低 |
+| `crates/zeroclaw-runtime/src/heartbeat/engine.rs` | `with_hooks()` + heartbeat tick hook | ~15 | 低 |
 
 ## Routine Sync Workflow
 
@@ -80,8 +88,8 @@ git remote add upstream https://github.com/zeroclaw-labs/zeroclaw.git
 
 ```bash
 # 确保在最新的 custom 分支上
-git checkout one2x/custom-v4  # 或当前最新版本
-git pull origin one2x/custom-v4
+git checkout one2x/custom-v7  # 或当前最新版本
+git pull origin one2x/custom-v7
 
 # 检查上游更新量
 git fetch upstream master
@@ -158,7 +166,7 @@ git rev-parse upstream/master > dev/.last-parity-check
 ```
 [ERROR] CONFLICT during cherry-pick of: abc1234 feat: xxx
 Conflicted files:
-  src/gateway/mod.rs
+  crates/zeroclaw-gateway/src/lib.rs
 ```
 
 **解决方法：**
@@ -167,13 +175,13 @@ Conflicted files:
 # 1. 打开冲突文件，查找 <<<< 标记
 # 2. 保留上游代码 + 我们的注册调用
 # 3. 标记解决
-git add src/gateway/mod.rs
+git add crates/zeroclaw-gateway/src/lib.rs
 git cherry-pick --continue
 
 # 4. 如果需要放弃重来
 git cherry-pick --abort
-git checkout one2x/custom-v4
-git branch -D one2x/custom-v5
+git checkout one2x/custom-v7
+git branch -D one2x/custom-v8
 ```
 
 ### Step 4: Verify
@@ -238,10 +246,11 @@ git push
 
 | 场景 | 位置 | 解决方法 |
 |------|------|---------|
-| 上游新增 channel | `channels/mod.rs` | 保留上游新增 + 保留我们的 `extend_channels()` 调用 |
-| 上游改 router 结构 | `gateway/mod.rs` | 保留上游改动 + 保留我们的 `extend_router()` 调用 |
-| 上游改 ChannelsConfig | `config/schema.rs` | 保留上游字段 + 保留我们的 cfg-gated `web` field |
-| 上游改 match arms | `cron/scheduler.rs` | 保留上游 arms + 保留我们的 cfg-gated `"web"` arm |
+| 上游改 channel orchestrator | `crates/zeroclaw-channels/src/orchestrator/mod.rs` | 保留上游新增 + 重新挂回我们的 injected web channel / session hygiene / fast approval hooks |
+| 上游改 router 结构 | `crates/zeroclaw-gateway/src/lib.rs` | 保留上游改动 + 保留我们的 `extend_router()` 调用 |
+| 上游改启动顺序 | `src/main.rs` | 保留上游改动 + 确认 `register_integrations()` 仍在 gateway/runtime 启动前执行 |
+| 上游改 ChannelsConfig | `crates/zeroclaw-config/src/schema.rs` | 保留上游字段 + 保留我们的 cfg-gated `channels.web` 字段 |
+| 上游改 compaction 流程 | `crates/zeroclaw-runtime/src/agent/context_compressor.rs` | 保留上游压缩逻辑 + 重新挂回 key-facts flush / multi-stage hook |
 
 ### 冲突解决原则
 
@@ -255,32 +264,30 @@ git push
 ### 添加新的自定义功能
 
 ```bash
-# 1. 在 src/one2x/ 下创建新文件
-touch src/one2x/my_feature.rs
+# 1. 先判断功能属于哪个 crate：
+#    - root-only HTTP / AppState / approval 依赖 → src/one2x/
+#    - runtime 行为钩子 → crates/zeroclaw-runtime/src/one2x/
+#    - channel / orchestrator 行为 → crates/zeroclaw-channels/src/one2x.rs
+#    - gateway IoC → crates/zeroclaw-gateway/src/one2x.rs
 
-# 2. 在 src/one2x/mod.rs 中声明模块
-# pub mod my_feature;
+# 2. 把 canonical 实现放在所属 crate 的 one2x 模块
 
-# 3. 如果需要路由，在 extend_router() 中添加
-# .route("/my-endpoint", get(my_feature::handler))
-
-# 4. 如果需要 channel 注册，在 extend_channels() 中添加
-
-# 5. 如果需要修改上游文件（不得已）：
-#    - 用 #[cfg(feature = "one2x")] 门控
-#    - 保持改动最小化
-#    - 在 mod.rs 文档注释中记录集成点
+# 3. 只在 upstream-owned 文件里加最小 hook：
+#    - #[cfg(feature = "one2x")] 门控
+#    - 1~数行注册 / 调用
+#    - 在文档里记录集成点
 ```
 
 ### 新功能 checklist
 
-- [ ] 实现代码在 `src/one2x/` 下
-- [ ] 通过 `mod.rs` 的注册函数接入
+- [ ] canonical 实现在正确的 crate 边界内
+- [ ] root-crate 只保留必须的 wiring / handler
+- [ ] 通过注册函数或最小 hook 接入
 - [ ] 上游文件改动有 cfg 门控
 - [ ] `cargo check` 有/无 feature 都通过
 - [ ] `cargo clippy -D warnings` 通过
 - [ ] `cargo test` 通过
-- [ ] `mod.rs` 文档注释更新了集成点表格
+- [ ] `dev/custom-features.md` / `dev/UPSTREAM-SYNC-SOP.md` / `src/one2x/mod.rs` 注释已同步
 
 ## Contributing Back to Upstream
 
@@ -301,8 +308,8 @@ touch src/one2x/my_feature.rs
 ### 回滚到上一个版本
 
 ```bash
-git checkout one2x/custom-v4  # 回到上一个稳定版本
-git push -f origin one2x/custom-v4:one2x/custom-v5  # 如果已推送了 v5
+git checkout one2x/custom-v7  # 回到上一个稳定版本
+git push -f origin one2x/custom-v7:one2x/custom-v8  # 如果已推送了 v8
 ```
 
 ### 上游有 breaking change
@@ -364,3 +371,5 @@ git cherry-pick <commit-1> <commit-2> ...  # 逐个应用，逐个解决
 | v5.2.0 | v5.1.0 + orphan fixes | 精确 orphan 检测 + channel error recovery + #5537 cherry-pick |
 | v5.3.0 | v5.2.0 + session hygiene | 工具结果截断 + 压缩后文件同步 + 启动时自修复；修复 `__` 分隔符测试 |
 | v5.4.0 | v5.3.0 + agent hooks 接线 | planning 检测 + fast approval 正式生效；Parity Audit SOP + check-parity.sh |
+| v6 | upstream sync + workspace extraction | canonical one2x 代码迁移到 runtime/channels/gateway 子 crate |
+| v7 | 远端开源 ZeroClaw 合并基线 + V6 功能回灌 | 当前维护基线；使用 `one2x/custom-v7` |

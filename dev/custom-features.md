@@ -5,13 +5,22 @@
 **使用方式**：在每次 upstream sync 时，配合 `./dev/check-parity.sh` 一起使用。
 脚本发出 ⚠️ REVIEW 信号后，对照本文档的「等价性标准」手动判断是否可以删除。
 
+> 2026-04-19 对齐说明：
+> v6/v7 清理后，One2X 的 canonical 实现已经是 workspace 布局，而不是“所有代码都在 `src/one2x/`”。
+> 当前真实落点是：
+> - root crate：`src/one2x/{mod.rs,agent_sse.rs,gateway_ext.rs,web_channel.rs}`
+> - runtime：`crates/zeroclaw-runtime/src/one2x/{mod.rs,compaction.rs}`
+> - channels：`crates/zeroclaw-channels/src/one2x.rs`
+> - gateway：`crates/zeroclaw-gateway/src/one2x.rs`
+> - config：`crates/zeroclaw-config/src/{schema.rs,scattered_types.rs}`
+
 ---
 
 ## F-01: Session Hygiene
 
 **状态**: 保留中  
-**我们的文件**: `src/one2x/session_hygiene.rs`  
-**上游文件改动**: `channels/mod.rs` (+3 hooks), `channels/session_store.rs` (+pub fn)
+**我们的文件**: `crates/zeroclaw-channels/src/one2x.rs`（`session_hygiene` 模块）  
+**上游文件改动**: `crates/zeroclaw-channels/src/orchestrator/mod.rs` (+3 hooks), `crates/zeroclaw-infra/src/session_store.rs` (`session_path` 保持可访问)
 
 ### 功能说明
 防止 session JSONL 无限膨胀导致重启后上下文爆炸 → 504 级联：
@@ -32,10 +41,9 @@ trim_tool_result | truncate_session | repair_session | session.*bloat | prune.*s
 
 ### 删除步骤
 ```bash
-rm src/one2x/session_hygiene.rs
-# channels/mod.rs: 删除 3 个 cfg(one2x) 块（行号见 Upstream Integration Points）
-# channels/session_store.rs: session_path 改回 fn（如果上游恢复了私有性）
-# src/one2x/mod.rs: 删除 pub mod session_hygiene;
+# crates/zeroclaw-channels/src/one2x.rs: 删除 session_hygiene 模块
+# crates/zeroclaw-channels/src/orchestrator/mod.rs: 删除 trim/truncate/repair 三个调用点
+# crates/zeroclaw-infra/src/session_store.rs: 如果上游不再需要直接拿路径，可重新评估 session_path 可见性
 # dev/UPSTREAM-SYNC-SOP.md: 更新 Architecture 表格
 ```
 
@@ -44,8 +52,8 @@ rm src/one2x/session_hygiene.rs
 ## F-02: Multi-Stage Compaction
 
 **状态**: 保留中  
-**我们的文件**: `src/one2x/compaction.rs`  
-**上游文件改动**: `agent/context_compressor.rs` (+1 cfg hook)
+**我们的文件**: `crates/zeroclaw-runtime/src/one2x/compaction.rs`  
+**上游文件改动**: `crates/zeroclaw-runtime/src/agent/context_compressor.rs` (+1 cfg hook)
 
 ### 功能说明
 替换上游单次 `compress_once` 为分块多阶段压缩：
@@ -66,18 +74,21 @@ merge.*summary | quality.*check.*compress
 
 ### 删除步骤
 ```bash
-rm src/one2x/compaction.rs
-# agent/context_compressor.rs: 删除 cfg(one2x) 的 try_multi_stage_compress 调用块
-# src/one2x/mod.rs: 删除 pub mod compaction;
+# crates/zeroclaw-runtime/src/one2x/compaction.rs: 删除 try_multi_stage_compress 及相关 prompt/constants
+# crates/zeroclaw-runtime/src/agent/context_compressor.rs: 删除 cfg(one2x) 的 try_multi_stage_compress 调用块
 ```
 
 ---
 
 ## F-03: Planning Detection + Fast Approval
 
-**状态**: 保留中（已实现，已接线至 loop_.rs 和 channels/mod.rs）  
-**我们的文件**: `src/one2x/agent_hooks.rs`  
-**上游文件改动**: `agent/loop_.rs` (+planning hook), `channels/mod.rs` (+fast approval hook)
+**状态**: 保留中（已实现，已接线至 `loop_.rs` 和 `orchestrator/mod.rs`）  
+**我们的文件**:
+- `crates/zeroclaw-runtime/src/one2x/mod.rs`（`agent_hooks::check_planning_without_execution`）
+- `crates/zeroclaw-channels/src/one2x.rs`（`agent_hooks::detect_fast_approval`）
+**上游文件改动**:
+- `crates/zeroclaw-runtime/src/agent/loop_.rs` (+planning hook)
+- `crates/zeroclaw-channels/src/orchestrator/mod.rs` (+fast approval hook)
 
 ### 功能说明
 两个独立的 agent 行为钩子：
@@ -97,10 +108,10 @@ fast.*approval | approval.*detect | short.*confirm
 
 ### 删除步骤
 ```bash
-rm src/one2x/agent_hooks.rs
-# agent/loop_.rs: 删除 planning_nudge_used 变量 + cfg(one2x) 检查块
-# channels/mod.rs: 删除 fast_approval cfg(one2x) 块
-# src/one2x/mod.rs: 删除 pub mod agent_hooks;
+# crates/zeroclaw-runtime/src/one2x/mod.rs: 删除 agent_hooks 模块
+# crates/zeroclaw-channels/src/one2x.rs: 删除 agent_hooks 模块
+# crates/zeroclaw-runtime/src/agent/loop_.rs: 删除 planning_nudge 检查块
+# crates/zeroclaw-channels/src/orchestrator/mod.rs: 删除 fast_approval 调用块
 ```
 
 ---
@@ -108,8 +119,17 @@ rm src/one2x/agent_hooks.rs
 ## F-04: Web Channel (WebSocket)
 
 **状态**: 保留中（One2X 专属功能，不期望上游采纳）  
-**我们的文件**: `src/one2x/web_channel.rs`, `src/one2x/gateway_ext.rs`, `src/one2x/config.rs`  
-**上游文件改动**: `config/schema.rs` (+cfg web field), `gateway/mod.rs` (+extend_router), `channels/mod.rs` (+extend_channels), `cron/scheduler.rs` (+cfg arm)
+**我们的文件**:
+- `src/one2x/web_channel.rs`
+- `src/one2x/gateway_ext.rs`
+- `src/one2x/mod.rs`
+- `crates/zeroclaw-config/src/scattered_types.rs`
+**上游文件改动**:
+- `src/main.rs`（启动时 `register_integrations()`）
+- `crates/zeroclaw-config/src/schema.rs`（`config.channels.web` 字段）
+- `crates/zeroclaw-gateway/src/one2x.rs`（route extender IoC）
+- `crates/zeroclaw-gateway/src/lib.rs`（调用 `extend_router()`）
+- `crates/zeroclaw-channels/src/orchestrator/mod.rs`（收集 injected channel）
 
 ### 功能说明
 为 videoclaw 前端提供 WebSocket 实时 agent 通道。
@@ -127,11 +147,13 @@ _注：这是业务专属功能，通常不会被上游采纳。_
 
 ### 删除步骤
 ```bash
-rm src/one2x/web_channel.rs src/one2x/gateway_ext.rs src/one2x/config.rs
-# config/schema.rs: 删除 cfg-gated web field
-# gateway/mod.rs: 删除 extend_router() 调用
-# channels/mod.rs: 删除 extend_channels() 调用
-# cron/scheduler.rs: 删除 cfg-gated "web" arm
+rm src/one2x/web_channel.rs src/one2x/gateway_ext.rs
+# src/one2x/mod.rs: 删除 register_channel_hooks / register_gateway_routes 中的 web wiring
+# src/main.rs: 不再调用 register_integrations()（若 SSE 也一起删除）
+# crates/zeroclaw-config/src/schema.rs: 删除 cfg-gated web 字段
+# crates/zeroclaw-config/src/scattered_types.rs: 删除 WebChannelConfig
+# crates/zeroclaw-gateway/src/lib.rs: 删除 extend_router() 调用（若无其他 one2x 路由）
+# crates/zeroclaw-channels/src/orchestrator/mod.rs: 删除 injected web channel 收集逻辑
 ```
 
 ---
@@ -140,7 +162,10 @@ rm src/one2x/web_channel.rs src/one2x/gateway_ext.rs src/one2x/config.rs
 
 **状态**: 保留中（One2X 专属功能）  
 **我们的文件**: `src/one2x/agent_sse.rs`  
-**上游文件改动**: `gateway/mod.rs` (+extend_router 中注册)
+**上游文件改动**:
+- `src/one2x/mod.rs`（`register_gateway_routes()` 中注册）
+- `src/main.rs`（启动时 `register_integrations()`）
+- `crates/zeroclaw-gateway/src/one2x.rs` / `crates/zeroclaw-gateway/src/lib.rs`（IoC route extender）
 
 ### 功能说明
 HTTP SSE（Server-Sent Events）Agent 端点，供 videoclaw 服务端以 HTTP 流的形式驱动 agent 执行。
@@ -159,19 +184,22 @@ _注：这是业务专属功能。_
 ### 删除步骤
 ```bash
 rm src/one2x/agent_sse.rs
-# gateway/mod.rs: 删除 extend_router() 中的 agent_sse 路由注册
+# src/one2x/mod.rs: 删除 `/agent` 和 `/agent/clear` 路由注册
+# 如无其他 one2x 路由：同时移除 gateway extender wiring
 ```
 
 ---
 
 ## F-06: Memory `list_by_prefix`
 
-**状态**: 保留中（可考虑贡献回上游）  
-**上游文件改动**: `memory/traits.rs` (+default method), `memory/sqlite.rs` (+impl), `gateway/api.rs` (+两个端点)
+**状态**: 保留中（可考虑贡献回上游；当前只在 memory trait/backends 层实现）  
+**上游文件改动**:
+- `crates/zeroclaw-api/src/memory_traits.rs` (+default method)
+- `crates/zeroclaw-memory/src/sqlite.rs` (+impl)
 
 ### 功能说明
 Memory trait 扩展方法，按 key 前缀批量列举记忆条目。
-上游 Memory API 只有 get/store/search，缺少按前缀枚举（用于 agent 构建上下文摘要）。
+上游 Memory API 只有 list/get/store/search 等通用能力，缺少按前缀枚举（用于按命名约定扫描一批记忆条目）。
 
 ### 上游观察关键词
 ```
@@ -184,9 +212,8 @@ list_by_prefix | memory.*list | prefix.*memory | enumerate.*memor
 
 ### 删除步骤
 ```bash
-# memory/traits.rs: 删除 list_by_prefix default method
-# memory/sqlite.rs: 删除 list_by_prefix SQLite impl
-# gateway/api.rs: 删除两个相关端点
+# crates/zeroclaw-api/src/memory_traits.rs: 删除 list_by_prefix default method
+# crates/zeroclaw-memory/src/sqlite.rs: 删除 list_by_prefix SQLite impl
 ```
 
 ---
@@ -194,11 +221,13 @@ list_by_prefix | memory.*list | prefix.*memory | enumerate.*memor
 ## F-07: Shell `SESSION_ID` Environment Variable
 
 **状态**: 保留中  
-**上游文件改动**: `tools/shell.rs` (~9 行)
+**上游文件改动**:
+- `crates/zeroclaw-runtime/src/tools/shell.rs`
+- `crates/zeroclaw-runtime/src/tools/skill_tool.rs`
 
 ### 功能说明
 在 shell 工具执行时注入 `ZEROCLAW_SESSION_ID` 环境变量，使 shell 脚本能感知当前 session。
-用于 videoclaw skill 脚本中的 session 隔离和日志关联。
+同样的 session 透传也接到了 skill 子进程执行路径，便于 videoclaw skill 脚本做 session 隔离和日志关联。
 
 ### 上游观察关键词
 ```
@@ -210,7 +239,8 @@ SESSION_ID.*env | ZEROCLAW_SESSION | session.*id.*shell | shell.*session.*env
 
 ### 删除步骤
 ```bash
-# tools/shell.rs: 删除 cfg(one2x) 的 SESSION_ID 注入块（约 9 行）
+# crates/zeroclaw-runtime/src/tools/shell.rs: 删除 ZEROCLAW_SESSION_ID 注入块
+# crates/zeroclaw-runtime/src/tools/skill_tool.rs: 删除 ZEROCLAW_SESSION_ID 注入块
 ```
 
 ---
@@ -218,7 +248,7 @@ SESSION_ID.*env | ZEROCLAW_SESSION | session.*id.*shell | shell.*session.*env
 ## F-08: Heartbeat Lark/Feishu Validation
 
 **状态**: 保留中  
-**上游文件改动**: `daemon/mod.rs` (~22 行)
+**上游文件改动**: `crates/zeroclaw-runtime/src/daemon/mod.rs` (~22 行)
 
 ### 功能说明
 Heartbeat 系统在检测到 Lark/Feishu channel 配置时的扩展验证。
@@ -234,7 +264,7 @@ heartbeat.*lark | heartbeat.*feishu | lark.*heartbeat | feishu.*heartbeat | daem
 
 ### 删除步骤
 ```bash
-# daemon/mod.rs: 删除 cfg(one2x) 的 lark/feishu heartbeat 验证块（约 22 行）
+# crates/zeroclaw-runtime/src/daemon/mod.rs: 删除 cfg(one2x) 的 lark/feishu heartbeat 验证块（约 22 行）
 ```
 
 ---
@@ -242,7 +272,7 @@ heartbeat.*lark | heartbeat.*feishu | lark.*heartbeat | feishu.*heartbeat | daem
 ## F-09: Stream Idle Timeout (N1)
 
 **状态**: 保留中（改动在上游文件，无 feature flag — 属于全局改进）  
-**上游文件改动**: `providers/reliable.rs` — `stream_chat`、`stream_chat_with_system`、`stream_chat_with_history` 三个函数的 tokio::spawn 内，将 `stream.next().await` 替换为带 60s 超时的 loop  
+**上游文件改动**: `crates/zeroclaw-providers/src/reliable.rs` — `stream_chat`、`stream_chat_with_system`、`stream_chat_with_history` 三个函数的 tokio::spawn 内，将 `stream.next().await` 替换为带 60s 超时的 loop  
 **对应上游实现**:
 - openclaw: `src/agents/pi-embedded-runner/run/llm-idle-timeout.ts` — `DEFAULT_LLM_IDLE_TIMEOUT_MS = 60_000`，全局生效，无 flag
 - claude-code: `src/services/api/claude.ts:1868` — `STREAM_IDLE_TIMEOUT_MS = 90_000`，需要 `CLAUDE_ENABLE_STREAM_WATCHDOG=true`
@@ -264,8 +294,8 @@ idle.*timeout | stream.*timeout | per.*token.*timeout | STREAM_IDLE_TIMEOUT
 
 ### 删除步骤
 ```bash
-# providers/reliable.rs: 删除 STREAM_IDLE_TIMEOUT_SECS 常量
-# providers/reliable.rs: 将三个 spawn 内的 loop { timeout(...) } 还原为 while let Some(x) = stream.next().await
+# crates/zeroclaw-providers/src/reliable.rs: 删除 STREAM_IDLE_TIMEOUT_SECS 常量
+# crates/zeroclaw-providers/src/reliable.rs: 将三个 spawn 内的 loop { timeout(...) } 还原为 while let Some(x) = stream.next().await
 ```
 
 ---
@@ -273,7 +303,7 @@ idle.*timeout | stream.*timeout | per.*token.*timeout | STREAM_IDLE_TIMEOUT
 ## F-10: Compaction Context Window Floor (N2)
 
 **状态**: 保留中（改动在上游文件，无 feature flag — 属于全局防御性改进）  
-**上游文件改动**: `agent/context_compressor.rs` — `ContextCompressor::new()` 应用 `context_window.max(MIN_CONTEXT_WINDOW_FLOOR)`  
+**上游文件改动**: `crates/zeroclaw-runtime/src/agent/context_compressor.rs` — `ContextCompressor::new()` 应用 `context_window.max(MIN_CONTEXT_WINDOW_FLOOR)`  
 **对应上游实现**:
 - openclaw: `src/agents/pi-settings.ts:4` — `DEFAULT_PI_COMPACTION_RESERVE_TOKENS_FLOOR = 20_000`，应用在 `reserveTokens` 参数（语义略不同：保护 tail token 数，而非总窗口下限）
 - claude-code: `src/services/compact/autoCompact.ts:30` — `MAX_OUTPUT_TOKENS_FOR_SUMMARY = 20_000`，应用在输出空间预留（语义再次不同）
@@ -292,8 +322,8 @@ context_window.*floor | context_window.*min | MIN_CONTEXT | compaction.*floor | 
 
 ### 删除步骤
 ```bash
-# agent/context_compressor.rs: 删除 MIN_CONTEXT_WINDOW_FLOOR 常量
-# agent/context_compressor.rs: ContextCompressor::new() 中 context_window 恢复直接赋值
+# crates/zeroclaw-runtime/src/agent/context_compressor.rs: 删除 MIN_CONTEXT_WINDOW_FLOOR 常量
+# crates/zeroclaw-runtime/src/agent/context_compressor.rs: ContextCompressor::new() 中 context_window 恢复直接赋值
 ```
 
 ---
@@ -301,7 +331,7 @@ context_window.*floor | context_window.*min | MIN_CONTEXT | compaction.*floor | 
 ## F-11: Case-Insensitive Tool Name Lookup (N3)
 
 **状态**: 保留中（改动在上游文件，无 feature flag）  
-**上游文件改动**: `agent/tool_execution.rs` — `find_tool()` 新增大小写不敏感 fallback  
+**上游文件改动**: `crates/zeroclaw-runtime/src/agent/tool_execution.rs` — `find_tool()` 新增大小写不敏感 fallback  
 **对应上游实现**:
 - openclaw: `src/agents/pi-embedded-runner/run/attempt.tool-call-normalization.ts` — 多级标准化 pipeline，在**流层面**提前处理（先 exact → lowercase+alias → case-insensitive scan → 结构化 → ID 推断）
 - claude-code: `src/Tool.ts:355` — **没有大小写不敏感匹配**，只有 exact + `aliases[]`
@@ -322,8 +352,8 @@ case.*insensitive.*tool | toLowerCase.*tool | tool.*normalize | tool.*alias | fi
 
 ### 删除步骤
 ```bash
-# agent/tool_execution.rs: 删除 find_tool 里的 case-insensitive fallback 段（约 5 行）
-# agent/tool_execution.rs: 删除文档注释中的 openclaw 引用
+# crates/zeroclaw-runtime/src/agent/tool_execution.rs: 删除 find_tool 里的 case-insensitive fallback 段（约 5 行）
+# crates/zeroclaw-runtime/src/agent/tool_execution.rs: 删除文档注释中的 openclaw 引用
 ```
 
 ---
@@ -331,8 +361,8 @@ case.*insensitive.*tool | toLowerCase.*tool | tool.*normalize | tool.*alias | fi
 ## F-12: Full Mid-History Tool Pairing Repair
 
 **状态**: 保留中（`#[cfg(feature = "one2x")]` — 改动在 one2x 文件 + loop_.rs hook）  
-**我们的文件**: `src/one2x/session_hygiene.rs` — `repair_full_tool_pairing()`  
-**上游文件改动**: `agent/loop_.rs` — 在 `prepare_messages_for_provider` 前添加 cfg-gated hook
+**我们的文件**: `crates/zeroclaw-runtime/src/one2x/mod.rs`（`session_hygiene::repair_full_tool_pairing()`）  
+**上游文件改动**: `crates/zeroclaw-runtime/src/agent/loop_.rs` — 在 `prepare_messages_for_provider` 前添加 cfg-gated hook
 
 ### 功能说明
 扩展 `ensure_tool_result_pairing`（仅修复开头/结尾/summary 后的孤立 tool 消息）：
@@ -350,9 +380,9 @@ repair.*tool.*pairing.*full | full.*tool.*pairing | mid.*history.*orphan | synth
 
 ### 删除步骤
 ```bash
-# src/one2x/session_hygiene.rs: 删除 repair_full_tool_pairing() 函数
-# agent/loop_.rs: 删除 cfg(one2x) 的 repair_full_tool_pairing + limit_tool_result_sizes 块
-# src/one2x/mod.rs: 更新 Upstream Integration Points 表格
+# crates/zeroclaw-runtime/src/one2x/mod.rs: 删除 repair_full_tool_pairing() 函数
+# crates/zeroclaw-runtime/src/agent/loop_.rs: 删除 cfg(one2x) 的 repair_full_tool_pairing + limit_tool_result_sizes 块
+# dev/UPSTREAM-SYNC-SOP.md: 更新 Upstream Integration Points 表格
 ```
 
 ---
@@ -360,8 +390,8 @@ repair.*tool.*pairing.*full | full.*tool.*pairing | mid.*history.*orphan | synth
 ## F-13: Pre-LLM Tool Result Size Guard
 
 **状态**: 保留中（`#[cfg(feature = "one2x")]` — 与 F-12 共用同一个 loop_.rs hook 块）  
-**我们的文件**: `src/one2x/session_hygiene.rs` — `limit_tool_result_sizes()`  
-**上游文件改动**: `agent/loop_.rs` — 与 F-12 同一个 cfg-gated block
+**我们的文件**: `crates/zeroclaw-runtime/src/one2x/mod.rs`（`session_hygiene::limit_tool_result_sizes_with_budget()`）  
+**上游文件改动**: `crates/zeroclaw-runtime/src/agent/loop_.rs` — 与 F-12 同一个 cfg-gated block
 
 ### 功能说明
 在每次 LLM 调用**之前**（无条件）将超大 tool 结果截断至 20,000 字符。
@@ -378,16 +408,16 @@ limit.*tool.*result.*size | pre.*llm.*tool.*trim | unconditional.*tool.*trim | t
 
 ### 删除步骤
 ```bash
-# src/one2x/session_hygiene.rs: 删除 limit_tool_result_sizes() 函数
-# agent/loop_.rs: 同 F-12 删除块（共用）
+# crates/zeroclaw-runtime/src/one2x/mod.rs: 删除 limit_tool_result_sizes_with_budget() 函数
+# crates/zeroclaw-runtime/src/agent/loop_.rs: 同 F-12 删除块（共用）
 ```
 
 ---
 
 ## F-14: Pre-Compaction Key-Facts Memory Flush
 
-**状态**: 保留中（改动在 one2x 文件，`#[cfg(feature = "one2x")]` 内）  
-**我们的文件**: `src/one2x/compaction.rs` — `try_multi_stage_compress()` 内新增 pre-compaction 阶段  
+**状态**: 保留中（改动在上游压缩器文件，`#[cfg(feature = "one2x")]` 内）  
+**我们的文件**: `crates/zeroclaw-runtime/src/agent/context_compressor.rs` — `compress_if_needed()` 内新增 pre-compaction 阶段  
 **对应上游实现**:
 - openclaw: `src/agents/pi-embedded-runner/run/memory/memory-flush.ts` — 压缩前单独 LLM turn 提取 key facts，写入 `memory/YYYY-MM-DD.md`
 
@@ -406,8 +436,8 @@ pre.*compact.*memory | memory.*flush.*compress | key.*facts.*extract | before.*c
 
 ### 删除步骤
 ```bash
-# src/one2x/compaction.rs: 删除 KEY_FACTS_EXTRACTOR_SYSTEM 常量
-# src/one2x/compaction.rs: 删除 try_multi_stage_compress 中 "Pre-compaction key-facts flush" 块（约 45 行）
+# crates/zeroclaw-runtime/src/agent/context_compressor.rs: 删除 KEY_FACTS_EXTRACTOR_SYSTEM 常量
+# crates/zeroclaw-runtime/src/agent/context_compressor.rs: 删除 compress_if_needed 中 "Pre-compaction key facts flushed to memory" 分支
 ```
 
 ---
@@ -415,12 +445,12 @@ pre.*compact.*memory | memory.*flush.*compress | key.*facts.*extract | before.*c
 ## F-15: Retry Jitter in ReliableProvider Backoff
 
 **状态**: 保留中（改动在上游文件，无 feature flag — 防御性改进）  
-**上游文件改动**: `providers/reliable.rs` — `compute_backoff()` 新增 ±10% jitter  
+**上游文件改动**: `crates/zeroclaw-providers/src/reliable.rs` — `compute_backoff()` 新增 ±25% jitter  
 **对应上游实现**:
 - openclaw: `src/agents/pi-embedded-runner/run/llm-retry.ts` — `jitter: 0.1` 系数
 
 ### 功能说明
-在指数退避基础上增加 ±10% 随机 jitter，避免多个客户端/API keys 同时触发速率限制后
+在指数退避基础上增加 ±25% 随机 jitter，避免多个客户端/API keys 同时触发速率限制后
 同步重试形成 retry storm。
 覆盖所有四条 `chat*` 路径（`compute_backoff` 是统一入口）。
 
@@ -434,8 +464,8 @@ jitter.*backoff | backoff.*jitter | retry.*jitter | random.*backoff
 
 ### 删除步骤
 ```bash
-# providers/reliable.rs: 删除 compute_backoff 中的 jitter 计算（3 行）
-# providers/reliable.rs: 删除顶部 use rand::RngExt as _; import
+# crates/zeroclaw-providers/src/reliable.rs: 删除 compute_backoff 中的 jitter 计算块
+# crates/zeroclaw-providers/src/reliable.rs: 恢复为无随机抖动的固定 backoff
 ```
 
 ---
@@ -443,7 +473,7 @@ jitter.*backoff | backoff.*jitter | retry.*jitter | random.*backoff
 ## F-16: Skill Creation 安全审计 (Phase 0 - C5)
 
 **状态**: 保留中（改动在上游文件，无 feature flag — 安全防御改进）  
-**上游文件改动**: `skills/creator.rs` — `create_from_execution()` 写入 SKILL.toml 后  
+**上游文件改动**: `crates/zeroclaw-runtime/src/skills/creator.rs` — `create_from_execution()` 写入 SKILL.toml 后  
 **添加时间**: 2026-04-16 (自进化 Phase 0)
 
 ### 功能说明
@@ -461,7 +491,7 @@ audit.*skill.*creat | creator.*audit | post.*create.*audit | skill.*security.*cr
 
 ### 删除步骤
 ```bash
-# skills/creator.rs: 删除 create_from_execution 中 audit_skill_directory 调用块（约 14 行，在 tokio::fs::write 之后）
+# crates/zeroclaw-runtime/src/skills/creator.rs: 删除 create_from_execution 中 audit_skill_directory 调用块（约 14 行，在 tokio::fs::write 之后）
 ```
 
 ---
@@ -469,7 +499,7 @@ audit.*skill.*creat | creator.*audit | post.*create.*audit | skill.*security.*cr
 ## F-17: AuditedMemory 工厂接入 (Phase 0 - C3)
 
 **状态**: 保留中（改动在上游文件，无 feature flag — 安全基础设施）  
-**上游文件改动**: `memory/lib.rs` — 新增 `create_audited_memory_with_builders` 函数 + 修改 `create_memory_with_storage_and_routes` 末尾  
+**上游文件改动**: `crates/zeroclaw-memory/src/lib.rs` — 新增 `create_audited_memory_with_builders` 函数 + 修改 `create_memory_with_storage_and_routes` 末尾  
 **添加时间**: 2026-04-16 (自进化 Phase 0)
 
 ### 功能说明
@@ -488,8 +518,8 @@ AuditedMemory.*create_memory | create_memory.*audit | factory.*audit.*memory
 
 ### 删除步骤
 ```bash
-# memory/lib.rs: 删除 create_audited_memory_with_builders 函数（约 30 行）
-# memory/lib.rs: 在 create_memory_with_storage_and_routes 末尾删除 audit_enabled 分支（约 8 行），恢复直接调 create_memory_with_builders
+# crates/zeroclaw-memory/src/lib.rs: 删除 create_audited_memory_with_builders 函数（约 30 行）
+# crates/zeroclaw-memory/src/lib.rs: 在 create_memory_with_storage_and_routes 末尾删除 audit_enabled 分支（约 8 行），恢复直接调 create_memory_with_builders
 ```
 
 ---
@@ -498,8 +528,8 @@ AuditedMemory.*create_memory | create_memory.*audit | factory.*audit.*memory
 
 **状态**: 保留中（改动在上游文件，无 feature flag — 功能完善）  
 **上游文件改动**:
-- `agent/loop_.rs` — `process_message()` 末尾新增 skill 创建逻辑
-- `channels/orchestrator/mod.rs` — memory consolidation 后新增 fire-and-forget skill 创建  
+- `crates/zeroclaw-runtime/src/agent/loop_.rs` — `process_message()` 末尾新增 skill 创建逻辑
+- `crates/zeroclaw-channels/src/orchestrator/mod.rs` — memory consolidation 后新增 fire-and-forget skill 创建  
 **添加时间**: 2026-04-16 (自进化 Phase 0)
 
 ### 功能说明
@@ -519,8 +549,8 @@ process_message.*skill.*creat | orchestrator.*skill.*creat | channel.*skill.*cre
 
 ### 删除步骤
 ```bash
-# agent/loop_.rs: 删除 process_message 末尾的 skill creation 块（约 20 行，`let response = agent_turn` 改回 `agent_turn(...).await`）
-# channels/orchestrator/mod.rs: 删除 memory consolidation 后的 skill creation tokio::spawn 块（约 20 行）
+# crates/zeroclaw-runtime/src/agent/loop_.rs: 删除 process_message 末尾的 skill creation 块（约 20 行，`let response = agent_turn` 改回 `agent_turn(...).await`）
+# crates/zeroclaw-channels/src/orchestrator/mod.rs: 删除 memory consolidation 后的 skill creation tokio::spawn 块（约 20 行）
 ```
 
 ---
@@ -529,10 +559,10 @@ process_message.*skill.*creat | orchestrator.*skill.*creat | channel.*skill.*cre
 
 **状态**: 保留中（改动在上游文件，无 feature flag — bug fix）  
 **上游文件改动**:
-- `agent/loop_.rs` — `run_tool_call_loop` 中 LLM 响应后新增 `fire_llm_output`
-- `channels/orchestrator/mod.rs` — 新增 `fire_session_start`（新 session 时）、`fire_session_end`（`/new` 命令时）、`fire_message_sent`（消息成功发送后）
-- `gateway/lib.rs` — 关闭前新增 `fire_gateway_stop`
-- `heartbeat/engine.rs` — `HeartbeatEngine` 新增 `hooks` 字段 + `with_hooks()` builder + tick 时 `fire_heartbeat_tick`  
+- `crates/zeroclaw-runtime/src/agent/loop_.rs` — `run_tool_call_loop` 中 LLM 响应后新增 `fire_llm_output`
+- `crates/zeroclaw-channels/src/orchestrator/mod.rs` — 新增 `fire_session_start`（新 session 时）、`fire_session_end`（`/new` 命令时）、`fire_message_sent`（消息成功发送后）
+- `crates/zeroclaw-gateway/src/lib.rs` — 关闭前新增 `fire_gateway_stop`
+- `crates/zeroclaw-runtime/src/heartbeat/engine.rs` — `HeartbeatEngine` 新增 `hooks` 字段 + `with_hooks()` builder + tick 时 `fire_heartbeat_tick`  
 **添加时间**: 2026-04-16 (自进化 Phase 0)
 
 ### 功能说明
@@ -551,36 +581,41 @@ fire_session_start | fire_session_end | fire_llm_output | fire_message_sent | fi
 
 ### 删除步骤
 ```bash
-# agent/loop_.rs: 删除 fire_llm_output 调用块（3 行，在 ObserverEvent::LlmResponse 后）
-# channels/orchestrator/mod.rs: 删除 fire_session_start 块（5 行）、fire_session_end 块（4 行）、fire_message_sent 块（8 行）
-# gateway/lib.rs: 删除 fire_gateway_stop 块（3 行，在 Ok(()) 前）
-# heartbeat/engine.rs: 删除 hooks 字段、with_hooks() 方法、tick 中的 fire_heartbeat_tick 块
+# crates/zeroclaw-runtime/src/agent/loop_.rs: 删除 fire_llm_output 调用块（3 行，在 ObserverEvent::LlmResponse 后）
+# crates/zeroclaw-channels/src/orchestrator/mod.rs: 删除 fire_session_start 块（5 行）、fire_session_end 块（4 行）、fire_message_sent 块（8 行）
+# crates/zeroclaw-gateway/src/lib.rs: 删除 fire_gateway_stop 块（3 行，在 Ok(()) 前）
+# crates/zeroclaw-runtime/src/heartbeat/engine.rs: 删除 hooks 字段、with_hooks() 方法、tick 中的 fire_heartbeat_tick 块
 ```
 
 ---
 
-## 审计发现：现有 fork 代码问题
+## 维护风险提示
 
-### 问题 1: 同逻辑多份拷贝（高风险）
+### 风险 1: 行为分散在多个 crate，需要按边界看问题
 
-`session_hygiene` 和 `agent_hooks` 在三个位置有重复实现：
-- `src/one2x/session_hygiene.rs` (479 行)
-- `crates/zeroclaw-channels/src/one2x.rs` (247 行，含 session_hygiene + tool_pairing)
-- `crates/zeroclaw-runtime/src/one2x.rs` (245 行，含 session_hygiene + agent_hooks)
+当前布局已经从 v5 的 root-crate 大杂烩，收敛成：
+- root crate：只保留 `agent_sse` / `web_channel` / `gateway_ext` / 注册入口
+- runtime crate：planning、pre-LLM hygiene、多阶段 compaction
+- channels crate：session hygiene、channel-side tool pairing、fast approval
+- gateway crate：只保留 IoC hook，不直接依赖 root crate
 
-v6 将代码拆分为 workspace crate 后产生的副本。长期易漂移，合并时三处都要改。
+这比旧结构健康得多，但维护时必须先判断问题属于哪一层，不能再用“都去 `src/one2x/` 找”的旧习惯。
 
-**建议**: 将共享逻辑统一到一个 crate（如 `zeroclaw-runtime`），其他 crate 引用而非拷贝。
+### 风险 2: root-crate wiring 依赖启动时一次性注册
 
-### 问题 2: TODO(v6) 未完成项
+`src/main.rs` 会在 `#[cfg(all(feature = "agent-runtime", feature = "one2x"))]`
+下调用 `crate::one2x::register_integrations()`。
 
-`src/one2x/mod.rs` 中两个模块被注释：
-- `agent_sse` — SSE Agent 端点，v6 crate 路径未适配
-- `compaction` — 多阶段压缩，v6 crate 路径未适配
+如果后续 upstream 改动了启动顺序、gateway 启动路径、或 channel orchestrator 初始化顺序，
+F-04/F-05 这类 root-crate wiring 功能最容易静默失效。每次 sync 后都应至少验证：
+- `/agent` / `/agent/clear` 是否还在路由表
+- `/ws/channel` 是否还能接入
+- `config.channels.web` 打开时 injected channel 是否被实际收集
 
-这意味着 F-02（Multi-Stage Compaction）和 F-05（Agent SSE）在 v6 上实际 **不可用**。
+### 风险 3: registry 文档必须跟 workspace 路径一起迁移
 
-### 问题 3: Gateway extend_router 为空实现
-
-`crates/zeroclaw-gateway/src/one2x.rs` 的 `extend_router` 直接返回传入的 router，
-F-04（Web Channel）和 F-05（Agent SSE）在 gateway 侧 **未实际注册**。
+本文件曾长期保留 v5 root-crate 路径，导致 merge 完代码后，文档仍指向已删除文件。
+以后每次做完 crate 迁移、文件重命名或 hook 位置调整，都要同步更新：
+- `dev/custom-features.md`
+- `dev/UPSTREAM-SYNC-SOP.md`
+- `src/one2x/mod.rs` 的模块注释

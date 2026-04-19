@@ -12,7 +12,7 @@
 |------|--------|----------|----------|
 | **定位** | RL 训练 + 生产 Agent，Python，OpenAI-spec | 高性能 Rust Agent Runtime，One2X 定制版 | 多渠道个人助理平台，TypeScript，插件生态 |
 | **Agent Loop** | async + ThreadPoolExecutor(128)，标准 tool_calls | Tokio async，7-dim context，CancellationToken | 事件驱动，插件 hook 点丰富 |
-| **Memory** | SQLite 短期 + MemoryProvider 插件 | LanceDB 向量 + 多后端（Qdrant/Lucid/Sqlite）| LanceDB + active-memory 插件，autoCapture |
+| **Memory** | SQLite 短期 + MemoryProvider 插件 | 多后端记忆（Sqlite/Markdown/Qdrant/Lucid/None）+ 可选 embedding | LanceDB + active-memory 插件，autoCapture |
 | **Compaction** | 4-phase 结构化摘要，anti-thrashing，focus_topic | Multi-stage chunked + quality check + key-facts flush | 预防式 compaction，compaction hooks，post-compaction AGENTS.md 注入 |
 | **错误处理** | FailoverReason 枚举（14 种），jittered backoff，credential rotation | MAX_OVERFLOW_RECOVERY_ATTEMPTS=3，emergency_history_trim | 插件级 retry，compaction safety timeout |
 | **Skills** | `~/.hermes/skills/`，SKILL.md 必需，agentskills.io 标准 | SkillForge 自动发现（GitHub/ClawHub/HuggingFace），sandbox verify | 100+ 内置 skills，SKILL.md 体系，clawhub 集成 |
@@ -47,7 +47,7 @@
 Crate 结构（`~/projects/tools/zeroclaw/`，branch `one2x/custom-v7`）：
 ```
 zeroclaw-runtime/  ← 核心 (loop_.rs = 7593 行)
-zeroclaw-memory/   ← LanceDB 多后端记忆
+zeroclaw-memory/   ← 多后端记忆（Sqlite/Markdown/Qdrant/Lucid/None）
 zeroclaw-providers/ ← LLM provider 抽象
 zeroclaw-channels/ ← 多渠道支持
 zeroclaw-config/   ← 配置 schema
@@ -59,9 +59,11 @@ zeroclaw-security/ ← 安全子系统（Sandbox/PairingGuard/LeakDetector）
 zeroclaw-observability/ ← OTel/Prometheus
 ```
 
-One2X 定制集中在 `crates/zeroclaw-runtime/src/one2x/`：
-- `compaction.rs`（398 行）：多阶段压缩
-- `mod.rs`：`session_hygiene` + `agent_hooks` 两个模块
+One2X 定制不是只集中在一个目录，而是按 crate 边界分布：
+- `crates/zeroclaw-runtime/src/one2x/compaction.rs`（400 行）：多阶段压缩
+- `crates/zeroclaw-runtime/src/one2x/mod.rs`：pre-LLM hygiene + planning detection
+- `crates/zeroclaw-channels/src/one2x.rs`：session hygiene + channel-side tool pairing + fast approval
+- `src/one2x/`：Web channel / Agent SSE / root-crate wiring
 
 **弱点**：Rust 编译门槛高，修改核心逻辑需要重新编译；没有 Python/JS 生态的直接集成；Skill 系统仍在成熟中。
 
@@ -221,9 +223,9 @@ const DEFAULT_HALF_LIFE_DAYS: f64 = 7.0;
 ```
 这个设计参考了人类记忆曲线——最近的记忆权重高，7天后权重减半。Core memories（用户明确设置的重要记忆）不受衰减影响。
 
-**Compaction 前 key-facts flush**（`one2x/compaction.rs`）：
+**Compaction 前 key-facts flush**（`crates/zeroclaw-runtime/src/agent/context_compressor.rs`）：
 ```rust
-// 压缩前提取关键事实存到 LanceDB
+// 压缩前提取关键事实存到当前 memory backend
 // KEY_FACTS_EXTRACTOR_SYSTEM 提取 UUIDs/tokens/决策/配置值
 // 存到 MemoryCategory::Daily，key = "key_facts_YYYY-MM-DD"
 ```
@@ -246,7 +248,7 @@ const DEFAULT_QUERY_MODE = "recent";   // 默认近期查询模式
 
 | | Hermes | ZeroClaw | OpenClaw |
 |---|---|---|---|
-| **向量存储** | 插件化 | LanceDB/Qdrant/Lucid | LanceDB |
+| **向量存储** | 插件化 | Sqlite embedding BLOB / Qdrant / Lucid | LanceDB |
 | **时间衰减** | ❌ | ✅ (half_life=7天) | ❌ |
 | **记忆去重** | ❌ | ✅ conflict模块 | ✅ SHA-256 hash |
 | **成本追踪** | ✅ InsightsEngine | ✅ cost tracking | ❌ |
@@ -306,7 +308,7 @@ this summary; they were already addressed..."
 
 **结论：ZeroClaw 是唯一有质量验证环节的压缩系统——PASS/FAIL 检查保证最新用户请求不被丢失。**
 
-实现（`crates/zeroclaw-runtime/src/one2x/compaction.rs`，398 行）：
+实现（`crates/zeroclaw-runtime/src/one2x/compaction.rs`，400 行）：
 
 **4 个专用 LLM 系统 prompt**：
 - `KEY_FACTS_EXTRACTOR_SYSTEM`：压缩前提取持久化事实
@@ -316,7 +318,7 @@ this summary; they were already addressed..."
 
 **算法流程**：
 ```
-1. pre-compaction: flush key-facts to LanceDB (memory category: Daily)
+1. pre-compaction: flush key-facts to memory backend (memory category: Daily)
 2. split middle section into chunks (CHUNK_SIZE=20)
 3. summarize each chunk independently (parallel? sequential?)
 4. merge chunk summaries → single summary
@@ -361,7 +363,7 @@ CompactionHookRunner.runAfterCompaction()    // 压缩后 hook
 | | Hermes | ZeroClaw | OpenClaw |
 |---|---|---|---|
 | **触发方式** | token 阈值 | token 阈值 | preemptive（提前预估）|
-| **压缩前保护** | key-facts（摘要结构模板）| key-facts flush to LanceDB | AGENTS.md 注入 |
+| **压缩前保护** | key-facts（摘要结构模板）| key-facts flush to memory backend | AGENTS.md 注入 |
 | **质量验证** | anti-thrashing（统计）| PASS/FAIL LLM 检查 | 无 |
 | **压缩后可查** | ❌（一次性） | ❌（除非 key-facts 入库）| ✅ LCM DAG |
 | **focus topic** | ✅ /compress topic | ❌ | ❌ |
