@@ -1,0 +1,23 @@
+[plugin]
+name = "cli-plugin"
+version = "0.1.0"
+description = "Basic CLI execution test fixture — calls echo command."
+wasm_path = "cli_plugin.wasm"
+capabilities = ["tool", "cli"]
+
+[capabilities.cli]
+allowed_commands = ["echo"]
+
+[[tools]]
+name = "tool_cli_echo"
+description = "Echoes a message using the system echo command."
+export = "tool_cli_echo"
+risk_level = "low"
+
+[tools.parameters_schema]
+type = "object"
+required = ["message"]
+
+[tools.parameters_schema.properties.message]
+type = "string"
+description = "The message to echo"

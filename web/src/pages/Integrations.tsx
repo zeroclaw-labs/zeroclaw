@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react';
-import { Puzzle, Check, Zap, Clock } from 'lucide-react';
-import type { Integration } from '@/types/api';
-import { getIntegrations } from '@/lib/api';
+import { Link } from 'react-router-dom';
+import { Puzzle, Check, Zap, Clock, ChevronRight, Wrench } from 'lucide-react';
+import type { Integration, Plugin } from '@/types/api';
+import { getIntegrations, getPlugins, enablePlugin, disablePlugin } from '@/lib/api';
 import { t } from '@/lib/i18n';
 
 function statusBadge(status: Integration['status']) {
@@ -35,21 +36,45 @@ function statusBadge(status: Integration['status']) {
 
 export default function Integrations() {
   const [integrations, setIntegrations] = useState<Integration[]>([]);
+  const [plugins, setPlugins] = useState<Plugin[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeCategory, setActiveCategory] = useState<string>('all');
+  const [togglingPlugin, setTogglingPlugin] = useState<string | null>(null);
 
   useEffect(() => {
-    getIntegrations().then(setIntegrations).catch((err) => setError(err.message)).finally(() => setLoading(false));
+    Promise.all([
+      getIntegrations().then(setIntegrations),
+      getPlugins().then((res) => setPlugins(res.plugins)).catch(() => {}),
+    ]).catch((err) => setError(err.message)).finally(() => setLoading(false));
   }, []);
 
+  const togglePlugin = async (plugin: Plugin) => {
+    setTogglingPlugin(plugin.name);
+    try {
+      const updated = plugin.status === 'loaded'
+        ? await disablePlugin(plugin.name)
+        : await enablePlugin(plugin.name);
+      setPlugins((prev) =>
+        prev.map((p) => (p.name === plugin.name ? { ...p, status: updated.status } : p)),
+      );
+    } catch {
+      // silently ignore — state stays unchanged
+    } finally {
+      setTogglingPlugin(null);
+    }
+  };
+
   const categories = ['all',
-    ...Array.from(new Set(integrations.map((i) => i.category))).sort()
+    ...Array.from(new Set(integrations.map((i) => i.category))).sort(),
+    ...(plugins.length > 0 ? ['plugins'] : []),
   ];
   const filtered =
     activeCategory === 'all'
       ? integrations
-      : integrations.filter((i) => i.category === activeCategory);
+      : activeCategory === 'plugins'
+        ? []
+        : integrations.filter((i) => i.category === activeCategory);
 
   // Group by category for display
   const grouped = filtered.reduce<Record<string, Integration[]>>((acc, item) => {
@@ -103,8 +128,90 @@ export default function Integrations() {
         ))}
       </div>
 
+      {/* Plugin Cards (when Plugins tab is active) */}
+      {(activeCategory === 'plugins' || activeCategory === 'all') && plugins.length > 0 && (
+        <div>
+          {activeCategory === 'all' && (
+            <h3 className="text-[10px] font-semibold uppercase tracking-wider mb-3" style={{ color: 'var(--pc-text-faint)' }}>
+              {t('plugin.category_plugins')}
+            </h3>
+          )}
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 stagger-children">
+            {plugins.map((plugin) => (
+              <div key={plugin.name} className="card p-5 animate-slide-in-up">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <Link
+                      to={`/plugins/${encodeURIComponent(plugin.name)}`}
+                      className="group/link inline-flex items-center gap-1 hover:underline"
+                      style={{ color: 'var(--pc-text-primary)' }}
+                    >
+                      <h4 className="text-sm font-semibold truncate">{plugin.name}</h4>
+                      <ChevronRight className="h-3.5 w-3.5 flex-shrink-0 opacity-40 group-hover/link:opacity-100 transition-opacity" />
+                    </Link>
+                    <span className="text-[10px] mt-0.5 block" style={{ color: 'var(--pc-text-faint)' }}>
+                      v{plugin.version}
+                    </span>
+                    {plugin.description && (
+                      <p className="text-sm mt-1 line-clamp-2" style={{ color: 'var(--pc-text-muted)' }}>
+                        {plugin.description}
+                      </p>
+                    )}
+                  </div>
+                  <span
+                    className="flex-shrink-0 inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-semibold border"
+                    style={plugin.status === 'loaded'
+                      ? { color: 'var(--color-status-success)', borderColor: 'rgba(0, 230, 138, 0.2)', background: 'rgba(0, 230, 138, 0.06)' }
+                      : { color: 'var(--pc-text-muted)', borderColor: 'var(--pc-border)', background: 'transparent' }
+                    }
+                  >
+                    <Check className="h-3 w-3" />
+                    {plugin.status === 'loaded' ? t('plugin.status_loaded') : t('plugin.status_discovered')}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between mt-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="inline-flex items-center gap-1 text-[11px]" style={{ color: 'var(--pc-text-muted)' }}>
+                      <Wrench className="h-3 w-3" />
+                      {t('plugin.tool_count').replace('{count}', String(plugin.tools.length))}
+                    </span>
+                    {plugin.capabilities.map((cap) => (
+                      <span
+                        key={cap}
+                        className="px-2 py-0.5 rounded-full text-[10px] font-medium border"
+                        style={{ color: 'var(--pc-accent)', borderColor: 'var(--pc-accent-dim)', background: 'var(--pc-accent-glow)' }}
+                      >
+                        {cap}
+                      </span>
+                    ))}
+                  </div>
+                  <button
+                    onClick={() => togglePlugin(plugin)}
+                    disabled={togglingPlugin === plugin.name}
+                    className={`relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full transition-colors duration-300 focus:outline-none ${
+                      plugin.status === 'loaded'
+                        ? 'bg-[#0080ff]'
+                        : 'bg-[#1a1a3e]'
+                    }`}
+                    title={plugin.status === 'loaded' ? t('plugin.disable') : t('plugin.enable')}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 rounded-full bg-white transition-transform duration-300 ${
+                        plugin.status === 'loaded'
+                          ? 'translate-x-6'
+                          : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Grouped Integration Cards */}
-      {Object.keys(grouped).length === 0 ? (
+      {activeCategory !== 'plugins' && (Object.keys(grouped).length === 0 ? (
         <div className="card p-8 text-center">
           <Puzzle className="h-10 w-10 mx-auto mb-3" style={{ color: 'var(--pc-text-faint)' }} />
           <p style={{ color: 'var(--pc-text-muted)' }}>{t('integrations.empty')}</p>
@@ -126,9 +233,16 @@ export default function Integrations() {
                   >
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
-                        <h4 className="text-sm font-semibold truncate" style={{ color: 'var(--pc-text-primary)' }}>
-                          {integration.name}
-                        </h4>
+                        <Link
+                          to={`/plugins/${encodeURIComponent(integration.name)}`}
+                          className="group/link inline-flex items-center gap-1 hover:underline"
+                          style={{ color: 'var(--pc-text-primary)' }}
+                        >
+                          <h4 className="text-sm font-semibold truncate">
+                            {integration.name}
+                          </h4>
+                          <ChevronRight className="h-3.5 w-3.5 flex-shrink-0 opacity-40 group-hover/link:opacity-100 transition-opacity" />
+                        </Link>
                         <p className="text-sm mt-1 line-clamp-2" style={{ color: 'var(--pc-text-muted)' }}>
                           {integration.description}
                         </p>
@@ -147,7 +261,7 @@ export default function Integrations() {
             </div>
           </div>
         ))
-      )}
+      ))}
     </div>
   );
 }

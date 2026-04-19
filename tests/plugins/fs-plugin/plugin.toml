@@ -1,0 +1,32 @@
+[plugin]
+name = "fs-plugin"
+version = "0.1.0"
+description = "Filesystem test plugin — reads from a mounted input path and writes to an output path."
+wasm_path = "fs_plugin.wasm"
+capabilities = ["tool"]
+permissions = ["file_read", "file_write"]
+
+[plugin.filesystem]
+"/input" = "/tmp/zeroclaw-test-input"
+"/output" = "/tmp/zeroclaw-test-output"
+
+[[tools]]
+name = "tool_read_file"
+description = "Reads a file from the filesystem sandbox and returns its contents."
+export = "tool_read_file"
+risk_level = "medium"
+parameters_schema = { type = "object", properties = { path = { type = "string", description = "Path to the file to read (within allowed_paths)" } }, required = ["path"] }
+
+[[tools]]
+name = "tool_write_file"
+description = "Writes content to a file in the filesystem sandbox and returns bytes written."
+export = "tool_write_file"
+risk_level = "medium"
+parameters_schema = { type = "object", properties = { path = { type = "string", description = "Path to the file to write (within allowed_paths)" }, contents = { type = "string", description = "Content to write to the file" } }, required = ["path", "contents"] }
+
+[[tools]]
+name = "tool_transform_file"
+description = "Reads /input/data.txt, transforms content to uppercase, writes result to /output/result.txt."
+export = "tool_transform_file"
+risk_level = "medium"
+parameters_schema = { type = "object", properties = {} }

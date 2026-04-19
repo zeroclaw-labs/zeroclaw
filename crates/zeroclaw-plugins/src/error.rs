@@ -37,6 +37,75 @@ pub enum PluginError {
     #[error("invalid plugin signature: {0}")]
     SignatureInvalid(String),
 
+    #[error("missing required field '{field}' in plugin manifest")]
+    MissingField { field: String },
+
+    #[error("malformed TOML in plugin manifest: {0}")]
+    MalformedToml(String),
+
+    #[error("plugin '{plugin}' is missing required config keys: {keys}")]
+    MissingConfig { plugin: String, keys: String },
+
+    #[error(
+        "plugin '{plugin}' declares wildcard host '{host}' which is forbidden at {level} security level"
+    )]
+    WildcardHostRejected {
+        plugin: String,
+        host: String,
+        level: String,
+    },
+
+    #[error(
+        "plugin '{plugin}' declares wildcard tool delegation which is forbidden at {level} security level"
+    )]
+    WildcardDelegationRejected { plugin: String, level: String },
+
+    #[error(
+        "plugin '{plugin}' declares wildcard CLI command '{command}' which is forbidden at all security levels"
+    )]
+    WildcardCliCommandRejected { plugin: String, command: String },
+
+    #[error("plugin '{plugin}' declares forbidden path '{path}' in allowed_paths")]
+    ForbiddenPath { plugin: String, path: String },
+
+    #[error(
+        "plugin '{plugin}' declares path '{path}' outside workspace root '{workspace}' (strict mode)"
+    )]
+    PathOutsideWorkspace {
+        plugin: String,
+        path: String,
+        workspace: String,
+    },
+
+    #[error("plugin '{plugin}' is not allowlisted in paranoid mode")]
+    PluginNotAllowlisted { plugin: String },
+
+    #[error("failed to decrypt config key '{key}': {source}")]
+    ConfigDecrypt { key: String, source: anyhow::Error },
+
+    #[error(
+        "WASM binary integrity check failed for plugin '{plugin}': expected hash {expected}, got {actual}"
+    )]
+    HashMismatch {
+        plugin: String,
+        expected: String,
+        actual: String,
+    },
+
+    #[error("download failed: {0}")]
+    DownloadFailed(String),
+
+    #[error("unsupported archive format: {0}")]
+    UnsupportedArchive(String),
+
+    #[error("archive extraction failed: {0}")]
+    ExtractionFailed(String),
+
+    #[error(
+        "manifest not found after extracting archive — expected manifest.toml in root or one subdirectory"
+    )]
+    ManifestNotFoundInArchive,
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

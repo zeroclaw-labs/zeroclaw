@@ -12,6 +12,8 @@ import type {
   Session,
   ChannelDetail,
   SessionMessagesResponse,
+  PluginDetail,
+  PluginsResponse,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
 import { apiOrigin, basePath } from './basePath';
@@ -234,6 +236,90 @@ export function patchCronSettings(
     method: 'PATCH',
     body: JSON.stringify(patch),
   });
+}
+
+// ---------------------------------------------------------------------------
+// Plugins
+// ---------------------------------------------------------------------------
+
+export function getPlugins(): Promise<PluginsResponse> {
+  return apiFetch<PluginsResponse>('/api/plugins');
+}
+
+export async function getPlugin(name: string): Promise<PluginDetail | null> {
+  try {
+    return await apiFetch<PluginDetail>(`/api/plugins/${encodeURIComponent(name)}`);
+  } catch {
+    return null;
+  }
+}
+
+export function enablePlugin(name: string): Promise<PluginDetail> {
+  return apiFetch<PluginDetail>(`/api/plugins/${encodeURIComponent(name)}/enable`, {
+    method: 'POST',
+  });
+}
+
+export function disablePlugin(name: string): Promise<PluginDetail> {
+  return apiFetch<PluginDetail>(`/api/plugins/${encodeURIComponent(name)}/disable`, {
+    method: 'POST',
+  });
+}
+
+export interface ReloadPluginsResponse {
+  ok: boolean;
+  total?: number;
+  loaded?: string[];
+  unloaded?: string[];
+  error?: string;
+}
+
+export function reloadPlugins(): Promise<ReloadPluginsResponse> {
+  return apiFetch<ReloadPluginsResponse>('/api/plugins/reload', {
+    method: 'POST',
+  });
+}
+
+export interface InstallPluginResponse {
+  ok: boolean;
+  message?: string;
+  plugin_name?: string;
+  error?: string;
+}
+
+export function installPlugin(source: string): Promise<InstallPluginResponse> {
+  return apiFetch<InstallPluginResponse>('/api/plugins/install', {
+    method: 'POST',
+    body: JSON.stringify({ source }),
+  });
+}
+
+export function patchPluginConfig(
+  name: string,
+  config: Record<string, string>,
+): Promise<{ status: string }> {
+  return apiFetch<{ status: string }>(
+    `/api/plugins/${encodeURIComponent(name)}/config`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(config),
+    },
+  );
+}
+
+export interface RemovePluginResponse {
+  ok: boolean;
+  message?: string;
+  error?: string;
+}
+
+export function removePlugin(name: string): Promise<RemovePluginResponse> {
+  return apiFetch<RemovePluginResponse>(
+    `/api/plugins/${encodeURIComponent(name)}`,
+    {
+      method: 'DELETE',
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------

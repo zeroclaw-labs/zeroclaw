@@ -628,15 +628,18 @@ pub async fn handle_api_doctor(
         .filter(|r| r.severity == zeroclaw_runtime::doctor::Severity::Error)
         .count();
 
-    Json(serde_json::json!({
+    let body = serde_json::json!({
         "results": results,
         "summary": {
             "ok": ok_count,
             "warnings": warn_count,
             "errors": error_count,
         }
-    }))
-    .into_response()
+    });
+
+    // Plugin diagnostics are wired at the binary level via the root crate's doctor module.
+
+    Json(body).into_response()
 }
 
 /// GET /api/memory — list or search memory entries

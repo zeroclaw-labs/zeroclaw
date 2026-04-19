@@ -1,4 +1,4 @@
-import { NavLink } from 'react-router-dom';
+import { NavLink, useLocation } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
 import {
   LayoutDashboard,
@@ -12,15 +12,35 @@ import {
   Activity,
   Stethoscope,
   Monitor,
+  Blocks,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
 
-const navItems = [
+interface NavChild {
+  to: string;
+  labelKey: string;
+}
+
+interface NavItem {
+  to: string;
+  icon: typeof LayoutDashboard;
+  labelKey: string;
+  children?: NavChild[];
+}
+
+const navItems: NavItem[] = [
   { to: '/', icon: LayoutDashboard, labelKey: 'nav.dashboard' },
   { to: '/agent', icon: MessageSquare, labelKey: 'nav.agent' },
   { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
   { to: '/cron', icon: Clock, labelKey: 'nav.cron' },
-  { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations' },
+  {
+    to: '/integrations',
+    icon: Puzzle,
+    labelKey: 'nav.integrations',
+    children: [
+      { to: '/plugins', labelKey: 'nav.plugins' },
+    ],
+  },
   { to: '/memory', icon: Brain, labelKey: 'nav.memory' },
   { to: '/config', icon: Settings, labelKey: 'nav.config' },
   { to: '/cost', icon: DollarSign, labelKey: 'nav.cost' },
@@ -36,41 +56,71 @@ function SidebarNavItem({ item, showLabel, showTooltip, onClick }: {
   showTooltip: boolean;
   onClick: () => void;
 }) {
-  const { to, icon: Icon, labelKey } = item;
+  const { to, icon: Icon, labelKey, children } = item;
+  const location = useLocation();
   return (
-    <NavLink
-      key={to}
-      to={to}
-      end={to === '/'}
-      onClick={onClick}
-      className={({ isActive }) =>
-        [
-          'flex items-center rounded-xl text-sm font-medium transition-all group relative',
-          showLabel ? 'justify-start gap-3 px-3 py-2.5' : 'justify-center w-10 h-10 mx-auto',
-          isActive
-            ? 'text-(--pc-accent-light)'
-            : 'text-(--pc-text-muted) hover:text-(--pc-text-secondary) hover:bg-(--pc-hover)',
-        ].join(' ')
-      }
-      style={({ isActive }) => ({
-        ...(isActive ? { background: 'var(--pc-accent-glow)', border: '1px solid var(--pc-accent-dim)' } : {}),
-      })}
-    >
-      {({ isActive }) => (
-        <>
-          <Icon className={`h-5 w-5 shrink-0 transition-colors ${isActive ? 'text-(--pc-accent)' : 'group-hover:text-(--pc-accent)'}`} />
-          {showLabel && <span className="whitespace-nowrap">{t(labelKey)}</span>}
-          {showTooltip && (
-            <span
-              className="absolute left-full ml-2 px-2 py-1 rounded-md text-xs whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-9999"
-              style={{ background: 'var(--pc-bg-elevated)', color: 'var(--pc-text-primary)', border: '1px solid var(--pc-border)' }}
-            >
-              {t(labelKey)}
-            </span>
-          )}
-        </>
+    <div>
+      <NavLink
+        key={to}
+        to={to}
+        end={to === '/' || !!children}
+        onClick={onClick}
+        className={({ isActive }) =>
+          [
+            'flex items-center rounded-xl text-sm font-medium transition-all group relative',
+            showLabel ? 'justify-start gap-3 px-3 py-2.5' : 'justify-center w-10 h-10 mx-auto',
+            isActive
+              ? 'text-(--pc-accent-light)'
+              : 'text-(--pc-text-muted) hover:text-(--pc-text-secondary) hover:bg-(--pc-hover)',
+          ].join(' ')
+        }
+        style={({ isActive }) => ({
+          ...(isActive ? { background: 'var(--pc-accent-glow)', border: '1px solid var(--pc-accent-dim)' } : {}),
+        })}
+      >
+        {({ isActive }) => (
+          <>
+            <Icon className={`h-5 w-5 shrink-0 transition-colors ${isActive ? 'text-(--pc-accent)' : 'group-hover:text-(--pc-accent)'}`} />
+            {showLabel && <span className="whitespace-nowrap">{t(labelKey)}</span>}
+            {showTooltip && (
+              <span
+                className="absolute left-full ml-2 px-2 py-1 rounded-md text-xs whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-9999"
+                style={{ background: 'var(--pc-bg-elevated)', color: 'var(--pc-text-primary)', border: '1px solid var(--pc-border)' }}
+              >
+                {t(labelKey)}
+              </span>
+            )}
+          </>
+        )}
+      </NavLink>
+      {children && showLabel && (
+        <div className="ml-6 mt-1 space-y-1">
+          {children.map((child) => {
+            const isChildActive = location.pathname === child.to || location.pathname.startsWith(child.to + '/');
+            return (
+              <NavLink
+                key={child.to}
+                to={child.to}
+                onClick={onClick}
+                className={[
+                  'flex items-center gap-2 pl-5 pr-3 py-2 rounded-xl text-sm transition-all group',
+                  isChildActive
+                    ? 'text-(--pc-accent-light)'
+                    : 'text-(--pc-text-muted) hover:text-(--pc-text-secondary) hover:bg-(--pc-hover)',
+                ].join(' ')}
+                style={isChildActive ? {
+                  background: 'var(--pc-accent-glow)',
+                  border: '1px solid var(--pc-accent-dim)',
+                } : {}}
+              >
+                <Blocks className={`h-4 w-4 shrink-0 transition-colors ${isChildActive ? 'text-(--pc-accent)' : 'group-hover:text-(--pc-accent)'}`} />
+                <span>{t(child.labelKey)}</span>
+              </NavLink>
+            );
+          })}
+        </div>
       )}
-    </NavLink>
+    </div>
   );
 }
 

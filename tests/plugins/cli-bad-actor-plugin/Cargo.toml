@@ -1,0 +1,13 @@
+[package]
+name = "cli-bad-actor-plugin"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+zeroclaw-plugin-sdk = { path = "../../../crates/zeroclaw-plugin-sdk" }

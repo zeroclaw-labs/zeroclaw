@@ -34,11 +34,12 @@ credentials.json
 .worktrees/
 .zeroclaw/*
 
-# Skill eval workspaces (test outputs, transcripts, grading)
-.claude/skills/*-workspace/
+# Claude Code local config and state
+.claude/
+.mcp.json
 
-# Claude Code agent worktrees (temporary isolated workspaces)
-.claude/worktrees/
+# Project management local state
+.project/
 
 # Local state backups
 .local-state-backups/
@@ -58,6 +59,9 @@ playground/
 
 # Temporary rustc output
 rust_out
+
+# Test plugin build artifacts
+tests/plugins/target/
 
 # Auto-generated Tauri schemas
 apps/tauri/gen/schemas/

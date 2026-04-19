@@ -926,11 +926,25 @@ pub fn all_tools_with_runtime(
                 Ok(host) => {
                     let tool_manifests = host.tool_plugins();
                     let count = tool_manifests.len();
-                    for manifest in tool_manifests {
+                    for (manifest, wasm_path) in tool_manifests {
+                        let wasm_bytes = std::fs::read(&wasm_path).unwrap_or_default();
+                        let extism_manifest =
+                            extism::Manifest::new([extism::Wasm::data(wasm_bytes)]);
+                        let plugin = match extism::Plugin::new(&extism_manifest, [], true) {
+                            Ok(p) => std::sync::Arc::new(std::sync::Mutex::new(p)),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to instantiate plugin {}: {e}",
+                                    manifest.name
+                                );
+                                continue;
+                            }
+                        };
                         tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::new(
                             manifest.name.clone(),
                             manifest.description.clone().unwrap_or_default(),
                             manifest.name.clone(),
+                            manifest.version.clone(),
                             "call".to_string(),
                             serde_json::json!({
                                 "type": "object",
@@ -942,6 +956,7 @@ pub fn all_tools_with_runtime(
                                 },
                                 "required": ["input"]
                             }),
+                            plugin,
                         )));
                     }
                     tracing::info!("Loaded {count} WASM plugin tools");

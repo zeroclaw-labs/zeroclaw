@@ -1,0 +1,47 @@
+[plugin]
+name = "bad-actor-plugin"
+version = "0.1.0"
+description = "Adversarial test plugin — exercises timeout enforcement, crash recovery, malformed output handling, and sandbox boundary enforcement."
+wasm_path = "bad_actor_plugin.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "file_read"]
+timeout_ms = 2000
+allowed_hosts = ["httpbin.org"]
+
+[plugin.filesystem]
+allowed_paths = { "/safe" = "/tmp/zeroclaw-test-safe" }
+
+[[tools]]
+name = "tool_infinite_loop"
+description = "Spins forever in an infinite loop — tests timeout_ms enforcement."
+export = "tool_infinite_loop"
+risk_level = "high"
+parameters_schema = { type = "object" }
+
+[[tools]]
+name = "tool_panic"
+description = "Triggers a Rust panic inside the WASM guest — tests crash recovery."
+export = "tool_panic"
+risk_level = "high"
+parameters_schema = { type = "object" }
+
+[[tools]]
+name = "tool_bad_json"
+description = "Returns invalid non-JSON bytes — tests malformed output handling."
+export = "tool_bad_json"
+risk_level = "high"
+parameters_schema = { type = "object" }
+
+[[tools]]
+name = "tool_http_blocked"
+description = "Attempts HTTP to evil.example.com which is NOT in allowed_hosts — tests sandbox denial."
+export = "tool_http_blocked"
+risk_level = "high"
+parameters_schema = { type = "object" }
+
+[[tools]]
+name = "tool_file_escape"
+description = "Attempts to read /etc/passwd which is outside allowed_paths — tests filesystem sandbox."
+export = "tool_file_escape"
+risk_level = "high"
+parameters_schema = { type = "object" }

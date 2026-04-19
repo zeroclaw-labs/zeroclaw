@@ -1,0 +1,1 @@
+#![cfg(feature = "plugins-wasm")]

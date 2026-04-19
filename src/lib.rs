@@ -88,7 +88,7 @@ pub mod rag;
 #[cfg(feature = "agent-runtime")]
 pub mod routines;
 #[cfg(feature = "agent-runtime")]
-pub(crate) mod security;
+pub mod security;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod service;
 #[cfg(feature = "agent-runtime")]

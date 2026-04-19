@@ -686,6 +686,15 @@ enum PluginCommands {
         /// Plugin name
         name: String,
     },
+    /// Reload all plugins (re-scan directory and re-instantiate)
+    Reload,
+    /// Audit a plugin manifest without installing
+    Audit {
+        /// Path to plugin directory or manifest file
+        path: String,
+    },
+    /// Run diagnostic checks on all installed plugins
+    Doctor,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2070,8 +2079,49 @@ async fn main() -> Result<()> {
             }
             PluginCommands::Install { source } => {
                 let mut host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
-                host.install(&source)?;
-                println!("Plugin installed from {source}");
+                if zeroclaw::plugins::archive::is_url(&source) {
+                    // Download and extract remote archive, then install (disabled by default)
+                    let (_tmp_dir, plugin_dir) =
+                        zeroclaw::plugins::archive::download_and_extract(&source)?;
+                    let manifest_path = zeroclaw::plugins::archive::find_manifest(&plugin_dir)?;
+                    let manifest = zeroclaw::plugins::PluginManifest::parse(
+                        &std::fs::read_to_string(&manifest_path)?,
+                    )?;
+                    let source_dir = manifest_path
+                        .parent()
+                        .ok_or_else(|| anyhow::anyhow!("manifest has no parent directory"))?;
+                    host.install_from_source_dir(source_dir, &manifest_path, &manifest, false)?;
+                    println!(
+                        "Plugin '{}' installed from URL (disabled — run `zeroclaw plugin enable {}` after configuration)",
+                        manifest.name, manifest.name
+                    );
+                } else if std::path::Path::new(&source).is_file()
+                    && zeroclaw::plugins::archive::is_archive(&source)
+                {
+                    // Extract local archive, then install (disabled by default)
+                    let format = zeroclaw::plugins::archive::ArchiveFormat::from_url(&source)?;
+                    let tmp_dir = tempfile::TempDir::new()?;
+                    zeroclaw::plugins::archive::extract(
+                        std::path::Path::new(&source),
+                        format,
+                        tmp_dir.path(),
+                    )?;
+                    let manifest_path = zeroclaw::plugins::archive::find_manifest(tmp_dir.path())?;
+                    let manifest = zeroclaw::plugins::PluginManifest::parse(
+                        &std::fs::read_to_string(&manifest_path)?,
+                    )?;
+                    let source_dir = manifest_path
+                        .parent()
+                        .ok_or_else(|| anyhow::anyhow!("manifest has no parent directory"))?;
+                    host.install_from_source_dir(source_dir, &manifest_path, &manifest, false)?;
+                    println!(
+                        "Plugin '{}' installed from archive (disabled — run `zeroclaw plugin enable {}` after configuration)",
+                        manifest.name, manifest.name
+                    );
+                } else {
+                    host.install(&source)?;
+                    println!("Plugin installed from {source}");
+                }
                 Ok(())
             }
             PluginCommands::Remove { name } => {
@@ -2093,6 +2143,83 @@ async fn main() -> Result<()> {
                         println!("WASM: {}", info.wasm_path.display());
                     }
                     None => println!("Plugin '{name}' not found."),
+                }
+                Ok(())
+            }
+            PluginCommands::Audit { path } => {
+                let manifest_path = {
+                    let p = std::path::Path::new(&path);
+                    if p.is_file() {
+                        p.to_path_buf()
+                    } else {
+                        let candidate = p.join("plugin.toml");
+                        if candidate.exists() {
+                            candidate
+                        } else {
+                            p.join("manifest.toml")
+                        }
+                    }
+                };
+                let content = std::fs::read_to_string(&manifest_path).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to read manifest at {}: {e}",
+                        manifest_path.display()
+                    )
+                })?;
+                let manifest: zeroclaw::plugins::PluginManifest = toml::from_str(&content)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to parse manifest at {}: {e}",
+                            manifest_path.display()
+                        )
+                    })?;
+                println!("{:#?}", manifest);
+                Ok(())
+            }
+            PluginCommands::Reload => {
+                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                let summary = host.reload()?;
+
+                println!("Plugins reloaded.");
+                println!("  Total: {}", summary.total);
+                if !summary.loaded.is_empty() {
+                    println!("  Loaded: {}", summary.loaded.join(", "));
+                }
+                if !summary.unloaded.is_empty() {
+                    println!("  Unloaded: {}", summary.unloaded.join(", "));
+                }
+                if !summary.failed.is_empty() {
+                    println!("  Failed:");
+                    for err in &summary.failed {
+                        println!("    - {err}");
+                    }
+                }
+                Ok(())
+            }
+            PluginCommands::Doctor => {
+                use zeroclaw::plugins::host::DiagStatus;
+                let host = zeroclaw::plugins::host::PluginHost::new(&config.workspace_dir)?;
+                let diagnostics = host.doctor();
+                if diagnostics.is_empty() {
+                    println!("No plugins installed.");
+                    return Ok(());
+                }
+                for diag in &diagnostics {
+                    let overall = diag.overall();
+                    let marker = match overall {
+                        DiagStatus::Pass => "✓",
+                        DiagStatus::Warn => "⚠",
+                        DiagStatus::Fail => "✗",
+                    };
+                    println!("{marker} {} [{overall}]", diag.plugin_name);
+                    for check in &diag.checks {
+                        let check_marker = match check.status {
+                            DiagStatus::Pass => "  ✓",
+                            DiagStatus::Warn => "  ⚠",
+                            DiagStatus::Fail => "  ✗",
+                        };
+                        println!("{check_marker} {}: {}", check.name, check.message);
+                    }
                 }
                 Ok(())
             }

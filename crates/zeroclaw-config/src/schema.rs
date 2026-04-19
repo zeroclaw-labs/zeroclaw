@@ -3456,6 +3456,9 @@ pub struct PluginsConfig {
     #[serde(default)]
     #[nested]
     pub security: PluginSecurityConfig,
+    /// Per-plugin configuration sections (`[plugins.<name>]`).
+    #[serde(default, flatten)]
+    pub per_plugin: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
 }
 
 /// Plugin signature verification configuration (`[plugins.security]`).
@@ -3474,6 +3477,12 @@ pub struct PluginSecurityConfig {
     /// Hex-encoded Ed25519 public keys of trusted plugin publishers.
     #[serde(default)]
     pub trusted_publisher_keys: Vec<String>,
+    /// Network security level: "default", "strict", or "paranoid".
+    #[serde(default)]
+    pub network_security_level: String,
+    /// Plugins explicitly allowed in paranoid mode (by name).
+    #[serde(default)]
+    pub allowed_plugins: Vec<String>,
 }
 
 fn default_signature_mode() -> String {
@@ -3485,6 +3494,8 @@ impl Default for PluginSecurityConfig {
         Self {
             signature_mode: default_signature_mode(),
             trusted_publisher_keys: Vec::new(),
+            network_security_level: String::new(),
+            allowed_plugins: Vec::new(),
         }
     }
 }
@@ -3505,6 +3516,7 @@ impl Default for PluginsConfig {
             auto_discover: false,
             max_plugins: default_max_plugins(),
             security: PluginSecurityConfig::default(),
+            per_plugin: std::collections::HashMap::new(),
         }
     }
 }

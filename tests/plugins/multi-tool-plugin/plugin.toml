@@ -1,0 +1,60 @@
+[plugin]
+name = "multi-tool-plugin"
+version = "0.1.0"
+description = "Multi-tool test plugin — exercises multi-tool registry, config injection, HTTP access, and filesystem access."
+wasm_path = "multi_tool_plugin.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "file_read"]
+
+[plugin.network]
+allowed_hosts = ["httpbin.org", "example.com"]
+
+[plugin.config]
+api_key = { required = true }
+model = "gpt-4"
+
+[plugin.filesystem]
+"/data" = "/tmp/zeroclaw-test-data"
+"/config" = "/tmp/zeroclaw-test-config"
+
+[[tools]]
+name = "tool_add"
+description = "Adds two numbers and returns their sum."
+export = "tool_add"
+risk_level = "low"
+parameters_schema = { type = "object", properties = { a = { type = "number", description = "First operand" }, b = { type = "number", description = "Second operand" } }, required = ["a", "b"] }
+
+[[tools]]
+name = "tool_reverse_string"
+description = "Reverses the characters in a string."
+export = "tool_reverse_string"
+risk_level = "low"
+parameters_schema = { type = "object", properties = { text = { type = "string", description = "The string to reverse" } }, required = ["text"] }
+
+[[tools]]
+name = "tool_lookup_config"
+description = "Reads injected Extism config vars (api_key, model) and returns them as JSON."
+export = "tool_lookup_config"
+risk_level = "low"
+parameters_schema = { type = "object" }
+
+[[tools]]
+name = "tool_http_get"
+description = "Makes an HTTP GET request to a URL and returns the status code and body."
+export = "tool_http_get"
+risk_level = "medium"
+parameters_schema = { type = "object", properties = { url = { type = "string", description = "The URL to fetch" } }, required = ["url"] }
+
+[[tools]]
+name = "tool_http_get_auth"
+description = "Makes an HTTP GET request with an Authorization Bearer header derived from the api_key config value."
+export = "tool_http_get_auth"
+risk_level = "medium"
+parameters_schema = { type = "object", properties = { url = { type = "string", description = "The URL to fetch" } }, required = ["url"] }
+
+[[tools]]
+name = "tool_read_file"
+description = "Reads a file from the filesystem sandbox and returns its contents."
+export = "tool_read_file"
+risk_level = "medium"
+parameters_schema = { type = "object", properties = { path = { type = "string", description = "Path to the file to read (within allowed_paths)" } }, required = ["path"] }
