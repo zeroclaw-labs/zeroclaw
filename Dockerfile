@@ -27,7 +27,10 @@ COPY Cargo.toml Cargo.lock ./
 # Full source crates (small, no stub needed):
 COPY crates/robot-kit/ crates/robot-kit/
 COPY crates/aardvark-sys/ crates/aardvark-sys/
-# Manifest-only copies for all other workspace crates + tauri app:
+# Manifest-only copies for all workspace crates.
+# If a new crate is added to the workspace, add a COPY line here and
+# a matching entry in the stub-creation loop below.
+# Tracked for automation in #5885.
 COPY crates/zeroclaw-api/Cargo.toml crates/zeroclaw-api/Cargo.toml
 COPY crates/zeroclaw-config/Cargo.toml crates/zeroclaw-config/Cargo.toml
 COPY crates/zeroclaw-providers/Cargo.toml crates/zeroclaw-providers/Cargo.toml
