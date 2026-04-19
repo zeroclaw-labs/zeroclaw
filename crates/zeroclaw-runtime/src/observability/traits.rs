@@ -65,6 +65,7 @@ mod tests {
             tool: "shell".into(),
             duration: Duration::from_millis(10),
             success: true,
+            output: None,
         };
         let metric = ObserverMetric::RequestLatency(Duration::from_millis(8));
 

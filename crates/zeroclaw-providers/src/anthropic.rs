@@ -592,6 +592,9 @@ impl AnthropicProvider {
         let mut tool_id: Option<String> = None;
         let mut tool_name: Option<String> = None;
         let mut tool_input_json = String::new();
+        let mut stream_input_tokens: Option<u64> = None;
+        let mut stream_output_tokens: Option<u64> = None;
+        let mut stream_cached_tokens: Option<u64> = None;
 
         while let Ok(Some(line)) = lines.next_line().await {
             let line = line.trim().to_string();
@@ -617,15 +620,31 @@ impl AnthropicProvider {
                         .and_then(|m| m.get("model"))
                         .and_then(|m| m.as_str())
                         .unwrap_or("unknown");
-                    let input_tokens = event
-                        .get("message")
-                        .and_then(|m| m.get("usage"))
+                    let usage = event.get("message").and_then(|m| m.get("usage"));
+                    let input_tokens = usage
                         .and_then(|u| u.get("input_tokens"))
                         .and_then(|t| t.as_u64())
                         .unwrap_or(0);
+                    let cache_read = usage
+                        .and_then(|u| u.get("cache_read_input_tokens"))
+                        .and_then(|t| t.as_u64());
+                    let cache_creation = usage
+                        .and_then(|u| u.get("cache_creation_input_tokens"))
+                        .and_then(|t| t.as_u64());
+                    let total_input =
+                        input_tokens + cache_read.unwrap_or(0) + cache_creation.unwrap_or(0);
+                    if total_input > 0 {
+                        stream_input_tokens = Some(total_input);
+                    }
+                    if cache_read.is_some() || cache_creation.is_some() {
+                        stream_cached_tokens = cache_read;
+                    }
                     tracing::debug!(
                         model = %model,
-                        input_tokens = input_tokens,
+                        input_tokens,
+                        cache_read = ?cache_read,
+                        cache_creation = ?cache_creation,
+                        total_input,
                         "Anthropic stream: message_start"
                     );
                 }
@@ -714,6 +733,9 @@ impl AnthropicProvider {
                         .and_then(|u| u.get("output_tokens"))
                         .and_then(|t| t.as_u64())
                         .unwrap_or(0);
+                    if output_tokens > 0 {
+                        stream_output_tokens = Some(output_tokens);
+                    }
                     if stop_reason == "max_tokens" {
                         tracing::warn!(
                             output_tokens = output_tokens,
@@ -728,8 +750,21 @@ impl AnthropicProvider {
                     }
                 }
                 "message_stop" => {
-                    tracing::debug!("Anthropic stream: message_stop");
-                    let _ = tx.send(Ok(StreamEvent::Final)).await;
+                    let usage = if stream_input_tokens.is_some() || stream_output_tokens.is_some() {
+                        Some(TokenUsage {
+                            input_tokens: stream_input_tokens,
+                            output_tokens: stream_output_tokens,
+                            cached_input_tokens: stream_cached_tokens,
+                        })
+                    } else {
+                        None
+                    };
+                    tracing::debug!(
+                        input_tokens = ?stream_input_tokens,
+                        output_tokens = ?stream_output_tokens,
+                        "Anthropic stream: message_stop"
+                    );
+                    let _ = tx.send(Ok(StreamEvent::Final { usage })).await;
                     return;
                 }
                 "error" => {
@@ -745,7 +780,7 @@ impl AnthropicProvider {
             }
         }
 
-        let _ = tx.send(Ok(StreamEvent::Final)).await;
+        let _ = tx.send(Ok(StreamEvent::Final { usage: None })).await;
     }
 }
 
@@ -966,7 +1001,7 @@ impl Provider for AnthropicProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         if !options.enabled {
-            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+            return stream::once(async { Ok(StreamEvent::Final { usage: None }) }).boxed();
         }
 
         let credential = match self.credential.as_ref() {

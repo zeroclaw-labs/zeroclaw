@@ -141,6 +141,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 tool,
                 duration,
                 success,
+                ..
             } => serde_json::json!({
                 "type": "tool_call",
                 "tool": tool,

@@ -503,6 +503,6 @@ mod tests {
             StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "hello"),
             other => panic!("expected text delta event, got {other:?}"),
         }
-        assert!(matches!(second, StreamEvent::Final));
+        assert!(matches!(second, StreamEvent::Final { .. }));
     }
 }

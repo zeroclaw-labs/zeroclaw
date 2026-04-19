@@ -22,6 +22,26 @@ use zeroclaw_providers::{self, ChatMessage, ChatRequest, ConversationMessage, Pr
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
 
+/// Check whether OTEL content tracing is enabled via environment variable.
+pub fn trace_content_enabled() -> bool {
+    std::env::var("ZEROCLAW_OTEL_TRACE_CONTENT")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
+/// Safely truncate a UTF-8 string to at most `max_bytes` bytes without
+/// splitting a multi-byte character.
+pub fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
+}
+
 pub struct Agent {
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
@@ -33,6 +53,7 @@ pub struct Agent {
     memory_loader: Box<dyn MemoryLoader>,
     config: zeroclaw_config::schema::AgentConfig,
     model_name: String,
+    provider_name: String,
     temperature: f64,
     workspace_dir: std::path::PathBuf,
     identity_config: zeroclaw_config::schema::IdentityConfig,
@@ -72,6 +93,7 @@ pub struct AgentBuilder {
     memory_loader: Option<Box<dyn MemoryLoader>>,
     config: Option<zeroclaw_config::schema::AgentConfig>,
     model_name: Option<String>,
+    provider_name: Option<String>,
     temperature: Option<f64>,
     workspace_dir: Option<std::path::PathBuf>,
     identity_config: Option<zeroclaw_config::schema::IdentityConfig>,
@@ -109,6 +131,7 @@ impl AgentBuilder {
             memory_loader: None,
             config: None,
             model_name: None,
+            provider_name: None,
             temperature: None,
             workspace_dir: None,
             identity_config: None,
@@ -171,6 +194,11 @@ impl AgentBuilder {
 
     pub fn model_name(mut self, model_name: String) -> Self {
         self.model_name = Some(model_name);
+        self
+    }
+
+    pub fn provider_name(mut self, provider_name: String) -> Self {
+        self.provider_name = Some(provider_name);
         self
     }
 
@@ -309,6 +337,7 @@ impl AgentBuilder {
             model_name: self
                 .model_name
                 .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into()),
+            provider_name: self.provider_name.unwrap_or_else(|| "unknown".into()),
             temperature: self.temperature.unwrap_or(0.7),
             workspace_dir: self
                 .workspace_dir
@@ -550,6 +579,7 @@ impl Agent {
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(config.agent.clone())
             .model_name(model_name)
+            .provider_name(provider_name.to_string())
             .temperature(
                 fallback_provider_ag
                     .and_then(|e| e.temperature)
@@ -679,6 +709,17 @@ impl Agent {
             }
         }
 
+        // Emit ToolCallStart so the OTEL observer can attach arguments to the span.
+        let tc = trace_content_enabled();
+        self.observer.record_event(&ObserverEvent::ToolCallStart {
+            tool: tool_name.clone(),
+            arguments: if tc {
+                Some(truncate_utf8(&tool_args.to_string(), 1024))
+            } else {
+                None
+            },
+        });
+
         // First try to find tool in static registry, then in activated MCP tools.
         let (result, success) =
             if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
@@ -688,6 +729,11 @@ impl Agent {
                             tool: tool_name.clone(),
                             duration: start.elapsed(),
                             success: r.success,
+                            output: if tc {
+                                Some(truncate_utf8(&r.output, 4096))
+                            } else {
+                                None
+                            },
                         });
                         if r.success {
                             (r.output, true)
@@ -696,12 +742,18 @@ impl Agent {
                         }
                     }
                     Err(e) => {
+                        let reason = format!("Error executing {}: {e}", tool_name);
                         self.observer.record_event(&ObserverEvent::ToolCall {
                             tool: tool_name.clone(),
                             duration: start.elapsed(),
                             success: false,
+                            output: if tc {
+                                Some(truncate_utf8(&reason, 4096))
+                            } else {
+                                None
+                            },
                         });
-                        (format!("Error executing {}: {e}", tool_name), false)
+                        (reason, false)
                     }
                 }
             } else if let Some(activated_arc) = self.activated_tools.as_ref() {
@@ -713,6 +765,11 @@ impl Agent {
                                 tool: tool_name.clone(),
                                 duration: start.elapsed(),
                                 success: r.success,
+                                output: if tc {
+                                    Some(truncate_utf8(&r.output, 4096))
+                                } else {
+                                    None
+                                },
                             });
                             if r.success {
                                 (r.output, true)
@@ -721,12 +778,18 @@ impl Agent {
                             }
                         }
                         Err(e) => {
+                            let reason = format!("Error executing {}: {e}", tool_name);
                             self.observer.record_event(&ObserverEvent::ToolCall {
                                 tool: tool_name.clone(),
                                 duration: start.elapsed(),
                                 success: false,
+                                output: if tc {
+                                    Some(truncate_utf8(&reason, 4096))
+                                } else {
+                                    None
+                                },
                             });
-                            (format!("Error executing {}: {e}", tool_name), false)
+                            (reason, false)
                         }
                     }
                 } else {
@@ -907,6 +970,20 @@ impl Agent {
                 });
             }
 
+            let tc = trace_content_enabled();
+            self.observer.record_event(&ObserverEvent::LlmRequest {
+                provider: self.provider_name.clone(),
+                model: effective_model.clone(),
+                messages_count: messages.len(),
+                prompt_content: if tc {
+                    serde_json::to_string(&messages)
+                        .ok()
+                        .map(|s| truncate_utf8(&s, 32_768))
+                } else {
+                    None
+                },
+            });
+            let llm_start = std::time::Instant::now();
             let response = match self
                 .provider
                 .chat(
@@ -923,8 +1000,41 @@ impl Agent {
                 )
                 .await
             {
-                Ok(resp) => resp,
-                Err(err) => return Err(err),
+                Ok(resp) => {
+                    let (input_tokens, output_tokens) = resp
+                        .usage
+                        .as_ref()
+                        .map(|u| (u.input_tokens, u.output_tokens))
+                        .unwrap_or((None, None));
+                    self.observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: self.provider_name.clone(),
+                        model: effective_model.clone(),
+                        duration: llm_start.elapsed(),
+                        success: true,
+                        error_message: None,
+                        input_tokens,
+                        output_tokens,
+                        response_content: if tc {
+                            resp.text.as_deref().map(|t| truncate_utf8(t, 32_768))
+                        } else {
+                            None
+                        },
+                    });
+                    resp
+                }
+                Err(err) => {
+                    self.observer.record_event(&ObserverEvent::LlmResponse {
+                        provider: self.provider_name.clone(),
+                        model: effective_model.clone(),
+                        duration: llm_start.elapsed(),
+                        success: false,
+                        error_message: Some(err.to_string()),
+                        input_tokens: None,
+                        output_tokens: None,
+                        response_content: None,
+                    });
+                    return Err(err);
+                }
             };
 
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
@@ -995,6 +1105,12 @@ impl Agent {
         user_message: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
     ) -> Result<String> {
+        let streamed_start = std::time::Instant::now();
+        self.observer.record_event(&ObserverEvent::AgentStart {
+            provider: self.provider_name.clone(),
+            model: self.model_name.clone(),
+        });
+
         // ── Preamble (identical to turn) ───────────────────────────────
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
@@ -1075,6 +1191,13 @@ impl Agent {
                             cached.clone(),
                         )));
                     self.trim_history();
+                    self.observer.record_event(&ObserverEvent::AgentEnd {
+                        provider: self.provider_name.clone(),
+                        model: self.model_name.clone(),
+                        duration: streamed_start.elapsed(),
+                        tokens_used: None,
+                        cost_usd: None,
+                    });
                     return Ok(cached);
                 }
                 self.observer.record_event(&ObserverEvent::CacheMiss {
@@ -1086,6 +1209,21 @@ impl Agent {
             // Try streaming first; if the provider returns content we
             // forward deltas.  Otherwise fall back to non-streaming chat.
             use futures_util::StreamExt;
+
+            let tc = trace_content_enabled();
+            self.observer.record_event(&ObserverEvent::LlmRequest {
+                provider: self.provider_name.clone(),
+                model: effective_model.clone(),
+                messages_count: messages.len(),
+                prompt_content: if tc {
+                    serde_json::to_string(&messages)
+                        .ok()
+                        .map(|s| truncate_utf8(&s, 32_768))
+                } else {
+                    None
+                },
+            });
+            let llm_start = std::time::Instant::now();
 
             let stream_opts = zeroclaw_providers::traits::StreamOptions::new(true);
             let mut stream = self.provider.stream_chat(
@@ -1105,6 +1243,7 @@ impl Agent {
             let mut streamed_text = String::new();
             let mut streamed_tool_calls: Vec<zeroclaw_providers::traits::ToolCall> = Vec::new();
             let mut got_stream = false;
+            let mut stream_usage: Option<zeroclaw_providers::traits::TokenUsage> = None;
 
             while let Some(item) = stream.next().await {
                 match item {
@@ -1124,11 +1263,11 @@ impl Agent {
                                     event_tx.send(TurnEvent::Chunk { delta: chunk.delta }).await;
                             }
                         }
-                        zeroclaw_providers::traits::StreamEvent::ToolCall(tc) => {
+                        zeroclaw_providers::traits::StreamEvent::ToolCall(tc_event) => {
                             got_stream = true;
                             // ToolCall event is sent later (after parse_response) to
                             // avoid duplicates; just collect here.
-                            streamed_tool_calls.push(tc);
+                            streamed_tool_calls.push(tc_event);
                         }
                         zeroclaw_providers::traits::StreamEvent::PreExecutedToolCall {
                             name,
@@ -1148,7 +1287,10 @@ impl Agent {
                         } => {
                             let _ = event_tx.send(TurnEvent::ToolResult { name, output }).await;
                         }
-                        zeroclaw_providers::traits::StreamEvent::Final => break,
+                        zeroclaw_providers::traits::StreamEvent::Final { usage } => {
+                            stream_usage = usage;
+                            break;
+                        }
                     },
                     Err(_) => break,
                 }
@@ -1159,6 +1301,24 @@ impl Agent {
             // If streaming produced text, use it as the response and
             // check for tool calls via the dispatcher.
             let response = if got_stream {
+                let (s_input, s_output) = stream_usage
+                    .as_ref()
+                    .map(|u| (u.input_tokens, u.output_tokens))
+                    .unwrap_or((None, None));
+                self.observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: self.provider_name.clone(),
+                    model: effective_model.clone(),
+                    duration: llm_start.elapsed(),
+                    success: true,
+                    error_message: None,
+                    input_tokens: s_input,
+                    output_tokens: s_output,
+                    response_content: if tc {
+                        Some(truncate_utf8(&streamed_text, 32_768))
+                    } else {
+                        None
+                    },
+                });
                 // Build a synthetic ChatResponse from streamed text
                 zeroclaw_providers::ChatResponse {
                     text: Some(streamed_text),
@@ -1184,8 +1344,48 @@ impl Agent {
                     )
                     .await
                 {
-                    Ok(resp) => resp,
-                    Err(err) => return Err(err),
+                    Ok(resp) => {
+                        let (input_tokens, output_tokens) = resp
+                            .usage
+                            .as_ref()
+                            .map(|u| (u.input_tokens, u.output_tokens))
+                            .unwrap_or((None, None));
+                        self.observer.record_event(&ObserverEvent::LlmResponse {
+                            provider: self.provider_name.clone(),
+                            model: effective_model.clone(),
+                            duration: llm_start.elapsed(),
+                            success: true,
+                            error_message: None,
+                            input_tokens,
+                            output_tokens,
+                            response_content: if tc {
+                                resp.text.as_deref().map(|t| truncate_utf8(t, 32_768))
+                            } else {
+                                None
+                            },
+                        });
+                        resp
+                    }
+                    Err(err) => {
+                        self.observer.record_event(&ObserverEvent::LlmResponse {
+                            provider: self.provider_name.clone(),
+                            model: effective_model.clone(),
+                            duration: llm_start.elapsed(),
+                            success: false,
+                            error_message: Some(err.to_string()),
+                            input_tokens: None,
+                            output_tokens: None,
+                            response_content: None,
+                        });
+                        self.observer.record_event(&ObserverEvent::AgentEnd {
+                            provider: self.provider_name.clone(),
+                            model: self.model_name.clone(),
+                            duration: streamed_start.elapsed(),
+                            tokens_used: None,
+                            cost_usd: None,
+                        });
+                        return Err(err);
+                    }
                 }
             };
 
@@ -1223,6 +1423,13 @@ impl Agent {
                     )));
                 self.trim_history();
 
+                self.observer.record_event(&ObserverEvent::AgentEnd {
+                    provider: self.provider_name.clone(),
+                    model: self.model_name.clone(),
+                    duration: streamed_start.elapsed(),
+                    tokens_used: None,
+                    cost_usd: None,
+                });
                 return Ok(final_text);
             }
 
@@ -1267,6 +1474,13 @@ impl Agent {
             self.trim_history();
         }
 
+        self.observer.record_event(&ObserverEvent::AgentEnd {
+            provider: self.provider_name.clone(),
+            model: self.model_name.clone(),
+            duration: streamed_start.elapsed(),
+            tokens_used: None,
+            cost_usd: None,
+        });
         anyhow::bail!(
             "Agent exceeded maximum tool iterations ({})",
             self.config.max_tool_iterations
@@ -1889,7 +2103,7 @@ mod tests {
                 );
                 stream::iter(vec![
                     Ok(tc),
-                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final { usage: None }),
                 ])
                 .boxed()
             } else {
@@ -1903,7 +2117,7 @@ mod tests {
                 );
                 stream::iter(vec![
                     Ok(chunk),
-                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final { usage: None }),
                 ])
                 .boxed()
             }

@@ -2664,7 +2664,7 @@ mod tests {
                     name: "shell".to_string(),
                     arguments: r#"{"command":"date"}"#.to_string(),
                 })),
-                Ok(StreamEvent::Final),
+                Ok(StreamEvent::Final { usage: None }),
             ])
             .boxed()
         }
@@ -2720,7 +2720,7 @@ mod tests {
             StreamEvent::ToolCall(call) => assert_eq!(call.name, "shell"),
             other => panic!("expected tool-call event, got {other:?}"),
         }
-        assert!(matches!(second, StreamEvent::Final));
+        assert!(matches!(second, StreamEvent::Final { .. }));
         assert_eq!(primary.stream_calls.load(Ordering::SeqCst), 0);
         assert_eq!(fallback.stream_calls.load(Ordering::SeqCst), 1);
     }
