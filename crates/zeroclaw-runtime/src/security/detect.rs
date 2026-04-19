@@ -275,17 +275,14 @@ mod tests {
     #[test]
     fn linux_memcg_proc_cgroups_parses_without_panic() {
         if let Ok(content) = std::fs::read_to_string("/proc/cgroups") {
-            let _found = content
-                .lines()
-                .filter(|l| !l.starts_with('#'))
-                .any(|l| {
-                    let mut f = l.split_whitespace();
-                    let name = f.next().unwrap_or("");
-                    let _hier = f.next();
-                    let _num = f.next();
-                    let enabled = f.next().unwrap_or("0");
-                    name == "memory" && enabled == "1"
-                });
+            let _found = content.lines().filter(|l| !l.starts_with('#')).any(|l| {
+                let mut f = l.split_whitespace();
+                let name = f.next().unwrap_or("");
+                let _hier = f.next();
+                let _num = f.next();
+                let enabled = f.next().unwrap_or("0");
+                name == "memory" && enabled == "1"
+            });
         }
     }
 }

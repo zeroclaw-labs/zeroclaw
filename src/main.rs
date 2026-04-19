@@ -1381,14 +1381,21 @@ async fn main() -> Result<()> {
             #[cfg(target_os = "linux")]
             {
                 use zeroclaw_config::schema::SandboxBackend;
-                let sandbox_docker = matches!(config.security.sandbox.backend, SandboxBackend::Docker);
+                let sandbox_docker =
+                    matches!(config.security.sandbox.backend, SandboxBackend::Docker);
                 let runtime_docker_mem = config.runtime.kind == "docker"
-                    && config.runtime.docker.memory_limit_mb.map_or(false, |mb| mb > 0);
+                    && config
+                        .runtime
+                        .docker
+                        .memory_limit_mb
+                        .map_or(false, |mb| mb > 0);
                 if (sandbox_docker || runtime_docker_mem)
                     && !zeroclaw_runtime::security::linux_memcg_available()
                 {
                     let which = match (sandbox_docker, runtime_docker_mem) {
-                        (true, true) => "security.sandbox.backend = \"docker\" and runtime.kind = \"docker\"",
+                        (true, true) => {
+                            "security.sandbox.backend = \"docker\" and runtime.kind = \"docker\""
+                        }
                         (true, false) => "security.sandbox.backend = \"docker\"",
                         _ => "runtime.kind = \"docker\"",
                     };
