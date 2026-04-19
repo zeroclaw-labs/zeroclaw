@@ -331,7 +331,8 @@ pub fn all_tools_with_runtime(
     Option<ChannelMapHandle>,
 ) {
     let has_shell_access = runtime.has_shell_access();
-    let sandbox = create_sandbox(&root_config.security);
+    let runtime_kind = root_config.runtime.as_ref().map(|r| r.kind.as_str()).unwrap_or("docker");
+    let sandbox = create_sandbox(&root_config.security, runtime_kind);
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
