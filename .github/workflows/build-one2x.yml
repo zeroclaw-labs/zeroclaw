@@ -2,7 +2,7 @@ name: "One2X: Build & Deploy"
 
 on:
   push:
-    branches: [one2x/custom-v5, one2x/custom-v6]
+    branches: [one2x/custom-v5, one2x/custom-v6, one2x/custom-v7]
     paths:
       - "src/**"
       - "crates/**"
@@ -65,6 +65,9 @@ jobs:
           docker push "${FULL_IMAGE}"
           echo "FULL_IMAGE=${FULL_IMAGE}" >> "$GITHUB_ENV"
 
+      - name: Setup Kustomize
+        uses: imranismail/setup-kustomize@v2
+
       - name: Update videoclaw-ops manifests
         if: success()
         env:
@@ -80,13 +83,11 @@ jobs:
           git clone --depth 1 \
             "https://x-access-token:${VIDEOCLAW_OPS_TOKEN}@github.com/one2x-ai/videoclaw-ops.git" \
             /tmp/videoclaw-ops
+          cd /tmp/videoclaw-ops/apps/zeroclaw/dev
+          kustomize edit set image \
+            "${{ secrets.ACR_REGISTRY }}/platform/zeroclaw=${FULL_IMAGE}"
+
           cd /tmp/videoclaw-ops
-
-          sed -i "s|value: \".*platform/zeroclaw:.*\"|value: \"${FULL_IMAGE}\"|g" \
-            apps/zeroclaw/dev/manifests.yaml
-          sed -i "s|image: .*platform/zeroclaw:.*|image: ${FULL_IMAGE}|g" \
-            apps/zeroclaw/dev/manifests.yaml
-
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A

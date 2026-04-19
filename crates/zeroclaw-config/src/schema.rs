@@ -9735,6 +9735,22 @@ fn normalize_wire_api(raw: &str) -> Option<&'static str> {
     }
 }
 
+fn is_openai_family_provider(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "openai" | "openai-codex" | "openai_codex" | "codex"
+    )
+}
+
+fn first_nonempty_env(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
 fn read_codex_openai_api_key() -> Option<String> {
     let home = UserDirs::new()?.home_dir().to_path_buf();
     let auth_path = home.join(".codex").join("auth.json");
@@ -9992,20 +10008,23 @@ impl Config {
             return;
         };
 
-        let base_url = profile
+        let profile_base_url = profile
             .base_url
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string);
+        let effective_base_url = self
+            .fallback_provider_env_base_url()
+            .or_else(|| profile_base_url.clone());
 
         {
             let fallback_provider = self.providers.fallback_provider();
             let current_url = fallback_provider
                 .and_then(|e| e.base_url.as_deref())
                 .map(str::trim);
-            if current_url.is_none_or(|value| value.is_empty())
-                && let Some(base_url) = base_url.as_ref()
+            if let Some(base_url) = effective_base_url.as_ref()
+                && current_url != Some(base_url.as_str())
                 && let Some(entry) = self.providers.fallback_provider_mut()
             {
                 entry.base_url = Some(base_url.clone());
@@ -10084,7 +10103,10 @@ impl Config {
             return;
         }
 
-        if let Some(base_url) = base_url {
+        if profile_base_url.is_some()
+            && !is_openai_family_provider(&profile_key)
+            && let Some(base_url) = effective_base_url
+        {
             self.providers.fallback = Some(format!("custom:{base_url}"));
         }
     }
@@ -10733,6 +10755,49 @@ impl Config {
         self.providers.models.entry(fallback).or_default()
     }
 
+    fn fallback_provider_env_base_url(&self) -> Option<String> {
+        let provider = self
+            .providers
+            .fallback
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+
+        if let Some(url) = first_nonempty_env(&["ZEROCLAW_PROVIDER_URL"]) {
+            return Some(url);
+        }
+
+        let provider_is_openai_family = is_openai_family_provider(provider);
+        let profile_is_openai_compatible =
+            self.providers.fallback_provider().is_some_and(|entry| {
+                entry
+                    .base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty())
+                    || entry
+                        .wire_api
+                        .as_deref()
+                        .and_then(normalize_wire_api)
+                        .is_some()
+                    || entry.requires_openai_auth
+            });
+
+        if provider_is_openai_family || profile_is_openai_compatible {
+            first_nonempty_env(&["OPENAI_BASE_URL"])
+        } else {
+            None
+        }
+    }
+
+    fn apply_fallback_provider_base_url_override(&mut self) {
+        let Some(base_url) = self.fallback_provider_env_base_url() else {
+            return;
+        };
+
+        self.ensure_fallback_provider().base_url = Some(base_url);
+    }
+
     /// Apply environment variable overrides to config
     pub fn apply_env_overrides(&mut self) {
         // API Key: ZEROCLAW_API_KEY or API_KEY (generic)
@@ -10808,6 +10873,12 @@ impl Config {
 
         // Apply named provider profile remapping (Codex app-server compatibility).
         self.apply_named_model_provider_profile();
+
+        // Provider base URL: ZEROCLAW_PROVIDER_URL (generic) or provider-native envs
+        // such as OPENAI_BASE_URL. Keep this in config so every runtime path
+        // reads the same effective endpoint rather than depending on caller-specific
+        // env handling.
+        self.apply_fallback_provider_base_url_override();
 
         // Workspace directory: ZEROCLAW_WORKSPACE
         if let Ok(workspace) = std::env::var("ZEROCLAW_WORKSPACE")
@@ -14084,6 +14155,158 @@ requires_openai_auth = true
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_MODEL") };
+    }
+
+    #[test]
+    async fn env_override_openai_base_url_updates_fallback_entry() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_PROVIDER", "openai") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("OPENAI_BASE_URL", "https://proxy.example.com/v1") };
+        config.apply_env_overrides();
+
+        assert_eq!(config.providers.fallback.as_deref(), Some("openai"));
+        assert_eq!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.base_url.as_deref()),
+            Some("https://proxy.example.com/v1")
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_PROVIDER") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("OPENAI_BASE_URL") };
+    }
+
+    #[test]
+    async fn configured_openai_profile_base_url_keeps_openai_fallback() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.providers.fallback = Some("openai".to_string());
+        config.providers.models.insert(
+            "openai".to_string(),
+            ModelProviderConfig {
+                base_url: Some("https://proxy.example.com/v1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        config.apply_env_overrides();
+
+        assert_eq!(config.providers.fallback.as_deref(), Some("openai"));
+        assert_eq!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.base_url.as_deref()),
+            Some("https://proxy.example.com/v1")
+        );
+    }
+
+    #[test]
+    async fn env_override_openai_base_url_keeps_configured_openai_fallback() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.providers.fallback = Some("openai".to_string());
+        config.providers.models.insert(
+            "openai".to_string(),
+            ModelProviderConfig {
+                base_url: Some("https://old-proxy.example.com/v1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("OPENAI_BASE_URL", "https://proxy.example.com/v1") };
+        config.apply_env_overrides();
+
+        assert_eq!(config.providers.fallback.as_deref(), Some("openai"));
+        assert_eq!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.base_url.as_deref()),
+            Some("https://proxy.example.com/v1")
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("OPENAI_BASE_URL") };
+    }
+
+    #[test]
+    async fn env_override_provider_url_wins_over_openai_base_url() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_PROVIDER", "openai") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("OPENAI_BASE_URL", "https://proxy.example.com/v1") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_PROVIDER_URL", "https://generic.example.com/v1") };
+        config.apply_env_overrides();
+
+        assert_eq!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.base_url.as_deref()),
+            Some("https://generic.example.com/v1")
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_PROVIDER") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("OPENAI_BASE_URL") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_PROVIDER_URL") };
+    }
+
+    #[test]
+    async fn env_override_openai_base_url_rewrites_named_profile_custom_endpoint() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.providers.fallback = Some("sub2api".to_string());
+        config.providers.models.insert(
+            "sub2api".to_string(),
+            ModelProviderConfig {
+                name: Some("sub2api".to_string()),
+                base_url: Some("https://api.tonsof.blue/v1".to_string()),
+                wire_api: None,
+                requires_openai_auth: false,
+                azure_openai_resource: None,
+                azure_openai_deployment: None,
+                azure_openai_api_version: None,
+                api_path: None,
+                max_tokens: None,
+                ..Default::default()
+            },
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("OPENAI_BASE_URL", "https://proxy.example.com/v1") };
+        config.apply_env_overrides();
+
+        assert_eq!(
+            config.providers.fallback.as_deref(),
+            Some("custom:https://proxy.example.com/v1")
+        );
+        assert_eq!(
+            config
+                .providers
+                .models
+                .get("sub2api")
+                .and_then(|e| e.base_url.as_deref()),
+            Some("https://proxy.example.com/v1")
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("OPENAI_BASE_URL") };
     }
 
     #[test]
