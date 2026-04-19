@@ -555,6 +555,32 @@ pub struct ModelProviderConfig {
     /// Merge system messages into first user message.
     #[serde(default)]
     pub merge_system_into_user: bool,
+    /// Optional per-provider capability overrides. When unset, the runtime
+    /// uses sensible defaults per provider family (e.g. OpenAI-compatible
+    /// providers default to `vision = true` since the OpenAI spec supports
+    /// image_url content parts).
+    #[nested]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<ProviderCapabilitiesConfig>,
+}
+
+/// Per-provider capability overrides.
+///
+/// Each field is `Option<bool>` so that "unset" remains distinct from
+/// "explicitly false" — letting the runtime apply family defaults only
+/// when the user has not expressed an opinion.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.capabilities"]
+pub struct ProviderCapabilitiesConfig {
+    /// Does the serving model support image input via OpenAI-spec
+    /// `image_url` content parts? Default depends on provider family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
+    /// Does the serving model support native tool calling? Default depends
+    /// on provider family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<bool>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────

@@ -1,6 +1,6 @@
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, TokenUsage, ToolCall as ProviderToolCall,
+    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use reqwest::Client;
@@ -11,6 +11,9 @@ pub struct OpenAiProvider {
     base_url: String,
     credential: Option<String>,
     max_tokens: Option<u32>,
+    /// Vision capability override; defaults to true (GPT-4o / 5 natively
+    /// support image_url content parts).
+    supports_vision: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -189,12 +192,24 @@ impl OpenAiProvider {
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             credential: credential.map(ToString::to_string),
             max_tokens: None,
+            supports_vision: true,
         }
     }
 
     /// Set the maximum output tokens for API requests.
     pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Override the provider's vision capability.
+    ///
+    /// Defaults to `true` because modern OpenAI chat models (GPT-4o,
+    /// GPT-5, etc.) support `image_url` content parts per the OpenAI
+    /// Chat Completions spec. Set `false` only when pointing this
+    /// provider at a text-only backend.
+    pub fn with_supports_vision(mut self, supports_vision: bool) -> Self {
+        self.supports_vision = supports_vision;
         self
     }
 
@@ -352,6 +367,14 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl Provider for OpenAiProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: self.supports_vision,
+            prompt_caching: false,
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -563,6 +586,24 @@ mod tests {
     fn creates_with_empty_key() {
         let p = OpenAiProvider::new(Some(""));
         assert_eq!(p.credential.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn default_capabilities_report_vision_true() {
+        // Modern OpenAI chat models (GPT-4o / GPT-5) natively support
+        // image_url content parts. The provider default must reflect this
+        // so the runtime pre-flight check doesn't reject images.
+        let p = OpenAiProvider::new(Some("k"));
+        let caps = <OpenAiProvider as Provider>::capabilities(&p);
+        assert!(caps.vision, "OpenAI defaults to vision=true");
+        assert!(caps.native_tool_calling);
+    }
+
+    #[test]
+    fn with_supports_vision_override_respected() {
+        let p = OpenAiProvider::new(Some("k")).with_supports_vision(false);
+        let caps = <OpenAiProvider as Provider>::capabilities(&p);
+        assert!(!caps.vision, "override must propagate");
     }
 
     #[test]

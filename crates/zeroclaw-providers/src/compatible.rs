@@ -255,6 +255,23 @@ impl OpenAiCompatibleProvider {
         self
     }
 
+    /// Override the provider's vision capability.
+    ///
+    /// OpenAI-compatible backends (vLLM, sglang, OpenAI, etc.) serve
+    /// a mix of vision-capable and text-only models. Use this to match
+    /// the actual serving model's capability when it differs from the
+    /// provider family default.
+    pub fn with_supports_vision(mut self, supports_vision: bool) -> Self {
+        self.supports_vision = supports_vision;
+        self
+    }
+
+    /// Override the provider's native tool-calling capability.
+    pub fn with_native_tool_calling(mut self, native_tool_calling: bool) -> Self {
+        self.native_tool_calling = native_tool_calling;
+        self
+    }
+
     /// Merge all system messages into the first user message before sending.
     /// Unlike `new_merge_system_into_user`, this preserves native tool calling.
     pub fn with_merge_system_into_user(mut self) -> Self {
@@ -3266,6 +3283,21 @@ mod tests {
         let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn with_supports_vision_builder_flips_capability() {
+        // Config-driven per-provider override path: default new() gives
+        // vision=false, but the config-derived builder flips it to true.
+        let p = OpenAiCompatibleProvider::new("vLLM", "http://x", None, AuthStyle::Bearer)
+            .with_supports_vision(true);
+        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        assert!(caps.vision, "builder must propagate vision=true to capabilities");
+
+        let p2 = OpenAiCompatibleProvider::new("vLLM", "http://x", None, AuthStyle::Bearer)
+            .with_supports_vision(false);
+        let caps2 = <OpenAiCompatibleProvider as Provider>::capabilities(&p2);
+        assert!(!caps2.vision, "builder must also support vision=false");
     }
 
     #[test]
