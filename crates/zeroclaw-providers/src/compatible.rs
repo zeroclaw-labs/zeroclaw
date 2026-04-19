@@ -255,6 +255,23 @@ impl OpenAiCompatibleProvider {
         self
     }
 
+    /// Override the provider's vision capability.
+    ///
+    /// OpenAI-compatible backends (vLLM, sglang, OpenAI, etc.) serve
+    /// a mix of vision-capable and text-only models. Use this to match
+    /// the actual serving model's capability when it differs from the
+    /// provider family default.
+    pub fn with_supports_vision(mut self, supports_vision: bool) -> Self {
+        self.supports_vision = supports_vision;
+        self
+    }
+
+    /// Override the provider's native tool-calling capability.
+    pub fn with_native_tool_calling(mut self, native_tool_calling: bool) -> Self {
+        self.native_tool_calling = native_tool_calling;
+        self
+    }
+
     /// Merge all system messages into the first user message before sending.
     /// Unlike `new_merge_system_into_user`, this preserves native tool calling.
     pub fn with_merge_system_into_user(mut self) -> Self {
@@ -1438,7 +1455,11 @@ impl OpenAiCompatibleProvider {
     fn convert_tool_specs(
         tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
     ) -> Option<Vec<serde_json::Value>> {
-        tools.map(|items| {
+        let items = tools?;
+        if items.is_empty() {
+            return None;
+        }
+        Some(
             items
                 .iter()
                 .map(|tool| {
@@ -1454,8 +1475,8 @@ impl OpenAiCompatibleProvider {
                         }
                     })
                 })
-                .collect()
-        })
+                .collect(),
+        )
     }
 
     fn to_message_content(
@@ -2061,7 +2082,9 @@ impl Provider for OpenAiCompatibleProvider {
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: self
                 .tool_stream_for_tools(tools.as_ref().is_some_and(|tools| !tools.is_empty())),
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools,
             max_tokens: self.max_tokens,
         };
@@ -2202,7 +2225,9 @@ impl Provider for OpenAiCompatibleProvider {
                 },
                 stream: Some(options.enabled),
                 tools: tools.clone(),
-                tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+                tool_choice: tools
+                    .as_ref()
+                    .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
                 max_tokens: self.max_tokens,
             })
         } else {
@@ -3261,6 +3286,21 @@ mod tests {
     }
 
     #[test]
+    fn with_supports_vision_builder_flips_capability() {
+        // Config-driven per-provider override path: default new() gives
+        // vision=false, but the config-derived builder flips it to true.
+        let p = OpenAiCompatibleProvider::new("vLLM", "http://x", None, AuthStyle::Bearer)
+            .with_supports_vision(true);
+        let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
+        assert!(caps.vision, "builder must propagate vision=true to capabilities");
+
+        let p2 = OpenAiCompatibleProvider::new("vLLM", "http://x", None, AuthStyle::Bearer)
+            .with_supports_vision(false);
+        let caps2 = <OpenAiCompatibleProvider as Provider>::capabilities(&p2);
+        assert!(!caps2.vision, "builder must also support vision=false");
+    }
+
+    #[test]
     fn minimax_provider_disables_native_tool_calling() {
         let p = OpenAiCompatibleProvider::new_merge_system_into_user(
             "MiniMax",
@@ -3535,6 +3575,58 @@ mod tests {
         assert!(json.contains("\"tools\""));
         assert!(json.contains("get_weather"));
         assert!(json.contains("\"tool_choice\":\"auto\""));
+    }
+
+    #[test]
+    fn convert_tool_specs_returns_none_for_empty_slice() {
+        let empty: &[zeroclaw_api::tool::ToolSpec] = &[];
+        let result = OpenAiCompatibleProvider::convert_tool_specs(Some(empty));
+        assert!(
+            result.is_none(),
+            "expected None for empty slice, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn convert_tool_specs_returns_none_for_none_input() {
+        let result = OpenAiCompatibleProvider::convert_tool_specs(None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn request_omits_tool_choice_when_tools_empty() {
+        // Simulates the fixed call site: convert_tool_specs(Some(&[])) returns None,
+        // and the .and_then guard yields None for tool_choice too. Neither appears
+        // in the serialized JSON (vLLM 0.19+ rejects tool_choice-without-tools).
+        let tools = OpenAiCompatibleProvider::convert_tool_specs(Some(&[]));
+        let req = ApiChatRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("hello".to_string()),
+            }],
+            temperature: 0.7,
+            stream: Some(false),
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: tools.clone(),
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
+            max_tokens: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("tool_choice"),
+            "tool_choice must be omitted when tools is empty; got: {}",
+            json
+        );
+        assert!(
+            !json.contains("\"tools\""),
+            "tools must be omitted when empty; got: {}",
+            json
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, TokenUsage, ToolCall as ProviderToolCall,
+    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use reqwest::Client;
@@ -11,6 +11,9 @@ pub struct OpenAiProvider {
     base_url: String,
     credential: Option<String>,
     max_tokens: Option<u32>,
+    /// Vision capability override; defaults to true (GPT-4o / 5 natively
+    /// support image_url content parts).
+    supports_vision: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -189,12 +192,24 @@ impl OpenAiProvider {
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             credential: credential.map(ToString::to_string),
             max_tokens: None,
+            supports_vision: true,
         }
     }
 
     /// Set the maximum output tokens for API requests.
     pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Override the provider's vision capability.
+    ///
+    /// Defaults to `true` because modern OpenAI chat models (GPT-4o,
+    /// GPT-5, etc.) support `image_url` content parts per the OpenAI
+    /// Chat Completions spec. Set `false` only when pointing this
+    /// provider at a text-only backend.
+    pub fn with_supports_vision(mut self, supports_vision: bool) -> Self {
+        self.supports_vision = supports_vision;
         self
     }
 
@@ -231,7 +246,11 @@ impl OpenAiProvider {
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
-        tools.map(|items| {
+        let items = tools?;
+        if items.is_empty() {
+            return None;
+        }
+        Some(
             items
                 .iter()
                 .map(|tool| NativeToolSpec {
@@ -242,8 +261,8 @@ impl OpenAiProvider {
                         parameters: tool.parameters.clone(),
                     },
                 })
-                .collect()
-        })
+                .collect(),
+        )
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
@@ -348,6 +367,14 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl Provider for OpenAiProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: self.supports_vision,
+            prompt_caching: false,
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -421,7 +448,9 @@ impl Provider for OpenAiProvider {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
             temperature: adjusted_temperature,
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools,
             max_tokens: self.max_tokens,
         };
@@ -488,7 +517,9 @@ impl Provider for OpenAiProvider {
             model: model.to_string(),
             messages: Self::convert_messages(messages),
             temperature: adjusted_temperature,
-            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice: native_tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools: native_tools,
             max_tokens: self.max_tokens,
         };
@@ -555,6 +586,74 @@ mod tests {
     fn creates_with_empty_key() {
         let p = OpenAiProvider::new(Some(""));
         assert_eq!(p.credential.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn default_capabilities_report_vision_true() {
+        // Modern OpenAI chat models (GPT-4o / GPT-5) natively support
+        // image_url content parts. The provider default must reflect this
+        // so the runtime pre-flight check doesn't reject images.
+        let p = OpenAiProvider::new(Some("k"));
+        let caps = <OpenAiProvider as Provider>::capabilities(&p);
+        assert!(caps.vision, "OpenAI defaults to vision=true");
+        assert!(caps.native_tool_calling);
+    }
+
+    #[test]
+    fn with_supports_vision_override_respected() {
+        let p = OpenAiProvider::new(Some("k")).with_supports_vision(false);
+        let caps = <OpenAiProvider as Provider>::capabilities(&p);
+        assert!(!caps.vision, "override must propagate");
+    }
+
+    #[test]
+    fn request_omits_tool_choice_when_tools_none() {
+        // Regression for vLLM 0.19+ rejecting tool_choice without tools.
+        // Real call site passes request.tools=None; convert_tools returns None;
+        // the .and_then guard yields None for tool_choice. Neither appears in JSON.
+        let tools = OpenAiProvider::convert_tools(None);
+        let req = NativeChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![],
+            temperature: 0.7,
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
+            tools,
+            max_tokens: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("tool_choice"), "got: {}", json);
+        assert!(!json.contains("\"tools\""), "got: {}", json);
+    }
+
+    #[test]
+    fn request_omits_tool_choice_when_tools_empty() {
+        // Same as above but with an explicit empty slice (e.g. max_tool_iterations=0
+        // with an empty MCP server list).
+        let empty: &[zeroclaw_api::tool::ToolSpec] = &[];
+        let tools = OpenAiProvider::convert_tools(Some(empty));
+        let req = NativeChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![],
+            temperature: 0.7,
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
+            tools,
+            max_tokens: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("tool_choice"),
+            "tool_choice must not be emitted when tools is empty; got: {}",
+            json
+        );
+        assert!(
+            !json.contains("\"tools\""),
+            "tools must not be emitted when empty; got: {}",
+            json
+        );
     }
 
     #[tokio::test]

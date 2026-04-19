@@ -713,6 +713,14 @@ pub struct ProviderRuntimeOptions {
     /// When true, system messages are merged into the first user message before
     /// sending. Propagated from `ModelProviderConfig::merge_system_into_user`.
     pub merge_system_into_user: bool,
+    /// Per-provider capability override for vision (image input). When
+    /// `None`, the provider uses its family default. Propagated from
+    /// `ModelProviderConfig::capabilities.vision`.
+    pub capability_vision: Option<bool>,
+    /// Per-provider capability override for native tool calling. When
+    /// `None`, the provider uses its family default. Propagated from
+    /// `ModelProviderConfig::capabilities.tools`.
+    pub capability_tools: Option<bool>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -729,6 +737,8 @@ impl Default for ProviderRuntimeOptions {
             api_path: None,
             provider_max_tokens: None,
             merge_system_into_user: false,
+            capability_vision: None,
+            capability_tools: None,
         }
     }
 }
@@ -740,7 +750,7 @@ pub fn provider_runtime_options_from_config(
     // Resolve merge_system_into_user from the active model provider profile by
     // matching api_url — apply_named_model_provider_profile() has already run
     // and rewritten providers.fallback, but providers.models retains all profiles.
-    let merge_system_into_user = fallback
+    let active_profile = fallback
         .and_then(|e| e.base_url.as_deref())
         .map(str::trim)
         .filter(|u| !u.is_empty())
@@ -753,9 +763,14 @@ pub fn provider_runtime_options_from_config(
                     .map(|u| u.trim_end_matches('/'))
                     == Some(active_url.trim_end_matches('/'))
             })
-        })
-        .map(|p| p.merge_system_into_user)
-        .unwrap_or(false);
+        });
+    let merge_system_into_user = active_profile.map(|p| p.merge_system_into_user).unwrap_or(false);
+    let capability_vision = active_profile
+        .and_then(|p| p.capabilities.as_ref())
+        .and_then(|c| c.vision);
+    let capability_tools = active_profile
+        .and_then(|p| p.capabilities.as_ref())
+        .and_then(|c| c.tools);
 
     ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -771,6 +786,8 @@ pub fn provider_runtime_options_from_config(
         api_path: fallback.and_then(|e| e.api_path.clone()),
         provider_max_tokens: fallback.and_then(|e| e.max_tokens),
         merge_system_into_user,
+        capability_vision,
+        capability_tools,
     }
 }
 
@@ -1199,6 +1216,9 @@ fn create_provider_with_url_and_options(
             if let Some(mt) = options.provider_max_tokens {
                 p = p.with_max_tokens(Some(mt));
             }
+            if let Some(v) = options.capability_vision {
+                p = p.with_supports_vision(v);
+            }
             Ok(Box::new(p))
         }
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
@@ -1487,24 +1507,33 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("http://localhost:30000/v1");
-            Ok(compat(OpenAiCompatibleProvider::new(
+            let provider = OpenAiCompatibleProvider::new(
                 "SGLang",
                 base_url,
                 key,
                 AuthStyle::Bearer,
-            )))
+            )
+            .with_supports_vision(options.capability_vision.unwrap_or(true));
+            Ok(compat(provider))
         }
         "vllm" => {
             let base_url = api_url
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("http://localhost:8000/v1");
-            Ok(compat(OpenAiCompatibleProvider::new(
+            // Default vision to true for vLLM — the OpenAI Chat Completions
+            // spec fully supports `image_url` content parts, and most modern
+            // vLLM deployments (Gemma, LLaVA, Qwen-VL, Pixtral) serve vision
+            // models. Users can opt-out via [providers.models.vllm.capabilities]
+            // vision = false when running a text-only model.
+            let provider = OpenAiCompatibleProvider::new(
                 "vLLM",
                 base_url,
                 key,
                 AuthStyle::Bearer,
-            )))
+            )
+            .with_supports_vision(options.capability_vision.unwrap_or(true));
+            Ok(compat(provider))
         }
         "osaurus" => {
             let base_url = api_url
@@ -1515,12 +1544,14 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("osaurus");
-            Ok(compat(OpenAiCompatibleProvider::new(
+            let provider = OpenAiCompatibleProvider::new(
                 "Osaurus",
                 base_url,
                 Some(osaurus_key),
                 AuthStyle::Bearer,
-            )))
+            )
+            .with_supports_vision(options.capability_vision.unwrap_or(true));
+            Ok(compat(provider))
         }
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => {
             Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(

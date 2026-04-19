@@ -681,12 +681,62 @@ impl BedrockProvider {
             }
         }
 
+        Self::strip_orphaned_tool_uses(&mut converse_messages);
+
         let system = if system_blocks.is_empty() {
             None
         } else {
             Some(system_blocks)
         };
         (system, converse_messages)
+    }
+
+    /// Belt-and-suspenders sanitiser: strip `toolUse` blocks whose id has no
+    /// matching `toolResult` in a subsequent user message.
+    ///
+    /// Bedrock and the Anthropic API reject requests with unpaired tool_use
+    /// blocks, returning: "Expected toolResult blocks at messages.N.content
+    /// for the following Ids: tooluse_*". The runtime's history pruner
+    /// should catch this upstream, but if any path ever slips through
+    /// (e.g. a new code path that mutates history post-prune), this guard
+    /// keeps the failure from reaching AWS. If every block in an assistant
+    /// message would be stripped, a minimal text fallback is inserted to
+    /// preserve the message role.
+    fn strip_orphaned_tool_uses(messages: &mut [ConverseMessage]) {
+        // Collect every toolResult id present in any user message.
+        let answered_ids: std::collections::HashSet<String> = messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult(w) => Some(w.tool_result.tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+
+        for msg in messages.iter_mut() {
+            if msg.role != "assistant" {
+                continue;
+            }
+            let before = msg.content.len();
+            msg.content.retain(|block| match block {
+                ContentBlock::ToolUse(w) => answered_ids.contains(&w.tool_use.tool_use_id),
+                _ => true,
+            });
+            let removed = before - msg.content.len();
+            if removed > 0 {
+                tracing::warn!(
+                    removed,
+                    "Bedrock converter stripped {removed} orphaned toolUse block(s) from an \
+                     assistant message — upstream history pruning likely missed a case"
+                );
+                if msg.content.is_empty() {
+                    msg.content.push(ContentBlock::Text(TextBlock {
+                        text: "(tool call omitted — no matching result)".to_string(),
+                    }));
+                }
+            }
+        }
     }
 
     /// Remove empty text ContentBlocks from converse messages.
@@ -1511,13 +1561,49 @@ mod tests {
     #[test]
     fn convert_messages_assistant_tool_calls_parsed() {
         let tool_call_json = r#"{"content": "Let me check", "tool_calls": [{"id": "call_1", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
-        let messages = vec![ChatMessage::assistant(tool_call_json)];
+        let tool_result_json = r#"{"content":"ls output","tool_call_id":"call_1"}"#;
+        // Supply a matching tool result so strip_orphaned_tool_uses (added to
+        // defend against unpaired toolUse blocks reaching Bedrock) keeps the
+        // ToolUse intact.
+        let messages = vec![
+            ChatMessage::assistant(tool_call_json),
+            ChatMessage::tool(tool_result_json),
+        ];
         let (_, msgs) = BedrockProvider::convert_messages(&messages);
-        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "assistant");
         assert_eq!(msgs[0].content.len(), 2);
         assert!(matches!(msgs[0].content[0], ContentBlock::Text(_)));
         assert!(matches!(msgs[0].content[1], ContentBlock::ToolUse(_)));
+    }
+
+    #[test]
+    fn convert_messages_strips_orphaned_tool_use() {
+        // Belt-and-suspenders: if an orphaned tool_use ever slips past the
+        // runtime's history pruner, the Bedrock converter must strip it so
+        // AWS doesn't reject the request with
+        // "Expected toolResult blocks at messages.N.content for ... tooluse_*".
+        let tool_call_json = r#"{"content": "Let me check", "tool_calls": [{"id": "call_ORPHAN", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
+        let messages = vec![ChatMessage::assistant(tool_call_json)];
+        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "assistant");
+        // The ToolUse block must be gone; only the text block (or fallback)
+        // remains.
+        assert!(
+            !msgs[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse(_))),
+            "orphaned ToolUse must be stripped"
+        );
+        assert!(
+            msgs[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(_))),
+            "text content must survive"
+        );
     }
 
     #[test]

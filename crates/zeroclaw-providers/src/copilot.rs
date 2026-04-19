@@ -256,7 +256,11 @@ impl CopilotProvider {
     ];
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec<'_>>> {
-        tools.map(|items| {
+        let items = tools?;
+        if items.is_empty() {
+            return None;
+        }
+        Some(
             items
                 .iter()
                 .map(|tool| NativeToolSpec {
@@ -267,8 +271,8 @@ impl CopilotProvider {
                         parameters: &tool.parameters,
                     },
                 })
-                .collect()
-        })
+                .collect(),
+        )
     }
 
     /// Convert message content to API format, with multi-part support for
@@ -380,7 +384,9 @@ impl CopilotProvider {
             model: model.to_string(),
             messages,
             temperature,
-            tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
+            tool_choice: native_tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools: native_tools,
         };
 

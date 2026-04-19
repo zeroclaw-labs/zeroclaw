@@ -586,3 +586,45 @@ fn config_empty_parses_with_all_defaults() {
             < f64::EPSILON
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-provider capability overrides
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn provider_capabilities_parse_from_toml() {
+    let toml_str = r#"
+[providers.models.vllm]
+base_url = "http://host:8000/v1"
+
+[providers.models.vllm.capabilities]
+vision = true
+tools = false
+"#;
+    let config: Config = toml::from_str(toml_str).expect("capability overrides must parse");
+    let vllm = config
+        .providers
+        .models
+        .get("vllm")
+        .expect("vllm profile must be present");
+    let caps = vllm
+        .capabilities
+        .as_ref()
+        .expect("capabilities sub-struct must deserialise");
+    assert_eq!(caps.vision, Some(true));
+    assert_eq!(caps.tools, Some(false));
+}
+
+#[test]
+fn provider_capabilities_default_to_none_when_unset() {
+    let toml_str = r#"
+[providers.models.vllm]
+base_url = "http://host:8000/v1"
+"#;
+    let config: Config = toml::from_str(toml_str).expect("parse");
+    let vllm = config.providers.models.get("vllm").unwrap();
+    assert!(
+        vllm.capabilities.is_none(),
+        "capabilities must be None when omitted so family defaults apply"
+    );
+}

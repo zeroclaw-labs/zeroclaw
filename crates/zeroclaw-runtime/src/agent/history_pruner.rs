@@ -154,6 +154,97 @@ fn extract_tool_call_id(content: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Strip `tool_calls` entries from assistant messages when no following
+/// `tool` message pairs with the call's id.
+///
+/// This complements `remove_orphaned_tool_messages`, which only handles the
+/// inverse case (tool messages without a matching assistant). Unpaired
+/// `tool_use` blocks in assistant messages cause Bedrock/Anthropic to reject
+/// the next request with: "Expected toolResult blocks at messages.N.content
+/// for the following Ids: tooluse_*". The usual trigger is the agent loop
+/// hitting `max_tool_iterations` immediately after emitting a tool_use but
+/// before the runner recorded the tool_result.
+///
+/// Behaviour:
+/// * If SOME of an assistant's `tool_calls` ids pair with later `tool`
+///   messages and some do not, the unpaired entries are removed and the
+///   others are retained.
+/// * If NONE of the `tool_calls` pair, the `tool_calls` field is removed
+///   entirely; the assistant's text content is preserved.
+///
+/// Returns the number of assistant messages that had at least one unpaired
+/// tool_call stripped.
+pub fn strip_orphaned_tool_calls_from_assistants(messages: &mut [ChatMessage]) -> usize {
+    // suffix_tool_ids[i] = set of tool_call_ids referenced by tool-role
+    // messages at positions >= i. Pre-computed so each assistant check is O(1)
+    // in message-index lookups.
+    let mut suffix_tool_ids: Vec<std::collections::HashSet<String>> =
+        vec![std::collections::HashSet::new(); messages.len() + 1];
+    for i in (0..messages.len()).rev() {
+        let mut set = suffix_tool_ids[i + 1].clone();
+        if messages[i].role == "tool"
+            && let Some(id) = extract_tool_call_id(&messages[i].content)
+        {
+            set.insert(id);
+        }
+        suffix_tool_ids[i] = set;
+    }
+
+    let mut stripped = 0usize;
+    for (idx, message) in messages.iter_mut().enumerate() {
+        if message.role != "assistant" || !message.content.contains("tool_calls") {
+            continue;
+        }
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&message.content) else {
+            continue;
+        };
+        let Some(calls) = value.get("tool_calls").and_then(|v| v.as_array()) else {
+            continue;
+        };
+
+        let following_ids = &suffix_tool_ids[idx + 1];
+        let paired_calls: Vec<serde_json::Value> = calls
+            .iter()
+            .filter(|call| {
+                call.get("id")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|id| following_ids.contains(id))
+            })
+            .cloned()
+            .collect();
+
+        if paired_calls.len() == calls.len() {
+            continue; // every tool_call is paired — nothing to do
+        }
+
+        let orphan_ids: Vec<String> = calls
+            .iter()
+            .filter_map(|call| call.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .filter(|id| !following_ids.contains(id))
+            .collect();
+
+        if let serde_json::Value::Object(ref mut map) = value {
+            if paired_calls.is_empty() {
+                map.remove("tool_calls");
+            } else {
+                map.insert(
+                    "tool_calls".to_string(),
+                    serde_json::Value::Array(paired_calls),
+                );
+            }
+        }
+        message.content = value.to_string();
+        stripped += 1;
+
+        tracing::warn!(
+            orphan_ids = ?orphan_ids,
+            "Stripped unpaired tool_calls from assistant history message — likely a \
+             max_tool_iterations early exit"
+        );
+    }
+    stripped
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -777,5 +868,79 @@ mod tests {
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[2].role, "user");
+    }
+
+    // ------------------------------------------------------------------
+    // strip_orphaned_tool_calls_from_assistants tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn strip_orphan_tool_calls_drops_tool_calls_when_no_result_follows() {
+        // Bug 3 canonical case: loop hit max_tool_iterations after the
+        // assistant emitted a tool_use but before any tool_result landed.
+        // The Bedrock converter would then receive an orphaned tool_use
+        // and AWS returns: "Expected toolResult blocks at messages.N.content".
+        let tool_calls_assistant =
+            r#"{"content":"looking it up","tool_calls":[{"id":"toolu_ORPHAN","name":"search","arguments":"{}"}]}"#;
+        let mut messages = vec![
+            msg("user", "search for X"),
+            msg("assistant", tool_calls_assistant),
+        ];
+        let stripped = strip_orphaned_tool_calls_from_assistants(&mut messages);
+        assert_eq!(stripped, 1);
+        let parsed: serde_json::Value = serde_json::from_str(&messages[1].content).unwrap();
+        assert!(
+            parsed.get("tool_calls").is_none(),
+            "tool_calls must be gone; got: {}",
+            parsed
+        );
+        assert_eq!(parsed.get("content").and_then(|v| v.as_str()), Some("looking it up"));
+    }
+
+    #[test]
+    fn strip_orphan_tool_calls_retains_paired_calls() {
+        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"toolu_OK","name":"search","arguments":"{}"}]}"#;
+        let tool_result = r#"{"content":"result","tool_call_id":"toolu_OK"}"#;
+        let mut messages = vec![
+            msg("user", "q"),
+            msg("assistant", tool_calls_assistant),
+            msg("tool", tool_result),
+        ];
+        let stripped = strip_orphaned_tool_calls_from_assistants(&mut messages);
+        assert_eq!(stripped, 0, "paired tool_call must not be stripped");
+        assert!(messages[1].content.contains("toolu_OK"));
+    }
+
+    #[test]
+    fn strip_orphan_tool_calls_partial_keeps_paired_drops_orphans() {
+        // One paired, one orphaned — the paired entry must survive and the
+        // orphan must go.
+        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"toolu_OK","name":"a","arguments":"{}"},{"id":"toolu_ORPHAN","name":"b","arguments":"{}"}]}"#;
+        let tool_result = r#"{"content":"result","tool_call_id":"toolu_OK"}"#;
+        let mut messages = vec![
+            msg("user", "q"),
+            msg("assistant", tool_calls_assistant),
+            msg("tool", tool_result),
+        ];
+        let stripped = strip_orphaned_tool_calls_from_assistants(&mut messages);
+        assert_eq!(stripped, 1);
+        let parsed: serde_json::Value = serde_json::from_str(&messages[1].content).unwrap();
+        let calls = parsed.get("tool_calls").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].get("id").and_then(|v| v.as_str()), Some("toolu_OK"));
+        assert!(!messages[1].content.contains("toolu_ORPHAN"));
+    }
+
+    #[test]
+    fn strip_orphan_tool_calls_no_op_on_plain_assistants() {
+        let mut messages = vec![
+            msg("user", "hi"),
+            msg("assistant", "hello"),
+            msg("user", "how are you"),
+            msg("assistant", "great"),
+        ];
+        let stripped = strip_orphaned_tool_calls_from_assistants(&mut messages);
+        assert_eq!(stripped, 0);
+        assert_eq!(messages.len(), 4);
     }
 }
