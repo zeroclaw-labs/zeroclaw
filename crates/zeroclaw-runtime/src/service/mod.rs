@@ -749,7 +749,6 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
 
     fs::write(&file, unit)?;
     let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
-    let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "zeroclaw.service"]));
     println!("✅ Installed systemd user service: {}", file.display());
     println!("   Start with: zeroclaw service start");
     Ok(())
