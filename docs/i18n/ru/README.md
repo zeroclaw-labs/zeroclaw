@@ -90,6 +90,30 @@ ZeroClaw — это персональный ИИ-ассистент, котор
 
 Среда выполнения: стабильный набор инструментов Rust. Один бинарный файл, без зависимостей времени выполнения.
 
+### cargo binstall (macOS/Linux/Windows)
+
+Самый быстрый способ получить последнюю готовую сборку без компиляции из исходников:
+
+```bash
+cargo binstall zeroclaw
+```
+
+Если у вас ещё не установлен `cargo-binstall`, установите его сначала:
+
+```bash
+cargo install cargo-binstall
+```
+
+### Nix
+
+Запуск напрямую без установки:
+
+```bash
+nix run github:zeroclaw-labs/zeroclaw
+```
+
+Или добавьте во входы вашего flake для воспроизводимой среды разработки.
+
 ### Homebrew (macOS/Linuxbrew)
 
 ```bash

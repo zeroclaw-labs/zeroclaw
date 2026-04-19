@@ -90,6 +90,30 @@ Xoay vòng profile xác thực (OAuth vs API key) + failover: [Model failover](d
 
 Runtime: Rust stable toolchain. Binary đơn, không phụ thuộc runtime.
 
+### cargo binstall (macOS/Linux/Windows)
+
+Cách nhanh nhất để lấy bản binary pre-built mới nhất mà không cần biên dịch từ source:
+
+```bash
+cargo binstall zeroclaw
+```
+
+Nếu bạn chưa có `cargo-binstall`, hãy cài đặt trước:
+
+```bash
+cargo install cargo-binstall
+```
+
+### Nix
+
+Chạy trực tiếp mà không cần cài đặt:
+
+```bash
+nix run github:zeroclaw-labs/zeroclaw
+```
+
+Hoặc thêm vào flake inputs để có môi trường phát triển có thể tái tạo được.
+
 ### Homebrew (macOS/Linuxbrew)
 
 ```bash
