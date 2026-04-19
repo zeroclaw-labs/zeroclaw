@@ -24,11 +24,19 @@ Add the following to your `config.toml` under the `[channels_config]` section:
 [channels_config.mattermost]
 url = "https://mm.your-domain.com"
 bot_token = "your-bot-access-token"
-channel_id = "your-channel-id"
+channel_id = "your-channel-id"            # optional single-channel fallback
+channel_ids = ["your-channel-id", "dm-id"] # optional explicit list; takes precedence over channel_id
 allowed_users = ["user-id-1", "user-id-2"]
 thread_replies = true
 mention_only = true
 ```
+
+Listening scope works as follows:
+
+- Set `channel_ids` to listen on multiple specific channels and DMs.
+- Leave `channel_ids` empty and set `channel_id` to listen on one channel only.
+- Set `channel_id = "*"`, or leave both empty, to auto-discover all accessible Mattermost channels and DMs.
+- If both are set, `channel_ids` wins.
 
 ### Configuration Fields
 
@@ -36,7 +44,8 @@ mention_only = true
 |---|---|
 | `url` | The base URL of your Mattermost server. |
 | `bot_token` | The Personal Access Token for the bot account. |
-| `channel_id` | (Optional) The ID of the channel to listen to. Required for `listen` mode. |
+| `channel_id` | (Optional) Fallback single channel ID. Used only when `channel_ids` is empty. |
+| `channel_ids` | (Optional) Explicit list of channel or DM IDs to monitor simultaneously. When set, it takes precedence over `channel_id`. |
 | `allowed_users` | (Optional) A list of Mattermost User IDs permitted to interact with the bot. Use `["*"]` to allow everyone. |
 | `thread_replies` | (Optional) Whether top-level user messages should be answered in a thread. Default: `true`. Existing thread replies always remain in-thread. |
 | `mention_only` | (Optional) When `true`, only messages that explicitly mention the bot username (for example `@zeroclaw-bot`) are processed. Default: `false`. |

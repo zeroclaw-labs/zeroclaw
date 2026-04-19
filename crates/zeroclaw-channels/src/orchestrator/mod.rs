@@ -3971,14 +3971,19 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .mattermost
                 .as_ref()
                 .context("Mattermost channel is not configured")?;
-            Ok(Arc::new(MattermostChannel::new(
-                mm.url.clone(),
-                mm.bot_token.clone(),
-                mm.channel_id.clone(),
-                mm.allowed_users.clone(),
-                mm.thread_replies.unwrap_or(true),
-                mm.mention_only.unwrap_or(false),
-            )))
+            Ok(Arc::new(
+                MattermostChannel::new(
+                    mm.url.clone(),
+                    mm.bot_token.clone(),
+                    mm.channel_id.clone(),
+                    mm.channel_ids.clone(),
+                    mm.allowed_users.clone(),
+                    mm.thread_replies.unwrap_or(true),
+                    mm.mention_only.unwrap_or(false),
+                )
+                .with_listen_mode(mm.listen_mode.as_deref())
+                .with_credentials(mm.bot_id.clone(), mm.bot_password.clone()),
+            ))
         }
         "signal" => {
             let sg = config
@@ -4448,11 +4453,14 @@ fn collect_configured_channels(
                         mm.url.clone(),
                         mm.bot_token.clone(),
                         mm.channel_id.clone(),
+                        mm.channel_ids.clone(),
                         mm.allowed_users.clone(),
                         mm.thread_replies.unwrap_or(true),
                         mm.mention_only.unwrap_or(false),
                     )
                     .with_proxy_url(mm.proxy_url.clone())
+                    .with_listen_mode(mm.listen_mode.as_deref())
+                    .with_credentials(mm.bot_id.clone(), mm.bot_password.clone())
                     .with_transcription(config.transcription.clone()),
                 ),
             });
@@ -10369,13 +10377,17 @@ This is an example JSON object for profile settings."#;
         config.channels.mattermost = Some(zeroclaw_config::schema::MattermostConfig {
             enabled: true,
             url: "https://mattermost.example.com".to_string(),
-            bot_token: "test-token".to_string(),
+            bot_token: Some("test-token".to_string()),
             channel_id: Some("channel-1".to_string()),
+            channel_ids: vec![],
             allowed_users: vec![],
             thread_replies: Some(true),
             mention_only: Some(false),
             interrupt_on_new_message: false,
             proxy_url: None,
+            listen_mode: None,
+            bot_id: None,
+            bot_password: None,
         });
 
         let channels = collect_configured_channels(&config, "test");

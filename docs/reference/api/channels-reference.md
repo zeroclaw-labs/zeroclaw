@@ -210,9 +210,17 @@ Slack listen behavior:
 [channels_config.mattermost]
 url = "https://mm.example.com"
 bot_token = "mattermost-token"
-channel_id = "channel-id"          # required for listening
+channel_id = "channel-id"          # optional: single channel fallback
+channel_ids = ["channel-id"]       # optional: explicit channel list; takes precedence over channel_id
 allowed_users = ["*"]
 ```
+
+Mattermost listen behavior:
+
+- `channel_ids = ["chan-a", "chan-b"]`: listen only on the listed channels/DMs.
+- `channel_id = "chan-a"`: listen only on that single channel.
+- `channel_id = "*"` or both empty: auto-discover and listen across all accessible channels, including DMs.
+- if both are set, `channel_ids` takes precedence.
 
 ### 4.5 Matrix
 

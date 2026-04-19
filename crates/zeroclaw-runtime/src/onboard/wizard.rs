@@ -15,8 +15,8 @@ use zeroclaw_config::schema::{
     RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
 };
 use zeroclaw_config::schema::{
-    DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, NextcloudTalkConfig, QQConfig,
-    SignalConfig, StreamMode, WhatsAppConfig,
+    DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, MattermostConfig, NextcloudTalkConfig,
+    QQConfig, SignalConfig, StreamMode, WhatsAppConfig,
 };
 use zeroclaw_config::schema::{HardwareConfig, HardwareTransport};
 #[cfg(feature = "channel-nostr")]
@@ -3470,6 +3470,7 @@ enum ChannelMenuChoice {
     Linq,
     Irc,
     Webhook,
+    Mattermost,
     NextcloudTalk,
     DingTalk,
     QqOfficial,
@@ -3491,6 +3492,7 @@ const CHANNEL_MENU_CHOICES: &[ChannelMenuChoice] = &[
     ChannelMenuChoice::Linq,
     ChannelMenuChoice::Irc,
     ChannelMenuChoice::Webhook,
+    ChannelMenuChoice::Mattermost,
     ChannelMenuChoice::NextcloudTalk,
     ChannelMenuChoice::DingTalk,
     ChannelMenuChoice::QqOfficial,
@@ -3599,6 +3601,14 @@ fn setup_channels(
                         "✅ configured"
                     } else {
                         "— HTTP endpoint"
+                    }
+                ),
+                ChannelMenuChoice::Mattermost => format!(
+                    "Mattermost {}",
+                    if config.mattermost.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— Self-hosted team chat (REST + WebSocket)"
                     }
                 ),
                 ChannelMenuChoice::NextcloudTalk => format!(
@@ -4943,6 +4953,96 @@ fn setup_channels(
                     "  {} Webhook on port {}",
                     style("✅").green().bold(),
                     style(&port).cyan()
+                );
+            }
+            ChannelMenuChoice::Mattermost => {
+                // ── Mattermost ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Mattermost Setup").white().bold(),
+                    style("— Self-hosted team chat via REST API / WebSocket").dim()
+                );
+                print_bullet(
+                    "1. Go to System Console → Integrations → Bot Accounts and create a bot.",
+                );
+                print_bullet("2. Copy the bot's Personal Access Token (or use login credentials).");
+                print_bullet("3. Add the bot to the channel(s) you want it to monitor.");
+                println!();
+
+                let url: String = Input::new()
+                    .with_prompt("  Mattermost Server URL (e.g. https://mm.example.com)")
+                    .interact_text()?;
+
+                let auth_mode = Select::new()
+                    .with_prompt("  Authentication mode")
+                    .items([
+                        "Bot Token (Personal Access Token)",
+                        "Login credentials (bot_id + password)",
+                    ])
+                    .default(0)
+                    .interact()?;
+
+                let (bot_token, bot_id, bot_password) = if auth_mode == 0 {
+                    let token: String = Input::new().with_prompt("  Bot Token").interact_text()?;
+                    (Some(token), None, None)
+                } else {
+                    let id: String = Input::new()
+                        .with_prompt("  Bot ID (username or email)")
+                        .interact_text()?;
+                    let pw: String = Input::new().with_prompt("  Bot Password").interact_text()?;
+                    (None, Some(id), Some(pw))
+                };
+
+                let channel_id_input: String = Input::new()
+                    .with_prompt(
+                        "  Channel ID(s), comma-separated (Enter to listen on all channels)",
+                    )
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let (channel_id, channel_ids) = if channel_id_input.trim().is_empty() {
+                    (None, vec!["*".to_string()])
+                } else if channel_id_input.contains(',') {
+                    let ids: Vec<String> = channel_id_input
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    (None, ids)
+                } else {
+                    (Some(channel_id_input.trim().to_string()), vec![])
+                };
+
+                let listen_mode = {
+                    let mode = Select::new()
+                        .with_prompt("  Listen mode")
+                        .items(["polling (REST API, default)", "websocket (real-time)"])
+                        .default(0)
+                        .interact()?;
+                    Some(if mode == 0 { "polling" } else { "websocket" }.to_string())
+                };
+
+                config.mattermost = Some(MattermostConfig {
+                    enabled: true,
+                    url: url.trim().to_string(),
+                    bot_token,
+                    channel_id,
+                    channel_ids,
+                    allowed_users: vec!["*".to_string()],
+                    thread_replies: Some(true),
+                    mention_only: Some(false),
+                    interrupt_on_new_message: false,
+                    proxy_url: None,
+                    listen_mode,
+                    bot_id,
+                    bot_password,
+                });
+
+                println!(
+                    "  {} Mattermost connected to {}",
+                    style("✅").green().bold(),
+                    style(&url).cyan()
                 );
             }
             ChannelMenuChoice::NextcloudTalk => {
@@ -7863,13 +7963,17 @@ mod tests {
         channels.mattermost = Some(zeroclaw_config::schema::MattermostConfig {
             enabled: true,
             url: "https://mattermost.example.com".into(),
-            bot_token: "token".into(),
+            bot_token: Some("token".into()),
             channel_id: Some("channel".into()),
+            channel_ids: vec![],
             allowed_users: vec!["*".into()],
             thread_replies: Some(true),
             mention_only: Some(false),
             interrupt_on_new_message: false,
             proxy_url: None,
+            listen_mode: None,
+            bot_id: None,
+            bot_password: None,
         });
         assert!(has_launchable_channels(&channels));
 
