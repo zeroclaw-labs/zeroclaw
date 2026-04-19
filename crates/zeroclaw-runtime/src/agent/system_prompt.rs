@@ -35,6 +35,29 @@ fn load_openclaw_bootstrap_files(
     inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
 }
 
+fn load_openclaw_bootstrap_files_without_identity(
+    prompt: &mut String,
+    workspace_dir: &std::path::Path,
+    max_chars_per_file: usize,
+) {
+    prompt.push_str(
+        "The following workspace files provide additional behavior, operational rules, and user context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
+    );
+
+    let bootstrap_files = ["AGENTS.md", "SOUL.md", "TOOLS.md", "USER.md"];
+
+    for filename in &bootstrap_files {
+        inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file);
+    }
+
+    let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
+    if bootstrap_path.exists() {
+        inject_workspace_file(prompt, workspace_dir, "BOOTSTRAP.md", max_chars_per_file);
+    }
+
+    inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
+}
+
 /// Load workspace identity files and build a system prompt.
 ///
 /// Follows the `OpenClaw` framework structure by default:
@@ -46,8 +69,9 @@ fn load_openclaw_bootstrap_files(
 /// 6. Date & Time — timezone for cache stability
 /// 7. Runtime — host, OS, model
 ///
-/// When `identity_config` is set to AIEOS format, the bootstrap files section
-/// is replaced with the AIEOS identity data loaded from file or inline JSON.
+/// When `identity_config` is set to AIEOS format, the structured identity data
+/// is injected first, then the non-identity bootstrap files remain in context
+/// so platform rules (AGENTS/SOUL/USER/etc.) are not lost.
 ///
 /// Daily memory files (`memory/*.md`) are NOT injected — they are accessed
 /// on-demand via `memory_recall` / `memory_search` tools.
@@ -252,6 +276,12 @@ pub fn build_system_prompt_with_mode_and_autonomy(
                         prompt.push_str(&aieos_prompt);
                         prompt.push_str("\n\n");
                     }
+                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+                    load_openclaw_bootstrap_files_without_identity(
+                        &mut prompt,
+                        workspace_dir,
+                        max_chars,
+                    );
                 }
                 Ok(None) => {
                     // No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
@@ -385,5 +415,57 @@ fn inject_workspace_file(
             // Missing-file marker (matches OpenClaw behavior)
             let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_system_prompt;
+
+    #[test]
+    fn aieos_identity_keeps_non_identity_bootstrap_files() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_system_prompt_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "AGENTS_MD_LOADED").unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "SOUL_MD_LOADED").unwrap();
+        std::fs::write(
+            workspace.join("IDENTITY.md"),
+            "IDENTITY_MD_SHOULD_NOT_BE_USED",
+        )
+        .unwrap();
+
+        let identity_config = zeroclaw_config::schema::IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: None,
+            aieos_inline: Some(r#"{"identity":{"names":{"first":"Nova"}}}"#.into()),
+        };
+
+        let prompt = build_system_prompt(
+            &workspace,
+            "test-model",
+            &[],
+            &[],
+            Some(&identity_config),
+            None,
+        );
+
+        assert!(prompt.contains("Nova"), "AIEOS identity should be injected");
+        assert!(
+            prompt.contains("AGENTS_MD_LOADED"),
+            "AGENTS.md should remain injected when AIEOS is enabled"
+        );
+        assert!(
+            prompt.contains("SOUL_MD_LOADED"),
+            "SOUL.md should remain injected when AIEOS is enabled"
+        );
+        assert!(
+            !prompt.contains("IDENTITY_MD_SHOULD_NOT_BE_USED"),
+            "IDENTITY.md should be skipped when structured AIEOS identity is present"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }
