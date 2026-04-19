@@ -690,13 +690,15 @@ pub async fn handle_api_memory_list(
 }
 
 fn sanitize_memory_entries_for_api(
-    entries: Vec<crate::memory::MemoryEntry>,
-) -> Vec<crate::memory::MemoryEntry> {
+    entries: Vec<zeroclaw_memory::MemoryEntry>,
+) -> Vec<zeroclaw_memory::MemoryEntry> {
     entries
         .into_iter()
         .map(|mut entry| {
-            entry.content =
-                crate::util::truncate_with_ellipsis(&entry.content, MEMORY_API_CONTENT_MAX_CHARS);
+            entry.content = zeroclaw_runtime::util::truncate_with_ellipsis(
+                &entry.content,
+                MEMORY_API_CONTENT_MAX_CHARS,
+            );
             entry
         })
         .collect()
@@ -2430,7 +2432,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_api_memory_list_truncates_oversized_content() {
-        let mut cfg = crate::config::Config::default();
+        let mut cfg = zeroclaw_config::schema::Config::default();
         cfg.gateway.require_pairing = false;
         let huge = "x".repeat(MEMORY_API_CONTENT_MAX_CHARS + 128);
         let state = AppState {
