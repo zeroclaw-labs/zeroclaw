@@ -57,6 +57,7 @@ hex = "0.4"
 rusqlite = { version = "0.37", features = ["bundled"] }
 
 # Misc
+base64 = { workspace = true, optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 parking_lot = "0.12"
 toml = "1.0"
@@ -76,3 +77,4 @@ plugins-wasm = ["dep:zeroclaw-plugins"]
 webauthn = ["zeroclaw-runtime/webauthn"]
 observability-prometheus = ["zeroclaw-runtime/observability-prometheus"]
 channel-nostr = ["zeroclaw-channels/channel-nostr"]
+channel-bitchat-mesh = ["zeroclaw-channels/channel-bitchat-mesh", "dep:base64"]

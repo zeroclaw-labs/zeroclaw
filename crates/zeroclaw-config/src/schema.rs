@@ -6520,6 +6520,10 @@ pub struct ChannelsConfig {
     #[cfg(feature = "channel-nostr")]
     #[nested]
     pub nostr: Option<NostrConfig>,
+    /// BitChat BLE mesh channel configuration (offline P2P, Noise-encrypted).
+    #[cfg(feature = "channel-bitchat-mesh")]
+    #[nested]
+    pub bitchat_mesh: Option<BitchatMeshConfig>,
     /// ClawdTalk voice channel configuration.
     #[nested]
     pub clawdtalk: Option<crate::scattered_types::ClawdTalkConfig>,
@@ -8662,6 +8666,13 @@ pub struct NostrConfig {
     /// Allowed sender public keys (hex or npub). Empty = deny all, "*" = allow all
     #[serde(default)]
     pub allowed_pubkeys: Vec<String>,
+    /// Optional geohash for AetherNet agent discovery (Nostr kind 20001).
+    /// When set, the channel publishes agent presence to this geohash channel.
+    #[serde(default)]
+    pub geohash: Option<String>,
+    /// Whether to publish agent capabilities to the geohash channel. Default: false.
+    #[serde(default)]
+    pub advertise_capabilities: bool,
 }
 
 #[cfg(feature = "channel-nostr")]
@@ -8682,6 +8693,62 @@ pub fn default_nostr_relays() -> Vec<String> {
         "wss://relay.primal.net".to_string(),
         "wss://relay.snort.social".to_string(),
     ]
+}
+
+// -- BitChat Mesh --
+
+/// BitChat BLE mesh channel configuration.
+///
+/// Enables offline P2P agent communication over Bluetooth LE mesh using
+/// BitChat's binary wire format and Noise XX encryption. Also receives
+/// packets bridged from the Android WiFiDirectManager over WiFi Direct.
+///
+/// ```toml
+/// [channels_config.bitchat_mesh]
+/// enabled = true
+/// allowed_peers = ["*"]        # or specific hex peer-ID prefixes
+/// geohash = "dr5rs"            # optional: for Nostr cross-discovery
+/// ```
+#[cfg(feature = "channel-bitchat-mesh")]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels_config.bitchat_mesh"]
+pub struct BitchatMeshConfig {
+    /// Whether this channel is active. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allowed peer hex-ID prefixes. `["*"]` permits all. Default: `["*"]`.
+    #[serde(default = "default_bitchat_allowed_peers")]
+    pub allowed_peers: Vec<String>,
+    /// Optional geohash for cross-advertising with Nostr agents.
+    #[serde(default)]
+    pub geohash: Option<String>,
+}
+
+#[cfg(feature = "channel-bitchat-mesh")]
+impl Default for BitchatMeshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_peers: default_bitchat_allowed_peers(),
+            geohash: None,
+        }
+    }
+}
+
+#[cfg(feature = "channel-bitchat-mesh")]
+impl ChannelConfig for BitchatMeshConfig {
+    fn name() -> &'static str {
+        "BitChat Mesh"
+    }
+    fn desc() -> &'static str {
+        "BitChat BLE + WiFi Direct offline mesh"
+    }
+}
+
+#[cfg(feature = "channel-bitchat-mesh")]
+fn default_bitchat_allowed_peers() -> Vec<String> {
+    vec!["*".to_string()]
 }
 
 // -- Notion --

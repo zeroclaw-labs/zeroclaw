@@ -69,6 +69,10 @@ wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = f
 qrcode = { version = "0.14", optional = true }
 shellexpand = "3.1"
 
+# BitChat BLE mesh (optional — feature channel-bitchat-mesh)
+btleplug = { version = "0.11", optional = true }
+snow = { version = "0.9", optional = true }
+
 [features]
 default = [
     "channel-discord", "channel-slack", "channel-signal", "channel-mattermost",
@@ -110,6 +114,7 @@ channel-voice-call = []
 channel-acp-server = []
 channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
 voice-wake = ["dep:cpal", "zeroclaw-config/voice-wake"]
+channel-bitchat-mesh = ["dep:btleplug", "dep:snow", "zeroclaw-config/channel-bitchat-mesh"]
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }

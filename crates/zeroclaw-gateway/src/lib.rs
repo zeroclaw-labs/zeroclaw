@@ -955,6 +955,11 @@ pub async fn run_gateway(
         .route("/wati", post(handle_wati_webhook))
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
         .route("/webhook/gmail", post(handle_gmail_push_webhook))
+        // ── BitChat mesh WiFi Direct bridge ──
+        .route(
+            "/channels/bitchat_mesh/ingest",
+            post(handle_bitchat_mesh_ingest),
+        )
         // ── Claude Code runner hooks ──
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
@@ -2169,6 +2174,97 @@ async fn handle_gmail_push_webhook(
 
     // Acknowledge immediately — Google Pub/Sub requires a 2xx within ~10s
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BITCHAT MESH — WiFi Direct bridge endpoint
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Request body for `POST /channels/bitchat_mesh/ingest`.
+///
+/// Sent by `WiFiDirectManager.kt` when a packet arrives over WiFi Direct.
+/// The Kotlin side base64-encodes the raw BitChat binary packet before sending.
+#[derive(serde::Deserialize)]
+struct BitchatMeshIngestBody {
+    /// Transport that delivered the packet (currently always `"wifi-direct"`).
+    transport: String,
+    /// Source peer's IP address string (WiFi Direct group IP).
+    peer_address: String,
+    /// Base64-encoded raw BitChat packet bytes.
+    packet_bytes: String,
+}
+
+/// POST /channels/bitchat_mesh/ingest
+///
+/// Accepts WiFi Direct packets from ZeroClaw-Android's `WiFiDirectManager`
+/// and injects them into the same receive loop as BLE packets via the
+/// process-global [`zeroclaw_channels::bitchat_mesh::inject_wifi_direct_packet`] bus.
+///
+/// Only listens on localhost — not accessible from external networks.
+#[cfg(feature = "channel-bitchat-mesh")]
+async fn handle_bitchat_mesh_ingest(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    body: Result<Json<BitchatMeshIngestBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    // Restrict to loopback — this endpoint is only for the local Android daemon.
+    if !peer.ip().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Only callable from localhost"})),
+        );
+    }
+
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(e) => {
+            tracing::warn!("BitchatMesh ingest: invalid JSON: {e}");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid JSON: {e}")})),
+            );
+        }
+    };
+
+    // Decode base64 packet bytes.
+    use base64::Engine as _;
+    let packet_bytes = match base64::engine::general_purpose::STANDARD.decode(&body.packet_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("BitchatMesh ingest: base64 decode error: {e}");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid base64 in packet_bytes"})),
+            );
+        }
+    };
+
+    tracing::debug!(
+        "BitchatMesh ingest: {} bytes from {} via {}",
+        packet_bytes.len(),
+        body.peer_address,
+        body.transport,
+    );
+
+    if zeroclaw_channels::bitchat_mesh::inject_wifi_direct_packet(body.peer_address, packet_bytes) {
+        (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+    } else {
+        tracing::warn!("BitchatMesh ingest: channel not initialized (daemon not started yet?)");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "BitChat mesh channel not initialized"})),
+        )
+    }
+}
+
+/// Fallback for when the `channel-bitchat-mesh` feature is not compiled in.
+#[cfg(not(feature = "channel-bitchat-mesh"))]
+async fn handle_bitchat_mesh_ingest(
+    _body: Bytes,
+) -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "BitChat mesh channel not compiled (missing feature flag)"})),
+    )
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

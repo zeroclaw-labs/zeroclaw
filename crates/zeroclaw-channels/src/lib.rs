@@ -4,6 +4,7 @@ pub mod orchestrator;
 pub mod util;
 
 // Always-compiled channels and utilities (no feature gate)
+pub mod agent_discovery;
 pub mod cli;
 pub mod link_enricher;
 pub mod transcription;
@@ -42,6 +43,8 @@ pub mod mattermost;
 pub mod mochat;
 #[cfg(feature = "channel-nextcloud")]
 pub mod nextcloud_talk;
+#[cfg(feature = "channel-bitchat-mesh")]
+pub mod bitchat_mesh;
 #[cfg(feature = "channel-nostr")]
 pub mod nostr;
 #[cfg(feature = "channel-notion")]

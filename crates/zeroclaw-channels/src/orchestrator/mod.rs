@@ -4275,10 +4275,29 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 anyhow::bail!("Voice Call channel requires the `channel-voice-call` feature");
             }
         }
+        "bitchat-mesh" | "bitchat_mesh" => {
+            #[cfg(feature = "channel-bitchat-mesh")]
+            {
+                let bm = config
+                    .channels
+                    .bitchat_mesh
+                    .as_ref()
+                    .context("BitChat mesh channel is not configured")?;
+                Ok(Arc::new(crate::bitchat_mesh::BitChatMeshChannel::new(
+                    &bm.allowed_peers,
+                    bm.geohash.clone(),
+                )))
+            }
+            #[cfg(not(feature = "channel-bitchat-mesh"))]
+            {
+                anyhow::bail!("BitChat mesh channel requires the `channel-bitchat-mesh` feature");
+            }
+        }
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
             matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line, voice-call"
+            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line, voice-call, \
+            bitchat-mesh"
         ),
     }
 }
