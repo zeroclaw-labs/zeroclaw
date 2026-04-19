@@ -259,14 +259,9 @@ export default function Cron() {
     setSubmitting(true);
     setFormError(null);
 
-    const parsedTools = formAllowedTools
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
-
     try {
       if (isEditing) {
-        const patch: Record<string, unknown> = {
+        const patch: { name?: string; schedule?: string; command?: string; prompt?: string } = {
           name: formName.trim() || undefined,
           schedule: formSchedule.trim(),
         };
@@ -277,7 +272,7 @@ export default function Cron() {
         }
         const updated = await patchCronJob(
           (modalJob as CronJob).id,
-          patch as { name?: string; schedule?: string; command?: string; prompt?: string },
+          patch,
         );
         setJobs((prev) => prev.map((j) => (j.id === updated.id ? updated : j)));
       } else {
@@ -290,6 +285,10 @@ export default function Cron() {
           body.prompt = formPrompt.trim();
           if (formModel.trim()) body.model = formModel.trim();
           body.session_target = formSessionTarget;
+          const parsedTools = formAllowedTools
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean);
           if (parsedTools.length > 0) body.allowed_tools = parsedTools;
         } else {
           body.command = formCommand.trim();
@@ -547,7 +546,7 @@ export default function Cron() {
                       value={formAllowedTools}
                       onChange={(e) => setFormAllowedTools(e.target.value)}
                       placeholder={t('cron.allowed_tools_placeholder')}
-                      className="input-electric w-full px-3 py-2.5 text-sm"
+                      className="input-electric w-full px-3 py-2.5 text-sm font-mono"
                     />
                   </div>
                 </>
