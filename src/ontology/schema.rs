@@ -420,6 +420,54 @@ pub fn init_ontology_schema(conn: &Connection) -> anyhow::Result<()> {
         END;
 
         -- ================================================================
+        -- 3d. R-Tree spatial index (Q1 step #6 -- O(log n) geo lookup)
+        -- ================================================================
+        -- Built-in SQLite R*Tree for O(log n) bounding-box spatial queries.
+        -- Separate from geohash-prefix matching: R-Tree handles continuous
+        -- lat/lng ranges (e.g. within-5km queries), geohash handles
+        -- discretized grid equality (same-cell-as matches). Cross-search
+        -- uses geohash for disambiguation ties, R-Tree for proximity.
+        --
+        -- The virtual table stores bounding boxes. For point-locations the
+        -- min/max collapse (min_lat == max_lat == lat). Populated and torn
+        -- down via triggers from ontology_action_places.
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS ontology_action_geo USING rtree(
+            action_place_id,  -- rowid = ontology_action_places.id (1:1)
+            min_lat, max_lat,
+            min_lng, max_lng
+        );
+
+        -- Populate on INSERT when both coords are present.
+        CREATE TRIGGER IF NOT EXISTS trg_action_geo_ai
+            AFTER INSERT ON ontology_action_places
+            WHEN NEW.geo_lat IS NOT NULL AND NEW.geo_lng IS NOT NULL
+        BEGIN
+            INSERT OR REPLACE INTO ontology_action_geo
+                (action_place_id, min_lat, max_lat, min_lng, max_lng)
+            VALUES
+                (NEW.id, NEW.geo_lat, NEW.geo_lat, NEW.geo_lng, NEW.geo_lng);
+        END;
+
+        -- Update when coordinates change on an existing place row.
+        CREATE TRIGGER IF NOT EXISTS trg_action_geo_au
+            AFTER UPDATE OF geo_lat, geo_lng ON ontology_action_places
+        BEGIN
+            DELETE FROM ontology_action_geo WHERE action_place_id = OLD.id;
+            INSERT INTO ontology_action_geo
+                (action_place_id, min_lat, max_lat, min_lng, max_lng)
+            SELECT NEW.id, NEW.geo_lat, NEW.geo_lat, NEW.geo_lng, NEW.geo_lng
+             WHERE NEW.geo_lat IS NOT NULL AND NEW.geo_lng IS NOT NULL;
+        END;
+
+        -- Clean up the R-Tree when the place row is deleted.
+        CREATE TRIGGER IF NOT EXISTS trg_action_geo_ad
+            AFTER DELETE ON ontology_action_places
+        BEGIN
+            DELETE FROM ontology_action_geo WHERE action_place_id = OLD.id;
+        END;
+
+        -- ================================================================
         -- 4. Community layer (PR #9 — GraphRAG Phase 5)
         -- ================================================================
         -- One row per detected community in the ontology graph. `level`
@@ -1131,6 +1179,120 @@ mod tests {
             )
             .unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    /// Q1 Commit #6 — SQLite R-Tree bounding-box index gives O(log n)
+    /// spatial lookups for "what happened near lat/lng". Populated by
+    /// triggers from ontology_action_places.
+    #[test]
+    fn rtree_spatial_index_finds_points_within_bbox() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_ontology_schema(&conn).unwrap();
+        seed_default_types(&conn).unwrap();
+
+        // Insert three actions, each with one place at a known coordinate.
+        // * Action 1: Jeju ** 골프장  (33.43, 126.54)  ← inside bbox
+        // * Action 2: Jeju Airport   (33.51, 126.49)  ← inside bbox
+        // * Action 3: Seoul City Hall (37.57, 126.98) ← outside bbox
+        let action_type_id: i64 = conn
+            .query_row(
+                "SELECT id FROM ontology_action_types WHERE name = 'RecordDecision'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for (_label, _lat, _lng) in [
+            ("golf", 33.43_f64, 126.54_f64),
+            ("airport", 33.51, 126.49),
+            ("seoul", 37.57, 126.98),
+        ] {
+            conn.execute(
+                "INSERT INTO ontology_actions
+                    (action_type_id, actor_user_id, params, created_at, updated_at)
+                 VALUES (?1, 'user_test', '{}', 1000, 1000)",
+                rusqlite::params![action_type_id],
+            )
+            .unwrap();
+        }
+        let action_ids: Vec<i64> = conn
+            .prepare("SELECT id FROM ontology_actions ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        let places: [(i64, &str, f64, f64); 3] = [
+            (action_ids[0], "Jeju Golf",    33.43, 126.54),
+            (action_ids[1], "Jeju Airport", 33.51, 126.49),
+            (action_ids[2], "Seoul Hall",   37.57, 126.98),
+        ];
+        for (aid, label, lat, lng) in places {
+            conn.execute(
+                "INSERT INTO ontology_action_places
+                    (action_id, place_role, place_label,
+                     geo_lat, geo_lng, geohash, confidence, created_at)
+                 VALUES (?1, 'primary', ?2, ?3, ?4, NULL, 1.0, 1000)",
+                rusqlite::params![aid, label, lat, lng],
+            )
+            .unwrap();
+        }
+
+        // Bounding box covering all of Jeju but not Seoul.
+        let jeju_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ontology_action_geo
+                 WHERE min_lat >= 33.0 AND max_lat <= 34.0
+                   AND min_lng >= 126.0 AND max_lng <= 127.0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(jeju_count, 2, "R-Tree should find the 2 Jeju points");
+
+        // A single-point query (±0.05°) around the golf course.
+        let golf_vicinity: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ontology_action_geo
+                 WHERE min_lat >= 33.38 AND max_lat <= 33.48
+                   AND min_lng >= 126.49 AND max_lng <= 126.59",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(golf_vicinity, 1);
+
+        // Deletion propagates: drop the airport place row, R-Tree shrinks.
+        conn.execute(
+            "DELETE FROM ontology_action_places
+             WHERE place_label = 'Jeju Airport'",
+            [],
+        )
+        .unwrap();
+        let jeju_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ontology_action_geo
+                 WHERE min_lat >= 33.0 AND max_lat <= 34.0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(jeju_count, 1, "trigger should clean the R-Tree on DELETE");
+
+        // Inserting a place row with NULL coords must NOT populate R-Tree.
+        conn.execute(
+            "INSERT INTO ontology_action_places
+                (action_id, place_role, place_label,
+                 geo_lat, geo_lng, confidence, created_at)
+             VALUES (?1, 'primary', 'unknown venue', NULL, NULL, 0.5, 1000)",
+            rusqlite::params![action_ids[0]],
+        )
+        .unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ontology_action_geo", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 2, "NULL-coord place should not enter R-Tree");
     }
 
     /// Typed property system: property types are defined per object type,
