@@ -159,6 +159,11 @@ export default function Cron() {
   const [formName, setFormName] = useState('');
   const [formSchedule, setFormSchedule] = useState('');
   const [formCommand, setFormCommand] = useState('');
+  const [formJobType, setFormJobType] = useState<'shell' | 'agent'>('shell');
+  const [formPrompt, setFormPrompt] = useState('');
+  const [formModel, setFormModel] = useState('');
+  const [formSessionTarget, setFormSessionTarget] = useState<'isolated' | 'main'>('isolated');
+  const [formAllowedTools, setFormAllowedTools] = useState('');
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -168,14 +173,37 @@ export default function Cron() {
     setFormName('');
     setFormSchedule('');
     setFormCommand('');
+    setFormJobType('shell');
+    setFormPrompt('');
+    setFormModel('');
+    setFormSessionTarget('isolated');
+    setFormAllowedTools('');
     setFormError(null);
     setModalJob('add');
   };
 
   const openEditModal = (job: CronJob) => {
+    const jobType = job.job_type === 'agent' ? 'agent' : 'shell';
     setFormName(job.name ?? '');
     setFormSchedule(job.expression);
-    setFormCommand(job.prompt ?? job.command);
+    setFormJobType(jobType);
+    if (jobType === 'agent') {
+      setFormPrompt(job.prompt ?? '');
+      setFormCommand('');
+      setFormModel(job.model ?? '');
+      setFormSessionTarget(
+        job.session_target === 'main' ? 'main' : 'isolated',
+      );
+      setFormAllowedTools(
+        job.allowed_tools ? job.allowed_tools.join(', ') : '',
+      );
+    } else {
+      setFormCommand(job.command);
+      setFormPrompt('');
+      setFormModel('');
+      setFormSessionTarget('isolated');
+      setFormAllowedTools('');
+    }
     setFormError(null);
     setModalJob(job);
   };
@@ -215,26 +243,58 @@ export default function Cron() {
   }, []);
 
   const handleSubmit = async () => {
-    if (!formSchedule.trim() || !formCommand.trim()) {
+    const isAgent = formJobType === 'agent';
+    if (!formSchedule.trim()) {
       setFormError(t('cron.validation_error'));
+      return;
+    }
+    if (isAgent && !formPrompt.trim()) {
+      setFormError(t('cron.prompt_required_error'));
+      return;
+    }
+    if (!isAgent && !formCommand.trim()) {
+      setFormError(t('cron.command_required_error'));
       return;
     }
     setSubmitting(true);
     setFormError(null);
+
+    const parsedTools = formAllowedTools
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
     try {
       if (isEditing) {
-        const updated = await patchCronJob((modalJob as CronJob).id, {
+        const patch: Record<string, unknown> = {
           name: formName.trim() || undefined,
           schedule: formSchedule.trim(),
-          command: formCommand.trim(),
-        });
+        };
+        if (isAgent) {
+          patch.prompt = formPrompt.trim();
+        } else {
+          patch.command = formCommand.trim();
+        }
+        const updated = await patchCronJob(
+          (modalJob as CronJob).id,
+          patch as { name?: string; schedule?: string; command?: string; prompt?: string },
+        );
         setJobs((prev) => prev.map((j) => (j.id === updated.id ? updated : j)));
       } else {
-        const job = await addCronJob({
+        const body: Parameters<typeof addCronJob>[0] = {
           name: formName.trim() || undefined,
           schedule: formSchedule.trim(),
-          command: formCommand.trim(),
-        });
+          job_type: formJobType,
+        };
+        if (isAgent) {
+          body.prompt = formPrompt.trim();
+          if (formModel.trim()) body.model = formModel.trim();
+          body.session_target = formSessionTarget;
+          if (parsedTools.length > 0) body.allowed_tools = parsedTools;
+        } else {
+          body.command = formCommand.trim();
+        }
+        const job = await addCronJob(body);
         setJobs((prev) => [...prev, job]);
       }
       closeModal();
@@ -362,6 +422,38 @@ export default function Cron() {
               </div>
             )}
             <div className="space-y-4">
+              {/* Job Type Selector */}
+              <div>
+                <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                  {t('cron.job_type')}
+                </label>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setFormJobType('shell')}
+                    className={`flex-1 px-3 py-2.5 rounded-xl text-sm font-medium border transition-colors ${
+                      formJobType === 'shell'
+                        ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
+                        : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
+                    }`}
+                    style={formJobType === 'shell' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
+                  >
+                    {t('cron.job_type_shell')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFormJobType('agent')}
+                    className={`flex-1 px-3 py-2.5 rounded-xl text-sm font-medium border transition-colors ${
+                      formJobType === 'agent'
+                        ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
+                        : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
+                    }`}
+                    style={formJobType === 'agent' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
+                  >
+                    {t('cron.job_type_agent')}
+                  </button>
+                </div>
+              </div>
               <div>
                 <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
                   {t('cron.name_optional')}
@@ -374,18 +466,92 @@ export default function Cron() {
                 </label>
                 <input type="text" value={formSchedule} onChange={(e) => setFormSchedule(e.target.value)} placeholder="e.g. 0 0 * * * (cron expression)" className="input-electric w-full px-3 py-2.5 text-sm" />
               </div>
-              <div>
-                <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
-                  {t('cron.command_required')} <span style={{ color: 'var(--color-status-error)' }}>*</span>
-                </label>
-                <textarea
-                  value={formCommand}
-                  onChange={(e) => setFormCommand(e.target.value)}
-                  placeholder="e.g. cleanup --older-than 7d"
-                  rows={4}
-                  className="input-electric w-full px-3 py-2.5 text-sm resize-y"
-                />
-              </div>
+
+              {/* Conditional fields based on job type */}
+              {formJobType === 'shell' ? (
+                <div>
+                  <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                    {t('cron.command_required')} <span style={{ color: 'var(--color-status-error)' }}>*</span>
+                  </label>
+                  <textarea
+                    value={formCommand}
+                    onChange={(e) => setFormCommand(e.target.value)}
+                    placeholder="e.g. cleanup --older-than 7d"
+                    rows={4}
+                    className="input-electric w-full px-3 py-2.5 text-sm resize-y font-mono"
+                  />
+                </div>
+              ) : (
+                <>
+                  <div>
+                    <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                      {t('cron.prompt_required')} <span style={{ color: 'var(--color-status-error)' }}>*</span>
+                    </label>
+                    <textarea
+                      value={formPrompt}
+                      onChange={(e) => setFormPrompt(e.target.value)}
+                      placeholder={t('cron.prompt_placeholder')}
+                      rows={4}
+                      className="input-electric w-full px-3 py-2.5 text-sm resize-y"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                      {t('cron.model_optional')}
+                    </label>
+                    <input
+                      type="text"
+                      value={formModel}
+                      onChange={(e) => setFormModel(e.target.value)}
+                      placeholder={t('cron.model_placeholder')}
+                      className="input-electric w-full px-3 py-2.5 text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                      {t('cron.session_target')}
+                    </label>
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setFormSessionTarget('isolated')}
+                        className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${
+                          formSessionTarget === 'isolated'
+                            ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
+                            : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
+                        }`}
+                        style={formSessionTarget === 'isolated' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
+                      >
+                        {t('cron.session_isolated')}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setFormSessionTarget('main')}
+                        className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${
+                          formSessionTarget === 'main'
+                            ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
+                            : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
+                        }`}
+                        style={formSessionTarget === 'main' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
+                      >
+                        {t('cron.session_main')}
+                      </button>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                      {t('cron.allowed_tools_optional')}
+                    </label>
+                    <input
+                      type="text"
+                      value={formAllowedTools}
+                      onChange={(e) => setFormAllowedTools(e.target.value)}
+                      placeholder={t('cron.allowed_tools_placeholder')}
+                      className="input-electric w-full px-3 py-2.5 text-sm"
+                    />
+                  </div>
+                </>
+              )}
             </div>
             <div className="flex justify-end gap-3 mt-6">
               <button
@@ -421,6 +587,7 @@ export default function Cron() {
               <tr>
                 <th>{t('cron.id')}</th>
                 <th>{t('cron.name')}</th>
+                <th>{t('cron.job_type')}</th>
                 <th>{t('cron.command')}</th>
                 <th>{t('cron.next_run')}</th>
                 <th>{t('cron.last_status')}</th>
@@ -452,6 +619,15 @@ export default function Cron() {
                     </td>
                     <td className="font-medium text-sm" style={{ color: 'var(--pc-text-primary)' }}>
                       {job.name ?? '-'}
+                    </td>
+                    <td>
+                      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-semibold border"
+                        style={job.job_type === 'agent'
+                          ? { color: 'var(--pc-accent)', borderColor: 'rgba(0, 128, 255, 0.2)', background: 'rgba(0, 128, 255, 0.06)' }
+                          : { color: 'var(--pc-text-secondary)', borderColor: 'var(--pc-border)', background: 'transparent' }
+                        }>
+                        {job.job_type === 'agent' ? t('cron.job_type_agent') : t('cron.job_type_shell')}
+                      </span>
                     </td>
                     <td className="font-mono text-xs max-w-[200px] truncate" style={{ color: 'var(--pc-text-secondary)' }}>
                       {job.prompt ?? job.command}
@@ -515,7 +691,7 @@ export default function Cron() {
                   </tr>
                   {expandedJob === job.id && (
                     <tr>
-                      <td colSpan={7} style={{ background: 'var(--pc-bg-elevated)' }}>
+                      <td colSpan={8} style={{ background: 'var(--pc-bg-elevated)' }}>
                         <RunHistoryPanel jobId={job.id} />
                       </td>
                     </tr>
