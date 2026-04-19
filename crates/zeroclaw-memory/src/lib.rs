@@ -1,4 +1,20 @@
 //! Memory subsystem: backends, embeddings, consolidation, retrieval.
+//!
+//! ## Reserved Key Prefixes
+//!
+//! The following key prefixes are reserved for the auto-save system. Any memory
+//! stored under these keys will be **excluded from context assembly** by all
+//! three context-building paths (`build_context`, `DefaultMemoryLoader`, and
+//! `should_skip_memory_context_entry`). Do not use these prefixes for semantic
+//! memories that should surface in agent context.
+//!
+//! | Prefix | Purpose | Detection function |
+//! |---|---|---|
+//! | `assistant_resp` / `assistant_resp_*` | Model-authored assistant summaries (untrusted context) | [`is_assistant_autosave_key`] |
+//! | `user_msg` / `user_msg_*` | Raw per-turn user messages (consolidation queue) | [`is_user_autosave_key`] |
+//!
+//! Channel-scoped variants (e.g. `telegram_user_msg_*`, `discord_*`) are
+//! **not** filtered — they use different prefixes and are handled separately.
 
 pub mod audit;
 pub mod backend;
