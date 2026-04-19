@@ -137,6 +137,107 @@ impl ActiveProvider {
     }
 }
 
+/// Chat mode passed to [`decide_active_provider_v2`]. Matches the §3.1
+/// branching in `docs/plans/2026-04-16-moa-gemma4-ollama-v1.1.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChatMode {
+    /// User interacting directly with the MoA desktop/mobile app.
+    /// Default: prefer local Gemma 4 even when a BYOK key is present, so
+    /// everyday chat is free and private. Only route cloud when the user
+    /// opts into `quality_first` or when tooling the small model can't
+    /// serve (e.g. very long context).
+    App,
+    /// Messaging channel integration (Telegram/Discord/Slack/iMessage/…).
+    /// When a BYOK key is present: route cloud through the zero-storage
+    /// proxy relay (`Relay`) so the server never sees user content. No
+    /// key → local Gemma 4.
+    Channel,
+    /// Web chat widget on claude.ai/code-style pages. BYOK + key →
+    /// direct cloud. No key → local.
+    Web,
+}
+
+impl std::fmt::Display for ChatMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ChatMode::App => "app",
+            ChatMode::Channel => "channel",
+            ChatMode::Web => "web",
+        })
+    }
+}
+
+/// §3.1 routing input. Keep additive — adding fields here is non-breaking
+/// because every construction site uses struct-init syntax.
+#[derive(Debug, Clone)]
+pub struct RoutingContext<'a> {
+    /// Primary cloud provider name (for [`ActiveProvider::Cloud`]).
+    pub primary_cloud: &'a str,
+    /// Whether the user has a valid BYOK API key for `primary_cloud`.
+    pub has_cloud_api_key: bool,
+    /// Fresh network health snapshot (from [`shared_health`]).
+    pub network_online: bool,
+    /// Persisted reliability + offline-force config.
+    pub reliability: &'a ReliabilityConfig,
+    /// Which chat surface this request arrived through.
+    pub chat_mode: ChatMode,
+    /// When `true` under [`ChatMode::App`], prefer the cloud provider
+    /// over local (the user chose "quality first" in settings).
+    pub quality_first: bool,
+}
+
+/// §3.1 routing decision with detailed rationale. Extends [`ActiveProvider`]
+/// with the reason the decision was made so the gateway can emit a
+/// consistent "Local Gemma 4 in use" badge and observability tags without
+/// reconstructing the branching logic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingDecision {
+    /// Final provider the request will hit.
+    pub provider: ActiveProvider,
+    /// Structured reason for observability + UI badge.
+    pub reason: RoutingReason,
+    /// For [`ChatMode::Channel`] cloud paths: whether the request must go
+    /// through the server-side zero-storage relay (true) or can dial the
+    /// cloud API directly (false).
+    pub via_relay: bool,
+}
+
+/// Why [`decide_active_provider_v2`] picked what it picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoutingReason {
+    /// `offline_force_local` was set in config (strict privacy).
+    ForcedLocalByConfig,
+    /// Network health probe reports offline.
+    ForcedLocalByOffline,
+    /// No BYOK cloud key present.
+    ForcedLocalByMissingKey,
+    /// App chat default path — local is the privacy-preserving default.
+    AppChatDefaultLocal,
+    /// User explicitly asked for the cloud provider (quality_first on App,
+    /// or chat_mode == Web with a key).
+    CloudByUserChoice,
+    /// Channel chat with a BYOK key — routed through the zero-storage
+    /// relay so the MoA server never sees content.
+    CloudViaZeroStorageRelay,
+    /// Plain cloud path, no local fallback armed / not applicable.
+    CloudByDefault,
+}
+
+impl RoutingReason {
+    /// UI badge label the app can show on every message.
+    pub fn badge_label(self) -> &'static str {
+        match self {
+            RoutingReason::ForcedLocalByConfig => "Local Gemma 4 (privacy mode)",
+            RoutingReason::ForcedLocalByOffline => "Local Gemma 4 (offline)",
+            RoutingReason::ForcedLocalByMissingKey => "Local Gemma 4 (no API key)",
+            RoutingReason::AppChatDefaultLocal => "Local Gemma 4 (app chat default)",
+            RoutingReason::CloudByUserChoice => "Cloud (quality first)",
+            RoutingReason::CloudViaZeroStorageRelay => "Cloud via zero-storage relay",
+            RoutingReason::CloudByDefault => "Cloud",
+        }
+    }
+}
+
 /// Compute the active provider given configuration, API key presence, and
 /// runtime network state. Encapsulates the patent §3.1 routing rules:
 ///
@@ -144,35 +245,154 @@ impl ActiveProvider {
 /// 2. Network offline + local fallback armed → local
 /// 3. No API key for primary cloud provider + local fallback armed → local
 /// 4. Otherwise → primary cloud provider
+///
+/// Kept for call sites that do not yet know the `chat_mode`. Prefer
+/// [`decide_active_provider_v2`] for new code.
 pub fn decide_active_provider(
     primary_cloud: &str,
     has_cloud_api_key: bool,
     network_online: bool,
     reliability: &ReliabilityConfig,
 ) -> ActiveProvider {
-    let local_armed = reliability.local_llm_fallback
-        && reliability.fallback_providers.iter().any(|p| p == "ollama");
+    decide_active_provider_v2(&RoutingContext {
+        primary_cloud,
+        has_cloud_api_key,
+        network_online,
+        reliability,
+        // When the caller doesn't know, assume app chat. App's default
+        // is "prefer local" which is the safest behavior when the caller
+        // lacks context.
+        chat_mode: ChatMode::App,
+        quality_first: false,
+    })
+    .provider
+}
 
-    if reliability.offline_force_local {
-        return ActiveProvider::Local {
-            model: reliability.local_llm_model.clone(),
+/// §3.1 routing decision with chat-mode branching and badge metadata.
+///
+/// Branches (in priority order):
+/// 1. `reliability.offline_force_local` → [`RoutingReason::ForcedLocalByConfig`]
+/// 2. Network offline + local armed → [`RoutingReason::ForcedLocalByOffline`]
+/// 3. No BYOK key + local armed → [`RoutingReason::ForcedLocalByMissingKey`]
+/// 4. Per-chat-mode branch:
+///    * App: `quality_first` + key → cloud; else → local
+///      (local is the **default** even with a key — patent §3.1 inverts
+///      the usual "cloud when possible" bias)
+///    * Channel + key → cloud via zero-storage relay
+///    * Channel no key → local
+///    * Web + key → cloud direct
+///    * Web no key → local
+/// 5. Fallback → cloud
+pub fn decide_active_provider_v2(ctx: &RoutingContext<'_>) -> RoutingDecision {
+    let local_armed = ctx.reliability.local_llm_fallback
+        && ctx
+            .reliability
+            .fallback_providers
+            .iter()
+            .any(|p| p == "ollama");
+    let local_model = ctx.reliability.local_llm_model.clone();
+    let cloud_name = ctx.primary_cloud.to_string();
+
+    let local = || ActiveProvider::Local {
+        model: local_model.clone(),
+    };
+    let cloud = || ActiveProvider::Cloud {
+        name: cloud_name.clone(),
+    };
+
+    // 1. Strict privacy mode.
+    if ctx.reliability.offline_force_local {
+        return RoutingDecision {
+            provider: local(),
+            reason: RoutingReason::ForcedLocalByConfig,
+            via_relay: false,
         };
     }
 
-    if !network_online && local_armed {
-        return ActiveProvider::Local {
-            model: reliability.local_llm_model.clone(),
+    // 2. Offline.
+    if !ctx.network_online && local_armed {
+        return RoutingDecision {
+            provider: local(),
+            reason: RoutingReason::ForcedLocalByOffline,
+            via_relay: false,
         };
     }
 
-    if !has_cloud_api_key && local_armed {
-        return ActiveProvider::Local {
-            model: reliability.local_llm_model.clone(),
+    // 3. No BYOK key.
+    if !ctx.has_cloud_api_key && local_armed {
+        return RoutingDecision {
+            provider: local(),
+            reason: RoutingReason::ForcedLocalByMissingKey,
+            via_relay: false,
         };
     }
 
-    ActiveProvider::Cloud {
-        name: primary_cloud.to_string(),
+    // 4. Per-chat-mode branch.
+    match ctx.chat_mode {
+        ChatMode::App => {
+            if ctx.has_cloud_api_key && ctx.quality_first {
+                RoutingDecision {
+                    provider: cloud(),
+                    reason: RoutingReason::CloudByUserChoice,
+                    via_relay: false,
+                }
+            } else if local_armed {
+                RoutingDecision {
+                    provider: local(),
+                    reason: RoutingReason::AppChatDefaultLocal,
+                    via_relay: false,
+                }
+            } else {
+                // Local not armed — cloud is the only thing that can serve.
+                RoutingDecision {
+                    provider: cloud(),
+                    reason: RoutingReason::CloudByDefault,
+                    via_relay: false,
+                }
+            }
+        }
+        ChatMode::Channel => {
+            if ctx.has_cloud_api_key {
+                RoutingDecision {
+                    provider: cloud(),
+                    reason: RoutingReason::CloudViaZeroStorageRelay,
+                    via_relay: true,
+                }
+            } else if local_armed {
+                RoutingDecision {
+                    provider: local(),
+                    reason: RoutingReason::ForcedLocalByMissingKey,
+                    via_relay: false,
+                }
+            } else {
+                RoutingDecision {
+                    provider: cloud(),
+                    reason: RoutingReason::CloudByDefault,
+                    via_relay: false,
+                }
+            }
+        }
+        ChatMode::Web => {
+            if ctx.has_cloud_api_key {
+                RoutingDecision {
+                    provider: cloud(),
+                    reason: RoutingReason::CloudByUserChoice,
+                    via_relay: false,
+                }
+            } else if local_armed {
+                RoutingDecision {
+                    provider: local(),
+                    reason: RoutingReason::ForcedLocalByMissingKey,
+                    via_relay: false,
+                }
+            } else {
+                RoutingDecision {
+                    provider: cloud(),
+                    reason: RoutingReason::CloudByDefault,
+                    via_relay: false,
+                }
+            }
+        }
     }
 }
 
@@ -505,6 +725,148 @@ mod tests {
         c
     }
 
+    fn ctx_with<'a>(
+        reliability: &'a ReliabilityConfig,
+        has_key: bool,
+        online: bool,
+        mode: ChatMode,
+        quality_first: bool,
+    ) -> RoutingContext<'a> {
+        RoutingContext {
+            primary_cloud: "gemini",
+            has_cloud_api_key: has_key,
+            network_online: online,
+            reliability,
+            chat_mode: mode,
+            quality_first,
+        }
+    }
+
+    // ── §3.1 precedence tests (apply regardless of chat_mode) ──
+
+    #[test]
+    fn v2_offline_force_local_wins_over_everything() {
+        let mut r = armed_reliability();
+        r.offline_force_local = true;
+        for mode in [ChatMode::App, ChatMode::Channel, ChatMode::Web] {
+            let d = decide_active_provider_v2(&ctx_with(&r, true, true, mode, true));
+            assert!(d.provider.is_local());
+            assert_eq!(d.reason, RoutingReason::ForcedLocalByConfig);
+            assert!(!d.via_relay);
+        }
+    }
+
+    #[test]
+    fn v2_offline_routes_local_when_armed() {
+        let r = armed_reliability();
+        let d = decide_active_provider_v2(&ctx_with(&r, true, false, ChatMode::Web, false));
+        assert!(d.provider.is_local());
+        assert_eq!(d.reason, RoutingReason::ForcedLocalByOffline);
+    }
+
+    #[test]
+    fn v2_missing_key_routes_local_when_armed() {
+        let r = armed_reliability();
+        let d = decide_active_provider_v2(&ctx_with(&r, false, true, ChatMode::Web, false));
+        assert!(d.provider.is_local());
+        assert_eq!(d.reason, RoutingReason::ForcedLocalByMissingKey);
+    }
+
+    // ── App chat: local is the default even with a key ──
+
+    #[test]
+    fn v2_app_chat_default_prefers_local_with_key() {
+        let r = armed_reliability();
+        let d = decide_active_provider_v2(&ctx_with(&r, true, true, ChatMode::App, false));
+        assert!(d.provider.is_local(), "app chat must default to local");
+        assert_eq!(d.reason, RoutingReason::AppChatDefaultLocal);
+        assert!(!d.via_relay);
+    }
+
+    #[test]
+    fn v2_app_chat_quality_first_routes_cloud() {
+        let r = armed_reliability();
+        let d = decide_active_provider_v2(&ctx_with(&r, true, true, ChatMode::App, true));
+        assert!(!d.provider.is_local());
+        assert_eq!(d.reason, RoutingReason::CloudByUserChoice);
+    }
+
+    #[test]
+    fn v2_app_chat_without_local_armed_goes_cloud() {
+        // local_llm_fallback disabled → cloud is the only option, even on App.
+        let mut r = ReliabilityConfig::default();
+        r.local_llm_fallback = false;
+        let d = decide_active_provider_v2(&ctx_with(&r, true, true, ChatMode::App, false));
+        assert!(!d.provider.is_local());
+        assert_eq!(d.reason, RoutingReason::CloudByDefault);
+    }
+
+    // ── Channel chat: cloud via relay when keyed ──
+
+    #[test]
+    fn v2_channel_with_key_routes_cloud_via_relay() {
+        let r = armed_reliability();
+        let d = decide_active_provider_v2(&ctx_with(&r, true, true, ChatMode::Channel, false));
+        assert!(!d.provider.is_local());
+        assert_eq!(d.reason, RoutingReason::CloudViaZeroStorageRelay);
+        assert!(d.via_relay, "channel+key must flip via_relay");
+    }
+
+    #[test]
+    fn v2_channel_without_key_falls_back_local() {
+        let r = armed_reliability();
+        let d = decide_active_provider_v2(&ctx_with(&r, false, true, ChatMode::Channel, false));
+        assert!(d.provider.is_local());
+        assert_eq!(d.reason, RoutingReason::ForcedLocalByMissingKey);
+    }
+
+    // ── Web chat: cloud direct when keyed ──
+
+    #[test]
+    fn v2_web_with_key_routes_cloud_direct() {
+        let r = armed_reliability();
+        let d = decide_active_provider_v2(&ctx_with(&r, true, true, ChatMode::Web, false));
+        assert!(!d.provider.is_local());
+        assert_eq!(d.reason, RoutingReason::CloudByUserChoice);
+        assert!(!d.via_relay, "web path must not use the relay");
+    }
+
+    #[test]
+    fn v2_web_without_key_falls_back_local() {
+        let r = armed_reliability();
+        let d = decide_active_provider_v2(&ctx_with(&r, false, true, ChatMode::Web, false));
+        assert!(d.provider.is_local());
+    }
+
+    // ── Badge labels ──
+
+    #[test]
+    fn routing_reason_badge_labels_are_stable() {
+        // Stable UI strings; regressions here would silently change user-visible badges.
+        assert_eq!(
+            RoutingReason::AppChatDefaultLocal.badge_label(),
+            "Local Gemma 4 (app chat default)"
+        );
+        assert_eq!(
+            RoutingReason::ForcedLocalByOffline.badge_label(),
+            "Local Gemma 4 (offline)"
+        );
+        assert_eq!(
+            RoutingReason::CloudViaZeroStorageRelay.badge_label(),
+            "Cloud via zero-storage relay"
+        );
+    }
+
+    // ── Backwards-compat: v1 wrapper still works ──
+
+    #[test]
+    fn v1_wrapper_matches_app_chat_defaults() {
+        let r = armed_reliability();
+        let v1 = decide_active_provider("gemini", true, true, &r);
+        let v2 = decide_active_provider_v2(&ctx_with(&r, true, true, ChatMode::App, false));
+        assert_eq!(v1, v2.provider);
+    }
+
     #[tokio::test]
     async fn shared_health_returns_same_instance() {
         let h1 = shared_health();
@@ -552,12 +914,17 @@ mod tests {
     }
 
     #[test]
-    fn decide_active_provider_happy_path_picks_cloud() {
+    fn decide_active_provider_v1_wrapper_picks_local_on_app_chat_default() {
+        // §3.1 inverts the old "cloud when possible" default: App chat now
+        // prefers the on-device Gemma 4 path even when a BYOK key is
+        // present, unless the user opts into `quality_first`. The v1
+        // wrapper funnels through v2 with `ChatMode::App + quality_first
+        // false`, so the happy path now lands on local.
         let c = armed_reliability();
         let decision = decide_active_provider("gemini", true, true, &c);
         match decision {
-            ActiveProvider::Cloud { name } => assert_eq!(name, "gemini"),
-            _ => panic!("expected cloud, got {decision:?}"),
+            ActiveProvider::Local { model } => assert_eq!(model, "gemma4:e4b"),
+            _ => panic!("expected local, got {decision:?}"),
         }
     }
 
