@@ -10,6 +10,9 @@
 
 **核心原则：业务实现放到最贴近所属 crate 的 `one2x` 模块；上游文件只留最小接线。**
 
+> 如果目标已经从“维护 fork”转向“把本仓库升级为我方完全自控项目”，先看 [PROJECT-OWNERSHIP-SOP.md](PROJECT-OWNERSHIP-SOP.md)。
+> 本文档在那个模式下应被视为 **vendor import SOP**，不是产品治理总纲。
+
 ## Architecture
 
 ### Root crate (`src/one2x/`) — v6 layout

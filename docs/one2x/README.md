@@ -6,6 +6,7 @@
 
 | 文件 | 作用 | 面向 |
 |------|------|------|
+| `daily-intel/README.md` | 每日扫描官方开源 ZeroClaw、Meta-Harness、Hermes、OpenClaw、Claude Code 的情报目录规范 | 持续学习 |
 | `openclaw-architecture-final.md` | **主入口**：OpenClaw 架构合并版，含 DAG/Memory/Porting 总览 | 阅读起点 |
 | `agent-intelligence-comparison.md` | OpenClaw / Hermes / ZeroClaw 三家对比（LCM 部分已修正） | 横向参考 |
 | `porting-rfc.md` | LCM 机制移植到 ZeroClaw 的 RFC（P1/P2/P3 三阶段） | 开发实现 |
@@ -17,7 +18,8 @@
 1. `openclaw-architecture-final.md` —— 先看这个，理清四个角色（记忆后端 / 上下文引擎 / 工具注入 / 召回子代理）
 2. `agent-intelligence-comparison.md` —— 看三家差异，确认 ZeroClaw 缺什么
 3. `porting-rfc.md` —— 按 P1 → P2 → P3 落地
-4. 两个 deepdive —— 实现时遇到具体问题当字典查
+4. `daily-intel/` —— 每天先更新本地代码库，再基于本地 workspace 中的官方开源 ZeroClaw、Meta-Harness、Hermes、OpenClaw、Claude Code 做增量学习，先沉淀情报再决定是否进 backlog
+5. 两个 deepdive —— 实现时遇到具体问题当字典查
 
 ## 背景
 
