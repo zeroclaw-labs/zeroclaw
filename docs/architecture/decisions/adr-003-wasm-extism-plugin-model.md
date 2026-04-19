@@ -121,6 +121,33 @@ directly.
   convention. No registry server is required yet (registry is a Phase 4
   deliverable).
 
+### Known gaps (tracked follow-ups)
+
+The host-function surface is intentionally minimal in this initial version.
+Three gaps are acknowledged and have tracking issues filed; they do not block
+the v1 bridge but must be closed before plugins can be treated as a
+lower-trust surface than native tools:
+
+- **SSRF in `zc_http_request`** — the host function forwards any plugin-supplied
+  URL to `reqwest` without private-IP, loopback, or link-local restriction. A
+  plugin granted `http_client` can reach cloud IMDS endpoints, local admin
+  services, or the ZeroClaw gateway itself. Tracked in [#5918](https://github.com/zeroclaw-labs/zeroclaw/issues/5918).
+  Native `HttpRequestTool::is_private_or_local_host()` is the reuse target.
+- **Unbounded `zc_env_read`** — `env_read` permission grants access to *any*
+  variable by name, including unrelated secrets (`AWS_SECRET_ACCESS_KEY`,
+  `ANTHROPIC_API_KEY`, etc.). Tracked in [#5919](https://github.com/zeroclaw-labs/zeroclaw/issues/5919).
+  Preferred fix: per-plugin manifest allowlist (`env_read_vars = [...]`).
+- **CPU exhaustion** — no fuel limit or epoch interruption on Extism plugins.
+  An adversarial plugin can loop indefinitely and hold a blocking-pool thread
+  until the 120s HTTP timeout (if any request is outstanding) or forever (if
+  no host call is in flight). Out of scope for D2; to be addressed when
+  plugins are exposed to untrusted authors.
+
+The first two are the operational prerequisites for accepting plugins from
+third-party sources. Until they land, the permission model is a documentation
+contract, not a hardened boundary — operators should only install plugins
+from sources they already trust at the manifest level.
+
 ## References
 
 - `crates/zeroclaw-plugins/src/runtime.rs` — Extism execution bridge
@@ -129,6 +156,6 @@ directly.
 - `crates/zeroclaw-plugins/src/signature.rs` — Ed25519 verification
 - `crates/zeroclaw-config/src/schema.rs` — `PluginsConfig`, `ImageGenConfig`
 - `crates/zeroclaw-runtime/src/tools/mod.rs` — Plugin tool registration
-- `plugins/image-gen-wasm/` — Reference plugin implementation
+- `plugins/image-gen-fal/` — Reference plugin implementation (lands in a follow-up PR)
 - [Extism documentation](https://extism.org/docs/overview)
 - [Intentional Architecture RFC](https://github.com/zeroclaw-labs/zeroclaw/wiki/14.1-Intentional-Architecture)

@@ -53,16 +53,7 @@ impl WasmTool {
                     (
                         fallback_name.clone(),
                         fallback_description.clone(),
-                        serde_json::json!({
-                            "type": "object",
-                            "properties": {
-                                "input": {
-                                    "type": "string",
-                                    "description": "Input for the plugin"
-                                }
-                            },
-                            "required": ["input"]
-                        }),
+                        default_schema(),
                     )
                 }
             },
@@ -74,16 +65,7 @@ impl WasmTool {
                 (
                     fallback_name.clone(),
                     fallback_description.clone(),
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "input": {
-                                "type": "string",
-                                "description": "Input for the plugin"
-                            }
-                        },
-                        "required": ["input"]
-                    }),
+                    default_schema(),
                 )
             }
         };
@@ -96,6 +78,22 @@ impl WasmTool {
             permissions,
         }
     }
+}
+
+/// The JSON Schema returned when a plugin lacks a `tool_metadata` export or fails
+/// to load at discovery time. Single source of truth so the fallback shape stays
+/// consistent across code paths.
+fn default_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "input": {
+                "type": "string",
+                "description": "Input for the plugin"
+            }
+        },
+        "required": ["input"]
+    })
 }
 
 #[async_trait]

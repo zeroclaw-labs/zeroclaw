@@ -82,6 +82,12 @@ fn handle_http_request(
     let req: HttpRequest = serde_json::from_str(&request_json)
         .map_err(|e| Error::msg(format!("invalid HTTP request JSON: {e}")))?;
 
+    // 120s ceiling covers legitimate slow cases: large file downloads and slow
+    // model-inference endpoints (fal.ai image generation routinely takes 20-60s
+    // on cold models). A per-plugin override or tighter default is a candidate
+    // follow-up — see ADR-003 §"Known gaps". Note: this runs inside
+    // spawn_blocking, so a stalled request holds a blocking-pool thread for
+    // the full duration.
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
