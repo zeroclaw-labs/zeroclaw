@@ -1,8 +1,15 @@
-# MoA — 아키텍처 및 제품 비전
+# MoA — 아키텍처 및 제품 비전 (한국어, 구 v3.x 기반)
 
-> **날짜**: 2026-03-15
-> **상태**: 살아있는 문서 — 주요 기능 마일스톤마다 업데이트
-> **대상**: AI 리뷰어 (Gemini, Claude), 인간 기여자, 향후 유지보수 담당자
+> **번역 기준일**: 2026-03-15 (원본 v3.x 시점)
+> **상태**: ⚠️ 부분 번역 — 이 파일은 원본 영문 `docs/ARCHITECTURE.md` 가 v3 이던 시점의 한국어 번역이며, 이후 v6 / v6.1 / v7 업데이트(Dual-Brain, Vault, Self-Learning, SLM-First Gatekeeper, Advisor Strategy 등)가 **미반영** 상태입니다. 아래의 §1~§16 은 구버전 기준이므로 최신 아키텍처 파악에는 아래 링크를 먼저 참조하세요.
+> **대상**: AI 리뷰어 (Gemini, Claude), 기여자, 유지보수자
+>
+> **최신 콘텐츠 참조처**:
+>
+> - 영문 최신 원본(v7, 순차 번호): [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md)
+> - 영문 최신 재구성판(v8, 테마별): [`../../ARCHITECTURE-v8.md`](../../ARCHITECTURE-v8.md)
+> - **한국어 v8 재구성판** (추천 — 헤더·목차·§1~§3·§5·§8·§11·§12 한국어): [`./ARCHITECTURE-v8.md`](./ARCHITECTURE-v8.md)
+> - 변경 이력: [`../../architecture-changelog.md`](../../architecture-changelog.md)
 
 ---
 
