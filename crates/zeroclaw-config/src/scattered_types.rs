@@ -331,6 +331,9 @@ fn default_imap_folder() -> String {
 fn default_idle_timeout() -> u64 {
     1740
 }
+fn default_poll_interval_secs() -> u64 {
+    60
+}
 fn default_true() -> bool {
     true
 }
@@ -361,8 +364,12 @@ pub struct EmailConfig {
     #[secret]
     pub password: String,
     pub from_address: String,
-    #[serde(default = "default_idle_timeout", alias = "poll_interval_secs")]
+    #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
+    /// Polling interval used when the IMAP server does not advertise the IDLE
+    /// capability (RFC 2177). Ignored when IDLE is available.
+    #[serde(default = "default_poll_interval_secs")]
+    pub poll_interval_secs: u64,
     #[serde(default)]
     pub allowed_senders: Vec<String>,
     #[serde(default = "default_subject")]
@@ -394,6 +401,7 @@ impl Default for EmailConfig {
             password: String::new(),
             from_address: String::new(),
             idle_timeout_secs: default_idle_timeout(),
+            poll_interval_secs: default_poll_interval_secs(),
             allowed_senders: Vec::new(),
             default_subject: default_subject(),
             max_attachment_bytes: default_max_attachment_bytes(),
