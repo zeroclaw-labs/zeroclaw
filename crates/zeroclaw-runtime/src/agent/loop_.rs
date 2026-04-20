@@ -351,6 +351,12 @@ async fn build_context(
                 if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
                     continue;
                 }
+                // Skip raw per-turn user messages: re-injecting them causes each
+                // recalled entry to embed all prior generations, growing exponentially.
+                // Consolidated knowledge is already promoted to Core/Daily entries.
+                if zeroclaw_memory::is_user_autosave_key(&entry.key) {
+                    continue;
+                }
                 if zeroclaw_memory::should_skip_autosave_content(&entry.content) {
                     continue;
                 }
@@ -6180,7 +6186,7 @@ mod tests {
         .await
         .unwrap();
         mem.store(
-            "user_msg_real",
+            "user_preference",
             "User asked for concise status updates",
             MemoryCategory::Conversation,
             None,
@@ -6189,9 +6195,44 @@ mod tests {
         .unwrap();
 
         let context = build_context(&mem, "status updates", 0.0, None).await;
-        assert!(context.contains("user_msg_real"));
+        assert!(context.contains("user_preference"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
+    }
+
+    #[tokio::test]
+    async fn build_context_ignores_user_autosave_entries() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        mem.store(
+            "user_msg",
+            "Original user message with full conversation history",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "user_msg_a1b2c3d4",
+            "Follow-up user message embedding prior context verbatim",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "user_preference",
+            "User prefers concise answers",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let context = build_context(&mem, "answers", 0.0, None).await;
+        assert!(context.contains("user_preference"));
+        assert!(!context.contains("user_msg"));
+        assert!(!context.contains("embedding prior context"));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
