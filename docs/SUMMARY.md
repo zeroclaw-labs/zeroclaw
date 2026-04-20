@@ -98,6 +98,7 @@ Last refreshed: **February 18, 2026**.
 
 - [ops/README.md](ops/README.md)
 - [operations-runbook.md](ops/operations-runbook.md)
+- [release-runbook.md](maintainers/release-runbook.md)
 - [release-process.md](contributing/release-process.md)
 - [troubleshooting.md](ops/troubleshooting.md)
 - [network-deployment.md](ops/network-deployment.md)
