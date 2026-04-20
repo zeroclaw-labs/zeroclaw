@@ -16,7 +16,13 @@ dockerfilePath = "deploy/railway/Dockerfile"
 healthcheckPath = "/health"
 
 # Timeout (seconds) before Railway marks a health check as failed.
-healthcheckTimeout = 10
+# Rust gateway cold-start (config load, SQLite migrations, memory/embedding
+# init, auth store, skills git clone, axum assembly) can exceed 10s on
+# Railway's build tier. The old 10s window caused the deploy to fail at
+# the "Network / Healthcheck" stage, leaving Cloudflare to route traffic
+# to a dead container — surfacing externally as 502 Bad Gateway. Use
+# Railway's documented default so cold start has realistic headroom.
+healthcheckTimeout = 300
 
 # Number of replicas to run. Start with 1 for cost efficiency;
 # increase for high-availability if needed.
