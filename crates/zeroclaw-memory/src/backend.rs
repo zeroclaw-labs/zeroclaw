@@ -3,6 +3,7 @@ pub enum MemoryBackendKind {
     Sqlite,
     Lucid,
     Qdrant,
+    Postgres,
     Markdown,
     None,
     Unknown,
@@ -64,6 +65,15 @@ const NONE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     optional_dependency: false,
 };
 
+const POSTGRES_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "postgres",
+    label: "PostgreSQL — scalable remote backend via [memory.postgres] (requires --features backend-postgres)",
+    auto_save_default: true,
+    uses_sqlite_hygiene: false,
+    sqlite_based: false,
+    optional_dependency: true,
+};
+
 const CUSTOM_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "custom",
     label: "Custom backend — extension point",
@@ -73,6 +83,7 @@ const CUSTOM_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     optional_dependency: false,
 };
 
+#[cfg_attr(feature = "backend-postgres", allow(dead_code))]
 const SELECTABLE_MEMORY_BACKENDS: [MemoryBackendProfile; 4] = [
     SQLITE_PROFILE,
     LUCID_PROFILE,
@@ -80,8 +91,24 @@ const SELECTABLE_MEMORY_BACKENDS: [MemoryBackendProfile; 4] = [
     NONE_PROFILE,
 ];
 
+#[cfg(feature = "backend-postgres")]
+const SELECTABLE_MEMORY_BACKENDS_WITH_PG: [MemoryBackendProfile; 5] = [
+    SQLITE_PROFILE,
+    LUCID_PROFILE,
+    POSTGRES_PROFILE,
+    MARKDOWN_PROFILE,
+    NONE_PROFILE,
+];
+
 pub fn selectable_memory_backends() -> &'static [MemoryBackendProfile] {
-    &SELECTABLE_MEMORY_BACKENDS
+    #[cfg(feature = "backend-postgres")]
+    {
+        &SELECTABLE_MEMORY_BACKENDS_WITH_PG
+    }
+    #[cfg(not(feature = "backend-postgres"))]
+    {
+        &SELECTABLE_MEMORY_BACKENDS
+    }
 }
 
 pub fn default_memory_backend_key() -> &'static str {
@@ -93,6 +120,7 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
         "sqlite" => MemoryBackendKind::Sqlite,
         "lucid" => MemoryBackendKind::Lucid,
         "qdrant" => MemoryBackendKind::Qdrant,
+        "postgres" | "postgresql" => MemoryBackendKind::Postgres,
         "markdown" => MemoryBackendKind::Markdown,
         "none" => MemoryBackendKind::None,
         _ => MemoryBackendKind::Unknown,
@@ -104,6 +132,7 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
         MemoryBackendKind::Sqlite => SQLITE_PROFILE,
         MemoryBackendKind::Lucid => LUCID_PROFILE,
         MemoryBackendKind::Qdrant => QDRANT_PROFILE,
+        MemoryBackendKind::Postgres => POSTGRES_PROFILE,
         MemoryBackendKind::Markdown => MARKDOWN_PROFILE,
         MemoryBackendKind::None => NONE_PROFILE,
         MemoryBackendKind::Unknown => CUSTOM_PROFILE,
@@ -126,6 +155,18 @@ mod tests {
     }
 
     #[test]
+    fn classify_postgres_backend() {
+        assert_eq!(
+            classify_memory_backend("postgres"),
+            MemoryBackendKind::Postgres
+        );
+        assert_eq!(
+            classify_memory_backend("postgresql"),
+            MemoryBackendKind::Postgres
+        );
+    }
+
+    #[test]
     fn classify_unknown_backend() {
         assert_eq!(classify_memory_backend("redis"), MemoryBackendKind::Unknown);
     }
@@ -133,11 +174,21 @@ mod tests {
     #[test]
     fn selectable_backends_are_ordered_for_onboarding() {
         let backends = selectable_memory_backends();
-        assert_eq!(backends.len(), 4);
         assert_eq!(backends[0].key, "sqlite");
         assert_eq!(backends[1].key, "lucid");
-        assert_eq!(backends[2].key, "markdown");
-        assert_eq!(backends[3].key, "none");
+        #[cfg(feature = "backend-postgres")]
+        {
+            assert_eq!(backends.len(), 5);
+            assert_eq!(backends[2].key, "postgres");
+            assert_eq!(backends[3].key, "markdown");
+            assert_eq!(backends[4].key, "none");
+        }
+        #[cfg(not(feature = "backend-postgres"))]
+        {
+            assert_eq!(backends.len(), 4);
+            assert_eq!(backends[2].key, "markdown");
+            assert_eq!(backends[3].key, "none");
+        }
     }
 
     #[test]
@@ -154,5 +205,29 @@ mod tests {
         assert_eq!(profile.key, "custom");
         assert!(profile.auto_save_default);
         assert!(!profile.uses_sqlite_hygiene);
+    }
+
+    #[test]
+    fn postgres_profile_is_optional_non_sqlite_backend() {
+        let profile = memory_backend_profile("postgres");
+        assert_eq!(profile.key, "postgres");
+        assert!(profile.optional_dependency);
+        assert!(!profile.sqlite_based);
+        assert!(!profile.uses_sqlite_hygiene);
+        assert!(profile.auto_save_default);
+    }
+
+    #[cfg(feature = "backend-postgres")]
+    #[test]
+    fn selectable_backends_include_postgres_when_feature_enabled() {
+        let backends = selectable_memory_backends();
+        assert!(backends.iter().any(|b| b.key == "postgres"));
+    }
+
+    #[cfg(not(feature = "backend-postgres"))]
+    #[test]
+    fn selectable_backends_exclude_postgres_when_feature_disabled() {
+        let backends = selectable_memory_backends();
+        assert!(!backends.iter().any(|b| b.key == "postgres"));
     }
 }

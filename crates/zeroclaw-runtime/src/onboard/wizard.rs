@@ -501,6 +501,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         policy: zeroclaw_config::schema::MemoryPolicyConfig::default(),
         sqlite_open_timeout_secs: None,
         qdrant: zeroclaw_config::schema::QdrantConfig::default(),
+        postgres: zeroclaw_config::schema::PostgresConfig::default(),
     }
 }
 
