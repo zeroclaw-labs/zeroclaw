@@ -58,6 +58,8 @@ pub use crate::wati::WatiChannel;
 pub use crate::webhook::WebhookChannel;
 pub use crate::wecom::WeComChannel;
 pub use crate::whatsapp::WhatsAppChannel;
+#[cfg(feature = "channel-wukongim")]
+pub use crate::wukongim::WuKongIMChannel;
 pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
@@ -4133,6 +4135,15 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .with_proxy_url(dt.proxy_url.clone()),
             ))
         }
+        #[cfg(feature = "channel-wukongim")]
+        "wukongim" => {
+            let wk = config
+                .channels
+                .wukongim
+                .as_ref()
+                .context("WuKongIM channel is not configured")?;
+            Ok(Arc::new(WuKongIMChannel::from_config(wk)))
+        }
         "wecom" => {
             let wc = config
                 .channels
@@ -4989,6 +5000,25 @@ fn collect_configured_channels(
         } else {
             tracing::info!("Webhook channel configured but disabled (enabled = false)");
         }
+    }
+
+    #[cfg(feature = "channel-wukongim")]
+    if let Some(ref wk) = config.channels.wukongim {
+        if wk.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "WuKongIM",
+                channel: Arc::new(WuKongIMChannel::from_config(wk)),
+            });
+        } else {
+            tracing::info!("WuKongIM channel configured but disabled (enabled = false)");
+        }
+    }
+
+    #[cfg(not(feature = "channel-wukongim"))]
+    if config.channels.wukongim.is_some() {
+        tracing::warn!(
+            "WuKongIM channel is configured but this build was compiled without `channel-wukongim`; skipping."
+        );
     }
 
     channels
