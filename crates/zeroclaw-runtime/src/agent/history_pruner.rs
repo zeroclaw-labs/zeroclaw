@@ -70,18 +70,17 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
     let mut i = 0;
     while i < messages.len() {
         if messages[i].role == "assistant"
-            && messages[i].content.contains("tool_calls")
+            && extract_assistant_tool_call_ids(&messages[i].content).is_some()
             && i > 0
             && messages[i - 1].role == "assistant"
         {
-            // Collect tool_call_ids from this assistant to find matching tool_results.
-            let doomed_content = messages[i].content.clone();
+            let doomed_ids =
+                extract_assistant_tool_call_ids(&messages[i].content).unwrap_or_default();
             messages.remove(i);
             removed += 1;
-            // Remove following tool messages that reference this assistant.
             while i < messages.len() && messages[i].role == "tool" {
                 let dominated = match extract_tool_call_id(&messages[i].content) {
-                    Some(id) => doomed_content.contains(&id),
+                    Some(id) => doomed_ids.iter().any(|d| d == &id),
                     None => true,
                 };
                 if dominated {
@@ -97,7 +96,11 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
     }
 
     // Pass 2: Remove remaining orphan tool messages whose tool_call_id
-    // doesn't appear in the immediately preceding assistant.
+    // is not in the preceding assistant's structured tool_calls array.
+    // A substring match on the assistant's *text* is NOT sufficient —
+    // compaction summaries are instructed to preserve identifiers, so an
+    // id can appear in prose without an actual tool_use block backing it
+    // (see #5813).
     i = 0;
     while i < messages.len() {
         if messages[i].role != "tool" {
@@ -112,17 +115,13 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
 
         let is_orphan = match assistant_idx {
             None => true,
-            Some(idx) => {
-                let assistant_content = &messages[idx].content;
-                if assistant_content.contains("tool_calls") {
-                    match extract_tool_call_id(&messages[i].content) {
-                        Some(tool_call_id) => !assistant_content.contains(&tool_call_id),
-                        None => false,
-                    }
-                } else {
-                    true
-                }
-            }
+            Some(idx) => match extract_assistant_tool_call_ids(&messages[idx].content) {
+                None => true,
+                Some(ids) => match extract_tool_call_id(&messages[i].content) {
+                    Some(tool_call_id) => !ids.iter().any(|id| id == &tool_call_id),
+                    None => false,
+                },
+            },
         };
 
         if is_orphan {
@@ -152,6 +151,20 @@ fn extract_tool_call_id(content: &str) -> Option<String> {
         .get("tool_call_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// Extract the list of structured tool-call IDs an assistant message
+/// is claiming to have invoked, if any. Returns `None` when the content
+/// does not parse as a JSON object with a `tool_calls` array — meaning the
+/// assistant has no native tool_use blocks backing any tool_results.
+fn extract_assistant_tool_call_ids(content: &str) -> Option<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let arr = value.get("tool_calls")?.as_array()?;
+    let ids: Vec<String> = arr
+        .iter()
+        .filter_map(|call| call.get("id").and_then(|v| v.as_str()).map(str::to_owned))
+        .collect();
+    if ids.is_empty() { None } else { Some(ids) }
 }
 
 // ---------------------------------------------------------------------------
@@ -753,6 +766,36 @@ mod tests {
             messages.iter().any(|m| m.content.contains("toolu_recent")),
             "Protected tool message was dropped by Phase 2 budget enforcement"
         );
+    }
+
+    /// Regression test for issue #5813: a compaction summary preserves
+    /// identifiers by design (UUIDs, tokens, tool_call_ids). That means the
+    /// summary text may contain the tool_call_id of a tool_result whose
+    /// tool_use was dropped. The orphan detector must not be fooled by a
+    /// substring match on the summary — it must confirm the id appears in
+    /// a structured tool_calls array.
+    #[test]
+    fn orphan_tool_not_fooled_by_id_in_summary_text() {
+        let summary = format!(
+            "[CONTEXT SUMMARY \u{2014} 4 messages compressed]\n\
+             Earlier turns invoked shell with tool_calls id toolu_01Orphan \
+             and returned ok."
+        );
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("assistant", &summary),
+            msg(
+                "tool",
+                r#"{"tool_call_id":"toolu_01Orphan","content":"stale"}"#,
+            ),
+            msg("user", "new question"),
+        ];
+        let removed = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(
+            removed, 1,
+            "orphan must be removed even if its id is mentioned in summary text"
+        );
+        assert!(!messages.iter().any(|m| m.role == "tool"));
     }
 
     /// Regression test for issue #5743: MiniMax rejects orphaned tool-role

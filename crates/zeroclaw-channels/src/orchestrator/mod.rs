@@ -5600,6 +5600,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
             if msgs.len() > MAX_CHANNEL_HISTORY {
                 msgs.drain(..msgs.len() - MAX_CHANNEL_HISTORY);
             }
+            // Self-heal: strip orphaned tool_result messages left by a
+            // prior compaction that dropped the assistant tool_use without
+            // its paired tool_result. Without this, the session is bricked
+            // until the file is deleted because every API call fails with
+            // 400 "unexpected tool_use_id in tool_result blocks". See #5813.
+            zeroclaw_runtime::agent::history_pruner::remove_orphaned_tool_messages(&mut msgs);
             // Close orphaned user turns from crashed sessions.
             if msgs.last().is_some_and(|m| m.role == "user") {
                 let closure =

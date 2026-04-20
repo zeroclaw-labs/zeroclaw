@@ -409,39 +409,16 @@ fn align_boundary_backward(messages: &[ChatMessage], idx: usize) -> usize {
 // Tool pair repair
 // ---------------------------------------------------------------------------
 
-/// Remove orphaned tool_results and add stubs for orphaned tool_calls.
+/// Remove orphaned tool_result messages whose assistant (tool_use)
+/// counterpart was summarized away.
 ///
-/// After compression, some tool results may reference tool_calls that were
-/// summarized away, and vice versa. This function cleans up the history
-/// so every tool_result has a matching assistant message and every
-/// tool_call-bearing assistant message has results.
+/// Delegates to `history_pruner::remove_orphaned_tool_messages`, which
+/// matches on the structured `tool_call_id` payload — catching orphans
+/// regardless of where they sit relative to the [CONTEXT SUMMARY] marker.
+/// Without this, a compaction that trims a `tool_use` but leaves its
+/// `tool_result` bricks the session with a 400 from Anthropic. See #5813.
 fn repair_tool_pairs(messages: &mut Vec<ChatMessage>) {
-    // Heuristic: tool messages whose content references a call ID that no longer
-    // exists in any assistant message should be removed. Since ChatMessage is a
-    // simple role+content struct (no structured tool_call_id field), we use a
-    // simpler approach: remove any "tool" message that immediately follows the
-    // [CONTEXT SUMMARY] message (it's orphaned by definition).
-    let mut i = 0;
-    while i < messages.len() {
-        if messages[i].content.contains("[CONTEXT SUMMARY") {
-            // Remove any immediately following orphaned tool results
-            while i + 1 < messages.len() && messages[i + 1].role == "tool" {
-                messages.remove(i + 1);
-            }
-        }
-        i += 1;
-    }
-
-    // Also check for tool results at the very start (after system prompt) that
-    // are orphaned because their assistant message was compressed.
-    let start = if messages.first().is_some_and(|m| m.role == "system") {
-        1
-    } else {
-        0
-    };
-    while start < messages.len() && messages[start].role == "tool" {
-        messages.remove(start);
-    }
+    crate::agent::history_pruner::remove_orphaned_tool_messages(messages);
 }
 
 // ---------------------------------------------------------------------------
@@ -587,12 +564,42 @@ mod tests {
         let mut messages = vec![
             msg("system", "sys"),
             msg("user", "q"),
-            msg("assistant", "calling tool"),
-            msg("tool", "result"),
+            msg(
+                "assistant",
+                r#"{"content":"calling","tool_calls":[{"id":"toolu_abc","name":"shell","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"tool_call_id":"toolu_abc","content":"result"}"#),
             msg("user", "thanks"),
         ];
         repair_tool_pairs(&mut messages);
-        assert_eq!(messages.len(), 5); // no change
+        assert_eq!(messages.len(), 5); // no change — pairing intact
+    }
+
+    /// Regression test for #5813. The compact pass must remove orphaned
+    /// tool_result messages even when they sit after additional turns —
+    /// not just immediately after the [CONTEXT SUMMARY] marker. Otherwise
+    /// a post-compaction Anthropic call fails with 400 "unexpected
+    /// tool_use_id found in tool_result blocks".
+    #[test]
+    fn test_repair_tool_pairs_removes_orphan_after_intermediate_user() {
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg(
+                "assistant",
+                "[CONTEXT SUMMARY \u{2014} 4 earlier messages compressed]",
+            ),
+            msg("user", "follow-up"),
+            msg(
+                "tool",
+                r#"{"tool_call_id":"toolu_GONE","content":"stale result"}"#,
+            ),
+            msg("user", "next"),
+        ];
+        repair_tool_pairs(&mut messages);
+        assert!(
+            !messages.iter().any(|m| m.role == "tool"),
+            "orphaned tool whose tool_use was summarized must be removed"
+        );
     }
 
     #[test]
