@@ -329,6 +329,26 @@ async fn handle_socket(
                 };
 
                 let msg_type = parsed["type"].as_str().unwrap_or("");
+
+                // ── Voice duplex event dispatch (gated by feature flag + runtime config) ──
+                #[cfg(feature = "gateway-voice-duplex")]
+                {
+                    if let Some(voice_event) = crate::voice_duplex::try_parse_voice_event(&msg) {
+                        let duplex_enabled = state
+                            .config
+                            .lock()
+                            .channels
+                            .voice_duplex
+                            .as_ref()
+                            .is_some_and(|v| v.enabled);
+                        if duplex_enabled {
+                            crate::voice_duplex::handle_voice_event(voice_event);
+                            continue;
+                        }
+                        // Duplex not enabled at runtime → fall through to unknown type error
+                    }
+                }
+
                 if msg_type != "message" {
                     let err = serde_json::json!({
                         "type": "error",
