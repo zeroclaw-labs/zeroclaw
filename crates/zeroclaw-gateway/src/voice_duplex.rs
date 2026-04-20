@@ -49,8 +49,8 @@ pub fn try_parse_voice_event(text: &str) -> Option<VoiceEvent> {
 
 /// Handle a parsed voice event.
 ///
-/// Returns `Ok(None)` for successfully handled client→server events.
-/// Returns `Ok(Some(json))` with an error frame when the client sends
+/// Returns `None` for successfully handled client→server events.
+/// Returns `Some(json)` with an error frame when the client sends
 /// a server→client-only event, so the caller can relay it back.
 pub fn handle_voice_event(event: VoiceEvent) -> Option<serde_json::Value> {
     match event {
