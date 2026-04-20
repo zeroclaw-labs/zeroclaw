@@ -1982,14 +1982,29 @@ async fn main() -> Result<()> {
                         .as_ref()
                         .is_some_and(|f| f.kind == crate::config::PropKind::StringArray)
                     {
-                        let current = field_info
+                        let current_items: Vec<String> = field_info
                             .as_ref()
-                            .map(|f| f.display_value.trim_matches(|c| c == '[' || c == ']').replace('"', ""))
+                            .and_then(|f| {
+                                let raw = toml::from_str::<toml::Value>(&format!(
+                                    "v = {}",
+                                    if f.display_value == "<unset>" { "[]".to_string() } else { f.display_value.clone() }
+                                ))
+                                .ok();
+                                raw.and_then(|v| v.get("v").cloned())
+                                    .and_then(|v| v.as_array().cloned())
+                                    .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                            })
                             .unwrap_or_default();
-                        let val = dialoguer::Input::<String>::new()
-                            .with_prompt(format!("Enter comma-separated values for {path}"))
-                            .with_initial_text(current)
-                            .interact_text()?;
+                        let editor_content = current_items.join("\n");
+                        let edited = dialoguer::Editor::new()
+                            .edit(&editor_content)?
+                            .unwrap_or(editor_content);
+                        let val = edited
+                            .lines()
+                            .map(|l| l.trim())
+                            .filter(|l| !l.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         config.set_prop(&path, &val)?;
                     } else {
                         anyhow::bail!("Value required. Usage: zeroclaw config set {path} <value>");
