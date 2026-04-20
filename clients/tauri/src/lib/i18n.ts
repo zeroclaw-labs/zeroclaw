@@ -215,7 +215,18 @@ type TranslationKey =
   | "local_llm_uninstalling"
   | "local_llm_uninstall_confirm"
   | "local_llm_installed_inventory"
-  | "local_llm_switch_manual_hint";
+  | "local_llm_switch_manual_hint"
+  // ── Secretary migrator (§11.3 / PR #10) ──
+  | "secretary_migrator_title"
+  | "secretary_migrator_intro"
+  | "secretary_migrator_current"
+  | "secretary_migrator_recommended"
+  | "secretary_migrator_reason"
+  | "secretary_migrator_accept"
+  | "secretary_migrator_saved"
+  | "secretary_migrator_no_typecast_voice"
+  | "secretary_engine_cosyvoice"
+  | "secretary_engine_kokoro";
 
 const translations: Record<Locale, Record<TranslationKey, string>> = {
   en: {
@@ -418,6 +429,17 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     local_llm_uninstall_confirm: "Remove the local Gemma 4 model? You can reinstall later from this screen.",
     local_llm_installed_inventory: "Installed models ({count})",
     local_llm_switch_manual_hint: "Run this command to switch tiers:\n\n{command}",
+    secretary_migrator_title: "Secretary migration (offline)",
+    secretary_migrator_intro:
+      "If you go offline, we'll swap your paid Typecast secretary for the closest offline voice so the chat UX stays the same.",
+    secretary_migrator_current: "Current Typecast secretary",
+    secretary_migrator_recommended: "Recommended offline replacement",
+    secretary_migrator_reason: "Why this match",
+    secretary_migrator_accept: "Use this offline secretary",
+    secretary_migrator_saved: "Saved — we'll use this voice when you're offline",
+    secretary_migrator_no_typecast_voice: "No Typecast voice selected yet",
+    secretary_engine_cosyvoice: "Offline Pro · CosyVoice 2",
+    secretary_engine_kokoro: "Offline Basic · Kokoro",
   },
   ko: {
     app_title: "MoA",
@@ -619,6 +641,17 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     local_llm_uninstall_confirm: "로컬 Gemma 4 모델을 제거할까요? 이 화면에서 언제든 다시 설치할 수 있습니다.",
     local_llm_installed_inventory: "설치된 모델 ({count}개)",
     local_llm_switch_manual_hint: "다음 명령을 실행해 티어를 변경하세요:\n\n{command}",
+    secretary_migrator_title: "오프라인 비서 전환",
+    secretary_migrator_intro:
+      "오프라인 전환 시 평소 쓰시던 Typecast 비서와 가장 비슷한 오프라인 음성을 자동으로 추천합니다. 브랜드 UX는 그대로 유지됩니다.",
+    secretary_migrator_current: "현재 Typecast 비서",
+    secretary_migrator_recommended: "추천 오프라인 비서",
+    secretary_migrator_reason: "이 비서를 고른 이유",
+    secretary_migrator_accept: "이 오프라인 비서 사용",
+    secretary_migrator_saved: "저장되었습니다 — 오프라인 시 이 음성을 사용합니다",
+    secretary_migrator_no_typecast_voice: "아직 선택된 Typecast 비서가 없습니다",
+    secretary_engine_cosyvoice: "오프라인 프로 · CosyVoice 2",
+    secretary_engine_kokoro: "오프라인 기본 · Kokoro",
   },
 };
 
