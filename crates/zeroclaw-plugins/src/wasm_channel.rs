@@ -1,4 +1,9 @@
 //! Bridge between WASM plugins and the Channel trait.
+//!
+//! **Status:** Placeholder — `send` and `listen` are not yet wired to the
+//! Extism runtime.  Channel plugin support is a Phase 3 (v0.9.0) deliverable
+//! per the [Intentional Architecture RFC](https://github.com/zeroclaw-labs/zeroclaw/wiki/14.1-Intentional-Architecture).
+//! See `wasm_tool.rs` and `runtime.rs` for the working tool plugin bridge.
 
 use async_trait::async_trait;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};

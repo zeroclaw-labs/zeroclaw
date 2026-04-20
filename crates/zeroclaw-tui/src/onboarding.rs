@@ -709,25 +709,33 @@ async fn save_tui_config(app: &App) -> Result<()> {
 fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
     // ── Provider ────────────────────────────────────────────────────
     let provider_id = app.selected_provider_id();
-    config.default_provider = Some(provider_id.to_string());
+    config.providers.fallback = Some(provider_id.to_string());
+
+    let entry = config
+        .providers
+        .models
+        .entry(provider_id.to_string())
+        .or_default();
 
     // Clear stale custom provider URL if switching away from custom
     if !provider_id.starts_with("custom") {
-        config.api_url = None;
+        entry.base_url = None;
     }
 
     // API key (if entered)
     if !app.api_key_input.is_empty() {
-        config.api_key = Some(app.api_key_input.clone());
+        entry.api_key = Some(app.api_key_input.clone());
     }
 
     // ── Model ───────────────────────────────────────────────────────
     let model = app.selected_model();
     if model == "Auto (recommended)" {
-        config.default_model = None; // Let provider pick default
+        entry.model = None; // Let provider pick default
     } else {
-        config.default_model = Some(model.to_string());
+        entry.model = Some(model.to_string());
     }
+
+    // Provider fields are now resolved directly from providers — no cache needed.
 
     // ── Channel ─────────────────────────────────────────────────────
     // Create a stub config for the selected channel with placeholder
@@ -736,8 +744,8 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
     let channel = app.selected_channel();
     match channel {
         "Telegram" => {
-            if config.channels_config.telegram.is_none() {
-                config.channels_config.telegram = Some(TelegramConfig {
+            if config.channels.telegram.is_none() {
+                config.channels.telegram = Some(TelegramConfig {
                     enabled: true,
                     bot_token: String::from("YOUR_TELEGRAM_BOT_TOKEN"),
                     allowed_users: vec![],
@@ -747,12 +755,13 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     mention_only: false,
                     ack_reactions: None,
                     proxy_url: None,
+                    approval_timeout_secs: 120,
                 });
             }
         }
         "Discord" => {
-            if config.channels_config.discord.is_none() {
-                config.channels_config.discord = Some(DiscordConfig {
+            if config.channels.discord.is_none() {
+                config.channels.discord = Some(DiscordConfig {
                     enabled: true,
                     bot_token: String::from("YOUR_DISCORD_BOT_TOKEN"),
                     guild_id: None,
@@ -769,12 +778,11 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
             }
         }
         "Slack" => {
-            if config.channels_config.slack.is_none() {
-                config.channels_config.slack = Some(SlackConfig {
+            if config.channels.slack.is_none() {
+                config.channels.slack = Some(SlackConfig {
                     enabled: true,
                     bot_token: String::from("xoxb-YOUR_SLACK_BOT_TOKEN"),
                     app_token: Some(String::from("xapp-YOUR_SLACK_APP_TOKEN")),
-                    channel_id: None,
                     channel_ids: vec![],
                     allowed_users: vec![],
                     interrupt_on_new_message: false,
@@ -789,8 +797,8 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
             }
         }
         "WhatsApp" => {
-            if config.channels_config.whatsapp.is_none() {
-                config.channels_config.whatsapp = Some(WhatsAppConfig {
+            if config.channels.whatsapp.is_none() {
+                config.channels.whatsapp = Some(WhatsAppConfig {
                     enabled: true,
                     access_token: Some(String::from("YOUR_WHATSAPP_ACCESS_TOKEN")),
                     phone_number_id: Some(String::from("YOUR_PHONE_NUMBER_ID")),
@@ -812,8 +820,8 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
             }
         }
         "Signal" => {
-            if config.channels_config.signal.is_none() {
-                config.channels_config.signal = Some(SignalConfig {
+            if config.channels.signal.is_none() {
+                config.channels.signal = Some(SignalConfig {
                     enabled: true,
                     http_url: String::from("http://127.0.0.1:8080"),
                     account: String::from("YOUR_SIGNAL_PHONE_NUMBER"),
@@ -826,8 +834,8 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
             }
         }
         "IRC" => {
-            if config.channels_config.irc.is_none() {
-                config.channels_config.irc = Some(IrcConfig {
+            if config.channels.irc.is_none() {
+                config.channels.irc = Some(IrcConfig {
                     enabled: true,
                     server: String::from("irc.libera.chat"),
                     port: 6697,
@@ -843,25 +851,24 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
             }
         }
         "iMessage" => {
-            if config.channels_config.imessage.is_none() {
-                config.channels_config.imessage = Some(IMessageConfig {
+            if config.channels.imessage.is_none() {
+                config.channels.imessage = Some(IMessageConfig {
                     enabled: true,
                     allowed_contacts: vec![],
                 });
             }
         }
         "Matrix" => {
-            let existing_mx = config.channels_config.matrix.as_ref();
+            let existing_mx = config.channels.matrix.as_ref();
             if existing_mx.is_none() {
-                config.channels_config.matrix = Some(MatrixConfig {
+                config.channels.matrix = Some(MatrixConfig {
                     enabled: true,
                     homeserver: String::from("https://matrix.org"),
                     access_token: String::from("YOUR_MATRIX_ACCESS_TOKEN"),
                     user_id: None,
                     device_id: None,
-                    room_id: String::from("!YOUR_ROOM_ID:matrix.org"),
                     allowed_users: vec![],
-                    allowed_rooms: vec![],
+                    allowed_rooms: vec![String::from("!YOUR_ROOM_ID:matrix.org")],
                     interrupt_on_new_message: false,
                     stream_mode: StreamMode::default(),
                     draft_update_interval_ms: 500,
@@ -873,8 +880,8 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
             }
         }
         "Mattermost" => {
-            if config.channels_config.mattermost.is_none() {
-                config.channels_config.mattermost = Some(MattermostConfig {
+            if config.channels.mattermost.is_none() {
+                config.channels.mattermost = Some(MattermostConfig {
                     enabled: true,
                     url: String::from("https://mattermost.example.com"),
                     bot_token: String::from("YOUR_MATTERMOST_BOT_TOKEN"),
@@ -888,8 +895,8 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
             }
         }
         "Nextcloud Talk" => {
-            if config.channels_config.nextcloud_talk.is_none() {
-                config.channels_config.nextcloud_talk = Some(NextcloudTalkConfig {
+            if config.channels.nextcloud_talk.is_none() {
+                config.channels.nextcloud_talk = Some(NextcloudTalkConfig {
                     enabled: true,
                     base_url: String::from("https://cloud.example.com"),
                     app_token: String::from("YOUR_NEXTCLOUD_APP_TOKEN"),
@@ -901,8 +908,8 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
             }
         }
         "Feishu/Lark" => {
-            if config.channels_config.feishu.is_none() {
-                config.channels_config.feishu = Some(FeishuConfig {
+            if config.channels.feishu.is_none() {
+                config.channels.feishu = Some(FeishuConfig {
                     enabled: true,
                     app_id: String::from("YOUR_FEISHU_APP_ID"),
                     app_secret: String::from("YOUR_FEISHU_APP_SECRET"),
@@ -914,8 +921,8 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     proxy_url: None,
                 });
             }
-            if config.channels_config.lark.is_none() {
-                config.channels_config.lark = Some(LarkConfig {
+            if config.channels.lark.is_none() {
+                config.channels.lark = Some(LarkConfig {
                     enabled: true,
                     app_id: String::from("YOUR_LARK_APP_ID"),
                     app_secret: String::from("YOUR_LARK_APP_SECRET"),
@@ -3181,7 +3188,7 @@ mod tests {
         let app = test_app(); // tier 0, provider 0 = OpenRouter
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
-        assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
+        assert_eq!(config.providers.fallback.as_deref(), Some("openrouter"));
     }
 
     #[test]
@@ -3191,7 +3198,7 @@ mod tests {
         app.provider_idx = 2; // Anthropic
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
-        assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
+        assert_eq!(config.providers.fallback.as_deref(), Some("anthropic"));
     }
 
     #[test]
@@ -3201,7 +3208,7 @@ mod tests {
         app.provider_idx = 0; // Ollama
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
-        assert_eq!(config.default_provider.as_deref(), Some("ollama"));
+        assert_eq!(config.providers.fallback.as_deref(), Some("ollama"));
     }
 
     #[test]
@@ -3209,13 +3216,15 @@ mod tests {
         let mut app = test_app();
         app.provider_tier_idx = 0;
         app.provider_idx = 0; // OpenRouter (non-custom)
-        let mut config = Config {
-            api_url: Some("http://old-custom-url.com".to_string()),
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.ensure_fallback_provider().base_url = Some("http://old-custom-url.com".to_string());
         apply_tui_selections_to_config(&app, &mut config);
         assert!(
-            config.api_url.is_none(),
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.base_url.as_deref())
+                .is_none(),
             "api_url should be cleared for non-custom providers"
         );
     }
@@ -3228,19 +3237,36 @@ mod tests {
         app.api_key_input = "sk-test-key-12345".to_string();
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
-        assert_eq!(config.api_key.as_deref(), Some("sk-test-key-12345"));
+        assert_eq!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.api_key.as_deref()),
+            Some("sk-test-key-12345")
+        );
     }
 
     #[test]
     fn save_no_api_key_when_empty() {
         let app = test_app(); // api_key_input is empty
-        let mut config = Config {
-            api_key: Some("existing-key".to_string()),
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.providers.fallback = Some("openrouter".into());
+        config.providers.models.insert(
+            "openrouter".into(),
+            zeroclaw_config::schema::ModelProviderConfig {
+                api_key: Some("existing-key".to_string()),
+                ..Default::default()
+            },
+        );
         apply_tui_selections_to_config(&app, &mut config);
         // Should preserve existing key, not overwrite with empty
-        assert_eq!(config.api_key.as_deref(), Some("existing-key"));
+        assert_eq!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.api_key.as_deref()),
+            Some("existing-key")
+        );
     }
 
     // ── Model persistence ───────────────────────────────────────────
@@ -3248,13 +3274,15 @@ mod tests {
     #[test]
     fn save_model_auto_clears_default() {
         let app = test_app(); // model_idx 0 = "Auto (recommended)"
-        let mut config = Config {
-            default_model: Some("old-model".to_string()),
-            ..Config::default()
-        };
+        let mut config = Config::default();
+        config.ensure_fallback_provider().model = Some("old-model".to_string());
         apply_tui_selections_to_config(&app, &mut config);
         assert!(
-            config.default_model.is_none(),
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.model.as_deref())
+                .is_none(),
             "Auto should clear default_model"
         );
     }
@@ -3266,7 +3294,10 @@ mod tests {
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
         assert_eq!(
-            config.default_model.as_deref(),
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.model.as_deref()),
             Some("claude-sonnet-4-20250514")
         );
     }
@@ -3277,7 +3308,13 @@ mod tests {
         app.model_idx = 3; // "gpt-4o"
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
-        assert_eq!(config.default_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.model.as_deref()),
+            Some("gpt-4o")
+        );
     }
 
     // ── Channel persistence ─────────────────────────────────────────
@@ -3289,7 +3326,7 @@ mod tests {
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
         let tg = config
-            .channels_config
+            .channels
             .telegram
             .as_ref()
             .expect("telegram should be Some");
@@ -3303,7 +3340,7 @@ mod tests {
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
         let dc = config
-            .channels_config
+            .channels
             .discord
             .as_ref()
             .expect("discord should be Some");
@@ -3318,7 +3355,7 @@ mod tests {
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
         let sl = config
-            .channels_config
+            .channels
             .slack
             .as_ref()
             .expect("slack should be Some");
@@ -3333,7 +3370,7 @@ mod tests {
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
         let wa = config
-            .channels_config
+            .channels
             .whatsapp
             .as_ref()
             .expect("whatsapp should be Some");
@@ -3349,7 +3386,7 @@ mod tests {
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
         let sig = config
-            .channels_config
+            .channels
             .signal
             .as_ref()
             .expect("signal should be Some");
@@ -3362,11 +3399,7 @@ mod tests {
         app.channel_idx = 3; // IRC
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
-        let irc = config
-            .channels_config
-            .irc
-            .as_ref()
-            .expect("irc should be Some");
+        let irc = config.channels.irc.as_ref().expect("irc should be Some");
         assert_eq!(irc.server, "irc.libera.chat");
         assert_eq!(irc.port, 6697);
         assert_eq!(irc.nickname, "zeroclaw-bot");
@@ -3378,7 +3411,7 @@ mod tests {
         app.channel_idx = 7; // iMessage
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
-        assert!(config.channels_config.imessage.is_some());
+        assert!(config.channels.imessage.is_some());
     }
 
     #[test]
@@ -3390,7 +3423,7 @@ mod tests {
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
         let mx = config
-            .channels_config
+            .channels
             .matrix
             .as_ref()
             .expect("matrix should be Some");
@@ -3404,7 +3437,7 @@ mod tests {
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
         let mm = config
-            .channels_config
+            .channels
             .mattermost
             .as_ref()
             .expect("mattermost should be Some");
@@ -3422,7 +3455,7 @@ mod tests {
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
         let nc = config
-            .channels_config
+            .channels
             .nextcloud_talk
             .as_ref()
             .expect("nextcloud should be Some");
@@ -3436,11 +3469,8 @@ mod tests {
         app.channel_idx = idx;
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
-        assert!(
-            config.channels_config.feishu.is_some(),
-            "feishu should be set"
-        );
-        assert!(config.channels_config.lark.is_some(), "lark should be set");
+        assert!(config.channels.feishu.is_some(), "feishu should be set");
+        assert!(config.channels.lark.is_some(), "lark should be set");
     }
 
     #[test]
@@ -3450,9 +3480,9 @@ mod tests {
         app.channel_idx = idx;
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
-        assert!(config.channels_config.telegram.is_none());
-        assert!(config.channels_config.discord.is_none());
-        assert!(config.channels_config.slack.is_none());
+        assert!(config.channels.telegram.is_none());
+        assert!(config.channels.discord.is_none());
+        assert!(config.channels.slack.is_none());
     }
 
     #[test]
@@ -3461,7 +3491,7 @@ mod tests {
         app.channel_idx = 0; // Telegram
         let mut config = Config::default();
         // Pre-set a Telegram config with a real token
-        config.channels_config.telegram = Some(TelegramConfig {
+        config.channels.telegram = Some(TelegramConfig {
             enabled: true,
             bot_token: "REAL_TOKEN_123".to_string(),
             allowed_users: vec!["alice".to_string()],
@@ -3471,9 +3501,10 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: 120,
         });
         apply_tui_selections_to_config(&app, &mut config);
-        let tg = config.channels_config.telegram.as_ref().unwrap();
+        let tg = config.channels.telegram.as_ref().unwrap();
         assert_eq!(
             tg.bot_token, "REAL_TOKEN_123",
             "should NOT overwrite existing config"
@@ -3654,13 +3685,22 @@ mod tests {
         apply_tui_selections_to_config(&app, &mut config);
 
         // Verify everything was persisted
-        assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
-        assert_eq!(config.api_key.as_deref(), Some("sk-ant-api-key"));
+        assert_eq!(config.providers.fallback.as_deref(), Some("anthropic"));
         assert_eq!(
-            config.default_model.as_deref(),
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.api_key.as_deref()),
+            Some("sk-ant-api-key")
+        );
+        assert_eq!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.model.as_deref()),
             Some("claude-opus-4-20250514")
         );
-        assert!(config.channels_config.telegram.is_some());
+        assert!(config.channels.telegram.is_some());
         assert!(config.web_search.enabled);
         assert_eq!(config.web_search.provider, "brave");
         assert_eq!(
@@ -3700,11 +3740,23 @@ mod tests {
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
 
-        assert_eq!(config.default_provider.as_deref(), Some("ollama"));
-        assert!(config.api_key.is_none());
-        assert!(config.default_model.is_none());
-        assert!(config.channels_config.telegram.is_none());
-        assert!(config.channels_config.discord.is_none());
+        assert_eq!(config.providers.fallback.as_deref(), Some("ollama"));
+        assert!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.api_key.as_deref())
+                .is_none()
+        );
+        assert!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.model.as_deref())
+                .is_none()
+        );
+        assert!(config.channels.telegram.is_none());
+        assert!(config.channels.discord.is_none());
         assert!(!config.skills.open_skills_enabled);
         assert!(!config.hooks.enabled);
         assert!(!config.gateway.require_pairing);
@@ -3733,9 +3785,15 @@ mod tests {
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
 
-        assert_eq!(config.default_provider.as_deref(), Some("openai"));
-        assert_eq!(config.default_model.as_deref(), Some("gpt-4o"));
-        let dc = config.channels_config.discord.as_ref().unwrap();
+        assert_eq!(config.providers.fallback.as_deref(), Some("openai"));
+        assert_eq!(
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.model.as_deref()),
+            Some("gpt-4o")
+        );
+        let dc = config.channels.discord.as_ref().unwrap();
         assert_eq!(dc.bot_token, "YOUR_DISCORD_BOT_TOKEN");
         assert_eq!(config.web_search.provider, "searxng");
         assert_eq!(
@@ -3799,7 +3857,9 @@ mod tests {
         assert!(toml_str.contains("openrouter"));
 
         // Verify it parses back
-        let _: Config = toml::from_str(&toml_str).expect("serialized TOML should parse back");
+        let _: Config = toml::from_str::<zeroclaw_config::migration::V1Compat>(&toml_str)
+            .expect("serialized TOML should parse back")
+            .into_config();
     }
 
     #[test]
@@ -3830,8 +3890,9 @@ mod tests {
 
             let toml_str = toml::to_string(&config)
                 .unwrap_or_else(|e| panic!("failed to serialize config for {channel_name}: {e}"));
-            let _: Config = toml::from_str(&toml_str)
-                .unwrap_or_else(|e| panic!("failed to deserialize config for {channel_name}: {e}"));
+            let _: Config = toml::from_str::<zeroclaw_config::migration::V1Compat>(&toml_str)
+                .unwrap_or_else(|e| panic!("failed to deserialize config for {channel_name}: {e}"))
+                .into_config();
         }
     }
 }

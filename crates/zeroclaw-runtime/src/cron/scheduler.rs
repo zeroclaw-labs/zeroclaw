@@ -49,6 +49,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
             enabled: true,
             model: None,
             allowed_tools: None,
+            uses_memory: true,
             session_target: None,
             delivery: None,
         };
@@ -272,35 +273,43 @@ async fn run_agent_job(
     let prompt = job.prompt.clone().unwrap_or_default();
 
     // Recall relevant memories so cron jobs have context awareness.
+    // Skipped when `job.uses_memory` is false (e.g. stateless digest jobs).
     // Exclude `Conversation` memories to prevent chat context from
     // leaking into scheduled executions (see #5415).
-    let memory_context = match zeroclaw_memory::create_memory(
-        &config.memory,
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-    ) {
-        Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
-            Ok(entries) if !entries.is_empty() => {
-                let ctx: String = entries
-                    .iter()
-                    .filter(|e| {
-                        !matches!(
-                            e.category,
-                            zeroclaw_memory::traits::MemoryCategory::Conversation
-                        )
-                    })
-                    .map(|e| format!("- {}: {}", e.key, e.content))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if ctx.is_empty() {
-                    String::new()
-                } else {
-                    format!("[Memory context]\n{ctx}\n\n")
+    let memory_context = if !job.uses_memory {
+        String::new()
+    } else {
+        match zeroclaw_memory::create_memory(
+            &config.memory,
+            &config.workspace_dir,
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.api_key.as_deref()),
+        ) {
+            Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
+                Ok(entries) if !entries.is_empty() => {
+                    let ctx: String = entries
+                        .iter()
+                        .filter(|e| {
+                            !matches!(
+                                e.category,
+                                zeroclaw_memory::traits::MemoryCategory::Conversation
+                            )
+                        })
+                        .map(|e| format!("- {}: {}", e.key, e.content))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if ctx.is_empty() {
+                        String::new()
+                    } else {
+                        format!("[Memory context]\n{ctx}\n\n")
+                    }
                 }
-            }
-            _ => String::new(),
-        },
-        Err(_) => String::new(),
+                _ => String::new(),
+            },
+            Err(_) => String::new(),
+        }
     };
 
     let prefixed_prompt = format!("{memory_context}[cron:{} {name}] {prompt}", job.id);
@@ -309,6 +318,11 @@ async fn run_agent_job(
     let mut cron_config = config.clone();
     cron_config.memory.auto_save = false;
 
+    // Assign a unique session ID so memories written during this run can be
+    // purged atomically if the run fails (prevents snowball accumulation).
+    let run_session_id = uuid::Uuid::new_v4().to_string();
+    let session_path = std::path::PathBuf::from(format!("cron-{run_session_id}"));
+
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
             Box::pin(crate::agent::run(
@@ -316,10 +330,14 @@ async fn run_agent_job(
                 Some(prefixed_prompt),
                 None,
                 model_override,
-                config.default_temperature,
+                config
+                    .providers
+                    .fallback_provider()
+                    .and_then(|e| e.temperature)
+                    .unwrap_or(0.7),
                 vec![],
                 false,
-                None,
+                Some(session_path.clone()),
                 job.allowed_tools.clone(),
             ))
             .await
@@ -335,7 +353,22 @@ async fn run_agent_job(
                 response
             },
         ),
-        Err(e) => (false, format!("agent job failed: {e}")),
+        Err(e) => {
+            // Purge memories written during this failed run so they don't
+            // pollute future recall and cause context snowball.
+            let mem_session_key = format!("cli:{}", session_path.display());
+            if let Ok(mem) = zeroclaw_memory::create_memory(
+                &config.memory,
+                &config.workspace_dir,
+                config
+                    .providers
+                    .fallback_provider()
+                    .and_then(|e| e.api_key.as_deref()),
+            ) {
+                let _ = mem.purge_session(&mem_session_key).await;
+            }
+            (false, format!("agent job failed: {e}"))
+        }
     }
 }
 
@@ -652,6 +685,7 @@ mod tests {
             delivery: DeliveryConfig::default(),
             delete_after_run: false,
             allowed_tools: None,
+            uses_memory: true,
             source: "imperative".into(),
             created_at: Utc::now(),
             next_run: Utc::now(),

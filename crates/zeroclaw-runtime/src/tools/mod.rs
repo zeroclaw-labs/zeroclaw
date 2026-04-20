@@ -378,7 +378,7 @@ pub fn all_tools_with_runtime(
     ];
 
     // Register discord_search if discord_history channel is configured
-    if root_config.channels_config.discord_history.is_some() {
+    if root_config.channels.discord_history.is_some() {
         match zeroclaw_memory::SqliteMemory::new_named(workspace_dir, "discord") {
             Ok(discord_mem) => {
                 tool_arcs.push(Arc::new(DiscordSearchTool::new(Arc::new(discord_mem))));
@@ -392,12 +392,14 @@ pub fn all_tools_with_runtime(
     // LLM task tool — always registered when a provider is configured
     {
         let llm_task_provider = root_config
-            .default_provider
+            .providers
+            .fallback
             .clone()
             .unwrap_or_else(|| "openrouter".to_string());
         let llm_task_model = root_config
-            .default_model
-            .clone()
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.model.clone())
             .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
         let llm_task_runtime_options =
             zeroclaw_providers::provider_runtime_options_from_config(root_config);
@@ -405,8 +407,15 @@ pub fn all_tools_with_runtime(
             security.clone(),
             llm_task_provider,
             llm_task_model,
-            root_config.default_temperature,
-            root_config.api_key.clone(),
+            root_config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.temperature)
+                .unwrap_or(0.7),
+            root_config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.api_key.clone()),
             llm_task_runtime_options,
         )));
     }
@@ -915,24 +924,14 @@ pub fn all_tools_with_runtime(
                 plugin_path.parent().unwrap_or(&plugin_path),
             ) {
                 Ok(host) => {
-                    let tool_manifests = host.tool_plugins();
-                    let count = tool_manifests.len();
-                    for manifest in tool_manifests {
-                        tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::new(
+                    let details = host.tool_plugin_details();
+                    let count = details.len();
+                    for (manifest, wasm_path) in details {
+                        tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
+                            wasm_path.to_path_buf(),
+                            manifest.permissions.clone(),
                             manifest.name.clone(),
                             manifest.description.clone().unwrap_or_default(),
-                            manifest.name.clone(),
-                            "call".to_string(),
-                            serde_json::json!({
-                                "type": "object",
-                                "properties": {
-                                    "input": {
-                                        "type": "string",
-                                        "description": "Input for the plugin"
-                                    }
-                                },
-                                "required": ["input"]
-                            }),
                         )));
                     }
                     tracing::info!("Loaded {count} WASM plugin tools");

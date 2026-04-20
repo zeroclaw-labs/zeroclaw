@@ -381,13 +381,14 @@ impl Agent {
             &config.workspace_dir,
         ));
 
+        let fallback_provider_ag = config.providers.fallback_provider();
         let memory: Arc<dyn Memory> =
             Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
                 &config.memory,
-                &config.embedding_routes,
+                &config.providers.embedding_routes,
                 Some(&config.storage.provider.config),
                 &config.workspace_dir,
-                config.api_key.as_deref(),
+                fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
             )?);
 
         let composio_key = if config.composio.enabled {
@@ -420,7 +421,7 @@ impl Agent {
             &config.web_fetch,
             &config.workspace_dir,
             &config.agents,
-            config.api_key.as_deref(),
+            fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
             config,
             None,
         );
@@ -486,11 +487,10 @@ impl Agent {
             }
         }
 
-        let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
+        let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
 
-        let model_name = config
-            .default_model
-            .as_deref()
+        let model_name = fallback_provider_ag
+            .and_then(|e| e.model.as_deref())
             .unwrap_or("anthropic/claude-sonnet-4-20250514")
             .to_string();
 
@@ -499,10 +499,10 @@ impl Agent {
 
         let provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
             provider_name,
-            config.api_key.as_deref(),
-            config.api_url.as_deref(),
+            fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
+            fallback_provider_ag.and_then(|e| e.base_url.as_deref()),
             &config.reliability,
-            &config.model_routes,
+            &config.providers.model_routes,
             &model_name,
             &provider_runtime_options,
         )?;
@@ -516,6 +516,7 @@ impl Agent {
         };
 
         let route_model_by_hint: HashMap<String, String> = config
+            .providers
             .model_routes
             .iter()
             .map(|route| (route.hint.clone(), route.model.clone()))
@@ -535,6 +536,19 @@ impl Agent {
             None
         };
 
+        // Filter out excluded tools (non_cli_excluded_tools). The channel
+        // orchestrator applies this, but Agent::from_config (used by ws.rs)
+        // doesn't go through that path.
+        let excluded = &config.autonomy.non_cli_excluded_tools;
+        if !excluded.is_empty() {
+            tools.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
+        }
+
+        // Load skills and register them as callable tools so WebSocket/daemon
+        // sessions can execute them (not just describe them in the prompt).
+        let skills = crate::skills::load_skills_with_config(&config.workspace_dir, config);
+        tools::register_skill_tools(&mut tools, &skills, security.clone());
+
         Agent::builder()
             .provider(provider)
             .tools(tools)
@@ -549,16 +563,17 @@ impl Agent {
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(config.agent.clone())
             .model_name(model_name)
-            .temperature(config.default_temperature)
+            .temperature(
+                fallback_provider_ag
+                    .and_then(|e| e.temperature)
+                    .unwrap_or(0.7),
+            )
             .workspace_dir(config.workspace_dir.clone())
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
             .route_model_by_hint(route_model_by_hint)
             .identity_config(config.identity.clone())
-            .skills(crate::skills::load_skills_with_config(
-                &config.workspace_dir,
-                config,
-            ))
+            .skills(skills)
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
             .security_summary(Some(security.prompt_summary()))
@@ -1121,12 +1136,8 @@ impl Agent {
                         }
                         zeroclaw_providers::traits::StreamEvent::ToolCall(tc) => {
                             got_stream = true;
-                            let _ = event_tx
-                                .send(TurnEvent::ToolCall {
-                                    name: tc.name.clone(),
-                                    args: serde_json::from_str(&tc.arguments).unwrap_or_default(),
-                                })
-                                .await;
+                            // ToolCall event is sent later (after parse_response) to
+                            // avoid duplicates; just collect here.
                             streamed_tool_calls.push(tc);
                         }
                         zeroclaw_providers::traits::StreamEvent::PreExecutedToolCall {
@@ -1317,23 +1328,25 @@ pub async fn run(
 
     let mut effective_config = config;
     if let Some(p) = provider_override {
-        effective_config.default_provider = Some(p);
+        effective_config.providers.fallback = Some(p);
     }
     if let Some(m) = model_override {
-        effective_config.default_model = Some(m);
+        effective_config.ensure_fallback_provider().model = Some(m);
     }
-    effective_config.default_temperature = temperature;
+    effective_config.ensure_fallback_provider().temperature = Some(temperature);
 
     let mut agent = Agent::from_config(&effective_config).await?;
 
     let provider_name = effective_config
-        .default_provider
+        .providers
+        .fallback
         .as_deref()
         .unwrap_or("openrouter")
         .to_string();
     let model_name = effective_config
-        .default_model
-        .as_deref()
+        .providers
+        .fallback_provider()
+        .and_then(|e| e.model.as_deref())
         .unwrap_or("anthropic/claude-sonnet-4-20250514")
         .to_string();
 
@@ -1657,20 +1670,23 @@ mod tests {
         let mut config = zeroclaw_config::schema::Config {
             workspace_dir,
             config_path: tmp.path().join("config.toml"),
-            api_key: Some("test-key".to_string()),
-            default_provider: Some(format!("custom:http://{addr}")),
-            default_model: Some("test-model".to_string()),
-            ..zeroclaw_config::schema::Config::default()
+            ..Default::default()
         };
+        config.providers.fallback = Some(format!("custom:http://{addr}"));
+        {
+            let entry = config.ensure_fallback_provider();
+            entry.api_key = Some("test-key".to_string());
+            entry.model = Some("test-model".to_string());
+            entry.extra_headers.insert(
+                "User-Agent".to_string(),
+                "zeroclaw-web-test/1.0".to_string(),
+            );
+            entry
+                .extra_headers
+                .insert("X-Title".to_string(), "zeroclaw-web".to_string());
+        }
         config.memory.backend = "none".to_string();
         config.memory.auto_save = false;
-        config.extra_headers.insert(
-            "User-Agent".to_string(),
-            "zeroclaw-web-test/1.0".to_string(),
-        );
-        config
-            .extra_headers
-            .insert("X-Title".to_string(), "zeroclaw-web".to_string());
 
         let mut agent = Agent::from_config(&config)
             .await
@@ -2077,5 +2093,162 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Skill tool registration & excluded_tools filtering ──────────
+
+    /// A mock tool whose name is configurable (unlike `MockTool` which is
+    /// always "echo").
+    struct NamedMockTool {
+        tool_name: String,
+    }
+
+    impl NamedMockTool {
+        fn new(name: &str) -> Self {
+            Self {
+                tool_name: name.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for NamedMockTool {
+        fn name(&self) -> &str {
+            &self.tool_name
+        }
+
+        fn description(&self) -> &str {
+            "mock"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    fn make_skill(name: &str, tool_names: &[&str]) -> crate::skills::Skill {
+        crate::skills::Skill {
+            name: name.to_string(),
+            description: format!("{name} skill"),
+            version: "0.1.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: tool_names
+                .iter()
+                .map(|t| crate::skills::SkillTool {
+                    name: t.to_string(),
+                    description: format!("{t} tool"),
+                    kind: "shell".to_string(),
+                    command: format!("echo {t}"),
+                    args: std::collections::HashMap::new(),
+                })
+                .collect(),
+            prompts: vec![],
+            location: None,
+        }
+    }
+
+    #[test]
+    fn register_skill_tools_adds_skill_tools_to_registry() {
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool::new("builtin_a"))];
+
+        let skills = vec![make_skill("deploy", &["run", "status"])];
+        tools::register_skill_tools(&mut tools, &skills, security);
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert_eq!(names, &["builtin_a", "deploy.run", "deploy.status"]);
+    }
+
+    #[test]
+    fn register_skill_tools_skips_shadowed_builtins() {
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        // Pre-populate with a tool whose name matches what the skill would produce.
+        let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool::new("my_skill.run"))];
+
+        let skills = vec![make_skill("my_skill", &["run"])];
+        tools::register_skill_tools(&mut tools, &skills, security);
+
+        // Should still be just 1 tool — the duplicate was skipped.
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), "my_skill.run");
+    }
+
+    #[test]
+    fn excluded_tools_filters_matching_tools() {
+        let mut tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedMockTool::new("shell")),
+            Box::new(NamedMockTool::new("file_write")),
+            Box::new(NamedMockTool::new("web_search")),
+        ];
+
+        let excluded = ["shell".to_string(), "file_write".to_string()];
+        tools.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert_eq!(names, &["web_search"]);
+    }
+
+    #[test]
+    fn excluded_tools_preserves_non_excluded() {
+        let mut tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedMockTool::new("shell")),
+            Box::new(NamedMockTool::new("file_read")),
+            Box::new(NamedMockTool::new("web_fetch")),
+        ];
+
+        // Exclude only "shell" — the other two should survive.
+        let excluded = ["shell".to_string()];
+        tools.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert_eq!(names, &["file_read", "web_fetch"]);
+    }
+
+    #[test]
+    fn empty_excluded_tools_preserves_all() {
+        let mut tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedMockTool::new("shell")),
+            Box::new(NamedMockTool::new("file_read")),
+        ];
+
+        let excluded: Vec<String> = vec![];
+        if !excluded.is_empty() {
+            tools.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
+        }
+
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn excluded_tools_then_skill_registration_end_to_end() {
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let mut tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedMockTool::new("shell")),
+            Box::new(NamedMockTool::new("file_read")),
+            Box::new(NamedMockTool::new("web_fetch")),
+        ];
+
+        // Step 1: filter excluded tools (mirrors from_config logic)
+        let excluded = ["shell".to_string()];
+        tools.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
+
+        // Step 2: register skill tools (mirrors from_config logic)
+        let skills = vec![make_skill("ops", &["deploy", "rollback"])];
+        tools::register_skill_tools(&mut tools, &skills, security);
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            names,
+            &["file_read", "web_fetch", "ops.deploy", "ops.rollback"]
+        );
     }
 }

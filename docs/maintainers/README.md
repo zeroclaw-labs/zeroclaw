@@ -2,6 +2,10 @@
 
 Time-bound project status snapshots for planning documentation and operations work.
 
+## Release Operations
+
+- [release-runbook.md](release-runbook.md) — Authoritative step-by-step guide for cutting a stable release using `release-stable-manual.yml`. Use this for every release until automated tooling lands in v0.7.5.
+
 ## Current Snapshot
 
 - [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md)
