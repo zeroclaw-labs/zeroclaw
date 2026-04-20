@@ -469,6 +469,13 @@ pub async fn handle_api_chat(
     // 1. Client-provided api_key (from request body — user's own key)
     // 2. Server-side provider_api_keys map (from Settings / config)
     // 3. Environment variables (checked later by provider factory)
+    //
+    // NOTE: `provider_name` below may be overridden by the §3.1 routing
+    // decision after the key is resolved (for offline/strict/app-default
+    // paths). Key resolution uses the user's originally-configured
+    // provider name so env-var lookup (`ANTHROPIC_API_KEY` etc.) still
+    // picks the right slot; the override only flips the active primary
+    // provider, not the key source.
     let provider_name = config.default_provider.as_deref().unwrap_or("gemini");
 
     let client_key = chat_body
@@ -492,6 +499,58 @@ pub async fn handle_api_chat(
         // The provider factory will check env vars as fallback.
         config.api_key = None;
     }
+
+    // ── §3.1 routing decision (App-chat mode) ─────────────────────────
+    // Run the decision tree BEFORE the cloud-key validation so that
+    // `ForcedLocalByMissingKey`, `ForcedLocalByOffline`, and
+    // `ForcedLocalByConfig` can bypass the "no API key" error entirely —
+    // those paths intentionally don't need a cloud key because they
+    // route to on-device Ollama.
+    //
+    // When the decision is `Local`, swap `config.default_provider` to
+    // `"ollama"` and append the user's original primary (e.g. `"gemini"`)
+    // to `fallback_providers` so a local failure still degrades to cloud
+    // instead of killing the chat. Cloud decisions leave the config
+    // untouched.
+    //
+    // ChatMode::App is the correct classification here — this handler
+    // backs MoA's own desktop/mobile Tauri client. The Channel and Web
+    // handlers live in separate files and will pick up the same helper
+    // (`apply_routing_decision`) when they're migrated.
+    let has_cloud_api_key = providers::has_provider_credential(
+        provider_name,
+        config.api_key.as_deref(),
+    );
+    let network_online = crate::local_llm::shared_health().is_online();
+    let routing_decision = crate::local_llm::decide_active_provider_v2(
+        &crate::local_llm::RoutingContext {
+            primary_cloud: provider_name,
+            has_cloud_api_key,
+            network_online,
+            reliability: &config.reliability,
+            chat_mode: crate::local_llm::ChatMode::App,
+            // `quality_first` is a user preference MoA surfaces in the
+            // Settings panel; for now we read it from the reliability
+            // block's `prefer_cloud_on_app` flag if set (falls back to
+            // false). Hard-coded `false` here until that flag is wired.
+            quality_first: false,
+        },
+    );
+    if routing_decision.provider.is_local() {
+        let new_primary = crate::local_llm::apply_routing_decision(
+            provider_name,
+            &mut config.reliability,
+            &routing_decision,
+        );
+        tracing::info!(
+            reason = ?routing_decision.reason,
+            original = provider_name,
+            new_primary = %new_primary,
+            "§3.1 routing: swapping primary provider to on-device Gemma 4"
+        );
+        config.default_provider = Some(new_primary);
+    }
+    let provider_name = config.default_provider.as_deref().unwrap_or("gemini");
 
     // ── Validate API key for cloud providers ──
     // Check both the config-level key (from request body or config.toml) AND

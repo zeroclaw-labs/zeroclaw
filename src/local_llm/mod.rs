@@ -237,6 +237,57 @@ impl RoutingReason {
     }
 }
 
+/// Name that [`apply_routing_decision`] uses when it swaps Ollama into the
+/// primary slot. Matches the fallback-provider registration in
+/// `fallback_registry.rs` so the provider factory already knows how to
+/// instantiate it.
+pub const OLLAMA_PROVIDER_NAME: &str = "ollama";
+
+/// Apply a [`RoutingDecision`] to the (primary_name, reliability) pair a
+/// chat handler is about to pass to the provider factory.
+///
+/// When the decision is `Local`:
+/// * Override the primary provider name to `"ollama"`.
+/// * Ensure the user's originally-configured primary (e.g. `"gemini"`) is
+///   still in `fallback_providers` so a downstream ollama failure degrades
+///   gracefully to cloud instead of the chat dying outright.
+///
+/// When the decision is `Cloud`: return `(primary, reliability)` unchanged.
+///
+/// Returns the adjusted primary name as a `String` (allocation only when a
+/// swap actually happens; callers can cheaply keep the original `&str`
+/// when no swap is needed by checking
+/// [`RoutingDecision::provider.is_local`] first).
+pub fn apply_routing_decision(
+    primary: &str,
+    reliability: &mut ReliabilityConfig,
+    decision: &RoutingDecision,
+) -> String {
+    if !decision.provider.is_local() {
+        return primary.to_string();
+    }
+    // Make sure ollama isn't in fallback_providers (it would duplicate
+    // with the primary slot below). Remove any stale entry first so the
+    // subsequent "append primary" check doesn't accidentally treat it as
+    // already-present.
+    reliability
+        .fallback_providers
+        .retain(|p| p != OLLAMA_PROVIDER_NAME);
+    // Keep the originally-configured cloud provider in the fallback chain
+    // so a local failure still degrades to cloud. Skip the append when
+    // the primary was already ollama (nothing to move) or when the
+    // caller's primary is already listed in fallback_providers.
+    if primary != OLLAMA_PROVIDER_NAME
+        && !reliability
+            .fallback_providers
+            .iter()
+            .any(|p| p == primary)
+    {
+        reliability.fallback_providers.push(primary.to_string());
+    }
+    OLLAMA_PROVIDER_NAME.to_string()
+}
+
 /// Compute the active provider given configuration, API key presence, and
 /// runtime network state. Encapsulates the patent §3.1 routing rules:
 ///
@@ -853,6 +904,72 @@ mod tests {
         assert_eq!(
             RoutingReason::CloudViaZeroStorageRelay.badge_label(),
             "Cloud via zero-storage relay"
+        );
+    }
+
+    // ── apply_routing_decision: maps §3.1 decisions onto
+    //    (primary_name, reliability_config) pairs the provider factory
+    //    can consume. ──
+
+    fn decision_local() -> RoutingDecision {
+        RoutingDecision {
+            provider: ActiveProvider::Local {
+                model: "gemma4:e4b".to_string(),
+            },
+            reason: RoutingReason::AppChatDefaultLocal,
+            via_relay: false,
+        }
+    }
+
+    fn decision_cloud() -> RoutingDecision {
+        RoutingDecision {
+            provider: ActiveProvider::Cloud {
+                name: "gemini".to_string(),
+            },
+            reason: RoutingReason::CloudByUserChoice,
+            via_relay: false,
+        }
+    }
+
+    #[test]
+    fn apply_routing_decision_local_swaps_primary_to_ollama() {
+        let mut r = armed_reliability();
+        let new_primary = apply_routing_decision("gemini", &mut r, &decision_local());
+        assert_eq!(new_primary, "ollama");
+    }
+
+    #[test]
+    fn apply_routing_decision_local_moves_original_primary_into_fallback() {
+        let mut r = ReliabilityConfig::default();
+        r.local_llm_fallback = true;
+        r.local_llm_model = "gemma4:e4b".to_string();
+        r.fallback_providers.push("ollama".to_string());
+        apply_routing_decision("gemini", &mut r, &decision_local());
+        // ollama should NOT be duplicated in fallback_providers when it
+        // is now the primary.
+        assert!(!r.fallback_providers.iter().any(|p| p == "ollama"));
+        // Original primary gets appended so failures can degrade to cloud.
+        assert!(r.fallback_providers.iter().any(|p| p == "gemini"));
+    }
+
+    #[test]
+    fn apply_routing_decision_cloud_is_identity() {
+        let mut r = armed_reliability();
+        let before = r.fallback_providers.clone();
+        let new_primary = apply_routing_decision("gemini", &mut r, &decision_cloud());
+        assert_eq!(new_primary, "gemini");
+        assert_eq!(r.fallback_providers, before, "cloud decision must not mutate reliability");
+    }
+
+    #[test]
+    fn apply_routing_decision_local_idempotent_on_repeat() {
+        let mut r = armed_reliability();
+        apply_routing_decision("gemini", &mut r, &decision_local());
+        let after_first = r.fallback_providers.clone();
+        apply_routing_decision("ollama", &mut r, &decision_local());
+        assert_eq!(
+            r.fallback_providers, after_first,
+            "second pass should not re-append gemini or re-add ollama"
         );
     }
 
