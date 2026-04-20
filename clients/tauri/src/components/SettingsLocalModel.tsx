@@ -81,7 +81,13 @@ const TIERS: readonly TierSpec[] = [
     downloadGb: 3.0,
     memoryGb: 5.5,
     supportsAudio: true,
-    minEffectiveMemoryGb: 6,
+    // E4B needs ~5.5 GB at Q4_K_M. Setting the gate to 5.5 (exact
+    // requirement, not a buffer over it) means M1 8 GB machines with
+    // our 0.75 unified-memory factor = 6 GB effective — just above
+    // the line. Real hardware reports confirm E4B runs there (slow
+    // but usable). If future quantization shrinks the model, lower
+    // this; if we see OOM crashes in the wild, raise it.
+    minEffectiveMemoryGb: 5.5,
   },
   {
     key: "T3MoE26B",
@@ -114,8 +120,14 @@ function effectiveMemoryGb(hw: HardwareProfile | null): number {
   if (nvidia) return nvidia.vram_mb / 1024;
   if (amd) return amd.vram_mb / 1024;
   if (hw.gpu.AppleSilicon) {
-    // Apple Silicon allocates ~70% of unified memory to GPU workloads.
-    return (hw.total_ram_mb / 1024) * 0.7;
+    // Apple Silicon unified memory: macOS can dynamically allocate up
+    // to ~75% of RAM to the GPU on demand (increased from 70% in prior
+    // versions). Using 0.75 lets M1 8 GB users unlock T2E4B (5.5 GB
+    // effective memory required, with 0.75 factor: 6 GB — right at the
+    // minimum for T2E4B which works in practice per field reports).
+    // Go higher and we risk OOM under concurrent load; stay lower and
+    // M1 8 GB users get stuck on T1E2B despite E4B being usable.
+    return (hw.total_ram_mb / 1024) * 0.75;
   }
   // iGPU or no GPU: system RAM minus OS overhead.
   return Math.max(0, hw.total_ram_mb / 1024 - 4);
