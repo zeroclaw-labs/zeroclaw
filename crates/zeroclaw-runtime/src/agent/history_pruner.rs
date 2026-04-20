@@ -776,14 +776,12 @@ mod tests {
     /// a structured tool_calls array.
     #[test]
     fn orphan_tool_not_fooled_by_id_in_summary_text() {
-        let summary = format!(
-            "[CONTEXT SUMMARY \u{2014} 4 messages compressed]\n\
+        let summary = "[CONTEXT SUMMARY \u{2014} 4 messages compressed]\n\
              Earlier turns invoked shell with tool_calls id toolu_01Orphan \
-             and returned ok."
-        );
+             and returned ok.";
         let mut messages = vec![
             msg("system", "sys"),
-            msg("assistant", &summary),
+            msg("assistant", summary),
             msg(
                 "tool",
                 r#"{"tool_call_id":"toolu_01Orphan","content":"stale"}"#,
