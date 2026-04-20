@@ -3,7 +3,10 @@
 # which doesn't work with ephemeral CI runners (no persistent BuildKit cache).
 
 # ── Stage 0: Frontend build ─────────────────────────────────────
-FROM node:22-alpine AS web-builder
+# AUDIT-2026-04-19 §P2 #25: base images pinned by digest. Bump via
+# Renovate; never drop the digest back to tag-only. Scratch stages
+# carry no content and are intentionally unpinned.
+FROM node:22-alpine@sha256:8ea2348b068a9544dae7317b4f3aafcdc032df1647bb7d768a05a5cad1a7683f AS web-builder
 WORKDIR /web
 COPY web/package.json web/package-lock.json* ./
 RUN npm ci --ignore-scripts 2>/dev/null || npm install --ignore-scripts
@@ -11,7 +14,7 @@ COPY web/ .
 RUN npm run build
 
 # ── Stage 1: Build ───────────────────────────────────────────────
-FROM rust:1.94-bookworm AS builder
+FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS builder
 
 WORKDIR /app
 ARG ZEROCLAW_CARGO_FEATURES="one2x,channel-lark"
@@ -67,7 +70,7 @@ FROM scratch AS binary-extract
 COPY --from=builder /app/zeroclaw /zeroclaw
 
 # ── Stage 3: Runtime (default target) ────────────────────────────
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:4724b8cc51e33e398f0e2e15e18d5ec2851ff0c2280647e1310bc1642182655d AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash ca-certificates curl git \
