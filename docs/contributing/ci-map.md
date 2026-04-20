@@ -1,136 +1,133 @@
 # CI Workflow Map
 
-This document explains what each GitHub workflow does, when it runs, and whether it should block merges.
+What each GitHub workflow does, when it runs, and whether it blocks merges.
 
-For event-by-event delivery behavior across PR, merge, push, and release, see [`.github/workflows/master-branch-flow.md`](../../.github/workflows/master-branch-flow.md).
+Last updated: **May 2026** (post-v0.7.4 cleanup).
 
-## Merge-Blocking vs Optional
+For event-by-event delivery behavior, see
+[`.github/workflows/master-branch-flow.md`](../../.github/workflows/master-branch-flow.md).
 
-Merge-blocking checks should stay small and deterministic. Optional checks are useful for automation and maintenance, but should not block normal development.
+---
 
-### Merge-Blocking
+## Merge-Blocking
 
-- `.github/workflows/ci-run.yml` (`CI`)
-    - Purpose: Rust validation (`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D clippy::correctness`, strict delta lint gate on changed Rust lines, `test`, release build smoke) + docs quality checks when docs change (`markdownlint` blocks only issues on changed lines; link check scans only links added on changed lines)
-    - Additional behavior: for Rust-impacting PRs and pushes, `CI Required Gate` requires `lint` + `test` + `build` (no PR build-only bypass)
-    - Additional behavior: PRs that change `.github/workflows/**` require at least one approving review from a login in `WORKFLOW_OWNER_LOGINS` (repository variable fallback: `theonlyhennygod,JordanTheJet`)
-    - Additional behavior: lint gates run before `test`/`build`; when lint/docs gates fail on PRs, CI posts an actionable feedback comment with failing gate names and local fix commands
-    - Merge gate: `CI Required Gate`
-- `.github/workflows/workflow-sanity.yml` (`Workflow Sanity`)
-    - Purpose: lint GitHub workflow files (`actionlint`, tab checks)
-    - Recommended for workflow-changing PRs
-- `.github/workflows/pr-intake-checks.yml` (`PR Intake Checks`)
-    - Purpose: safe pre-CI PR checks (template completeness, added-line tabs/trailing-whitespace/conflict markers) with immediate sticky feedback comment
-### Non-Blocking but Important
+### `ci-run.yml` — CI
 
-- `.github/workflows/pub-docker-img.yml` (`Docker`)
-    - Purpose: PR Docker smoke check on `master` PRs and publish images on tag pushes (`v*`) only
-- `.github/workflows/sec-audit.yml` (`Security Audit`)
-    - Purpose: dependency advisories (`rustsec/audit-check`, pinned SHA) and policy/license checks (`cargo deny`)
-- `.github/workflows/sec-codeql.yml` (`CodeQL Analysis`)
-    - Purpose: scheduled/manual static analysis for security findings
-- `.github/workflows/sec-vorpal-reviewdog.yml` (`Sec Vorpal Reviewdog`)
-    - Purpose: manual secure-coding feedback scan for supported non-Rust files (`.py`, `.js`, `.jsx`, `.ts`, `.tsx`) using reviewdog annotations
-    - Noise control: excludes common test/fixture paths and test file patterns by default (`include_tests=false`)
-- `.github/workflows/pub-release.yml` (`Release`)
-    - Purpose: build release artifacts in verification mode (manual/scheduled) and publish GitHub releases on tag push or manual publish mode
-- `.github/workflows/pub-homebrew-core.yml` (`Pub Homebrew Core`)
-    - Purpose: manual, bot-owned Homebrew core formula bump PR flow for tagged releases
-    - Guardrail: release tag must match `Cargo.toml` version
-- `.github/workflows/pub-scoop.yml` (`Pub Scoop Manifest`)
-    - Purpose: Scoop bucket manifest update for Windows; auto-called by stable release, also manual dispatch
-    - Guardrail: release tag must be `vX.Y.Z` format; Windows binary hash extracted from `SHA256SUMS`
-- `.github/workflows/pub-aur.yml` (`Pub AUR Package`)
-    - Purpose: AUR PKGBUILD push for Arch Linux; auto-called by stable release, also manual dispatch
-    - Guardrail: release tag must be `vX.Y.Z` format; source tarball SHA256 computed at publish time
-- `.github/workflows/pr-label-policy-check.yml` (`Label Policy Sanity`)
-    - Purpose: validate shared contributor-tier policy in `.github/label-policy.json` and ensure label workflows consume that policy
-- `.github/workflows/test-rust-build.yml` (`Rust Reusable Job`)
-    - Purpose: reusable Rust setup/cache + command runner for workflow-call consumers
+**Trigger:** `pull_request` → `master`, `push` → `master`
 
-### Optional Repository Automation
+**Required status check:** `CI Required Gate`
 
-- `.github/workflows/pr-labeler.yml` (`PR Labeler`)
-    - Purpose: scope/path labels + size/risk labels + fine-grained module labels (`<module>: <component>`)
-    - Additional behavior: label descriptions are auto-managed as hover tooltips to explain each auto-judgment rule
-    - Additional behavior: provider-related keywords in provider/config/onboard/integration changes are promoted to `provider:*` labels (for example `provider:kimi`, `provider:deepseek`)
-    - Additional behavior: hierarchical de-duplication keeps only the most specific scope labels (for example `tool:composio` suppresses `tool:core` and `tool`)
-    - Additional behavior: module namespaces are compacted — one specific module keeps `prefix:component`; multiple specifics collapse to just `prefix`
-    - Additional behavior: applies contributor tiers on PRs by merged PR count (`trusted` >=5, `experienced` >=10, `principal` >=20, `distinguished` >=50)
-    - Additional behavior: final label set is priority-sorted (`risk:*` first, then `size:*`, then contributor tier, then module/path labels)
-    - Additional behavior: managed label colors follow display order to produce a smooth left-to-right gradient when many labels are present
-    - Manual governance: supports `workflow_dispatch` with `mode=audit|repair` to inspect/fix managed label metadata drift across the whole repository
-    - Additional behavior: risk + size labels are auto-corrected on manual PR label edits (`labeled`/`unlabeled` events); apply `risk: manual` when maintainers intentionally override automated risk selection
-    - High-risk heuristic paths: `src/security/**`, `src/runtime/**`, `src/gateway/**`, `src/tools/**`, `.github/workflows/**`
-    - Guardrail: maintainers can apply `risk: manual` to freeze automated risk recalculation
-- `.github/workflows/pr-auto-response.yml` (`PR Auto Responder`)
-    - Purpose: first-time contributor onboarding + label-driven response routing (`r:support`, `r:needs-repro`, etc.)
-    - Additional behavior: applies contributor tiers on issues by merged PR count (`trusted` >=5, `experienced` >=10, `principal` >=20, `distinguished` >=50), matching PR tier thresholds exactly
-    - Additional behavior: contributor-tier labels are treated as automation-managed (manual add/remove on PR/issue is auto-corrected)
-    - Guardrail: label-based close routes are issue-only; PRs are never auto-closed by route labels
-- `.github/workflows/pr-check-stale.yml` (`Stale`)
-    - Purpose: stale issue/PR lifecycle automation
-- `.github/dependabot.yml` (`Dependabot`)
-    - Purpose: grouped, rate-limited dependency update PRs (Cargo + GitHub Actions)
-- `.github/workflows/pr-check-status.yml` (`PR Hygiene`)
-    - Purpose: nudge stale-but-active PRs to rebase/re-run required checks before queue starvation
+The single source of truth for PR and post-merge quality. Three staged jobs:
 
-## Trigger Map
+- `lint` — `cargo fmt --all -- --check`, `cargo clippy -D warnings`,
+  `cargo check --features ci-all`, strict delta lint on changed lines (PRs only).
+- `test` — `cargo nextest run --locked` on `ubuntu-latest` with mold linker.
+- `build` — `cargo build --profile ci --locked` on Linux, macOS, and Windows.
+  Benchmarks are verified to compile on the Linux leg.
 
-- `CI`: push to `master`, PRs to `master`
-- `Docker`: tag push (`v*`) for publish, matching PRs to `master` for smoke build, manual dispatch for smoke only
-- `Release`: tag push (`v*`), weekly schedule (verification-only), manual dispatch (verification or publish)
-- `Pub Homebrew Core`: manual dispatch only
-- `Pub Scoop Manifest`: auto-called by stable release, also manual dispatch
-- `Pub AUR Package`: auto-called by stable release, also manual dispatch
-- `Security Audit`: push to `master`, PRs to `master`, weekly schedule
-- `Sec Vorpal Reviewdog`: manual dispatch only
-- `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change
-- `Dependabot`: all update PRs target `master`
-- `PR Intake Checks`: `pull_request_target` on opened/reopened/synchronize/edited/ready_for_review
-- `Label Policy Sanity`: PR/push when `.github/label-policy.json`, `.github/workflows/pr-labeler.yml`, or `.github/workflows/pr-auto-response.yml` changes
-- `PR Labeler`: `pull_request_target` lifecycle events
-- `PR Auto Responder`: issue opened/labeled, `pull_request_target` opened/labeled
-- `Stale PR Check`: daily schedule, manual dispatch
-- `PR Hygiene`: every 12 hours schedule, manual dispatch
+`lint` must pass before `test` and `build` start. `CI Required Gate` is the
+composite job that branch protection requires — it passes only if all three
+upstream jobs passed.
 
-## Fast Triage Guide
+**Concurrency:** in-flight runs are cancelled on new PR pushes. Master push
+runs are not cancelled.
 
-1. `CI Required Gate` failing: start with `.github/workflows/ci-run.yml`.
-2. Docker failures on PRs: inspect `.github/workflows/pub-docker-img.yml` `pr-smoke` job.
-3. Release failures (tag/manual/scheduled): inspect `.github/workflows/pub-release.yml` and the `prepare` job outputs.
-4. Homebrew formula publish failures: inspect `.github/workflows/pub-homebrew-core.yml` summary output and bot token/fork variables.
-5. Scoop manifest publish failures: inspect `.github/workflows/pub-scoop.yml` summary output and `SCOOP_BUCKET_REPO`/`SCOOP_BUCKET_TOKEN` settings.
-6. AUR package publish failures: inspect `.github/workflows/pub-aur.yml` summary output and `AUR_SSH_KEY` secret.
-7. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.
-8. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
-9. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs.
-10. Label policy parity failures: inspect `.github/workflows/pr-label-policy-check.yml`.
-11. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci-run.yml`.
-12. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
+---
+
+## Non-Blocking — Release
+
+### `release-stable-manual.yml` — Release Stable
+
+**Trigger:** `workflow_dispatch` (version input), tag push `v[0-9]+.[0-9]+.[0-9]+`
+
+**Frozen:** do not extend until v0.7.5.
+
+Full stable release pipeline. Jobs in order:
+
+1. `validate` — semver format, `Cargo.toml` version match, tag uniqueness guard.
+2. `web` — builds the web dashboard artifact.
+3. `release-notes` — generates release notes from git log.
+4. `build` — 7-target cross-platform matrix (Linux x86\_64, Linux aarch64,
+   ARMv7, ARM, macOS aarch64, Android (experimental), Windows x86\_64).
+5. `build-desktop` — macOS universal Tauri app.
+6. `publish` — GitHub Release, `SHA256SUMS`, `install.sh`. Removes
+   `CHANGELOG-next.md` from master after release.
+7. `crates-io` — publishes workspace crates to crates.io.
+8. `docker` — pushes multi-arch images to GHCR.
+9. Distribution: `scoop`, `aur`, `homebrew`, `marketplace`.
+10. Announcements: `discord`, `tweet`.
+
+`publish`, `crates-io`, and `docker` are gated by GitHub environment
+protection rules requiring maintainer approval.
+
+See [`docs/maintainers/release-runbook.md`](../maintainers/release-runbook.md)
+for the step-by-step procedure.
+
+---
+
+## Non-Blocking — Utilities
+
+### `cross-platform-build-manual.yml` — Cross-Platform Build
+
+**Trigger:** `workflow_dispatch`
+
+Manual build-only smoke check across targets not covered by the PR matrix.
+No tests. No publish. Used to verify cross-compilation health before a release
+or after a significant dependency change.
+
+### `pr-path-labeler.yml` — PR Path Labeler
+
+**Trigger:** `pull_request` lifecycle events
+
+Applies scope and path labels to PRs automatically based on changed files.
+All action refs are SHA-pinned. Low noise, no side effects beyond label
+application.
+
+---
+
+## Frozen Sub-Workflows
+
+Called by `release-stable-manual.yml`. Do not modify or extend until v0.7.5.
+Each can also be triggered manually with `dry_run: true` for verification.
+
+| File | Purpose |
+|---|---|
+| `pub-aur.yml` | Pushes updated PKGBUILD to AUR |
+| `pub-homebrew-core.yml` | Opens Homebrew Core formula bump PR via bot account |
+| `pub-scoop.yml` | Updates Scoop bucket manifest |
+| `publish-crates.yml` | Manual crates.io publish (backup for the release pipeline) |
+| `discord-release.yml` | Posts release announcement to Discord |
+| `tweet-release.yml` | Posts release announcement to Twitter/X |
+| `sync-marketplace-templates.yml` | Updates Dokploy and EasyPanel marketplace templates |
+
+---
+
+## Fast Triage
+
+1. **`CI Required Gate` red on a PR** — start with the `lint` job (fmt/clippy
+   failures are most common), then `test`, then `build`.
+2. **`CI Required Gate` red on master after a merge** — treat as P0; nothing
+   else merges until it is green.
+3. **Release `validate` failed** — `Cargo.toml` version does not match the
+   workflow input, or the tag already exists.
+4. **Release build failed** — check the specific target's job log. Android is
+   `experimental` and runs with `continue-on-error`.
+5. **Environment gate timed out** — re-run only the timed-out job from the
+   workflow run page.
+6. **Distribution channel failed** — re-run the corresponding sub-workflow
+   manually with `dry_run: true` first.
+
+---
 
 ## Maintenance Rules
 
-- Keep merge-blocking checks deterministic and reproducible (`--locked` where applicable).
-- Follow [`docs/contributing/release-process.md`](./release-process.md) for verify-before-publish release cadence and tag discipline.
-- Keep merge-blocking rust quality policy aligned across `.github/workflows/ci-run.yml`, `dev/ci.sh`, and `.githooks/pre-push` (`./scripts/ci/rust_quality_gate.sh` + `./scripts/ci/rust_strict_delta_gate.sh`).
-- Use `./scripts/ci/rust_strict_delta_gate.sh` (or `./dev/ci.sh lint-delta`) as the incremental strict merge gate for changed Rust lines.
-- Run full strict lint audits regularly via `./scripts/ci/rust_quality_gate.sh --strict` (for example through `./dev/ci.sh lint-strict`) and track cleanup in focused PRs.
-- Keep docs markdown gating incremental via `./scripts/ci/docs_quality_gate.sh` (block changed-line issues, report baseline issues separately).
-- Keep docs link gating incremental via `./scripts/ci/collect_changed_links.py` + lychee (check only links added on changed lines).
-- Prefer explicit workflow permissions (least privilege).
-- Keep Actions source policy restricted to approved allowlist patterns (see [`docs/contributing/actions-source-policy.md`](./actions-source-policy.md)).
-- Use path filters for expensive workflows when practical.
-- Keep docs quality checks low-noise (incremental markdown + incremental added-link checks).
-- Keep dependency update volume controlled (grouping + PR limits).
-- Avoid mixing onboarding/community automation with merge-gating logic.
-- Test levels: `cargo test --test component`, `cargo test --test integration`, `cargo test --test system`.
-- Live tests (manual only): `cargo test --test live -- --ignored`.
-
-## Automation Side-Effect Controls
-
-- Prefer deterministic automation that can be manually overridden (`risk: manual`) when context is nuanced.
-- Keep auto-response comments deduplicated to prevent triage noise.
-- Keep auto-close behavior scoped to issues; maintainers own PR close/merge decisions.
-- If automation is wrong, correct labels first, then continue review with explicit rationale.
-- Use `superseded` / `stale-candidate` labels to prune duplicate or dormant PRs before deep review.
+- Keep `CI Required Gate` deterministic and small. Do not add jobs to the gate
+  without a clear quality argument.
+- All third-party action refs must be pinned to a full commit SHA
+  (see [`actions-source-policy.md`](./actions-source-policy.md)).
+- Keep `ci-run.yml`, `dev/ci.sh`, and `.githooks/pre-push` aligned — the same
+  quality gates should run locally and in CI.
+- Do not modify the frozen sub-workflows until the v0.7.5 structured release
+  pipeline work begins.
+- `docs-quality` checks are not in the required gate. They can be run locally
+  with `bash scripts/ci/docs_quality_gate.sh`.
