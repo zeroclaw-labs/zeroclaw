@@ -12990,6 +12990,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-file-rotation"
+version = "0.7.3"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "filetime",
+ "libc",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "zeroclaw-gateway"
 version = "0.7.3"
 dependencies = [
@@ -13257,6 +13271,7 @@ dependencies = [
  "which",
  "zeroclaw-api",
  "zeroclaw-config",
+ "zeroclaw-file-rotation",
  "zeroclaw-infra",
  "zeroclaw-macros",
  "zeroclaw-memory",

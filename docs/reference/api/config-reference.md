@@ -37,12 +37,16 @@ Schema export command:
 | `runtime_trace_mode` | `none` | Runtime trace storage mode: `none`, `rolling`, or `full` |
 | `runtime_trace_path` | `state/runtime-trace.jsonl` | Runtime trace JSONL path (relative to workspace unless absolute) |
 | `runtime_trace_max_entries` | `200` | Maximum retained events when `runtime_trace_mode = "rolling"` |
+| `runtime_trace_rotation.max_file_size_mb` | `100` | Maximum size (MB) of a single trace file before rotation |
+| `runtime_trace_rotation.max_age_days` | `30` | Maximum age (days) for rotated trace files before deletion |
+| `runtime_trace_rotation.max_rotated_files` | `100` | Maximum number of rotated trace files to keep |
 
 Notes:
 
 - `backend = "otel"` uses OTLP HTTP export with a blocking exporter client so spans and metrics can be emitted safely from non-Tokio contexts.
 - Alias values `opentelemetry` and `otlp` map to the same OTel backend.
 - Runtime traces are intended for debugging tool-call failures and malformed model tool payloads. They can contain model output text, so keep this disabled by default on shared hosts.
+- File rotation is triggered by both file size and natural day boundary. Rotated files are named `<stem>.YYYY-MM-DD.<seq>.<ext>` (e.g. `runtime-trace.2026-04-20.1.jsonl`). Old files beyond the retention policy are automatically cleaned up.
 - Query runtime traces with:
   - `zeroclaw doctor traces --limit 20`
   - `zeroclaw doctor traces --event tool_call_result --contains \"error\"`
@@ -58,6 +62,11 @@ otel_service_name = "zeroclaw"
 runtime_trace_mode = "rolling"
 runtime_trace_path = "state/runtime-trace.jsonl"
 runtime_trace_max_entries = 200
+
+[observability.runtime_trace_rotation]
+max_file_size_mb = 100
+max_age_days = 30
+max_rotated_files = 100
 
 [observability.otel_headers]
 Authorization = "Bearer <your-token>"

@@ -1118,7 +1118,8 @@ async fn main() -> Result<()> {
     let mut config = Box::pin(Config::load_or_init()).await?;
     config.apply_env_overrides();
     #[cfg(feature = "agent-runtime")]
-    observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir);
+    observability::runtime_trace::init_from_config(&config.observability, &config.workspace_dir)
+        .await;
     #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
         let config_dir = config
