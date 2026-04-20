@@ -711,12 +711,11 @@ impl SqliteMemory {
             CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
             CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC);
             -- Indexes on 5W1H / tier columns are created AFTER the ALTER TABLE
-            -- migrations below. Older databases (pre-5W1H) don't have these
-            -- columns yet, so creating the indexes here would abort the whole
-            -- batch with "no such column: when_at" before the migrations get
-            -- a chance to add them. The second `execute_batch` further down
-            -- re-creates them (IF NOT EXISTS) once the columns are guaranteed
-            -- to exist for both fresh and upgraded schemas.
+            -- migrations below. Older databases (pre-5W1H) lack those columns,
+            -- so creating the indexes here would abort the batch before the
+            -- migrations get to add them. The second execute_batch further
+            -- down re-creates these indexes (IF NOT EXISTS) once the columns
+            -- are guaranteed to exist on both fresh and upgraded schemas.
             -- Note: no explicit index on `key` — the UNIQUE constraint already
             -- creates an implicit unique B-tree index, so a second one would
             -- waste space and slow inserts.
