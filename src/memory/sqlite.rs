@@ -1115,22 +1115,26 @@ impl SqliteMemory {
             CREATE INDEX IF NOT EXISTS idx_timeline_source_ref
                 ON memory_timeline(source_ref);
             CREATE INDEX IF NOT EXISTS idx_timeline_event_type
-                ON memory_timeline(event_type, event_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_timeline_location
-                ON memory_timeline(location) WHERE location IS NOT NULL;",
+                ON memory_timeline(event_type, event_at DESC);",
         )?;
 
-        // Migration: add location column for pre-existing DBs created before this change.
+        // Migration: add location column for pre-existing DBs created before
+        // this change. The index creation is run AFTER this conditional block so
+        // that both fresh and upgraded schemas get the index without racing the
+        // ALTER TABLE (see idx_memories_when_at for the prior instance of this
+        // same migration-order pitfall).
         let timeline_sql: String = conn
             .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_timeline'")?
             .query_row([], |row| row.get::<_, String>(0))?;
         if !timeline_sql.contains("location") {
             conn.execute_batch(
-                "ALTER TABLE memory_timeline ADD COLUMN location TEXT;
-                 CREATE INDEX IF NOT EXISTS idx_timeline_location
-                     ON memory_timeline(location) WHERE location IS NOT NULL;",
+                "ALTER TABLE memory_timeline ADD COLUMN location TEXT;",
             )?;
         }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_timeline_location
+                 ON memory_timeline(location) WHERE location IS NOT NULL;",
+        )?;
 
         // Append-only enforcement: block UPDATE on memory_timeline
         conn.execute_batch(
