@@ -38,6 +38,7 @@ Dernière mise à jour : **18 février 2026**.
 - [providers-reference.md](reference/api/providers-reference.md)
 - [channels-reference.md](reference/api/channels-reference.md)
 - [nextcloud-talk-setup.md](setup-guides/nextcloud-talk-setup.md)
+- [line-setup.md](setup-guides/line-setup.md)
 - [config-reference.md](reference/api/config-reference.md)
 - [custom-providers.md](contributing/custom-providers.md)
 - [zai-glm-setup.md](setup-guides/zai-glm-setup.md)

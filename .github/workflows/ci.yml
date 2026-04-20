@@ -1,0 +1,249 @@
+name: Quality Gate
+
+on:
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ── Stage 1: Lint (fast gate — fails early before burning compute) ────────
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: >
+          cargo clippy
+          --workspace
+          --exclude zeroclaw-desktop
+          --all-targets
+          --features ci-all
+          -- -D warnings
+
+  docs:
+    name: Docs Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4
+        with:
+          node-version: 20
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Run docs quality gate
+        run: bash scripts/ci/docs_quality_gate.sh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+
+  # ── Stage 2: Build + Check (parallel, gated on lint) ─────────────────────
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [lint]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        if: runner.os != 'Windows'
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install mold linker
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y mold
+      - name: Ensure web/dist placeholder exists
+        shell: bash
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Build
+        shell: bash
+        run: cargo build --profile ci --locked --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
+  check:
+    name: Check (${{ matrix.name }})
+    needs: [lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: all features
+            args: --features ci-all
+            sys_deps: libudev-dev
+          - name: no default features
+            args: --no-default-features
+            sys_deps: ""
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install system dependencies
+        if: matrix.sys_deps != ''
+        run: sudo apt-get update -qq && sudo apt-get install -y ${{ matrix.sys_deps }}
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Check
+        run: cargo check --locked ${{ matrix.args }}
+
+  check-32bit:
+    name: Check (32-bit)
+    needs: [lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+          targets: i686-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install 32-bit system libraries
+        run: sudo apt-get update -qq && sudo apt-get install -y gcc-multilib
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Check (32-bit, no default features)
+        run: cargo check --locked --target i686-unknown-linux-gnu --no-default-features
+
+  bench:
+    name: Benchmarks Compile
+    needs: [lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Verify benchmarks compile
+        run: cargo bench --no-run --locked
+
+  # ── Stage 3: Test (gated on lint) ────────────────────────────────────────
+
+  test:
+    name: Test
+    needs: [lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Install mold linker
+        run: sudo apt-get update -qq && sudo apt-get install -y mold
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+      - name: Run tests
+        run: cargo nextest run --locked
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
+  # ── Stage 4: Security (parallel with test, gated on lint) ────────────────
+
+  security:
+    name: Security
+    needs: [lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Check licenses, sources, and advisories
+        run: cargo deny check
+
+  # ── Stage 5: Required gate ────────────────────────────────────────────────
+  # Branch protection requires only this single job — internal structure
+  # can change without touching branch protection settings.
+
+  gate:
+    name: CI Required Gate
+    if: always()
+    needs: [lint, docs, build, check, check-32bit, bench, test, security]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "::error::One or more CI jobs failed or were cancelled"
+            exit 1
+          fi

@@ -33,6 +33,7 @@ Schema export command:
 | `backend` | `none` | Observability backend: `none`, `noop`, `log`, `prometheus`, `otel`, `opentelemetry`, or `otlp` |
 | `otel_endpoint` | `http://localhost:4318` | OTLP HTTP endpoint used when backend is `otel` |
 | `otel_service_name` | `zeroclaw` | Service name emitted to OTLP collector |
+| `otel_headers` | _(none)_ | Optional HTTP headers for OTLP export (e.g. authorization). Specified as a TOML table `[observability.otel_headers]`. Edit in `config.toml` directly — not settable via `zeroclaw config set`. Values are stored in plaintext; protect `config.toml` with `chmod 600`. |
 | `runtime_trace_mode` | `none` | Runtime trace storage mode: `none`, `rolling`, or `full` |
 | `runtime_trace_path` | `state/runtime-trace.jsonl` | Runtime trace JSONL path (relative to workspace unless absolute) |
 | `runtime_trace_max_entries` | `200` | Maximum retained events when `runtime_trace_mode = "rolling"` |
@@ -57,6 +58,9 @@ otel_service_name = "zeroclaw"
 runtime_trace_mode = "rolling"
 runtime_trace_path = "state/runtime-trace.jsonl"
 runtime_trace_max_entries = 200
+
+[observability.otel_headers]
+Authorization = "Bearer <your-token>"
 ```
 
 ## Environment Provider Overrides
@@ -722,6 +726,8 @@ Cloud API mode (Meta webhook):
 | `verify_token` | Yes | Webhook verification token |
 | `app_secret` | Optional | Enables webhook signature verification (`X-Hub-Signature-256`) |
 | `allowed_numbers` | Recommended | Allowed inbound numbers (`[]` = deny all, `"*"` = allow all) |
+| `dm_mention_patterns` | Optional | Regex patterns for DM mention gating (case-insensitive); matched fragments are stripped |
+| `group_mention_patterns` | Optional | Regex patterns for group-chat mention gating (case-insensitive); matched fragments are stripped |
 
 WhatsApp Web mode (native client):
 
@@ -732,6 +738,8 @@ WhatsApp Web mode (native client):
 | `pair_code` | Optional | Custom pair code (otherwise auto-generated) |
 | `allowed_numbers` | Recommended | Allowed inbound numbers (`[]` = deny all, `"*"` = allow all) |
 | `mention_only` | Optional | When `true`, only respond to group messages that @-mention the bot (DMs always processed) |
+| `dm_mention_patterns` | Optional | Regex patterns for DM mention gating (case-insensitive); matched fragments are stripped |
+| `group_mention_patterns` | Optional | Regex patterns for group-chat mention gating (case-insensitive); matched fragments are stripped |
 
 Notes:
 
