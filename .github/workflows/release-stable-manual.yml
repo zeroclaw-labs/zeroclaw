@@ -474,66 +474,6 @@ jobs:
             echo "No CHANGELOG-next.md to clean up."
           fi
 
-  crates-io:
-    name: Publish to crates.io
-    needs: [validate, publish]
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    environment:
-      name: crates-io
-      url: https://crates.io/crates/zeroclawlabs/${{ needs.validate.outputs.version }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.93.0
-
-      - uses: Swatinem/rust-cache@v2
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-
-      - name: Build web dashboard
-        run: cd web && npm ci && npm run build
-
-      - name: Clean web build artifacts
-        run: rm -rf web/node_modules web/src web/package.json web/package-lock.json web/tsconfig*.json web/vite.config.ts web/index.html
-
-      - name: Publish aardvark-sys to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          OUTPUT=$(cargo publish --locked --allow-dirty --no-verify -p aardvark-sys 2>&1) && exit 0
-          echo "$OUTPUT"
-          if echo "$OUTPUT" | grep -q 'already exists'; then
-            echo "::notice::aardvark-sys already on crates.io — skipping"
-            exit 0
-          fi
-          exit 1
-
-      - name: Wait for aardvark-sys to index
-        run: sleep 15
-
-      - name: Publish to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          VERSION: ${{ inputs.version }}
-        run: |
-          # Publish to crates.io; treat "already exists" as success
-          # (auto-publish workflow may have already published this version)
-          CRATE_NAME=$(sed -n 's/^name = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
-          OUTPUT=$(cargo publish --locked --allow-dirty --no-verify 2>&1) && exit 0
-          echo "$OUTPUT"
-          if echo "$OUTPUT" | grep -q 'already exists'; then
-            echo "::notice::${CRATE_NAME}@${VERSION} already on crates.io — skipping"
-            exit 0
-          fi
-          exit 1
-
   redeploy-website:
     name: Trigger Website Redeploy
     needs: [publish]
