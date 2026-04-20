@@ -2111,8 +2111,10 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     let stripped_summary = strip_tool_summary_prefix(trimmed_response);
     // Strip XML-style tool-call tags (e.g. <tool_call>...</tool_call>)
     let stripped_xml = strip_tool_call_tags(&stripped_summary);
+    // Strip XML-style tool-result blocks (e.g. <tool_result>...</tool_result>)
+    let stripped_results = strip_tool_result_content(&stripped_xml);
     // Strip isolated tool-call JSON artifacts
-    let stripped_json = strip_isolated_tool_json_artifacts(&stripped_xml, &known_tool_names);
+    let stripped_json = strip_isolated_tool_json_artifacts(&stripped_results, &known_tool_names);
     // Strip leading narration lines that announce tool usage
     let sanitized = strip_tool_narration(&stripped_json);
 
@@ -11861,6 +11863,26 @@ This is an example JSON object for profile settings."#;
         let result = sanitize_channel_response(clean_text, &tools);
 
         assert_eq!(result, clean_text);
+    }
+
+    #[test]
+    fn sanitize_channel_response_strips_xml_tool_result_blocks() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let input = "<tool_result>\n{\"results\":[]}\n</tool_result>\n<tool_result>\n{\"command\":\"ls\",\"exit_code\":0}\n</tool_result>Here is what I found.";
+        let result = sanitize_channel_response(input, &tools);
+        assert!(!result.contains("tool_result"));
+        assert!(!result.contains("exit_code"));
+        assert!(result.contains("Here is what I found."));
+    }
+
+    #[test]
+    fn sanitize_channel_response_strips_mixed_tool_result_and_text() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let input = "Let me check.\n<tool_result name=\"shell\">\noutput here\n</tool_result>\nThe answer is 42.";
+        let result = sanitize_channel_response(input, &tools);
+        assert!(!result.contains("<tool_result"));
+        assert!(!result.contains("output here"));
+        assert!(result.contains("The answer is 42."));
     }
 
     // ── Tests for strip_think_tags_inline (streaming draft sanitization) ──
