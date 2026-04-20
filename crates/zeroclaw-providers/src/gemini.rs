@@ -5,10 +5,13 @@
 //! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
 use crate::auth::AuthService;
-use crate::traits::{ChatMessage, Provider, TokenUsage};
+use crate::traits::{
+    ChatMessage, Provider, StreamChunk, StreamError, StreamOptions, StreamResult, TokenUsage,
+};
 use async_trait::async_trait;
 use base64::Engine;
 use directories::UserDirs;
+use futures_util::{StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -289,6 +292,29 @@ impl GenerateContentResponse {
             other => other,
         }
     }
+}
+
+/// One SSE `data:` payload from `:streamGenerateContent?alt=sse`.
+///
+/// Gemini streaming reuses the non-streaming response shape per chunk: each
+/// chunk carries a (possibly partial) `candidates[0].content.parts` array and
+/// may include a `finishReason` / `usageMetadata` on the tail frame.
+/// Tail frames with only `finishReason` (no `content.parts`) are normal and
+/// must be tolerated — see docs in `stream_generate_content`.
+#[derive(Debug, Deserialize)]
+struct StreamCandidate {
+    #[serde(default)]
+    content: Option<CandidateContent>,
+    #[serde(default, rename = "finishReason")]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamGenerateContentChunk {
+    #[serde(default)]
+    candidates: Option<Vec<StreamCandidate>>,
+    #[serde(default)]
+    error: Option<ApiError>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1192,6 +1218,247 @@ impl GeminiProvider {
 
         Ok((text, usage))
     }
+
+    /// URL for the public streaming endpoint.
+    ///
+    /// Streaming is currently wired up for API-key auth only; the OAuth/
+    /// cloudcode-pa path does not expose a publicly documented
+    /// `:streamGenerateContent` shape and is handled by the non-streaming
+    /// fallback (`supports_streaming()` returns `false` for OAuth variants).
+    fn build_stream_generate_content_url(model: &str, auth: &GeminiAuth) -> String {
+        let model_name = Self::format_model_name(model);
+        let base_url = format!("{PUBLIC_API_ENDPOINT}/{model_name}:streamGenerateContent?alt=sse");
+        if auth.is_api_key() {
+            format!("{base_url}&key={}", auth.api_key_credential())
+        } else {
+            base_url
+        }
+    }
+
+    /// Streaming counterpart to [`send_generate_content`].
+    ///
+    /// API-key path only. For OAuth/ManagedOAuth auth, `supports_streaming()`
+    /// returns `false` so the caller falls back to `chat_with_history`.
+    ///
+    /// Each SSE event is a `data: {...}\n\n` with the same shape as the
+    /// non-streaming response; the tail frame may omit `content.parts` while
+    /// carrying a `finishReason`. We emit a `StreamChunk::delta(text)` per
+    /// non-thought text part and a `StreamChunk::reasoning(text)` per
+    /// `thought: true` part; a `StreamChunk::final_chunk()` is emitted when
+    /// the underlying HTTP stream ends.
+    fn stream_generate_content(
+        &self,
+        contents: Vec<Content>,
+        system_instruction: Option<Content>,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+        let auth = match self.auth.as_ref() {
+            Some(a) if a.is_api_key() => a,
+            Some(_) => {
+                let tx_err = tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx_err
+                        .send(Err(StreamError::Provider(
+                            "Gemini streaming is only supported for API-key auth; \
+                             OAuth variants fall back to non-streaming chat"
+                                .into(),
+                        )))
+                        .await;
+                });
+                return stream::unfold(rx, |mut rx| async move {
+                    rx.recv().await.map(|chunk| (chunk, rx))
+                })
+                .boxed();
+            }
+            None => {
+                let tx_err = tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx_err
+                        .send(Err(StreamError::Provider(
+                            "Gemini API key not found. Set GEMINI_API_KEY or configure \
+                             [provider.gemini]."
+                                .into(),
+                        )))
+                        .await;
+                });
+                return stream::unfold(rx, |mut rx| async move {
+                    rx.recv().await.map(|chunk| (chunk, rx))
+                })
+                .boxed();
+            }
+        };
+
+        let request = GenerateContentRequest {
+            contents,
+            system_instruction,
+            generation_config: GenerationConfig {
+                temperature,
+                max_output_tokens: 8192,
+            },
+        };
+
+        let url = Self::build_stream_generate_content_url(model, auth);
+        let client = self.http_client();
+        let count_tokens = options.count_tokens;
+
+        tokio::spawn(async move {
+            let response = match client.post(&url).json(&request).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    return;
+                }
+            };
+
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                let _ = tx
+                    .send(Err(StreamError::Http(format!(
+                        "Gemini stream API error ({status}): {}",
+                        body.trim()
+                    ))))
+                    .await;
+                return;
+            }
+
+            let mut bytes_stream = response.bytes_stream();
+            let mut buffer = String::new();
+            let mut utf8_buf: Vec<u8> = Vec::new();
+
+            while let Some(item) = bytes_stream.next().await {
+                match item {
+                    Ok(bytes) => {
+                        utf8_buf.extend_from_slice(&bytes);
+                        let text = match std::str::from_utf8(&utf8_buf) {
+                            Ok(s) => {
+                                let owned = s.to_string();
+                                utf8_buf.clear();
+                                owned
+                            }
+                            Err(e) => {
+                                let valid_up_to = e.valid_up_to();
+                                if valid_up_to == 0 && utf8_buf.len() < 4 {
+                                    continue;
+                                }
+                                let valid =
+                                    String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
+                                utf8_buf.drain(..valid_up_to);
+                                valid
+                            }
+                        };
+                        if text.is_empty() {
+                            continue;
+                        }
+                        buffer.push_str(&text);
+
+                        while let Some(pos) = buffer.find('\n') {
+                            let line = buffer[..pos].to_string();
+                            buffer.drain(..=pos);
+
+                            match parse_gemini_sse_line(&line) {
+                                Ok(chunks) => {
+                                    for chunk in chunks {
+                                        let chunk = if count_tokens {
+                                            chunk.with_token_estimate()
+                                        } else {
+                                            chunk
+                                        };
+                                        if tx.send(Ok(chunk)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Err(e)).await;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                        return;
+                    }
+                }
+            }
+
+            let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+        });
+
+        stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|chunk| (chunk, rx))
+        })
+        .boxed()
+    }
+}
+
+/// Parse one SSE line from Gemini's `:streamGenerateContent?alt=sse` stream
+/// into zero or more [`StreamChunk`]s.
+///
+/// Gemini emits `data: {...}\n\n` frames with the same shape as a non-streaming
+/// [`GenerateContentResponse`]; there is no `[DONE]` sentinel. Each frame may
+/// contain multiple text parts (and optional `thought: true` reasoning parts),
+/// so we return a `Vec` to preserve part order. Tail frames with only
+/// `finishReason` and no `content.parts` are normal and yield an empty vec.
+fn parse_gemini_sse_line(line: &str) -> StreamResult<Vec<StreamChunk>> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with(':') {
+        return Ok(Vec::new());
+    }
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(Vec::new());
+    };
+    let data = data.trim();
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parsed: StreamGenerateContentChunk =
+        serde_json::from_str(data).map_err(StreamError::Json)?;
+
+    if let Some(err) = parsed.error {
+        return Err(StreamError::Provider(err.message));
+    }
+
+    let mut out = Vec::new();
+    let Some(candidates) = parsed.candidates else {
+        return Ok(out);
+    };
+    let Some(candidate) = candidates.into_iter().next() else {
+        return Ok(out);
+    };
+
+    // Warn when Gemini halts for a non-STOP reason (SAFETY, RECITATION, etc.)
+    // — the response may be truncated or empty even though the HTTP layer is OK.
+    if let Some(reason) = candidate.finish_reason.as_deref()
+        && !matches!(reason, "STOP" | "MAX_TOKENS" | "")
+    {
+        tracing::warn!("Gemini stream halted with finishReason={reason}");
+    }
+
+    let Some(content) = candidate.content else {
+        // Tail frame carrying only `finishReason` — no content to emit.
+        return Ok(out);
+    };
+
+    for part in content.parts {
+        let Some(text) = part.text else { continue };
+        if text.is_empty() {
+            continue;
+        }
+        if part.thought {
+            out.push(StreamChunk::reasoning(text));
+        } else {
+            out.push(StreamChunk::delta(text));
+        }
+    }
+
+    Ok(out)
 }
 
 #[async_trait]
@@ -1202,6 +1469,73 @@ impl Provider for GeminiProvider {
             native_tool_calling: false,
             prompt_caching: false,
         }
+    }
+
+    /// Gemini supports SSE streaming via `:streamGenerateContent?alt=sse`.
+    /// Only enabled for API-key auth; OAuth variants (Gemini CLI, managed
+    /// auth-profiles) do not expose a public streaming shape, so we advertise
+    /// `false` and let callers fall back to `chat_with_history`.
+    fn supports_streaming(&self) -> bool {
+        self.auth
+            .as_ref()
+            .map(GeminiAuth::is_api_key)
+            .unwrap_or(false)
+    }
+
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let system_instruction = system_prompt.map(|sys| Content {
+            role: None,
+            parts: vec![Part::text(sys)],
+        });
+        let contents = vec![Content {
+            role: Some("user".to_string()),
+            parts: build_parts(message),
+        }];
+        self.stream_generate_content(contents, system_instruction, model, temperature, options)
+    }
+
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let mut system_parts: Vec<&str> = Vec::new();
+        let mut contents: Vec<Content> = Vec::new();
+
+        for msg in messages {
+            match msg.role.as_str() {
+                "system" => system_parts.push(&msg.content),
+                "user" => contents.push(Content {
+                    role: Some("user".to_string()),
+                    parts: build_parts(&msg.content),
+                }),
+                "assistant" => contents.push(Content {
+                    role: Some("model".to_string()),
+                    parts: vec![Part::text(&msg.content)],
+                }),
+                _ => {}
+            }
+        }
+
+        let system_instruction = if system_parts.is_empty() {
+            None
+        } else {
+            Some(Content {
+                role: None,
+                parts: vec![Part::text(system_parts.join("\n\n"))],
+            })
+        };
+
+        self.stream_generate_content(contents, system_instruction, model, temperature, options)
     }
 
     async fn chat_with_system(
@@ -2255,6 +2589,109 @@ mod tests {
         // Should have just the inline part (text is empty after marker removal)
         assert_eq!(parts.len(), 1);
         assert!(matches!(&parts[0], Part::Inline { .. }));
+    }
+
+    // ── Streaming: supports_streaming + URL + SSE parsing ────────────────
+
+    #[test]
+    fn supports_streaming_true_for_api_key() {
+        let provider = test_provider(Some(GeminiAuth::ExplicitKey("key".into())));
+        assert!(provider.supports_streaming());
+    }
+
+    #[test]
+    fn supports_streaming_false_for_oauth() {
+        let provider = test_provider(Some(test_oauth_auth("ya29.mock")));
+        assert!(!provider.supports_streaming());
+    }
+
+    #[test]
+    fn supports_streaming_false_without_auth() {
+        let provider = test_provider(None);
+        assert!(!provider.supports_streaming());
+    }
+
+    #[test]
+    fn stream_url_api_key_includes_alt_sse_and_key() {
+        let auth = GeminiAuth::ExplicitKey("test-key".into());
+        let url = GeminiProvider::build_stream_generate_content_url("gemini-2.5-flash", &auth);
+        assert!(
+            url.contains(":streamGenerateContent?alt=sse"),
+            "URL missing streaming path: {url}"
+        );
+        assert!(url.contains("&key=test-key"), "URL missing key: {url}");
+        assert!(
+            url.contains("models/gemini-2.5-flash"),
+            "URL missing model: {url}"
+        );
+    }
+
+    #[test]
+    fn parse_sse_skips_empty_and_comment_lines() {
+        assert!(parse_gemini_sse_line("").unwrap().is_empty());
+        assert!(parse_gemini_sse_line(":ping").unwrap().is_empty());
+        assert!(parse_gemini_sse_line("  ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_sse_extracts_text_delta() {
+        let line =
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"안녕"}],"role":"model"}}]}"#;
+        let chunks = parse_gemini_sse_line(line).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].delta, "안녕");
+        assert!(chunks[0].reasoning.is_none());
+        assert!(!chunks[0].is_final);
+    }
+
+    #[test]
+    fn parse_sse_emits_reasoning_chunks_for_thought_parts() {
+        let line = r#"data: {"candidates":[{"content":{"parts":[{"thought":true,"text":"planning..."},{"text":"final answer"}],"role":"model"}}]}"#;
+        let chunks = parse_gemini_sse_line(line).unwrap();
+        assert_eq!(
+            chunks.len(),
+            2,
+            "expected reasoning + delta, got {chunks:?}"
+        );
+        assert_eq!(chunks[0].reasoning.as_deref(), Some("planning..."));
+        assert_eq!(chunks[0].delta, "");
+        assert_eq!(chunks[1].delta, "final answer");
+        assert!(chunks[1].reasoning.is_none());
+    }
+
+    #[test]
+    fn parse_sse_tolerates_tail_frame_without_content() {
+        let line = r#"data: {"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}"#;
+        let chunks = parse_gemini_sse_line(line).unwrap();
+        assert!(
+            chunks.is_empty(),
+            "tail frame should emit no chunks, got {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn parse_sse_surfaces_error_payloads() {
+        let line = r#"data: {"error":{"code":400,"message":"API key not valid","status":"INVALID_ARGUMENT"}}"#;
+        let err = parse_gemini_sse_line(line).err().unwrap();
+        assert!(
+            err.to_string().contains("API key not valid"),
+            "expected error propagation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_sse_skips_empty_text_parts() {
+        let line = r#"data: {"candidates":[{"content":{"parts":[{"text":""},{"text":"hi"}],"role":"model"}}]}"#;
+        let chunks = parse_gemini_sse_line(line).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].delta, "hi");
+    }
+
+    #[test]
+    fn parse_sse_ignores_non_data_prefix() {
+        // event:, id:, retry: lines are valid SSE metadata we don't consume.
+        assert!(parse_gemini_sse_line("event: message").unwrap().is_empty());
+        assert!(parse_gemini_sse_line("id: 42").unwrap().is_empty());
     }
 
     // ── chat_with_history uses build_parts for user messages ─────────────
