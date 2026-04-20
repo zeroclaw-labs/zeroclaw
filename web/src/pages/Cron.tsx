@@ -403,7 +403,7 @@ export default function Cron() {
       {/* Unified Add / Edit Modal */}
       {modalJob !== null && (
         <div className="fixed inset-0 modal-backdrop flex items-center justify-center z-50">
-          <div className="surface-panel p-6 w-full max-w-md mx-4 animate-fade-in-scale">
+          <div className="surface-panel p-6 w-full max-w-md mx-4 animate-fade-in-scale mt-15">
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-lg font-semibold" style={{ color: 'var(--pc-text-primary)' }}>
                 {isEditing ? t('cron.edit_modal_title') : t('cron.add_modal_title')}
