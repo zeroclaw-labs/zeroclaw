@@ -924,24 +924,14 @@ pub fn all_tools_with_runtime(
                 plugin_path.parent().unwrap_or(&plugin_path),
             ) {
                 Ok(host) => {
-                    let tool_manifests = host.tool_plugins();
-                    let count = tool_manifests.len();
-                    for manifest in tool_manifests {
-                        tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::new(
+                    let details = host.tool_plugin_details();
+                    let count = details.len();
+                    for (manifest, wasm_path) in details {
+                        tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
+                            wasm_path.to_path_buf(),
+                            manifest.permissions.clone(),
                             manifest.name.clone(),
                             manifest.description.clone().unwrap_or_default(),
-                            manifest.name.clone(),
-                            "call".to_string(),
-                            serde_json::json!({
-                                "type": "object",
-                                "properties": {
-                                    "input": {
-                                        "type": "string",
-                                        "description": "Input for the plugin"
-                                    }
-                                },
-                                "required": ["input"]
-                            }),
                         )));
                     }
                     tracing::info!("Loaded {count} WASM plugin tools");
