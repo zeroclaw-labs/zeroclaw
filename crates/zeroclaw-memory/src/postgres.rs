@@ -63,7 +63,10 @@ impl PostgresMemory {
     }
 
     async fn run_migrations(&self, pool: &Pool) -> Result<()> {
-        let client = pool.get().await.context("failed to get connection for migrations")?;
+        let client = pool
+            .get()
+            .await
+            .context("failed to get connection for migrations")?;
 
         let query = format!(
             r#"
@@ -177,8 +180,20 @@ impl Memory for PostgresMemory {
 
         client
             .execute(
-                &client.prepare(&query).await.context("postgres: prepare failed")?,
-                &[&id, &key, &content, &cat, &now, &session_id, &ns, &importance],
+                &client
+                    .prepare(&query)
+                    .await
+                    .context("postgres: prepare failed")?,
+                &[
+                    &id,
+                    &key,
+                    &content,
+                    &cat,
+                    &now,
+                    &session_id,
+                    &ns,
+                    &importance,
+                ],
             )
             .await
             .context("postgres: failed to store memory")?;
@@ -203,7 +218,8 @@ impl Memory for PostgresMemory {
              FROM {} WHERE content ILIKE $1",
             self.qualified_table(),
         );
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![Box::new(pattern)];
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            vec![Box::new(pattern)];
 
         if let Some(sid) = session_id {
             sql.push_str(&format!(" AND session_id = ${}", params.len() + 1));
@@ -221,12 +237,20 @@ impl Memory for PostgresMemory {
         }
 
         let lim = limit as i64;
-        sql.push_str(&format!(" ORDER BY timestamp DESC LIMIT ${}", params.len() + 1));
+        sql.push_str(&format!(
+            " ORDER BY timestamp DESC LIMIT ${}",
+            params.len() + 1
+        ));
         params.push(Box::new(lim));
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let stmt = client.prepare(&sql).await.context("postgres: prepare failed")?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let stmt = client
+            .prepare(&sql)
+            .await
+            .context("postgres: prepare failed")?;
         let rows = client
             .query(&stmt, &param_refs)
             .await
@@ -243,7 +267,10 @@ impl Memory for PostgresMemory {
              FROM {} WHERE key = $1 LIMIT 1",
             self.qualified_table(),
         );
-        let stmt = client.prepare(&sql).await.context("postgres: prepare failed")?;
+        let stmt = client
+            .prepare(&sql)
+            .await
+            .context("postgres: prepare failed")?;
         let row = client
             .query_opt(&stmt, &[&key])
             .await
@@ -276,9 +303,14 @@ impl Memory for PostgresMemory {
         }
         sql.push_str(" ORDER BY timestamp DESC");
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let stmt = client.prepare(&sql).await.context("postgres: prepare failed")?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let stmt = client
+            .prepare(&sql)
+            .await
+            .context("postgres: prepare failed")?;
         let rows = client
             .query(&stmt, &param_refs)
             .await
@@ -291,7 +323,10 @@ impl Memory for PostgresMemory {
         let pool = self.pool().await?;
         let client = pool.get().await.context("postgres: connection failed")?;
         let sql = format!("DELETE FROM {} WHERE key = $1", self.qualified_table());
-        let stmt = client.prepare(&sql).await.context("postgres: prepare failed")?;
+        let stmt = client
+            .prepare(&sql)
+            .await
+            .context("postgres: prepare failed")?;
         let count = client
             .execute(&stmt, &[&key])
             .await
@@ -306,7 +341,10 @@ impl Memory for PostgresMemory {
             "DELETE FROM {} WHERE namespace = $1",
             self.qualified_table()
         );
-        let stmt = client.prepare(&sql).await.context("postgres: prepare failed")?;
+        let stmt = client
+            .prepare(&sql)
+            .await
+            .context("postgres: prepare failed")?;
         let count = client
             .execute(&stmt, &[&namespace])
             .await
@@ -321,7 +359,10 @@ impl Memory for PostgresMemory {
             "DELETE FROM {} WHERE session_id = $1",
             self.qualified_table()
         );
-        let stmt = client.prepare(&sql).await.context("postgres: prepare failed")?;
+        let stmt = client
+            .prepare(&sql)
+            .await
+            .context("postgres: prepare failed")?;
         let count = client
             .execute(&stmt, &[&session_id])
             .await
@@ -396,12 +437,20 @@ impl Memory for PostgresMemory {
         }
 
         let lim = limit as i64;
-        sql.push_str(&format!(" ORDER BY timestamp DESC LIMIT ${}", params.len() + 1));
+        sql.push_str(&format!(
+            " ORDER BY timestamp DESC LIMIT ${}",
+            params.len() + 1
+        ));
         params.push(Box::new(lim));
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let stmt = client.prepare(&sql).await.context("postgres: prepare failed")?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let stmt = client
+            .prepare(&sql)
+            .await
+            .context("postgres: prepare failed")?;
         let rows = client
             .query(&stmt, &param_refs)
             .await
@@ -445,9 +494,14 @@ impl Memory for PostgresMemory {
         }
         sql.push_str(" ORDER BY timestamp ASC");
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let stmt = client.prepare(&sql).await.context("postgres: prepare failed")?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let stmt = client
+            .prepare(&sql)
+            .await
+            .context("postgres: prepare failed")?;
         let rows = client
             .query(&stmt, &param_refs)
             .await
