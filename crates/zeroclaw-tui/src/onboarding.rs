@@ -14,6 +14,7 @@ use ratatui::{
 };
 use std::io::{self, IsTerminal};
 
+use zeroclaw_config::channel_catalog::ONBOARDING_CHANNELS;
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::{
     DiscordConfig, FeishuConfig, IMessageConfig, IrcConfig, LarkConfig, LarkReceiveMode,
@@ -194,30 +195,7 @@ const TIER_PROVIDERS: &[&[(&str, &str, &str)]] = &[
     )],
 ];
 
-const CHANNELS: &[(&str, &str, bool)] = &[
-    ("Telegram", "Bot API", false),
-    ("WhatsApp", "QR link", true),
-    ("Discord", "Bot API", false),
-    ("IRC", "Server + Nick", false),
-    ("Google Chat", "Chat API", true),
-    ("Slack", "Socket Mode", false),
-    ("Signal", "signal-cli", false),
-    ("iMessage", "imsg", false),
-    ("LINE", "Messaging API", false),
-    ("Mattermost", "plugin", false),
-    ("Nextcloud Talk", "self-hosted", false),
-    ("Feishu/Lark", "\u{98de}\u{4e66}", false),
-    ("BlueBubbles", "macOS app", false),
-    ("Zalo", "Bot API", false),
-    ("Synology Chat", "Webhook", false),
-    ("Nostr", "NIP-04 DMs", true),
-    ("Microsoft Teams", "Teams SDK", true),
-    ("Matrix", "plugin", true),
-    ("Zalo Personal", "Personal Account", true),
-    ("Tlon", "Urbit", true),
-    ("Twitch", "Chat", true),
-    ("Skip for now", "configure later", false),
-];
+const CHANNELS: &[zeroclaw_config::channel_catalog::OnboardingChannelOption] = ONBOARDING_CHANNELS;
 
 const SETUP_MODES: &[&str] = &["QuickStart", "Full Setup (9 steps)", "Skip for now"];
 
@@ -556,7 +534,13 @@ impl App {
     }
 
     fn selected_channel(&self) -> &str {
-        CHANNELS.get(self.channel_idx).map_or("Skip", |c| c.0)
+        CHANNELS
+            .get(self.channel_idx)
+            .map_or("Skip for now", |c| c.display_name)
+    }
+
+    fn selected_channel_id(&self) -> &str {
+        CHANNELS.get(self.channel_idx).map_or("skip", |c| c.id)
     }
 
     fn selected_search_provider(&self) -> &str {
@@ -664,7 +648,7 @@ pub async fn run_tui_onboarding() -> Result<()> {
                 }
                 println!();
                 let channel = app.selected_channel();
-                if channel != "Skip for now" {
+                if app.selected_channel_id() != "skip" {
                     println!("  Next: edit config.toml to add your {channel} credentials.");
                     println!("        zeroclaw config edit");
                     println!();
@@ -741,9 +725,9 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
     // Create a stub config for the selected channel with placeholder
     // values so the section appears in config.toml. The user fills in
     // real tokens via `zeroclaw config edit` or the dashboard.
-    let channel = app.selected_channel();
-    match channel {
-        "Telegram" => {
+    let channel_id = app.selected_channel_id();
+    match channel_id {
+        "telegram" => {
             if config.channels.telegram.is_none() {
                 config.channels.telegram = Some(TelegramConfig {
                     enabled: true,
@@ -759,7 +743,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                 });
             }
         }
-        "Discord" => {
+        "discord" => {
             if config.channels.discord.is_none() {
                 config.channels.discord = Some(DiscordConfig {
                     enabled: true,
@@ -777,7 +761,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                 });
             }
         }
-        "Slack" => {
+        "slack" => {
             if config.channels.slack.is_none() {
                 config.channels.slack = Some(SlackConfig {
                     enabled: true,
@@ -796,7 +780,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                 });
             }
         }
-        "WhatsApp" => {
+        "whatsapp" => {
             if config.channels.whatsapp.is_none() {
                 config.channels.whatsapp = Some(WhatsAppConfig {
                     enabled: true,
@@ -819,7 +803,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                 });
             }
         }
-        "Signal" => {
+        "signal" => {
             if config.channels.signal.is_none() {
                 config.channels.signal = Some(SignalConfig {
                     enabled: true,
@@ -833,7 +817,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                 });
             }
         }
-        "IRC" => {
+        "irc" => {
             if config.channels.irc.is_none() {
                 config.channels.irc = Some(IrcConfig {
                     enabled: true,
@@ -850,7 +834,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                 });
             }
         }
-        "iMessage" => {
+        "imessage" => {
             if config.channels.imessage.is_none() {
                 config.channels.imessage = Some(IMessageConfig {
                     enabled: true,
@@ -858,7 +842,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                 });
             }
         }
-        "Matrix" => {
+        "matrix" => {
             let existing_mx = config.channels.matrix.as_ref();
             if existing_mx.is_none() {
                 config.channels.matrix = Some(MatrixConfig {
@@ -879,7 +863,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                 });
             }
         }
-        "Mattermost" => {
+        "mattermost" => {
             if config.channels.mattermost.is_none() {
                 config.channels.mattermost = Some(MattermostConfig {
                     enabled: true,
@@ -894,7 +878,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                 });
             }
         }
-        "Nextcloud Talk" => {
+        "nextcloud_talk" => {
             if config.channels.nextcloud_talk.is_none() {
                 config.channels.nextcloud_talk = Some(NextcloudTalkConfig {
                     enabled: true,
@@ -907,7 +891,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                 });
             }
         }
-        "Feishu/Lark" => {
+        "feishu_lark" => {
             if config.channels.feishu.is_none() {
                 config.channels.feishu = Some(FeishuConfig {
                     enabled: true,
@@ -2392,15 +2376,15 @@ fn render_channel_select(frame: &mut Frame, area: Rect, app: &App) {
     let items: Vec<SelectableItem> = CHANNELS
         .iter()
         .enumerate()
-        .map(|(i, (name, hint, installed))| SelectableItem {
-            label: name.to_string(),
-            hint: if *installed {
-                format!("{hint} \u{2713} installed")
+        .map(|(i, channel)| SelectableItem {
+            label: channel.display_name.to_string(),
+            hint: if channel.installed {
+                format!("{} \u{2713} installed", channel.hint)
             } else {
-                hint.to_string()
+                channel.hint.to_string()
             },
             is_active: i == app.channel_idx,
-            installed: *installed,
+            installed: channel.installed,
         })
         .collect();
 
@@ -3418,7 +3402,10 @@ mod tests {
     fn save_channel_matrix() {
         let mut app = test_app();
         // Find Matrix index in CHANNELS
-        let matrix_idx = CHANNELS.iter().position(|c| c.0 == "Matrix").unwrap();
+        let matrix_idx = CHANNELS
+            .iter()
+            .position(|c| c.display_name == "Matrix")
+            .unwrap();
         app.channel_idx = matrix_idx;
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
@@ -3449,7 +3436,7 @@ mod tests {
         let mut app = test_app();
         let idx = CHANNELS
             .iter()
-            .position(|c| c.0 == "Nextcloud Talk")
+            .position(|c| c.display_name == "Nextcloud Talk")
             .unwrap();
         app.channel_idx = idx;
         let mut config = Config::default();
@@ -3465,7 +3452,10 @@ mod tests {
     #[test]
     fn save_channel_feishu_lark() {
         let mut app = test_app();
-        let idx = CHANNELS.iter().position(|c| c.0 == "Feishu/Lark").unwrap();
+        let idx = CHANNELS
+            .iter()
+            .position(|c| c.display_name == "Feishu/Lark")
+            .unwrap();
         app.channel_idx = idx;
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
@@ -3476,7 +3466,10 @@ mod tests {
     #[test]
     fn save_channel_skip_does_not_create_stubs() {
         let mut app = test_app();
-        let idx = CHANNELS.iter().position(|c| c.0 == "Skip for now").unwrap();
+        let idx = CHANNELS
+            .iter()
+            .position(|c| c.display_name == "Skip for now")
+            .unwrap();
         app.channel_idx = idx;
         let mut config = Config::default();
         apply_tui_selections_to_config(&app, &mut config);
@@ -3726,7 +3719,10 @@ mod tests {
         // Model: Auto
         app.model_idx = 0;
         // Channel: Skip
-        let skip_idx = CHANNELS.iter().position(|c| c.0 == "Skip for now").unwrap();
+        let skip_idx = CHANNELS
+            .iter()
+            .position(|c| c.display_name == "Skip for now")
+            .unwrap();
         app.channel_idx = skip_idx;
         // Web search: Skip
         app.search_provider_idx = 5;
@@ -3881,7 +3877,7 @@ mod tests {
             let mut app = test_app();
             let idx = CHANNELS
                 .iter()
-                .position(|c| c.0 == *channel_name)
+                .position(|c| c.display_name == *channel_name)
                 .unwrap_or_else(|| panic!("channel {channel_name} not found in CHANNELS"));
             app.channel_idx = idx;
 
