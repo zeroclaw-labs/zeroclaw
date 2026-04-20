@@ -5210,20 +5210,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
-    let tools_registry = Arc::new(built_tools);
-
-    // Extract (name, description) specs from built tools for channel command registration.
-    let tool_specs: Vec<(String, String)> = tools_registry
-        .iter()
-        .map(|t| (t.name().to_string(), t.description().to_string()))
-        .collect();
-
     let skills = zeroclaw_runtime::skills::load_skills_with_config(&workspace, &config);
 
     // Register skill-defined tools so the gateway can execute them (not just
     // describe them in the prompt). Without this, skill tools like email.send
     // appear in the system prompt but return "Unknown tool" when called.
     zeroclaw_runtime::tools::register_skill_tools(&mut built_tools, &skills, security.clone());
+
+    // Extract (name, description) specs from built tools for channel command registration.
+    let tool_specs: Vec<(String, String)> = built_tools
+        .iter()
+        .map(|t| (t.name().to_string(), t.description().to_string()))
+        .collect();
 
     let tools_registry = Arc::new(built_tools);
 
