@@ -552,6 +552,108 @@ impl TranscriptionProvider for GoogleSttProvider {
     }
 }
 
+// ── InworldProvider ─────────────────────────────────────────────
+
+/// Inworld STT provider (`POST https://api.inworld.ai/stt/v1/transcribe`).
+///
+/// Uses HTTP Basic auth with a Base64-encoded API key from Inworld Studio.
+/// Sends audio as Base64-encoded bytes in the JSON body and returns the
+/// `transcription.transcript` field.
+pub struct InworldProvider {
+    api_key: String,
+    model_id: String,
+    audio_encoding: String,
+    language: Option<String>,
+    include_word_timestamps: bool,
+}
+
+impl InworldProvider {
+    /// Build from `[transcription.inworld]` config. Resolves the API key from
+    /// the config field or the `INWORLD_API_KEY` environment variable.
+    pub fn from_config(config: &zeroclaw_config::schema::InworldSttConfig) -> Result<Self> {
+        let api_key = config
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                std::env::var("INWORLD_API_KEY")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            })
+            .context(
+                "Missing Inworld STT API key: set [transcription.inworld].api_key or INWORLD_API_KEY",
+            )?;
+
+        Ok(Self {
+            api_key,
+            model_id: config.model_id.clone(),
+            audio_encoding: config.audio_encoding.clone(),
+            language: config.language.clone(),
+            include_word_timestamps: config.include_word_timestamps,
+        })
+    }
+}
+
+#[async_trait]
+impl TranscriptionProvider for InworldProvider {
+    fn name(&self) -> &str {
+        "inworld"
+    }
+
+    async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
+        validate_audio(audio_data, file_name)?;
+
+        let client = zeroclaw_config::schema::build_runtime_proxy_client("transcription.inworld");
+
+        let audio_content =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, audio_data);
+
+        let mut transcribe_config = serde_json::json!({
+            "modelId": self.model_id,
+            "audioEncoding": self.audio_encoding,
+            "includeWordTimestamps": self.include_word_timestamps,
+        });
+        if let Some(ref lang) = self.language {
+            transcribe_config["language"] = serde_json::Value::String(lang.clone());
+        }
+
+        let body = serde_json::json!({
+            "transcribeConfig": transcribe_config,
+            "audioData": { "content": audio_content },
+        });
+
+        let resp = client
+            .post("https://api.inworld.ai/stt/v1/transcribe")
+            .header("Authorization", format!("Basic {}", self.api_key))
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS))
+            .send()
+            .await
+            .context("Failed to send transcription request to Inworld")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            bail!("Inworld STT API error ({}): {}", status, body_text.trim());
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse Inworld STT response")?;
+
+        let text = body["transcription"]["transcript"]
+            .as_str()
+            .context("Inworld STT response missing 'transcription.transcript' field")?
+            .to_string();
+
+        Ok(text)
+    }
+}
+
 // ── LocalWhisperProvider ────────────────────────────────────────
 
 /// Self-hosted faster-whisper-compatible STT provider.
@@ -734,6 +836,12 @@ impl TranscriptionManager {
             }
         }
 
+        if let Some(ref inworld_cfg) = config.inworld
+            && let Ok(p) = InworldProvider::from_config(inworld_cfg)
+        {
+            providers.insert("inworld".to_string(), Box::new(p));
+        }
+
         let default_provider = config.default_provider.clone();
 
         if config.enabled && !providers.contains_key(&default_provider) {
@@ -836,6 +944,13 @@ pub async fn transcribe_audio(
             )?;
             let google = GoogleSttProvider::from_config(google_cfg)?;
             google.transcribe(&audio_data, file_name).await
+        }
+        "inworld" => {
+            let inworld_cfg = config.inworld.as_ref().context(
+                "Default transcription provider 'inworld' is not configured. Add [transcription.inworld]",
+            )?;
+            let inworld = InworldProvider::from_config(inworld_cfg)?;
+            inworld.transcribe(&audio_data, file_name).await
         }
         other => bail!("Unsupported transcription provider '{other}'"),
     }
@@ -1135,7 +1250,59 @@ mod tests {
         assert!(config.assemblyai.is_none());
         assert!(config.google.is_none());
         assert!(config.local_whisper.is_none());
+        assert!(config.inworld.is_none());
         assert!(!config.transcribe_non_ptt_audio);
+    }
+
+    // ── InworldProvider tests ────────────────────────────────────
+
+    #[test]
+    fn inworld_provider_requires_api_key() {
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("INWORLD_API_KEY") };
+
+        let cfg = zeroclaw_config::schema::InworldSttConfig::default();
+        let err = InworldProvider::from_config(&cfg).err().unwrap();
+        assert!(
+            err.to_string().contains("Inworld STT API key"),
+            "expected missing-key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn inworld_provider_accepts_config_api_key() {
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("INWORLD_API_KEY") };
+
+        let cfg = zeroclaw_config::schema::InworldSttConfig {
+            api_key: Some("test-base64-key".into()),
+            ..zeroclaw_config::schema::InworldSttConfig::default()
+        };
+        let provider = InworldProvider::from_config(&cfg).ok().unwrap();
+        assert_eq!(provider.name(), "inworld");
+    }
+
+    #[test]
+    fn manager_registers_inworld_when_configured() {
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
+        unsafe { std::env::remove_var("INWORLD_API_KEY") };
+
+        let config = TranscriptionConfig {
+            default_provider: "inworld".to_string(),
+            inworld: Some(zeroclaw_config::schema::InworldSttConfig {
+                api_key: Some("test-base64-key".into()),
+                ..zeroclaw_config::schema::InworldSttConfig::default()
+            }),
+            ..TranscriptionConfig::default()
+        };
+
+        let manager = TranscriptionManager::new(&config).unwrap();
+        assert!(
+            manager.available_providers().contains(&"inworld"),
+            "expected inworld in {:?}",
+            manager.available_providers()
+        );
     }
 
     // ── LocalWhisperProvider tests (TDD — added below as red/green cycles) ──

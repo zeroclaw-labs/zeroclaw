@@ -1,7 +1,7 @@
 //! Multi-provider Text-to-Speech (TTS) subsystem.
 //!
 //! Supports OpenAI, ElevenLabs, Google Cloud TTS, Edge TTS (free, subprocess-based),
-//! and Piper TTS (local GPU-accelerated, OpenAI-compatible endpoint).
+//! Piper TTS (local GPU-accelerated, OpenAI-compatible endpoint), and Inworld TTS.
 //! Provider selection is driven by [`TtsConfig`] in `config.toml`.
 
 use std::collections::HashMap;
@@ -526,6 +526,135 @@ impl TtsProvider for PiperTtsProvider {
     }
 }
 
+// ── Inworld TTS ──────────────────────────────────────────────────
+
+/// Inworld TTS provider (`POST https://api.inworld.ai/tts/v1/voice`).
+///
+/// Uses HTTP Basic auth with a Base64-encoded API key from Inworld Studio
+/// and returns raw audio bytes decoded from the Base64 `audioContent` field.
+pub struct InworldTtsProvider {
+    api_key: String,
+    model_id: String,
+    audio_encoding: String,
+    sample_rate_hertz: u32,
+    speaking_rate: f64,
+    client: reqwest::Client,
+}
+
+impl InworldTtsProvider {
+    /// Create a new Inworld TTS provider from config, resolving the API key
+    /// from config or the `INWORLD_API_KEY` env var.
+    pub fn new(config: &zeroclaw_config::schema::InworldTtsConfig) -> Result<Self> {
+        let api_key = config
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                std::env::var("INWORLD_API_KEY")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            })
+            .context("Missing Inworld TTS API key: set [tts.inworld].api_key or INWORLD_API_KEY")?;
+
+        Ok(Self {
+            api_key,
+            model_id: config.model_id.clone(),
+            audio_encoding: config.audio_encoding.clone(),
+            sample_rate_hertz: config.sample_rate_hertz,
+            speaking_rate: config.speaking_rate,
+            client: reqwest::Client::builder()
+                .timeout(TTS_HTTP_TIMEOUT)
+                .build()
+                .context("Failed to build HTTP client for Inworld TTS")?,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl TtsProvider for InworldTtsProvider {
+    fn name(&self) -> &str {
+        "inworld"
+    }
+
+    async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
+        let body = serde_json::json!({
+            "text": text,
+            "voiceId": voice,
+            "modelId": self.model_id,
+            "audioConfig": {
+                "audioEncoding": self.audio_encoding,
+                "sampleRateHertz": self.sample_rate_hertz,
+                "speakingRate": self.speaking_rate,
+            },
+        });
+
+        let resp = self
+            .client
+            .post("https://api.inworld.ai/tts/v1/voice")
+            .header("Authorization", format!("Basic {}", self.api_key))
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to send Inworld TTS request")?;
+
+        let status = resp.status();
+        let resp_body: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse Inworld TTS response")?;
+
+        if !status.is_success() {
+            let msg = resp_body["error"]["message"]
+                .as_str()
+                .or_else(|| resp_body["message"].as_str())
+                .unwrap_or("unknown error");
+            bail!("Inworld TTS API error ({}): {}", status, msg);
+        }
+
+        let audio_b64 = resp_body["audioContent"]
+            .as_str()
+            .context("Inworld TTS response missing 'audioContent' field")?;
+
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(audio_b64)
+            .context("Failed to decode Inworld TTS base64 audio")?;
+        Ok(bytes)
+    }
+
+    fn supported_voices(&self) -> Vec<String> {
+        // Inworld exposes 22+ preset voices. Return a representative subset.
+        // Use GET /tts/v1/voices for the full live list.
+        [
+            "Alex",
+            "Ashley",
+            "Dennis",
+            "Elizabeth",
+            "Julia",
+            "Mark",
+            "Olivia",
+            "Priya",
+            "Sarah",
+            "Theodore",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+    }
+
+    fn supported_formats(&self) -> Vec<String> {
+        [
+            "mp3", "pcm", "wav", "linear16", "ogg_opus", "alaw", "mulaw", "flac",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+    }
+}
+
 // ── TtsManager ───────────────────────────────────────────────────
 
 /// Central manager for multi-provider TTS synthesis.
@@ -588,6 +717,17 @@ impl TtsManager {
         if let Some(ref piper_cfg) = config.piper {
             let provider = PiperTtsProvider::new(&piper_cfg.api_url);
             providers.insert("piper".to_string(), Box::new(provider));
+        }
+
+        if let Some(ref inworld_cfg) = config.inworld {
+            match InworldTtsProvider::new(inworld_cfg) {
+                Ok(p) => {
+                    providers.insert("inworld".to_string(), Box::new(p));
+                }
+                Err(e) => {
+                    tracing::warn!("Skipping Inworld TTS provider: {e}");
+                }
+            }
         }
 
         let max_text_length = if config.max_text_length == 0 {
@@ -793,6 +933,51 @@ mod tests {
         assert!(config.google.is_none());
         assert!(config.edge.is_none());
         assert!(config.piper.is_none());
+        assert!(config.inworld.is_none());
+    }
+
+    #[test]
+    fn inworld_provider_requires_api_key() {
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("INWORLD_API_KEY") };
+
+        let cfg = zeroclaw_config::schema::InworldTtsConfig::default();
+        let err = InworldTtsProvider::new(&cfg).err().unwrap();
+        assert!(
+            err.to_string().contains("Inworld TTS API key"),
+            "expected missing-key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn inworld_provider_accepts_config_api_key() {
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("INWORLD_API_KEY") };
+
+        let cfg = zeroclaw_config::schema::InworldTtsConfig {
+            api_key: Some("test-base64-key".into()),
+            ..zeroclaw_config::schema::InworldTtsConfig::default()
+        };
+        let provider = InworldTtsProvider::new(&cfg).ok().unwrap();
+        assert_eq!(provider.name(), "inworld");
+        assert!(provider.supported_formats().iter().any(|f| f == "mp3"));
+        assert!(!provider.supported_voices().is_empty());
+    }
+
+    #[test]
+    fn tts_manager_registers_inworld_when_configured() {
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("INWORLD_API_KEY") };
+
+        let mut config = default_tts_config();
+        config.default_provider = "inworld".to_string();
+        config.inworld = Some(zeroclaw_config::schema::InworldTtsConfig {
+            api_key: Some("test-base64-key".into()),
+            ..zeroclaw_config::schema::InworldTtsConfig::default()
+        });
+
+        let manager = TtsManager::new(&config).unwrap();
+        assert_eq!(manager.available_providers(), vec!["inworld"]);
     }
 
     #[test]
