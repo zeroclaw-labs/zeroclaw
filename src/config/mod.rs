@@ -103,6 +103,7 @@ pub fn make_prop_field(
     let display_value = if is_secret {
         match table.and_then(|t| t.get(serde_name)) {
             Some(toml::Value::String(s)) if !s.is_empty() => "****".to_string(),
+            Some(toml::Value::Array(arr)) if !arr.is_empty() => format!("[{}]", vec!["****"; arr.len()].join(", ")),
             _ => "<unset>".to_string(),
         }
     } else {
@@ -229,6 +230,15 @@ mod tests {
         let arr = result.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0].as_str(), Some("alice"));
+    }
+
+    #[test]
+    fn parse_string_array_quote_in_value_is_literal() {
+        let result = parse_prop_value(r#"tok1, p@ss"word"#, PropKind::StringArray).unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0].as_str(), Some("tok1"));
+        assert_eq!(arr[1].as_str(), Some(r#"p@ss"word"#));
     }
 
     #[test]
