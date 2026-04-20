@@ -47,6 +47,15 @@ interface ReprobeResponse {
   persisted: boolean;
 }
 
+// ── SSE event from POST /api/local-llm/switch-tier ────────────────────
+
+type SwitchEvent =
+  | { kind: "stage"; stage: string }
+  | { kind: "install_progress"; stage: string; line?: string }
+  | { kind: "pull_progress"; status: string; digest?: string; fraction?: number }
+  | { kind: "done"; model_tag: string; pull_attempts: number; probe_succeeded: boolean }
+  | { kind: "error"; message: string };
+
 // ── Tier catalog (kept in the component so the dropdown renders even
 //    when /status is down) ────────────────────────────────────────────
 
@@ -153,6 +162,10 @@ export function SettingsLocalModel({ locale }: Props) {
   const [autoUpgradeNotify, setAutoUpgradeNotify] = useState<boolean>(
     () => localStorage.getItem(AUTO_UPGRADE_PREF_KEY) !== "off",
   );
+  // Live tier-switch progress (null when no switch in flight).
+  const [switchStage, setSwitchStage] = useState<string | null>(null);
+  const [switchPullPercent, setSwitchPullPercent] = useState<number | null>(null);
+  const [switchAttempt, setSwitchAttempt] = useState<number | null>(null);
 
   const baseUrl = apiClient.getServerUrl();
 
@@ -245,18 +258,73 @@ export function SettingsLocalModel({ locale }: Props) {
   }, []);
 
   const handleSwitchTier = useCallback(
-    (targetTag: string) => {
-      // The actual re-install runs via `zeroclaw setup local-llm --tier X`;
-      // this UI exposes it by firing the setup endpoint once wired. For
-      // now we surface the command users can run manually.
-      alert(
-        t("local_llm_switch_manual_hint", locale).replace(
-          "{command}",
-          `zeroclaw setup local-llm --tier ${targetTag.replace("gemma4:", "")}`,
-        ),
-      );
+    async (targetTag: string) => {
+      if (busy) return;
+      const shortTier = targetTag.replace("gemma4:", "");
+      if (!confirm(t("local_llm_switch_confirm", locale).replace("{tier}", shortTier))) {
+        return;
+      }
+      setBusy("switch");
+      setError(null);
+      setSwitchStage(null);
+      setSwitchPullPercent(null);
+      setSwitchAttempt(null);
+      try {
+        const resp = await fetch(
+          `${baseUrl}/api/local-llm/switch-tier?tier=${encodeURIComponent(shortTier)}`,
+          { method: "POST" },
+        );
+        if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let finalTag: string | null = null;
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let sep = buffer.indexOf("\n\n");
+          while (sep !== -1) {
+            const rawEvent = buffer.slice(0, sep);
+            buffer = buffer.slice(sep + 2);
+            sep = buffer.indexOf("\n\n");
+            const dataLine = rawEvent.split("\n").find((l) => l.startsWith("data:"));
+            if (!dataLine) continue;
+            const payload = dataLine.slice(5).trim();
+            if (!payload) continue;
+            let evt: SwitchEvent;
+            try { evt = JSON.parse(payload) as SwitchEvent; } catch { continue; }
+            switch (evt.kind) {
+              case "stage":
+                setSwitchStage(evt.stage);
+                break;
+              case "pull_progress":
+                if (typeof evt.fraction === "number") {
+                  setSwitchPullPercent(Math.round(evt.fraction * 100));
+                }
+                break;
+              case "install_progress":
+                setSwitchStage(evt.stage);
+                break;
+              case "done":
+                finalTag = evt.model_tag;
+                setSwitchAttempt(evt.pull_attempts);
+                break;
+              case "error":
+                throw new Error(evt.message);
+            }
+          }
+        }
+        if (finalTag) await refresh();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setBusy(null);
+        setSwitchStage(null);
+        setSwitchPullPercent(null);
+      }
     },
-    [locale],
+    [baseUrl, busy, locale, refresh],
   );
 
   if (loading) {
@@ -344,6 +412,28 @@ export function SettingsLocalModel({ locale }: Props) {
           })}
         </select>
       </div>
+
+      {/* Live tier-switch progress (visible only while a switch is in flight) */}
+      {busy === "switch" && (
+        <div className="settings-row settings-live-progress">
+          <label>{t("local_llm_switching", locale)}</label>
+          <span>
+            {switchStage ?? "…"}
+            {switchPullPercent !== null && (
+              <>
+                {" · "}
+                {switchPullPercent}%
+              </>
+            )}
+            {switchAttempt !== null && (
+              <>
+                {" · "}
+                {t("local_llm_switch_attempt", locale).replace("{n}", String(switchAttempt))}
+              </>
+            )}
+          </span>
+        </div>
+      )}
 
       {/* Hardware re-probe */}
       <div className="settings-row">

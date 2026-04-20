@@ -16,20 +16,27 @@
 //!                                    Ollama itself)
 //! * `POST /api/local-llm/offline-only`
 //!                                  — toggle `reliability.offline_force_local`
-//!
-//! Tier switching is handled by the existing `setup local-llm --tier X`
-//! CLI + `setup::run_setup` — the switch UI triggers a background
-//! `run_setup` call and streams progress via the same channel as
-//! `maybe_auto_bootstrap_local_llm`, so there's no new endpoint here.
+//! * `POST /api/local-llm/switch-tier?tier=<e2b|e4b|26b|31b>`
+//!                                  — run `setup::run_setup` with the
+//!                                    override tier and stream stage +
+//!                                    install + pull progress as
+//!                                    Server-Sent Events
+
+use std::convert::Infallible;
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 
 use super::AppState;
 use crate::host_probe::{self, HardwareProfile, Tier};
@@ -43,6 +50,7 @@ pub fn router() -> Router<AppState> {
         .route("/reprobe", post(handle_reprobe))
         .route("/uninstall", post(handle_uninstall))
         .route("/offline-only", post(handle_offline_only))
+        .route("/switch-tier", post(handle_switch_tier))
 }
 
 // ── /status ──────────────────────────────────────────────────────────
@@ -258,6 +266,145 @@ async fn handle_offline_only(
     })
 }
 
+// ── /switch-tier (SSE stream of setup progress) ─────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct SwitchTierQuery {
+    pub tier: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SwitchEvent {
+    Stage {
+        stage: local_llm::setup::SetupStage,
+    },
+    InstallProgress {
+        stage: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        line: Option<String>,
+    },
+    PullProgress {
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        digest: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fraction: Option<f32>,
+    },
+    Done {
+        model_tag: String,
+        pull_attempts: u32,
+        probe_succeeded: bool,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// POST /api/local-llm/switch-tier?tier=<e2b|e4b|26b|31b>
+///
+/// Streams setup::run_setup progress as Server-Sent Events. Cancels the
+/// background work when the SSE client disconnects so we don't keep
+/// downloading multi-GB blobs for a closed connection.
+async fn handle_switch_tier(Query(q): Query<SwitchTierQuery>) -> axum::response::Response {
+    let tier = match parse_tier(&q.tier) {
+        Ok(t) => t,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e })).into_response();
+        }
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<SwitchEvent>(64);
+    let cb_stage_tx = tx.clone();
+    let cb_install_tx = tx.clone();
+    let cb_pull_tx = tx.clone();
+    let terminal_tx = tx.clone();
+    let disconnect_watcher = tx.clone();
+
+    tokio::spawn(async move {
+        let mut on_stage = move |stage: local_llm::setup::SetupStage| {
+            let _ = cb_stage_tx.try_send(SwitchEvent::Stage { stage });
+        };
+        let mut on_install = move |p: local_llm::installer::InstallProgress| {
+            let _ = cb_install_tx.try_send(SwitchEvent::InstallProgress {
+                stage: p.stage,
+                line: p.line,
+            });
+        };
+        let mut on_pull = move |p: local_llm::PullProgress| {
+            let _ = cb_pull_tx.try_send(SwitchEvent::PullProgress {
+                status: p.status.clone(),
+                digest: p.digest.clone(),
+                fraction: p.fraction(),
+            });
+        };
+
+        let mut callbacks = local_llm::setup::SetupCallbacks {
+            on_stage: &mut on_stage,
+            on_install_progress: &mut on_install,
+            on_pull_progress: &mut on_pull,
+        };
+        let opts = local_llm::setup::SetupOptions {
+            override_tier: Some(tier),
+            ..local_llm::setup::SetupOptions::default()
+        };
+
+        let setup_fut = local_llm::setup::run_setup(opts, &mut callbacks);
+        let cancel_fut = disconnect_watcher.closed();
+
+        tokio::select! {
+            biased;
+            _ = cancel_fut => {
+                tracing::info!(
+                    "switch-tier client disconnected mid-setup; aborting run_setup"
+                );
+            }
+            result = setup_fut => {
+                match result {
+                    Ok(report) => {
+                        let _ = terminal_tx
+                            .send(SwitchEvent::Done {
+                                model_tag: report.model_tag,
+                                pull_attempts: report.pull_attempts,
+                                probe_succeeded: report.probe_succeeded,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = terminal_tx
+                            .send(SwitchEvent::Error {
+                                message: format!("{e:#}"),
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
+    });
+    drop(tx);
+
+    let stream = ReceiverStream::new(rx).map(|evt| {
+        let payload = serde_json::to_string(&evt).unwrap_or_else(|_| "{}".to_string());
+        Ok::<_, Infallible>(Event::default().data(payload))
+    });
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+fn parse_tier(raw: &str) -> Result<Tier, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "e2b" | "t1" | "t1e2b" => Ok(Tier::T1E2B),
+        "e4b" | "t2" | "t2e4b" => Ok(Tier::T2E4B),
+        "26b" | "t3" | "t3moe26b" => Ok(Tier::T3MoE26B),
+        "31b" | "t4" | "t4dense31b" => Ok(Tier::T4Dense31B),
+        other => Err(format!(
+            "unknown tier `{other}`; valid: e2b, e4b, 26b, 31b"
+        )),
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 /// Friendly tier labels matching the §1 matrix. Kept here next to the API
@@ -269,4 +416,76 @@ pub fn tier_display_name(tier: Tier) -> &'static str {
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tier_accepts_all_four_tiers() {
+        assert_eq!(parse_tier("e2b").unwrap(), Tier::T1E2B);
+        assert_eq!(parse_tier("e4b").unwrap(), Tier::T2E4B);
+        assert_eq!(parse_tier("26b").unwrap(), Tier::T3MoE26B);
+        assert_eq!(parse_tier("31b").unwrap(), Tier::T4Dense31B);
+    }
+
+    #[test]
+    fn parse_tier_rejects_unknown() {
+        let err = parse_tier("bogus").expect_err("bogus must be rejected");
+        assert!(err.contains("bogus"));
+    }
+
+    #[test]
+    fn switch_event_kind_tags() {
+        let done = SwitchEvent::Done {
+            model_tag: "gemma4:e4b".into(),
+            pull_attempts: 1,
+            probe_succeeded: true,
+        };
+        let err = SwitchEvent::Error {
+            message: "disk full".into(),
+        };
+        assert_eq!(serde_json::to_value(&done).unwrap()["kind"], "done");
+        assert_eq!(serde_json::to_value(&err).unwrap()["kind"], "error");
+    }
+
+    #[tokio::test]
+    async fn switch_tier_aborts_setup_on_client_disconnect() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<SwitchEvent>(64);
+        let disconnect_watcher = tx.clone();
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = Arc::clone(&flag);
+
+        let handle = tokio::spawn(async move {
+            let surrogate_setup = async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                flag_clone.store(true, Ordering::Relaxed);
+            };
+            let cancel_fut = disconnect_watcher.closed();
+            tokio::select! {
+                biased;
+                _ = cancel_fut => {}
+                () = surrogate_setup => {}
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(rx);
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("task should finish within 1 s of disconnect")
+            .expect("no panic");
+
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "surrogate completed; cancellation did not fire"
+        );
+        drop(tx);
+    }
 }

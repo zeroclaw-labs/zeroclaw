@@ -216,6 +216,9 @@ type TranslationKey =
   | "local_llm_uninstall_confirm"
   | "local_llm_installed_inventory"
   | "local_llm_switch_manual_hint"
+  | "local_llm_switch_confirm"
+  | "local_llm_switching"
+  | "local_llm_switch_attempt"
   // ── Secretary migrator (§11.3 / PR #10) ──
   | "secretary_migrator_title"
   | "secretary_migrator_intro"
@@ -429,6 +432,9 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     local_llm_uninstall_confirm: "Remove the local Gemma 4 model? You can reinstall later from this screen.",
     local_llm_installed_inventory: "Installed models ({count})",
     local_llm_switch_manual_hint: "Run this command to switch tiers:\n\n{command}",
+    local_llm_switch_confirm: "Switch local Gemma 4 to tier {tier}? This downloads the new model and can take several minutes.",
+    local_llm_switching: "Switching tier…",
+    local_llm_switch_attempt: "attempt {n}",
     secretary_migrator_title: "Secretary migration (offline)",
     secretary_migrator_intro:
       "If you go offline, we'll swap your paid Typecast secretary for the closest offline voice so the chat UX stays the same.",
@@ -641,6 +647,9 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     local_llm_uninstall_confirm: "로컬 Gemma 4 모델을 제거할까요? 이 화면에서 언제든 다시 설치할 수 있습니다.",
     local_llm_installed_inventory: "설치된 모델 ({count}개)",
     local_llm_switch_manual_hint: "다음 명령을 실행해 티어를 변경하세요:\n\n{command}",
+    local_llm_switch_confirm: "로컬 Gemma 4를 {tier} 티어로 변경할까요? 새 모델을 다운로드하며 몇 분이 걸릴 수 있습니다.",
+    local_llm_switching: "티어 변경 중…",
+    local_llm_switch_attempt: "{n}번째 시도",
     secretary_migrator_title: "오프라인 비서 전환",
     secretary_migrator_intro:
       "오프라인 전환 시 평소 쓰시던 Typecast 비서와 가장 비슷한 오프라인 음성을 자동으로 추천합니다. 브랜드 UX는 그대로 유지됩니다.",
