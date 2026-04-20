@@ -89,36 +89,58 @@ jobs:
             RANGE="${PREV_TAG}..HEAD"
           fi
 
-          # Extract features only (feat commits) — skip bug fixes for clean notes
-          FEATURES=$(git log "$RANGE" --pretty=format:"%s" --no-merges \
-            | grep -iE '^feat(\(|:)' \
-            | sed 's/^feat(\([^)]*\)): /\1: /' \
-            | sed 's/^feat: //' \
-            | sed 's/ (#[0-9]*)$//' \
-            | sort -uf \
-            | while IFS= read -r line; do echo "- ${line}"; done || true)
+          # If a hand-written changelog exists, use it as the release body
+          # and skip the auto-generated notes entirely.
+          if [ -f "CHANGELOG-next.md" ]; then
+            echo "Using CHANGELOG-next.md as release notes"
+            BODY=$(cat CHANGELOG-next.md)
 
-          if [ -z "$FEATURES" ]; then
-            FEATURES="- Incremental improvements and polish"
-          fi
+            # Still extract features + contributors for downstream jobs that
+            # consume those outputs (discord, tweet, etc.)
+            FEATURES=$(git log "$RANGE" --pretty=format:"%s" --no-merges \
+              | grep -iE '^feat(\(|:)' \
+              | sed 's/^feat(\([^)]*\)): /\1: /' \
+              | sed 's/^feat: //' \
+              | sed 's/ (#[0-9]*)$//' \
+              | sort -uf \
+              | while IFS= read -r line; do echo "- ${line}"; done || true)
 
-          # Collect ALL unique contributors: git authors + Co-Authored-By
-          GIT_AUTHORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges | sort -uf || true)
-          CO_AUTHORS=$(git log "$RANGE" --pretty=format:"%b" --no-merges \
-            | grep -ioE 'Co-Authored-By: *[^<]+' \
-            | sed 's/Co-Authored-By: *//i' \
-            | sed 's/ *$//' \
-            | sort -uf || true)
+            ALL_CONTRIBUTORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges \
+              | sort -uf \
+              | grep -v '^$' \
+              | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
+              | while IFS= read -r name; do echo "- ${name}"; done || true)
+          else
+            # Extract features only (feat commits) — skip bug fixes for clean notes
+            FEATURES=$(git log "$RANGE" --pretty=format:"%s" --no-merges \
+              | grep -iE '^feat(\(|:)' \
+              | sed 's/^feat(\([^)]*\)): /\1: /' \
+              | sed 's/^feat: //' \
+              | sed 's/ (#[0-9]*)$//' \
+              | sort -uf \
+              | while IFS= read -r line; do echo "- ${line}"; done || true)
 
-          # Merge, deduplicate, and filter out bots
-          ALL_CONTRIBUTORS=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
-            | sort -uf \
-            | grep -v '^$' \
-            | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
-            | while IFS= read -r name; do echo "- ${name}"; done || true)
+            if [ -z "$FEATURES" ]; then
+              FEATURES="- Incremental improvements and polish"
+            fi
 
-          # Build release body
-          BODY=$(cat <<NOTES_EOF
+            # Collect ALL unique contributors: git authors + Co-Authored-By
+            GIT_AUTHORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges | sort -uf || true)
+            CO_AUTHORS=$(git log "$RANGE" --pretty=format:"%b" --no-merges \
+              | grep -ioE 'Co-Authored-By: *[^<]+' \
+              | sed 's/Co-Authored-By: *//i' \
+              | sed 's/ *$//' \
+              | sort -uf || true)
+
+            # Merge, deduplicate, and filter out bots
+            ALL_CONTRIBUTORS=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
+              | sort -uf \
+              | grep -v '^$' \
+              | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
+              | while IFS= read -r name; do echo "- ${name}"; done || true)
+
+            # Build release body
+            BODY=$(cat <<NOTES_EOF
           ## What's New
 
           ${FEATURES}
@@ -130,7 +152,8 @@ jobs:
           ---
           *Full changelog: ${PREV_TAG}...HEAD*
           NOTES_EOF
-          )
+            )
+          fi
 
           # Output multiline values
           {
@@ -252,7 +275,7 @@ jobs:
         shell: bash
         run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
         env:
-          BINARY_SIZE_HARD_LIMIT: "52428800"  # 50MB — release builds include all optional features
+          BINARY_SIZE_HARD_LIMIT: "52428800" # 50MB — release builds include all optional features
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -401,7 +424,7 @@ jobs:
 
       - name: Create GitHub Release
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.version.outputs.tag }}
         run: |
           gh release create "$TAG" release-assets/* \

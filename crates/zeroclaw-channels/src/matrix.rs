@@ -3,6 +3,7 @@ use matrix_sdk::{
     Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
     authentication::matrix::MatrixSession,
     config::SyncSettings,
+    media::{MediaFormat, MediaRequestParameters},
     ruma::{
         OwnedEventId, OwnedRoomId, OwnedUserId,
         api::client::receipt::create_receipt,
@@ -13,7 +14,7 @@ use matrix_sdk::{
         events::room::member::StrippedRoomMemberEvent,
         events::room::message::{
             MessageType, OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata,
-            RoomMessageEventContent,
+            ReplyWithinThread, RoomMessageEventContent,
         },
     },
 };
@@ -268,6 +269,32 @@ impl MatrixChannel {
             last_draft_edit: Arc::new(Mutex::new(HashMap::new())),
             multi_message_sent_len: Arc::new(Mutex::new(HashMap::new())),
             multi_message_thread_ts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Extract body text and media source from a message type.
+    /// Returns `(body_text, Option<(MediaSource, filename)>)`.
+    fn extract_media_info(msgtype: &MessageType) -> (String, Option<(MediaSource, String)>) {
+        match msgtype {
+            MessageType::Text(content) => (content.body.clone(), None),
+            MessageType::Notice(content) => (content.body.clone(), None),
+            MessageType::Image(content) => (
+                format!("[IMAGE:{}]", content.body),
+                Some((content.source.clone(), content.body.clone())),
+            ),
+            MessageType::File(content) => (
+                format!("[FILE:{}]", content.body),
+                Some((content.source.clone(), content.body.clone())),
+            ),
+            MessageType::Audio(content) => (
+                format!("[AUDIO:{}]", content.body),
+                Some((content.source.clone(), content.body.clone())),
+            ),
+            MessageType::Video(content) => (
+                format!("[VIDEO:{}]", content.body),
+                Some((content.source.clone(), content.body.clone())),
+            ),
+            _ => (String::new(), None),
         }
     }
 
@@ -878,18 +905,49 @@ impl Channel for MatrixChannel {
             tracing::warn!("Matrix failed to stop typing notification: {error}");
         }
 
-        let mut content = RoomMessageEventContent::text_markdown(&message.content);
+        let (cleaned_text, attachments) = crate::util::parse_attachment_markers(&message.content);
 
-        if let Some(ref thread_ts) = message.thread_ts
-            && let Ok(thread_root) = thread_ts.parse::<OwnedEventId>()
-        {
-            content.relates_to = Some(Relation::Thread(Thread::plain(
-                thread_root.clone(),
-                thread_root,
-            )));
+        if !cleaned_text.trim().is_empty() {
+            let mut content = RoomMessageEventContent::text_markdown(&cleaned_text);
+            if let Some(ref thread_ts) = message.thread_ts
+                && let Ok(thread_root) = thread_ts.parse::<OwnedEventId>()
+            {
+                content.relates_to = Some(Relation::Thread(Thread::plain(
+                    thread_root.clone(),
+                    thread_root,
+                )));
+            }
+            room.send(content).await?;
         }
 
-        room.send(content).await?;
+        for (_kind, target) in &attachments {
+            let path = std::path::Path::new(target.as_str());
+            if let Ok(data) = tokio::fs::read(path).await {
+                let mime = mime_guess::from_path(path).first_or_octet_stream();
+                let name = path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy();
+                let mut attachment_config = matrix_sdk::attachment::AttachmentConfig::new();
+                if let Some(ref thread_ts) = message.thread_ts
+                    && let Ok(event_id) = thread_ts.parse::<OwnedEventId>()
+                {
+                    attachment_config =
+                        attachment_config.reply(Some(matrix_sdk::room::reply::Reply {
+                            event_id,
+                            enforce_thread: matrix_sdk::room::reply::EnforceThread::Threaded(
+                                ReplyWithinThread::Yes,
+                            ),
+                        }));
+                }
+                if let Err(e) = room
+                    .send_attachment(&*name, &mime, data, attachment_config)
+                    .await
+                {
+                    tracing::warn!(file = %name, err = %e, "Matrix: attachment upload failed");
+                }
+            }
+        }
 
         // Voice reply: generate TTS audio and send as m.audio when voice_mode is active
         if self.voice_mode.load(Ordering::Relaxed) {
@@ -1020,8 +1078,7 @@ impl Channel for MatrixChannel {
         let allowed_users_for_handler = self.allowed_users.clone();
         let allowed_rooms_for_handler = self.allowed_rooms.clone();
         let dedupe_for_handler = Arc::clone(&recent_event_cache);
-        let homeserver_for_handler = self.homeserver.clone();
-        let access_token_for_handler = self.access_token.clone();
+        let sdk_client_for_handler = client.clone();
         let voice_mode_for_handler = Arc::clone(&self.voice_mode);
         let transcription_mgr_for_handler = self.transcription_manager.clone();
         let mention_only_for_handler = self.mention_only;
@@ -1033,8 +1090,7 @@ impl Channel for MatrixChannel {
             let allowed_users = allowed_users_for_handler.clone();
             let allowed_rooms = allowed_rooms_for_handler.clone();
             let dedupe = Arc::clone(&dedupe_for_handler);
-            let homeserver = homeserver_for_handler.clone();
-            let access_token = access_token_for_handler.clone();
+            let sdk_client = sdk_client_for_handler.clone();
             let voice_mode = Arc::clone(&voice_mode_for_handler);
             let transcription_mgr = transcription_mgr_for_handler.clone();
             let mention_only = mention_only_for_handler;
@@ -1103,62 +1159,14 @@ impl Channel for MatrixChannel {
                     }
                 }
 
-                // Helper: extract mxc:// download URL, filename, and MIME type for media.
-                // MediaSource::Encrypted appears only when SDK decryption failed (missing
-                // keys). When E2EE works (recovery key), encrypted media arrives as
-                // MediaSource::Plain after transparent SDK decryption.
-                let media_info =
-                    |source: &MediaSource,
-                     name: &str,
-                     mime: Option<&str>|
-                     -> Option<(String, String, Option<String>)> {
-                        match source {
-                            MediaSource::Plain(mxc) => {
-                                let rest = mxc.as_str().strip_prefix("mxc://")?;
-                                let url = format!(
-                                    "{}/_matrix/client/v1/media/download/{}",
-                                    homeserver, rest
-                                );
-                                Some((url, name.to_string(), mime.map(String::from)))
-                            }
-                            MediaSource::Encrypted(_) => {
-                                tracing::debug!(
-                                    "Matrix: encrypted media could not be decrypted (missing room keys?), skipping"
-                                );
-                                None
-                            }
-                        }
-                    };
+                let (body, media_download) =
+                    MatrixChannel::extract_media_info(&event.content.msgtype);
+                if body.is_empty() {
+                    return;
+                }
 
-                // Extract body text, media source, and MIME type from the message.
-                let (body, media_download) = match &event.content.msgtype {
-                    MessageType::Text(content) => (content.body.clone(), None),
-                    MessageType::Notice(content) => (content.body.clone(), None),
-                    MessageType::Image(content) => {
-                        let mime = content.info.as_ref().and_then(|i| i.mimetype.as_deref());
-                        let dl = media_info(&content.source, &content.body, mime);
-                        (format!("[IMAGE:{}]", content.body), dl)
-                    }
-                    MessageType::File(content) => {
-                        let mime = content.info.as_ref().and_then(|i| i.mimetype.as_deref());
-                        let dl = media_info(&content.source, &content.body, mime);
-                        (format!("[file: {}]", content.body), dl)
-                    }
-                    MessageType::Audio(content) => {
-                        let mime = content.info.as_ref().and_then(|i| i.mimetype.as_deref());
-                        let dl = media_info(&content.source, &content.body, mime);
-                        (format!("[audio: {}]", content.body), dl)
-                    }
-                    MessageType::Video(content) => {
-                        let mime = content.info.as_ref().and_then(|i| i.mimetype.as_deref());
-                        let dl = media_info(&content.source, &content.body, mime);
-                        (format!("[video: {}]", content.body), dl)
-                    }
-                    _ => return,
-                };
-
-                // Download media to workspace if present
-                let body = if let Some((url, filename, _mime_type)) = media_download {
+                // Download media to workspace via SDK (handles both plain and encrypted)
+                let body = if let Some((source, filename)) = media_download {
                     let workspace = std::path::PathBuf::from(
                         shellexpand::tilde(
                             &std::env::var("ZEROCLAW_WORKSPACE")
@@ -1168,34 +1176,36 @@ impl Channel for MatrixChannel {
                     );
                     let _ = tokio::fs::create_dir_all(&workspace).await;
                     let dest = workspace.join(&filename);
-                    let client = reqwest::Client::new();
-                    match client
-                        .get(&url)
-                        .header("Authorization", format!("Bearer {}", access_token))
-                        .send()
-                        .await
-                    {
-                        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                            Ok(bytes) => match tokio::fs::write(&dest, &bytes).await {
-                                Ok(()) => {
-                                    if body.starts_with("[IMAGE:") {
-                                        format!("[IMAGE:{}]", dest.display())
-                                    } else {
-                                        format!("{} — saved to {}", body, dest.display())
-                                    }
+                    let request = MediaRequestParameters {
+                        source,
+                        format: MediaFormat::File,
+                    };
+                    match sdk_client.media().get_media_content(&request, true).await {
+                        Ok(bytes) => match tokio::fs::write(&dest, &bytes).await {
+                            Ok(()) => {
+                                if body.starts_with("[IMAGE:") {
+                                    format!("[IMAGE:{}]", dest.display())
+                                } else {
+                                    format!("{} — saved to {}", body, dest.display())
                                 }
-                                Err(_) => format!("{} — failed to write to disk", body),
-                            },
-                            Err(_) => format!("{} — download failed", body),
+                            }
+                            Err(e) => {
+                                tracing::warn!("Matrix media write failed: {e}");
+                                format!("{} — failed to write to disk", body)
+                            }
                         },
-                        _ => format!("{} — download failed (auth error?)", body),
+                        Err(e) => {
+                            tracing::warn!("Matrix media download failed: {e}");
+                            let prefix_end = body.find(':').unwrap_or(body.len());
+                            format!("[{}-failed:{}", &body[1..prefix_end], &body[prefix_end..])
+                        }
                     }
                 } else {
                     body
                 };
 
                 // Voice transcription: if this was an audio message, transcribe it
-                let body = if body.starts_with("[audio:") {
+                let body = if body.starts_with("[AUDIO:") {
                     if let (Some(path_start), Some(manager)) = (body.find("saved to "), &transcription_mgr) {
                         let audio_path = body[path_start + 9..].to_string();
                         let file_name = audio_path
@@ -2548,5 +2558,71 @@ mod tests {
             "hey @bot:matrix.org what's up",
             "@bot:matrix.org"
         ));
+    }
+
+    // ── extract_media_info tests ────────────────────────────────────
+
+    fn make_encrypted_file() -> matrix_sdk::ruma::events::room::EncryptedFile {
+        serde_json::from_value(serde_json::json!({
+            "url": "mxc://matrix.org/encrypted123",
+            "key": {
+                "kty": "oct",
+                "key_ops": ["encrypt", "decrypt"],
+                "alg": "A256CTR",
+                "k": "b50ACIv6LMn9AfMCFD1POJI_UAFWIclxAN1kWrEO2X8",
+                "ext": true,
+            },
+            "iv": "AK1wyzigZtQAAAABAAAAKK",
+            "hashes": {
+                "sha256": "foobar",
+            },
+            "v": "v2",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn extract_media_info_plain_image_returns_source() {
+        use matrix_sdk::ruma::events::room::message::ImageMessageEventContent;
+        use matrix_sdk::ruma::owned_mxc_uri;
+
+        let content = ImageMessageEventContent::plain(
+            "photo.jpg".to_string(),
+            owned_mxc_uri!("mxc://matrix.org/plain123"),
+        );
+        let msgtype = MessageType::Image(content);
+        let (body, media) = MatrixChannel::extract_media_info(&msgtype);
+        assert_eq!(body, "[IMAGE:photo.jpg]");
+        assert!(media.is_some(), "plain image must return Some media source");
+        let (_, filename) = media.unwrap();
+        assert_eq!(filename, "photo.jpg");
+    }
+
+    #[test]
+    fn extract_media_info_encrypted_image_returns_source() {
+        use matrix_sdk::ruma::events::room::message::ImageMessageEventContent;
+
+        let content =
+            ImageMessageEventContent::encrypted("9637.jpg".to_string(), make_encrypted_file());
+        let msgtype = MessageType::Image(content);
+        let (body, media) = MatrixChannel::extract_media_info(&msgtype);
+        assert_eq!(body, "[IMAGE:9637.jpg]");
+        assert!(
+            media.is_some(),
+            "encrypted image must return Some media source — not None"
+        );
+        let (_, filename) = media.unwrap();
+        assert_eq!(filename, "9637.jpg");
+    }
+
+    #[test]
+    fn extract_media_info_text_returns_none() {
+        use matrix_sdk::ruma::events::room::message::TextMessageEventContent;
+
+        let content = TextMessageEventContent::plain("hello world");
+        let msgtype = MessageType::Text(content);
+        let (body, media) = MatrixChannel::extract_media_info(&msgtype);
+        assert_eq!(body, "hello world");
+        assert!(media.is_none());
     }
 }
