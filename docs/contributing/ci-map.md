@@ -11,26 +11,30 @@ For event-by-event delivery behavior, see
 
 ## Merge-Blocking
 
-### `ci-run.yml` — CI
+### `ci.yml` — CI
 
-**Trigger:** `pull_request` → `master`, `push` → `master`
+**Trigger:** `pull_request` → `master`
 
 **Required status check:** `CI Required Gate`
 
-The single source of truth for PR and post-merge quality. Three staged jobs:
+The single source of truth for PR quality. Jobs:
 
 - `lint` — `cargo fmt --all -- --check`, `cargo clippy -D warnings`,
   `cargo check --features ci-all`, strict delta lint on changed lines (PRs only).
-- `test` — `cargo nextest run --locked` on `ubuntu-latest` with mold linker.
-- `build` — `cargo build --profile ci --locked` on Linux, macOS, and Windows.
-  Benchmarks are verified to compile on the Linux leg.
+- `build` — matrix across `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`,
+  `x86_64-pc-windows-msvc`.
+- `check` — matrix: all features + no default features.
+- `check-32bit` — `i686-unknown-linux-gnu`, no default features.
+- `bench` — benchmarks compile check.
+- `test` — `cargo nextest run --locked` on `ubuntu-latest`.
+- `security` — `cargo deny check`.
+- `gate` — `CI Required Gate`: composite job; branch protection requires this.
+  Passes only if all upstream jobs passed.
 
-`lint` must pass before `test` and `build` start. `CI Required Gate` is the
-composite job that branch protection requires — it passes only if all three
-upstream jobs passed.
+`lint` must pass before `build`, `check`, `check-32bit`, `bench`, `test`, and
+`security` start.
 
-**Concurrency:** in-flight runs are cancelled on new PR pushes. Master push
-runs are not cancelled.
+**Concurrency:** in-flight runs are cancelled on new PR pushes.
 
 ---
 
@@ -106,15 +110,13 @@ Each can also be triggered manually with `dry_run: true` for verification.
 
 1. **`CI Required Gate` red on a PR** — start with the `lint` job (fmt/clippy
    failures are most common), then `test`, then `build`.
-2. **`CI Required Gate` red on master after a merge** — treat as P0; nothing
-   else merges until it is green.
-3. **Release `validate` failed** — `Cargo.toml` version does not match the
+2. **Release `validate` failed** — `Cargo.toml` version does not match the
    workflow input, or the tag already exists.
-4. **Release build failed** — check the specific target's job log. Android is
+3. **Release build failed** — check the specific target's job log. Android is
    `experimental` and runs with `continue-on-error`.
-5. **Environment gate timed out** — re-run only the timed-out job from the
+4. **Environment gate timed out** — re-run only the timed-out job from the
    workflow run page.
-6. **Distribution channel failed** — re-run the corresponding sub-workflow
+5. **Distribution channel failed** — re-run the corresponding sub-workflow
    manually with `dry_run: true` first.
 
 ---
@@ -125,7 +127,7 @@ Each can also be triggered manually with `dry_run: true` for verification.
   without a clear quality argument.
 - All third-party action refs must be pinned to a full commit SHA
   (see [`actions-source-policy.md`](./actions-source-policy.md)).
-- Keep `ci-run.yml`, `dev/ci.sh`, and `.githooks/pre-push` aligned — the same
+- Keep `ci.yml`, `dev/ci.sh`, and `.githooks/pre-push` aligned — the same
   quality gates should run locally and in CI.
 - Do not modify the frozen sub-workflows until the v0.7.5 structured release
   pipeline work begins.
