@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn noop_vad_always_silence() {
-        let mut vad = NoopVad::default();
+        let mut vad = NoopVad;
         assert_eq!(vad.process(&[0.0; 160]), VadEvent::Silence);
         assert_eq!(vad.process(&[0.5; 160]), VadEvent::Silence);
     }

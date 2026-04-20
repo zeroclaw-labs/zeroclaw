@@ -11728,6 +11728,7 @@ auto_save = true
                 reddit: None,
                 bluesky: None,
                 voice_call: None,
+                voice_duplex: None,
                 #[cfg(feature = "voice-wake")]
                 voice_wake: None,
                 mqtt: None,
@@ -12863,6 +12864,7 @@ allowed_rooms = ["!ops:matrix.org"]
             reddit: None,
             bluesky: None,
             voice_call: None,
+            voice_duplex: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
@@ -13237,6 +13239,7 @@ bot_token = "xoxb-tok"
             reddit: None,
             bluesky: None,
             voice_call: None,
+            voice_duplex: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
