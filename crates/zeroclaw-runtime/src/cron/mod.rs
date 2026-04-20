@@ -14,8 +14,9 @@ pub use schedule::{
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, all_overdue_jobs, due_jobs, get_job, list_jobs, list_runs, record_last_run,
-    record_run, remove_job, reschedule_after_run, sync_declarative_jobs, update_job,
+    add_agent_job, add_announce_job, all_overdue_jobs, due_jobs, get_job, list_jobs, list_runs,
+    record_last_run, record_run, remove_job, reschedule_after_run, sync_declarative_jobs,
+    update_job,
 };
 pub use types::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
@@ -252,6 +253,9 @@ mod tests {
                 command: command.map(Into::into),
                 name: name.map(Into::into),
                 allowed_tools: vec![],
+                delivery_channel: None,
+                delivery_to: None,
+                no_best_effort: false,
             },
             config,
         )
@@ -617,6 +621,9 @@ mod tests {
                 tz: None,
                 agent: true,
                 allowed_tools: vec![],
+                delivery_channel: None,
+                delivery_to: None,
+                no_best_effort: false,
                 command: "Check server health: disk space, memory, CPU load".into(),
             },
             &config,
@@ -648,6 +655,9 @@ mod tests {
                 tz: None,
                 agent: true,
                 allowed_tools: vec![],
+                delivery_channel: None,
+                delivery_to: None,
+                no_best_effort: false,
                 command: "Check server health: disk space, memory, CPU load".into(),
             },
             &config,
@@ -670,6 +680,9 @@ mod tests {
                 tz: None,
                 agent: true,
                 allowed_tools: vec!["file_read".into(), "web_search".into()],
+                delivery_channel: None,
+                delivery_to: None,
+                no_best_effort: false,
                 command: "Check server health".into(),
             },
             &config,
@@ -712,6 +725,9 @@ mod tests {
                 command: None,
                 name: None,
                 allowed_tools: vec!["shell".into()],
+                delivery_channel: None,
+                delivery_to: None,
+                no_best_effort: false,
             },
             &config,
         )
@@ -719,6 +735,87 @@ mod tests {
 
         let updated = get_job(&config, &job.id).unwrap();
         assert_eq!(updated.allowed_tools, Some(vec!["shell".into()]));
+    }
+
+    #[test]
+    fn cli_add_persists_delivery_config() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                tz: None,
+                agent: false,
+                allowed_tools: vec![],
+                delivery_channel: Some("telegram".into()),
+                delivery_to: Some("12345".into()),
+                no_best_effort: true,
+                command: "echo ok".into(),
+            },
+            &config,
+        )
+        .unwrap();
+
+        let jobs = list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].delivery.mode, "announce");
+        assert_eq!(jobs[0].delivery.channel.as_deref(), Some("telegram"));
+        assert_eq!(jobs[0].delivery.to.as_deref(), Some("12345"));
+        assert!(!jobs[0].delivery.best_effort);
+    }
+
+    #[test]
+    fn cli_update_patches_delivery_config() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = make_job(&config, "*/5 * * * *", None, "echo test");
+
+        handle_command(
+            crate::CronCommands::Update {
+                id: job.id.clone(),
+                expression: None,
+                tz: None,
+                command: None,
+                name: None,
+                allowed_tools: vec![],
+                delivery_channel: Some("discord".into()),
+                delivery_to: Some("chan-42".into()),
+                no_best_effort: false,
+            },
+            &config,
+        )
+        .unwrap();
+
+        let updated = get_job(&config, &job.id).unwrap();
+        assert_eq!(updated.delivery.mode, "announce");
+        assert_eq!(updated.delivery.channel.as_deref(), Some("discord"));
+        assert_eq!(updated.delivery.to.as_deref(), Some("chan-42"));
+        assert!(updated.delivery.best_effort);
+    }
+
+    #[test]
+    fn cli_add_without_channel_uses_default_none_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                tz: None,
+                agent: false,
+                allowed_tools: vec![],
+                delivery_channel: None,
+                delivery_to: None,
+                no_best_effort: false,
+                command: "echo ok".into(),
+            },
+            &config,
+        )
+        .unwrap();
+
+        let jobs = list_jobs(&config).unwrap();
+        assert_eq!(jobs[0].delivery.mode, "none");
     }
 
     #[test]
@@ -732,6 +829,9 @@ mod tests {
                 tz: None,
                 agent: false,
                 allowed_tools: vec![],
+                delivery_channel: None,
+                delivery_to: None,
+                no_best_effort: false,
                 command: "echo ok".into(),
             },
             &config,

@@ -349,6 +349,33 @@ impl Tool for CronAddTool {
                     allowed_tools,
                 )
             }
+            JobType::Announce => {
+                let message = match args.get("command").and_then(serde_json::Value::as_str) {
+                    Some(m) if !m.trim().is_empty() => m,
+                    _ => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(
+                                "Missing 'command' (message body) for announce job".to_string(),
+                            ),
+                        });
+                    }
+                };
+                let Some(delivery) = delivery else {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some("announce jobs require a delivery config".to_string()),
+                    });
+                };
+
+                if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
+                    return Ok(blocked);
+                }
+
+                cron::add_announce_job(&self.config, name, schedule, message, delivery, None, None)
+            }
         };
 
         match result {

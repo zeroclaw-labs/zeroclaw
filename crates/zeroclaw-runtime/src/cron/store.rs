@@ -120,12 +120,61 @@ pub fn add_agent_job(
     get_job(config, &id)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn add_announce_job(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    message: &str,
+    delivery: DeliveryConfig,
+    remaining_runs: Option<i64>,
+    expires_until: Option<DateTime<Utc>>,
+) -> Result<CronJob> {
+    let now = Utc::now();
+    validate_schedule(&schedule, now)?;
+    validate_delivery_config(Some(&delivery))?;
+    if !delivery.mode.eq_ignore_ascii_case("announce") {
+        anyhow::bail!("announce jobs require delivery.mode = \"announce\"");
+    }
+    let next_run = next_run_for_schedule(&schedule, now)?;
+    let id = Uuid::new_v4().to_string();
+    let expression = schedule_cron_expression(&schedule).unwrap_or_default();
+    let schedule_json = serde_json::to_string(&schedule)?;
+    let delete_after_run = matches!(schedule, Schedule::At { .. });
+
+    with_connection(config, |conn| {
+        conn.execute(
+            "INSERT INTO cron_jobs (
+                id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                enabled, delivery, delete_after_run, created_at, next_run, remaining_runs, expires_until
+             ) VALUES (?1, ?2, ?3, ?4, 'announce', NULL, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                id,
+                expression,
+                message,
+                schedule_json,
+                name,
+                serde_json::to_string(&delivery)?,
+                if delete_after_run { 1 } else { 0 },
+                now.to_rfc3339(),
+                next_run.to_rfc3339(),
+                remaining_runs,
+                expires_until.map(|t| t.to_rfc3339()),
+            ],
+        )
+        .context("Failed to insert cron announce job")?;
+        Ok(())
+    })?;
+
+    get_job(config, &id)
+}
+
 pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source
+                    allowed_tools, source, remaining_runs, expires_until
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -144,7 +193,7 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source
+                    allowed_tools, source, remaining_runs, expires_until
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -178,7 +227,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source
+                    allowed_tools, source, remaining_runs, expires_until
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1
              ORDER BY next_run ASC
@@ -208,7 +257,7 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source
+                    allowed_tools, source, remaining_runs, expires_until
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1
              ORDER BY next_run ASC",
@@ -270,6 +319,12 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
             job.allowed_tools = Some(allowed_tools);
         }
     }
+    if let Some(remaining) = patch.remaining_runs {
+        job.remaining_runs = Some(remaining);
+    }
+    if let Some(expires) = patch.expires_until {
+        job.expires_until = Some(expires);
+    }
 
     if schedule_changed {
         job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
@@ -280,8 +335,8 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
             "UPDATE cron_jobs
              SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                  session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                 allowed_tools = ?12, next_run = ?13
-             WHERE id = ?14",
+                 allowed_tools = ?12, next_run = ?13, remaining_runs = ?14, expires_until = ?15
+             WHERE id = ?16",
             params![
                 job.expression,
                 job.command,
@@ -296,6 +351,8 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                 if job.delete_after_run { 1 } else { 0 },
                 encode_allowed_tools(job.allowed_tools.as_ref())?,
                 job.next_run.to_rfc3339(),
+                job.remaining_runs,
+                job.expires_until.map(|t| t.to_rfc3339()),
                 job.id,
             ],
         )
@@ -497,6 +554,8 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     let created_at_raw: String = row.get(12)?;
     let allowed_tools_raw: Option<String> = row.get(17)?;
     let source: Option<String> = row.get(18)?;
+    let remaining_runs: Option<i64> = row.get(19)?;
+    let expires_until_raw: Option<String> = row.get(20)?;
 
     Ok(CronJob {
         id: row.get(0)?,
@@ -522,6 +581,11 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         last_output: row.get(16)?,
         allowed_tools: decode_allowed_tools(allowed_tools_raw.as_deref())
             .map_err(sql_conversion_error)?,
+        remaining_runs,
+        expires_until: match expires_until_raw {
+            Some(raw) => Some(parse_rfc3339(&raw).map_err(sql_conversion_error)?),
+            None => None,
+        },
     })
 }
 
@@ -901,7 +965,9 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             next_run         TEXT NOT NULL,
             last_run         TEXT,
             last_status      TEXT,
-            last_output      TEXT
+            last_output      TEXT,
+            remaining_runs   INTEGER,
+            expires_until    TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_run ON cron_jobs(next_run);
 
@@ -932,6 +998,8 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(&conn, "allowed_tools", "TEXT")?;
     add_column_if_missing(&conn, "source", "TEXT DEFAULT 'imperative'")?;
+    add_column_if_missing(&conn, "remaining_runs", "INTEGER")?;
+    add_column_if_missing(&conn, "expires_until", "TEXT")?;
 
     f(&conn)
 }
