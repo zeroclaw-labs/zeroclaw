@@ -36,6 +36,7 @@ fn backup_cron_job_synced_when_schedule_set() {
             model: None,
             allowed_tools: None,
             session_target: None,
+            uses_memory: true,
             delivery: None,
         };
         jobs_with_builtin.push(backup_job);
@@ -88,6 +89,7 @@ fn backup_cron_job_removed_when_schedule_cleared() {
             model: None,
             allowed_tools: None,
             session_target: None,
+            uses_memory: true,
             delivery: None,
         };
         jobs_with_builtin.push(backup_job);
@@ -129,6 +131,7 @@ fn backup_cron_job_schedule_updated() {
             model: None,
             allowed_tools: None,
             session_target: None,
+            uses_memory: true,
             delivery: None,
         };
         jobs_v1.push(backup_job);
@@ -156,6 +159,7 @@ fn backup_cron_job_schedule_updated() {
             model: None,
             allowed_tools: None,
             session_target: None,
+            uses_memory: true,
             delivery: None,
         };
         jobs_v2.push(backup_job);
@@ -193,6 +197,7 @@ fn backup_cron_job_id_is_stable() {
                 model: None,
                 allowed_tools: None,
                 session_target: None,
+                uses_memory: true,
                 delivery: None,
             };
             jobs_with_builtin.push(backup_job);
@@ -237,6 +242,7 @@ fn backup_cron_job_command_is_backup_create() {
             model: None,
             allowed_tools: None,
             session_target: None,
+            uses_memory: true,
             delivery: None,
         };
         jobs_with_builtin.push(backup_job);
@@ -268,6 +274,7 @@ fn backup_cron_job_type_is_shell() {
             model: None,
             allowed_tools: None,
             session_target: None,
+            uses_memory: true,
             delivery: None,
         };
         jobs_with_builtin.push(backup_job);
@@ -299,6 +306,7 @@ fn backup_cron_job_source_is_declarative() {
             model: None,
             allowed_tools: None,
             session_target: None,
+            uses_memory: true,
             delivery: None,
         };
         jobs_with_builtin.push(backup_job);

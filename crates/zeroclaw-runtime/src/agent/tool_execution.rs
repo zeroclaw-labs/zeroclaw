@@ -30,6 +30,9 @@ pub struct ToolExecutionOutcome {
     pub success: bool,
     pub error_reason: Option<String>,
     pub duration: Duration,
+    /// Cryptographic HMAC receipt proving this tool actually executed.
+    /// Present only when tool receipts are enabled in config.
+    pub receipt: Option<String>,
 }
 
 // ── Single tool execution ────────────────────────────────────────────────
@@ -41,6 +44,7 @@ pub async fn execute_one_tool(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
 ) -> Result<ToolExecutionOutcome> {
     let args_summary = truncate_with_ellipsis(&call_arguments.to_string(), 300);
     observer.record_event(&ObserverEvent::ToolCallStart {
@@ -68,10 +72,11 @@ pub async fn execute_one_tool(
             success: false,
             error_reason: Some(scrub_credentials(&reason)),
             duration,
+            receipt: None,
         });
     };
 
-    let tool_future = tool.execute(call_arguments);
+    let tool_future = tool.execute(call_arguments.clone());
     let tool_result = if let Some(token) = cancellation_token {
         tokio::select! {
             () = token.cancelled() => return Err(ToolLoopCancelled.into()),
@@ -95,11 +100,16 @@ pub async fn execute_one_tool(
                 } else {
                     &r.output
                 };
+                let output = scrub_credentials(normalized_output);
+                let receipt = receipt_generator.map(|receipt_gen| {
+                    receipt_gen.generate_now(call_name, &call_arguments, &output)
+                });
                 Ok(ToolExecutionOutcome {
-                    output: scrub_credentials(normalized_output),
+                    output,
                     success: true,
                     error_reason: None,
                     duration,
+                    receipt,
                 })
             } else {
                 let reason = r.error.unwrap_or(r.output);
@@ -108,6 +118,7 @@ pub async fn execute_one_tool(
                     success: false,
                     error_reason: Some(scrub_credentials(&reason)),
                     duration,
+                    receipt: None,
                 })
             }
         }
@@ -124,6 +135,7 @@ pub async fn execute_one_tool(
                 success: false,
                 error_reason: Some(scrub_credentials(&reason)),
                 duration,
+                receipt: None,
             })
         }
     }
@@ -166,6 +178,7 @@ pub async fn execute_tools_parallel(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let futures: Vec<_> = tool_calls
         .iter()
@@ -177,6 +190,7 @@ pub async fn execute_tools_parallel(
                 activated_tools,
                 observer,
                 cancellation_token,
+                receipt_generator,
             )
         })
         .collect();
@@ -193,6 +207,7 @@ pub async fn execute_tools_sequential(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let mut outcomes = Vec::with_capacity(tool_calls.len());
 
@@ -205,6 +220,7 @@ pub async fn execute_tools_sequential(
                 activated_tools,
                 observer,
                 cancellation_token,
+                receipt_generator,
             )
             .await?,
         );

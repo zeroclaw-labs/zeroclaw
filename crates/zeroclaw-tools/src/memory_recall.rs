@@ -124,7 +124,7 @@ impl Tool for MemoryRecallTool {
                 for entry in &entries {
                     let score = entry
                         .score
-                        .map_or_else(String::new, |s| format!(" [{s:.0}%]"));
+                        .map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
                     let _ = writeln!(
                         output,
                         "- [{}] {}: {}{score}",
@@ -239,6 +239,29 @@ mod tests {
         let tool = MemoryRecallTool::new(mem);
         assert_eq!(tool.name(), "memory_recall");
         assert!(tool.parameters_schema()["properties"]["query"].is_object());
+    }
+
+    #[test]
+    fn score_formatted_as_percent() {
+        let score: Option<f64> = Some(0.63);
+        let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
+        assert_eq!(formatted, " [63%]");
+
+        let score: Option<f64> = Some(0.42);
+        let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
+        assert_eq!(formatted, " [42%]");
+
+        let score: Option<f64> = Some(1.0);
+        let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
+        assert_eq!(formatted, " [100%]");
+
+        let score: Option<f64> = Some(0.0);
+        let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
+        assert_eq!(formatted, " [0%]");
+
+        let score: Option<f64> = None;
+        let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
+        assert_eq!(formatted, "");
     }
 
     #[test]

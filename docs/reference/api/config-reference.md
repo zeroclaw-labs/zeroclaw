@@ -135,6 +135,23 @@ tools = ["mcp_browser_*"]
 keywords = ["browse", "navigate", "open url", "screenshot"]
 ```
 
+### `tool_receipts`
+
+> **Note:** Config activation is not yet wired. Setting these keys currently has no effect. The receipt mechanism exists but is controlled programmatically. Config-driven activation is tracked as a follow-up.
+
+HMAC-SHA256 tool execution receipts for hallucination detection. When enabled, every successful tool execution produces a cryptographic receipt that proves the tool actually ran. See [tool-receipts.md](../../security/tool-receipts.md) for full documentation.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Generate HMAC receipts for tool executions |
+| `show_in_response` | `false` | Append receipts to user-visible channel messages |
+
+```toml
+[agent.tool_receipts]
+enabled = true
+show_in_response = false
+```
+
 ## `[pacing]`
 
 Pacing controls for slow/local LLM workloads (Ollama, llama.cpp, vLLM). All keys are optional; when absent, existing behavior is preserved.
