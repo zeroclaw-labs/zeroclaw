@@ -1046,12 +1046,13 @@ system automatically routes to the most appropriate model per task type:
 |---------------|----------|---------------|-----------|
 | **일반 채팅 (General Chat)** | Gemini | `gemini-3.1-flash-lite-preview` | Most cost-effective for casual conversation |
 | **추론/문서 (Reasoning/Document)** | Gemini | `gemini-3.1-pro-preview` | High-quality reasoning and document analysis |
-| **코딩 (Coding)** | Anthropic | `claude-opus-4-6` | Best-in-class code generation |
-| **코드 리뷰 (Code Review)** | Gemini | `gemini-3.1-pro-preview` | Architecture-aware review |
+| **코딩 / 코드 리뷰 (Coding / Code Review)** | Anthropic + Gemini | `claude-opus-4-6` (write) + `gemini-3.1-pro-preview` (review) | Best-in-class code generation + architecture-aware review (a single category covering both authoring and multi-model review) |
+| **쇼핑 (Shopping)** | Gemini | `gemini-3.1-pro-preview` | Price/option reasoning, review synthesis, vendor comparison |
+| **전화비서 (Phone Assistant)** | Gemini | Gemini 2.5 Flash Live API | Real-time voice call handling, live STT/TTS, call summarization |
+| **통역 (Interpretation)** | Gemini | Gemini 2.5 Flash Live API | Real-time voice streaming |
 | **이미지 (Image)** | Gemini | `gemini-3.1-flash-lite-preview` | Cost-effective vision tasks |
 | **음악 (Music)** | Gemini | `gemini-3.1-flash-lite-preview` | Lightweight orchestration |
 | **비디오 (Video)** | Gemini | `gemini-3.1-flash-lite-preview` | Lightweight orchestration |
-| **통역 (Interpretation)** | Gemini | Gemini 2.5 Flash Live API | Real-time voice streaming |
 
 #### Credit System & Billing Logic
 
@@ -1868,20 +1869,24 @@ relay peer로부터 암호화 델타 수신
 
 ## 5. Task Categories
 
-MoA organizes all user interactions into **7 top-bar categories** and
+MoA organizes all user interactions into **9 top-bar categories** and
 **3 sidebar navigation items**:
 
 ### Top-Bar (Task Modes)
 
+> Coding includes both code authoring and multi-model code review as a **single category** (not two separate categories), because the agent loop runs the review pipeline inline after each coding step.
+
 | Category | Korean | UI Mode | Tool Scope |
 |----------|--------|---------|------------|
-| **WebGeneral** | 웹/일반 | default chat | BASE + VISION |
-| **Document** | 문서 | `document` editor (2-layer viewer+Tiptap) | BASE + DOCUMENT |
-| **Coding** | 코딩 | `sandbox` | ALL tools (unrestricted) |
+| **WebGeneral** | 일반 채팅 (웹/일반) | default chat | BASE + VISION |
+| **Document** | 추론/문서 | `document` editor (2-layer viewer+Tiptap) | BASE + DOCUMENT |
+| **Coding** | 코딩 / 코드 리뷰 | `sandbox` | ALL tools (unrestricted) |
+| **Shopping** | 쇼핑 | default chat | BASE + VISION + BROWSER (credential vault, price tracking, cart automation) |
+| **PhoneAssistant** | 전화비서 | `voice_call` (Live API) | MINIMAL + PHONE (caller ID, call log, calendar, contacts) |
+| **Translation** | 통역 | `voice_interpret` | MINIMAL (memory + browser + file I/O) |
 | **Image** | 이미지 | default chat | BASE + VISION + MEDIA_IMAGE |
 | **Music** | 음악 | default chat | BASE + MEDIA_MUSIC |
 | **Video** | 비디오 | default chat | BASE + VISION + MEDIA_VIDEO |
-| **Translation** | 통역 | `voice_interpret` | MINIMAL (memory + browser + file I/O) |
 
 ### Sidebar (Navigation)
 
@@ -2228,9 +2233,11 @@ Every MoA task category benefits from the persistent browser:
 | **WebGeneral** | Web search result verification, page content extraction, real-time info |
 | **Document** | PDF/document rendering verification in browser |
 | **Coding** | Test results in real browser, screenshot comparison, QA automation |
+| **Shopping** | Vendor comparison, login with credential vault, cart automation, price tracking, coupon/review scraping |
+| **PhoneAssistant** | Contact/call-log lookup pages, calendar integration UIs, number blocklist management |
+| **Translation** | Real-time translation result verification on web pages |
 | **Image** | Generated image preview and validation |
 | **Music/Video** | Media playback testing |
-| **Translation** | Real-time translation result verification on web pages |
 
 ### Development Methodology: gstack Sprint Cycle
 
