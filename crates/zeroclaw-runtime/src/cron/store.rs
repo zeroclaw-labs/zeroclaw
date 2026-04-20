@@ -125,7 +125,7 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source
+                    allowed_tools, source, uses_memory
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -144,7 +144,7 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source
+                    allowed_tools, source, uses_memory
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -178,7 +178,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source
+                    allowed_tools, source, uses_memory
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1
              ORDER BY next_run ASC
@@ -208,7 +208,7 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source
+                    allowed_tools, source, uses_memory
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1
              ORDER BY next_run ASC",
@@ -270,6 +270,9 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
             job.allowed_tools = Some(allowed_tools);
         }
     }
+    if let Some(uses_memory) = patch.uses_memory {
+        job.uses_memory = uses_memory;
+    }
 
     if schedule_changed {
         job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
@@ -280,8 +283,8 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
             "UPDATE cron_jobs
              SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                  session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                 allowed_tools = ?12, next_run = ?13
-             WHERE id = ?14",
+                 allowed_tools = ?12, next_run = ?13, uses_memory = ?14
+             WHERE id = ?15",
             params![
                 job.expression,
                 job.command,
@@ -296,6 +299,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                 if job.delete_after_run { 1 } else { 0 },
                 encode_allowed_tools(job.allowed_tools.as_ref())?,
                 job.next_run.to_rfc3339(),
+                if job.uses_memory { 1 } else { 0 },
                 job.id,
             ],
         )
@@ -497,6 +501,7 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     let created_at_raw: String = row.get(12)?;
     let allowed_tools_raw: Option<String> = row.get(17)?;
     let source: Option<String> = row.get(18)?;
+    let uses_memory: Option<i64> = row.get(19)?;
 
     Ok(CronJob {
         id: row.get(0)?,
@@ -512,6 +517,7 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         delivery,
         delete_after_run: row.get::<_, i64>(11)? != 0,
         source: source.unwrap_or_else(|| "imperative".to_string()),
+        uses_memory: uses_memory != Some(0),
         created_at: parse_rfc3339(&created_at_raw).map_err(sql_conversion_error)?,
         next_run: parse_rfc3339(&next_run_raw).map_err(sql_conversion_error)?,
         last_run: match last_run_raw {
@@ -680,8 +686,9 @@ pub fn sync_declarative_jobs(
                          SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4,
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
                              enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                             allowed_tools = ?12, source = 'declarative', next_run = ?13
-                         WHERE id = ?14",
+                             allowed_tools = ?12, source = 'declarative', next_run = ?13,
+                             uses_memory = ?14
+                         WHERE id = ?15",
                         params![
                             expression,
                             command,
@@ -696,6 +703,7 @@ pub fn sync_declarative_jobs(
                             if delete_after_run { 1 } else { 0 },
                             allowed_tools_json,
                             next_run.to_rfc3339(),
+                            if decl.uses_memory { 1 } else { 0 },
                             decl.id,
                         ],
                     )
@@ -708,8 +716,9 @@ pub fn sync_declarative_jobs(
                          SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4,
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
                              enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                             allowed_tools = ?12, source = 'declarative'
-                         WHERE id = ?13",
+                             allowed_tools = ?12, source = 'declarative',
+                             uses_memory = ?13
+                         WHERE id = ?14",
                         params![
                             expression,
                             command,
@@ -723,6 +732,7 @@ pub fn sync_declarative_jobs(
                             delivery_json,
                             if delete_after_run { 1 } else { 0 },
                             allowed_tools_json,
+                            if decl.uses_memory { 1 } else { 0 },
                             decl.id,
                         ],
                     )
@@ -739,8 +749,8 @@ pub fn sync_declarative_jobs(
                     "INSERT INTO cron_jobs (
                         id, expression, command, schedule, job_type, prompt, name,
                         session_target, model, enabled, delivery, delete_after_run,
-                        allowed_tools, source, created_at, next_run
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'declarative', ?14, ?15)",
+                        allowed_tools, source, uses_memory, created_at, next_run
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'declarative', ?14, ?15, ?16)",
                     params![
                         decl.id,
                         expression,
@@ -755,6 +765,7 @@ pub fn sync_declarative_jobs(
                         delivery_json,
                         if delete_after_run { 1 } else { 0 },
                         allowed_tools_json,
+                        if decl.uses_memory { 1 } else { 0 },
                         now.to_rfc3339(),
                         next_run.to_rfc3339(),
                     ],
@@ -932,6 +943,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(&conn, "allowed_tools", "TEXT")?;
     add_column_if_missing(&conn, "source", "TEXT DEFAULT 'imperative'")?;
+    add_column_if_missing(&conn, "uses_memory", "INTEGER NOT NULL DEFAULT 1")?;
 
     f(&conn)
 }
@@ -1465,6 +1477,7 @@ mod tests {
             enabled: true,
             model: None,
             allowed_tools: None,
+            uses_memory: true,
             session_target: None,
             delivery: None,
         }
@@ -1484,6 +1497,7 @@ mod tests {
             enabled: true,
             model: None,
             allowed_tools: None,
+            uses_memory: true,
             session_target: None,
             delivery: None,
         }
@@ -1638,6 +1652,7 @@ mod tests {
             enabled: true,
             model: None,
             allowed_tools: None,
+            uses_memory: true,
             session_target: None,
             delivery: None,
         };
