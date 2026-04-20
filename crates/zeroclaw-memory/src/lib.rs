@@ -31,6 +31,8 @@ pub mod markdown;
 pub mod namespaced;
 pub mod none;
 pub mod policy;
+#[cfg(feature = "backend-postgres")]
+pub mod postgres;
 pub mod qdrant;
 pub mod response_cache;
 pub mod retrieval;
@@ -52,6 +54,8 @@ pub use namespaced::NamespacedMemory;
 pub use none::NoneMemory;
 #[allow(unused_imports)]
 pub use policy::PolicyEnforcer;
+#[cfg(feature = "backend-postgres")]
+pub use postgres::PostgresMemory;
 pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
 #[allow(unused_imports)]
@@ -81,7 +85,7 @@ where
             let local = sqlite_builder()?;
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
-        MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
+        MemoryBackendKind::Qdrant | MemoryBackendKind::Postgres | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
         }
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
@@ -337,6 +341,26 @@ pub fn create_memory_with_storage_and_routes(
         Ok(mem)
     }
 
+    #[cfg(feature = "backend-postgres")]
+    if matches!(backend_kind, MemoryBackendKind::Postgres) {
+        let mem = PostgresMemory::new_lazy(&config.postgres)
+            .context("failed to initialize Postgres memory backend")?;
+        tracing::info!(
+            "📦 Postgres memory backend configured (schema: {}, table: {})",
+            config.postgres.schema,
+            config.postgres.table,
+        );
+        return Ok(Box::new(mem));
+    }
+
+    #[cfg(not(feature = "backend-postgres"))]
+    if matches!(backend_kind, MemoryBackendKind::Postgres) {
+        anyhow::bail!(
+            "Memory backend 'postgres' was requested but is not compiled in. \
+             Rebuild with: cargo install zeroclaw --features backend-postgres"
+        );
+    }
+
     if matches!(backend_kind, MemoryBackendKind::Qdrant) {
         let url = config
             .qdrant
@@ -534,6 +558,23 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mem = create_memory_for_migration("lucid", tmp.path()).unwrap();
         assert_eq!(mem.name(), "lucid");
+    }
+
+    #[cfg(not(feature = "backend-postgres"))]
+    #[test]
+    fn factory_postgres_without_feature_produces_clear_error() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "postgres".into(),
+            ..MemoryConfig::default()
+        };
+        let err = create_memory(&cfg, tmp.path(), None)
+            .err()
+            .expect("postgres without feature should fail");
+        assert!(
+            err.to_string().contains("not compiled in"),
+            "error should tell user to rebuild with feature: {err}"
+        );
     }
 
     #[test]

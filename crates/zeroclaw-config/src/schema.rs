@@ -5096,6 +5096,55 @@ impl Default for QdrantConfig {
     }
 }
 
+/// Configuration for the Postgres memory backend (`[memory.postgres]`).
+/// Only used when `backend = "postgres"`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "memory.postgres"]
+pub struct PostgresConfig {
+    /// PostgreSQL connection URL (e.g. "postgres://user:pass@localhost/zeroclaw").
+    /// Falls back to `POSTGRES_URL` or `DATABASE_URL` env var if not set.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Database schema to use. Default: "public".
+    #[serde(default = "default_pg_schema")]
+    pub schema: String,
+    /// Table name for storing memories. Default: "memories".
+    #[serde(default = "default_pg_table")]
+    pub table: String,
+    /// Maximum number of connections in the pool. Default: 5.
+    #[serde(default = "default_pg_max_connections")]
+    pub max_connections: u32,
+    /// Connection timeout in seconds. Default: 10.
+    #[serde(default = "default_pg_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+}
+
+fn default_pg_schema() -> String {
+    "public".into()
+}
+fn default_pg_table() -> String {
+    "memories".into()
+}
+fn default_pg_max_connections() -> u32 {
+    5
+}
+fn default_pg_connect_timeout_secs() -> u64 {
+    10
+}
+
+impl Default for PostgresConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            schema: default_pg_schema(),
+            table: default_pg_table(),
+            max_connections: default_pg_max_connections(),
+            connect_timeout_secs: default_pg_connect_timeout_secs(),
+        }
+    }
+}
+
 /// Search strategy for memory recall.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -5238,6 +5287,13 @@ pub struct MemoryConfig {
     #[serde(default)]
     #[nested]
     pub qdrant: QdrantConfig,
+
+    // ── Postgres backend options ──────────────────���───────────
+    /// Configuration for PostgreSQL memory backend.
+    /// Only used when `backend = "postgres"`. Requires `--features backend-postgres`.
+    #[serde(default)]
+    #[nested]
+    pub postgres: PostgresConfig,
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
@@ -5361,6 +5417,7 @@ impl Default for MemoryConfig {
             policy: MemoryPolicyConfig::default(),
             sqlite_open_timeout_secs: None,
             qdrant: QdrantConfig::default(),
+            postgres: PostgresConfig::default(),
         }
     }
 }
