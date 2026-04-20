@@ -33,6 +33,7 @@
 - [one-click-bootstrap.md](i18n/zh-CN/setup-guides/one-click-bootstrap.zh-CN.md)
 - [mattermost-setup.md](i18n/zh-CN/setup-guides/mattermost-setup.zh-CN.md)
 - [nextcloud-talk-setup.md](i18n/zh-CN/setup-guides/nextcloud-talk-setup.zh-CN.md)
+- [line-setup.md](setup-guides/line-setup.md)
 - [zai-glm-setup.md](i18n/zh-CN/setup-guides/zai-glm-setup.zh-CN.md)
 
 ### 2) 命令 / 配置参考与集成

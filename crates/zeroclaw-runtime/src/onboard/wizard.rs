@@ -94,7 +94,7 @@ const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 
 fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
-    channels.channels_except_webhook().iter().any(|(_, ok)| *ok)
+    channels.channels().iter().any(|(_, ok)| *ok)
 }
 
 // ── Main wizard entry point ──────────────────────────────────────
@@ -922,6 +922,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
         "avian" => "deepseek/deepseek-v3.2".into(),
+        "copilot" => "gpt-4o".into(),
         _ => "anthropic/claude-sonnet-4.6".into(),
     }
 }
@@ -1000,6 +1001,17 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "GPT-5.2 Codex (agentic coding)".to_string(),
             ),
             ("o4-mini".to_string(), "o4-mini (fallback)".to_string()),
+        ],
+        "copilot" => vec![
+            ("gpt-4o".to_string(), "GPT-4o".to_string()),
+            ("gpt-4.1".to_string(), "GPT-4.1".to_string()),
+            ("gpt-5-mini".to_string(), "GPT-5 mini".to_string()),
+            (
+                "claude-sonnet-4.6".to_string(),
+                "Claude Sonnet 4.6".to_string(),
+            ),
+            ("gpt-5.3-codex".to_string(), "GPT-5.3 Codex".to_string()),
+            ("claude-opus-4.6".to_string(), "Claude Opus 4.6".to_string()),
         ],
         "venice" => vec![
             (
@@ -2401,7 +2413,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
         "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
-        "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
+        "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere, GitHub Copilot)",
         "🏠 Local / private (Ollama, llama.cpp server, vLLM — no API key needed)",
         "🔧 Custom — bring your own OpenAI-compatible API",
     ];
@@ -2485,6 +2497,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             ("opencode", "OpenCode Zen — code-focused AI"),
             ("opencode-go", "OpenCode Go — Subsidized code-focused AI"),
             ("cohere", "Cohere — Command R+ & embeddings"),
+            ("copilot", "GitHub Copilot"),
         ],
         4 => local_provider_choices(),
         _ => vec![], // Custom — handled below
@@ -2839,6 +2852,25 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 key
             }
         }
+    } else if canonical_provider_name(provider_name) == "copilot" {
+        // GitHub Copilot uses OAuth device flow — no API key needed during setup.
+        // Check if a GITHUB_TOKEN is already available in the environment.
+        if std::env::var("GITHUB_TOKEN").is_ok() {
+            print_bullet(&format!(
+                "{} GITHUB_TOKEN environment variable detected!",
+                style("✓").green().bold()
+            ));
+            print_bullet("ZeroClaw will use it for GitHub Copilot authentication.");
+        } else {
+            print_bullet("GitHub Copilot uses OAuth device-flow authentication.");
+            print_bullet("No API key is needed — you'll be prompted to authorize on first run.");
+            print_bullet(&format!(
+                "Or set {} to use a pre-existing GitHub personal access token.",
+                style("GITHUB_TOKEN").yellow()
+            ));
+        }
+        println!();
+        String::new()
     } else {
         let key_url = if is_moonshot_alias(provider_name)
             || canonical_provider_name(provider_name) == "kimi-code"
@@ -3178,6 +3210,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => "NVIDIA_API_KEY",
         "astrai" => "ASTRAI_API_KEY",
         "avian" => "AVIAN_API_KEY",
+        "copilot" => "GITHUB_TOKEN",
         _ => "API_KEY",
     }
 }
@@ -3757,6 +3790,9 @@ fn setup_channels(
                     mention_only: existing_tg.map(|t| t.mention_only).unwrap_or(false),
                     ack_reactions: existing_tg.and_then(|t| t.ack_reactions),
                     proxy_url: existing_tg.and_then(|t| t.proxy_url.clone()),
+                    approval_timeout_secs: existing_tg
+                        .map(|t| t.approval_timeout_secs)
+                        .unwrap_or(120),
                 });
             }
             ChannelMenuChoice::Discord => {
@@ -7066,6 +7102,8 @@ mod tests {
         );
         assert_eq!(default_model_for_provider("openai"), "gpt-5.2");
         assert_eq!(default_model_for_provider("openai-codex"), "gpt-5-codex");
+        assert_eq!(default_model_for_provider("copilot"), "gpt-4o");
+        assert_eq!(default_model_for_provider("github-copilot"), "gpt-4o");
         assert_eq!(
             default_model_for_provider("anthropic"),
             "claude-sonnet-4-5-20250929"
@@ -7134,6 +7172,8 @@ mod tests {
         assert_eq!(canonical_provider_name("aws-bedrock"), "bedrock");
         assert_eq!(canonical_provider_name("build.nvidia.com"), "nvidia");
         assert_eq!(canonical_provider_name("llama.cpp"), "llamacpp");
+        assert_eq!(canonical_provider_name("github-copilot"), "copilot");
+        assert_eq!(canonical_provider_name("copilot"), "copilot");
     }
 
     #[test]
@@ -7170,6 +7210,21 @@ mod tests {
 
         assert!(ids.contains(&"gpt-5-codex".to_string()));
         assert!(ids.contains(&"gpt-5.2-codex".to_string()));
+    }
+
+    #[test]
+    fn curated_models_for_copilot_include_expected_models() {
+        let ids: Vec<String> = curated_models_for_provider("copilot")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"gpt-4o".to_string()));
+        assert!(ids.contains(&"gpt-4.1".to_string()));
+        assert!(ids.contains(&"gpt-5-mini".to_string()));
+        assert!(ids.contains(&"claude-sonnet-4.6".to_string()));
+        assert!(ids.contains(&"gpt-5.3-codex".to_string()));
+        assert!(ids.contains(&"claude-opus-4.6".to_string()));
     }
 
     #[test]
@@ -7660,6 +7715,8 @@ mod tests {
         assert_eq!(provider_env_var("anthropic"), "ANTHROPIC_API_KEY");
         assert_eq!(provider_env_var("openai-codex"), "OPENAI_API_KEY");
         assert_eq!(provider_env_var("openai"), "OPENAI_API_KEY");
+        assert_eq!(provider_env_var("copilot"), "GITHUB_TOKEN");
+        assert_eq!(provider_env_var("github-copilot"), "GITHUB_TOKEN"); // alias
         assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
         assert_eq!(provider_env_var("llamacpp"), "LLAMACPP_API_KEY");
         assert_eq!(provider_env_var("llama.cpp"), "LLAMACPP_API_KEY");
@@ -7850,6 +7907,23 @@ mod tests {
             port: None,
             proxy_url: None,
         });
+        assert!(has_launchable_channels(&channels));
+    }
+
+    #[test]
+    fn webhook_only_config_is_launchable() {
+        let channels = ChannelsConfig {
+            webhook: Some(zeroclaw_config::schema::WebhookConfig {
+                enabled: true,
+                port: 8080,
+                listen_path: None,
+                send_url: None,
+                send_method: None,
+                auth_header: None,
+                secret: None,
+            }),
+            ..Default::default()
+        };
         assert!(has_launchable_channels(&channels));
     }
 

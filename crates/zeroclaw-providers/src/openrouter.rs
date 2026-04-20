@@ -1,9 +1,13 @@
+use crate::compatible::sse_bytes_to_events;
 use crate::multimodal;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
+    Provider, ProviderCapabilities, StreamError, StreamEvent, StreamOptions, StreamResult,
+    TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
+use futures_util::StreamExt as _;
+use futures_util::stream;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -78,6 +82,8 @@ struct NativeChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -508,6 +514,7 @@ impl Provider for OpenRouterProvider {
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
             max_tokens: self.max_tokens,
+            stream: None,
         };
 
         let response = self
@@ -545,6 +552,104 @@ impl Provider for OpenRouterProvider {
 
     fn supports_native_tools(&self) -> bool {
         true
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn supports_streaming_tool_events(&self) -> bool {
+        true
+    }
+
+    fn stream_chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        if !options.enabled {
+            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+        }
+
+        let credential = match self.credential.as_ref() {
+            Some(c) => c.clone(),
+            None => {
+                return stream::once(async {
+                    Err(StreamError::Provider(
+                        "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.".to_string(),
+                    ))
+                })
+                .boxed();
+            }
+        };
+
+        let tools = Self::convert_tools(request.tools);
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            messages: Self::convert_messages(request.messages),
+            temperature,
+            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tools,
+            max_tokens: self.max_tokens,
+            stream: Some(true),
+        };
+
+        let payload = match serde_json::to_value(&native_request) {
+            Ok(v) => v,
+            Err(e) => {
+                return stream::once(async move { Err(StreamError::Json(e)) }).boxed();
+            }
+        };
+
+        let client = self.http_client();
+        let count_tokens = options.count_tokens;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
+
+        tokio::spawn(async move {
+            let response = match client
+                .post("https://openrouter.ai/api/v1/chat/completions")
+                .header("Authorization", format!("Bearer {credential}"))
+                .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
+                .header("X-Title", "ZeroClaw")
+                .header("Accept", "text/event-stream")
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let error = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| format!("HTTP error: {status}"));
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{status}: {error}"))))
+                    .await;
+                return;
+            }
+
+            let mut event_stream = sse_bytes_to_events(response, count_tokens);
+            while let Some(event) = event_stream.next().await {
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed()
     }
 
     async fn chat_with_tools(
@@ -599,6 +704,7 @@ impl Provider for OpenRouterProvider {
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
             max_tokens: self.max_tokens,
+            stream: None,
         };
 
         let response = self
@@ -656,6 +762,118 @@ mod tests {
         let caps = <OpenRouterProvider as Provider>::capabilities(&provider);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn supports_streaming_returns_true() {
+        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"), None);
+        assert!(provider.supports_streaming());
+    }
+
+    #[test]
+    fn supports_streaming_tool_events_returns_true() {
+        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"), None);
+        assert!(provider.supports_streaming_tool_events());
+    }
+
+    #[tokio::test]
+    async fn stream_chat_without_key_returns_error_event() {
+        use crate::traits::{ChatMessage, ChatRequest};
+        use futures_util::StreamExt as _;
+
+        let provider = OpenRouterProvider::new(None, None);
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        }];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+
+        let mut stream = provider.stream_chat(
+            request,
+            "anthropic/claude-haiku-4-5",
+            0.0,
+            crate::traits::StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+
+        let first = stream
+            .next()
+            .await
+            .expect("stream should yield at least one event");
+        assert!(first.is_err(), "expected error without API key");
+        let err = first.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("API key not set"),
+            "error should mention API key: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_disabled_options_returns_final() {
+        use crate::traits::{ChatMessage, ChatRequest, StreamEvent};
+        use futures_util::StreamExt as _;
+
+        let provider = OpenRouterProvider::new(Some("key"), None);
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        }];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+
+        let mut stream = provider.stream_chat(
+            request,
+            "anthropic/claude-haiku-4-5",
+            0.0,
+            crate::traits::StreamOptions {
+                enabled: false,
+                count_tokens: false,
+            },
+        );
+
+        let first = stream
+            .next()
+            .await
+            .expect("stream should yield Final immediately");
+        assert!(matches!(first, Ok(StreamEvent::Final)));
+    }
+
+    #[test]
+    fn native_chat_request_serializes_stream_true() {
+        let req = NativeChatRequest {
+            model: "anthropic/claude-haiku-4-5".into(),
+            messages: vec![],
+            temperature: 0.0,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            stream: Some(true),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"stream\":true"));
+    }
+
+    #[test]
+    fn native_chat_request_omits_stream_when_none() {
+        let req = NativeChatRequest {
+            model: "anthropic/claude-haiku-4-5".into(),
+            messages: vec![],
+            temperature: 0.0,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            stream: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("stream"));
     }
 
     #[test]

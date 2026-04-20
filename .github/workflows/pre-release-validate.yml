@@ -10,9 +10,6 @@ on:
         description: "Version to validate (e.g. 0.6.9)"
         required: false
         type: string
-  pull_request:
-    paths:
-      - "Cargo.toml"
 
 permissions:
   contents: read
@@ -22,7 +19,7 @@ jobs:
     name: Validate Release Readiness
     runs-on: ubuntu-latest
     env:
-      PAT: ${{ secrets.PAT }}
+      PAT: ${{ secrets.RELEASE_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -39,23 +36,10 @@ jobs:
             echo "version=$version" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Check crates.io publishability
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        run: |
-          echo "::group::Checking cargo publish --dry-run"
-          cargo publish --dry-run --allow-dirty --no-verify 2>&1 || {
-            echo "::error::cargo publish --dry-run failed. Fix dependency version issues before releasing."
-            exit 1
-          }
-          echo "::endgroup::"
-          echo "crates.io publish dry-run passed"
-
       - name: Check required secrets exist
         shell: bash
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          CHECK_PAT: ${{ secrets.PAT }}
+          CHECK_PAT: ${{ secrets.RELEASE_TOKEN }}
           HOMEBREW_CORE_BOT_TOKEN: ${{ secrets.HOMEBREW_CORE_BOT_TOKEN }}
           HOMEBREW_UPSTREAM_PR_TOKEN: ${{ secrets.HOMEBREW_UPSTREAM_PR_TOKEN }}
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
@@ -78,7 +62,6 @@ jobs:
           }
 
           echo "=== Required Secrets ==="
-          check_secret "CARGO_REGISTRY_TOKEN" "$CARGO_REGISTRY_TOKEN"
           check_secret "PAT" "$CHECK_PAT"
           check_secret "AUR_SSH_KEY" "$AUR_SSH_KEY"
 
@@ -107,25 +90,39 @@ jobs:
         if: env.PAT != ''
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.PAT }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          WEBSITE_PAT: ${{ secrets.WEBSITE_REPO_PAT }}
         run: |
           failed=0
 
           check_repo_access() {
             local repo="$1"
             if gh api "repos/$repo" --jq '.permissions.push' 2>/dev/null | grep -q true; then
-              echo "OK: PAT has write access to $repo"
+              echo "OK: RELEASE_TOKEN has write access to $repo"
             else
-              echo "::error::PAT cannot write to $repo"
+              echo "::error::RELEASE_TOKEN cannot write to $repo"
               failed=1
             fi
           }
 
-          echo "=== Downstream Repository Access ==="
-          check_repo_access "zeroclaw-labs/zeroclaw-website"
+          echo "=== Downstream Repository Access (RELEASE_TOKEN) ==="
           check_repo_access "zeroclaw-labs/dokploy"
           check_repo_access "zeroclaw-labs/easypanel"
           check_repo_access "zeroclaw-labs/coolify"
+
+          echo ""
+          echo "=== Website Access (WEBSITE_REPO_PAT) ==="
+          if [[ -n "$WEBSITE_PAT" ]]; then
+            if GH_TOKEN="$WEBSITE_PAT" gh api "repos/zeroclaw-labs/zeroclaw-website" --jq '.permissions.push' 2>/dev/null | grep -q true; then
+              echo "OK: WEBSITE_REPO_PAT has write access to zeroclaw-labs/zeroclaw-website"
+            else
+              echo "::error::WEBSITE_REPO_PAT cannot write to zeroclaw-labs/zeroclaw-website"
+              failed=1
+            fi
+          else
+            echo "::error::WEBSITE_REPO_PAT secret is missing"
+            failed=1
+          fi
 
           echo ""
           echo "=== Homebrew Fork Access ==="
@@ -138,7 +135,7 @@ jobs:
 
           if [[ $failed -ne 0 ]]; then
             echo ""
-            echo "::error::PAT lacks write access to one or more downstream repos. Update the PAT scopes."
+            echo "::error::One or more tokens lack required access. Check repo Settings > Secrets."
             exit 1
           fi
 
@@ -185,11 +182,6 @@ jobs:
             echo ""
             echo "| Check | Status |"
             echo "|---|---|"
-            if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-              echo "| crates.io dry-run | Passed |"
-            else
-              echo "| crates.io dry-run | Skipped (PR) |"
-            fi
             echo "| Required secrets | Passed |"
             echo "| Downstream repo access | Passed |"
             echo "| Version consistency | Passed |"
