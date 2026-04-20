@@ -221,6 +221,8 @@ Mattermost listen behavior:
 - `channel_id = "specific-id"`: listen on all events but only process the specified channel.
 - `mention_only = true`: in group/public channels, only respond to @-mentions. DMs (`channel_type = "D"`) always receive responses regardless of this setting.
 
+> **Upgrading from earlier releases:** previously, omitting `channel_id` caused the Mattermost channel to exit on startup. It now listens across all accessible channels and DMs via WebSocket. To disable the channel entirely, remove the `[channels_config.mattermost]` block; to restrict it to a single channel as before, keep `channel_id = "specific-id"` explicitly set.
+
 ### 4.5 Matrix
 
 ```toml
