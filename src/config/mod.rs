@@ -192,12 +192,44 @@ fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Val
             })?))
         }
         PropKind::String | PropKind::Enum => Ok(toml::Value::String(value_str.to_string())),
+        PropKind::StringArray => {
+            let items = value_str
+                .split(',')
+                .map(|s| toml::Value::String(s.trim().to_string()))
+                .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                .collect();
+            Ok(toml::Value::Array(items))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_string_array_splits_on_comma() {
+        let result = parse_prop_value("alice, bob, charlie", PropKind::StringArray).unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0].as_str(), Some("alice"));
+        assert_eq!(arr[1].as_str(), Some("bob"));
+        assert_eq!(arr[2].as_str(), Some("charlie"));
+    }
+
+    #[test]
+    fn parse_string_array_empty_input_gives_empty_array() {
+        let result = parse_prop_value("", PropKind::StringArray).unwrap();
+        assert_eq!(result.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn parse_string_array_single_value() {
+        let result = parse_prop_value("alice", PropKind::StringArray).unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].as_str(), Some("alice"));
+    }
 
     #[test]
     fn reexported_config_default_is_constructible() {
