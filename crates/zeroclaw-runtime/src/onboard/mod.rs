@@ -74,7 +74,35 @@ pub async fn run(
 // Each lands in its own commit. Bodies stay in mod.rs until one grows past
 // ~50 lines, at which point it earns its own file under `sections/`.
 
-async fn workspace(_cfg: &mut Config, _ui: &mut dyn OnboardUi, _flags: &Flags) -> Result<()> {
+async fn workspace(cfg: &mut Config, ui: &mut dyn OnboardUi, _flags: &Flags) -> Result<()> {
+    ui.status(&format!(
+        "Workspace directory: {}",
+        cfg.workspace_dir.display()
+    ));
+
+    let currently_enabled = cfg.workspace.enabled;
+    let enable = ui
+        .confirm(
+            "Enable multi-workspace isolation (separate memory / secrets / audit per workspace)?",
+            currently_enabled,
+        )
+        .await?;
+    if enable != currently_enabled {
+        cfg.set_prop("workspace.enabled", &enable.to_string())?;
+    }
+
+    if !enable {
+        return Ok(());
+    }
+
+    let current_name = cfg.workspace.active_workspace.clone().unwrap_or_default();
+    let name = ui
+        .string("Active workspace name", Some(&current_name))
+        .await?;
+    if name != current_name && !name.trim().is_empty() {
+        cfg.set_prop("workspace.active-workspace", name.trim())?;
+    }
+
     Ok(())
 }
 
