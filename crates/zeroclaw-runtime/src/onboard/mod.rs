@@ -67,6 +67,16 @@ pub async fn run(
     Ok(())
 }
 
+/// Write a single property and immediately persist the whole config. This is
+/// the ONE path every section takes to mutate cfg, so users who Ctrl+C
+/// mid-flow find their prior answers already saved on disk — re-running
+/// `zeroclaw onboard` picks up where they left off.
+async fn persist(cfg: &mut Config, path: &str, value: &str) -> Result<()> {
+    cfg.set_prop(path, value)?;
+    cfg.save().await?;
+    Ok(())
+}
+
 // ── Field-driven helpers ─────────────────────────────────────────────────
 
 /// Prompt for a single config field identified by its dotted name.
@@ -98,7 +108,7 @@ async fn prompt_field(cfg: &mut Config, ui: &mut dyn OnboardUi, name: &str) -> R
 
     if field.is_secret {
         if let Some(value) = ui.secret(prompt, is_set).await? {
-            cfg.set_prop(name, &value)?;
+            persist(cfg, name, &value).await?;
         }
         return Ok(());
     }
@@ -108,7 +118,7 @@ async fn prompt_field(cfg: &mut Config, ui: &mut dyn OnboardUi, name: &str) -> R
             let cur = current.parse::<bool>().unwrap_or(false);
             let new = ui.confirm(prompt, cur).await?;
             if new != cur {
-                cfg.set_prop(name, &new.to_string())?;
+                persist(cfg, name, &new.to_string()).await?;
             }
         }
         PropKind::String | PropKind::Integer | PropKind::Float => {
@@ -118,7 +128,7 @@ async fn prompt_field(cfg: &mut Config, ui: &mut dyn OnboardUi, name: &str) -> R
             // Empty input on a set field = would be a clear; set_prop with "" will
             // remove the key (serde_set_prop handles the Option case).
             if (is_set || !new.is_empty()) && new != current {
-                cfg.set_prop(name, &new)?;
+                persist(cfg, name, &new).await?;
             }
         }
         PropKind::Enum => {
@@ -132,7 +142,7 @@ async fn prompt_field(cfg: &mut Config, ui: &mut dyn OnboardUi, name: &str) -> R
             let idx = ui.select(prompt, &items, current_idx).await?;
             let new = &variants[idx];
             if new != &current {
-                cfg.set_prop(name, new)?;
+                persist(cfg, name, new).await?;
             }
         }
     }
@@ -218,12 +228,13 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
     };
 
     if picked != current_fallback {
-        cfg.set_prop("providers.fallback", &picked)?;
+        persist(cfg, "providers.fallback", &picked).await?;
     }
 
     // Seed the HashMap entry so prop_fields enumerates its fields. Default
     // ModelProviderConfig is empty; set_prop fills it as we prompt.
     cfg.providers.models.entry(picked.clone()).or_default();
+    cfg.save().await?;
 
     // Apply CLI-flag overrides up front, then skip those names in the
     // interactive pass so the user isn't re-prompted for what they already
@@ -231,11 +242,11 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
     let prefix = format!("providers.models.{picked}");
     let mut excludes: Vec<&str> = vec!["model"]; // handled below via live fetch
     if let Some(api_key) = &flags.api_key {
-        cfg.set_prop(&format!("{prefix}.api-key"), api_key)?;
+        persist(cfg, &format!("{prefix}.api-key"), api_key).await?;
         excludes.push("api-key");
     }
     if let Some(model) = &flags.model {
-        cfg.set_prop(&format!("{prefix}.model"), model)?;
+        persist(cfg, &format!("{prefix}.model"), model).await?;
         return prompt_fields_under(cfg, ui, &prefix, &excludes).await;
     }
 
@@ -273,7 +284,7 @@ async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, provider: &str) 
     };
 
     if new_value != current && !new_value.is_empty() {
-        cfg.set_prop(&model_path, &new_value)?;
+        persist(cfg, &model_path, &new_value).await?;
     }
     Ok(())
 }
@@ -327,6 +338,7 @@ async fn channels(cfg: &mut Config, ui: &mut dyn OnboardUi, _flags: &Flags) -> R
         let picked = &all_channels[idx];
         let prefix = format!("channels.{picked}");
         cfg.init_defaults(Some(&prefix));
+        cfg.save().await?;
         prompt_fields_under(cfg, ui, &prefix, &[]).await?;
     }
     Ok(())
@@ -348,7 +360,7 @@ async fn memory(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Resu
         backends[idx].key.to_string()
     };
     if new_backend != current_backend {
-        cfg.set_prop("memory.backend", &new_backend)?;
+        persist(cfg, "memory.backend", &new_backend).await?;
     }
 
     prompt_field(cfg, ui, "memory.auto-save").await
@@ -388,7 +400,7 @@ async fn tunnel(cfg: &mut Config, ui: &mut dyn OnboardUi, _flags: &Flags) -> Res
     let new_provider = providers[idx].clone();
 
     if new_provider != current_provider {
-        cfg.set_prop("tunnel.provider", &new_provider)?;
+        persist(cfg, "tunnel.provider", &new_provider).await?;
     }
 
     if new_provider != "none" {
@@ -396,6 +408,7 @@ async fn tunnel(cfg: &mut Config, ui: &mut dyn OnboardUi, _flags: &Flags) -> Res
         // then prompt every field generically.
         let prefix = format!("tunnel.{new_provider}");
         cfg.init_defaults(Some(&prefix));
+        cfg.save().await?;
         prompt_fields_under(cfg, ui, &prefix, &[]).await?;
     }
     Ok(())
