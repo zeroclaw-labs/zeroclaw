@@ -58,6 +58,9 @@ impl MemoryLoader for DefaultMemoryLoader {
             if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
                 continue;
             }
+            if zeroclaw_memory::is_user_autosave_key(&entry.key) {
+                continue;
+            }
             if zeroclaw_memory::should_skip_autosave_content(&entry.content) {
                 continue;
             }
@@ -258,5 +261,46 @@ mod tests {
         assert!(context.contains("user_fact"));
         assert!(!context.contains("assistant_resp_legacy"));
         assert!(!context.contains("fabricated detail"));
+    }
+
+    #[tokio::test]
+    async fn default_loader_skips_user_autosave_entries() {
+        let loader = DefaultMemoryLoader::new(5, 0.0);
+        let memory = MockMemoryWithEntries {
+            entries: Arc::new(vec![
+                MemoryEntry {
+                    id: "1".into(),
+                    key: "user_msg_e5f6g7h8".into(),
+                    content: "User message embedding prior context verbatim".into(),
+                    category: MemoryCategory::Conversation,
+                    timestamp: "now".into(),
+                    session_id: None,
+                    score: Some(0.95),
+                    namespace: "default".into(),
+                    importance: None,
+                    superseded_by: None,
+                },
+                MemoryEntry {
+                    id: "2".into(),
+                    key: "user_fact".into(),
+                    content: "User prefers concise answers".into(),
+                    category: MemoryCategory::Conversation,
+                    timestamp: "now".into(),
+                    session_id: None,
+                    score: Some(0.9),
+                    namespace: "default".into(),
+                    importance: None,
+                    superseded_by: None,
+                },
+            ]),
+        };
+
+        let context = loader
+            .load_context(&memory, "answer style", None)
+            .await
+            .unwrap();
+        assert!(context.contains("user_fact"));
+        assert!(!context.contains("user_msg_e5f6g7h8"));
+        assert!(!context.contains("embedding prior context"));
     }
 }

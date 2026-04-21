@@ -222,6 +222,8 @@ phone_number_id = "123456789012345"
 verify_token = "your-verify-token"
 app_secret = "your-app-secret"     # tùy chọn nhưng được khuyến nghị
 allowed_numbers = ["*"]
+dm_mention_patterns = []           # tùy chọn: regex pattern cho DM mention gating
+group_mention_patterns = []        # tùy chọn: regex pattern cho group-chat mention gating
 ```
 
 Chế độ WhatsApp Web:
@@ -232,6 +234,8 @@ session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
 pair_phone = "15551234567"         # tùy chọn; bỏ qua để dùng QR flow
 pair_code = ""                     # tùy chọn pair code tùy chỉnh
 allowed_numbers = ["*"]
+dm_mention_patterns = []           # tùy chọn: regex pattern cho DM mention gating
+group_mention_patterns = []        # tùy chọn: regex pattern cho group-chat mention gating
 ```
 
 Lưu ý:
@@ -239,6 +243,7 @@ Lưu ý:
 - Build với `cargo build --features whatsapp-web` (hoặc lệnh run tương đương).
 - Giữ `session_path` trên bộ nhớ lưu trữ bền vững để tránh phải liên kết lại sau khi khởi động lại.
 - Định tuyến trả lời sử dụng JID của chat nguồn, vì vậy cả trả lời trực tiếp và nhóm đều hoạt động đúng.
+- `dm_mention_patterns` và `group_mention_patterns` cung cấp mention gating dựa trên regex cho DM và group chat tương ứng. Khi không rỗng, chỉ tin nhắn khớp ít nhất một pattern mới được xử lý; các đoạn khớp sẽ bị loại bỏ khỏi nội dung chuyển tiếp. Pattern không phân biệt hoa thường. Ví dụ: `["@?ZeroClaw", "\\+?15555550123"]`. Pattern không hợp lệ hoặc quá lớn sẽ được ghi log và bỏ qua.
 
 ### 4.8 Cấu hình Webhook Channel (Gateway)
 

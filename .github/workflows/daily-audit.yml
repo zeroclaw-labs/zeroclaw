@@ -1,0 +1,88 @@
+name: Daily Advisory Scan
+
+on:
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: daily-audit
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  advisories:
+    name: Advisory Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Run advisory scan
+        id: scan
+        continue-on-error: true
+        shell: bash
+        run: |
+          cargo deny check advisories 2>&1 | tee /tmp/advisory-output.txt
+          exit "${PIPESTATUS[0]}"
+
+      - name: Open issue on advisory failure
+        if: steps.scan.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Avoid opening a duplicate while an advisory issue is still open.
+          open_count=$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --label "security" \
+            --state open \
+            --search "Advisory scan failed in:title" \
+            --json number \
+            --jq 'length')
+
+          if [[ "$open_count" -gt 0 ]]; then
+            echo "An open advisory issue already exists — skipping duplicate."
+            exit 0
+          fi
+
+          advisory_output=$(cat /tmp/advisory-output.txt)
+
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "ci: Advisory scan failed — $(date -u +%Y-%m-%d)" \
+            --label "security" \
+            --label "risk: high" \
+            --body "## Advisory scan failed
+
+Workflow run: ${RUN_URL}
+
+\`\`\`
+${advisory_output}
+\`\`\`
+
+Review \`deny.toml\` for the current ignore list. If this advisory is a known
+acceptable risk, add an entry with a \`reason\` field. If it requires a
+dependency update, open a tracking issue and link it here.
+
+cc @JordanTheJet @theonlyhennygod"
+
+      - name: Propagate scan failure
+        if: steps.scan.outcome == 'failure'
+        run: |
+          echo "::error::Advisory scan failed. See the issue opened above for details."
+          exit 1
