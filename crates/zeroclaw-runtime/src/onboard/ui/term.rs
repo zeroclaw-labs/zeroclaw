@@ -28,7 +28,13 @@ impl OnboardUi for TermUi {
         let prompt = prompt.to_string();
         let default = current.map(ToOwned::to_owned);
         tokio::task::spawn_blocking(move || {
-            let mut input = Input::<String>::new().with_prompt(prompt);
+            // allow_empty(true): for Option fields with no current value,
+            // pressing Enter on an empty line must return "" so the caller can
+            // treat empty-means-leave-unset. Default dialoguer rejects empty
+            // input and infinite-loops.
+            let mut input = Input::<String>::new()
+                .with_prompt(prompt)
+                .allow_empty(true);
             if let Some(value) = default {
                 input = input.default(value);
             }

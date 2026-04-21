@@ -287,6 +287,38 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     if <#value_ty>::prop_is_secret(name) { return true; }
                 });
 
+                // Path routing through HashMap<String, T>: the one parser
+                // lives in `crate::config::route_hashmap_path` so get/set
+                // don't duplicate it. Paths look like
+                // `<my_prefix>.<field>.<key>.<inner_suffix>`; on a hit the
+                // dispatch is forwarded to the value type's own get_prop /
+                // set_prop via its `configurable_prefix()`.
+                let field_name_lit = snake_to_kebab(&field_ident.to_string());
+                nested_get_prop.push(quote! {
+                    if let Some((hm_key, inner_name)) = crate::config::route_hashmap_path(
+                        name,
+                        Self::configurable_prefix(),
+                        #field_name_lit,
+                        <#value_ty>::configurable_prefix(),
+                    ) && let Some(inner) = self.#field_ident.get(hm_key)
+                        && let Ok(val) = inner.get_prop(&inner_name)
+                    {
+                        return Ok(val);
+                    }
+                });
+                nested_set_prop.push(quote! {
+                    if let Some((hm_key, inner_name)) = crate::config::route_hashmap_path(
+                        name,
+                        Self::configurable_prefix(),
+                        #field_name_lit,
+                        <#value_ty>::configurable_prefix(),
+                    ) && let Some(inner) = self.#field_ident.get_mut(hm_key)
+                        && let Ok(()) = inner.set_prop(&inner_name, value_str)
+                    {
+                        return Ok(());
+                    }
+                });
+
                 continue;
             } else if is_option {
                 nested_collect.push(quote! {
