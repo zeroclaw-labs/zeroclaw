@@ -1148,6 +1148,36 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // task exits immediately and marks the stage as `skipped`.
     tokio::spawn(spawn_local_llm_bootstrap());
 
+    // Credit-grant expiration sweep (spec, 2026-04-22): walk the ledger
+    // every 6 hours, expire grants older than 30 days, and claw back any
+    // unused credits from the user's balance (clamped at zero). Running
+    // on a loose schedule is fine because grants store their own
+    // `expires_at` — a missed sweep window just delays the claw-back to
+    // the next tick. Bootstrapping with an immediate sweep handles the
+    // common case of a service that was offline for longer than 30 days.
+    if let Some(pm_arc) = payment_manager.clone() {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let outcome = {
+                    let pm = pm_arc.lock();
+                    pm.sweep_expired_grants()
+                };
+                match outcome {
+                    Ok((grants, credits)) if grants > 0 => tracing::info!(
+                        grants,
+                        credits,
+                        "credit-grant expiration sweep clawed back expired credits"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "credit-grant sweep failed"),
+                }
+            }
+        });
+    }
+
     // Fire gateway start hook
     if let Some(ref hooks) = hooks {
         hooks.fire_gateway_start(host, actual_port).await;
@@ -1392,6 +1422,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         )
         .route("/api/credits/history", get(api::handle_api_credits_history))
         .route("/api/credits/usage", get(api::handle_api_credits_usage))
+        // Billing preferences + manual expiration sweep (spec, 2026-04-22)
+        .route(
+            "/api/billing/preferences",
+            get(api::handle_api_billing_preferences_get)
+                .put(api::handle_api_billing_preferences_put),
+        )
+        .route(
+            "/api/billing/sweep-expired",
+            post(api::handle_api_billing_sweep_expired),
+        )
         // ── Payment callbacks (Kakao Pay redirects) ──
         .route("/api/payment/approve", get(api::handle_api_payment_approve))
         .route("/api/payment/cancel", get(api::handle_api_payment_cancel))

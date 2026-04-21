@@ -3423,3 +3423,104 @@ mod tests {
         );
     }
 }
+
+// ── Billing preferences + expiration sweep (spec, 2026-04-22) ────
+
+/// GET /api/billing/preferences — read the caller's billing preferences
+/// (low-balance threshold, auto-recharge config, saved payment method).
+pub async fn handle_api_billing_preferences_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(ref pm) = state.payment_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Payment subsystem disabled"})),
+        )
+            .into_response();
+    };
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+    let pm_guard = pm.lock();
+    match pm_guard.get_billing_preferences(&user_id) {
+        Ok(prefs) => Json(prefs).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to read preferences: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /api/billing/preferences — upsert the caller's preferences.
+/// Body matches `BillingPreferences` minus `user_id` which is derived
+/// from the session (ignored if the body supplies it).
+pub async fn handle_api_billing_preferences_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut body): Json<crate::billing::BillingPreferences>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(ref pm) = state.payment_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Payment subsystem disabled"})),
+        )
+            .into_response();
+    };
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+    body.user_id = user_id;
+    let pm_guard = pm.lock();
+    match pm_guard.set_billing_preferences(&body) {
+        Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/billing/sweep-expired — operator-triggered expiration sweep.
+/// The periodic task in `run_gateway` runs this every 6h; this endpoint is
+/// kept for manual triggering from the admin dashboard and for tests.
+pub async fn handle_api_billing_sweep_expired(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(ref pm) = state.payment_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Payment subsystem disabled"})),
+        )
+            .into_response();
+    };
+    let pm_guard = pm.lock();
+    match pm_guard.sweep_expired_grants() {
+        Ok((grants, credits)) => Json(serde_json::json!({
+            "grants_expired": grants,
+            "credits_clawed_back": credits,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Sweep failed: {e}")})),
+        )
+            .into_response(),
+    }
+}

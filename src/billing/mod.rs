@@ -17,7 +17,7 @@ pub mod pricing;
 pub mod tracker;
 
 #[allow(unused_imports)]
-pub use checkout::{
+pub use checkout::{AUTO_RECHARGE_PACKAGE_IDS, 
     AutoRechargeSettings, CheckoutProvider, CheckoutRequest, CheckoutResponse, UsdCreditPackage,
     USD_PACKAGES,
 };
@@ -27,7 +27,10 @@ pub use llm_router::{
     CREDITS_PER_USD, LOW_BALANCE_WARNING_THRESHOLD, SIGNUP_BONUS_CREDITS,
 };
 #[allow(unused_imports)]
-pub use payment::{CreditPackage, PaymentManager, PaymentRecord, PaymentStatus};
+pub use payment::{
+    BillingPreferences, CreditPackage, PaymentManager, PaymentRecord, PaymentStatus,
+    GRANT_TTL_SECS_30D,
+};
 #[allow(unused_imports)]
 pub use pricing::{ModelPrice, PricingRegistry, SharedPricingRegistry};
 #[allow(unused_imports)]

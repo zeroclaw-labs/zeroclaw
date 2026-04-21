@@ -144,6 +144,15 @@ pub const SIGNUP_BONUS_CREDITS: u32 = 2_000;
 /// cost-effective) and a few coding/document tasks.
 pub fn grant_signup_bonus(payment_manager: &PaymentManager, user_id: &str) -> anyhow::Result<u32> {
     payment_manager.add_bonus_credits(user_id, SIGNUP_BONUS_CREDITS)?;
+    // Log the grant in the per-grant ledger with the standard 30-day TTL
+    // so the monthly sweep can expire any unused portion on schedule.
+    payment_manager.record_grant(
+        "",
+        user_id,
+        SIGNUP_BONUS_CREDITS,
+        "signup",
+        crate::billing::GRANT_TTL_SECS_30D,
+    )?;
     tracing::info!(
         user_id,
         credits = SIGNUP_BONUS_CREDITS,
