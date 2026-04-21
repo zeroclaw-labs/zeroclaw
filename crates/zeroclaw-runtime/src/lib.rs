@@ -18,6 +18,7 @@ pub mod i18n;
 pub mod integrations;
 pub mod nodes;
 pub mod observability;
+pub mod onboard;
 pub mod platform;
 pub mod rag;
 pub mod routines;
