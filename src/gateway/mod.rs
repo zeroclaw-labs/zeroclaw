@@ -3929,11 +3929,21 @@ async fn handle_kakao_webhook(State(state): State<AppState>, body: Bytes) -> imp
         _ => prompt_owned.as_str(),
     };
 
+    // Slash commands and postback callbacks are user-action acks, not AI
+    // content — they should not carry the share-back button. We mark
+    // those before calling the router so we can decide later.
+    let looks_like_command = utterance.starts_with('/') || utterance.starts_with("moa:");
+
     // Route through the common channel routing framework
     match process_channel_message_rich(&state, "kakao", user_id, prompt, session_id.as_deref())
         .await
     {
-        Ok(reply) => kakao_skill_json(&reply.text, &reply.buttons),
+        Ok(mut reply) => {
+            if !looks_like_command && !reply.text.trim().is_empty() {
+                attach_kakao_share_button(&state, user_id, &mut reply);
+            }
+            kakao_skill_json(&reply.text, &reply.buttons)
+        }
         Err(e) => {
             tracing::error!("KakaoTalk processing failed: {e:#}");
             kakao_skill_json(
@@ -3942,6 +3952,64 @@ async fn handle_kakao_webhook(State(state): State<AppState>, body: Bytes) -> imp
             )
         }
     }
+}
+
+/// Mint a share token for the AI reply and append a `📤 단톡방으로 보내기`
+/// quick-reply button. Silent no-op when the share store is missing or
+/// the JS app key is not configured (graceful degradation per
+/// CLAUDE.md §3.5 fail-fast — better to drop the optional UX than to
+/// fail the whole webhook reply).
+fn attach_kakao_share_button(
+    state: &AppState,
+    user_id: &str,
+    reply: &mut channel_router::ChannelReply,
+) {
+    let store = match state.kakao_share_store.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+    let js_app_key = state
+        .config
+        .lock()
+        .channels_config
+        .kakao
+        .as_ref()
+        .and_then(|k| k.javascript_app_key.clone());
+    let gateway_base = resolve_public_gateway_url(state);
+    append_kakao_share_button_with(store, js_app_key.as_deref(), &gateway_base, user_id, reply);
+}
+
+/// Pure version of [`attach_kakao_share_button`] for unit testing —
+/// takes the share store, JS app key, and gateway base directly so a
+/// test does not need to build a full `AppState`. Returns whether a
+/// button was appended.
+fn append_kakao_share_button_with(
+    store: &crate::channels::kakao_share_store::KakaoShareStore,
+    javascript_app_key: Option<&str>,
+    gateway_base: &str,
+    user_id: &str,
+    reply: &mut channel_router::ChannelReply,
+) -> bool {
+    let key_present = javascript_app_key
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false);
+    if !key_present {
+        return false;
+    }
+    let token = match store.create_token_with_rate_limit(
+        user_id,
+        &reply.text,
+        crate::channels::kakao_share_store::DEFAULT_RATE_LIMIT_PER_MINUTE,
+    ) {
+        Some(t) => t,
+        None => return false,
+    };
+    let url = crate::channels::kakao_share_store::share_url(gateway_base, &token);
+    reply.buttons.push(channel_router::ReplyButton {
+        label: "📤 단톡방으로 보내기".to_string(),
+        action: channel_router::ButtonAction::WebLink(url),
+    });
+    true
 }
 
 /// Render a ChannelReply as Kakao Chatbot Skill JSON with quickReplies.
@@ -6566,5 +6634,93 @@ Reminder set successfully."#;
 
         // Should be allowed again
         assert!(limiter.allow("burst-ip"));
+    }
+
+    // ── Kakao share-button attachment ──
+
+    #[test]
+    fn share_button_appended_when_key_and_store_present() {
+        use crate::channels::kakao_share_store::KakaoShareStore;
+        let store = KakaoShareStore::new();
+        let mut reply = channel_router::ChannelReply::with_buttons(
+            "AI reply body".to_string(),
+            vec![channel_router::ReplyButton {
+                label: "⚙️ 설정".to_string(),
+                action: channel_router::ButtonAction::PostBack("moa:settings".to_string()),
+            }],
+        );
+        let appended = append_kakao_share_button_with(
+            &store,
+            Some("jsappkey"),
+            "https://gw.example.com",
+            "kakao_user_1",
+            &mut reply,
+        );
+        assert!(appended);
+        assert_eq!(reply.buttons.len(), 2);
+        match &reply.buttons[1].action {
+            channel_router::ButtonAction::WebLink(url) => {
+                assert!(url.starts_with("https://gw.example.com/kakao/share/"));
+                assert_eq!(reply.buttons[1].label, "📤 단톡방으로 보내기");
+            }
+            other => panic!("expected WebLink, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn share_button_omitted_when_key_missing() {
+        use crate::channels::kakao_share_store::KakaoShareStore;
+        let store = KakaoShareStore::new();
+        let mut reply = channel_router::ChannelReply::text("hi");
+        let appended = append_kakao_share_button_with(
+            &store,
+            None,
+            "https://gw.example.com",
+            "kakao_user_1",
+            &mut reply,
+        );
+        assert!(!appended);
+        assert!(reply.buttons.is_empty());
+    }
+
+    #[test]
+    fn share_button_omitted_when_key_blank() {
+        use crate::channels::kakao_share_store::KakaoShareStore;
+        let store = KakaoShareStore::new();
+        let mut reply = channel_router::ChannelReply::text("hi");
+        let appended = append_kakao_share_button_with(
+            &store,
+            Some("   "),
+            "https://gw.example.com",
+            "kakao_user_1",
+            &mut reply,
+        );
+        assert!(!appended);
+        assert!(reply.buttons.is_empty());
+    }
+
+    #[test]
+    fn share_button_token_resolves_via_share_store() {
+        use crate::channels::kakao_share_store::KakaoShareStore;
+        let store = KakaoShareStore::new();
+        let mut reply = channel_router::ChannelReply::text("body content");
+        let appended = append_kakao_share_button_with(
+            &store,
+            Some("k"),
+            "https://gw.example.com",
+            "kakao_user_1",
+            &mut reply,
+        );
+        assert!(appended);
+        // Pull the token out of the URL and verify it's resolvable
+        // and contains the original body text.
+        let url = match &reply.buttons[0].action {
+            channel_router::ButtonAction::WebLink(u) => u.clone(),
+            _ => panic!("expected WebLink"),
+        };
+        let token = url.rsplit('/').next().unwrap();
+        let entry = store.lookup_token(token).expect("token must be present");
+        assert_eq!(entry.message_text, "body content");
+        assert_eq!(entry.user_id, "kakao_user_1");
     }
 }

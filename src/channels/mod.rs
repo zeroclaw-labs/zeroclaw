@@ -67,7 +67,6 @@ pub use github::GitHubChannel;
 pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 pub use kakao::KakaoTalkChannel;
-pub use kakao_share_store::KakaoShareStore;
 #[cfg(feature = "channel-lark")]
 pub use lark::LarkChannel;
 pub use line::LineChannel;
