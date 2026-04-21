@@ -8019,6 +8019,14 @@ pub struct OtpConfig {
     /// Maximum number of OTP challenge attempts before lockout.
     #[serde(default = "default_otp_challenge_max_attempts")]
     pub challenge_max_attempts: u32,
+
+    /// Shell command patterns (glob-style) that require TOTP confirmation before
+    /// execution, even when `shell` is in `auto_approve`. Patterns are matched
+    /// against each command segment. A trailing `*` acts as a suffix glob
+    /// (e.g. `"sudo *"` gates any sudo subcommand). No wildcard means exact
+    /// match. Empty list disables command-level gating.
+    #[serde(default)]
+    pub gated_commands: Vec<String>,
 }
 
 fn default_otp_token_ttl_secs() -> u64 {
@@ -8054,6 +8062,7 @@ impl Default for OtpConfig {
             gated_domains: Vec::new(),
             gated_domain_categories: Vec::new(),
             challenge_max_attempts: default_otp_challenge_max_attempts(),
+            gated_commands: Vec::new(),
         }
     }
 }
@@ -9990,6 +9999,11 @@ impl Config {
                 anyhow::bail!(
                     "security.otp.gated_actions[{i}] contains invalid characters: {normalized}"
                 );
+            }
+        }
+        for (i, pattern) in self.security.otp.gated_commands.iter().enumerate() {
+            if pattern.trim().is_empty() {
+                anyhow::bail!("security.otp.gated_commands[{i}] must not be empty");
             }
         }
         DomainMatcher::new(

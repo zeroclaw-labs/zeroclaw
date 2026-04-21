@@ -177,6 +177,7 @@ pub struct SecurityPolicy {
     pub shell_env_passthrough: Vec<String>,
     pub shell_timeout_secs: u64,
     pub tracker: PerSenderTracker,
+    pub gated_commands: Vec<String>,
 }
 
 /// Default allowed commands for Unix platforms.
@@ -310,6 +311,7 @@ impl Default for SecurityPolicy {
             shell_env_passthrough: vec![],
             shell_timeout_secs: 60,
             tracker: PerSenderTracker::new(),
+            gated_commands: Vec::new(),
         }
     }
 }
@@ -834,6 +836,31 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
     }
 
     false
+}
+
+/// Check whether `cmd_segment` matches a `gated_commands` pattern.
+///
+/// Pattern rules:
+/// - A trailing `*` is a suffix glob: `"sudo *"` matches `"sudo reboot"`.
+/// - No wildcard means exact match: `"reboot"` matches only `"reboot"`.
+/// - A bare `"*"` matches any non-empty segment.
+fn matches_gated_pattern(cmd_segment: &str, pattern: &str) -> bool {
+    let cmd = cmd_segment.trim();
+    let pat = pattern.trim();
+    if pat.is_empty() || cmd.is_empty() {
+        return false;
+    }
+    if let Some(prefix) = pat.strip_suffix('*') {
+        let prefix = prefix.trim_end();
+        if prefix.is_empty() {
+            return true;
+        }
+        cmd == prefix
+            || cmd.starts_with(&format!("{prefix} "))
+            || cmd.starts_with(&format!("{prefix}\t"))
+    } else {
+        cmd == pat
+    }
 }
 
 impl SecurityPolicy {
@@ -1610,7 +1637,38 @@ impl SecurityPolicy {
             shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
             shell_timeout_secs: autonomy_config.shell_timeout_secs,
             tracker: PerSenderTracker::new(),
+            gated_commands: Vec::new(),
         }
+    }
+
+    /// Set the list of command patterns that require TOTP confirmation.
+    /// Call after `from_config` to wire in OTP-gated command patterns from
+    /// `security.otp.gated_commands`.
+    pub fn with_gated_commands(mut self, patterns: Vec<String>) -> Self {
+        self.gated_commands = patterns;
+        self
+    }
+
+    /// Returns `true` if the command (or any pipe/chain segment) matches one
+    /// of the configured `gated_commands` patterns and therefore requires a
+    /// TOTP code before execution.
+    pub fn is_command_gated(&self, command: &str) -> bool {
+        if self.gated_commands.is_empty() {
+            return false;
+        }
+        for segment in split_unquoted_segments(command) {
+            let cmd_part = skip_env_assignments(&segment);
+            let remaining = cmd_part.trim();
+            if remaining.is_empty() {
+                continue;
+            }
+            for pattern in &self.gated_commands {
+                if matches_gated_pattern(remaining, pattern) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Render a human-readable summary of the active security constraints
@@ -1673,6 +1731,15 @@ impl SecurityPolicy {
                 "**Forbidden paths**: {}. \
                  Avoid accessing these paths.",
                 paths.join(", ")
+            );
+        }
+
+        // TOTP-gated commands
+        if !self.gated_commands.is_empty() {
+            let _ = writeln!(
+                out,
+                "**TOTP-gated commands** (require OTP code via `otp_code` parameter): {}",
+                self.gated_commands.join(", ")
             );
         }
 
@@ -3670,5 +3737,78 @@ mod tests {
         let t = PerSenderTracker::new();
         // Key "ghost" has never been recorded — should not be exhausted at max=1
         assert!(!t.is_exhausted("ghost", 1));
+    }
+
+    // ── is_command_gated ────────────────────────────────────
+
+    fn gated_policy(patterns: Vec<&str>) -> SecurityPolicy {
+        SecurityPolicy {
+            gated_commands: patterns.into_iter().map(String::from).collect(),
+            ..SecurityPolicy::default()
+        }
+    }
+
+    #[test]
+    fn gated_commands_empty_never_gates() {
+        let p = SecurityPolicy::default();
+        assert!(!p.is_command_gated("sudo reboot"));
+        assert!(!p.is_command_gated("rm -rf /tmp"));
+    }
+
+    #[test]
+    fn gated_commands_glob_suffix_matches() {
+        let p = gated_policy(vec!["sudo *"]);
+        assert!(p.is_command_gated("sudo reboot"));
+        assert!(p.is_command_gated("sudo apt install nginx"));
+        assert!(p.is_command_gated("sudo systemctl restart sshd"));
+    }
+
+    #[test]
+    fn gated_commands_glob_does_not_match_other_commands() {
+        let p = gated_policy(vec!["sudo *"]);
+        assert!(!p.is_command_gated("ls -la"));
+        assert!(!p.is_command_gated("echo sudo"));
+        assert!(!p.is_command_gated("git status"));
+    }
+
+    #[test]
+    fn gated_commands_exact_match() {
+        let p = gated_policy(vec!["reboot"]);
+        assert!(p.is_command_gated("reboot"));
+        assert!(!p.is_command_gated("reboot -f"));
+        assert!(!p.is_command_gated("ls"));
+    }
+
+    #[test]
+    fn gated_commands_matches_pipeline_segment() {
+        let p = gated_policy(vec!["sudo *"]);
+        // Any segment matching a gated pattern gates the whole command
+        assert!(p.is_command_gated("ls | sudo tee /etc/hosts"));
+    }
+
+    #[test]
+    fn gated_commands_multi_pattern() {
+        let p = gated_policy(vec!["sudo *", "rm -rf *", "reboot"]);
+        assert!(p.is_command_gated("sudo reboot"));
+        assert!(p.is_command_gated("rm -rf /tmp/foo"));
+        assert!(p.is_command_gated("reboot"));
+        assert!(!p.is_command_gated("ls -la"));
+        assert!(!p.is_command_gated("cargo build"));
+    }
+
+    #[test]
+    fn gated_commands_wildcard_only_matches_all() {
+        let p = gated_policy(vec!["*"]);
+        assert!(p.is_command_gated("ls"));
+        assert!(p.is_command_gated("sudo reboot"));
+    }
+
+    #[test]
+    fn with_gated_commands_builder_sets_patterns() {
+        let p = SecurityPolicy::default()
+            .with_gated_commands(vec!["sudo *".to_string(), "reboot".to_string()]);
+        assert!(p.is_command_gated("sudo apt update"));
+        assert!(p.is_command_gated("reboot"));
+        assert!(!p.is_command_gated("ls"));
     }
 }

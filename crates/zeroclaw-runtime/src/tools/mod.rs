@@ -332,13 +332,44 @@ pub fn all_tools_with_runtime(
 ) {
     let has_shell_access = runtime.has_shell_access();
     let sandbox = create_sandbox(&root_config.security);
+
+    // Build OTP validator for gated_commands enforcement when configured.
+    let otp_validator: Option<Arc<crate::security::OtpValidator>> = if root_config
+        .security
+        .otp
+        .enabled
+        && !root_config.security.otp.gated_commands.is_empty()
+    {
+        root_config.config_path.parent().and_then(|config_dir| {
+            let store = crate::security::SecretStore::new(config_dir, root_config.secrets.encrypt);
+            match crate::security::OtpValidator::from_config(
+                &root_config.security.otp,
+                config_dir,
+                &store,
+            ) {
+                Ok((validator, _)) => Some(Arc::new(validator)),
+                Err(e) => {
+                    tracing::warn!("Failed to initialize OTP validator for gated_commands: {e}");
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
+
+    let shell_tool = {
+        let base = ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
+            .with_timeout_secs(root_config.shell_tool.timeout_secs);
+        match otp_validator {
+            Some(validator) => base.with_otp_validator(validator),
+            None => base,
+        }
+    };
+
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
-            PathGuardedTool::new(
-                ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
-                    .with_timeout_secs(root_config.shell_tool.timeout_secs),
-                security.clone(),
-            ),
+            PathGuardedTool::new(shell_tool, security.clone()),
             security.clone(),
         )),
         Arc::new(FileReadTool::new(security.clone())),

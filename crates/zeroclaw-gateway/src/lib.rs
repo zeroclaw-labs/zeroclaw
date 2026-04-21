@@ -443,10 +443,10 @@ pub async fn run_gateway(
     )?);
     let runtime: Arc<dyn platform::RuntimeAdapter> =
         Arc::from(platform::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ));
+    let security = Arc::new(
+        SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+            .with_gated_commands(config.security.otp.gated_commands.clone()),
+    );
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
