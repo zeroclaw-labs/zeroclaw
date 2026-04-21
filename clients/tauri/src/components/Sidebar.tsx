@@ -93,6 +93,7 @@ interface SidebarProps {
   onSelectChat: (id: string) => void;
   onDeleteChat: (id: string) => void;
   onOpenSettings: () => void;
+  onOpenBilling?: () => void;
   onOpenInterpreter: () => void;
   onOpenDocument: () => void;
   onOpenArchive: () => void;
@@ -284,6 +285,7 @@ export function Sidebar({
   onSelectChat,
   onDeleteChat,
   onOpenSettings,
+  onOpenBilling,
   onOpenInterpreter,
   onOpenDocument,
   onOpenArchive,
@@ -808,6 +810,21 @@ export function Sidebar({
 
         {/* Footer */}
         <div className="sidebar-footer">
+          {onOpenBilling && (
+            <button
+              className={`sidebar-footer-btn ${currentPage === "billing" ? "active" : ""}`}
+              onClick={onOpenBilling}
+              title={t("sidebar_billing_link", locale)}
+            >
+              <span className="icon">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="2" y="5" width="20" height="14" rx="2" />
+                  <line x1="2" y1="10" x2="22" y2="10" />
+                </svg>
+              </span>
+              <span>{t("sidebar_billing_link", locale)}</span>
+            </button>
+          )}
           <button
             className={`sidebar-footer-btn ${currentPage === "settings" ? "active" : ""}`}
             onClick={onOpenSettings}

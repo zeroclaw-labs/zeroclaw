@@ -4411,3 +4411,225 @@ html, body {
   font-size: 1rem; font-weight: 700;
 }
 .voice-picker-empty { grid-column: 1 / -1; text-align: center; color: #666; padding: 40px; }
+
+/* ── Billing page (spec, 2026-04-22) ──────────────────────────────
+   Stacked cards on a dark surface. Matches the sidebar accent palette
+   (purple for actions, green for positive / active, yellow for
+   warning). Form controls intentionally use native selects/checkboxes
+   so the page stays keyboard-accessible out of the box. */
+.billing-page {
+  max-width: 720px;
+  margin: 24px auto;
+  padding: 0 20px 64px;
+  color: #e5e7eb;
+}
+.billing-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.billing-header h1 {
+  font-size: 20px;
+  font-weight: 600;
+  margin: 0;
+}
+.billing-back {
+  background: transparent;
+  border: 1px solid rgba(255,255,255,0.12);
+  color: #e5e7eb;
+  border-radius: 8px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font-size: 16px;
+}
+.billing-card {
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px;
+  padding: 18px;
+  margin-bottom: 16px;
+}
+.billing-card-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: #9ca3af;
+  margin-bottom: 10px;
+}
+.billing-balance-value {
+  font-size: 32px;
+  font-weight: 700;
+  color: #fff;
+}
+.billing-balance-unit {
+  font-size: 14px;
+  font-weight: 400;
+  color: #9ca3af;
+  margin-left: 6px;
+}
+.billing-balance-fx {
+  margin-top: 6px;
+  font-size: 13px;
+  color: #cbd5e1;
+}
+.billing-fx-note {
+  opacity: 0.6;
+  font-size: 11px;
+}
+.billing-plan-list {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.billing-plan-card {
+  position: relative;
+  text-align: left;
+  background: rgba(120,99,255,0.08);
+  border: 1px solid rgba(120,99,255,0.24);
+  border-radius: 10px;
+  padding: 14px;
+  color: inherit;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.billing-plan-card:hover:not(:disabled) {
+  background: rgba(120,99,255,0.16);
+}
+.billing-plan-name { font-weight: 600; font-size: 14px; }
+.billing-plan-price { font-size: 18px; font-weight: 700; margin-top: 6px; }
+.billing-plan-krw { font-size: 13px; color: #cbd5e1; margin-top: 2px; }
+.billing-plan-credits { font-size: 12px; color: #6ee7b7; margin-top: 8px; }
+.billing-plan-badge {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: #10b98130;
+  color: #6ee7b7;
+}
+.billing-sub-active { font-weight: 600; color: #6ee7b7; }
+.billing-sub-renewal { font-size: 13px; color: #cbd5e1; margin-top: 4px; }
+
+.billing-btn {
+  margin-top: 12px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.billing-btn-danger {
+  color: #fca5a5;
+  border-color: rgba(252,165,165,0.3);
+}
+.billing-btn-danger:hover:not(:disabled) {
+  background: rgba(252,165,165,0.08);
+}
+
+.billing-topup-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 8px;
+}
+.billing-topup-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 10px 6px;
+  border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.1);
+  background: rgba(255,255,255,0.03);
+  color: inherit;
+  cursor: pointer;
+}
+.billing-topup-btn:hover:not(:disabled) {
+  background: rgba(120,99,255,0.12);
+  border-color: rgba(120,99,255,0.35);
+}
+.billing-topup-usd { font-size: 16px; font-weight: 700; }
+.billing-topup-credits { font-size: 11px; color: #6ee7b7; }
+.billing-topup-krw { font-size: 10px; color: #9ca3af; }
+
+.billing-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.billing-field label {
+  font-size: 13px;
+  color: #cbd5e1;
+}
+.billing-field select,
+.billing-field input[type="checkbox"] {
+  accent-color: #7863ff;
+}
+.billing-field select {
+  background: rgba(255,255,255,0.05);
+  color: inherit;
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+.billing-note {
+  font-size: 12px;
+  color: #fbbf24;
+  margin-top: 6px;
+  padding: 8px;
+  background: rgba(245,158,11,0.08);
+  border-radius: 6px;
+}
+.billing-message {
+  margin-top: 12px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: rgba(120,99,255,0.12);
+  border: 1px solid rgba(120,99,255,0.28);
+  font-size: 13px;
+}
+
+/* Low-balance banner — pinned above chat view, dismissible for the
+   session, re-evaluates every 60s. Warning palette chosen to catch
+   the eye without feeling like an error. */
+.low-balance-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  background: rgba(245,158,11,0.14);
+  border-bottom: 1px solid rgba(245,158,11,0.3);
+  color: #fcd34d;
+  font-size: 13px;
+}
+.low-balance-text {
+  flex: 1;
+  margin-right: 12px;
+}
+.low-balance-actions { display: flex; gap: 8px; }
+.low-balance-cta {
+  background: #f59e0b;
+  color: #111;
+  border: none;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 600;
+}
+.low-balance-cta:hover { background: #fbbf24; }
+.low-balance-dismiss {
+  background: transparent;
+  color: inherit;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  opacity: 0.7;
+}
+.low-balance-dismiss:hover { opacity: 1; }

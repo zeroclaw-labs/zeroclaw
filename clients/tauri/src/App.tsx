@@ -8,6 +8,8 @@ import { DeviceSelect } from "./components/DeviceSelect";
 import { Interpreter } from "./components/Interpreter";
 import { SetupWizard } from "./components/SetupWizard";
 import { LocalLlmBootstrap } from "./components/LocalLlmBootstrap";
+import { BillingPage } from "./components/BillingPage";
+import { LowBalanceBanner } from "./components/LowBalanceBanner";
 import { GatewayStatus } from "./components/GatewayStatus";
 import { LockScreen } from "./components/LockScreen";
 import { DocumentEditor } from "./components/DocumentEditor";
@@ -32,7 +34,7 @@ import {
   type ChatMessage,
 } from "./lib/storage";
 
-type Page = "setup" | "login" | "signup" | "device_select" | "locked" | "llm_bootstrap" | "chat" | "settings" | "interpreter" | "document" | "archive";
+type Page = "setup" | "login" | "signup" | "device_select" | "locked" | "llm_bootstrap" | "chat" | "settings" | "billing" | "interpreter" | "document" | "archive";
 
 /** Inactivity auto-lock timeout in milliseconds (default: 5 minutes). */
 const AUTO_LOCK_TIMEOUT_MS = 5 * 60 * 1000;
@@ -764,6 +766,14 @@ function App() {
     );
   }
 
+  if (page === "billing") {
+    return (
+      <div className="app">
+        <BillingPage locale={locale} onBack={() => setPage("chat")} />
+      </div>
+    );
+  }
+
   // Main app (with sidebar)
   return (
     <div className="app">
@@ -781,6 +791,7 @@ function App() {
         onSelectChat={handleSelectChat}
         onDeleteChat={handleDeleteChat}
         onOpenSettings={() => setPage("settings")}
+        onOpenBilling={() => setPage("billing")}
         onOpenInterpreter={() => {
           setPage("interpreter");
           if (window.innerWidth <= 768) setSidebarOpen(false);
@@ -798,6 +809,9 @@ function App() {
         currentPage={page}
       />
       <main className={`main-content ${sidebarOpen ? "" : "sidebar-collapsed"}`}>
+        {page === "chat" && isTauri() && (
+          <LowBalanceBanner locale={locale} onOpenBilling={() => setPage("billing")} />
+        )}
         {page === "chat" ? (
           <Chat
             chat={activeChat}

@@ -196,6 +196,30 @@ type TranslationKey =
   | "sidebar_badge_base_gun"
   | "sidebar_badge_byok"
   | "sidebar_badge_credit"
+  // Billing page + low-balance banner
+  | "billing_title"
+  | "billing_balance"
+  | "billing_credits_unit"
+  | "billing_fx_rate"
+  | "billing_subscription"
+  | "billing_sub_active"
+  | "billing_sub_renewal"
+  | "billing_cancel_subscription"
+  | "billing_subscribe_success"
+  | "billing_cancel_success"
+  | "billing_interval_month"
+  | "billing_interval_year"
+  | "billing_topup"
+  | "billing_checkout_failed"
+  | "billing_alerts"
+  | "billing_low_balance_label"
+  | "billing_auto_recharge_label"
+  | "billing_auto_amount_label"
+  | "billing_auto_threshold_label"
+  | "billing_auto_card_note"
+  | "low_balance_banner_text"
+  | "low_balance_recharge"
+  | "sidebar_billing_link"
   // Lock screen
   | "lock_title"
   | "lock_subtitle"
@@ -435,6 +459,29 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     sidebar_badge_base_gun: "local",
     sidebar_badge_byok: "BYOK",
     sidebar_badge_credit: "credits",
+    billing_title: "Billing",
+    billing_balance: "Credit balance",
+    billing_credits_unit: "credits",
+    billing_fx_rate: "1 USD ≈ {rate} KRW",
+    billing_subscription: "Subscription",
+    billing_sub_active: "Active: {plan}",
+    billing_sub_renewal: "Next renewal: {date}",
+    billing_cancel_subscription: "Cancel subscription",
+    billing_subscribe_success: "Subscribed to {plan}.",
+    billing_cancel_success: "Subscription cancelled.",
+    billing_interval_month: "month",
+    billing_interval_year: "year",
+    billing_topup: "One-time top-up",
+    billing_checkout_failed: "Could not open checkout — try again later.",
+    billing_alerts: "Alerts & auto-recharge",
+    billing_low_balance_label: "Warn me when credits fall below:",
+    billing_auto_recharge_label: "Enable auto-recharge (uses saved card)",
+    billing_auto_amount_label: "Auto-recharge amount:",
+    billing_auto_threshold_label: "Trigger when credits fall below:",
+    billing_auto_card_note: "Your card is saved during your next top-up checkout — tick 'Save card' there.",
+    low_balance_banner_text: "{balance} credits left (threshold {threshold}). Time to recharge.",
+    low_balance_recharge: "Recharge",
+    sidebar_billing_link: "Billing & credits",
     // Lock screen
     lock_title: "MoA Locked",
     lock_subtitle: "Enter your password to unlock",
@@ -671,6 +718,29 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     sidebar_badge_base_gun: "로컬",
     sidebar_badge_byok: "BYOK",
     sidebar_badge_credit: "크레딧",
+    billing_title: "결제 및 크레딧",
+    billing_balance: "크레딧 잔액",
+    billing_credits_unit: "크레딧",
+    billing_fx_rate: "1달러 ≈ {rate}원",
+    billing_subscription: "구독",
+    billing_sub_active: "이용 중: {plan}",
+    billing_sub_renewal: "다음 갱신일: {date}",
+    billing_cancel_subscription: "구독 해지",
+    billing_subscribe_success: "{plan} 구독이 시작되었습니다.",
+    billing_cancel_success: "구독이 해지되었습니다.",
+    billing_interval_month: "월",
+    billing_interval_year: "년",
+    billing_topup: "일회성 충전",
+    billing_checkout_failed: "결제창을 열 수 없습니다. 잠시 후 다시 시도해 주세요.",
+    billing_alerts: "알림 및 자동 충전",
+    billing_low_balance_label: "크레딧이 이 값 이하로 내려가면 알려주세요:",
+    billing_auto_recharge_label: "자동 충전 사용 (저장된 카드로 결제)",
+    billing_auto_amount_label: "자동 충전 금액:",
+    billing_auto_threshold_label: "자동 충전 조건 (이 값 이하일 때):",
+    billing_auto_card_note: "다음 수동 충전 시 '카드 저장' 체크박스를 선택하시면 이 자동 충전에 사용할 카드가 저장됩니다.",
+    low_balance_banner_text: "남은 크레딧: {balance} (임계값 {threshold}). 충전할 시점입니다.",
+    low_balance_recharge: "충전하기",
+    sidebar_billing_link: "결제 및 크레딧",
     // Lock screen
     lock_title: "MoA \uc7a0\uae08",
     lock_subtitle: "\ube44\ubc00\ubc88\ud638\ub97c \uc785\ub825\ud558\uc5ec \uc7a0\uae08\uc744 \ud574\uc81c\ud558\uc138\uc694",
