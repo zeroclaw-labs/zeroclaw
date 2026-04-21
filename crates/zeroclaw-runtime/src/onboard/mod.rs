@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 use zeroclaw_config::schema::Config;
-use zeroclaw_config::traits::{OnboardUi, SelectItem};
+use zeroclaw_config::traits::{OnboardUi, PropKind, SelectItem};
 
 pub mod ui;
 
@@ -67,39 +67,110 @@ pub async fn run(
     Ok(())
 }
 
-// ── Section stubs ────────────────────────────────────────────────────────
-// Each lands in its own commit. Bodies stay in mod.rs until one grows past
-// ~50 lines, at which point it earns its own file under `sections/`.
+// ── Field-driven helpers ─────────────────────────────────────────────────
+
+/// Prompt for a single config field identified by its dotted name.
+///
+/// Reads the field's metadata from `prop_fields()` — type, current value,
+/// secret flag, enum variants — and dispatches to the right `OnboardUi`
+/// method. Writes via `set_prop` only when the value actually changes.
+/// Adding a new field to the schema makes it promptable via this helper
+/// automatically; no parallel type-dispatch logic to maintain here.
+async fn prompt_field(cfg: &mut Config, ui: &mut dyn OnboardUi, name: &str) -> Result<()> {
+    let field = cfg
+        .prop_fields()
+        .into_iter()
+        .find(|f| f.name == name)
+        .ok_or_else(|| anyhow::anyhow!("unknown config field: {name}"))?;
+
+    let prompt = name.rsplit('.').next().unwrap_or(name);
+    let current = field.display_value;
+
+    if field.is_secret {
+        let has_current = !current.is_empty() && current != "<unset>";
+        if let Some(value) = ui.secret(prompt, has_current).await? {
+            cfg.set_prop(name, &value)?;
+        }
+        return Ok(());
+    }
+
+    match field.kind {
+        PropKind::Bool => {
+            let cur = current.parse::<bool>().unwrap_or(false);
+            let new = ui.confirm(prompt, cur).await?;
+            if new != cur {
+                cfg.set_prop(name, &new.to_string())?;
+            }
+        }
+        PropKind::String | PropKind::Integer | PropKind::Float => {
+            let new = ui.string(prompt, Some(&current)).await?;
+            if new != current {
+                cfg.set_prop(name, &new)?;
+            }
+        }
+        PropKind::Enum => {
+            let variants = field
+                .enum_variants
+                .map(|get| get())
+                .unwrap_or_default();
+            if variants.is_empty() {
+                ui.warn(&format!("skipping {name}: no enum variants exposed"));
+                return Ok(());
+            }
+            let items: Vec<SelectItem> = variants.iter().map(SelectItem::new).collect();
+            let current_idx = variants.iter().position(|v| v == &current);
+            let idx = ui.select(prompt, &items, current_idx).await?;
+            let new = &variants[idx];
+            if new != &current {
+                cfg.set_prop(name, new)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Iterate every field under `prefix` in `prop_fields()` and prompt for each.
+/// `excludes` lists leaf field names that should be skipped (useful when a
+/// section has already handled one field specially — e.g., memory.backend via
+/// the memory-backend registry — and just wants the rest prompted generically).
+async fn prompt_fields_under(
+    cfg: &mut Config,
+    ui: &mut dyn OnboardUi,
+    prefix: &str,
+    excludes: &[&str],
+) -> Result<()> {
+    let names: Vec<String> = cfg
+        .prop_fields()
+        .into_iter()
+        .filter_map(|f| {
+            let suffix = f.name.strip_prefix(prefix)?.strip_prefix('.')?;
+            // Skip nested sub-sections (anything with another `.` in it) and
+            // anything the caller asked to exclude.
+            if suffix.contains('.') || excludes.contains(&suffix) {
+                return None;
+            }
+            Some(f.name.to_string())
+        })
+        .collect();
+    for name in names {
+        prompt_field(cfg, ui, &name).await?;
+    }
+    Ok(())
+}
+
+// ── Sections ─────────────────────────────────────────────────────────────
+// Each section picks the specialized pre-work (registry-driven choices,
+// flag overrides) and then defers to `prompt_fields_under` for the rest.
 
 async fn workspace(cfg: &mut Config, ui: &mut dyn OnboardUi, _flags: &Flags) -> Result<()> {
     ui.status(&format!(
         "Workspace directory: {}",
         cfg.workspace_dir.display()
     ));
-
-    let currently_enabled = cfg.workspace.enabled;
-    let enable = ui
-        .confirm(
-            "Enable multi-workspace isolation (separate memory / secrets / audit per workspace)?",
-            currently_enabled,
-        )
-        .await?;
-    if enable != currently_enabled {
-        cfg.set_prop("workspace.enabled", &enable.to_string())?;
+    prompt_field(cfg, ui, "workspace.enabled").await?;
+    if cfg.workspace.enabled {
+        prompt_fields_under(cfg, ui, "workspace", &["enabled"]).await?;
     }
-
-    if !enable {
-        return Ok(());
-    }
-
-    let current_name = cfg.workspace.active_workspace.clone().unwrap_or_default();
-    let name = ui
-        .string("Active workspace name", Some(&current_name))
-        .await?;
-    if name != current_name && !name.trim().is_empty() {
-        cfg.set_prop("workspace.active-workspace", name.trim())?;
-    }
-
     Ok(())
 }
 
@@ -112,15 +183,16 @@ async fn channels(_cfg: &mut Config, _ui: &mut dyn OnboardUi, _flags: &Flags) ->
 }
 
 async fn memory(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Result<()> {
+    // Backend: registry-driven select (key + label both come from
+    // zeroclaw-memory's selectable_memory_backends()). --memory CLI flag
+    // bypasses the prompt.
     let backends = zeroclaw_memory::selectable_memory_backends();
-    let options: Vec<SelectItem> = backends.iter().map(|b| SelectItem::new(b.label)).collect();
-
     let current_backend = cfg.memory.backend.clone();
-    let current_idx = backends.iter().position(|b| b.key == current_backend);
-
     let new_backend = if let Some(forced) = &flags.memory {
         forced.clone()
     } else {
+        let options: Vec<SelectItem> = backends.iter().map(|b| SelectItem::new(b.label)).collect();
+        let current_idx = backends.iter().position(|b| b.key == current_backend);
         let idx = ui.select("Memory backend", &options, current_idx).await?;
         backends[idx].key.to_string()
     };
@@ -128,14 +200,7 @@ async fn memory(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Resu
         cfg.set_prop("memory.backend", &new_backend)?;
     }
 
-    let current_auto_save = cfg.memory.auto_save;
-    let auto_save = ui
-        .confirm("Auto-save user messages to memory?", current_auto_save)
-        .await?;
-    if auto_save != current_auto_save {
-        cfg.set_prop("memory.auto-save", &auto_save.to_string())?;
-    }
-    Ok(())
+    prompt_field(cfg, ui, "memory.auto-save").await
 }
 
 async fn hardware(_cfg: &mut Config, _ui: &mut dyn OnboardUi, _flags: &Flags) -> Result<()> {
@@ -143,14 +208,14 @@ async fn hardware(_cfg: &mut Config, _ui: &mut dyn OnboardUi, _flags: &Flags) ->
 }
 
 async fn tunnel(cfg: &mut Config, ui: &mut dyn OnboardUi, _flags: &Flags) -> Result<()> {
-    // Derive the provider list from the schema itself: each `tunnel.<name>.*`
-    // field in prop_fields() names a real provider. "none" is always valid and
-    // has no sub-config, so it's prepended. Adding a new TunnelConfig
-    // subsection automatically surfaces here — no parallel list to maintain.
+    // Provider list is derived from the schema: each `tunnel.<name>.*` field
+    // in prop_fields() names a real provider. "none" is always valid and has
+    // no sub-config, so it's prepended. Adding a new TunnelConfig subsection
+    // surfaces here automatically — no parallel list to drift.
     let mut providers: Vec<String> = cfg
         .prop_fields()
         .iter()
-        .filter_map(|field| field.name.strip_prefix("tunnel."))
+        .filter_map(|f| f.name.strip_prefix("tunnel."))
         .filter_map(|suffix| suffix.split_once('.').map(|(head, _)| head.to_string()))
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -158,22 +223,23 @@ async fn tunnel(cfg: &mut Config, ui: &mut dyn OnboardUi, _flags: &Flags) -> Res
     providers.insert(0, "none".to_string());
 
     let options: Vec<SelectItem> = providers.iter().map(SelectItem::new).collect();
-
     let current_provider = cfg.tunnel.provider.clone();
     let current_idx = providers.iter().position(|p| p == &current_provider);
     let idx = ui
         .select("Public tunnel provider", &options, current_idx)
         .await?;
-    let new_provider = &providers[idx];
+    let new_provider = providers[idx].clone();
 
-    if new_provider != &current_provider {
-        cfg.set_prop("tunnel.provider", new_provider)?;
+    if new_provider != current_provider {
+        cfg.set_prop("tunnel.provider", &new_provider)?;
     }
 
     if new_provider != "none" {
-        ui.note(&format!(
-            "Set credentials with: zeroclaw config set tunnel.{new_provider}.<field> <value>"
-        ));
+        // Materialize the Option<T> sub-config so its fields become enumerable,
+        // then prompt every field generically.
+        let prefix = format!("tunnel.{new_provider}");
+        cfg.init_defaults(Some(&prefix));
+        prompt_fields_under(cfg, ui, &prefix, &[]).await?;
     }
     Ok(())
 }
