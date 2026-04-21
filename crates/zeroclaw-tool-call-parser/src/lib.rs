@@ -69,12 +69,12 @@ pub fn canonicalize_json_for_tool_signature(value: &serde_json::Value) -> serde_
 fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     if let Some(function) = value.get("function") {
         let tool_call_id = parse_tool_call_id(value, Some(function));
-        let name = function
+        let raw_name = function
             .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or("")
-            .trim()
-            .to_string();
+            .trim();
+        let name = map_tool_name_alias(raw_name).to_string();
         if !name.is_empty() {
             let arguments = parse_arguments_value(
                 function
@@ -90,12 +90,12 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     }
 
     let tool_call_id = parse_tool_call_id(value, None);
-    let name = value
+    let raw_name = value
         .get("name")
         .and_then(|v| v.as_str())
         .unwrap_or("")
-        .trim()
-        .to_string();
+        .trim();
+    let name = map_tool_name_alias(raw_name).to_string();
 
     if name.is_empty() {
         return None;
@@ -696,6 +696,13 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 /// Map tool name aliases from various LLM providers to ZeroClaw tool names.
 /// This handles variations like "fileread" -> "file_read", "bash" -> "shell", etc.
 fn map_tool_name_alias(tool_name: &str) -> &str {
+    // Strip Gemini-style namespace prefixes like `default_api.<name>` or `tools.<name>`.
+    // Why: OpenRouter-routed Gemini models emit function names as `default_api.foo`,
+    // which otherwise fails dispatch as "Unknown tool".
+    let tool_name = tool_name
+        .strip_prefix("default_api.")
+        .or_else(|| tool_name.strip_prefix("tools."))
+        .unwrap_or(tool_name);
     match tool_name {
         // Shell variations (including GLM aliases that map to shell)
         "shell" | "bash" | "sh" | "exec" | "command" | "cmd" | "browser_open" | "browser"
