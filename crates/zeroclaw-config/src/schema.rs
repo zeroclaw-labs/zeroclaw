@@ -16464,6 +16464,7 @@ impl_enum_prop_kind!(
 );
 
 impl HasPropKind for serde_json::Value {
+<<<<<<< HEAD
     // `serde_json::Value` is an arbitrary JSON document, not an enum.
     // Classifying it as `Enum` previously made `enum_variants_for::<Value>()`
     // hand back the literal placeholder `"(unknown variants)"`, and the

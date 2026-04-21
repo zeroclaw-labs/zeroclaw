@@ -2053,6 +2053,123 @@ mod tests {
         assert_eq!(prov["allow_fallbacks"], false);
     }
 
+    #[test]
+    fn with_extra_body_sets_value() {
+        let extra = serde_json::json!({"provider": {"only": ["Anthropic"]}});
+        let provider = OpenRouterProvider::new(Some("key"), None).with_extra_body(extra.clone());
+        assert_eq!(provider.extra_body, Some(extra));
+    }
+
+    #[test]
+    fn extra_body_none_produces_unchanged_request() {
+        let provider = OpenRouterProvider::new(Some("key"), None);
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![],
+            temperature: 0.5,
+            max_tokens: None,
+        };
+
+        let base = serde_json::to_value(&request).unwrap();
+        let merged = provider.merge_extra_body(&request).unwrap();
+        assert_eq!(base, merged);
+    }
+
+    #[test]
+    fn extra_body_empty_object_produces_unchanged_request() {
+        let provider =
+            OpenRouterProvider::new(Some("key"), None).with_extra_body(serde_json::json!({}));
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![],
+            temperature: 0.5,
+            max_tokens: None,
+        };
+
+        let base = serde_json::to_value(&request).unwrap();
+        let merged = provider.merge_extra_body(&request).unwrap();
+        assert_eq!(base, merged);
+    }
+
+    #[test]
+    fn extra_body_adds_new_top_level_keys() {
+        let provider = OpenRouterProvider::new(Some("key"), None)
+            .with_extra_body(serde_json::json!({"provider": {"only": ["Anthropic"]}}));
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![],
+            temperature: 0.5,
+            max_tokens: None,
+        };
+
+        let merged = provider.merge_extra_body(&request).unwrap();
+        let obj = merged.as_object().unwrap();
+        assert_eq!(
+            obj.get("provider").unwrap(),
+            &serde_json::json!({"only": ["Anthropic"]})
+        );
+        assert_eq!(obj.get("model").unwrap(), "test-model");
+        assert_eq!(obj.get("temperature").unwrap(), 0.5);
+    }
+
+    #[test]
+    fn extra_body_overrides_existing_keys() {
+        let provider = OpenRouterProvider::new(Some("key"), None)
+            .with_extra_body(serde_json::json!({"temperature": 0.9}));
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![],
+            temperature: 0.5,
+            max_tokens: None,
+        };
+
+        let merged = provider.merge_extra_body(&request).unwrap();
+        let obj = merged.as_object().unwrap();
+        assert_eq!(obj.get("temperature").unwrap(), 0.9);
+    }
+
+    #[test]
+    fn extra_body_merges_at_top_level_not_nested() {
+        let provider = OpenRouterProvider::new(Some("key"), None)
+            .with_extra_body(serde_json::json!({"transforms": ["middle-out"]}));
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![],
+            temperature: 0.5,
+            max_tokens: None,
+        };
+
+        let merged = provider.merge_extra_body(&request).unwrap();
+        let obj = merged.as_object().unwrap();
+        assert_eq!(
+            obj.get("transforms").unwrap(),
+            &serde_json::json!(["middle-out"])
+        );
+        assert!(obj.get("extra_body").is_none());
+    }
+
+    #[test]
+    fn extra_body_with_nested_provider_routing() {
+        let provider = OpenRouterProvider::new(Some("key"), None).with_extra_body(
+            serde_json::json!({"provider": {"only": ["Anthropic"], "allow_fallbacks": false}}),
+        );
+        let request = NativeChatRequest {
+            model: "anthropic/claude-sonnet-4".into(),
+            messages: vec![],
+            temperature: 0.7,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            stream: None,
+        };
+
+        let merged = provider.merge_extra_body(&request).unwrap();
+        let obj = merged.as_object().unwrap();
+        let prov = obj.get("provider").unwrap();
+        assert_eq!(prov["only"], serde_json::json!(["Anthropic"]));
+        assert_eq!(prov["allow_fallbacks"], false);
+    }
+
     /// Regression for #5822.
     ///
     /// `AbortOnDrop` must cancel the bound tokio task when it is dropped.
