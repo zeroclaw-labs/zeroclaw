@@ -177,7 +177,14 @@ async fn prompt_field(
 
     // Surface the docstring as help text above the prompt, and append the
     // default (if any) so the user always sees what Enter will accept.
+    //
+    // Booleans are suppressed from the "Current: …" annotation: their
+    // `display_value` is always `"true"` or `"false"` (never empty, never
+    // `"<unset>"`), so `is_set` can't distinguish an explicit user choice
+    // from the struct-level default. The [Yes]/[No] toggle in the input
+    // bar surfaces the current state without the misleading prefix.
     let mut help = field.description.to_string();
+    let is_bool = field.kind == PropKind::Bool;
     if !is_set
         && let Some(d) = default
         && !d.is_empty()
@@ -186,7 +193,7 @@ async fn prompt_field(
             help.push('\n');
         }
         help.push_str(&format!("Default: {d}. Press Enter to accept."));
-    } else if is_set {
+    } else if is_set && !is_bool {
         if !help.is_empty() {
             help.push('\n');
         }

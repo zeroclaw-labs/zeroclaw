@@ -204,10 +204,15 @@ fn render_help(frame: &mut Frame, area: Rect, help: Option<&str>) {
         return;
     }
     let text = help.unwrap_or("");
-    frame.render_widget(
-        Paragraph::new(Span::styled(text, theme::dim_style())).wrap(Wrap { trim: false }),
-        area,
-    );
+    // Split explicit `\n` separators into distinct Lines. A single
+    // `Span` containing `\n` does not produce a visual break under
+    // `Paragraph::wrap`, which is how the description + "Current: …"
+    // suffix were fusing together mid-sentence.
+    let lines: Vec<Line<'_>> = text
+        .split('\n')
+        .map(|line| Line::from(Span::styled(line.to_string(), theme::dim_style())))
+        .collect();
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn render_hints(frame: &mut Frame, area: Rect, hints: &str) {
