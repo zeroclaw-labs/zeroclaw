@@ -18,6 +18,8 @@ const FIRECRAWL_MIN_BODY_LEN: usize = 100;
 /// - Follows redirects (up to 10)
 /// - Converts HTML to clean plain text via `nanohtml2text`
 /// - Passes through text/plain, text/markdown, and application/json as-is
+/// - For `application/pdf`, decodes the body and returns extracted plain text when built with
+///   the `rag-pdf` feature (same stack as `pdf_read`)
 /// - Sets a descriptive User-Agent
 /// - Falls back to Firecrawl API when standard fetch fails (if enabled)
 pub struct WebFetchTool {
@@ -78,6 +80,14 @@ impl WebFetchTool {
         &self,
         response: reqwest::Response,
     ) -> anyhow::Result<String> {
+        let bytes = self.read_response_bytes_limited(response).await?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    async fn read_response_bytes_limited(
+        &self,
+        response: reqwest::Response,
+    ) -> anyhow::Result<Vec<u8>> {
         let mut bytes_stream = response.bytes_stream();
         let hard_cap = self.max_response_size.saturating_add(1);
         let mut bytes = Vec::new();
@@ -89,7 +99,7 @@ impl WebFetchTool {
             }
         }
 
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        Ok(bytes)
     }
 
     /// Whether the standard fetch result should trigger a Firecrawl fallback.
@@ -181,29 +191,39 @@ impl WebFetchTool {
     }
 
     /// Perform the standard HTTP GET fetch and convert to text.
-    async fn standard_fetch(&self, client: &reqwest::Client, url: &str) -> ToolResult {
+    ///
+    /// The second return value is whether a Firecrawl fallback may be attempted for this
+    /// response. PDF responses skip Firecrawl (wrong tool for binary documents, and short
+    /// extracted text must not trigger a bogus fallback).
+    async fn standard_fetch(&self, client: &reqwest::Client, url: &str) -> (ToolResult, bool) {
         let response = match client.get(url).send().await {
             Ok(r) => r,
             Err(e) => {
-                return ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("HTTP request failed: {e}")),
-                };
+                return (
+                    ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("HTTP request failed: {e}")),
+                    },
+                    true,
+                );
             }
         };
 
         let status = response.status();
         if !status.is_success() {
-            return ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "HTTP {} {}",
-                    status.as_u16(),
-                    status.canonical_reason().unwrap_or("Unknown")
-                )),
-            };
+            return (
+                ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "HTTP {} {}",
+                        status.as_u16(),
+                        status.canonical_reason().unwrap_or("Unknown")
+                    )),
+                },
+                true,
+            );
         }
 
         // Determine content type for processing strategy
@@ -221,25 +241,121 @@ impl WebFetchTool {
             || content_type.contains("application/json")
         {
             "plain"
+        } else if content_type.contains("application/pdf") {
+            "pdf"
         } else {
-            return ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Unsupported content type: {content_type}. \
-                     web_fetch supports text/html, text/plain, text/markdown, and application/json."
-                )),
-            };
+            return (
+                ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Unsupported content type: {content_type}. \
+                         web_fetch supports text/html, text/plain, text/markdown, application/json, \
+                         and application/pdf (plain-text extraction; build with --features rag-pdf)."
+                    )),
+                },
+                true,
+            );
         };
+
+        if body_mode == "pdf" {
+            let body = match self.read_response_bytes_limited(response).await {
+                Ok(b) => b,
+                Err(e) => {
+                    return (
+                        ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("Failed to read response body: {e}")),
+                        },
+                        false,
+                    );
+                }
+            };
+
+            #[cfg(feature = "rag-pdf")]
+            {
+                let text = match tokio::task::spawn_blocking(move || {
+                    pdf_extract::extract_text_from_mem(&body)
+                })
+                .await
+                {
+                    Ok(Ok(t)) => t,
+                    Ok(Err(e)) => {
+                        return (
+                            ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!("PDF extraction failed: {e}")),
+                            },
+                            false,
+                        );
+                    }
+                    Err(e) => {
+                        return (
+                            ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!("PDF extraction task panicked: {e}")),
+                            },
+                            false,
+                        );
+                    }
+                };
+
+                if text.trim().is_empty() {
+                    return (
+                        ToolResult {
+                            success: true,
+                            output:
+                                "PDF contains no extractable text (may be image-only or encrypted)"
+                                    .into(),
+                            error: None,
+                        },
+                        false,
+                    );
+                }
+
+                let output = self.truncate_response(&text);
+                return (
+                    ToolResult {
+                        success: true,
+                        output,
+                        error: None,
+                    },
+                    false,
+                );
+            }
+
+            #[cfg(not(feature = "rag-pdf"))]
+            {
+                let _ = body;
+                return (
+                    ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(
+                            "PDF support requires the 'rag-pdf' build feature. \
+                             Rebuild with: cargo build --features rag-pdf"
+                                .into(),
+                        ),
+                    },
+                    false,
+                );
+            }
+        }
 
         let body = match self.read_response_text_limited(response).await {
             Ok(t) => t,
             Err(e) => {
-                return ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to read response body: {e}")),
-                };
+                return (
+                    ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Failed to read response body: {e}")),
+                    },
+                    true,
+                );
             }
         };
 
@@ -251,11 +367,14 @@ impl WebFetchTool {
 
         let output = self.truncate_response(&text);
 
-        ToolResult {
-            success: true,
-            output,
-            error: None,
-        }
+        (
+            ToolResult {
+                success: true,
+                output,
+                error: None,
+            },
+            true,
+        )
     }
 }
 
@@ -269,6 +388,7 @@ impl Tool for WebFetchTool {
         "Fetch a web page and return its content as clean plain text. \
          HTML pages are automatically converted to readable text. \
          JSON and plain text responses are returned as-is. \
+         PDF responses return extracted plain text when the build includes the 'rag-pdf' feature. \
          Only GET requests; follows redirects. \
          Falls back to Firecrawl for JS-heavy/bot-blocked sites (if enabled). \
          Security: allowlist-only domains, no local/private hosts."
@@ -370,11 +490,11 @@ impl Tool for WebFetchTool {
             }
         };
 
-        let standard_result = self.standard_fetch(&client, &url).await;
+        let (standard_result, allow_firecrawl_fallback) = self.standard_fetch(&client, &url).await;
 
         // If standard fetch succeeded well enough, return it directly.
         // Otherwise, try Firecrawl fallback if enabled.
-        if self.should_fallback_to_firecrawl(&standard_result) {
+        if allow_firecrawl_fallback && self.should_fallback_to_firecrawl(&standard_result) {
             tracing::info!(
                 "web_fetch: standard fetch insufficient for {url}, attempting Firecrawl fallback"
             );
@@ -1363,7 +1483,8 @@ mod tests {
             .unwrap();
 
         let url = format!("http://{addr}/page");
-        let standard_result = tool.standard_fetch(&client, &url).await;
+        let (standard_result, allow_fc) = tool.standard_fetch(&client, &url).await;
+        assert!(allow_fc);
 
         // standard_fetch should fail with 403
         assert!(!standard_result.success);
@@ -1452,7 +1573,8 @@ mod tests {
             .unwrap();
 
         let url = format!("http://{standard_addr}/page");
-        let standard_result = tool.standard_fetch(&client, &url).await;
+        let (standard_result, allow_fc) = tool.standard_fetch(&client, &url).await;
+        assert!(allow_fc);
 
         // Standard fetch returns short body, should trigger fallback
         assert!(tool.should_fallback_to_firecrawl(&standard_result));
@@ -1470,6 +1592,104 @@ mod tests {
         // Clean up env var
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("FIRECRAWL_E2E_TEST_KEY") };
+    }
+
+    // ── PDF responses ─────────────────────────────────────────────
+
+    #[cfg(not(feature = "rag-pdf"))]
+    #[tokio::test]
+    async fn pdf_without_rag_pdf_returns_feature_hint() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"%PDF-1.4\n")
+                    .insert_header("content-type", "application/pdf"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = test_tool(vec!["*"]);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let url = format!("http://{addr}/doc.pdf");
+        let (res, allow_fc) = tool.standard_fetch(&client, &url).await;
+        assert!(!allow_fc);
+        assert!(!res.success);
+        let err = res.error.unwrap_or_default();
+        assert!(err.contains("rag-pdf"), "expected feature hint, got: {err}");
+    }
+
+    #[cfg(feature = "rag-pdf")]
+    #[tokio::test]
+    async fn pdf_response_is_extracted_as_text() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn minimal_pdf_bytes() -> Vec<u8> {
+            let body = b"%PDF-1.4\n\
+                1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n\
+                2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n\
+                3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R\
+                /Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n\
+                4 0 obj<</Length 44>>\nstream\n\
+                BT /F1 12 Tf 72 720 Td (Hello PDF) Tj ET\n\
+                endstream\nendobj\n\
+                5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n";
+
+            let xref_offset = body.len();
+
+            let xref = format!(
+                "xref\n0 6\n\
+                 0000000000 65535 f \n\
+                 0000000009 00000 n \n\
+                 0000000058 00000 n \n\
+                 0000000115 00000 n \n\
+                 0000000274 00000 n \n\
+                 0000000370 00000 n \n\
+                 trailer<</Size 6/Root 1 0 R>>\n\
+                 startxref\n{xref_offset}\n%%EOF\n"
+            );
+
+            let mut pdf = body.to_vec();
+            pdf.extend_from_slice(xref.as_bytes());
+            pdf
+        }
+
+        let server = MockServer::start().await;
+        let addr = server.address();
+        let pdf = minimal_pdf_bytes();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(pdf)
+                    .insert_header("content-type", "application/pdf"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = test_tool(vec!["*"]);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let url = format!("http://{addr}/paper.pdf");
+        let (res, allow_fc) = tool.standard_fetch(&client, &url).await;
+        assert!(!allow_fc, "PDF fetch must not offer Firecrawl fallback");
+        assert!(res.success, "expected success, got error: {:?}", res.error);
+        assert!(
+            res.output.contains("Hello")
+                || res.output.contains("PDF")
+                || res.output.contains("no extractable"),
+            "unexpected output: {}",
+            res.output
+        );
     }
 
     // ── Allowed private hosts ─────────────────────────────────────
