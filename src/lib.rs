@@ -74,8 +74,6 @@ pub enum ChannelCommands {
     List,
     /// Start the CLI channel (interactive)
     Start,
-    /// Start the orchestrator channel (Redis Streams listener)
-    Orchestrator,
     /// Start the iMessage channel (macOS native, polls chat.db)
     #[command(name = "imessage")]
     IMessage,

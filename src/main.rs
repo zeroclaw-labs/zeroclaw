@@ -265,14 +265,10 @@ async fn main() -> Result<()> {
             ChannelCommands::List => {
                 println!("Configured channels:");
                 println!("  - cli (always available)");
-                println!("  - orchestrator (Redis Streams, requires --features orchestrator)");
                 println!("  - imessage (macOS native, requires Full Disk Access)");
             }
             ChannelCommands::Start => {
                 channels::start_cli(config).await?;
-            }
-            ChannelCommands::Orchestrator => {
-                channels::start_orchestrator(config).await?;
             }
             ChannelCommands::IMessage => {
                 channels::start_imessage(config).await?;

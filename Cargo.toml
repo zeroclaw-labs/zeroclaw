@@ -129,9 +129,6 @@ webpki-roots = "1.0.6"
 # HTTP server (for health/status endpoint, optional)
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "macros"], optional = true }
 
-# Redis (orchestrator channel)
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"], optional = true }
-
 # Unix-specific dependencies
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -144,7 +141,6 @@ default = ["createos"]
 createos = []
 brain = ["dep:fastembed"]
 browser-native = ["dep:fantoccini"]
-orchestrator = ["dep:redis"]
 gateway = ["dep:axum"]
 
 # Suppress warnings for stripped feature flags still referenced in cfg gates
