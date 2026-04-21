@@ -16,6 +16,7 @@ tauri-plugin-single-instance = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
+rustls = { version = "0.23", features = ["ring"] }
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "sync", "time"] }
 anyhow = "1.0"
 

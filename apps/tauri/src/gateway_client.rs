@@ -10,6 +10,7 @@ pub struct GatewayClient {
 
 impl GatewayClient {
     pub fn new(base_url: &str, token: Option<&str>) -> Self {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
