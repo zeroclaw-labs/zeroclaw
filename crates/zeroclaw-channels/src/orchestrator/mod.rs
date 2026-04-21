@@ -2055,7 +2055,7 @@ async fn classify_channel_reply_intent(
     }
 
     let response = provider
-        .chat_with_system(Some(system_prompt), &convo, model, temperature)
+        .chat_fast(Some(system_prompt), &convo, model, temperature)
         .await?;
     let trimmed = response.trim();
     if trimmed.is_empty() {
