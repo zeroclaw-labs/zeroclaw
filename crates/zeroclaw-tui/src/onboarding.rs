@@ -1,10 +1,9 @@
 //! `OnboardUi` implementation backed by ratatui.
 //!
-//! Provides the same prompt surface as the dialoguer-based `TermUi` in
-//! `zeroclaw-runtime` — all flow logic lives above the trait, this is just
-//! the drawing + input backend. Each trait method renders a small screen,
-//! runs a synchronous crossterm event loop, and returns the value. No
-//! duplication of orchestrator / section logic.
+//! Six-region layout — banner, breadcrumb, status log, help text, input,
+//! nav hints — keeps everything decision-relevant clustered around the
+//! input at the bottom while the rolling log stays as background context.
+//! All flow logic lives above the trait; this file is just drawing + input.
 
 use std::io::{self, Stdout};
 
@@ -16,7 +15,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
-    Terminal,
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::Modifier,
@@ -26,19 +25,35 @@ use ratatui::{
 use zeroclaw_config::traits::{Answer, OnboardUi, SelectItem};
 
 use crate::theme;
-use crate::widgets::{BANNER_HEIGHT, Banner, InfoPanel, InputPrompt};
+use crate::widgets::{BANNER_HEIGHT, Banner, InputPrompt};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
+/// Nav-hint text rendered at the bottom of the screen, specialized per
+/// prompt type. The user sees these keys on every prompt without having
+/// to remember what the current screen accepts.
+const HINTS_CONFIRM: &str = "y=yes  n=no  ← →=toggle  Enter=confirm  Esc=back";
+const HINTS_STRING: &str = "Enter=accept  Esc=back";
+const HINTS_SECRET: &str = "Enter=save  Esc=back  (input hidden)";
+const HINTS_SELECT: &str = "↑↓=navigate  type=filter  Enter=select  Esc=back";
+
 pub struct RatatuiUi {
     terminal: Term,
-    log: Vec<LogLine>,
+    /// Current section (e.g. "Providers"). Rendered in the breadcrumb bar
+    /// until replaced by `heading(1, _)`.
     section: Option<String>,
+    /// Current subsection (e.g. "Anthropic"). Rendered after the section
+    /// in the breadcrumb; cleared by `heading(1, _)`.
     subsection: Option<String>,
+    /// Help text for the current prompt (field docstring). Ephemeral —
+    /// replaced by each `note(_)` call. Renders directly above the input.
+    help: Option<String>,
+    /// Rolling status / warning log. Renders between breadcrumb and help
+    /// as background context. Cleared on section entry.
+    log: Vec<LogLine>,
 }
 
 enum LogLevel {
-    Note,
     Status,
     Warn,
 }
@@ -56,9 +71,10 @@ impl RatatuiUi {
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self {
             terminal,
-            log: Vec::new(),
             section: None,
             subsection: None,
+            help: None,
+            log: Vec::new(),
         })
     }
 
@@ -76,43 +92,6 @@ impl RatatuiUi {
         self.terminal.clear()?;
         Ok(())
     }
-
-    /// Compose the panel title from persistent section state. Owned so the
-    /// caller can stash it in a local and then pass a `&str` reference to
-    /// `log_panel` without conflicting borrows on `self`.
-    fn panel_title(&self) -> String {
-        match &self.section {
-            Some(s) => format!("ZeroClaw Onboard › {s}"),
-            None => "ZeroClaw Onboard".to_string(),
-        }
-    }
-}
-
-/// Build the rolling log panel. Free function (not `&self`) so the caller can
-/// hold a shared borrow of `self.log` while `self.terminal` is borrowed
-/// mutably by `draw()`.
-///
-/// The title is the section breadcrumb — `ZeroClaw Onboard › Providers`
-/// or `ZeroClaw Onboard › Hardware › Transport` — so every prompt screen
-/// tells the user which phase + sub-phase they're in. Notes / status /
-/// warn lines render beneath as the body.
-fn log_panel<'a>(title: &'a str, subsection: Option<&'a str>, log: &'a [LogLine]) -> InfoPanel<'a> {
-    let mut lines: Vec<Line<'a>> = Vec::new();
-    if let Some(sub) = subsection {
-        lines.push(Line::from(Span::styled(
-            format!("› {sub}"),
-            theme::accent_style(),
-        )));
-    }
-    lines.extend(log.iter().rev().take(8).rev().map(|entry| {
-        let style = match entry.level {
-            LogLevel::Note => theme::dim_style(),
-            LogLevel::Status => theme::body_style(),
-            LogLevel::Warn => theme::warn_style(),
-        };
-        Line::from(Span::styled(entry.text.clone(), style))
-    }));
-    InfoPanel { title, lines }
 }
 
 impl Drop for RatatuiUi {
@@ -122,30 +101,120 @@ impl Drop for RatatuiUi {
     }
 }
 
-/// Vertical layout: branded header + log panel (flex) + prompt bar sized to
-/// the prompt text so long doc-comment labels don't get truncated. The
-/// banner collapses when the terminal is too short to leave room for it.
-fn split(area: Rect, prompt_text: &str) -> (Rect, Rect, Rect) {
+/// Layout regions returned by `layout()`. Any region may have height 0
+/// when its contents are empty / space is tight.
+struct Regions {
+    banner: Rect,
+    breadcrumb: Rect,
+    log: Rect,
+    help: Rect,
+    input: Rect,
+    hints: Rect,
+}
+
+/// Compute the six-region layout. `help_text_rows` and `input_rows` are
+/// driven by wrapped content length so long docstrings / multi-line
+/// prompts don't get truncated; log gets the remaining flex space.
+fn layout(area: Rect, help_text: Option<&str>, input_rows: u16) -> Regions {
     let inner_width = area.width.saturating_sub(2).max(1) as usize;
-    let wrapped_rows = prompt_text
-        .split('\n')
-        .map(|line| line.len().div_ceil(inner_width).max(1))
-        .sum::<usize>();
-    let bottom_rows = (wrapped_rows + 2).clamp(3, (area.height / 2) as usize) as u16;
-    let banner_rows = if area.height >= BANNER_HEIGHT + bottom_rows + 3 {
+    let help_rows: u16 = help_text
+        .map(|s| {
+            s.split('\n')
+                .map(|line| line.len().div_ceil(inner_width).max(1))
+                .sum::<usize>()
+                .min(6) as u16
+        })
+        .unwrap_or(0);
+
+    // Fixed overhead: breadcrumb (1) + input + hints (1) + help (0..=6)
+    let fixed_below_banner = 1 + input_rows + 1 + help_rows;
+    let banner_rows = if area.height >= BANNER_HEIGHT + fixed_below_banner + 3 {
         BANNER_HEIGHT
     } else {
         0
     };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(banner_rows),
-            Constraint::Min(3),
-            Constraint::Length(bottom_rows),
+            Constraint::Length(1),          // breadcrumb
+            Constraint::Min(1),             // log (flex)
+            Constraint::Length(help_rows),  // help (0..=6)
+            Constraint::Length(input_rows), // input
+            Constraint::Length(1),          // hints
         ])
         .split(area);
-    (chunks[0], chunks[1], chunks[2])
+    Regions {
+        banner: chunks[0],
+        breadcrumb: chunks[1],
+        log: chunks[2],
+        help: chunks[3],
+        input: chunks[4],
+        hints: chunks[5],
+    }
+}
+
+fn render_banner(frame: &mut Frame, area: Rect) {
+    if area.height > 0 {
+        frame.render_widget(Banner, area);
+    }
+}
+
+fn render_breadcrumb(
+    frame: &mut Frame,
+    area: Rect,
+    section: Option<&str>,
+    subsection: Option<&str>,
+) {
+    let mut spans: Vec<Span<'_>> = vec![Span::styled("ZeroClaw Onboard", theme::heading_style())];
+    if let Some(s) = section {
+        spans.push(Span::styled("  ›  ", theme::dim_style()));
+        spans.push(Span::styled(s.to_string(), theme::accent_style()));
+    }
+    if let Some(sub) = subsection {
+        spans.push(Span::styled("  ›  ", theme::dim_style()));
+        spans.push(Span::styled(
+            sub.to_string(),
+            theme::accent_style().add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_log(frame: &mut Frame, area: Rect, log: &[LogLine]) {
+    let lines: Vec<Line<'_>> = log
+        .iter()
+        .rev()
+        .take(area.height as usize)
+        .rev()
+        .map(|entry| {
+            let style = match entry.level {
+                LogLevel::Status => theme::body_style(),
+                LogLevel::Warn => theme::warn_style(),
+            };
+            Line::from(Span::styled(entry.text.clone(), style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn render_help(frame: &mut Frame, area: Rect, help: Option<&str>) {
+    if area.height == 0 {
+        return;
+    }
+    let text = help.unwrap_or("");
+    frame.render_widget(
+        Paragraph::new(Span::styled(text, theme::dim_style())).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_hints(frame: &mut Frame, area: Rect, hints: &str) {
+    frame.render_widget(
+        Paragraph::new(Span::styled(hints, theme::dim_style())),
+        area,
+    );
 }
 
 fn wait_key() -> Result<KeyEvent> {
@@ -166,25 +235,52 @@ impl OnboardUi for RatatuiUi {
     async fn confirm(&mut self, prompt: &str, default: bool) -> Result<Answer<bool>> {
         let mut choice = default;
         loop {
-            let title = self.panel_title();
-            let log = log_panel(&title, self.subsection.as_deref(), &self.log);
-            let label = format!(
-                "{prompt}  [{}] (y/n, Enter confirms, Esc=back)",
-                if choice { "Yes" } else { "No" }
-            );
+            let section = self.section.clone();
+            let subsection = self.subsection.clone();
+            let help = self.help.clone();
+            let log_snapshot: Vec<(LogLevel, String)> = self
+                .log
+                .iter()
+                .map(|l| {
+                    (
+                        match l.level {
+                            LogLevel::Status => LogLevel::Status,
+                            LogLevel::Warn => LogLevel::Warn,
+                        },
+                        l.text.clone(),
+                    )
+                })
+                .collect();
+            let label = format!("◆ {prompt}  [{}]", if choice { "Yes" } else { "No" });
             self.terminal.draw(|frame| {
-                let (header, top, bottom) = split(frame.area(), &label);
-                if header.height > 0 {
-                    frame.render_widget(Banner, header);
-                }
-                frame.render_widget(log, top);
+                let r = layout(frame.area(), help.as_deref(), 3);
+                render_banner(frame, r.banner);
+                render_breadcrumb(
+                    frame,
+                    r.breadcrumb,
+                    section.as_deref(),
+                    subsection.as_deref(),
+                );
+                let log_lines: Vec<LogLine> = log_snapshot
+                    .iter()
+                    .map(|(lvl, txt)| LogLine {
+                        level: match lvl {
+                            LogLevel::Status => LogLevel::Status,
+                            LogLevel::Warn => LogLevel::Warn,
+                        },
+                        text: txt.clone(),
+                    })
+                    .collect();
+                render_log(frame, r.log, &log_lines);
+                render_help(frame, r.help, help.as_deref());
                 frame.render_widget(
                     Paragraph::new(label.clone())
                         .style(theme::body_style())
                         .wrap(Wrap { trim: false })
                         .block(Block::default().borders(Borders::ALL)),
-                    bottom,
+                    r.input,
                 );
+                render_hints(frame, r.hints, HINTS_CONFIRM);
             })?;
             match wait_key()?.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(Answer::Value(true)),
@@ -200,25 +296,41 @@ impl OnboardUi for RatatuiUi {
     async fn string(&mut self, prompt: &str, current: Option<&str>) -> Result<Answer<String>> {
         let mut buffer = current.unwrap_or_default().to_string();
         loop {
-            let title = self.panel_title();
-            let log = log_panel(&title, self.subsection.as_deref(), &self.log);
-            let label = prompt.to_string();
+            let section = self.section.clone();
+            let subsection = self.subsection.clone();
+            let help = self.help.clone();
+            let log_lines: Vec<LogLine> = self
+                .log
+                .iter()
+                .map(|l| LogLine {
+                    level: match l.level {
+                        LogLevel::Status => LogLevel::Status,
+                        LogLevel::Warn => LogLevel::Warn,
+                    },
+                    text: l.text.clone(),
+                })
+                .collect();
             let input = buffer.clone();
-            let measure = format!("{label}  {input}");
             self.terminal.draw(|frame| {
-                let (header, top, bottom) = split(frame.area(), &measure);
-                if header.height > 0 {
-                    frame.render_widget(Banner, header);
-                }
-                frame.render_widget(log, top);
+                let r = layout(frame.area(), help.as_deref(), 3);
+                render_banner(frame, r.banner);
+                render_breadcrumb(
+                    frame,
+                    r.breadcrumb,
+                    section.as_deref(),
+                    subsection.as_deref(),
+                );
+                render_log(frame, r.log, &log_lines);
+                render_help(frame, r.help, help.as_deref());
                 frame.render_widget(
                     InputPrompt {
-                        label: &label,
+                        label: prompt,
                         input: &input,
                         masked: false,
                     },
-                    bottom,
+                    r.input,
                 );
+                render_hints(frame, r.hints, HINTS_STRING);
             })?;
             match wait_key()? {
                 KeyEvent {
@@ -246,7 +358,7 @@ impl OnboardUi for RatatuiUi {
     async fn secret(&mut self, prompt: &str, has_current: bool) -> Result<Answer<Option<String>>> {
         if has_current {
             match self
-                .confirm(&format!("{prompt} (stored, replace?)"), false)
+                .confirm(&format!("{prompt} (already stored — replace?)"), false)
                 .await?
             {
                 Answer::Value(false) => return Ok(Answer::Value(None)),
@@ -256,25 +368,41 @@ impl OnboardUi for RatatuiUi {
         }
         let mut buffer = String::new();
         loop {
-            let title = self.panel_title();
-            let log = log_panel(&title, self.subsection.as_deref(), &self.log);
-            let label = prompt.to_string();
+            let section = self.section.clone();
+            let subsection = self.subsection.clone();
+            let help = self.help.clone();
+            let log_lines: Vec<LogLine> = self
+                .log
+                .iter()
+                .map(|l| LogLine {
+                    level: match l.level {
+                        LogLevel::Status => LogLevel::Status,
+                        LogLevel::Warn => LogLevel::Warn,
+                    },
+                    text: l.text.clone(),
+                })
+                .collect();
             let input = buffer.clone();
-            let measure = label.clone();
             self.terminal.draw(|frame| {
-                let (header, top, bottom) = split(frame.area(), &measure);
-                if header.height > 0 {
-                    frame.render_widget(Banner, header);
-                }
-                frame.render_widget(log, top);
+                let r = layout(frame.area(), help.as_deref(), 3);
+                render_banner(frame, r.banner);
+                render_breadcrumb(
+                    frame,
+                    r.breadcrumb,
+                    section.as_deref(),
+                    subsection.as_deref(),
+                );
+                render_log(frame, r.log, &log_lines);
+                render_help(frame, r.help, help.as_deref());
                 frame.render_widget(
                     InputPrompt {
-                        label: &label,
+                        label: prompt,
                         input: &input,
                         masked: true,
                     },
-                    bottom,
+                    r.input,
                 );
+                render_hints(frame, r.hints, HINTS_SECRET);
             })?;
             match wait_key()? {
                 KeyEvent {
@@ -328,10 +456,9 @@ impl OnboardUi for RatatuiUi {
                 cursor = matches.len() - 1;
             }
 
-            let title = self.panel_title();
-            let log = log_panel(&title, self.subsection.as_deref(), &self.log);
-            let prompt_text = prompt.to_string();
-            let filter_text = filter.clone();
+            let section = self.section.clone();
+            let subsection = self.subsection.clone();
+            let help = self.help.clone();
             let list_items: Vec<ListItem<'_>> = matches
                 .iter()
                 .map(|&real_idx| {
@@ -351,10 +478,22 @@ impl OnboardUi for RatatuiUi {
             if !matches.is_empty() {
                 list_state.select(Some(cursor));
             }
+            let prompt_line = format!("◆ {prompt}  filter: {filter}");
 
             self.terminal.draw(|frame| {
                 let area = frame.area();
-                let banner_rows = if area.height >= BANNER_HEIGHT + 13 {
+                let inner_width = area.width.saturating_sub(2).max(1) as usize;
+                let help_rows: u16 = help
+                    .as_deref()
+                    .map(|s| {
+                        s.split('\n')
+                            .map(|line| line.len().div_ceil(inner_width).max(1))
+                            .sum::<usize>()
+                            .min(6) as u16
+                    })
+                    .unwrap_or(0);
+                let fixed = 1 + help_rows + 1 + 1; // breadcrumb + help + prompt + hints
+                let banner_rows = if area.height >= BANNER_HEIGHT + fixed + 6 {
                     BANNER_HEIGHT
                 } else {
                     0
@@ -363,42 +502,29 @@ impl OnboardUi for RatatuiUi {
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Length(banner_rows),
-                        Constraint::Length(8),
-                        Constraint::Length(1),
-                        Constraint::Min(3),
-                        Constraint::Length(1),
+                        Constraint::Length(1),         // breadcrumb
+                        Constraint::Length(help_rows), // help
+                        Constraint::Length(1),         // prompt + filter line
+                        Constraint::Min(4),            // list (flex)
+                        Constraint::Length(1),         // hints
                     ])
                     .split(area);
-                if banner_rows > 0 {
-                    frame.render_widget(Banner, chunks[0]);
-                }
-                frame.render_widget(log, chunks[1]);
+                render_banner(frame, chunks[0]);
+                render_breadcrumb(frame, chunks[1], section.as_deref(), subsection.as_deref());
+                render_help(frame, chunks[2], help.as_deref());
                 frame.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(prompt_text, theme::heading_style()),
-                        Span::raw(" "),
-                        Span::styled(format!("filter: {filter_text}"), theme::dim_style()),
-                    ])),
-                    chunks[2],
+                    Paragraph::new(Span::styled(prompt_line, theme::heading_style())),
+                    chunks[3],
                 );
-                // ratatui's List + ListState handles scrolling + highlight
-                // automatically — the visible window follows the cursor so
-                // long lists (e.g., 28 channels + Done) stay reachable.
                 frame.render_stateful_widget(
                     List::new(list_items)
                         .block(Block::default().borders(Borders::ALL))
                         .highlight_style(theme::selected_style())
                         .highlight_symbol("› "),
-                    chunks[3],
+                    chunks[4],
                     &mut list_state,
                 );
-                frame.render_widget(
-                    Paragraph::new(Span::styled(
-                        "type to filter  Enter=select  Esc=back",
-                        theme::dim_style(),
-                    )),
-                    chunks[4],
-                );
+                render_hints(frame, chunks[5], HINTS_SELECT);
             })?;
 
             match wait_key()? {
@@ -475,32 +601,33 @@ impl OnboardUi for RatatuiUi {
     }
 
     fn heading(&mut self, level: u8, text: &str) {
-        // level 1 = section (persists in title bar). Entering a new section
-        // clears any stale subsection and log lines. level 2 = subsection
-        // (renders as the first line inside the panel until replaced).
+        // level 1 = section (breadcrumb root). Entering a new section
+        // clears subsection, help, and log — the user is in a new phase.
+        // level 2 = subsection (e.g. picked provider / channel). Only
+        // clears help, since the log may still be carrying status from
+        // just-completed subsection work.
         match level {
             1 => {
                 self.section = Some(text.to_string());
                 self.subsection = None;
+                self.help = None;
                 self.log.clear();
             }
             _ => {
                 self.subsection = Some(text.to_string());
+                self.help = None;
             }
         }
     }
 
     fn note(&mut self, msg: &str) {
-        // Note = "current context for the next prompt". Replace (don't
-        // append) so stale context from a previous section doesn't leak
-        // into a later screen. Section / subsection headings live outside
-        // the log and are untouched here.
-        self.log.clear();
-        if !msg.is_empty() {
-            self.log.push(LogLine {
-                level: LogLevel::Note,
-                text: msg.to_string(),
-            });
+        // Note = help text for the upcoming prompt (usually the field
+        // docstring). Persists until replaced by the next note() or
+        // cleared by entering a new section / subsection.
+        if msg.is_empty() {
+            self.help = None;
+        } else {
+            self.help = Some(msg.to_string());
         }
     }
 

@@ -43,10 +43,6 @@ pub fn selected_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-pub fn border_style() -> Style {
-    Style::default().fg(ICY_BLUE)
-}
-
 pub fn input_style() -> Style {
     Style::default().fg(ICY_WHITE)
 }

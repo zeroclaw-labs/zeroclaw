@@ -1,8 +1,8 @@
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Rect},
-    text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Widget, Wrap},
+    text::{Line, Span},
+    widgets::{Paragraph, Widget},
 };
 
 use super::theme;
@@ -41,32 +41,6 @@ impl Widget for Banner {
 
 /// Fixed height the banner widget wants (7 ASCII-art rows + 1 tagline).
 pub const BANNER_HEIGHT: u16 = 7;
-
-/// Bordered info panel — title bar + wrapped body content.
-pub struct InfoPanel<'a> {
-    pub title: &'a str,
-    pub lines: Vec<Line<'a>>,
-}
-
-impl Widget for InfoPanel<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(theme::border_style())
-            .title(Span::styled(
-                format!(" {} ", self.title),
-                theme::heading_style(),
-            ));
-
-        let inner = block.inner(area);
-        block.render(area, buf);
-
-        Paragraph::new(Text::from(self.lines))
-            .wrap(Wrap { trim: false })
-            .style(theme::body_style())
-            .render(inner, buf);
-    }
-}
 
 /// Single-line prompt with a label and the current input buffer. Masks the
 /// input when `masked` is true (for secrets).

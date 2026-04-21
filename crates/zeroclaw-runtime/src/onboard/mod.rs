@@ -135,10 +135,36 @@ async fn persist(cfg: &mut Config, path: &str, value: &str) -> Result<()> {
 
 // ── Field-driven helpers ─────────────────────────────────────────────────
 
+/// Per-field default override. When a section knows a sensible default
+/// that lives outside the config (e.g. `AnthropicProvider::default_temperature()`),
+/// it builds a list of these and passes them to `prompt_fields_under`.
+/// The prompt surfaces the default — shown in the label as
+/// `"timeout-secs (default: 120)"` and prefilled into the input so the
+/// user just hits Enter to accept — only when the field is unset in cfg.
+#[derive(Debug, Clone)]
+pub struct FieldDefault {
+    pub path: String,
+    pub display: String,
+}
+
+fn find_default<'a>(defaults: &'a [FieldDefault], path: &str) -> Option<&'a str> {
+    defaults
+        .iter()
+        .find(|d| d.path == path)
+        .map(|d| d.display.as_str())
+}
+
 /// Prompt for a single config field identified by its dotted name. Returns
 /// `Nav::Back` when the user pressed Esc at the prompt; `Nav::Done` on any
-/// other outcome (including "kept current value").
-async fn prompt_field(cfg: &mut Config, ui: &mut dyn OnboardUi, name: &str) -> Result<Nav> {
+/// other outcome (including "kept current value"). `default` is the
+/// section-supplied fallback for unset fields — surfaced in the label and
+/// prefilled into the input.
+async fn prompt_field(
+    cfg: &mut Config,
+    ui: &mut dyn OnboardUi,
+    name: &str,
+    default: Option<&str>,
+) -> Result<Nav> {
     let field = cfg
         .prop_fields()
         .into_iter()
@@ -146,12 +172,35 @@ async fn prompt_field(cfg: &mut Config, ui: &mut dyn OnboardUi, name: &str) -> R
         .ok_or_else(|| anyhow::anyhow!("unknown config field: {name}"))?;
 
     let short = name.rsplit('.').next().unwrap_or(name);
-    if !field.description.is_empty() {
-        ui.note(field.description);
-    }
-    let prompt = short;
     let current = field.display_value;
     let is_set = !current.is_empty() && current != "<unset>";
+
+    // Surface the docstring as help text above the prompt, and append the
+    // default (if any) so the user always sees what Enter will accept.
+    let mut help = field.description.to_string();
+    if !is_set
+        && let Some(d) = default
+        && !d.is_empty()
+    {
+        if !help.is_empty() {
+            help.push('\n');
+        }
+        help.push_str(&format!("Default: {d}. Press Enter to accept."));
+    } else if is_set {
+        if !help.is_empty() {
+            help.push('\n');
+        }
+        help.push_str(&format!("Current: {current}. Enter to keep."));
+    }
+    ui.note(&help);
+
+    // Label decorates the short name with the default (when visible) so the
+    // value is anchored to the prompt line itself, not just the help text.
+    let prompt_label = match (is_set, default) {
+        (false, Some(d)) if !d.is_empty() => format!("{short} (default: {d})"),
+        _ => short.to_string(),
+    };
+    let prompt = prompt_label.as_str();
 
     if field.is_secret {
         match ui.secret(prompt, is_set).await? {
@@ -172,8 +221,16 @@ async fn prompt_field(cfg: &mut Config, ui: &mut dyn OnboardUi, name: &str) -> R
             }
         }
         PropKind::String | PropKind::Integer | PropKind::Float => {
-            let default = if is_set { Some(current.as_str()) } else { None };
-            match ui.string(prompt, default).await? {
+            // Prefill priority: config current value > section default > empty.
+            // When the user accepts the prefilled default (no edit), we
+            // still write it through set_prop so the config records the
+            // resolved value rather than leaving it as an implicit fallback.
+            let prefill = if is_set {
+                Some(current.as_str())
+            } else {
+                default
+            };
+            match ui.string(prompt, prefill).await? {
                 Answer::Back => return Ok(Nav::Back),
                 Answer::Value(new) => {
                     if (is_set || !new.is_empty()) && new != current {
@@ -189,7 +246,11 @@ async fn prompt_field(cfg: &mut Config, ui: &mut dyn OnboardUi, name: &str) -> R
                 return Ok(Nav::Done);
             }
             let items: Vec<SelectItem> = variants.iter().map(SelectItem::new).collect();
-            let current_idx = variants.iter().position(|v| v == &current);
+            let current_idx = if is_set {
+                variants.iter().position(|v| v == &current)
+            } else {
+                default.and_then(|d| variants.iter().position(|v| v == d))
+            };
             match ui.select(prompt, &items, current_idx).await? {
                 Answer::Back => return Ok(Nav::Back),
                 Answer::Value(idx) => {
@@ -205,14 +266,16 @@ async fn prompt_field(cfg: &mut Config, ui: &mut dyn OnboardUi, name: &str) -> R
 }
 
 /// Iterate every field under `prefix` in `prop_fields()` and prompt for each.
-/// `excludes` lists leaf field names to skip. Rewinds the iteration on
-/// `Nav::Back`; if the user rewinds past the first prompt, propagates `Back`
-/// to the caller so the containing section can decide what to do.
+/// `excludes` lists leaf field names to skip. `defaults` carries per-field
+/// fallback values (e.g. provider-trait defaults) surfaced in the prompt
+/// when the field is unset. Rewinds on `Nav::Back`; propagates `Back` to
+/// the caller when the user rewinds past the first prompt.
 async fn prompt_fields_under(
     cfg: &mut Config,
     ui: &mut dyn OnboardUi,
     prefix: &str,
     excludes: &[&str],
+    defaults: &[FieldDefault],
 ) -> Result<Nav> {
     let names: Vec<String> = cfg
         .prop_fields()
@@ -227,7 +290,8 @@ async fn prompt_fields_under(
         .collect();
     let mut i: usize = 0;
     while i < names.len() {
-        match prompt_field(cfg, ui, &names[i]).await? {
+        let default = find_default(defaults, &names[i]);
+        match prompt_field(cfg, ui, &names[i], default).await? {
             Nav::Done => i += 1,
             Nav::Back => {
                 if i == 0 {
@@ -341,12 +405,12 @@ async fn workspace(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
     }
 
     loop {
-        match prompt_field(cfg, ui, "workspace.enabled").await? {
+        match prompt_field(cfg, ui, "workspace.enabled", None).await? {
             Nav::Back => return Ok(Nav::Back),
             Nav::Done => {}
         }
         if cfg.workspace.enabled {
-            match prompt_fields_under(cfg, ui, "workspace", &["enabled"]).await? {
+            match prompt_fields_under(cfg, ui, "workspace", &["enabled"], &[]).await? {
                 Nav::Back => continue,
                 Nav::Done => break,
             }
@@ -440,7 +504,6 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
         // passed on the command line.
         let prefix = format!("providers.models.{picked}");
         let api_key_path = format!("{prefix}.api-key");
-        let excludes: &[&str] = &["model", "api-key"];
         if let Some(api_key) = &flags.api_key {
             persist(cfg, &api_key_path, api_key).await?;
         }
@@ -454,13 +517,7 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
         // provider subsection so the panel reads "Providers › Authentication".
         if flags.api_key.is_none() {
             ui.heading(2, &format!("{display_name} › Authentication"));
-            ui.note(
-                "Paste an API key from the provider's dashboard. Enter to keep \
-                 the stored key, or `y` at the `replace?` prompt to rotate it. \
-                 For OAuth-only providers (Codex, Claude Code), use \
-                 `zeroclaw auth login --provider <name>` instead.",
-            );
-            match prompt_field(cfg, ui, &api_key_path).await? {
+            match prompt_field(cfg, ui, &api_key_path, None).await? {
                 Nav::Back => {
                     if flags.provider.is_some() {
                         return Ok(Nav::Back);
@@ -470,18 +527,6 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
                 Nav::Done => {}
             }
             ui.heading(2, display_name);
-        }
-
-        // Remaining provider-specific fields (base-url, region, etc.) —
-        // skipped for `model` (handled by prompt_model) and `api-key` (above).
-        match prompt_fields_under(cfg, ui, &prefix, excludes).await? {
-            Nav::Back => {
-                if flags.provider.is_some() {
-                    return Ok(Nav::Back);
-                }
-                continue;
-            }
-            Nav::Done => {}
         }
 
         if flags.model.is_none() {
@@ -495,12 +540,90 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
                 }
                 Nav::Done => {}
             }
+            ui.heading(2, display_name);
         }
+
+        // Advanced settings (temperature, timeout, base-url override,
+        // wire-api, etc.) are gated behind an opt-in. Most users never
+        // touch these, and the trait-level defaults are sensible.
+        match offer_advanced_settings(cfg, ui, &picked, &prefix).await? {
+            Nav::Back => {
+                if flags.provider.is_some() {
+                    return Ok(Nav::Back);
+                }
+                continue;
+            }
+            Nav::Done => {}
+        }
+
         break;
     }
 
     mark_completed(cfg, "providers").await?;
     Ok(Nav::Done)
+}
+
+/// Opt-in gate for the per-provider advanced field sweep. Default N so the
+/// user breezes through onboarding after auth + model; Y walks them through
+/// every remaining field (temperature, max_tokens, timeout_secs, base_url,
+/// wire_api, azure_*, etc.) with the provider's trait defaults pre-filled.
+async fn offer_advanced_settings(
+    cfg: &mut Config,
+    ui: &mut dyn OnboardUi,
+    provider: &str,
+    prefix: &str,
+) -> Result<Nav> {
+    ui.heading(2, "Advanced settings");
+    ui.note(
+        "Temperature, timeout, base-URL override, wire protocol, etc. The \
+         provider's own defaults are used when these are left unset — skip \
+         unless you need to override something specific.",
+    );
+    match ui.confirm("Configure advanced settings?", false).await? {
+        Answer::Back => return Ok(Nav::Back),
+        Answer::Value(false) => return Ok(Nav::Done),
+        Answer::Value(true) => {}
+    }
+
+    // Build the defaults override map from the concrete Provider's trait
+    // methods. A provider handle constructed with `api_key = None` can
+    // still answer the `default_*` questions — they're family-level
+    // constants, not runtime values. If construction fails (unknown /
+    // local-only provider), fall through with an empty override map and
+    // let each field's own display_value carry the prompt.
+    let defaults: Vec<FieldDefault> = match zeroclaw_providers::create_provider(provider, None) {
+        Ok(handle) => {
+            let mut v = vec![
+                FieldDefault {
+                    path: format!("{prefix}.temperature"),
+                    display: handle.default_temperature().to_string(),
+                },
+                FieldDefault {
+                    path: format!("{prefix}.max-tokens"),
+                    display: handle.default_max_tokens().to_string(),
+                },
+                FieldDefault {
+                    path: format!("{prefix}.timeout-secs"),
+                    display: handle.default_timeout_secs().to_string(),
+                },
+                FieldDefault {
+                    path: format!("{prefix}.wire-api"),
+                    display: handle.default_wire_api().to_string(),
+                },
+            ];
+            if let Some(url) = handle.default_base_url() {
+                v.push(FieldDefault {
+                    path: format!("{prefix}.base-url"),
+                    display: url.to_string(),
+                });
+            }
+            v
+        }
+        Err(_) => Vec::new(),
+    };
+
+    // Skipped: `model` (already via prompt_model), `api-key` (explicit auth phase).
+    prompt_fields_under(cfg, ui, prefix, &["model", "api-key"], &defaults).await
 }
 
 /// Per-provider example model-id used in the manual-entry fallback prompt.
@@ -637,7 +760,7 @@ async fn channels(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Re
         ui.heading(2, picked);
         // Back inside a channel's subfields bounces to the channel list
         // (not to the previous section) — user is still inside Channels.
-        let _ = prompt_fields_under(cfg, ui, &prefix, &[]).await?;
+        let _ = prompt_fields_under(cfg, ui, &prefix, &[], &[]).await?;
     }
     mark_completed(cfg, "channels").await?;
     Ok(Nav::Done)
@@ -680,7 +803,7 @@ async fn memory(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Resu
     }
 
     // Back on auto-save bounces to the backend picker (consumed).
-    let _ = prompt_field(cfg, ui, "memory.auto-save").await?;
+    let _ = prompt_field(cfg, ui, "memory.auto-save", None).await?;
     mark_completed(cfg, "memory").await?;
     Ok(Nav::Done)
 }
@@ -703,12 +826,12 @@ async fn hardware(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Re
     }
 
     loop {
-        match prompt_field(cfg, ui, "hardware.enabled").await? {
+        match prompt_field(cfg, ui, "hardware.enabled", None).await? {
             Nav::Back => return Ok(Nav::Back),
             Nav::Done => {}
         }
         if cfg.hardware.enabled {
-            match prompt_fields_under(cfg, ui, "hardware", &["enabled"]).await? {
+            match prompt_fields_under(cfg, ui, "hardware", &["enabled"], &[]).await? {
                 Nav::Back => continue,
                 Nav::Done => break,
             }
@@ -775,7 +898,7 @@ async fn tunnel(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Resu
         cfg.init_defaults(Some(&prefix));
         cfg.save().await?;
         ui.heading(2, &new_provider);
-        match prompt_fields_under(cfg, ui, &prefix, &[]).await? {
+        match prompt_fields_under(cfg, ui, &prefix, &[], &[]).await? {
             Nav::Back => continue,
             Nav::Done => break,
         }
