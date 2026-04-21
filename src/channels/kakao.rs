@@ -1010,5 +1010,20 @@ admin_key = "admin"
         assert!(config.allowed_users.is_empty());
         assert!(config.webhook_secret.is_none());
         assert_eq!(config.port, 8787);
+        assert!(config.javascript_app_key.is_none());
+    }
+
+    #[test]
+    fn test_config_serde_javascript_app_key_present() {
+        let toml_str = r#"
+rest_api_key = "key"
+admin_key = "admin"
+javascript_app_key = "jsapp_key_xyz"
+"#;
+        let config: crate::config::schema::KakaoTalkConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.javascript_app_key.as_deref(),
+            Some("jsapp_key_xyz")
+        );
     }
 }
