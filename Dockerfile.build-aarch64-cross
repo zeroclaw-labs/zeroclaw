@@ -1,0 +1,51 @@
+# Dockerfile.build-aarch64-cross - 交叉编译 aarch64 版本
+# 在 x86_64 主机上交叉编译到 aarch64
+
+FROM rust:1.88-bookworm AS builder
+
+# 安装交叉编译工具链
+RUN dpkg --add-architecture arm64 && \
+    apt-get update && \
+    apt-get install -y \
+        gcc-aarch64-linux-gnu \
+        libc6-dev-arm64-cross \
+        libssl-dev:arm64 \
+        pkg-config \
+        protobuf-compiler \
+        && rm -rf /var/lib/apt/lists/*
+
+# 添加 aarch64 目标
+RUN rustup target add aarch64-unknown-linux-gnu
+
+# 设置交叉编译环境变量
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+ENV PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu
+
+WORKDIR /app
+
+# 复制项目文件
+COPY Cargo.toml ./
+COPY Cargo.lock ./
+COPY crates/ crates/
+COPY src/ src/
+COPY benches/ benches/
+
+# 复制本地已构建的前端
+COPY web/dist/ web/dist/
+
+# 修改 Cargo.toml 排除 apps/tauri
+RUN sed -i 's/, "apps\/tauri"//' Cargo.toml
+
+# 交叉编译 release 版本
+RUN cargo build --target aarch64-unknown-linux-gnu --release && \
+    cp target/aarch64-unknown-linux-gnu/release/quantclaw /app/quantclaw && \
+    aarch64-linux-gnu-strip /app/quantclaw
+
+# 验证
+RUN file /app/quantclaw && ls -lh /app/quantclaw
+
+# 导出阶段
+FROM scratch AS export
+COPY --from=builder /app/quantclaw /quantclaw

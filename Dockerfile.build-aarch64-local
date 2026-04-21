@@ -26,7 +26,12 @@ COPY web/dist/ web/dist/
 # 修改 Cargo.toml 排除 apps/tauri（因为它需要额外的源文件）
 RUN sed -i 's/, "apps\/tauri"//' Cargo.toml
 
+# 设置环境变量强制使用 ring 后端（避免 aws-lc-sys）
+ENV AWS_LC_SYS_CMAKE_BUILDER=0
+ENV RUSTFLAGS="-C target-feature=+crt-static"
+
 # 构建 release 版本（原生 arm64 编译，不需要交叉编译）
+# 使用 --no-default-features 避免某些默认的 aws-lc 依赖
 RUN cargo build --release && \
     cp target/release/quantclaw /app/quantclaw && \
     strip /app/quantclaw
