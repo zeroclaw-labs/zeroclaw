@@ -1250,6 +1250,23 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         }
     };
 
+    // Case-session store: SQLite file under the workspace so an active
+    // case survives a gateway restart. Fallback to in-memory on open
+    // error so the process still boots — cases will reset at next
+    // restart in that degraded mode.
+    let case_sessions_store = {
+        let path = std::path::Path::new(&config.workspace_dir).join("case_sessions.db");
+        match crate::channels::case_session::CaseSessionStore::open(&path) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to open case_sessions.db ({e}); falling back to in-memory case sessions (will not survive restart)."
+                );
+                Arc::new(crate::channels::case_session::CaseSessionStore::new())
+            }
+        }
+    };
+
     let state = AppState {
         config: config_state,
         provider,
@@ -1288,7 +1305,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         auth_store,
         channel_pairing,
         chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
-        case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+        case_sessions: case_sessions_store,
         kakao_share_store,
         auth_allow_registration,
         device_router,
