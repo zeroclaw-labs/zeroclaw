@@ -25,7 +25,7 @@ tempfile = "3.26"
 toml = "1.0"
 tracing = { version = "0.1", default-features = false }
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
 
 # Optional hardware deps
 nusb = { version = "0.2", default-features = false, optional = true }

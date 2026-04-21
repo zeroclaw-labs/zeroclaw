@@ -34,7 +34,7 @@ parking_lot = "0.12"
 portable-atomic = "1"
 prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
 regex = "1.10"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "multipart", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls", "multipart", "stream"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pki-types = "1.14.0"
