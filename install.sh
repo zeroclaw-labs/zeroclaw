@@ -187,23 +187,31 @@ install_prebuilt() {
   curl -fSL --progress-bar "$asset_url" -o "$tmp_dir/$asset_name" \
     || { warn "Download failed — falling back to source build"; rm -rf "$tmp_dir"; return 1; }
 
-  # Verify checksum
-  if curl -fsSL "$sha256_url" -o "$tmp_dir/SHA256SUMS" 2>/dev/null; then
-    expected=$(grep "$asset_name" "$tmp_dir/SHA256SUMS" | awk '{print $1}')
-    if [ -n "$expected" ]; then
-      if command -v sha256sum >/dev/null 2>&1; then
-        actual=$(sha256sum "$tmp_dir/$asset_name" | awk '{print $1}')
-      elif command -v shasum >/dev/null 2>&1; then
-        actual=$(shasum -a 256 "$tmp_dir/$asset_name" | awk '{print $1}')
-      else
-        actual=""
-      fi
-      if [ -n "$actual" ] && [ "$actual" != "$expected" ]; then
-        die "Checksum mismatch — download may be corrupt. Expected: $expected  Got: $actual"
-      fi
-      [ -n "$actual" ] && info "Checksum verified"
-    fi
+  # Verify checksum — all failure modes fall back to source rather than install unverified
+  if ! curl -fsSL "$sha256_url" -o "$tmp_dir/SHA256SUMS" 2>/dev/null; then
+    warn "Could not fetch SHA256SUMS — falling back to source build"
+    rm -rf "$tmp_dir"; return 1
   fi
+
+  expected=$(grep "$asset_name" "$tmp_dir/SHA256SUMS" | awk '{print $1}')
+  if [ -z "$expected" ]; then
+    warn "Asset not found in SHA256SUMS — falling back to source build"
+    rm -rf "$tmp_dir"; return 1
+  fi
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual=$(sha256sum "$tmp_dir/$asset_name" | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    actual=$(shasum -a 256 "$tmp_dir/$asset_name" | awk '{print $1}')
+  else
+    warn "No checksum tool available (sha256sum/shasum) — falling back to source build"
+    rm -rf "$tmp_dir"; return 1
+  fi
+
+  if [ "$actual" != "$expected" ]; then
+    die "Checksum mismatch — download may be corrupt. Expected: $expected  Got: $actual"
+  fi
+  info "Checksum verified"
 
   tar -xzf "$tmp_dir/$asset_name" -C "$tmp_dir"
   mkdir -p "$CARGO_HOME/bin"
