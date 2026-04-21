@@ -421,9 +421,46 @@ async fn handle_socket(
                                         );
                                     }
                                     zeroclaw_api::vad::VadEvent::SpeechEnd => {
-                                        tracing::debug!(
-                                            "voice duplex: VAD speech_end"
-                                        );
+                                        tracing::debug!("voice duplex: VAD speech_end");
+                                        if let Some(ref mut vs) = voice_session {
+                                            let samples = vs.drain_captured_audio();
+                                            if !samples.is_empty() {
+                                                let wav = crate::voice_duplex::audio::encode_wav_from_f32(
+                                                    &samples,
+                                                    crate::voice_duplex::audio::SAMPLE_RATE,
+                                                    1,
+                                                );
+                                                let transcription_config = state
+                                                    .config
+                                                    .lock()
+                                                    .transcription
+                                                    .clone();
+                                                if transcription_config.enabled {
+                                                    match zeroclaw_channels::transcription::transcribe_audio(
+                                                        wav,
+                                                        "voice_duplex.wav",
+                                                        &transcription_config,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(text) => {
+                                                            let transcript = crate::voice_duplex::VoiceEvent::Transcript {
+                                                                text,
+                                                            };
+                                                            let json = serde_json::to_string(&transcript).unwrap();
+                                                            let _ = sender
+                                                                .send(Message::Text(json.into()))
+                                                                .await;
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(error = %e, "voice duplex: STT transcription failed");
+                                                        }
+                                                    }
+                                                } else {
+                                                    tracing::debug!("voice duplex: transcription disabled, captured audio discarded");
+                                                }
+                                            }
+                                        }
                                     }
                                     zeroclaw_api::vad::VadEvent::Silence => {}
                                 }
