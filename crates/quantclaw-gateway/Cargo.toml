@@ -21,6 +21,7 @@ quantclaw-plugins = { workspace = true, optional = true }
 
 # HTTP server
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["native-tls"] }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
@@ -28,8 +29,8 @@ tower-http = { version = "0.6", default-features = false, features = ["limit", "
 http-body-util = "0.1"
 
 # TLS
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
+native-tls = { version = "0.2" }
+tokio-native-tls = { version = "0.3" }
 
 # Frontend asset MIME type detection (dashboard served from filesystem)
 mime_guess = "2"
@@ -61,7 +62,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 parking_lot = "0.12"
 toml = "1.0"
 tracing = { version = "0.1", default-features = false }
-rustls-pemfile = "2"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
 [dev-dependencies]

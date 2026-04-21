@@ -26,11 +26,11 @@ sha2 = "0.10"
 shellexpand = "3.1"
 thiserror = "2.0"
 tokio = { version = "1.50", default-features = false, features = ["fs", "io-util", "sync"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
+tokio-native-tls = { version = "0.3" }
 tokio-socks = "0.5"
 tokio-stream = { version = "0.1.18", default-features = false }
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-rustls-pki-types = "1.14.0"
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "native-tls"] }
+native-tls-crate = { package = "native-tls", version = "0.2" }
 toml = "1.0"
 tracing = { version = "0.1", default-features = false }
 url = "2.5"

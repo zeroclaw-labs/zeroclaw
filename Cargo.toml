@@ -191,10 +191,8 @@ tokio-socks = { version = "0.5", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 regex = "1.10"
 hostname = { version = "0.4.2", optional = true }
-rustls = { version = "0.23", optional = true }
-rustls-pemfile = { version = "2", optional = true }
-rustls-pki-types = { version = "1.14.0", optional = true }
-tokio-rustls = { version = "0.26.4", optional = true }
+native-tls = { version = "0.2", optional = true }
+tokio-native-tls = { version = "0.3", optional = true }
 webpki-roots = { version = "1.0.6", optional = true }
 
 # email
@@ -239,7 +237,7 @@ agent-runtime = [
     "dep:ring", "dep:lru", "dep:chrono-tz", "dep:cron", "dep:glob", "dep:which",
     "dep:ratatui", "dep:crossterm",
     "dep:tokio-tungstenite", "dep:tokio-socks", "dep:hostname",
-    "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots",
+    "dep:native-tls", "dep:tokio-native-tls",
     "dep:lettre", "dep:mail-parser", "dep:async-imap",
     "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tower-http", "dep:http-body-util",
     "dep:mime_guess",

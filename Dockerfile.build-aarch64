@@ -1,0 +1,51 @@
+# Dockerfile.build-aarch64 - 交叉编译 aarch64 版本的 QuantClaw
+# 使用方法:
+#   docker build -f Dockerfile.build-aarch64 -t quantclaw-builder:aarch64 .
+#   docker create --name extract-aarch64 quantclaw-builder:aarch64
+#   docker cp extract-aarch64:/app/quantclaw ./quantclaw-aarch64
+#   docker rm extract-aarch64
+
+# 使用多阶段构建
+FROM --platform=linux/amd64 rust:1.75-bookworm AS builder
+
+# 安装交叉编译工具链
+RUN dpkg --add-architecture arm64 && \
+    apt-get update && \
+    apt-get install -y \
+        gcc-aarch64-linux-gnu \
+        libc6-dev-arm64-cross \
+        pkg-config \
+        libssl-dev:arm64 && \
+    rm -rf /var/lib/apt/lists/*
+
+# 添加 aarch64 目标
+RUN rustup target add aarch64-unknown-linux-gnu
+
+# 设置交叉编译环境变量
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+ENV PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu
+
+WORKDIR /app
+
+# 复制项目文件
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY src/ src/
+COPY benches/ benches/
+COPY web/dist web/dist
+
+# 构建 release 版本
+ARG FEATURES="hardware,peripheral-rpi"
+RUN cargo build --target aarch64-unknown-linux-gnu --features "${FEATURES}" --release && \
+    cp target/aarch64-unknown-linux-gnu/release/quantclaw /app/quantclaw && \
+    aarch64-linux-gnu-strip /app/quantclaw
+
+# 验证文件
+RUN file /app/quantclaw && \
+    ls -lh /app/quantclaw
+
+# 最终阶段 - 只保留二进制文件
+FROM scratch AS export
+COPY --from=builder /app/quantclaw /quantclaw
