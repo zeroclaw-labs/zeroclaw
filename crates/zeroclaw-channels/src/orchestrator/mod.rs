@@ -578,6 +578,9 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on Matrix:\n\
              - Use Markdown formatting (bold, italic, code blocks)\n\
              - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<absolute-path>], [DOCUMENT:<absolute-path>], [VIDEO:<absolute-path>], [AUDIO:<absolute-path>], or [VOICE:<absolute-path>]\n\
+             - Paths inside markers MUST be absolute (starting with /). Never use relative paths.\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
              - When you receive a [Voice message], the user spoke to you. Respond naturally as in conversation.\n\
              - Your text reply will automatically be converted to audio and sent back as a voice message.\n",
         ),
@@ -1349,6 +1352,13 @@ fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
 
 fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
     if zeroclaw_memory::is_assistant_autosave_key(key) {
+        return true;
+    }
+
+    // Skip raw per-turn user messages: re-injecting them causes each
+    // recalled entry to embed all prior generations, growing exponentially.
+    // Consolidated knowledge is already promoted to Core/Daily entries.
+    if zeroclaw_memory::is_user_autosave_key(key) {
         return true;
     }
 
@@ -3052,6 +3062,9 @@ async fn process_channel_message(
                         ctx.max_tool_result_chars,
                         ctx.context_token_budget,
                         None, // shared_budget
+                        target_channel.as_deref(),
+                        None, // receipt_generator
+                        None, // collected_receipts
                     ),
                     ),
                     ),
@@ -3914,7 +3927,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
                 .with_tts(config.tts.clone())
-                .with_workspace_dir(config.workspace_dir.clone()),
+                .with_workspace_dir(config.workspace_dir.clone())
+                .with_approval_timeout_secs(tg.approval_timeout_secs),
             ))
         }
         "discord" => {
@@ -4343,7 +4357,8 @@ fn collect_configured_channels(
                     .with_transcription(config.transcription.clone())
                     .with_tts(config.tts.clone())
                     .with_workspace_dir(config.workspace_dir.clone())
-                    .with_proxy_url(tg.proxy_url.clone()),
+                    .with_proxy_url(tg.proxy_url.clone())
+                    .with_approval_timeout_secs(tg.approval_timeout_secs),
                 ),
             });
         } else {
@@ -5192,9 +5207,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
-    let tools_registry = Arc::new(built_tools);
-
     let skills = zeroclaw_runtime::skills::load_skills_with_config(&workspace, &config);
+
+    // Register skill-defined tools so the gateway can execute them (not just
+    // describe them in the prompt). Without this, skill tools like email.send
+    // appear in the system prompt but return "Unknown tool" when called.
+    zeroclaw_runtime::tools::register_skill_tools(&mut built_tools, &skills, security.clone());
+
+    let tools_registry = Arc::new(built_tools);
 
     // ── Load locale-aware tool descriptions ────────────────────────
     let i18n_locale = config
@@ -5871,6 +5891,22 @@ mod tests {
         assert!(!should_skip_memory_context_entry(
             "telegram_user_msg_201",
             "plain text without tool results"
+        ));
+
+        // Per-turn user auto-save keys must be skipped to prevent exponential
+        // context bloat from re-injected conversation history.
+        assert!(should_skip_memory_context_entry(
+            "user_msg",
+            "original user message text"
+        ));
+        assert!(should_skip_memory_context_entry(
+            "user_msg_a1b2c3d4e5f6",
+            "follow-up message embedding prior context"
+        ));
+        // Channel-scoped keys (e.g. telegram_*) must NOT be affected.
+        assert!(!should_skip_memory_context_entry(
+            "telegram_user_msg_101",
+            "Please describe the image"
         ));
     }
 
@@ -11511,6 +11547,7 @@ This is an example JSON object for profile settings."#;
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: 120,
         });
         match build_channel_by_id(&config, "telegram") {
             Ok(channel) => assert_eq!(channel.name(), "telegram"),

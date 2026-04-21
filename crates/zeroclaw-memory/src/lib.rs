@@ -1,4 +1,20 @@
 //! Memory subsystem: backends, embeddings, consolidation, retrieval.
+//!
+//! ## Reserved Key Prefixes
+//!
+//! The following key prefixes are reserved for the auto-save system. Any memory
+//! stored under these keys will be **excluded from context assembly** by all
+//! three context-building paths (`build_context`, `DefaultMemoryLoader`, and
+//! `should_skip_memory_context_entry`). Do not use these prefixes for semantic
+//! memories that should surface in agent context.
+//!
+//! | Prefix | Purpose | Detection function |
+//! |---|---|---|
+//! | `assistant_resp` / `assistant_resp_*` | Model-authored assistant summaries (untrusted context) | [`is_assistant_autosave_key`] |
+//! | `user_msg` / `user_msg_*` | Raw per-turn user messages (consolidation queue) | [`is_user_autosave_key`] |
+//!
+//! Channel-scoped variants (e.g. `telegram_user_msg_*`, `discord_*`) are
+//! **not** filtered — they use different prefixes and are handled separately.
 
 pub mod audit;
 pub mod backend;
@@ -97,6 +113,15 @@ pub fn effective_memory_backend_name(
 pub fn is_assistant_autosave_key(key: &str) -> bool {
     let normalized = key.trim().to_ascii_lowercase();
     normalized == "assistant_resp" || normalized.starts_with("assistant_resp_")
+}
+
+/// Auto-save key used for raw user messages captured per-turn.
+/// Re-injecting these into build_context causes exponential bloat: each recalled
+/// entry contains prior generations' context verbatim, growing unboundedly.
+/// Consolidated knowledge is already promoted to Core/Daily entries.
+pub fn is_user_autosave_key(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase();
+    normalized == "user_msg" || normalized.starts_with("user_msg_")
 }
 
 /// Filter known synthetic autosave noise patterns that should not be
@@ -429,6 +454,15 @@ mod tests {
         assert!(is_assistant_autosave_key("ASSISTANT_RESP_abcd"));
         assert!(!is_assistant_autosave_key("assistant_response"));
         assert!(!is_assistant_autosave_key("user_msg_1234"));
+    }
+
+    #[test]
+    fn user_autosave_key_detection_matches_per_turn_patterns() {
+        assert!(is_user_autosave_key("user_msg"));
+        assert!(is_user_autosave_key("user_msg_1234"));
+        assert!(is_user_autosave_key("USER_MSG_abcd"));
+        assert!(!is_user_autosave_key("user_message"));
+        assert!(!is_user_autosave_key("assistant_resp_1234"));
     }
 
     #[test]

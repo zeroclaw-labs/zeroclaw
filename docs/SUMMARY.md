@@ -88,6 +88,7 @@ Last refreshed: **February 18, 2026**.
 - [providers-reference.md](reference/api/providers-reference.md)
 - [channels-reference.md](reference/api/channels-reference.md)
 - [nextcloud-talk-setup.md](setup-guides/nextcloud-talk-setup.md)
+- [line-setup.md](setup-guides/line-setup.md)
 - [config-reference.md](reference/api/config-reference.md)
 - [custom-providers.md](contributing/custom-providers.md)
 - [zai-glm-setup.md](setup-guides/zai-glm-setup.md)
@@ -97,6 +98,7 @@ Last refreshed: **February 18, 2026**.
 
 - [ops/README.md](ops/README.md)
 - [operations-runbook.md](ops/operations-runbook.md)
+- [release-runbook.md](maintainers/release-runbook.md)
 - [release-process.md](contributing/release-process.md)
 - [troubleshooting.md](ops/troubleshooting.md)
 - [network-deployment.md](ops/network-deployment.md)

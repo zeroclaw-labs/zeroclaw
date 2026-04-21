@@ -219,6 +219,7 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: 120,
         };
 
         let discord = DiscordConfig {
