@@ -143,6 +143,11 @@ pub fn default_chat_mode_for(channel: &str) -> ChatMode {
 /// v1 contract: kakao/observer is wired. participant on every other channel
 /// is wired (current default behavior). Observer on non-kakao channels is
 /// declared-but-not-wired.
+//
+// The four match arms are intentionally kept explicit even though two pairs
+// share bodies — each arm documents one cell of the v1 capability matrix.
+// Collapsing would hide the matrix for a trivial deduplication win.
+#[allow(clippy::match_same_arms)]
 pub fn is_mode_wired_v1(channel: &str, mode: ChatMode) -> bool {
     match (channel, mode) {
         ("kakao", ChatMode::Observer) => true,

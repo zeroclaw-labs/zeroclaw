@@ -384,9 +384,10 @@ KakaoTalk Chats with Project Team\n\
 
     #[test]
     fn batch_caps_at_max_ingest_messages() {
+        use std::fmt::Write as _;
         let mut utt = String::new();
         for i in 0..(MAX_INGEST_MESSAGES + 50) {
-            utt.push_str(&format!("[u{i}] [13:24] msg{i}\n"));
+            writeln!(utt, "[u{i}] [13:24] msg{i}").expect("writeln to String cannot fail");
         }
         let parsed = parse_ingest(&utt);
         match parsed {
