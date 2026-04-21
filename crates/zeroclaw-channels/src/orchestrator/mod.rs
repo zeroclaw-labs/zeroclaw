@@ -361,6 +361,7 @@ struct ChannelRuntimeContext {
     model_routes: Arc<Vec<zeroclaw_config::schema::ModelRouteConfig>>,
     query_classification: zeroclaw_config::schema::QueryClassificationConfig,
     ack_reactions: bool,
+    precheck_reply_intent: bool,
     show_tool_calls: bool,
     session_store: Option<Arc<zeroclaw_infra::session_store::SessionStore>>,
     /// Non-interactive approval manager for channel-driven runs.
@@ -2806,15 +2807,22 @@ async fn process_channel_message(
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
-    let reply_intent = classify_channel_reply_intent(
-        active_provider.as_ref(),
-        history[0].content.as_str(),
-        &history,
-        route.model.as_str(),
-        runtime_defaults.temperature,
-    )
-    .await
-    .unwrap_or(AssistantChannelOutcome::Reply(String::new()));
+    // Runs a small classifier LLM call that decides whether this bot should
+    // reply. Useful for multi-bot group chats; pure overhead in single-bot
+    // DMs. Disable via `[channels] precheck_reply_intent = false`.
+    let reply_intent = if ctx.precheck_reply_intent {
+        classify_channel_reply_intent(
+            active_provider.as_ref(),
+            history[0].content.as_str(),
+            &history,
+            route.model.as_str(),
+            runtime_defaults.temperature,
+        )
+        .await
+        .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
+    } else {
+        AssistantChannelOutcome::Reply(String::new())
+    };
 
     if let AssistantChannelOutcome::NoReply { reason } = reply_intent {
         let history_response = AssistantChannelOutcome::NoReply {
@@ -5543,6 +5551,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model_routes: Arc::new(config.providers.model_routes.clone()),
         query_classification: config.query_classification.clone(),
         ack_reactions: config.channels.ack_reactions,
+        precheck_reply_intent: config.channels.precheck_reply_intent,
         show_tool_calls: config.channels.show_tool_calls,
         session_store: if config.channels.session_persistence {
             match zeroclaw_infra::session_store::SessionStore::new(&config.workspace_dir) {
@@ -6108,6 +6117,7 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -6234,6 +6244,7 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -6317,6 +6328,7 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -6417,6 +6429,7 @@ mod tests {
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: Some(Arc::clone(&store)),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7018,6 +7031,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7110,6 +7124,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7216,6 +7231,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7307,6 +7323,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7408,6 +7425,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7530,6 +7548,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7633,6 +7652,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7751,6 +7771,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7854,6 +7875,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -7950,6 +7972,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8172,6 +8195,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8286,6 +8310,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8410,6 +8435,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 matrix: false,
             },
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -8549,6 +8575,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8657,6 +8684,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8746,6 +8774,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -8835,6 +8864,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -9630,6 +9660,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -9776,6 +9807,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -9963,6 +9995,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -10081,6 +10114,7 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -10705,6 +10739,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -10803,6 +10838,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -10933,6 +10969,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -11111,6 +11148,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(model_routes),
             query_classification: classification_config,
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -11233,6 +11271,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(model_routes),
             query_classification: classification_config,
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -11347,6 +11386,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(model_routes),
             query_classification: classification_config,
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -11481,6 +11521,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(model_routes),
             query_classification: classification_config,
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -11797,6 +11838,7 @@ This is an example JSON object for profile settings."#;
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(

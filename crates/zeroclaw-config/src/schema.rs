@@ -6570,6 +6570,13 @@ pub struct ChannelsConfig {
     /// completion) to incoming channel messages. Default: `true`.
     #[serde(default = "default_true")]
     pub ack_reactions: bool,
+    /// Whether to run the reply-intent classifier LLM call before every
+    /// channel message. The classifier coordinates multi-bot group chats by
+    /// deciding whether this bot should answer a given message. For
+    /// single-bot DM deployments it is pure overhead (always returns REPLY)
+    /// and can be disabled to halve per-message latency. Default: `true`.
+    #[serde(default = "default_true")]
+    pub precheck_reply_intent: bool,
     /// Whether to send tool-call notification messages (e.g. `🔧 web_search_tool: …`)
     /// to channel users. When `false`, tool calls are still logged server-side but
     /// not forwarded as individual channel messages. Default: `false`.
@@ -6787,6 +6794,7 @@ impl Default for ChannelsConfig {
             mqtt: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: false,
             session_persistence: true,
             session_backend: default_session_backend(),
@@ -11734,6 +11742,7 @@ auto_save = true
                 mqtt: None,
                 message_timeout_secs: 300,
                 ack_reactions: true,
+                precheck_reply_intent: true,
                 show_tool_calls: true,
                 session_persistence: true,
                 session_backend: default_session_backend(),
@@ -12870,6 +12879,7 @@ allowed_rooms = ["!ops:matrix.org"]
             mqtt: None,
             message_timeout_secs: 300,
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_persistence: true,
             session_backend: default_session_backend(),
@@ -13244,6 +13254,7 @@ bot_token = "xoxb-tok"
             mqtt: None,
             message_timeout_secs: 300,
             ack_reactions: true,
+            precheck_reply_intent: true,
             show_tool_calls: true,
             session_persistence: true,
             session_backend: default_session_backend(),
