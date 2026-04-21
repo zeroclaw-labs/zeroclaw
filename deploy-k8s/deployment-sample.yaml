@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zeroclaw
+  namespace: zeroclaw
+  labels:
+    app.kubernetes.io/name: zeroclaw
+    app.kubernetes.io/part-of: zeroclaw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zeroclaw
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: zeroclaw
+        app.kubernetes.io/part-of: zeroclaw
+    spec:
+      containers:
+        - name: zeroclaw
+          # For production, pin to a version tag (e.g. ghcr.io/zeroclaw-labs/zeroclaw:v0.7.1)
+          image: ghcr.io/zeroclaw-labs/zeroclaw:latest
+          args: ["daemon"]
+          ports:
+            - name: gateway
+              containerPort: 42617
+              protocol: TCP
+          env:
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: zeroclaw-api-key
+                  key: api-key
+            - name: LANG
+              value: "C.UTF-8"
+            - name: HOME
+              value: "/zeroclaw-data"
+            - name: ZEROCLAW_WORKSPACE
+              value: "/zeroclaw-data/workspace"
+            - name: ZEROCLAW_GATEWAY_PORT
+              value: "42617"
+          volumeMounts:
+            - name: state
+              mountPath: /zeroclaw-data/.zeroclaw
+            - name: config
+              mountPath: /zeroclaw-data/.zeroclaw/config.toml
+              subPath: config.toml
+              readOnly: true
+            - name: workspace
+              mountPath: /zeroclaw-data/workspace
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "2"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: gateway
+            initialDelaySeconds: 10
+            periodSeconds: 60
+            timeoutSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: gateway
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: config
+          configMap:
+            name: zeroclaw-config
+        - name: state
+          emptyDir: {}
+        - name: workspace
+          emptyDir: {}

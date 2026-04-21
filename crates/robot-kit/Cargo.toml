@@ -33,7 +33,7 @@ serde_json = "1.0"
 toml = "1.0"
 
 # HTTP client (for Ollama vision)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
 
 # Base64 encoding (for image data)
 base64 = "0.22"

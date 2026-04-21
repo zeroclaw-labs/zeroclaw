@@ -3,7 +3,7 @@ name: Release Stable
 on:
   push:
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"   # stable tags only (no -beta suffix)
+      - "v[0-9]+.[0-9]+.[0-9]+" # stable tags only (no -beta suffix)
   workflow_dispatch:
     inputs:
       version:
@@ -31,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Validate semver and Cargo.toml match
@@ -73,6 +74,7 @@ jobs:
           fi
 
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${input_version}" >> "$GITHUB_OUTPUT"
 
   web:
     name: Build Web Dashboard
@@ -125,35 +127,41 @@ jobs:
             RANGE="${PREV_TAG}..HEAD"
           fi
 
-          # Extract features only — skip bug fixes for clean release notes
-          FEATURES=$(git log "$RANGE" --pretty=format:"%s" --no-merges \
-            | grep -iE '^feat(\(|:)' \
-            | sed 's/^feat(\([^)]*\)): /\1: /' \
-            | sed 's/^feat: //' \
-            | sed 's/ (#[0-9]*)$//' \
-            | sort -uf \
-            | while IFS= read -r line; do echo "- ${line}"; done || true)
+          # If a hand-written changelog exists, use it as the release body
+          # and skip the auto-generated notes entirely.
+          if [ -f "CHANGELOG-next.md" ]; then
+            echo "Using CHANGELOG-next.md as release notes"
+            BODY=$(cat CHANGELOG-next.md)
+          else
+            # Extract features only — skip bug fixes for clean release notes
+            FEATURES=$(git log "$RANGE" --pretty=format:"%s" --no-merges \
+              | grep -iE '^feat(\(|:)' \
+              | sed 's/^feat(\([^)]*\)): /\1: /' \
+              | sed 's/^feat: //' \
+              | sed 's/ (#[0-9]*)$//' \
+              | sort -uf \
+              | while IFS= read -r line; do echo "- ${line}"; done || true)
 
-          if [ -z "$FEATURES" ]; then
-            FEATURES="- Incremental improvements and polish"
-          fi
+            if [ -z "$FEATURES" ]; then
+              FEATURES="- Incremental improvements and polish"
+            fi
 
-          # Collect ALL unique contributors: git authors + Co-Authored-By
-          GIT_AUTHORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges | sort -uf || true)
-          CO_AUTHORS=$(git log "$RANGE" --pretty=format:"%b" --no-merges \
-            | grep -ioE 'Co-Authored-By: *[^<]+' \
-            | sed 's/Co-Authored-By: *//i' \
-            | sed 's/ *$//' \
-            | sort -uf || true)
+            # Collect ALL unique contributors: git authors + Co-Authored-By
+            GIT_AUTHORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges | sort -uf || true)
+            CO_AUTHORS=$(git log "$RANGE" --pretty=format:"%b" --no-merges \
+              | grep -ioE 'Co-Authored-By: *[^<]+' \
+              | sed 's/Co-Authored-By: *//i' \
+              | sed 's/ *$//' \
+              | sort -uf || true)
 
-          # Merge, deduplicate, and filter out bots
-          ALL_CONTRIBUTORS=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
-            | sort -uf \
-            | grep -v '^$' \
-            | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
-            | while IFS= read -r name; do echo "- ${name}"; done || true)
+            # Merge, deduplicate, and filter out bots
+            ALL_CONTRIBUTORS=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
+              | sort -uf \
+              | grep -v '^$' \
+              | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
+              | while IFS= read -r name; do echo "- ${name}"; done || true)
 
-          BODY=$(cat <<NOTES_EOF
+            BODY=$(cat <<NOTES_EOF
           ## What's New
 
           ${FEATURES}
@@ -165,7 +173,8 @@ jobs:
           ---
           *Full changelog: ${PREV_TAG}...v${INPUT_VERSION}*
           NOTES_EOF
-          )
+            )
+          fi
 
           {
             echo "body<<BODY_EOF"
@@ -270,7 +279,7 @@ jobs:
           # Use matrix-level feature override if set, otherwise use global RELEASE_CARGO_FEATURES
           FEATURES="${{ matrix.cargo_features || env.RELEASE_CARGO_FEATURES }}"
           if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
-            cargo build --release --locked --no-default-features --features "${FEATURES},channel-nostr,skill-creation" --target ${{ matrix.target }}
+            cargo build --release --locked --no-default-features --features "agent-runtime,schema-export,${FEATURES}" --target ${{ matrix.target }}
           else
             cargo build --release --locked --features "${FEATURES}" --target ${{ matrix.target }}
           fi
@@ -279,19 +288,26 @@ jobs:
         shell: bash
         run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
         env:
-          BINARY_SIZE_HARD_LIMIT: "52428800"  # 50MB — release builds include all optional features
+          BINARY_SIZE_HARD_LIMIT: "52428800" # 50MB — release builds include all optional features
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }}
+          mkdir -p staging/web
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
+          cp -r web/dist staging/web/dist
+          cd staging
+          tar czf ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} web/dist
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
+        shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }}
+          mkdir -p staging/web
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
+          cp -r web/dist staging/web/dist
+          cd staging
+          7z a ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} web/dist
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -360,11 +376,11 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: github-releases
-      url: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.validate.outputs.version }}
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ needs.validate.outputs.tag }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          token: ${{ secrets.RELEASE_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -421,86 +437,46 @@ jobs:
           NOTES: ${{ needs.release-notes.outputs.notes }}
         run: printf '%s\n' "$NOTES" > release-notes.md
 
-      - name: Create tag if manual dispatch
-        if: github.event_name == 'workflow_dispatch'
+      - name: Create tag and release
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.validate.outputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "zeroclaw $TAG"
-          git push origin "$TAG"
-
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-          TAG: ${{ needs.validate.outputs.tag }}
-        run: |
-          gh release create "$TAG" release-assets/* \
-            --repo "${{ github.repository }}" \
-            --title "$TAG" \
-            --notes-file release-notes.md \
-            --latest
-
-  crates-io:
-    name: Publish to crates.io
-    needs: [validate, publish]
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    environment:
-      name: crates-io
-      url: https://crates.io/crates/zeroclawlabs/${{ needs.validate.outputs.version }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.93.0
-
-      - uses: Swatinem/rust-cache@v2
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-
-      - name: Build web dashboard
-        run: cd web && npm ci && npm run build
-
-      - name: Clean web build artifacts
-        run: rm -rf web/node_modules web/src web/package.json web/package-lock.json web/tsconfig*.json web/vite.config.ts web/index.html
-
-      - name: Publish aardvark-sys to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          OUTPUT=$(cargo publish --locked --allow-dirty --no-verify -p aardvark-sys 2>&1) && exit 0
-          echo "$OUTPUT"
-          if echo "$OUTPUT" | grep -q 'already exists'; then
-            echo "::notice::aardvark-sys already on crates.io — skipping"
-            exit 0
+          # For manual dispatch, use --target to create tag + release atomically.
+          # For tag push, the tag already exists — just create the release.
+          # GITHUB_TOKEN with contents:write is sufficient for both paths.
+          # Note: workflow_dispatch requires github-actions[bot] to be on the
+          # tag protection allowlist if v* tags are protected.
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            gh release create "$TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --notes-file release-notes.md \
+              --target "$COMMIT_SHA" \
+              --latest
+          else
+            gh release create "$TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --notes-file release-notes.md \
+              --latest
           fi
-          exit 1
 
-      - name: Wait for aardvark-sys to index
-        run: sleep 15
-
-      - name: Publish to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          VERSION: ${{ inputs.version }}
+      - name: Remove CHANGELOG-next.md after stable release
+        shell: bash
         run: |
-          # Publish to crates.io; treat "already exists" as success
-          # (auto-publish workflow may have already published this version)
-          CRATE_NAME=$(sed -n 's/^name = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
-          OUTPUT=$(cargo publish --locked --allow-dirty --no-verify 2>&1) && exit 0
-          echo "$OUTPUT"
-          if echo "$OUTPUT" | grep -q 'already exists'; then
-            echo "::notice::${CRATE_NAME}@${VERSION} already on crates.io — skipping"
-            exit 0
+          if [ -f "CHANGELOG-next.md" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git rm CHANGELOG-next.md
+            git commit -m "chore: remove CHANGELOG-next.md after ${{ needs.validate.outputs.tag }} release"
+            git push origin HEAD:master
+            echo "CHANGELOG-next.md removed and committed."
+          else
+            echo "No CHANGELOG-next.md to clean up."
           fi
-          exit 1
 
   redeploy-website:
     name: Trigger Website Redeploy

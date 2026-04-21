@@ -33,6 +33,7 @@ Lệnh xuất schema:
 | `backend` | `none` | Backend quan sát: `none`, `noop`, `log`, `prometheus`, `otel`, `opentelemetry` hoặc `otlp` |
 | `otel_endpoint` | `http://localhost:4318` | Endpoint OTLP HTTP khi backend là `otel` |
 | `otel_service_name` | `zeroclaw` | Tên dịch vụ gửi đến OTLP collector |
+| `otel_headers` | _(không)_ | Header HTTP tùy chọn cho OTLP export (ví dụ: authorization). Chỉ định dưới dạng bảng TOML `[observability.otel_headers]`. Chỉnh sửa trực tiếp trong `config.toml` — không thể đặt qua `zeroclaw config set`. Giá trị được lưu dạng plaintext; bảo vệ `config.toml` bằng `chmod 600`. |
 
 Lưu ý:
 
@@ -46,6 +47,9 @@ Ví dụ:
 backend = "otel"
 otel_endpoint = "http://localhost:4318"
 otel_service_name = "zeroclaw"
+
+[observability.otel_headers]
+Authorization = "Bearer <your-token>"
 ```
 
 ## Ghi đè provider qua biến môi trường
@@ -461,6 +465,8 @@ Chế độ Cloud API (webhook Meta):
 | `verify_token` | Có | Token xác minh webhook |
 | `app_secret` | Tùy chọn | Bật xác minh chữ ký webhook (`X-Hub-Signature-256`) |
 | `allowed_numbers` | Khuyến nghị | Số điện thoại cho phép gửi đến (`[]` = từ chối tất cả, `"*"` = cho phép tất cả) |
+| `dm_mention_patterns` | Tùy chọn | Regex pattern cho DM mention gating (không phân biệt hoa thường). Khi không rỗng, chỉ DM khớp ít nhất một pattern mới được xử lý; đoạn khớp sẽ bị loại bỏ. Ví dụ: `["@?ZeroClaw"]` |
+| `group_mention_patterns` | Tùy chọn | Regex pattern cho group-chat mention gating (không phân biệt hoa thường). Khi không rỗng, chỉ tin nhắn nhóm khớp ít nhất một pattern mới được xử lý; đoạn khớp sẽ bị loại bỏ. Ví dụ: `["@?ZeroClaw"]` |
 
 Chế độ WhatsApp Web (client gốc):
 
@@ -470,6 +476,8 @@ Chế độ WhatsApp Web (client gốc):
 | `pair_phone` | Tùy chọn | Số điện thoại cho luồng pair-code (chỉ chữ số) |
 | `pair_code` | Tùy chọn | Mã pair tùy chỉnh (nếu không sẽ tự tạo) |
 | `allowed_numbers` | Khuyến nghị | Số điện thoại cho phép gửi đến (`[]` = từ chối tất cả, `"*"` = cho phép tất cả) |
+| `dm_mention_patterns` | Tùy chọn | Regex pattern cho DM mention gating (không phân biệt hoa thường). Khi không rỗng, chỉ DM khớp ít nhất một pattern mới được xử lý; đoạn khớp sẽ bị loại bỏ. Ví dụ: `["@?ZeroClaw"]` |
+| `group_mention_patterns` | Tùy chọn | Regex pattern cho group-chat mention gating (không phân biệt hoa thường). Khi không rỗng, chỉ tin nhắn nhóm khớp ít nhất một pattern mới được xử lý; đoạn khớp sẽ bị loại bỏ. Ví dụ: `["@?ZeroClaw"]` |
 
 Lưu ý:
 
