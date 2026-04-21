@@ -978,10 +978,8 @@ async fn main() -> Result<()> {
     let subscriber = fmt::Subscriber::builder()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| {
-                    EnvFilter::new(default_log_level)
-                }))
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_level)),
+        )
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");

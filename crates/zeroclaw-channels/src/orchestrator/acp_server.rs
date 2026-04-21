@@ -224,7 +224,8 @@ impl AcpServer {
     // ── Method handlers ──────────────────────────────────────────
 
     fn handle_initialize(&self, _params: &Value) -> RpcResult {
-        let default_model = self.config
+        let default_model = self
+            .config
             .providers
             .fallback_provider()
             .and_then(|e| e.model.clone())
@@ -514,11 +515,7 @@ impl AcpServer {
 
         let event_type = params
             .get("type")
-            .or_else(|| {
-                params
-                    .get("update")
-                    .and_then(|u| u.get("sessionUpdate"))
-            })
+            .or_else(|| params.get("update").and_then(|u| u.get("sessionUpdate")))
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
