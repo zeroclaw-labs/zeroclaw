@@ -695,13 +695,33 @@ fn sanitize_memory_entries_for_api(
     entries
         .into_iter()
         .map(|mut entry| {
-            entry.content = zeroclaw_runtime::util::truncate_with_ellipsis(
-                &entry.content,
-                MEMORY_API_CONTENT_MAX_CHARS,
-            );
+            entry.content =
+                truncate_with_ellipsis_total_chars(&entry.content, MEMORY_API_CONTENT_MAX_CHARS);
             entry
         })
         .collect()
+}
+
+fn truncate_with_ellipsis_total_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+
+    match max_chars {
+        0 => String::new(),
+        1 => ".".to_string(),
+        2 => "..".to_string(),
+        3 => "...".to_string(),
+        _ => {
+            let keep_chars = max_chars - 3;
+            let cut_idx = s
+                .char_indices()
+                .nth(keep_chars)
+                .map(|(idx, _)| idx)
+                .unwrap_or(s.len());
+            format!("{}...", &s[..cut_idx])
+        }
+    }
 }
 
 /// POST /api/memory — store a memory entry
@@ -2460,7 +2480,7 @@ mod tests {
             .as_str()
             .expect("string content");
 
-        assert_eq!(content.chars().count(), MEMORY_API_CONTENT_MAX_CHARS + 3);
+        assert_eq!(content.chars().count(), MEMORY_API_CONTENT_MAX_CHARS);
         assert!(content.ends_with("..."));
         assert_eq!(json["entries"][0]["key"], "huge-memory");
         assert_eq!(json["entries"][0]["category"], "conversation");
