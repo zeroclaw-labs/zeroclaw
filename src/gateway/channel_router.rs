@@ -14,6 +14,10 @@ use uuid::Uuid;
 
 use super::remote::{DeviceRouter, RoutedMessage, REMOTE_RESPONSE_CHANNELS};
 use crate::auth::store::{AuthStore, ChannelLink};
+use crate::channels::case_session::{ActiveCase, CaseSessionStore};
+use crate::channels::chat_mode::{
+    default_chat_mode_for, is_mode_wired_v1, ChatMode, ChatModeStore,
+};
 
 // ── Structured Reply ────────────────────────────────────────────────
 
@@ -105,6 +109,8 @@ pub const CB_UNLINK: &str = "moa:unlink";
 pub const CB_HELP: &str = "moa:help";
 pub const CB_DEVICE_LIST: &str = "moa:devlist";
 pub const CB_SETTINGS: &str = "moa:settings";
+pub const CB_CHATMODE_OBSERVER: &str = "moa:chatmode:observer";
+pub const CB_CHATMODE_PARTICIPANT: &str = "moa:chatmode:participant";
 
 // ── Route Result ────────────────────────────────────────────────────
 
@@ -260,6 +266,8 @@ pub async fn route_channel_message(
 pub fn handle_channel_command(
     auth_store: &AuthStore,
     device_router: &DeviceRouter,
+    chat_modes: &ChatModeStore,
+    case_sessions: &CaseSessionStore,
     channel: &str,
     platform_uid: &str,
     message: &str,
@@ -269,6 +277,16 @@ pub fn handle_channel_command(
     // ── Settings menu ──
     if trimmed == CB_SETTINGS || trimmed == "/설정" || trimmed.eq_ignore_ascii_case("/settings") {
         return Some(settings_menu(auth_store, channel, platform_uid));
+    }
+
+    // ── Chat mode (observer / participant) ──
+    if let Some(reply) = try_handle_mode_command(chat_modes, channel, platform_uid, trimmed) {
+        return Some(reply);
+    }
+
+    // ── Sticky case session (/case start | end | current | list) ──
+    if let Some(reply) = try_handle_case_command(case_sessions, channel, platform_uid, trimmed) {
+        return Some(reply);
     }
 
     // ── Device list ──
@@ -477,6 +495,306 @@ fn select_device(
     )
 }
 
+// ── Chat-mode command (/mode observer | participant | current) ─────
+
+/// Recognised forms (any whitespace allowed):
+/// - `/mode`, `/mode current` — show the active mode + supported set
+/// - `/mode observer` / `/mode participant` (also Korean: `/모드 옵저버`, `/모드 참가자`)
+/// - Postback callbacks `moa:chatmode:observer` / `moa:chatmode:participant`
+fn try_handle_mode_command(
+    chat_modes: &ChatModeStore,
+    channel: &str,
+    platform_uid: &str,
+    trimmed: &str,
+) -> Option<ChannelReply> {
+    if trimmed == CB_CHATMODE_OBSERVER {
+        return Some(apply_mode_change(
+            chat_modes,
+            channel,
+            platform_uid,
+            ChatMode::Observer,
+        ));
+    }
+    if trimmed == CB_CHATMODE_PARTICIPANT {
+        return Some(apply_mode_change(
+            chat_modes,
+            channel,
+            platform_uid,
+            ChatMode::Participant,
+        ));
+    }
+
+    let lower = trimmed.to_lowercase();
+    let stripped = lower
+        .strip_prefix("/mode")
+        .or_else(|| lower.strip_prefix("/모드"))?;
+
+    let arg = stripped.trim();
+    if arg.is_empty() || arg == "current" || arg == "현재" {
+        return Some(mode_status_reply(chat_modes, channel, platform_uid));
+    }
+
+    match ChatMode::parse_user_input(arg) {
+        Some(mode) => Some(apply_mode_change(chat_modes, channel, platform_uid, mode)),
+        None => Some(ChannelReply::text(
+            "사용법:\n  /mode current — 현재 모드 보기\n  /mode observer — 옵저버 모드\n  /mode participant — 참가자 모드",
+        )),
+    }
+}
+
+fn apply_mode_change(
+    chat_modes: &ChatModeStore,
+    channel: &str,
+    platform_uid: &str,
+    requested: ChatMode,
+) -> ChannelReply {
+    let supported = supported_modes_for(channel);
+    if !supported.contains(&requested) {
+        return ChannelReply::text(format!(
+            "{ch_label}에서는 {req_label}로 전환할 수 없습니다.\n\n지원 모드: {supported_label}",
+            ch_label = channel_display_label(channel),
+            req_label = requested.display_label_ko(),
+            supported_label = supported_modes_display(&supported),
+        ));
+    }
+
+    if !is_mode_wired_v1(channel, requested) {
+        return ChannelReply::text(format!(
+            "{req_label}는 {ch_label}에서 곧 지원될 예정입니다.\n현재는 {default_label}로 동작합니다.",
+            req_label = requested.display_label_ko(),
+            ch_label = channel_display_label(channel),
+            default_label = default_chat_mode_for(channel).display_label_ko(),
+        ));
+    }
+
+    chat_modes.set(channel, platform_uid, requested);
+    ChannelReply::with_buttons(
+        format!(
+            "{}로 전환되었습니다.\n\n{}",
+            requested.display_label_ko(),
+            mode_description_ko(requested),
+        ),
+        vec![postback("⚙️ 설정", CB_SETTINGS)],
+    )
+}
+
+fn mode_status_reply(
+    chat_modes: &ChatModeStore,
+    channel: &str,
+    platform_uid: &str,
+) -> ChannelReply {
+    let active = chat_modes.effective(channel, platform_uid);
+    let supported = supported_modes_for(channel);
+    let mut buttons = Vec::new();
+    if supported.contains(&ChatMode::Observer) && active != ChatMode::Observer {
+        buttons.push(postback("👁 옵저버 모드로 전환", CB_CHATMODE_OBSERVER));
+    }
+    if supported.contains(&ChatMode::Participant) && active != ChatMode::Participant {
+        buttons.push(postback("👥 참가자 모드로 전환", CB_CHATMODE_PARTICIPANT));
+    }
+    buttons.push(postback("⚙️ 설정", CB_SETTINGS));
+
+    let text = format!(
+        "현재 모드: {active}\n지원 모드: {supported}\n\n{desc}",
+        active = active.display_label_ko(),
+        supported = supported_modes_display(&supported),
+        desc = mode_description_ko(active),
+    );
+    ChannelReply::with_buttons(text, buttons)
+}
+
+fn mode_description_ko(mode: ChatMode) -> &'static str {
+    match mode {
+        ChatMode::Observer => "단톡방에는 직접 참여하지 않습니다.\n• 사용자가 단톡방 메시지를 모아 1:1로 공유하면 모아가 읽고 답합니다.\n• 답변에는 단톡방으로 1탭에 보낼 수 있는 버튼이 첨부됩니다.",
+        ChatMode::Participant => "MoA가 그룹 채팅의 정식 멤버로 참여합니다.\n• 그룹 메시지를 직접 읽고 직접 답글을 보냅니다.",
+    }
+}
+
+fn supported_modes_for(channel: &str) -> Vec<ChatMode> {
+    // KakaoTalk: observer-only by platform constraint.
+    // Other channels: declare both for the unified UX, even when only
+    // participant mode is wired in v1 (see is_mode_wired_v1).
+    if channel == "kakao" {
+        vec![ChatMode::Observer]
+    } else {
+        vec![ChatMode::Participant, ChatMode::Observer]
+    }
+}
+
+fn supported_modes_display(modes: &[ChatMode]) -> String {
+    modes
+        .iter()
+        .map(|m| m.display_label_ko())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn channel_display_label(channel: &str) -> String {
+    match channel {
+        "kakao" => "카카오톡".to_string(),
+        "telegram" => "Telegram".to_string(),
+        "discord" => "Discord".to_string(),
+        "slack" => "Slack".to_string(),
+        "whatsapp" => "WhatsApp".to_string(),
+        "matrix" => "Matrix".to_string(),
+        "mattermost" => "Mattermost".to_string(),
+        "line" => "LINE".to_string(),
+        "imessage" => "iMessage".to_string(),
+        other => other.to_string(),
+    }
+}
+
+// ── Case session command (/case start | end | current | list) ──────
+
+/// Recognised forms (accepts `/case` and Korean `/사건`):
+/// - `/case`, `/case current`, `/case 현재` — show active case
+/// - `/case start <label>` (or `/사건 시작 <라벨>`) — pin a new case
+/// - `/case end` (or `/사건 종료`) — clear the active case
+/// - `/case list` (or `/사건 목록`) — list this user's active cases
+///   across all channels
+fn try_handle_case_command(
+    case_sessions: &CaseSessionStore,
+    channel: &str,
+    platform_uid: &str,
+    trimmed: &str,
+) -> Option<ChannelReply> {
+    let lower = trimmed.to_lowercase();
+    let stripped = lower
+        .strip_prefix("/case")
+        .or_else(|| lower.strip_prefix("/사건"))?;
+    // Accept only when the prefix is followed by whitespace, punctuation,
+    // or end-of-string — otherwise `/cases` or `/case_manager` would
+    // misfire. Original casing is preserved for label extraction below.
+    match stripped.chars().next() {
+        None => {}
+        Some(c) if c.is_whitespace() => {}
+        _ => return None,
+    }
+
+    // Recover the original-case argument by splitting on whitespace in
+    // the original trimmed input. `/case start foo` → args = "start foo".
+    let args_original = match trimmed.find(char::is_whitespace) {
+        Some(idx) => trimmed[idx..].trim(),
+        None => "",
+    };
+
+    if args_original.is_empty() {
+        return Some(case_status_reply(case_sessions, channel, platform_uid));
+    }
+
+    let (subcmd, rest) = match args_original.find(char::is_whitespace) {
+        Some(i) => (&args_original[..i], args_original[i..].trim()),
+        None => (args_original, ""),
+    };
+    let subcmd_lower = subcmd.to_lowercase();
+
+    match subcmd_lower.as_str() {
+        "start" | "시작" | "new" | "신규" => {
+            Some(handle_case_start(case_sessions, channel, platform_uid, rest))
+        }
+        "end" | "종료" | "stop" | "clear" | "close" => {
+            Some(handle_case_end(case_sessions, channel, platform_uid))
+        }
+        "current" | "현재" | "status" => {
+            Some(case_status_reply(case_sessions, channel, platform_uid))
+        }
+        "list" | "목록" => Some(handle_case_list(case_sessions, platform_uid)),
+        _ => Some(ChannelReply::text(
+            "사용법:\n  /case start <사건명> — 사건 시작\n  /case end — 사건 종료\n  /case current — 현재 사건 보기\n  /case list — 내 사건 목록",
+        )),
+    }
+}
+
+fn handle_case_start(
+    case_sessions: &CaseSessionStore,
+    channel: &str,
+    platform_uid: &str,
+    label: &str,
+) -> ChannelReply {
+    if label.trim().is_empty() {
+        return ChannelReply::text("사건명을 함께 입력해주세요.\n예: /case start 김OO_2024가합123");
+    }
+    match case_sessions.start(channel, platform_uid, label) {
+        Ok(active) => ChannelReply::with_buttons(
+            format!(
+                "📁 사건 '{label}'을(를) 시작했습니다.\n\n이후 이 채팅창에서 공유하는 메시지와 질문은 이 사건의 메모리에 누적됩니다.\n종료하려면 /case end 를 보내주세요.",
+                label = active.label,
+            ),
+            vec![
+                postback("📌 현재 사건 보기", "/case current"),
+                postback("⚙️ 설정", CB_SETTINGS),
+            ],
+        ),
+        Err(e) => ChannelReply::text(format!(
+            "사건을 시작할 수 없습니다: {e}\n\n영문/숫자/한글 문자가 포함된 사건명을 입력해주세요."
+        )),
+    }
+}
+
+fn handle_case_end(
+    case_sessions: &CaseSessionStore,
+    channel: &str,
+    platform_uid: &str,
+) -> ChannelReply {
+    match case_sessions.end(channel, platform_uid) {
+        Some(active) => ChannelReply::with_buttons(
+            format!(
+                "✅ 사건 '{}'을(를) 종료했습니다.\n누적된 메모리는 그대로 보존됩니다.",
+                active.label
+            ),
+            vec![postback("⚙️ 설정", CB_SETTINGS)],
+        ),
+        None => ChannelReply::text("현재 활성화된 사건이 없습니다."),
+    }
+}
+
+fn case_status_reply(
+    case_sessions: &CaseSessionStore,
+    channel: &str,
+    platform_uid: &str,
+) -> ChannelReply {
+    match case_sessions.current(channel, platform_uid) {
+        Some(active) => ChannelReply::with_buttons(
+            format_case_status(&active),
+            vec![
+                postback("🛑 사건 종료", "/case end"),
+                postback("📋 사건 목록", "/case list"),
+                postback("⚙️ 설정", CB_SETTINGS),
+            ],
+        ),
+        None => ChannelReply::with_buttons(
+            "현재 활성 사건이 없습니다.\n\n사건을 시작하려면:\n  /case start <사건명>".to_string(),
+            vec![postback("⚙️ 설정", CB_SETTINGS)],
+        ),
+    }
+}
+
+fn handle_case_list(case_sessions: &CaseSessionStore, platform_uid: &str) -> ChannelReply {
+    let entries = case_sessions.list_for_user(platform_uid);
+    if entries.is_empty() {
+        return ChannelReply::text("활성화된 사건이 없습니다.");
+    }
+    let mut text = String::from("📋 내 활성 사건\n");
+    for (channel, active) in entries {
+        text.push_str(&format!(
+            "\n• [{channel}] {label} (시작: {ts})",
+            channel = channel,
+            label = active.label,
+            ts = active.started_at,
+        ));
+    }
+    ChannelReply::with_buttons(text, vec![postback("⚙️ 설정", CB_SETTINGS)])
+}
+
+fn format_case_status(active: &ActiveCase) -> String {
+    format!(
+        "📁 현재 사건: {label}\n사건 ID: {case_id}\n시작 시각(Unix): {ts}",
+        label = active.label,
+        case_id = active.case_id,
+        ts = active.started_at,
+    )
+}
+
 // ── Onboarding Messages ─────────────────────────────────────────────
 
 /// Generate the onboarding auth URL.
@@ -538,4 +856,209 @@ pub fn device_offline_reply(device_name: Option<&str>) -> ChannelReply {
             postback("⚙️ 설정", CB_SETTINGS),
         ],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_command_without_args_shows_status() {
+        let store = ChatModeStore::new();
+        let reply = try_handle_mode_command(&store, "kakao", "u_1", "/mode").unwrap();
+        assert!(reply.text.contains("옵저버 모드"), "text: {}", reply.text);
+        assert!(reply.text.contains("현재 모드"));
+    }
+
+    #[test]
+    fn mode_command_status_alias_korean() {
+        let store = ChatModeStore::new();
+        let reply = try_handle_mode_command(&store, "telegram", "u_1", "/모드 현재").unwrap();
+        assert!(reply.text.contains("참가자 모드"));
+    }
+
+    #[test]
+    fn mode_command_kakao_observer_succeeds() {
+        let store = ChatModeStore::new();
+        let reply = try_handle_mode_command(&store, "kakao", "u_1", "/mode observer").unwrap();
+        assert!(reply.text.contains("옵저버 모드로 전환"));
+        assert_eq!(store.current("kakao", "u_1"), Some(ChatMode::Observer));
+    }
+
+    #[test]
+    fn mode_command_kakao_participant_rejected_unsupported() {
+        let store = ChatModeStore::new();
+        let reply = try_handle_mode_command(&store, "kakao", "u_1", "/mode participant").unwrap();
+        assert!(
+            reply.text.contains("전환할 수 없습니다"),
+            "text: {}",
+            reply.text
+        );
+        assert_eq!(store.current("kakao", "u_1"), None);
+    }
+
+    #[test]
+    fn mode_command_telegram_observer_declared_but_not_wired() {
+        let store = ChatModeStore::new();
+        let reply = try_handle_mode_command(&store, "telegram", "u_1", "/mode observer").unwrap();
+        assert!(
+            reply.text.contains("곧 지원될 예정"),
+            "text: {}",
+            reply.text
+        );
+        assert_eq!(store.current("telegram", "u_1"), None);
+    }
+
+    #[test]
+    fn mode_command_telegram_participant_succeeds() {
+        let store = ChatModeStore::new();
+        let reply =
+            try_handle_mode_command(&store, "telegram", "u_1", "/mode participant").unwrap();
+        assert!(reply.text.contains("참가자 모드로 전환"));
+        assert_eq!(
+            store.current("telegram", "u_1"),
+            Some(ChatMode::Participant)
+        );
+    }
+
+    #[test]
+    fn mode_command_unknown_arg_shows_usage() {
+        let store = ChatModeStore::new();
+        let reply = try_handle_mode_command(&store, "kakao", "u_1", "/mode bogus").unwrap();
+        assert!(reply.text.contains("사용법"), "text: {}", reply.text);
+    }
+
+    #[test]
+    fn mode_command_callback_observer() {
+        let store = ChatModeStore::new();
+        let reply = try_handle_mode_command(&store, "kakao", "u_1", CB_CHATMODE_OBSERVER).unwrap();
+        assert_eq!(store.current("kakao", "u_1"), Some(ChatMode::Observer));
+        assert!(reply.text.contains("옵저버 모드로 전환"));
+    }
+
+    #[test]
+    fn mode_command_does_not_match_other_text() {
+        let store = ChatModeStore::new();
+        assert!(try_handle_mode_command(&store, "kakao", "u_1", "/help").is_none());
+        assert!(try_handle_mode_command(&store, "kakao", "u_1", "안녕하세요").is_none());
+    }
+
+    #[test]
+    fn supported_modes_for_returns_kakao_observer_only() {
+        assert_eq!(supported_modes_for("kakao"), vec![ChatMode::Observer]);
+        assert_eq!(
+            supported_modes_for("telegram"),
+            vec![ChatMode::Participant, ChatMode::Observer]
+        );
+    }
+
+    #[test]
+    fn channel_display_label_known_and_unknown() {
+        assert_eq!(channel_display_label("kakao"), "카카오톡");
+        assert_eq!(channel_display_label("imessage"), "iMessage");
+        assert_eq!(channel_display_label("custom"), "custom");
+    }
+
+    // ── /case command tests ──
+
+    #[test]
+    fn case_command_start_success() {
+        let store = CaseSessionStore::new();
+        let reply = try_handle_case_command(&store, "kakao", "u_1", "/case start 김OO_2024가합123")
+            .unwrap();
+        assert!(reply.text.contains("시작했습니다"), "text: {}", reply.text);
+        assert!(reply.text.contains("김OO_2024가합123"));
+        assert_eq!(
+            store.current("kakao", "u_1").unwrap().label,
+            "김OO_2024가합123"
+        );
+    }
+
+    #[test]
+    fn case_command_start_korean_alias() {
+        let store = CaseSessionStore::new();
+        let reply = try_handle_case_command(&store, "kakao", "u_1", "/사건 시작 사건A").unwrap();
+        assert!(reply.text.contains("시작했습니다"));
+        assert_eq!(store.current("kakao", "u_1").unwrap().label, "사건A");
+    }
+
+    #[test]
+    fn case_command_start_without_label_shows_usage() {
+        let store = CaseSessionStore::new();
+        let reply = try_handle_case_command(&store, "kakao", "u_1", "/case start").unwrap();
+        assert!(reply.text.contains("사건명"), "text: {}", reply.text);
+        assert!(store.current("kakao", "u_1").is_none());
+    }
+
+    #[test]
+    fn case_command_end_clears_active() {
+        let store = CaseSessionStore::new();
+        store.start("kakao", "u_1", "사건A").unwrap();
+        let reply = try_handle_case_command(&store, "kakao", "u_1", "/case end").unwrap();
+        assert!(reply.text.contains("종료했습니다"));
+        assert!(store.current("kakao", "u_1").is_none());
+    }
+
+    #[test]
+    fn case_command_end_without_active_returns_friendly() {
+        let store = CaseSessionStore::new();
+        let reply = try_handle_case_command(&store, "kakao", "u_1", "/case end").unwrap();
+        assert!(reply.text.contains("활성화된 사건이 없습니다"));
+    }
+
+    #[test]
+    fn case_command_current_with_active() {
+        let store = CaseSessionStore::new();
+        store.start("kakao", "u_1", "사건A").unwrap();
+        let reply = try_handle_case_command(&store, "kakao", "u_1", "/case current").unwrap();
+        assert!(reply.text.contains("현재 사건"));
+        assert!(reply.text.contains("사건A"));
+    }
+
+    #[test]
+    fn case_command_current_without_active_offers_start_hint() {
+        let store = CaseSessionStore::new();
+        let reply = try_handle_case_command(&store, "kakao", "u_1", "/case").unwrap();
+        assert!(reply.text.contains("활성 사건이 없습니다"));
+        assert!(reply.text.contains("/case start"));
+    }
+
+    #[test]
+    fn case_command_list_across_channels() {
+        let store = CaseSessionStore::new();
+        store.start("kakao", "u_1", "사건A").unwrap();
+        store.start("telegram", "u_1", "사건B").unwrap();
+        let reply = try_handle_case_command(&store, "kakao", "u_1", "/case list").unwrap();
+        assert!(reply.text.contains("사건A"));
+        assert!(reply.text.contains("사건B"));
+        assert!(reply.text.contains("[kakao]"));
+        assert!(reply.text.contains("[telegram]"));
+    }
+
+    #[test]
+    fn case_command_unknown_subcommand_shows_usage() {
+        let store = CaseSessionStore::new();
+        let reply = try_handle_case_command(&store, "kakao", "u_1", "/case bogus").unwrap();
+        assert!(reply.text.contains("사용법"));
+    }
+
+    #[test]
+    fn case_command_does_not_match_other_text() {
+        let store = CaseSessionStore::new();
+        assert!(try_handle_case_command(&store, "kakao", "u_1", "/help").is_none());
+        assert!(try_handle_case_command(&store, "kakao", "u_1", "안녕하세요").is_none());
+        assert!(try_handle_case_command(&store, "kakao", "u_1", "/cases").is_none());
+        assert!(try_handle_case_command(&store, "kakao", "u_1", "/case_extra").is_none());
+    }
+
+    #[test]
+    fn case_command_preserves_label_case_sensitivity() {
+        let store = CaseSessionStore::new();
+        // "Case" subcommand may be lowercase, but the label "MyCase" must
+        // keep its original casing.
+        let reply =
+            try_handle_case_command(&store, "kakao", "u_1", "/case START MyCaseLabel").unwrap();
+        assert!(reply.text.contains("MyCaseLabel"), "text: {}", reply.text);
+        assert_eq!(store.current("kakao", "u_1").unwrap().label, "MyCaseLabel");
+    }
 }

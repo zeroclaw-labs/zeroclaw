@@ -182,6 +182,16 @@ Provider connectivity matrix CI/local helper:
 
 Runtime in-chat commands while channel server is running:
 
+- Channel mode (observer / participant):
+  - `/mode` or `/mode current` — show active mode
+  - `/mode observer` / `/mode participant` (Korean: `/모드 옵저버`, `/모드 참가자`)
+  - KakaoTalk supports observer-only; other channels default participant
+  - See `docs/channels-reference.md#2a-chat-modes-observer--participant`
+- Sticky case sessions:
+  - `/case start <라벨>` — pin the active case (also `/사건 시작 <라벨>`)
+  - `/case end` — end the active case (also `/사건 종료`)
+  - `/case current` — show active case (also `/사건 현재`)
+  - `/case list` — list this user's cases across channels
 - Telegram/Discord sender-session routing:
   - `/models`
   - `/models <provider>`

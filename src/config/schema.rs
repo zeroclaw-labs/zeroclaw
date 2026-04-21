@@ -7767,6 +7767,15 @@ pub struct KakaoTalkConfig {
     /// HTTP port for the webhook receiver server (default: 8787)
     #[serde(default = "default_kakao_port")]
     pub port: u16,
+    /// Kakao JavaScript SDK app key for the one-tap share-back button.
+    ///
+    /// When set, AI replies sent through the Kakao gateway include a
+    /// `📤 단톡방으로 보내기` quick-reply that opens the native KakaoTalk
+    /// share picker (via Kakao JS SDK `Kakao.Share.sendDefault`). When
+    /// `None`, the share button is omitted (graceful degradation — the
+    /// rest of the channel keeps working).
+    #[serde(default)]
+    pub javascript_app_key: Option<String>,
 }
 
 fn default_kakao_port() -> u16 {
@@ -10194,6 +10203,7 @@ impl Config {
                     webhook_secret: None,
                     allowed_users: vec![],
                     port: default_kakao_port(),
+                    javascript_app_key: None,
                 });
             kk.rest_api_key = key;
         }
@@ -10216,6 +10226,7 @@ impl Config {
                     webhook_secret: None,
                     allowed_users: vec![],
                     port: default_kakao_port(),
+                    javascript_app_key: None,
                 });
             kk.admin_key = key;
         }

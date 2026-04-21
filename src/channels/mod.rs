@@ -18,6 +18,8 @@ pub(crate) mod ack_reaction;
 pub mod acp;
 pub mod bluebubbles;
 pub mod bridge;
+pub mod case_session;
+pub mod chat_mode;
 pub mod clawdtalk;
 pub mod cli;
 pub mod dingtalk;
@@ -27,6 +29,8 @@ pub mod github;
 pub mod imessage;
 pub mod irc;
 pub mod kakao;
+pub mod kakao_ingest;
+pub mod kakao_share_store;
 #[cfg(feature = "channel-lark")]
 pub mod lark;
 pub mod line;

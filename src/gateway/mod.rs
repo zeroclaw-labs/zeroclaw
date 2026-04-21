@@ -11,6 +11,7 @@ pub mod admin_api;
 pub mod api;
 pub mod auth_api;
 pub mod channel_router;
+pub mod kakao_share;
 pub mod llm_proxy;
 pub mod local_llm_api;
 mod openai_compat;
@@ -385,6 +386,19 @@ pub struct AppState {
     pub auth_store: Option<Arc<crate::auth::store::AuthStore>>,
     /// Channel pairing store for one-click messaging channel auth.
     pub channel_pairing: Option<Arc<crate::channels::pairing::ChannelPairingStore>>,
+    /// Active chat mode (observer/participant) per (channel, platform_uid).
+    /// In-memory; defaults apply when the user has not issued `/mode`.
+    pub chat_modes: Arc<crate::channels::chat_mode::ChatModeStore>,
+    /// Active sticky case session per (channel, platform_uid). When set,
+    /// inbound utterances are scoped to a per-case `session_id` so that
+    /// memory recall can answer "어제 의뢰인이 뭐라 했지?" questions
+    /// without bleeding across cases.
+    pub case_sessions: Arc<crate::channels::case_session::CaseSessionStore>,
+    /// Single-use, short-lived tokens that back the
+    /// `📤 단톡방으로 보내기` quick-reply button on KakaoTalk replies.
+    /// `None` when the deployment has no SQLite workspace (degrades
+    /// the share button to a no-op).
+    pub kakao_share_store: Option<Arc<crate::channels::kakao_share_store::KakaoShareStore>>,
     /// Whether new user registration is allowed.
     pub auth_allow_registration: bool,
     /// Device router for cross-device remote access via web chat.
@@ -653,12 +667,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         let ollama: Arc<dyn crate::providers::Provider> = Arc::new(
             crate::providers::ollama::OllamaProvider::new(Some(&base), None),
         );
-        let executor = crate::advisor::SlmExecutor::new(
-            ollama,
-            config.gatekeeper.model.clone(),
-            0.3,
-            8,
-        );
+        let executor =
+            crate::advisor::SlmExecutor::new(ollama, config.gatekeeper.model.clone(), 0.3, 8);
         tracing::info!(
             model = executor.model(),
             url = base.as_str(),
@@ -1224,6 +1234,22 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             (None, None, false, None, None)
         };
 
+    // Kakao share-back token store. File-backed when a workspace dir is
+    // present; falls back to None on open error so the deployment keeps
+    // working without share-back support.
+    let kakao_share_store = {
+        let path = std::path::Path::new(&config.workspace_dir).join("kakao_share.db");
+        match crate::channels::kakao_share_store::KakaoShareStore::open(&path) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to open kakao_share.db ({e}); 단톡방 공유 버튼이 비활성화됩니다."
+                );
+                None
+            }
+        }
+    };
+
     let state = AppState {
         config: config_state,
         provider,
@@ -1261,6 +1287,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         payment_manager,
         auth_store,
         channel_pairing,
+        chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+        case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+        kakao_share_store,
         auth_allow_registration,
         device_router,
         email_verify_service,
@@ -1484,10 +1513,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             post(auth_api::handle_auth_set_password),
         )
         .route("/api/user/profile", get(auth_api::handle_user_profile))
-        .route(
-            "/api/user/channels",
-            get(auth_api::handle_user_channels),
-        )
+        .route("/api/user/channels", get(auth_api::handle_user_channels))
         .route("/api/auth/devices", get(auth_api::handle_auth_devices_list))
         .route(
             "/api/auth/devices",
@@ -1531,6 +1557,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/pair/auto/{token}", post(pair::handle_auto_pair_login))
         .route("/pair/signup", get(pair::handle_pair_signup_page))
         .route("/pair/signup", post(pair::handle_pair_signup_submit))
+        // ── KakaoTalk one-tap share-back ──
+        .route("/kakao/share/{token}", get(kakao_share::handle_share_page))
+        .route(
+            "/kakao/share/{token}/consume",
+            post(kakao_share::handle_share_consume),
+        )
         // ── Sync endpoints (cross-device memory sync) ──
         .route("/api/sync/push", post(api::handle_sync_push))
         .route("/api/sync/pull", post(api::handle_sync_pull))
@@ -1555,11 +1587,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                     Method::DELETE,
                     Method::OPTIONS,
                 ])
-                .allow_headers([
-                    header::AUTHORIZATION,
-                    header::CONTENT_TYPE,
-                    header::ACCEPT,
-                ])
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
                 .max_age(Duration::from_secs(3600));
             match std::env::var("CORS_ALLOWED_ORIGINS") {
                 Ok(origins) if !origins.is_empty() && origins != "*" => {
@@ -1936,6 +1964,8 @@ pub(super) async fn process_channel_message_rich(
     if let Some(reply) = channel_router::handle_channel_command(
         auth_store,
         device_router,
+        &state.chat_modes,
+        &state.case_sessions,
         channel_name,
         sender_platform_uid,
         content,
@@ -3881,9 +3911,39 @@ async fn handle_kakao_webhook(State(state): State<AppState>, body: Bytes) -> imp
         "KakaoTalk webhook received"
     );
 
+    // If a sticky case is active for this user, scope the inbound message
+    // to a per-case `session_id` so memory recall can answer
+    // "어제 의뢰인이 뭐라 했지?" without bleeding across cases.
+    let active_case = state.case_sessions.current("kakao", user_id);
+    let session_id = active_case
+        .as_ref()
+        .map(|c| crate::channels::case_session::case_session_id("kakao", c));
+
+    // Recognise multi-select forwards and chat-export pastes and rewrite
+    // them into a structured prompt prefix before sending to the AI loop.
+    // Plain typed messages pass through unchanged.
+    let ingest = crate::channels::kakao_ingest::parse_ingest(utterance);
+    let prompt_owned = crate::channels::kakao_ingest::render_for_prompt(&ingest);
+    let prompt: &str = match &ingest {
+        crate::channels::kakao_ingest::KakaoIngest::PlainText(_) => utterance,
+        _ => prompt_owned.as_str(),
+    };
+
+    // Slash commands and postback callbacks are user-action acks, not AI
+    // content — they should not carry the share-back button. We mark
+    // those before calling the router so we can decide later.
+    let looks_like_command = utterance.starts_with('/') || utterance.starts_with("moa:");
+
     // Route through the common channel routing framework
-    match process_channel_message_rich(&state, "kakao", user_id, utterance, None).await {
-        Ok(reply) => kakao_skill_json(&reply.text, &reply.buttons),
+    match process_channel_message_rich(&state, "kakao", user_id, prompt, session_id.as_deref())
+        .await
+    {
+        Ok(mut reply) => {
+            if !looks_like_command && !reply.text.trim().is_empty() {
+                attach_kakao_share_button(&state, user_id, &mut reply);
+            }
+            kakao_skill_json(&reply.text, &reply.buttons)
+        }
         Err(e) => {
             tracing::error!("KakaoTalk processing failed: {e:#}");
             kakao_skill_json(
@@ -3892,6 +3952,64 @@ async fn handle_kakao_webhook(State(state): State<AppState>, body: Bytes) -> imp
             )
         }
     }
+}
+
+/// Mint a share token for the AI reply and append a `📤 단톡방으로 보내기`
+/// quick-reply button. Silent no-op when the share store is missing or
+/// the JS app key is not configured (graceful degradation per
+/// CLAUDE.md §3.5 fail-fast — better to drop the optional UX than to
+/// fail the whole webhook reply).
+fn attach_kakao_share_button(
+    state: &AppState,
+    user_id: &str,
+    reply: &mut channel_router::ChannelReply,
+) {
+    let store = match state.kakao_share_store.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+    let js_app_key = state
+        .config
+        .lock()
+        .channels_config
+        .kakao
+        .as_ref()
+        .and_then(|k| k.javascript_app_key.clone());
+    let gateway_base = resolve_public_gateway_url(state);
+    append_kakao_share_button_with(store, js_app_key.as_deref(), &gateway_base, user_id, reply);
+}
+
+/// Pure version of [`attach_kakao_share_button`] for unit testing —
+/// takes the share store, JS app key, and gateway base directly so a
+/// test does not need to build a full `AppState`. Returns whether a
+/// button was appended.
+fn append_kakao_share_button_with(
+    store: &crate::channels::kakao_share_store::KakaoShareStore,
+    javascript_app_key: Option<&str>,
+    gateway_base: &str,
+    user_id: &str,
+    reply: &mut channel_router::ChannelReply,
+) -> bool {
+    let key_present = javascript_app_key
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false);
+    if !key_present {
+        return false;
+    }
+    let token = match store.create_token_with_rate_limit(
+        user_id,
+        &reply.text,
+        crate::channels::kakao_share_store::DEFAULT_RATE_LIMIT_PER_MINUTE,
+    ) {
+        Some(t) => t,
+        None => return false,
+    };
+    let url = crate::channels::kakao_share_store::share_url(gateway_base, &token);
+    reply.buttons.push(channel_router::ReplyButton {
+        label: "📤 단톡방으로 보내기".to_string(),
+        action: channel_router::ButtonAction::WebLink(url),
+    });
+    true
 }
 
 /// Render a ChannelReply as Kakao Chatbot Skill JSON with quickReplies.
@@ -4068,6 +4186,9 @@ mod tests {
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4145,6 +4266,9 @@ mod tests {
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4205,6 +4329,9 @@ mod tests {
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4266,6 +4393,9 @@ mod tests {
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4771,6 +4901,9 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4860,6 +4993,9 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -4930,6 +5066,9 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5001,6 +5140,9 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5081,6 +5223,9 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5153,6 +5298,9 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5230,6 +5378,9 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5333,6 +5484,9 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5406,6 +5560,9 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5484,6 +5641,9 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5576,6 +5736,9 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5647,6 +5810,9 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5729,6 +5895,9 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5816,6 +5985,9 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5893,6 +6065,9 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -5963,6 +6138,9 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -6032,6 +6210,9 @@ Reminder set successfully."#;
             payment_manager: None,
             auth_store: None,
             channel_pairing: None,
+            chat_modes: Arc::new(crate::channels::chat_mode::ChatModeStore::new()),
+            case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
+            kakao_share_store: None,
             auth_allow_registration: false,
             device_router: None,
             email_verify_service: None,
@@ -6453,5 +6634,93 @@ Reminder set successfully."#;
 
         // Should be allowed again
         assert!(limiter.allow("burst-ip"));
+    }
+
+    // ── Kakao share-button attachment ──
+
+    #[test]
+    fn share_button_appended_when_key_and_store_present() {
+        use crate::channels::kakao_share_store::KakaoShareStore;
+        let store = KakaoShareStore::new();
+        let mut reply = channel_router::ChannelReply::with_buttons(
+            "AI reply body".to_string(),
+            vec![channel_router::ReplyButton {
+                label: "⚙️ 설정".to_string(),
+                action: channel_router::ButtonAction::PostBack("moa:settings".to_string()),
+            }],
+        );
+        let appended = append_kakao_share_button_with(
+            &store,
+            Some("jsappkey"),
+            "https://gw.example.com",
+            "kakao_user_1",
+            &mut reply,
+        );
+        assert!(appended);
+        assert_eq!(reply.buttons.len(), 2);
+        match &reply.buttons[1].action {
+            channel_router::ButtonAction::WebLink(url) => {
+                assert!(url.starts_with("https://gw.example.com/kakao/share/"));
+                assert_eq!(reply.buttons[1].label, "📤 단톡방으로 보내기");
+            }
+            other => panic!("expected WebLink, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn share_button_omitted_when_key_missing() {
+        use crate::channels::kakao_share_store::KakaoShareStore;
+        let store = KakaoShareStore::new();
+        let mut reply = channel_router::ChannelReply::text("hi");
+        let appended = append_kakao_share_button_with(
+            &store,
+            None,
+            "https://gw.example.com",
+            "kakao_user_1",
+            &mut reply,
+        );
+        assert!(!appended);
+        assert!(reply.buttons.is_empty());
+    }
+
+    #[test]
+    fn share_button_omitted_when_key_blank() {
+        use crate::channels::kakao_share_store::KakaoShareStore;
+        let store = KakaoShareStore::new();
+        let mut reply = channel_router::ChannelReply::text("hi");
+        let appended = append_kakao_share_button_with(
+            &store,
+            Some("   "),
+            "https://gw.example.com",
+            "kakao_user_1",
+            &mut reply,
+        );
+        assert!(!appended);
+        assert!(reply.buttons.is_empty());
+    }
+
+    #[test]
+    fn share_button_token_resolves_via_share_store() {
+        use crate::channels::kakao_share_store::KakaoShareStore;
+        let store = KakaoShareStore::new();
+        let mut reply = channel_router::ChannelReply::text("body content");
+        let appended = append_kakao_share_button_with(
+            &store,
+            Some("k"),
+            "https://gw.example.com",
+            "kakao_user_1",
+            &mut reply,
+        );
+        assert!(appended);
+        // Pull the token out of the URL and verify it's resolvable
+        // and contains the original body text.
+        let url = match &reply.buttons[0].action {
+            channel_router::ButtonAction::WebLink(u) => u.clone(),
+            _ => panic!("expected WebLink"),
+        };
+        let token = url.rsplit('/').next().unwrap();
+        let entry = store.lookup_token(token).expect("token must be present");
+        assert_eq!(entry.message_text, "body content");
+        assert_eq!(entry.user_id, "kakao_user_1");
     }
 }

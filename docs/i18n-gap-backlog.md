@@ -37,6 +37,27 @@ Completed in this PR stream:
 
 - None. Top-level baseline gaps are closed for all supported locales.
 
+## Pending Localization (PR-scoped, deferred to follow-up)
+
+The KakaoTalk group-chat assist PR (`claude/ai-group-chat-monitoring-lqJzi`)
+adds the following English-only content to runtime-contract docs:
+
+- `docs/channels-reference.md` — new `In-Chat Runtime Commands` rows
+  (`/mode`, `/case`) and a new `2A. Chat Modes (Observer / Participant)`
+  section.
+- `docs/commands-reference.md` — new `Channel mode` and
+  `Sticky case sessions` runtime-command bullets under `channel`.
+- `docs/channel-setup-guide.md` — KakaoTalk section gains
+  `javascript_app_key` config field, new `/case` and `/mode` command
+  rows, and a `단톡방(Group Chat) Assist Workflow` subsection (already
+  bilingual EN/KO inline, matching the file's existing style).
+
+Localized parity for `zh-CN`/`ja`/`ru`/`fr`/`vi`/`el` of these
+new sections is intentionally deferred so this PR can ship the
+behavior change without serializing on six translation passes.
+Owner: same PR series; follow-up issue to be opened once the EN
+copy stabilizes.
+
 ## Optional Next Depth
 
 These are not baseline blockers, but can be advanced in future waves:

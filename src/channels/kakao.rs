@@ -476,10 +476,8 @@ async fn handle_webhook(
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("KakaoTalk: invalid webhook payload: {e}");
-            return kakao_skill_response(
-                "요청을 처리할 수 없습니다.\n\nInvalid request payload.",
-            )
-            .into_response();
+            return kakao_skill_response("요청을 처리할 수 없습니다.\n\nInvalid request payload.")
+                .into_response();
         }
     };
 
@@ -537,7 +535,9 @@ async fn handle_webhook(
                         .into_response();
                     }
 
-                    tracing::warn!("KakaoTalk: unauthorized user (no gateway URL for pairing): {user_id}");
+                    tracing::warn!(
+                        "KakaoTalk: unauthorized user (no gateway URL for pairing): {user_id}"
+                    );
                     return kakao_skill_response("접근이 허용되지 않은 사용자입니다.\n\nAccess denied. Please contact the operator.").into_response();
                 }
             } else {
@@ -667,8 +667,7 @@ async fn handle_webhook(
                         .into_response();
                 }
             } else {
-                return kakao_skill_response("접근이 허용되지 않은 사용자입니다.")
-                    .into_response();
+                return kakao_skill_response("접근이 허용되지 않은 사용자입니다.").into_response();
             }
         }
 
@@ -712,6 +711,16 @@ async fn handle_health() -> StatusCode {
 impl Channel for KakaoTalkChannel {
     fn name(&self) -> &str {
         "kakao"
+    }
+
+    /// KakaoTalk's official Open Builder API only exposes the bot's 1:1
+    /// chat, never a third-party group chat. The channel therefore
+    /// supports only observer mode — the user forwards messages from
+    /// the group into the bot's 1:1 chat and the bot's reply carries a
+    /// share-back button that opens KakaoTalk's native share picker.
+    fn supported_chat_modes(&self) -> &'static [super::chat_mode::ChatMode] {
+        use super::chat_mode::ChatMode;
+        &[ChatMode::Observer]
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -1010,5 +1019,17 @@ admin_key = "admin"
         assert!(config.allowed_users.is_empty());
         assert!(config.webhook_secret.is_none());
         assert_eq!(config.port, 8787);
+        assert!(config.javascript_app_key.is_none());
+    }
+
+    #[test]
+    fn test_config_serde_javascript_app_key_present() {
+        let toml_str = r#"
+rest_api_key = "key"
+admin_key = "admin"
+javascript_app_key = "jsapp_key_xyz"
+"#;
+        let config: crate::config::schema::KakaoTalkConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.javascript_app_key.as_deref(), Some("jsapp_key_xyz"));
     }
 }

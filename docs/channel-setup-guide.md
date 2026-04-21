@@ -85,6 +85,9 @@ rest_api_key = "YOUR_REST_API_KEY"
 admin_key = "YOUR_ADMIN_KEY"
 allowed_users = ["*"]
 port = 8787
+# Optional — enables the 단톡방 one-tap share-back button on AI replies.
+# Get this from Kakao Developers → 앱 설정 → 일반 → JavaScript 키.
+javascript_app_key = "YOUR_KAKAO_JS_APP_KEY"
 ```
 
 **Option B: Environment variables**
@@ -114,6 +117,55 @@ Add the channel as a friend in KakaoTalk and send a message!
 | `/remember <text>` | Save to memory / 메모리 저장 |
 | `/forget <key>` | Delete memory / 메모리 삭제 |
 | `/cron` | List scheduled tasks / 예약 작업 목록 |
+| `/case start <라벨>` | Pin a case session / 사건 시작 — also `/사건 시작` |
+| `/case end` | End the active case / 사건 종료 |
+| `/case current` | Show active case / 현재 사건 보기 |
+| `/case list` | List active cases / 내 사건 목록 |
+| `/mode current` | Show channel mode / 현재 모드 — also `/모드` |
+| `/mode observer` | Switch to observer mode / 옵저버 모드 |
+| `/mode participant` | Switch to participant mode (not on KakaoTalk) / 참가자 모드 |
+
+### 단톡방(Group Chat) Assist Workflow / 단톡방 보조 워크플로
+
+KakaoTalk's official Open Builder API does **not** allow bots to join
+third-party group chats (`단톡방`). MoA therefore operates in **observer
+mode** on KakaoTalk: you forward 단톡방 content into MoA's 1:1 chat,
+and MoA replies with a one-tap button to share its answer back to the
+원하는 단톡방.
+
+**Inbound — getting 단톡방 content into MoA**
+
+1. In your 단톡방, long-press a message (or multi-select several) →
+   tap **Share / 공유** → pick the MoA channel.
+2. Optional: paste a `대화 내보내기 .txt` export into the 1:1 chat
+   to ingest a whole conversation history.
+3. Use `/case start <사건명>` to pin a sticky case session before
+   forwarding so all subsequent shares accumulate under the same
+   memory namespace. Then "어제 의뢰인이 뭐라 했지?" returns just
+   that case's history.
+
+**Outbound — sending MoA's answer back to the 단톡방**
+
+1. MoA's reply appears in your 1:1 chat.
+2. Tap the **📤 단톡방으로 보내기** quick-reply button.
+3. KakaoTalk's native share picker opens — select the target 단톡방.
+4. The message is posted to that 단톡방 with a `[🤖 AI 답변]`
+   prefix so all participants see it came from an AI.
+
+Every share-back requires an explicit tap — by design, for legal and
+professional safety. Set `javascript_app_key` (Step 4 above) to enable
+the one-tap button. Without it, you can still copy/paste manually.
+
+**Taps minimization tip — pin MoA in the OS share sheet**
+
+- **iOS**: Open the share sheet → swipe app row to the end → tap
+  **Edit Actions** → pin MoA to the top.
+- **Android**: Open the share sheet → long-press the MoA app icon →
+  **Pin**. (Requires Android 11+; older versions show MoA in the
+  recents row.)
+
+After pinning, sharing 단톡방 messages to MoA is a 2-tap operation:
+long-press → tap MoA.
 
 ---
 

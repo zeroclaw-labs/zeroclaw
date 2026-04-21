@@ -125,6 +125,44 @@ pgrep -af "cargo (check|build|test)|cargo check|cargo build|cargo test"
 
 Stop unrelated cargo jobs before running your own build.
 
+### `cargo clippy` crashes with `SIGSEGV` in low-memory environments
+
+Symptom:
+
+- `cargo clippy --all-targets` aborts mid-compile with
+  `error: could not compile ... (signal: 11, SIGSEGV: invalid memory reference)`
+- Happens reliably in small CI runners, web sandboxes, or containers
+  capped below ~6 GB RAM; usually does NOT happen on a normal workstation.
+
+Root cause:
+
+- `cargo` spawns one `clippy-driver` per compilation unit in parallel.
+  For ZeroClaw's `--tests` build the test binary pulls the full crate
+  plus 5 000+ tests into a single unit, and each parallel worker keeps
+  the full AST plus pedantic-lint state resident. RSS can spike above
+  what the environment allows, at which point the kernel OOM-kills a
+  worker or the process segfaults on a guard page.
+- This is independent of the crate code — plain `cargo test` succeeds
+  in the same environment because it does not carry clippy's extra
+  analysis state.
+
+Fix — serialize clippy workers:
+
+```bash
+CARGO_BUILD_JOBS=1 cargo clippy --locked --all-targets -- -D warnings
+```
+
+Or bump the per-thread stack for extra headroom on deeply nested lints:
+
+```bash
+RUST_MIN_STACK=33554432 CARGO_BUILD_JOBS=1 \
+    cargo clippy --locked --all-targets -- -D warnings
+```
+
+With `-j1` the full lint pass takes roughly 6–8 minutes on a small
+host but completes cleanly. CI container runs (see `dev/ci.sh lint`)
+have enough RAM to keep the default parallelism.
+
 ### `zeroclaw` command not found after install
 
 Symptom:

@@ -65,6 +65,20 @@ pub trait Channel: Send + Sync {
     /// Human-readable channel name
     fn name(&self) -> &str;
 
+    /// Operating modes this channel can serve. Defaults to both
+    /// participant and observer — channels with platform constraints
+    /// (e.g. KakaoTalk has no API access to third-party group chats)
+    /// override to a narrower set.
+    ///
+    /// Order is significant: the first entry is the channel's preferred
+    /// mode when the user has not made an explicit choice. See
+    /// [`crate::channels::chat_mode::default_chat_mode_for`] for the
+    /// channel-name-keyed default used by `/mode current`.
+    fn supported_chat_modes(&self) -> &'static [super::chat_mode::ChatMode] {
+        use super::chat_mode::ChatMode;
+        &[ChatMode::Participant, ChatMode::Observer]
+    }
+
     /// Send a message through this channel
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
 
