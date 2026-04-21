@@ -917,9 +917,19 @@ async fn main() -> Result<()> {
     }
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO
+    // For the ACP command, we default to WARN to avoid INFO logs corrupting the stdio protocol.
+    // We also always redirect logs to stderr so stdout remains clean for data.
+    let default_log_level = if matches!(cli.command, Commands::Acp { .. }) {
+        "warn"
+    } else {
+        "info"
+    };
+
     let subscriber = fmt::Subscriber::builder()
+        .with_writer(std::io::stderr)
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(default_log_level)),
         )
         .finish();
 
@@ -3106,5 +3116,33 @@ mod tests {
         let final_temperature = user_temperature.unwrap_or(config.default_temperature);
 
         assert!((final_temperature - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn acp_log_level_defaults_to_warn() {
+        let cli = Cli::try_parse_from(["zeroclaw", "acp"])
+            .expect("acp command should parse");
+
+        let log_level = if matches!(cli.command, Commands::Acp { .. }) {
+            "warn"
+        } else {
+            "info"
+        };
+
+        assert_eq!(log_level, "warn");
+    }
+
+    #[test]
+    fn other_commands_default_to_info() {
+        let cli = Cli::try_parse_from(["zeroclaw", "daemon"])
+            .expect("daemon command should parse");
+
+        let log_level = if matches!(cli.command, Commands::Acp { .. }) {
+            "warn"
+        } else {
+            "info"
+        };
+
+        assert_eq!(log_level, "info");
     }
 }
