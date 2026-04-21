@@ -203,7 +203,11 @@ async fn memory(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Resu
     prompt_field(cfg, ui, "memory.auto-save").await
 }
 
-async fn hardware(_cfg: &mut Config, _ui: &mut dyn OnboardUi, _flags: &Flags) -> Result<()> {
+async fn hardware(cfg: &mut Config, ui: &mut dyn OnboardUi, _flags: &Flags) -> Result<()> {
+    prompt_field(cfg, ui, "hardware.enabled").await?;
+    if cfg.hardware.enabled {
+        prompt_fields_under(cfg, ui, "hardware", &["enabled"]).await?;
+    }
     Ok(())
 }
 
