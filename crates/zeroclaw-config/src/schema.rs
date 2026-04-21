@@ -463,25 +463,25 @@ pub struct Config {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "workspace"]
 pub struct WorkspaceConfig {
-    /// Enable workspace isolation. Default: false.
+    /// Enable multi-workspace profiles — each named workspace gets its own memory / secrets / audit directories, isolated from the others. Leave disabled for single-workspace (default) mode where everything lives under `~/.zeroclaw/workspace`.
     #[serde(default)]
     pub enabled: bool,
-    /// Currently active workspace name.
+    /// Active workspace profile name. Required when multi-workspace is enabled; picks which `<workspaces_dir>/<name>/` directory ZeroClaw reads from and writes to.
     #[serde(default)]
     pub active_workspace: Option<String>,
-    /// Base directory for workspace profiles.
+    /// Parent directory holding all workspace profiles (one subdirectory per profile).
     #[serde(default = "default_workspaces_dir")]
     pub workspaces_dir: String,
-    /// Isolate memory databases per workspace. Default: true.
+    /// Isolate memory databases per workspace — each profile gets its own `brain.db` so conversation history doesn't bleed across profiles.
     #[serde(default = "default_true")]
     pub isolate_memory: bool,
-    /// Isolate secrets namespaces per workspace. Default: true.
+    /// Isolate secrets namespaces per workspace — provider API keys and channel tokens are scoped to the active profile.
     #[serde(default = "default_true")]
     pub isolate_secrets: bool,
-    /// Isolate audit logs per workspace. Default: true.
+    /// Isolate audit logs per workspace — each profile gets its own tool-call / channel-message audit trail.
     #[serde(default = "default_true")]
     pub isolate_audit: bool,
-    /// Allow searching across workspaces. Default: false (security).
+    /// Allow memory search to cross workspace boundaries. Off by default — turning this on defeats the point of isolation.
     #[serde(default)]
     pub cross_workspace_search: bool,
 }
@@ -780,22 +780,22 @@ impl std::fmt::Display for HardwareTransport {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "hardware"]
 pub struct HardwareConfig {
-    /// Whether hardware access is enabled
+    /// Enable direct communication with physical hardware — GPIO pins, USB-connected microcontrollers (Arduino, ESP32, Nucleo), or SWD/JTAG debug probes. Leave off for software-only use.
     #[serde(default)]
     pub enabled: bool,
-    /// Transport mode
+    /// How ZeroClaw reaches the hardware: `native` (direct GPIO on a Linux SBC like Raspberry Pi), `serial` (USB-tethered MCU at a path like `/dev/ttyACM0`), `probe` (SWD/JTAG debug probe via probe-rs), or `none` (disabled).
     #[serde(default)]
     pub transport: HardwareTransport,
-    /// Serial port path (e.g. "/dev/ttyACM0")
+    /// Serial device path for `transport = serial` (e.g. `/dev/ttyACM0` on Linux, `/dev/tty.usbmodem1`on macOS, `COM3` on Windows).
     #[serde(default)]
     pub serial_port: Option<String>,
-    /// Serial baud rate
+    /// Baud rate for the serial link. 115200 is the common Arduino / ESP32 default; bump to 230400+ for faster MCU comms.
     #[serde(default = "default_baud_rate")]
     pub baud_rate: u32,
-    /// Probe target chip (e.g. "STM32F401RE")
+    /// Target chip identifier for `transport = probe` (e.g. `STM32F401RE`, `nRF52840_xxAA`). Passed to probe-rs for flash/debug operations.
     #[serde(default)]
     pub probe_target: Option<String>,
-    /// Enable workspace datasheet RAG (index PDF schematics for AI pin lookups)
+    /// Index PDF schematics and datasheets from the workspace into a local RAG store so the agent can look up pin assignments and electrical specs inline.
     #[serde(default)]
     pub workspace_datasheets: bool,
 }
