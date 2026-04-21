@@ -1393,6 +1393,22 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     fn extract_reply_context(&self, message: &serde_json::Value) -> Option<String> {
         let reply = message.get("reply_to_message")?;
 
+        // Skip the auto-injected topic-root reference Telegram adds to every
+        // message in a non-General forum topic. Its message_id equals the
+        // parent message's message_thread_id. Treating it as a real reply
+        // produces a spurious `> @user:\n> [Message]` blockquote prefix that
+        // downstream reply-intent classification reads as "user is replying
+        // to someone else" and rejects.
+        let reply_mid = reply.get("message_id").and_then(serde_json::Value::as_i64);
+        let thread_id = message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64);
+        if let (Some(rmid), Some(tid)) = (reply_mid, thread_id)
+            && rmid == tid
+        {
+            return None;
+        }
+
         let reply_sender = reply
             .get("from")
             .and_then(|from| from.get("username"))
@@ -4470,6 +4486,43 @@ mod tests {
             "text": "just a regular message"
         });
         assert!(ch.extract_reply_context(&msg).is_none());
+    }
+
+    #[test]
+    fn extract_reply_context_skips_topic_root() {
+        // Telegram auto-injects a reply_to_message pointing at the topic-root
+        // message on every message in a non-General forum topic. The injected
+        // reply's message_id equals the parent's message_thread_id. It is
+        // not a real reply and must not produce a blockquote prefix.
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        let msg = serde_json::json!({
+            "message_thread_id": 42,
+            "text": "hello in topic",
+            "reply_to_message": {
+                "message_id": 42,
+                "from": { "username": "alice" },
+                "forum_topic_created": { "name": "General Discussion", "icon_color": 0 }
+            }
+        });
+        assert!(ch.extract_reply_context(&msg).is_none());
+    }
+
+    #[test]
+    fn extract_reply_context_real_reply_in_topic() {
+        // A genuine reply inside a forum topic (reply.message_id differs from
+        // the parent's message_thread_id) should still produce a blockquote.
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        let msg = serde_json::json!({
+            "message_thread_id": 42,
+            "text": "I agree",
+            "reply_to_message": {
+                "message_id": 100,
+                "from": { "username": "alice" },
+                "text": "What do you think?"
+            }
+        });
+        let ctx = ch.extract_reply_context(&msg).unwrap();
+        assert_eq!(ctx, "> @alice:\n> What do you think?");
     }
 
     #[test]
