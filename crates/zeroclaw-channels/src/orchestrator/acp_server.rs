@@ -306,15 +306,39 @@ impl AcpServer {
             })?
             .to_string();
 
-        let prompt = params
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| RpcError {
+        // `prompt` may be a plain string or an array of content-part objects
+        // per the ACP spec (e.g. `[{"type":"text","text":"..."},...]`).
+        // Concatenate all text-typed parts; non-text parts (resource_link, etc.)
+        // are skipped because the agent operates on plain text.
+        let prompt = match params.get("prompt") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| {
+                    if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        part.get("text").and_then(|t| t.as_str()).map(str::to_owned)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => {
+                return Err(RpcError {
+                    code: INVALID_PARAMS,
+                    message: "Missing required parameter: prompt".to_string(),
+                    data: None,
+                });
+            }
+        };
+
+        if prompt.is_empty() {
+            return Err(RpcError {
                 code: INVALID_PARAMS,
                 message: "Missing required parameter: prompt".to_string(),
                 data: None,
-            })?
-            .to_string();
+            });
+        }
 
         // Remove the session from the map so we can take mutable ownership of
         // the Agent for the duration of the turn. It will be reinserted after.
@@ -591,5 +615,109 @@ mod tests {
         let json = serde_json::to_string(&notif).unwrap();
         assert!(json.contains(r#""method":"session/event""#));
         assert!(json.contains(r#""content":"hello""#));
+    }
+
+    // Helpers for exercising prompt extraction without a live agent.
+    fn extract_prompt(params: &Value) -> Result<String, RpcError> {
+        match params.get("prompt") {
+            Some(Value::String(s)) => {
+                if s.is_empty() {
+                    return Err(RpcError {
+                        code: INVALID_PARAMS,
+                        message: "Missing required parameter: prompt".to_string(),
+                        data: None,
+                    });
+                }
+                Ok(s.clone())
+            }
+            Some(Value::Array(parts)) => {
+                let text = parts
+                    .iter()
+                    .filter_map(|part| {
+                        if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            part.get("text").and_then(|t| t.as_str()).map(str::to_owned)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if text.is_empty() {
+                    return Err(RpcError {
+                        code: INVALID_PARAMS,
+                        message: "Missing required parameter: prompt".to_string(),
+                        data: None,
+                    });
+                }
+                Ok(text)
+            }
+            _ => Err(RpcError {
+                code: INVALID_PARAMS,
+                message: "Missing required parameter: prompt".to_string(),
+                data: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn prompt_accepts_plain_string() {
+        let params = serde_json::json!({"prompt": "hello world", "sessionId": "s1"});
+        let result = extract_prompt(&params).unwrap();
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn prompt_accepts_content_part_array() {
+        let params = serde_json::json!({
+            "sessionId": "s1",
+            "prompt": [
+                {"type": "text", "text": "Add support for ZeroClaw ACP."},
+                {"type": "text", "text": "<environment_info>editor: Neovim</environment_info>"},
+                {"type": "resource_link", "uri": "file:///path/to/file.lua"}
+            ]
+        });
+        let result = extract_prompt(&params).unwrap();
+        assert_eq!(
+            result,
+            "Add support for ZeroClaw ACP.\n<environment_info>editor: Neovim</environment_info>"
+        );
+    }
+
+    #[test]
+    fn prompt_array_skips_non_text_parts() {
+        let params = serde_json::json!({
+            "sessionId": "s1",
+            "prompt": [
+                {"type": "resource_link", "uri": "file:///some/file.rs"},
+                {"type": "text", "text": "Fix this file."}
+            ]
+        });
+        let result = extract_prompt(&params).unwrap();
+        assert_eq!(result, "Fix this file.");
+    }
+
+    #[test]
+    fn prompt_missing_returns_error() {
+        let params = serde_json::json!({"sessionId": "s1"});
+        let err = extract_prompt(&params).unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("prompt"));
+    }
+
+    #[test]
+    fn prompt_empty_array_returns_error() {
+        let params = serde_json::json!({"sessionId": "s1", "prompt": []});
+        let err = extract_prompt(&params).unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[test]
+    fn prompt_array_all_non_text_returns_error() {
+        let params = serde_json::json!({
+            "sessionId": "s1",
+            "prompt": [{"type": "resource_link", "uri": "file:///foo.rs"}]
+        });
+        let err = extract_prompt(&params).unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
     }
 }
