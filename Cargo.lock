@@ -13678,6 +13678,7 @@ name = "zeroclaw-tui"
 version = "0.7.3"
 dependencies = [
  "anyhow",
+ "async-trait",
  "crossterm",
  "libc",
  "ratatui",

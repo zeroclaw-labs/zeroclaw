@@ -1,5 +1,10 @@
-// Onboarding UI is temporarily removed during the clean-slate rewrite (#5951).
-// A new `RatatuiUi` impl of the shared `OnboardUi` trait will land here.
+//! Ratatui-backed `OnboardUi` implementation.
+//!
+//! The onboard orchestrator lives in `zeroclaw-runtime`; this crate only
+//! provides the TUI drawing/input layer. `RatatuiUi` is the one export.
 
+mod onboarding;
 mod theme;
 mod widgets;
+
+pub use onboarding::RatatuiUi;
