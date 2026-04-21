@@ -204,7 +204,7 @@ async fn handle_socket(
         }
     };
     #[cfg(not(feature = "gateway-voice-duplex"))]
-    let voice_session: Option<()> = None;
+    let _voice_session: Option<()> = None;
 
     agent.set_memory_session_id(Some(session_id.clone()));
 
@@ -287,14 +287,12 @@ async fn handle_socket(
                             }
                         }
 
-                        let mut ack = serde_json::json!({
-                            "type": "connected",
-                            "message": "Connection established"
-                        });
-
-                        // Confirm binary audio support in ack
                         #[cfg(feature = "gateway-voice-duplex")]
-                        {
+                        let ack = {
+                            let mut ack = serde_json::json!({
+                                "type": "connected",
+                                "message": "Connection established"
+                            });
                             if voice_session.as_ref().is_some_and(|vs| vs.binary_audio) {
                                 ack["capabilities"] =
                                     serde_json::json!([crate::voice_duplex::CAP_BINARY_AUDIO]);
@@ -306,7 +304,14 @@ async fn handle_socket(
                                     "max_frame_ms": crate::voice_duplex::audio::MAX_FRAME_MS,
                                 });
                             }
-                        }
+                            ack
+                        };
+
+                        #[cfg(not(feature = "gateway-voice-duplex"))]
+                        let ack = serde_json::json!({
+                            "type": "connected",
+                            "message": "Connection established"
+                        });
 
                         let _ = sender.send(Message::Text(ack.to_string().into())).await;
                     } else {
