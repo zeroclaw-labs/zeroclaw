@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 
 /// Voice event types for the WebSocket duplex protocol.
 ///
-/// These are serialized as JSON text frames. Using base64-encoded audio
-/// in the `tts_chunk` variant means the existing `Message::Text` path
-/// handles everything — no binary frame changes needed yet.
+/// These are serialized as JSON text frames. Binary audio frames (PCM16 LE
+/// mono 16kHz) are handled separately via [`validate_pcm16_frame`] and
+/// [`pcm16_to_f32`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum VoiceEvent {
@@ -78,6 +78,146 @@ pub fn handle_voice_event(event: VoiceEvent) -> Option<serde_json::Value> {
                 "message": "this event type is server-to-client only"
             }))
         }
+    }
+}
+
+// ── Binary audio frame handling ─────────────────────────────────
+
+/// PCM audio constants for the voice duplex protocol.
+///
+/// Audio format: **PCM16 little-endian, mono, 16 kHz**.
+pub mod audio {
+    /// Sample rate in Hz.
+    pub const SAMPLE_RATE: u32 = 16_000;
+    /// Bytes per sample (16-bit = 2 bytes).
+    pub const BYTES_PER_SAMPLE: usize = 2;
+    /// Minimum frame duration in milliseconds.
+    pub const MIN_FRAME_MS: u32 = 10;
+    /// Maximum frame duration in milliseconds.
+    pub const MAX_FRAME_MS: u32 = 300;
+    /// Minimum frame size in bytes (10 ms × 16 kHz × 2 bytes / 1000 = 320).
+    pub const MIN_FRAME_BYTES: usize =
+        (SAMPLE_RATE as usize * BYTES_PER_SAMPLE * MIN_FRAME_MS as usize) / 1000;
+    /// Maximum frame size in bytes (300 ms × 16 kHz × 2 bytes / 1000 = 9600).
+    pub const MAX_FRAME_BYTES: usize =
+        (SAMPLE_RATE as usize * BYTES_PER_SAMPLE * MAX_FRAME_MS as usize) / 1000;
+}
+
+/// Capability string clients must advertise to enable binary audio frames.
+pub const CAP_BINARY_AUDIO: &str = "binary-audio";
+
+/// Errors that can occur when processing binary audio frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioFrameError {
+    /// Frame size is not a multiple of 2 (must be complete PCM16 samples).
+    InvalidAlignment { bytes: usize },
+    /// Frame is too short (below minimum duration).
+    TooShort { bytes: usize, min: usize },
+    /// Frame is too long (exceeds maximum duration).
+    TooLong { bytes: usize, max: usize },
+    /// Binary audio not negotiated for this session.
+    NotNegotiated,
+}
+
+impl std::fmt::Display for AudioFrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidAlignment { bytes } => write!(
+                f,
+                "binary frame has odd byte count ({bytes}); PCM16 requires 2-byte alignment"
+            ),
+            Self::TooShort { bytes, min } => write!(
+                f,
+                "binary frame too short ({bytes} bytes; minimum {min} = {}ms)",
+                audio::MIN_FRAME_MS
+            ),
+            Self::TooLong { bytes, max } => write!(
+                f,
+                "binary frame too long ({bytes} bytes; maximum {max} = {}ms)",
+                audio::MAX_FRAME_MS
+            ),
+            Self::NotNegotiated => write!(
+                f,
+                "binary audio frames not negotiated; send '{CAP_BINARY_AUDIO}' in connect capabilities"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AudioFrameError {}
+
+/// Validate a binary audio frame's size constraints.
+///
+/// Returns `Ok(())` if the frame is a valid PCM16 buffer within size
+/// limits, or an [`AudioFrameError`] describing the problem.
+pub fn validate_pcm16_frame(data: &[u8]) -> Result<(), AudioFrameError> {
+    let len = data.len();
+    if len % audio::BYTES_PER_SAMPLE != 0 {
+        return Err(AudioFrameError::InvalidAlignment { bytes: len });
+    }
+    if len < audio::MIN_FRAME_BYTES {
+        return Err(AudioFrameError::TooShort {
+            bytes: len,
+            min: audio::MIN_FRAME_BYTES,
+        });
+    }
+    if len > audio::MAX_FRAME_BYTES {
+        return Err(AudioFrameError::TooLong {
+            bytes: len,
+            max: audio::MAX_FRAME_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Convert PCM16 LE samples to f32 samples normalised to [-1.0, 1.0].
+///
+/// Each pair of bytes is interpreted as a little-endian `i16`, then
+/// divided by `i16::MAX` to produce a float in approximately [-1.0, 1.0].
+pub fn pcm16_to_f32(pcm: &[u8]) -> Vec<f32> {
+    pcm.chunks_exact(2)
+        .map(|chunk| {
+            let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+            sample as f32 / i16::MAX as f32
+        })
+        .collect()
+}
+
+/// Per-session voice duplex state, created when `gateway-voice-duplex` is
+/// enabled and the client negotiates binary audio support.
+pub struct VoiceDuplexSession {
+    /// Whether the client has advertised binary audio capability.
+    pub binary_audio: bool,
+    /// VAD instance for this session (`NoopVad` until a real impl lands).
+    pub vad: Box<dyn zeroclaw_api::vad::Vad>,
+}
+
+impl VoiceDuplexSession {
+    /// Create a new session with binary audio disabled and a no-op VAD.
+    pub fn new() -> Self {
+        Self {
+            binary_audio: false,
+            vad: Box::new(zeroclaw_api::vad::NoopVad),
+        }
+    }
+
+    /// Enable binary audio after successful capability negotiation.
+    pub fn enable_binary(&mut self) {
+        self.binary_audio = true;
+    }
+
+    /// Process a validated PCM16 frame through the VAD pipeline.
+    ///
+    /// Returns the [`VadEvent`] produced by the underlying VAD
+    /// implementation.
+    pub fn process_frame(&mut self, f32_samples: &[f32]) -> zeroclaw_api::vad::VadEvent {
+        self.vad.process(f32_samples)
+    }
+}
+
+impl Default for VoiceDuplexSession {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -179,6 +319,120 @@ mod tests {
         });
         assert!(chunk_result.is_some());
         assert_eq!(chunk_result.unwrap()["code"], "invalid_event_direction");
+    }
+
+    // ── Binary audio frame tests ──
+
+    #[test]
+    fn validate_frame_min_size() {
+        // Exactly MIN_FRAME_BYTES should pass
+        let frame = vec![0u8; audio::MIN_FRAME_BYTES];
+        assert!(validate_pcm16_frame(&frame).is_ok());
+    }
+
+    #[test]
+    fn validate_frame_max_size() {
+        // Exactly MAX_FRAME_BYTES should pass
+        let frame = vec![0u8; audio::MAX_FRAME_BYTES];
+        assert!(validate_pcm16_frame(&frame).is_ok());
+    }
+
+    #[test]
+    fn validate_frame_too_short() {
+        let frame = vec![0u8; audio::MIN_FRAME_BYTES - 2];
+        let err = validate_pcm16_frame(&frame).unwrap_err();
+        assert_eq!(
+            err,
+            AudioFrameError::TooShort {
+                bytes: audio::MIN_FRAME_BYTES - 2,
+                min: audio::MIN_FRAME_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn validate_frame_too_long() {
+        let frame = vec![0u8; audio::MAX_FRAME_BYTES + 2];
+        let err = validate_pcm16_frame(&frame).unwrap_err();
+        assert_eq!(
+            err,
+            AudioFrameError::TooLong {
+                bytes: audio::MAX_FRAME_BYTES + 2,
+                max: audio::MAX_FRAME_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn validate_frame_odd_bytes() {
+        let frame = vec![0u8; audio::MIN_FRAME_BYTES + 1]; // odd count
+        let err = validate_pcm16_frame(&frame).unwrap_err();
+        assert_eq!(
+            err,
+            AudioFrameError::InvalidAlignment {
+                bytes: audio::MIN_FRAME_BYTES + 1
+            }
+        );
+    }
+
+    #[test]
+    fn pcm16_to_f32_conversion() {
+        // Zero samples → 0.0
+        let zeros = vec![0u8, 0u8, 0u8, 0u8];
+        let f32_samples = pcm16_to_f32(&zeros);
+        assert_eq!(f32_samples.len(), 2);
+        assert_eq!(f32_samples[0], 0.0);
+        assert_eq!(f32_samples[1], 0.0);
+
+        // Max positive i16 (0x7FFF) → ~1.0
+        let max_pos = vec![0xFFu8, 0x7Fu8];
+        let f32_max = pcm16_to_f32(&max_pos);
+        assert!((f32_max[0] - 1.0).abs() < f32::EPSILON);
+
+        // Min negative i16 (0x8000) → -1.0 (after i16::MAX division)
+        let max_neg = vec![0x00u8, 0x80u8];
+        let f32_min = pcm16_to_f32(&max_neg);
+        assert!(f32_min[0] <= -1.0);
+    }
+
+    #[test]
+    fn voice_duplex_session_defaults() {
+        let session = VoiceDuplexSession::default();
+        assert!(!session.binary_audio);
+    }
+
+    #[test]
+    fn voice_duplex_session_enable_binary() {
+        let mut session = VoiceDuplexSession::new();
+        assert!(!session.binary_audio);
+        session.enable_binary();
+        assert!(session.binary_audio);
+    }
+
+    #[test]
+    fn voice_duplex_session_process_frame_noop() {
+        let mut session = VoiceDuplexSession::new();
+        let samples = vec![0.5f32; 160];
+        let event = session.process_frame(&samples);
+        assert_eq!(event, zeroclaw_api::vad::VadEvent::Silence);
+    }
+
+    #[test]
+    fn audio_frame_error_display() {
+        let err = AudioFrameError::InvalidAlignment { bytes: 5 };
+        assert!(err.to_string().contains("odd byte count"));
+        let err = AudioFrameError::TooShort {
+            bytes: 10,
+            min: 320,
+        };
+        assert!(err.to_string().contains("too short"));
+        let err = AudioFrameError::TooLong {
+            bytes: 20000,
+            max: 9600,
+        };
+        assert!(err.to_string().contains("too long"));
+        let err = AudioFrameError::NotNegotiated;
+        assert!(err.to_string().contains("not negotiated"));
     }
 
     #[test]

@@ -5,11 +5,14 @@
 //! Protocol:
 //! ```text
 //! Server -> Client: {"type":"session_start","session_id":"...","name":"...","resumed":true,"message_count":42}
+//! Client -> Server: {"type":"connect","capabilities":["binary-audio"]}    // optional handshake
+//! Server -> Client: {"type":"connected","capabilities":["binary-audio"],"audio_format":{...}}
 //! Client -> Server: {"type":"message","content":"Hello"}
 //! Server -> Client: {"type":"chunk","content":"Hi! "}
 //! Server -> Client: {"type":"tool_call","name":"shell","args":{...}}
 //! Server -> Client: {"type":"tool_result","name":"shell","output":"..."}
 //! Server -> Client: {"type":"done","full_response":"..."}
+//! Client -> Server: <binary PCM16-LE mono 16kHz audio frame>            // when binary-audio negotiated
 //! ```
 //!
 //! Query params:
@@ -184,6 +187,25 @@ async fn handle_socket(
             return;
         }
     };
+    // ── Voice duplex session state (gated by feature flag) ──
+    #[cfg(feature = "gateway-voice-duplex")]
+    let mut voice_session = {
+        let duplex_enabled = state
+            .config
+            .lock()
+            .channels
+            .voice_duplex
+            .as_ref()
+            .is_some_and(|v| v.enabled);
+        if duplex_enabled {
+            Some(crate::voice_duplex::VoiceDuplexSession::new())
+        } else {
+            None
+        }
+    };
+    #[cfg(not(feature = "gateway-voice-duplex"))]
+    let voice_session: Option<()> = None;
+
     agent.set_memory_session_id(Some(session_id.clone()));
 
     // Hydrate agent from persisted session (if available)
@@ -247,10 +269,45 @@ async fn handle_socket(
                         if let Some(sid) = &cp.session_id {
                             agent.set_memory_session_id(Some(sid.clone()));
                         }
-                        let ack = serde_json::json!({
+
+                        // ── Binary audio capability negotiation ──
+                        #[cfg(feature = "gateway-voice-duplex")]
+                        {
+                            let has_binary = cp
+                                .capabilities
+                                .iter()
+                                .any(|c| c == crate::voice_duplex::CAP_BINARY_AUDIO);
+                            if has_binary {
+                                if let Some(ref mut vs) = voice_session {
+                                    vs.enable_binary();
+                                    tracing::debug!(
+                                        "voice duplex: binary-audio capability negotiated"
+                                    );
+                                }
+                            }
+                        }
+
+                        let mut ack = serde_json::json!({
                             "type": "connected",
                             "message": "Connection established"
                         });
+
+                        // Confirm binary audio support in ack
+                        #[cfg(feature = "gateway-voice-duplex")]
+                        {
+                            if voice_session.as_ref().is_some_and(|vs| vs.binary_audio) {
+                                ack["capabilities"] =
+                                    serde_json::json!([crate::voice_duplex::CAP_BINARY_AUDIO]);
+                                ack["audio_format"] = serde_json::json!({
+                                    "encoding": "pcm16-le",
+                                    "sample_rate": crate::voice_duplex::audio::SAMPLE_RATE,
+                                    "channels": 1,
+                                    "min_frame_ms": crate::voice_duplex::audio::MIN_FRAME_MS,
+                                    "max_frame_ms": crate::voice_duplex::audio::MAX_FRAME_MS,
+                                });
+                            }
+                        }
+
                         let _ = sender.send(Message::Text(ack.to_string().into())).await;
                     } else {
                         // Not a connect message — fall through to normal processing
@@ -311,6 +368,96 @@ async fn handle_socket(
                 let msg = match msg {
                     Ok(Message::Text(text)) => text,
                     Ok(Message::Close(_)) | Err(_) => break,
+
+                    // ── Binary audio frame handling (gated by feature flag) ──
+                    #[cfg(feature = "gateway-voice-duplex")]
+                    Ok(Message::Binary(data)) => {
+                        let duplex_enabled = state
+                            .config
+                            .lock()
+                            .channels
+                            .voice_duplex
+                            .as_ref()
+                            .is_some_and(|v| v.enabled);
+                        if !duplex_enabled {
+                            // Duplex disabled — reject binary frames
+                            let err = serde_json::json!({
+                                "type": "error",
+                                "code": "BINARY_NOT_ENABLED",
+                                "message": "Binary frames rejected: voice duplex is disabled"
+                            });
+                            let _ = sender
+                                .send(Message::Text(err.to_string().into()))
+                                .await;
+                            continue;
+                        }
+
+                        match voice_session.as_mut() {
+                            Some(vs) if vs.binary_audio => {
+                                // Validate frame
+                                if let Err(e) =
+                                    crate::voice_duplex::validate_pcm16_frame(&data)
+                                {
+                                    let err = serde_json::json!({
+                                        "type": "error",
+                                        "code": "INVALID_AUDIO_FRAME",
+                                        "message": e.to_string()
+                                    });
+                                    let _ = sender
+                                        .send(Message::Text(err.to_string().into()))
+                                        .await;
+                                    continue;
+                                }
+
+                                // Convert PCM16 → f32 and feed to VAD
+                                let f32_samples =
+                                    crate::voice_duplex::pcm16_to_f32(&data);
+                                let vad_event = vs.process_frame(&f32_samples);
+
+                                match vad_event {
+                                    zeroclaw_api::vad::VadEvent::SpeechStart => {
+                                        tracing::debug!(
+                                            "voice duplex: VAD speech_start"
+                                        );
+                                    }
+                                    zeroclaw_api::vad::VadEvent::SpeechEnd => {
+                                        tracing::debug!(
+                                            "voice duplex: VAD speech_end"
+                                        );
+                                    }
+                                    zeroclaw_api::vad::VadEvent::Silence => {}
+                                }
+                            }
+                            Some(_) => {
+                                // Session exists but binary not negotiated
+                                let err = serde_json::json!({
+                                    "type": "error",
+                                    "code": "BINARY_NOT_NEGOTIATED",
+                                    "message": crate::voice_duplex::AudioFrameError::NotNegotiated
+                                        .to_string()
+                                });
+                                let _ = sender
+                                    .send(Message::Text(err.to_string().into()))
+                                    .await;
+                            }
+                            None => {
+                                // Voice duplex not configured for this session
+                                let err = serde_json::json!({
+                                    "type": "error",
+                                    "code": "BINARY_NOT_ENABLED",
+                                    "message": "Binary frames rejected: voice duplex is disabled"
+                                });
+                                let _ = sender
+                                    .send(Message::Text(err.to_string().into()))
+                                    .await;
+                            }
+                        }
+                        continue;
+                    }
+
+                    #[cfg(not(feature = "gateway-voice-duplex"))]
+                    Ok(Message::Binary(_)) => continue,
+
                     _ => continue,
                 };
 
