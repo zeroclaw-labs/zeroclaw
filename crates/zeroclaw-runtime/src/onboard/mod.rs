@@ -85,10 +85,10 @@ async fn prompt_field(cfg: &mut Config, ui: &mut dyn OnboardUi, name: &str) -> R
 
     let prompt = name.rsplit('.').next().unwrap_or(name);
     let current = field.display_value;
+    let is_set = !current.is_empty() && current != "<unset>";
 
     if field.is_secret {
-        let has_current = !current.is_empty() && current != "<unset>";
-        if let Some(value) = ui.secret(prompt, has_current).await? {
+        if let Some(value) = ui.secret(prompt, is_set).await? {
             cfg.set_prop(name, &value)?;
         }
         return Ok(());
@@ -103,16 +103,17 @@ async fn prompt_field(cfg: &mut Config, ui: &mut dyn OnboardUi, name: &str) -> R
             }
         }
         PropKind::String | PropKind::Integer | PropKind::Float => {
-            let new = ui.string(prompt, Some(&current)).await?;
-            if new != current {
+            let default = if is_set { Some(current.as_str()) } else { None };
+            let new = ui.string(prompt, default).await?;
+            // Empty input on an unset Option field = leave it unset.
+            // Empty input on a set field = would be a clear; set_prop with "" will
+            // remove the key (serde_set_prop handles the Option case).
+            if new != current && !(new.is_empty() && !is_set) {
                 cfg.set_prop(name, &new)?;
             }
         }
         PropKind::Enum => {
-            let variants = field
-                .enum_variants
-                .map(|get| get())
-                .unwrap_or_default();
+            let variants = field.enum_variants.map(|get| get()).unwrap_or_default();
             if variants.is_empty() {
                 ui.warn(&format!("skipping {name}: no enum variants exposed"));
                 return Ok(());
@@ -174,7 +175,63 @@ async fn workspace(cfg: &mut Config, ui: &mut dyn OnboardUi, _flags: &Flags) -> 
     Ok(())
 }
 
-async fn providers(_cfg: &mut Config, _ui: &mut dyn OnboardUi, _flags: &Flags) -> Result<()> {
+async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Result<()> {
+    // Menu is driven by zeroclaw_providers::list_providers() — single source
+    // of truth for canonical names, display names, aliases. Badges show which
+    // provider is the current fallback and which already have a stored config.
+    let entries = zeroclaw_providers::list_providers();
+    let current_fallback = cfg.providers.fallback.clone().unwrap_or_default();
+    let current_idx = entries.iter().position(|p| p.name == current_fallback);
+
+    let picked = if let Some(forced) = &flags.provider {
+        forced.clone()
+    } else {
+        let options: Vec<SelectItem> = entries
+            .iter()
+            .map(|p| {
+                let configured = cfg.providers.models.contains_key(p.name);
+                let is_active = p.name == current_fallback;
+                let badge = match (is_active, configured) {
+                    (true, _) => Some("[active]".into()),
+                    (_, true) => Some("[configured]".into()),
+                    _ => None,
+                };
+                SelectItem {
+                    label: p.display_name.to_string(),
+                    badge,
+                }
+            })
+            .collect();
+        let idx = ui.select("Provider", &options, current_idx).await?;
+        entries[idx].name.to_string()
+    };
+
+    if picked != current_fallback {
+        cfg.set_prop("providers.fallback", &picked)?;
+    }
+
+    // Seed the HashMap entry so prop_fields enumerates its fields. Default
+    // ModelProviderConfig is empty; set_prop fills it as we prompt.
+    cfg.providers
+        .models
+        .entry(picked.clone())
+        .or_insert_with(Default::default);
+
+    // Apply CLI-flag overrides up front, then skip those names in the
+    // interactive pass so the user isn't re-prompted for what they already
+    // passed on the command line.
+    let prefix = format!("providers.models.{picked}");
+    let mut excludes: Vec<&str> = Vec::new();
+    if let Some(api_key) = &flags.api_key {
+        cfg.set_prop(&format!("{prefix}.api-key"), api_key)?;
+        excludes.push("api-key");
+    }
+    if let Some(model) = &flags.model {
+        cfg.set_prop(&format!("{prefix}.model"), model)?;
+        excludes.push("model");
+    }
+
+    prompt_fields_under(cfg, ui, &prefix, &excludes).await?;
     Ok(())
 }
 
