@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use dialoguer::{Confirm, Editor, Input, Password, Select};
+use dialoguer::{Confirm, Editor, FuzzySelect, Input, Password};
 use zeroclaw_config::traits::{OnboardUi, SelectItem};
 
 pub struct TermUi;
@@ -70,7 +70,10 @@ impl OnboardUi for TermUi {
             })
             .collect();
         tokio::task::spawn_blocking(move || {
-            let mut select = Select::new().with_prompt(prompt).items(&labels);
+            // FuzzySelect accepts typed input to filter — essential for lists
+            // like OpenRouter's 343-model catalog. Small lists degrade to
+            // arrow-key navigation; typing is additive.
+            let mut select = FuzzySelect::new().with_prompt(prompt).items(&labels);
             if let Some(index) = current {
                 select = select.default(index);
             }
