@@ -90,17 +90,51 @@ pub fn diagnose(config: &Config) -> Vec<DiagResult> {
 }
 
 /// Run diagnostics and print human-readable report to stdout.
-pub fn run(config: &Config) -> Result<()> {
-    let results = diagnose(config);
+async fn probe_models(config: &Config) -> Vec<DiagResult> {
+    let targets = doctor_model_targets(config, None);
+    let mut out = Vec::new();
 
-    // Print report
+    for provider_name in &targets {
+        let result = match zeroclaw_providers::create_provider(provider_name, None) {
+            Ok(handle) => handle.list_models().await,
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(models) => out.push(DiagResult {
+                severity: Severity::Ok,
+                category: "providers.models".to_string(),
+                message: format!("{}: {} models", provider_name, models.len()),
+            }),
+            Err(e) => {
+                let text = format_error_chain(&e);
+                let severity = match classify_model_probe_error(&text) {
+                    ModelProbeOutcome::Skipped => Severity::Warn,
+                    ModelProbeOutcome::AuthOrAccess => Severity::Warn,
+                    ModelProbeOutcome::Ok | ModelProbeOutcome::Error => Severity::Error,
+                };
+                out.push(DiagResult {
+                    severity,
+                    category: "providers.models".to_string(),
+                    message: format!("{}: {}", provider_name, truncate_for_display(&text, 120)),
+                });
+            }
+        }
+    }
+
+    out
+}
+
+pub async fn run(config: &Config) -> Result<()> {
+    let mut results = diagnose(config);
+    results.extend(probe_models(config).await);
+
     println!("🩺 ZeroClaw Doctor (enhanced)");
     println!();
 
-    let mut current_cat = "";
+    let mut current_cat = String::new();
     for item in &results {
         if item.category != current_cat {
-            current_cat = &item.category;
+            current_cat = item.category.clone();
             println!("  [{current_cat}]");
         }
         let icon = match item.severity {
@@ -111,24 +145,195 @@ pub fn run(config: &Config) -> Result<()> {
         println!("    {} {}", icon, item.message);
     }
 
-    let errors = results
-        .iter()
-        .filter(|i| i.severity == Severity::Error)
-        .count();
-    let warns = results
-        .iter()
-        .filter(|i| i.severity == Severity::Warn)
-        .count();
-    let oks = results
-        .iter()
-        .filter(|i| i.severity == Severity::Ok)
-        .count();
+    let errors = results.iter().filter(|i| i.severity == Severity::Error).count();
+    let warns = results.iter().filter(|i| i.severity == Severity::Warn).count();
+    let oks = results.iter().filter(|i| i.severity == Severity::Ok).count();
 
     println!();
     println!("  Summary: {oks} ok, {warns} warnings, {errors} errors");
 
     if errors > 0 {
         println!("  💡 Fix the errors above, then run `zeroclaw doctor` again.");
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelProbeOutcome {
+    Ok,
+    Skipped,
+    AuthOrAccess,
+    Error,
+}
+
+fn model_probe_status_label(outcome: ModelProbeOutcome) -> &'static str {
+    match outcome {
+        ModelProbeOutcome::Ok => "ok",
+        ModelProbeOutcome::Skipped => "skipped",
+        ModelProbeOutcome::AuthOrAccess => "auth/access",
+        ModelProbeOutcome::Error => "error",
+    }
+}
+
+fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
+    let lower = err_message.to_lowercase();
+
+    if lower.contains("does not support live model discovery") {
+        return ModelProbeOutcome::Skipped;
+    }
+
+    if [
+        "401",
+        "403",
+        "429",
+        "unauthorized",
+        "forbidden",
+        "api key",
+        "token",
+        "insufficient balance",
+        "insufficient quota",
+        "plan does not include",
+        "rate limit",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
+    {
+        return ModelProbeOutcome::AuthOrAccess;
+    }
+
+    ModelProbeOutcome::Error
+}
+
+fn doctor_model_targets(config: &Config, provider_override: Option<&str>) -> Vec<String> {
+    if let Some(provider) = provider_override.map(str::trim).filter(|p| !p.is_empty()) {
+        return vec![provider.to_string()];
+    }
+
+    config.providers.models.keys().cloned().collect()
+}
+
+pub async fn run_models(
+    config: &Config,
+    provider_override: Option<&str>,
+    _use_cache: bool,
+) -> Result<()> {
+    let targets = doctor_model_targets(config, provider_override);
+
+    if targets.is_empty() {
+        anyhow::bail!("No configured providers to probe — run `zeroclaw onboard providers` first");
+    }
+
+    println!("🩺 ZeroClaw Doctor — Model Catalog Probe");
+    println!("  Providers to probe: {}", targets.len());
+    println!();
+
+    let mut ok_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut auth_count = 0usize;
+    let mut error_count = 0usize;
+    let mut matrix_rows: Vec<(String, ModelProbeOutcome, Option<usize>, String)> = Vec::new();
+
+    for provider_name in &targets {
+        println!("  [{}]", provider_name);
+
+        let outcome = match zeroclaw_providers::create_provider(provider_name, None) {
+            Ok(handle) => handle.list_models().await,
+            Err(e) => Err(e),
+        };
+
+        match outcome {
+            Ok(models) => {
+                ok_count += 1;
+                println!("    ✅ {} models", models.len());
+                matrix_rows.push((
+                    provider_name.clone(),
+                    ModelProbeOutcome::Ok,
+                    Some(models.len()),
+                    "catalog fetched".to_string(),
+                ));
+            }
+            Err(error) => {
+                let error_text = format_error_chain(&error);
+                match classify_model_probe_error(&error_text) {
+                    ModelProbeOutcome::Skipped => {
+                        skipped_count += 1;
+                        println!("    ⚪ skipped: {}", truncate_for_display(&error_text, 160));
+                        matrix_rows.push((
+                            provider_name.clone(),
+                            ModelProbeOutcome::Skipped,
+                            None,
+                            truncate_for_display(&error_text, 120),
+                        ));
+                    }
+                    ModelProbeOutcome::AuthOrAccess => {
+                        auth_count += 1;
+                        println!(
+                            "    ⚠️  auth/access: {}",
+                            truncate_for_display(&error_text, 160)
+                        );
+                        matrix_rows.push((
+                            provider_name.clone(),
+                            ModelProbeOutcome::AuthOrAccess,
+                            None,
+                            truncate_for_display(&error_text, 120),
+                        ));
+                    }
+                    ModelProbeOutcome::Error | ModelProbeOutcome::Ok => {
+                        error_count += 1;
+                        println!("    ❌ error: {}", truncate_for_display(&error_text, 160));
+                        matrix_rows.push((
+                            provider_name.clone(),
+                            ModelProbeOutcome::Error,
+                            None,
+                            truncate_for_display(&error_text, 120),
+                        ));
+                    }
+                }
+            }
+        }
+
+        println!();
+    }
+
+    println!(
+        "  Summary: {} ok, {} skipped, {} auth/access, {} errors",
+        ok_count, skipped_count, auth_count, error_count
+    );
+
+    if !matrix_rows.is_empty() {
+        println!();
+        println!("  Connectivity matrix:");
+        println!(
+            "  {:<18} {:<12} {:<8} detail",
+            "provider", "status", "models"
+        );
+        println!(
+            "  {:<18} {:<12} {:<8} ------",
+            "------------------", "------------", "--------"
+        );
+        for (provider, outcome, models_count, detail) in matrix_rows {
+            let models_text = models_count
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "  {:<18} {:<12} {:<8} {}",
+                provider,
+                model_probe_status_label(outcome),
+                models_text,
+                detail
+            );
+        }
+    }
+
+    if auth_count > 0 {
+        println!(
+            "  💡 Some providers need valid API keys/plan access before `/models` can be fetched."
+        );
+    }
+
+    if provider_override.is_some() && ok_count == 0 {
+        anyhow::bail!("Model probe failed for target provider")
     }
 
     Ok(())
@@ -786,6 +991,22 @@ fn check_command_available(cmd: &str, args: &[&str], cat: &'static str, items: &
             items.push(DiagItem::warn(cat, format!("{cmd} not found in PATH")));
         }
     }
+}
+
+fn format_error_chain(error: &anyhow::Error) -> String {
+    let mut parts = Vec::new();
+    for cause in error.chain() {
+        let message = cause.to_string();
+        if !message.is_empty() {
+            parts.push(message);
+        }
+    }
+
+    if parts.is_empty() {
+        return String::new();
+    }
+
+    parts.join(": ")
 }
 
 fn truncate_for_display(input: &str, max_chars: usize) -> String {

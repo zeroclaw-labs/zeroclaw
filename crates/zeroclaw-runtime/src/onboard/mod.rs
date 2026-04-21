@@ -641,26 +641,6 @@ async fn offer_advanced_settings(
     prompt_fields_under(cfg, ui, prefix, &["model", "api-key"], &defaults).await
 }
 
-/// Per-provider example model-id used in the manual-entry fallback prompt.
-/// Small colocated table (per ADR #5951 — consolidating into `ProviderInfo`
-/// is a separate follow-up). Providers not listed get a generic example.
-fn model_id_hint(provider: &str) -> &'static str {
-    match provider {
-        "anthropic" => "claude-opus-4-6",
-        "openai" => "gpt-4o",
-        "openrouter" => "anthropic/claude-opus-4.6",
-        "gemini" | "google" => "gemini-2.0-flash",
-        "bedrock" => "anthropic.claude-opus-4-v1:0",
-        "azure" => "gpt-4o",
-        "ollama" => "llama3.2",
-        "mistral" => "mistral-large-latest",
-        "groq" => "llama-3.3-70b-versatile",
-        "deepseek" => "deepseek-chat",
-        "xai" | "grok" => "grok-beta",
-        _ => "provider/model-id",
-    }
-}
-
 /// Prompt for the model field using the provider's live model catalog.
 ///
 /// Calls `Provider::list_models()` (no auth — see `zeroclaw-providers`
@@ -692,10 +672,7 @@ async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, provider: &str) 
             // Live fetch failed / provider doesn't expose no-auth listing.
             // Give the user a provider-flavored nudge so they don't have to
             // guess the model-id format.
-            ui.note(&format!(
-                "Couldn't reach the provider's model catalog. Type an id manually — e.g. `{}`.",
-                model_id_hint(provider)
-            ));
+            ui.note("Couldn't reach the provider's model catalog. Check the provider's docs for the exact model id format, then enter it manually.");
             let default = if is_set { Some(current.as_str()) } else { None };
             match ui.string("Model id", default).await? {
                 Answer::Back => return Ok(Nav::Back),

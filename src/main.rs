@@ -1776,8 +1776,9 @@ async fn main() -> Result<()> {
 
         Commands::Models { model_command: _ } => {
             bail!(
-                "`zeroclaw models` is temporarily disabled during the onboard rewrite — \
-                 see https://github.com/zeroclaw-labs/zeroclaw/issues/5951"
+                "`zeroclaw models` is temporarily disabled — \
+                 use `zeroclaw onboard providers` for the live model picker, \
+                 or check `providers.models.<name>.model` in your config.toml"
             );
         }
 
@@ -1824,10 +1825,10 @@ async fn main() -> Result<()> {
         }
 
         Commands::Doctor { doctor_command } => match doctor_command {
-            Some(DoctorCommands::Models { .. }) => bail!(
-                "`zeroclaw doctor models` is temporarily disabled during the onboard rewrite — \
-                 see https://github.com/zeroclaw-labs/zeroclaw/issues/5951"
-            ),
+            Some(DoctorCommands::Models {
+                provider,
+                use_cache,
+            }) => doctor::run_models(&config, provider.as_deref(), use_cache).await,
             Some(DoctorCommands::Traces {
                 id,
                 event,
@@ -1840,7 +1841,7 @@ async fn main() -> Result<()> {
                 contains.as_deref(),
                 limit,
             ),
-            None => doctor::run(&config),
+            None => doctor::run(&config).await,
         },
 
         Commands::Channel { channel_command } => match channel_command {
