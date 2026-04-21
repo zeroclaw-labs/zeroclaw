@@ -106,10 +106,18 @@ impl Drop for RatatuiUi {
     }
 }
 
-fn split(area: Rect) -> (Rect, Rect) {
+/// Vertical layout: top log panel (flex) + bottom prompt bar sized to the
+/// prompt text so long doc-comment labels don't get truncated.
+fn split(area: Rect, prompt_text: &str) -> (Rect, Rect) {
+    let inner_width = area.width.saturating_sub(2).max(1) as usize; // minus borders
+    let wrapped_rows = prompt_text
+        .split('\n')
+        .map(|line| line.len().div_ceil(inner_width).max(1))
+        .sum::<usize>();
+    let bottom_rows = (wrapped_rows + 2).clamp(3, (area.height / 2) as usize) as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .constraints([Constraint::Min(3), Constraint::Length(bottom_rows)])
         .split(area);
     (chunks[0], chunks[1])
 }
@@ -133,17 +141,17 @@ impl OnboardUi for RatatuiUi {
         let mut choice = default;
         loop {
             let log = log_panel(&self.log);
-            let prompt = prompt.to_string();
+            let label = format!(
+                "{prompt}  [{}] (y/n, Enter confirms)",
+                if choice { "Yes" } else { "No" }
+            );
             self.terminal.draw(|frame| {
-                let (top, bottom) = split(frame.area());
+                let (top, bottom) = split(frame.area(), &label);
                 frame.render_widget(log, top);
-                let label = format!(
-                    "{prompt}  [{}] (y/n, Enter confirms)",
-                    if choice { "Yes" } else { "No" }
-                );
                 frame.render_widget(
-                    Paragraph::new(label)
+                    Paragraph::new(label.clone())
                         .style(theme::body_style())
+                        .wrap(Wrap { trim: false })
                         .block(Block::default().borders(Borders::ALL)),
                     bottom,
                 );
@@ -165,8 +173,11 @@ impl OnboardUi for RatatuiUi {
             let log = log_panel(&self.log);
             let label = prompt.to_string();
             let input = buffer.clone();
+            // Approximate the InputPrompt's rendered width so split() can
+            // allocate enough bottom rows for wrapped labels.
+            let measure = format!("{label}  {input}");
             self.terminal.draw(|frame| {
-                let (top, bottom) = split(frame.area());
+                let (top, bottom) = split(frame.area(), &measure);
                 frame.render_widget(log, top);
                 frame.render_widget(
                     InputPrompt {
@@ -214,8 +225,9 @@ impl OnboardUi for RatatuiUi {
             let log = log_panel(&self.log);
             let label = prompt.to_string();
             let input = buffer.clone();
+            let measure = label.clone();
             self.terminal.draw(|frame| {
-                let (top, bottom) = split(frame.area());
+                let (top, bottom) = split(frame.area(), &measure);
                 frame.render_widget(log, top);
                 frame.render_widget(
                     InputPrompt {
