@@ -367,6 +367,12 @@ pub struct Config {
     #[nested]
     pub workspace: WorkspaceConfig,
 
+    /// Meta-state for `zeroclaw onboard` (which sections the user has
+    /// already walked through). Not user-facing config (`[onboard_state]`).
+    #[serde(default)]
+    #[nested]
+    pub onboard_state: OnboardStateConfig,
+
     /// Notion integration configuration (`[notion]`).
     #[serde(default)]
     #[nested]
@@ -459,6 +465,23 @@ pub struct Config {
 /// When enabled, each client engagement gets an isolated workspace with
 /// separate memory, audit, secrets, and tool restrictions.
 #[allow(clippy::struct_excessive_bools)]
+/// Opaque state the `zeroclaw onboard` flow writes so it can tell, on a
+/// re-run, which sections the user has already walked through at least
+/// once — which lets it offer "Reconfigure? [y/N]" skip gates instead of
+/// forcing users through every field again.
+///
+/// This is meta-state about the onboard process, not user-facing config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "onboard_state"]
+pub struct OnboardStateConfig {
+    /// Section keys the user has completed at least once via onboard.
+    /// Values are the lowercased Section variant names
+    /// (`"workspace"`, `"providers"`, …).
+    #[serde(default)]
+    pub completed_sections: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "workspace"]
@@ -9303,6 +9326,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
             workspace: WorkspaceConfig::default(),
+            onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),
@@ -11963,6 +11987,7 @@ auto_save = true
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
             workspace: WorkspaceConfig::default(),
+            onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),
@@ -12532,6 +12557,7 @@ default_temperature = 0.7
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
             workspace: WorkspaceConfig::default(),
+            onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),

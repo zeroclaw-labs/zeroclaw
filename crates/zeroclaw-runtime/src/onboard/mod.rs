@@ -178,26 +178,52 @@ async fn prompt_fields_under(
     Ok(())
 }
 
-/// Section-level skip gate. When the section is already meaningfully
-/// configured, offer to skip reconfiguration. Flags.force bypasses the
-/// gate (forces reconfiguration). Quick mode bypasses too — scripts want
-/// deterministic behavior, not prompts.
+/// Section-level skip gate. The signal is `onboard_state.completed_sections`
+/// — sections that have actually been walked through before. `--force`
+/// bypasses (always reconfigure), as does any per-section CLI override flag
+/// the caller deems relevant.
 async fn skip_if_configured(
+    cfg: &Config,
     ui: &mut dyn OnboardUi,
     flags: &Flags,
-    section: &str,
-    already_configured: bool,
+    section_key: &str,
+    label: &str,
 ) -> Result<bool> {
-    if flags.force || !already_configured {
+    if flags.force {
+        return Ok(false);
+    }
+    let seen = cfg
+        .onboard_state
+        .completed_sections
+        .iter()
+        .any(|s| s == section_key);
+    if !seen {
         return Ok(false);
     }
     let reconfigure = ui
         .confirm(
-            &format!("{section} is already configured. Reconfigure?"),
+            &format!("{label} is already configured. Reconfigure?"),
             false,
         )
         .await?;
     Ok(!reconfigure)
+}
+
+/// Record that a section finished so the next run's skip gate can fire.
+async fn mark_completed(cfg: &mut Config, section_key: &str) -> Result<()> {
+    if cfg
+        .onboard_state
+        .completed_sections
+        .iter()
+        .any(|s| s == section_key)
+    {
+        return Ok(());
+    }
+    cfg.onboard_state
+        .completed_sections
+        .push(section_key.to_string());
+    cfg.save().await?;
+    Ok(())
 }
 
 // ── Sections ─────────────────────────────────────────────────────────────
@@ -210,22 +236,33 @@ async fn workspace(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
         "Workspace directory: {}",
         cfg.workspace_dir.display()
     ));
-    if skip_if_configured(ui, flags, "Workspace", cfg.workspace.enabled).await? {
+    if skip_if_configured(cfg, ui, flags, "workspace", "Workspace").await? {
         return Ok(());
     }
     prompt_field(cfg, ui, "workspace.enabled").await?;
     if cfg.workspace.enabled {
         prompt_fields_under(cfg, ui, "workspace", &["enabled"]).await?;
     }
-    Ok(())
+    mark_completed(cfg, "workspace").await
 }
 
 async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Result<()> {
     ui.note("");
-    let already = cfg.providers.fallback.is_some() && flags.provider.is_none();
-    if skip_if_configured(ui, flags, "Providers", already).await? {
+    if flags.provider.is_none()
+        && skip_if_configured(cfg, ui, flags, "providers", "Providers").await?
+    {
         return Ok(());
     }
+    // Surface both auth paths up front so users with an existing key go
+    // straight to the api_key prompt, and users on OAuth-only providers
+    // (Codex, Claude Code, etc.) know to use the separate login flow.
+    // No provider list encoded here — auth login's own provider match is
+    // the source of truth for which names it supports.
+    ui.note(
+        "Paste an API key (e.g. `sk-ant-…` for Anthropic, `sk-…` for OpenAI) \
+         when prompted. For OAuth-based providers run: \
+         zeroclaw auth login --provider <name>",
+    );
     // Menu is driven by zeroclaw_providers::list_providers() — single source
     // of truth for canonical names, display names, aliases. Badges show which
     // provider is the current fallback and which already have a stored config.
@@ -276,12 +313,13 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
     }
     if let Some(model) = &flags.model {
         persist(cfg, &format!("{prefix}.model"), model).await?;
-        return prompt_fields_under(cfg, ui, &prefix, &excludes).await;
+        prompt_fields_under(cfg, ui, &prefix, &excludes).await?;
+        return mark_completed(cfg, "providers").await;
     }
 
     prompt_fields_under(cfg, ui, &prefix, &excludes).await?;
     prompt_model(cfg, ui, &picked).await?;
-    Ok(())
+    mark_completed(cfg, "providers").await
 }
 
 /// Prompt for the model field using the provider's live model catalog.
@@ -320,11 +358,7 @@ async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, provider: &str) 
 
 async fn channels(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Result<()> {
     ui.note("");
-    let already = cfg
-        .prop_fields()
-        .iter()
-        .any(|f| f.name.starts_with("channels.") && f.name.matches('.').count() >= 2);
-    if skip_if_configured(ui, flags, "Channels", already).await? {
+    if skip_if_configured(cfg, ui, flags, "channels", "Channels").await? {
         return Ok(());
     }
     loop {
@@ -377,16 +411,14 @@ async fn channels(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Re
         cfg.save().await?;
         prompt_fields_under(cfg, ui, &prefix, &[]).await?;
     }
-    Ok(())
+    mark_completed(cfg, "channels").await
 }
 
 async fn memory(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Result<()> {
     ui.note("");
-    // Memory always has a backend set (default "sqlite"). "Configured" here
-    // means the user has deviated from the default OR explicitly disabled
-    // auto-save — both count as a deliberate choice.
-    let already = cfg.memory.backend != "sqlite" || !cfg.memory.auto_save;
-    if skip_if_configured(ui, flags, "Memory", already).await? && flags.memory.is_none() {
+    if flags.memory.is_none()
+        && skip_if_configured(cfg, ui, flags, "memory", "Memory").await?
+    {
         return Ok(());
     }
     // Backend: registry-driven select (key + label both come from
@@ -406,25 +438,25 @@ async fn memory(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Resu
         persist(cfg, "memory.backend", &new_backend).await?;
     }
 
-    prompt_field(cfg, ui, "memory.auto-save").await
+    prompt_field(cfg, ui, "memory.auto-save").await?;
+    mark_completed(cfg, "memory").await
 }
 
 async fn hardware(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Result<()> {
     ui.note("");
-    if skip_if_configured(ui, flags, "Hardware", cfg.hardware.enabled).await? {
+    if skip_if_configured(cfg, ui, flags, "hardware", "Hardware").await? {
         return Ok(());
     }
     prompt_field(cfg, ui, "hardware.enabled").await?;
     if cfg.hardware.enabled {
         prompt_fields_under(cfg, ui, "hardware", &["enabled"]).await?;
     }
-    Ok(())
+    mark_completed(cfg, "hardware").await
 }
 
 async fn tunnel(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Result<()> {
     ui.note("");
-    let already = cfg.tunnel.provider != "none";
-    if skip_if_configured(ui, flags, "Tunnel", already).await? {
+    if skip_if_configured(cfg, ui, flags, "tunnel", "Tunnel").await? {
         return Ok(());
     }
     // Provider list is derived from the schema: each `tunnel.<name>.*` field
@@ -461,5 +493,5 @@ async fn tunnel(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Resu
         cfg.save().await?;
         prompt_fields_under(cfg, ui, &prefix, &[]).await?;
     }
-    Ok(())
+    mark_completed(cfg, "tunnel").await
 }
