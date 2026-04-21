@@ -190,17 +190,12 @@ async fn handle_socket(
     // ── Voice duplex session state (gated by feature flag) ──
     #[cfg(feature = "gateway-voice-duplex")]
     let mut voice_session = {
-        let duplex_enabled = state
-            .config
-            .lock()
-            .channels
-            .voice_duplex
-            .as_ref()
-            .is_some_and(|v| v.enabled);
-        if duplex_enabled {
-            Some(crate::voice_duplex::VoiceDuplexSession::new())
-        } else {
-            None
+        let cfg = state.config.lock().channels.voice_duplex.clone();
+        match cfg {
+            Some(ref v) if v.enabled => {
+                Some(crate::voice_duplex::VoiceDuplexSession::from_config(v))
+            }
+            _ => None,
         }
     };
     #[cfg(not(feature = "gateway-voice-duplex"))]

@@ -8600,13 +8600,44 @@ impl ChannelConfig for BlueskyConfig {
 ///
 /// Enables full-duplex voice event handling over WebSocket.
 /// When disabled (default), voice events are rejected as unknown types.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct VoiceDuplexConfig {
     /// Enable full-duplex voice event handling over WebSocket.
     /// Default: false. When false, voice events are rejected as unknown types.
     #[serde(default)]
     pub enabled: bool,
+
+    /// RMS energy threshold for the energy-based VAD.
+    /// Audio chunks with RMS energy above this value are considered speech.
+    /// Default: 0.01. Range: (0.0, 1.0].
+    #[serde(default = "default_vad_energy_threshold")]
+    pub vad_energy_threshold: f32,
+
+    /// Silence duration in milliseconds before the VAD declares speech has ended.
+    /// After this many milliseconds of continuous sub-threshold audio,
+    /// a `SpeechEnd` event is emitted.
+    /// Default: 500.
+    #[serde(default = "default_vad_silence_timeout_ms")]
+    pub vad_silence_timeout_ms: u32,
+}
+
+impl Default for VoiceDuplexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            vad_energy_threshold: default_vad_energy_threshold(),
+            vad_silence_timeout_ms: default_vad_silence_timeout_ms(),
+        }
+    }
+}
+
+fn default_vad_energy_threshold() -> f32 {
+    0.01
+}
+
+fn default_vad_silence_timeout_ms() -> u32 {
+    500
 }
 
 /// Voice wake word detection channel configuration.

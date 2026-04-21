@@ -188,17 +188,32 @@ pub fn pcm16_to_f32(pcm: &[u8]) -> Vec<f32> {
 pub struct VoiceDuplexSession {
     /// Whether the client has advertised binary audio capability.
     pub binary_audio: bool,
-    /// VAD instance for this session (`NoopVad` until a real impl lands).
+    /// VAD instance for this session.
     pub vad: Box<dyn zeroclaw_api::vad::Vad>,
 }
 
 impl VoiceDuplexSession {
-    /// Create a new session with binary audio disabled and a no-op VAD.
-    pub fn new() -> Self {
+    /// Create a new session with binary audio disabled and an energy-based VAD.
+    ///
+    /// Uses the VAD parameters from `config` to construct an [`EnergyVad`].
+    /// Falls back to default threshold (0.01) and silence timeout (500 ms)
+    /// if config values are not set.
+    pub fn from_config(config: &zeroclaw_config::schema::VoiceDuplexConfig) -> Self {
+        let vad: Box<dyn zeroclaw_api::vad::Vad> = Box::new(zeroclaw_api::vad::EnergyVad::new(
+            config.vad_energy_threshold,
+            u64::from(config.vad_silence_timeout_ms),
+        ));
         Self {
             binary_audio: false,
-            vad: Box::new(zeroclaw_api::vad::NoopVad),
+            vad,
         }
+    }
+
+    /// Create a new session with binary audio disabled and default VAD settings.
+    ///
+    /// Equivalent to `from_config(&VoiceDuplexConfig::default())`.
+    pub fn new() -> Self {
+        Self::from_config(&zeroclaw_config::schema::VoiceDuplexConfig::default())
     }
 
     /// Enable binary audio after successful capability negotiation.
@@ -410,11 +425,44 @@ mod tests {
     }
 
     #[test]
-    fn voice_duplex_session_process_frame_noop() {
+    fn voice_duplex_session_process_frame_detects_speech() {
         let mut session = VoiceDuplexSession::new();
-        let samples = vec![0.5f32; 160];
-        let event = session.process_frame(&samples);
-        assert_eq!(event, zeroclaw_api::vad::VadEvent::Silence);
+        let loud = vec![0.5f32; 160];
+        let quiet = vec![0.001f32; 160];
+
+        // Loud input should trigger SpeechStart
+        let event = session.process_frame(&loud);
+        assert_eq!(event, zeroclaw_api::vad::VadEvent::SpeechStart);
+
+        // Quiet input after speech — no timeout yet → Silence
+        assert_eq!(
+            session.process_frame(&quiet),
+            zeroclaw_api::vad::VadEvent::Silence
+        );
+    }
+
+    #[test]
+    fn voice_duplex_session_from_config_custom() {
+        let config = zeroclaw_config::schema::VoiceDuplexConfig {
+            enabled: true,
+            vad_energy_threshold: 0.5,
+            vad_silence_timeout_ms: 100,
+        };
+        let mut session = VoiceDuplexSession::from_config(&config);
+
+        // Moderate input below high threshold → Silence
+        let moderate = vec![0.1f32; 160];
+        assert_eq!(
+            session.process_frame(&moderate),
+            zeroclaw_api::vad::VadEvent::Silence
+        );
+
+        // Very loud input above threshold → SpeechStart
+        let very_loud = vec![0.9f32; 160];
+        assert_eq!(
+            session.process_frame(&very_loud),
+            zeroclaw_api::vad::VadEvent::SpeechStart
+        );
     }
 
     #[test]
