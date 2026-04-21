@@ -3116,8 +3116,10 @@ Ensure only one `zeroclaw` process is using this bot token."
     ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
-        // Parse recipient for chat_id (may contain ":thread_id" suffix).
-        let chat_id = recipient.split_once(':').map_or(recipient, |(c, _)| c);
+        // Parse recipient for chat_id + optional thread_id ("chat_id:thread_id" format).
+        let (chat_id, thread_id) = recipient
+            .split_once(':')
+            .map_or((recipient, None), |(c, t)| (c, Some(t)));
 
         // Unique key embedded in callback_data so listen() can route the tap.
         let approval_id = uuid::Uuid::new_v4().to_string();
@@ -3139,12 +3141,15 @@ Ensure only one `zeroclaw` process is using this bot token."
             ]]
         });
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "chat_id": chat_id,
             "text": text,
             "parse_mode": "HTML",
             "reply_markup": reply_markup,
         });
+        if let Some(tid) = thread_id {
+            body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+        }
 
         // Register the oneshot BEFORE sending the message to avoid a race
         // where the user taps the button before the sender is in the map.
