@@ -38,6 +38,40 @@ The single source of truth for PR quality. Jobs:
 
 ---
 
+## Build Cache
+
+All jobs in `ci.yml` use `Swatinem/rust-cache@v2` to cache compiled
+dependencies between runs. Key behaviors:
+
+**Cache writes are master-only.** The `save-if` condition is
+`github.ref == 'refs/heads/master'`, so cache is only written when a PR
+merges. PR runs read the cache seeded by the most recent master commit but
+never update it. This prevents PR branches from polluting the shared cache
+with branch-specific artifacts.
+
+**Cache is saved on failure.** `cache-on-failure: true` is set on every job.
+A run that fails part-way through still saves whatever it compiled, so a
+retry or a follow-up fix PR starts warm rather than cold.
+
+**Windows has no Rust cache.** The `build` job applies
+`if: runner.os != 'Windows'` to the cache step. Windows path handling causes
+cache poisoning with `rust-cache`, so the Windows build target always runs
+cold.
+
+**Incremental compilation is disabled globally.** `CARGO_INCREMENTAL: 0` is
+set in the workflow-level `env` block. Incremental builds are counterproductive
+in CI — they consume extra cache space and can produce incorrect results when
+the cache is partially stale. Disabling it keeps the cache smaller and
+results reproducible.
+
+**`cargo-deny` is not cached.** The `security` job installs it fresh each run
+via `cargo install cargo-deny --locked`. This compiles from source on every
+run. A future improvement would be to use a pre-built binary
+(e.g. `taiki-e/install-action`) to match the approach already used for
+`cargo-nextest`.
+
+---
+
 ## Non-Blocking — Release
 
 ### `release-stable-manual.yml` — Release Stable
