@@ -124,17 +124,109 @@ shell_export_syntax() {
   esac
 }
 
+# ── Platform / target triple detection ───────────────────────────
+
+detect_target_triple() {
+  local os arch
+  os=$(uname -s)
+  arch=$(uname -m)
+
+  case "$os" in
+    Darwin) echo "aarch64-apple-darwin" ;;   # presume M-series
+    Linux)
+      case "$arch" in
+        x86_64)          echo "x86_64-unknown-linux-gnu" ;;
+        aarch64|arm64)   echo "aarch64-unknown-linux-gnu" ;;
+        armv7l)          echo "armv7-unknown-linux-gnueabihf" ;;
+        armv6l|arm*)     echo "arm-unknown-linux-gnueabihf" ;;
+        *)               echo "" ;;
+      esac ;;
+    *) echo "" ;;
+  esac
+}
+
+# ── Pre-built binary install ──────────────────────────────────────
+
+install_prebuilt() {
+  local triple version asset_name asset_url sha256_url tmp_dir
+  triple=$(detect_target_triple)
+
+  if [ -z "$triple" ]; then
+    warn "No pre-built binary for this platform — falling back to source build"
+    return 1
+  fi
+
+  # Resolve latest release version via GitHub API
+  version=$(curl -fsSL "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest" \
+    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\(.*\)".*/\1/')
+
+  if [ -z "$version" ]; then
+    warn "Could not resolve latest release — falling back to source build"
+    return 1
+  fi
+
+  asset_name="zeroclaw-${triple}.tar.gz"
+  asset_url="https://github.com/zeroclaw-labs/zeroclaw/releases/download/${version}/${asset_name}"
+  sha256_url="https://github.com/zeroclaw-labs/zeroclaw/releases/download/${version}/SHA256SUMS"
+
+  echo
+  printf "%s\n" "$(bold "Installing ZeroClaw ${version} (pre-built)")"
+  info "Platform: $triple"
+  info "Source:   $asset_url"
+  echo
+
+  if [ "$DRY_RUN" = true ]; then
+    info "[dry-run] Would download $asset_url"
+    info "[dry-run] Would install to $CARGO_HOME/bin/zeroclaw"
+    return 0
+  fi
+
+  tmp_dir=$(mktemp -d)
+  trap 'rm -rf "$tmp_dir"' EXIT
+
+  curl -fSL --progress-bar "$asset_url" -o "$tmp_dir/$asset_name" \
+    || { warn "Download failed — falling back to source build"; rm -rf "$tmp_dir"; return 1; }
+
+  # Verify checksum
+  if curl -fsSL "$sha256_url" -o "$tmp_dir/SHA256SUMS" 2>/dev/null; then
+    expected=$(grep "$asset_name" "$tmp_dir/SHA256SUMS" | awk '{print $1}')
+    if [ -n "$expected" ]; then
+      if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$tmp_dir/$asset_name" | awk '{print $1}')
+      elif command -v shasum >/dev/null 2>&1; then
+        actual=$(shasum -a 256 "$tmp_dir/$asset_name" | awk '{print $1}')
+      else
+        actual=""
+      fi
+      if [ -n "$actual" ] && [ "$actual" != "$expected" ]; then
+        die "Checksum mismatch — download may be corrupt. Expected: $expected  Got: $actual"
+      fi
+      [ -n "$actual" ] && info "Checksum verified"
+    fi
+  fi
+
+  tar -xzf "$tmp_dir/$asset_name" -C "$tmp_dir"
+  mkdir -p "$CARGO_HOME/bin"
+  install -m 755 "$tmp_dir/zeroclaw" "$CARGO_HOME/bin/zeroclaw"
+
+  rm -rf "$tmp_dir"
+  trap - EXIT
+  return 0
+}
+
 # ── Usage ─────────────────────────────────────────────────────────
 
 usage() {
   cat <<EOF
-$(bold "ZeroClaw installer") — build and install from source
+$(bold "ZeroClaw installer")
 
 Usage: $0 [options]
 
 Options:
-  --minimal            Build kernel only (config + providers + memory, ~6.6MB)
-  --features X,Y       Select specific features (comma-separated)
+  --prebuilt           Download and install a pre-built binary (default when asked)
+  --source             Build from source (skips the pre-built prompt)
+  --minimal            Build kernel only — source only (config + providers + memory, ~6.6MB)
+  --features X,Y       Select specific features — source only (comma-separated)
   --list-features      Print all available features and exit
   --prefix PATH        Install everything under PATH (default: \$HOME)
                        Sets CARGO_HOME, RUSTUP_HOME, source checkout, config
@@ -145,13 +237,15 @@ Options:
   -V, --version        Show version from Cargo.toml
 
 Examples:
-  $0                                          # full install (interactive)
-  $0 --minimal                                # smallest possible binary
-  $0 --features agent-runtime,channel-discord  # custom feature set
-  $0 --skip-onboard                           # build only, configure later
-  $0 --prefix /tmp/zc-test --skip-onboard     # isolated test install
-  $0 --dry-run --minimal                      # preview without building
-  $0 --uninstall                              # remove ZeroClaw
+  $0                                           # interactive: asks prebuilt or source
+  $0 --prebuilt                                # download pre-built binary (fast)
+  $0 --source                                  # always build from source
+  $0 --source --minimal                        # smallest possible binary
+  $0 --source --features agent-runtime,channel-discord  # custom feature set
+  $0 --skip-onboard                            # install only, configure later
+  $0 --prefix /tmp/zc-test --skip-onboard      # isolated test install
+  $0 --dry-run --prebuilt                      # preview without installing
+  $0 --uninstall                               # remove ZeroClaw
 
 Environment:
   ZEROCLAW_INSTALL_DIR   Source checkout override (default: PREFIX/.zeroclaw/src)
@@ -216,6 +310,7 @@ LIST_FEATURES=false
 UNINSTALL=false
 DRY_RUN=false
 PREFIX="$HOME"
+INSTALL_MODE=""   # ""=ask, "prebuilt"=force prebuilt, "source"=force source
 
 # Support legacy env var
 if [ -n "${ZEROCLAW_CARGO_FEATURES:-}" ]; then
@@ -238,6 +333,8 @@ while [ $# -gt 0 ]; do
       shift; PREFIX=$(echo "$1" | sed 's|/*$||') ;;
     --dry-run)        DRY_RUN=true ;;
     --skip-onboard)   SKIP_ONBOARD=true ;;
+    --prebuilt)       INSTALL_MODE="prebuilt" ;;
+    --source)         INSTALL_MODE="source" ;;
     --uninstall)      UNINSTALL=true ;;
     -h|--help)        usage; exit 0 ;;
     -V|--version)
@@ -277,7 +374,64 @@ if [ "$LIST_FEATURES" = true ]; then
   exit 0
 fi
 
+# ── Decide: pre-built or source ───────────────────────────────────
+
+# --minimal or --features imply source
+if [ "$MINIMAL" = true ] || [ -n "$USER_FEATURES" ]; then
+  INSTALL_MODE="source"
+fi
+
+if [ "$INSTALL_MODE" = "" ]; then
+  triple=$(detect_target_triple)
+  if [ -n "$triple" ]; then
+    if [ -t 0 ]; then
+      echo
+      printf "  %s\n" "$(bold "How would you like to install ZeroClaw?")"
+      printf "  [P] Pre-built binary  — fast, no Rust required  %s\n" "$(bold "(default)")"
+      printf "  [s] Build from source — custom features, latest code\n"
+      printf "\n  Choice [P/s]: "
+      read install_choice
+      case "$install_choice" in
+        [Ss]*) INSTALL_MODE="source" ;;
+        *)     INSTALL_MODE="prebuilt" ;;
+      esac
+    else
+      # Non-interactive (curl | bash): default to pre-built silently
+      INSTALL_MODE="prebuilt"
+    fi
+  else
+    INSTALL_MODE="source"
+  fi
+fi
+
+if [ "$INSTALL_MODE" = "prebuilt" ]; then
+  if install_prebuilt; then
+    PREBUILT_OK=true
+  else
+    warn "Pre-built install failed — continuing with source build"
+    INSTALL_MODE="source"
+    PREBUILT_OK=false
+  fi
+fi
+
+[ "${PREBUILT_OK:-false}" = true ] && [ "$DRY_RUN" != true ] && {
+  BIN="$CARGO_HOME/bin/zeroclaw"
+  if [ -f "$BIN" ]; then
+    NEW_VERSION=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || echo "?")
+    SIZE=$(du -h "$BIN" | awk '{print $1}')
+    echo
+    info "Installed: $BIN (v$NEW_VERSION, $SIZE)"
+  fi
+}
+
 # ── Locate source ─────────────────────────────────────────────────
+
+[ "${PREBUILT_OK:-false}" = true ] && {
+  # Jump past the source build to PATH + onboard
+  SOURCE_SKIPPED=true
+}
+
+if [ "${SOURCE_SKIPPED:-false}" != true ]; then
 
 echo
 printf "%s\n" "$(bold "ZeroClaw — source install")"
@@ -462,6 +616,10 @@ else
   warn "Binary not found at expected path: $BIN"
 fi
 
+fi  # end source build block
+
+BIN="$CARGO_HOME/bin/zeroclaw"
+
 # ── PATH guidance ─────────────────────────────────────────────────
 
 PROFILE=$(detect_shell_profile)
@@ -490,7 +648,7 @@ fi
 
 # ── Onboard ───────────────────────────────────────────────────────
 
-if [ "$SKIP_ONBOARD" = false ] && [ -f "$BIN" ]; then
+if [ "$SKIP_ONBOARD" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
   if [ -t 0 ]; then
     echo
     printf "%s\n" "$(bold "Running setup wizard...")"
