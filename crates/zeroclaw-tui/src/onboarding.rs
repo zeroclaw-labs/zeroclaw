@@ -23,7 +23,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
-use zeroclaw_config::traits::{OnboardUi, SelectItem};
+use zeroclaw_config::traits::{Answer, OnboardUi, SelectItem};
 
 use crate::theme;
 use crate::widgets::{BANNER_HEIGHT, Banner, InfoPanel, InputPrompt};
@@ -33,6 +33,8 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 pub struct RatatuiUi {
     terminal: Term,
     log: Vec<LogLine>,
+    section: Option<String>,
+    subsection: Option<String>,
 }
 
 enum LogLevel {
@@ -55,6 +57,8 @@ impl RatatuiUi {
         Ok(Self {
             terminal,
             log: Vec::new(),
+            section: None,
+            subsection: None,
         })
     }
 
@@ -73,30 +77,42 @@ impl RatatuiUi {
         Ok(())
     }
 
+    /// Compose the panel title from persistent section state. Owned so the
+    /// caller can stash it in a local and then pass a `&str` reference to
+    /// `log_panel` without conflicting borrows on `self`.
+    fn panel_title(&self) -> String {
+        match &self.section {
+            Some(s) => format!("ZeroClaw Onboard › {s}"),
+            None => "ZeroClaw Onboard".to_string(),
+        }
+    }
 }
 
 /// Build the rolling log panel. Free function (not `&self`) so the caller can
 /// hold a shared borrow of `self.log` while `self.terminal` is borrowed
 /// mutably by `draw()`.
-fn log_panel(log: &[LogLine]) -> InfoPanel<'_> {
-    let lines: Vec<Line<'_>> = log
-        .iter()
-        .rev()
-        .take(8)
-        .rev()
-        .map(|entry| {
-            let style = match entry.level {
-                LogLevel::Note => theme::dim_style(),
-                LogLevel::Status => theme::body_style(),
-                LogLevel::Warn => theme::warn_style(),
-            };
-            Line::from(Span::styled(entry.text.clone(), style))
-        })
-        .collect();
-    InfoPanel {
-        title: "ZeroClaw Onboard",
-        lines,
+///
+/// The title is the section breadcrumb — `ZeroClaw Onboard › Providers`
+/// or `ZeroClaw Onboard › Hardware › Transport` — so every prompt screen
+/// tells the user which phase + sub-phase they're in. Notes / status /
+/// warn lines render beneath as the body.
+fn log_panel<'a>(title: &'a str, subsection: Option<&'a str>, log: &'a [LogLine]) -> InfoPanel<'a> {
+    let mut lines: Vec<Line<'a>> = Vec::new();
+    if let Some(sub) = subsection {
+        lines.push(Line::from(Span::styled(
+            format!("› {sub}"),
+            theme::accent_style(),
+        )));
     }
+    lines.extend(log.iter().rev().take(8).rev().map(|entry| {
+        let style = match entry.level {
+            LogLevel::Note => theme::dim_style(),
+            LogLevel::Status => theme::body_style(),
+            LogLevel::Warn => theme::warn_style(),
+        };
+        Line::from(Span::styled(entry.text.clone(), style))
+    }));
+    InfoPanel { title, lines }
 }
 
 impl Drop for RatatuiUi {
@@ -147,12 +163,13 @@ fn wait_key() -> Result<KeyEvent> {
 
 #[async_trait]
 impl OnboardUi for RatatuiUi {
-    async fn confirm(&mut self, prompt: &str, default: bool) -> Result<bool> {
+    async fn confirm(&mut self, prompt: &str, default: bool) -> Result<Answer<bool>> {
         let mut choice = default;
         loop {
-            let log = log_panel(&self.log);
+            let title = self.panel_title();
+            let log = log_panel(&title, self.subsection.as_deref(), &self.log);
             let label = format!(
-                "{prompt}  [{}] (y/n, Enter confirms)",
+                "{prompt}  [{}] (y/n, Enter confirms, Esc=back)",
                 if choice { "Yes" } else { "No" }
             );
             self.terminal.draw(|frame| {
@@ -170,24 +187,23 @@ impl OnboardUi for RatatuiUi {
                 );
             })?;
             match wait_key()?.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(true),
-                KeyCode::Char('n') | KeyCode::Char('N') => return Ok(false),
-                KeyCode::Enter => return Ok(choice),
+                KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(Answer::Value(true)),
+                KeyCode::Char('n') | KeyCode::Char('N') => return Ok(Answer::Value(false)),
+                KeyCode::Enter => return Ok(Answer::Value(choice)),
                 KeyCode::Tab | KeyCode::Left | KeyCode::Right => choice = !choice,
-                KeyCode::Esc => anyhow::bail!("aborted by user"),
+                KeyCode::Esc => return Ok(Answer::Back),
                 _ => {}
             }
         }
     }
 
-    async fn string(&mut self, prompt: &str, current: Option<&str>) -> Result<String> {
+    async fn string(&mut self, prompt: &str, current: Option<&str>) -> Result<Answer<String>> {
         let mut buffer = current.unwrap_or_default().to_string();
         loop {
-            let log = log_panel(&self.log);
+            let title = self.panel_title();
+            let log = log_panel(&title, self.subsection.as_deref(), &self.log);
             let label = prompt.to_string();
             let input = buffer.clone();
-            // Approximate the InputPrompt's rendered width so split() can
-            // allocate enough bottom rows for wrapped labels.
             let measure = format!("{label}  {input}");
             self.terminal.draw(|frame| {
                 let (header, top, bottom) = split(frame.area(), &measure);
@@ -208,10 +224,10 @@ impl OnboardUi for RatatuiUi {
                 KeyEvent {
                     code: KeyCode::Enter,
                     ..
-                } => return Ok(buffer),
+                } => return Ok(Answer::Value(buffer)),
                 KeyEvent {
                     code: KeyCode::Esc, ..
-                } => anyhow::bail!("aborted by user"),
+                } => return Ok(Answer::Back),
                 KeyEvent {
                     code: KeyCode::Backspace,
                     ..
@@ -227,18 +243,21 @@ impl OnboardUi for RatatuiUi {
         }
     }
 
-    async fn secret(&mut self, prompt: &str, has_current: bool) -> Result<Option<String>> {
+    async fn secret(&mut self, prompt: &str, has_current: bool) -> Result<Answer<Option<String>>> {
         if has_current {
-            let replace = self
+            match self
                 .confirm(&format!("{prompt} (stored, replace?)"), false)
-                .await?;
-            if !replace {
-                return Ok(None);
+                .await?
+            {
+                Answer::Value(false) => return Ok(Answer::Value(None)),
+                Answer::Back => return Ok(Answer::Back),
+                Answer::Value(true) => {}
             }
         }
         let mut buffer = String::new();
         loop {
-            let log = log_panel(&self.log);
+            let title = self.panel_title();
+            let log = log_panel(&title, self.subsection.as_deref(), &self.log);
             let label = prompt.to_string();
             let input = buffer.clone();
             let measure = label.clone();
@@ -261,10 +280,10 @@ impl OnboardUi for RatatuiUi {
                 KeyEvent {
                     code: KeyCode::Enter,
                     ..
-                } => return Ok(Some(buffer)),
+                } => return Ok(Answer::Value(Some(buffer))),
                 KeyEvent {
                     code: KeyCode::Esc, ..
-                } => anyhow::bail!("aborted by user"),
+                } => return Ok(Answer::Back),
                 KeyEvent {
                     code: KeyCode::Backspace,
                     ..
@@ -285,7 +304,7 @@ impl OnboardUi for RatatuiUi {
         prompt: &str,
         items: &[SelectItem],
         current: Option<usize>,
-    ) -> Result<usize> {
+    ) -> Result<Answer<usize>> {
         if items.is_empty() {
             return Err(anyhow!("no items to choose from"));
         }
@@ -309,7 +328,8 @@ impl OnboardUi for RatatuiUi {
                 cursor = matches.len() - 1;
             }
 
-            let log = log_panel(&self.log);
+            let title = self.panel_title();
+            let log = log_panel(&title, self.subsection.as_deref(), &self.log);
             let prompt_text = prompt.to_string();
             let filter_text = filter.clone();
             let list_items: Vec<ListItem<'_>> = matches
@@ -374,7 +394,7 @@ impl OnboardUi for RatatuiUi {
                 );
                 frame.render_widget(
                     Paragraph::new(Span::styled(
-                        "type to filter  Enter=select  Esc=cancel",
+                        "type to filter  Enter=select  Esc=back",
                         theme::dim_style(),
                     )),
                     chunks[4],
@@ -387,12 +407,12 @@ impl OnboardUi for RatatuiUi {
                     ..
                 } => {
                     if let Some(&real) = matches.get(cursor) {
-                        return Ok(real);
+                        return Ok(Answer::Value(real));
                     }
                 }
                 KeyEvent {
                     code: KeyCode::Esc, ..
-                } => anyhow::bail!("aborted by user"),
+                } => return Ok(Answer::Back),
                 KeyEvent {
                     code: KeyCode::Up, ..
                 } => cursor = cursor.saturating_sub(1),
@@ -423,7 +443,7 @@ impl OnboardUi for RatatuiUi {
         }
     }
 
-    async fn editor(&mut self, hint: &str, initial: &str) -> Result<String> {
+    async fn editor(&mut self, hint: &str, initial: &str) -> Result<Answer<String>> {
         // Suspend ratatui and hand the terminal to $EDITOR. Inlined rather
         // than pulling in dialoguer just for the launcher — it's ~15 lines
         // of std::process + std::fs, no extra dep footprint.
@@ -451,14 +471,30 @@ impl OnboardUi for RatatuiUi {
         };
         let _ = std::fs::remove_file(&path);
         self.resume()?;
-        Ok(edited)
+        Ok(Answer::Value(edited))
+    }
+
+    fn heading(&mut self, level: u8, text: &str) {
+        // level 1 = section (persists in title bar). Entering a new section
+        // clears any stale subsection and log lines. level 2 = subsection
+        // (renders as the first line inside the panel until replaced).
+        match level {
+            1 => {
+                self.section = Some(text.to_string());
+                self.subsection = None;
+                self.log.clear();
+            }
+            _ => {
+                self.subsection = Some(text.to_string());
+            }
+        }
     }
 
     fn note(&mut self, msg: &str) {
         // Note = "current context for the next prompt". Replace (don't
         // append) so stale context from a previous section doesn't leak
-        // into a later screen that has no note of its own (e.g., the
-        // provider select).
+        // into a later screen. Section / subsection headings live outside
+        // the log and are untouched here.
         self.log.clear();
         if !msg.is_empty() {
             self.log.push(LogLine {

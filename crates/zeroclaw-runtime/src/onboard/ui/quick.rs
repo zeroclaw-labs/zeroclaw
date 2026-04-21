@@ -3,13 +3,14 @@
 //! Prompt text is the lookup key into `answers`. Unanswered prompts fall back
 //! to the caller-supplied `current`/`default`; when neither is available the
 //! call errors so a malformed script fails loudly instead of hanging or
-//! silently picking a wrong option.
+//! silently picking a wrong option. `Answer::Back` is never returned — quick
+//! mode has no interactive user to rewind.
 
 use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
-use zeroclaw_config::traits::{OnboardUi, SelectItem};
+use zeroclaw_config::traits::{Answer, OnboardUi, SelectItem};
 
 #[derive(Debug, Default)]
 pub struct QuickUi {
@@ -29,30 +30,30 @@ impl QuickUi {
 
 #[async_trait]
 impl OnboardUi for QuickUi {
-    async fn confirm(&mut self, prompt: &str, default: bool) -> Result<bool> {
-        match self.answers.get(prompt) {
-            Some(value) => Ok(matches!(
+    async fn confirm(&mut self, prompt: &str, default: bool) -> Result<Answer<bool>> {
+        Ok(Answer::Value(match self.answers.get(prompt) {
+            Some(value) => matches!(
                 value.trim().to_ascii_lowercase().as_str(),
                 "true" | "yes" | "y" | "1"
-            )),
-            None => Ok(default),
-        }
+            ),
+            None => default,
+        }))
     }
 
-    async fn string(&mut self, prompt: &str, current: Option<&str>) -> Result<String> {
+    async fn string(&mut self, prompt: &str, current: Option<&str>) -> Result<Answer<String>> {
         if let Some(answer) = self.answers.get(prompt) {
-            return Ok(answer.clone());
+            return Ok(Answer::Value(answer.clone()));
         }
         if let Some(value) = current {
-            return Ok(value.to_string());
+            return Ok(Answer::Value(value.to_string()));
         }
         bail!("quick mode: no answer or default provided for prompt {prompt:?}");
     }
 
-    async fn secret(&mut self, prompt: &str, has_current: bool) -> Result<Option<String>> {
+    async fn secret(&mut self, prompt: &str, has_current: bool) -> Result<Answer<Option<String>>> {
         match (self.answers.get(prompt), has_current) {
-            (Some(value), _) => Ok(Some(value.clone())),
-            (None, true) => Ok(None),
+            (Some(value), _) => Ok(Answer::Value(Some(value.clone()))),
+            (None, true) => Ok(Answer::Value(None)),
             (None, false) => {
                 bail!("quick mode: secret {prompt:?} is required but no value was supplied")
             }
@@ -64,24 +65,29 @@ impl OnboardUi for QuickUi {
         prompt: &str,
         items: &[SelectItem],
         current: Option<usize>,
-    ) -> Result<usize> {
+    ) -> Result<Answer<usize>> {
         if let Some(answer) = self.answers.get(prompt) {
             if let Some(index) = items
                 .iter()
                 .position(|item| item.label.eq_ignore_ascii_case(answer))
             {
-                return Ok(index);
+                return Ok(Answer::Value(index));
             }
             bail!("quick mode: {prompt:?} answer {answer:?} matches none of the available options");
         }
         if let Some(index) = current {
-            return Ok(index);
+            return Ok(Answer::Value(index));
         }
         bail!("quick mode: no answer or default provided for prompt {prompt:?}");
     }
 
-    async fn editor(&mut self, _hint: &str, initial: &str) -> Result<String> {
-        Ok(initial.to_string())
+    async fn editor(&mut self, _hint: &str, initial: &str) -> Result<Answer<String>> {
+        Ok(Answer::Value(initial.to_string()))
+    }
+
+    fn heading(&mut self, level: u8, text: &str) {
+        let marker = "#".repeat(level.clamp(1, 6) as usize);
+        println!("\n{marker} {text}");
     }
 
     fn note(&mut self, msg: &str) {

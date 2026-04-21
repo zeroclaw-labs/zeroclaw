@@ -71,7 +71,7 @@ pub fn enum_variants<T: schemars::JsonSchema>() -> String {
 #[allow(clippy::too_many_arguments)]
 pub fn make_prop_field(
     table: Option<&toml::Table>,
-    name: &'static str,
+    name: &str,
     serde_name: &str,
     category: &'static str,
     type_hint: &'static str,
@@ -92,7 +92,7 @@ pub fn make_prop_field(
         toml_value_to_display(table.and_then(|t| t.get(serde_name)))
     };
     PropFieldInfo {
-        name,
+        name: name.to_string(),
         category,
         display_value,
         type_hint,

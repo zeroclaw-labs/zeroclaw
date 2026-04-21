@@ -27,7 +27,9 @@ pub fn dim_style() -> Style {
 }
 
 pub fn accent_style() -> Style {
-    Style::default().fg(CRAB_ACCENT).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(CRAB_ACCENT)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn warn_style() -> Style {

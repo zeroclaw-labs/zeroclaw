@@ -319,6 +319,40 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     }
                 });
 
+                // Enumerate every HashMap entry and inject its runtime key
+                // into the child's static field paths: a child field named
+                // `<inner_prefix>.api-key` becomes
+                // `<my_prefix>.<field>.<hm_key>.api-key`. Without this, prop_fields()
+                // never surfaces e.g. `providers.models.anthropic.api-key`,
+                // so onboard has no way to prompt for it.
+                nested_prop_fields.push(quote! {
+                    {
+                        let inner_prefix = <#value_ty>::configurable_prefix();
+                        let outer_prefix = if Self::configurable_prefix().is_empty() {
+                            #field_name_lit.to_string()
+                        } else {
+                            format!("{}.{}", Self::configurable_prefix(), #field_name_lit)
+                        };
+                        for (hm_key, inner) in &self.#field_ident {
+                            let base = format!("{outer_prefix}.{hm_key}");
+                            for mut field in inner.prop_fields() {
+                                let leaf = field
+                                    .name
+                                    .strip_prefix(inner_prefix)
+                                    .and_then(|s| s.strip_prefix('.'))
+                                    .unwrap_or(field.name.as_str())
+                                    .to_string();
+                                field.name = if leaf.is_empty() {
+                                    base.clone()
+                                } else {
+                                    format!("{base}.{leaf}")
+                                };
+                                fields.push(field);
+                            }
+                        }
+                    }
+                });
+
                 continue;
             } else if is_option {
                 nested_collect.push(quote! {

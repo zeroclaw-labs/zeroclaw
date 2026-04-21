@@ -50,11 +50,11 @@ pub use traits::PropKind;
 pub use traits::SecretFieldInfo;
 
 // Property helpers — single source of truth in zeroclaw-config.
+#[cfg(feature = "schema-export")]
+pub use zeroclaw_config::helpers::enum_variants;
 pub use zeroclaw_config::helpers::{
     make_prop_field, route_hashmap_path, serde_get_prop, serde_set_prop,
 };
-#[cfg(feature = "schema-export")]
-pub use zeroclaw_config::helpers::enum_variants;
 
 
 #[cfg(test)]

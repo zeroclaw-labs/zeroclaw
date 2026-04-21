@@ -17229,7 +17229,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mx = test_matrix_config();
         let fields = mx.prop_fields();
         let by_name: std::collections::HashMap<&str, &crate::traits::PropFieldInfo> =
-            fields.iter().map(|f| (f.name, f)).collect();
+            fields.iter().map(|f| (f.name.as_str(), f)).collect();
 
         // Bool field
         let enabled = by_name["channels.matrix.enabled"];
@@ -17511,7 +17511,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
         for field in &fields {
             // get_prop must not panic or error
-            let get_result = config.get_prop(field.name);
+            let get_result = config.get_prop(&field.name);
             assert!(
                 get_result.is_ok(),
                 "get_prop failed for '{}': {}",
@@ -17525,7 +17525,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 continue;
             }
 
-            let set_result = config.set_prop(field.name, &field.display_value);
+            let set_result = config.set_prop(&field.name, &field.display_value);
             assert!(
                 set_result.is_ok(),
                 "set_prop failed for '{}' with value '{}': {}",
@@ -17535,7 +17535,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             );
 
             // Value should survive the round-trip
-            let after = config.get_prop(field.name).unwrap();
+            let after = config.get_prop(&field.name).unwrap();
             assert_eq!(
                 after, field.display_value,
                 "round-trip mismatch for '{}': set '{}', got '{}'",
@@ -17566,7 +17566,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             );
 
             for variant in &variants {
-                let result = config.set_prop(field.name, variant);
+                let result = config.set_prop(&field.name, variant);
                 assert!(
                     result.is_ok(),
                     "set_prop('{}', '{}') failed: {}",

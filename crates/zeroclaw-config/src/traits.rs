@@ -58,8 +58,11 @@ impl HasPropKind for Vec<String> {
 /// Describes a single property field discovered via `#[derive(Configurable)]`.
 #[derive(Clone)]
 pub struct PropFieldInfo {
-    /// Full dotted name (e.g. `channels.telegram.draft-update-interval-ms`)
-    pub name: &'static str,
+    /// Full dotted name (e.g. `channels.telegram.draft-update-interval-ms`).
+    /// Owned so the `HashMap<String, T>` branch of the derive can inject the
+    /// runtime map key into the path (`providers.models.anthropic.api-key`)
+    /// — `&'static str` can't carry user-supplied keys.
+    pub name: String,
     /// Category for grouping in property listings
     pub category: &'static str,
     /// Current value formatted for display (secrets show `"****"`)
@@ -133,6 +136,15 @@ impl SelectItem {
     }
 }
 
+/// Result of a single prompt — either the value the user chose, or a
+/// navigation signal. Backends return `Answer::Back` when the user presses
+/// the backend's back key (Esc on ratatui / dialoguer). Callers rewind.
+#[derive(Debug, Clone)]
+pub enum Answer<T> {
+    Value(T),
+    Back,
+}
+
 /// Prompt-surface the onboard orchestrator drives.
 ///
 /// Async is deliberate: the orchestrator is already async (Config::load_or_init,
@@ -148,21 +160,38 @@ impl SelectItem {
 /// calls `config.set_prop` unless the new value differs from `current`.
 #[async_trait::async_trait]
 pub trait OnboardUi: Send {
-    async fn confirm(&mut self, prompt: &str, default: bool) -> anyhow::Result<bool>;
+    async fn confirm(&mut self, prompt: &str, default: bool) -> anyhow::Result<Answer<bool>>;
 
-    async fn string(&mut self, prompt: &str, current: Option<&str>) -> anyhow::Result<String>;
+    async fn string(
+        &mut self,
+        prompt: &str,
+        current: Option<&str>,
+    ) -> anyhow::Result<Answer<String>>;
 
-    async fn secret(&mut self, prompt: &str, has_current: bool) -> anyhow::Result<Option<String>>;
+    /// `Answer::Value(Some(v))` = new secret entered. `Answer::Value(None)` =
+    /// user declined to update an existing secret (only when `has_current`).
+    /// `Answer::Back` = rewind.
+    async fn secret(
+        &mut self,
+        prompt: &str,
+        has_current: bool,
+    ) -> anyhow::Result<Answer<Option<String>>>;
 
     async fn select(
         &mut self,
         prompt: &str,
         items: &[SelectItem],
         current: Option<usize>,
-    ) -> anyhow::Result<usize>;
+    ) -> anyhow::Result<Answer<usize>>;
 
-    async fn editor(&mut self, hint: &str, initial: &str) -> anyhow::Result<String>;
+    async fn editor(&mut self, hint: &str, initial: &str) -> anyhow::Result<Answer<String>>;
 
+    /// Announce a new section or subsection. `level == 1` = section
+    /// (Providers, Channels, …). `level == 2` = subsection within a section
+    /// (Hardware › Transport). Backends render these persistently so every
+    /// prompt remains anchored to its phase — rendered like Markdown
+    /// headings. `level == 1` resets any prior subsection.
+    fn heading(&mut self, level: u8, text: &str);
     fn note(&mut self, msg: &str);
     fn status(&mut self, msg: &str);
     fn warn(&mut self, msg: &str);
