@@ -228,8 +228,12 @@ enum Commands {
         #[arg(long)]
         quick: bool,
 
-        /// Use the ratatui TUI backend instead of dialoguer prompts.
+        /// Force the dialoguer CLI backend instead of the default ratatui TUI.
         #[arg(long)]
+        cli: bool,
+
+        /// Deprecated: TUI is now the default. Accepted as a no-op for one release.
+        #[arg(long, hide = true)]
         tui: bool,
 
         /// Don't ask "keep stored secret?" — always re-prompt.
@@ -1187,7 +1191,8 @@ async fn main() -> Result<()> {
     if let Commands::Onboard {
         section,
         quick,
-        tui: use_tui,
+        cli: use_cli,
+        tui: use_tui_deprecated,
         force,
         reinit,
         api_key,
@@ -1256,24 +1261,54 @@ async fn main() -> Result<()> {
             memory: memory.clone(),
         };
 
-        match (*quick, *use_tui) {
-            (true, true) => bail!("--quick and --tui are mutually exclusive"),
+        if *use_tui_deprecated {
+            eprintln!(
+                "warning: --tui is deprecated and now a no-op (TUI is the default); \
+                 pass --cli to force the terminal-prompt backend"
+            );
+        }
+
+        match (*quick, *use_cli) {
+            (true, true) => bail!("--quick and --cli are mutually exclusive"),
             (true, false) => {
                 let mut ui = QuickUi::new();
                 run_onboard(&mut cfg, &mut ui, target, &flags).await?;
             }
             (false, true) => {
-                #[cfg(feature = "tui-onboarding")]
-                {
-                    let mut ui = zeroclaw_tui::RatatuiUi::new()?;
-                    run_onboard(&mut cfg, &mut ui, target, &flags).await?;
-                }
-                #[cfg(not(feature = "tui-onboarding"))]
-                bail!("--tui requires building with --features tui-onboarding");
-            }
-            (false, false) => {
                 let mut ui = TermUi;
                 run_onboard(&mut cfg, &mut ui, target, &flags).await?;
+            }
+            (false, false) => {
+                // Default: prefer ratatui TUI. Fall back to TermUi on init
+                // failure or when stdout isn't a terminal (e.g. piped output,
+                // CI without --quick).
+                #[cfg(feature = "tui-onboarding")]
+                {
+                    use std::io::IsTerminal;
+                    if std::io::stdout().is_terminal() {
+                        match zeroclaw_tui::RatatuiUi::new() {
+                            Ok(mut ui) => {
+                                run_onboard(&mut cfg, &mut ui, target, &flags).await?;
+                            }
+                            Err(e) => {
+                                tracing::debug!("TUI init failed: {e:?}");
+                                eprintln!(
+                                    "TUI init failed ({e}); falling back to terminal prompts."
+                                );
+                                let mut ui = TermUi;
+                                run_onboard(&mut cfg, &mut ui, target, &flags).await?;
+                            }
+                        }
+                    } else {
+                        let mut ui = TermUi;
+                        run_onboard(&mut cfg, &mut ui, target, &flags).await?;
+                    }
+                }
+                #[cfg(not(feature = "tui-onboarding"))]
+                {
+                    let mut ui = TermUi;
+                    run_onboard(&mut cfg, &mut ui, target, &flags).await?;
+                }
             }
         }
 
