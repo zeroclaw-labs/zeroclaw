@@ -368,6 +368,13 @@ pub struct GatekeeperRouter {
     /// cloud LLM. Pulled from `GatekeeperConfig::confidence_threshold`
     /// at construction time. Spec (2026-04-22).
     confidence_threshold: f64,
+    /// Whether the SLM meta-evaluator is allowed to run on borderline
+    /// messages. Spec (2026-04-23).
+    slm_reasoning_enabled: bool,
+    /// Half-width of the "borderline" band around
+    /// `confidence_threshold` that triggers the SLM meta-evaluator.
+    /// See `GatekeeperConfig::reasoning_band`.
+    reasoning_band: f64,
 }
 
 impl GatekeeperRouter {
@@ -385,6 +392,8 @@ impl GatekeeperRouter {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             queue: OfflineQueue::new(100),
             confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
+            slm_reasoning_enabled: true,
+            reasoning_band: 0.15,
         }
     }
 
@@ -401,6 +410,8 @@ impl GatekeeperRouter {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             queue: OfflineQueue::new(100),
             confidence_threshold: config.confidence_threshold,
+            slm_reasoning_enabled: config.slm_reasoning_enabled,
+            reasoning_band: config.reasoning_band,
         }
     }
 
@@ -445,34 +456,90 @@ impl GatekeeperRouter {
     /// Returns `Ok(response)` if the SLM generated a response, or `Err` on failure.
     /// On failure, callers should fall back to the cloud LLM.
     async fn respond_locally(&self, message: &str) -> anyhow::Result<String> {
+        self.call_slm_with_system(
+            "You are a helpful AI assistant. Respond concisely in the same language as the user. Keep responses under 3 sentences for simple queries.",
+            message,
+            0.7,
+        )
+        .await
+    }
+
+    /// Generic SLM round-trip. Used by `respond_locally` and by the
+    /// meta-evaluator prompts in `slm_reasoning`. Temperature 0.0 is
+    /// the right default for the meta-evaluator (JSON determinism);
+    /// `respond_locally` uses 0.7 for natural-language answers.
+    async fn call_slm_with_system(
+        &self,
+        system: &str,
+        user: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
         let url = self.ollama_url.replace("/v1", "/api/chat");
         let body = OllamaChatRequest {
             model: self.model.clone(),
             messages: vec![
                 OllamaMessage {
                     role: "system".to_string(),
-                    content: "You are a helpful AI assistant. Respond concisely in the same language as the user. Keep responses under 3 sentences for simple queries.".to_string(),
+                    content: system.to_string(),
                 },
                 OllamaMessage {
                     role: "user".to_string(),
-                    content: message.to_string(),
+                    content: user.to_string(),
                 },
             ],
             stream: false,
-            options: OllamaOptions { temperature: 0.7 },
+            options: OllamaOptions { temperature },
         };
-
         let resp = self.client.post(&url).json(&body).send().await?;
         if !resp.status().is_success() {
             anyhow::bail!("Ollama returned status {}", resp.status());
         }
-
         let chat_resp: OllamaChatResponse = resp.json().await?;
         let content = chat_resp.message.content.trim().to_string();
         if content.is_empty() {
             anyhow::bail!("Ollama returned empty response");
         }
         Ok(content)
+    }
+
+    /// Ask the local SLM to decompose the question into premises +
+    /// requirements. Expects strict JSON back; tolerates some
+    /// pre/post prose because small models sometimes preamble.
+    pub async fn analyze_question_with_slm(
+        &self,
+        message: &str,
+    ) -> anyhow::Result<super::slm_reasoning::SlmQuestionAnalysis> {
+        let raw = self
+            .call_slm_with_system(
+                super::slm_reasoning::QUESTION_DECOMPOSITION_SYSTEM_PROMPT,
+                &super::slm_reasoning::build_decomposition_user_prompt(message),
+                0.0,
+            )
+            .await?;
+        super::slm_reasoning::parse_question_analysis(&raw)
+    }
+
+    /// Ask the local SLM to rigorously evaluate its own draft answer
+    /// against the earlier decomposition. Returns a numeric
+    /// `final_confidence` the routing gate uses.
+    pub async fn evaluate_answer_with_slm(
+        &self,
+        question: &str,
+        analysis: &super::slm_reasoning::SlmQuestionAnalysis,
+        draft_answer: &str,
+    ) -> anyhow::Result<super::slm_reasoning::SlmAnswerEvaluation> {
+        let raw = self
+            .call_slm_with_system(
+                super::slm_reasoning::ANSWER_EVALUATION_SYSTEM_PROMPT,
+                &super::slm_reasoning::build_evaluation_user_prompt(
+                    question,
+                    analysis,
+                    draft_answer,
+                ),
+                0.0,
+            )
+            .await?;
+        super::slm_reasoning::parse_answer_evaluation(&raw)
     }
 
     /// Process a user message end-to-end through the gatekeeper.
@@ -552,6 +619,48 @@ impl GatekeeperRouter {
             routing_policy::weighted_confidence(decision.confidence, &classification, &quality);
         decision.weighted_confidence = Some(weighted);
 
+        // Spec (2026-04-23): when the heuristic lands in the
+        // `reasoning_band` neighbourhood of the threshold, we hand
+        // the judgement over to the SLM meta-evaluator. The SLM
+        // decomposes the question into premises + requirements and
+        // audits the draft answer against each. `final_confidence`
+        // from that audit *replaces* the heuristic score for the
+        // routing gate — the heuristic is now a pre-filter, not the
+        // decision. Obviously-local and obviously-cloud cases skip
+        // the extra SLM round-trip for latency. On any SLM failure
+        // (timeout, malformed JSON) we silently fall back to the
+        // heuristic weighted score.
+        let borderline = (weighted - self.confidence_threshold).abs() <= self.reasoning_band;
+        if self.slm_reasoning_enabled && borderline {
+            match self.run_slm_reasoning(message, &slm_reply).await {
+                Ok(final_conf) => {
+                    tracing::info!(
+                        heuristic_weighted = weighted,
+                        reasoning_final = final_conf,
+                        threshold = self.confidence_threshold,
+                        "SLM meta-evaluator produced reasoning-based confidence"
+                    );
+                    decision.weighted_confidence = Some(final_conf);
+                    if final_conf < self.confidence_threshold {
+                        return GatekeeperResult {
+                            decision,
+                            local_response: None,
+                        };
+                    }
+                    return GatekeeperResult {
+                        decision,
+                        local_response: Some(slm_reply),
+                    };
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "SLM meta-evaluator failed; falling back to heuristic weighted score"
+                    );
+                }
+            }
+        }
+
         if weighted < self.confidence_threshold {
             tracing::info!(
                 base = decision.confidence,
@@ -578,6 +687,20 @@ impl GatekeeperRouter {
             decision,
             local_response: Some(slm_reply),
         }
+    }
+
+    /// Orchestrate the two SLM meta-evaluator round-trips. Returns
+    /// `final_confidence` from the evaluation step. Kept private
+    /// (not `pub`) because the semantics only make sense as part of
+    /// `process_message`'s flow.
+    async fn run_slm_reasoning(&self, message: &str, draft: &str) -> anyhow::Result<f64> {
+        let analysis = self.analyze_question_with_slm(message).await?;
+        let evaluation = self
+            .evaluate_answer_with_slm(message, &analysis, draft)
+            .await?;
+        // Defend against a mis-calibrated SLM that returns numbers
+        // outside 0..1.
+        Ok(evaluation.final_confidence.clamp(0.0, 1.0))
     }
 
     /// Classify a user message and decide routing.

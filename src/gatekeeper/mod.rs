@@ -14,6 +14,7 @@
 
 pub mod router;
 pub mod routing_policy;
+pub mod slm_reasoning;
 
 #[allow(unused_imports)]
 pub use router::GatekeeperRouter;

@@ -17120,6 +17120,33 @@ pub struct GatekeeperConfig {
     /// `true` because the spec mandates the redaction round-trip.
     #[serde(default = "default_redact_pii_on_escalation")]
     pub redact_pii_on_escalation: bool,
+    /// Enable the SLM meta-evaluator (spec, 2026-04-23). When true,
+    /// questions whose keyword-weighted confidence lands within
+    /// `reasoning_band` of the threshold are handed back to the local
+    /// SLM for a reasoning-based re-evaluation: the SLM decomposes
+    /// the question into premises + requirements, drafts an answer,
+    /// then rigorously audits whether the draft actually addresses
+    /// each enumerated item. `final_confidence` from that audit
+    /// replaces the keyword score for the routing gate. Costs one
+    /// extra SLM round-trip per borderline message, so we only run
+    /// it when the heuristic is uncertain.
+    #[serde(default = "default_slm_reasoning_enabled")]
+    pub slm_reasoning_enabled: bool,
+    /// Distance from `confidence_threshold` within which the SLM
+    /// meta-evaluator runs. Example: threshold = 0.60, band = 0.15 →
+    /// meta-evaluator runs when the heuristic weighted confidence is
+    /// in [0.45, 0.75]. Obviously local and obviously cloud cases
+    /// skip the extra round-trip. Default 0.15.
+    #[serde(default = "default_slm_reasoning_band")]
+    pub reasoning_band: f64,
+}
+
+fn default_slm_reasoning_enabled() -> bool {
+    true
+}
+
+fn default_slm_reasoning_band() -> f64 {
+    0.15
 }
 
 fn default_gatekeeper_confidence_threshold() -> f64 {
@@ -17150,6 +17177,8 @@ impl Default for GatekeeperConfig {
             timeout_secs: 10,
             confidence_threshold: default_gatekeeper_confidence_threshold(),
             redact_pii_on_escalation: default_redact_pii_on_escalation(),
+            slm_reasoning_enabled: default_slm_reasoning_enabled(),
+            reasoning_band: default_slm_reasoning_band(),
         }
     }
 }
