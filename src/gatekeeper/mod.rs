@@ -13,6 +13,7 @@
 //! - Offline-capable: queues cloud tasks locally when disconnected
 
 pub mod router;
+pub mod routing_policy;
 
 #[allow(unused_imports)]
 pub use router::GatekeeperRouter;
