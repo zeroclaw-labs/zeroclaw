@@ -222,7 +222,7 @@ fn split_message(message: &str, max_bytes: usize) -> Vec<String> {
     chunks
 }
 
-/// Configuration for constructing an `IrcChannel`.
+// Configuration for constructing an `IrcChannel`.
 pub struct IrcChannelConfig {
     pub server: String,
     pub port: u16,
@@ -263,6 +263,10 @@ impl IrcChannel {
         self.allowed_users
             .iter()
             .any(|u| u.eq_ignore_ascii_case(nick))
+    }
+
+    fn is_mentioned(&self, my_nick: &str, text: &str) -> bool {
+        text.to_ascii_lowercase().contains(&my_nick.to_ascii_lowercase())
     }
 
     /// Create a TLS connection to the IRC server.
@@ -554,7 +558,10 @@ impl Channel for IrcChannel {
                         continue;
                     }
 
-                    if self.mention_only && is_channel && !text.contains(&current_nick) {
+                    if self.mention_only
+                        && is_channel
+                        && self.is_mentioned(&current_nick, text)
+                    {
                         continue;
                     }
 
@@ -833,6 +840,7 @@ mod tests {
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            mention_only: false,
         });
         assert!(ch.is_user_allowed("alice"));
         assert!(ch.is_user_allowed("bob"));
@@ -852,6 +860,7 @@ mod tests {
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            mention_only: false,
         });
         assert!(ch.is_user_allowed("alice"));
         assert!(ch.is_user_allowed("ALICE"));
@@ -871,8 +880,33 @@ mod tests {
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            mention_only: false,
         });
         assert!(!ch.is_user_allowed("anyone"));
+    }
+
+    // ── Mention only ────────────────────────────────────────
+
+    #[test]
+    fn mention_only_case_insensitive() {
+        let nick = "bot";
+        let ch = IrcChannel::new(IrcChannelConfig {
+            server: "irc.test".into(),
+            port: 6697,
+            nickname: nick.into(),
+            username: None,
+            channels: vec![],
+            allowed_users: vec![],
+            server_password: None,
+            nickserv_password: None,
+            sasl_password: None,
+            verify_tls: true,
+            mention_only: false,
+        });
+        assert!(ch.is_mentioned("bot", "Hello, bot!"));
+        assert!(ch.is_mentioned("bot", "HI BOT!"));
+        assert!(ch.is_mentioned("bot", "Bot: how are you doing?"));
+        assert!(!ch.is_mentioned("bot", "This one doesn't mention."));
     }
 
     // ── Constructor ─────────────────────────────────────────
@@ -890,6 +924,7 @@ mod tests {
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            mention_only: false,
         });
         assert_eq!(ch.username, "mybot");
     }
@@ -907,6 +942,7 @@ mod tests {
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            mention_only: false,
         });
         assert_eq!(ch.username, "customuser");
         assert_eq!(ch.nickname, "mybot");
@@ -931,6 +967,7 @@ mod tests {
             nickserv_password: Some("nspass".into()),
             sasl_password: Some("saslpass".into()),
             verify_tls: false,
+            mention_only: false,
         });
         assert_eq!(ch.server, "irc.example.com");
         assert_eq!(ch.port, 6697);
@@ -1022,6 +1059,7 @@ nickname = "bot"
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            mention_only: false,
         })
     }
 }
