@@ -4633,3 +4633,79 @@ html, body {
   opacity: 0.7;
 }
 .low-balance-dismiss:hover { opacity: 1; }
+
+
+/* ── Pending auto-recharge modal (spec, 2026-04-23) ───────────────
+   Full-screen backdrop with a centered card. Deliberately aggressive
+   visual weight — this is a pre-charge safety gate, not a promo. The
+   countdown text is tabular so it doesn't jitter every second. */
+.pending-ar-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+  backdrop-filter: blur(4px);
+}
+.pending-ar-card {
+  width: 90%;
+  max-width: 440px;
+  background: #1a1a24;
+  border: 1px solid rgba(120, 99, 255, 0.4);
+  border-radius: 14px;
+  padding: 28px;
+  color: #e5e7eb;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+.pending-ar-title {
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+.pending-ar-body {
+  font-size: 13px;
+  line-height: 1.6;
+  margin-bottom: 16px;
+  color: #cbd5e1;
+}
+.pending-ar-countdown {
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  font-weight: 600;
+  color: #fbbf24;
+  margin-bottom: 18px;
+}
+.pending-ar-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.pending-ar-btn {
+  flex: 1;
+  min-width: 110px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.04);
+  color: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.pending-ar-btn.approve {
+  background: linear-gradient(135deg, #7863ff, #a68bff);
+  border-color: transparent;
+  color: #fff;
+}
+.pending-ar-btn.approve:hover:not(:disabled) { filter: brightness(1.1); }
+.pending-ar-btn.defer { color: #fcd34d; border-color: rgba(252, 211, 77, 0.3); }
+.pending-ar-btn.cancel { color: #fca5a5; border-color: rgba(252, 165, 165, 0.3); }
+.pending-ar-message {
+  margin-top: 12px;
+  font-size: 12px;
+  color: #cbd5e1;
+  background: rgba(255, 255, 255, 0.04);
+  padding: 8px 10px;
+  border-radius: 6px;
+}

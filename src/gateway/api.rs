@@ -4178,3 +4178,166 @@ pub async fn handle_api_checkout_toss_billing_callback(
     )
         .into_response()
 }
+
+// ── Pending auto-recharge queue (spec, 2026-04-23) ─────────────
+
+/// GET /api/billing/pending-auto-recharge — return the caller's
+/// oldest unresolved pending auto-recharge row, or `{ pending: null }`
+/// when the queue is empty. Used by the React modal's poll loop.
+pub async fn handle_api_pending_auto_recharge_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(ref pm) = state.payment_manager else {
+        return Json(serde_json::json!({ "pending": null })).into_response();
+    };
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+    let pm_guard = pm.lock();
+    match pm_guard.list_oldest_pending_auto_recharge(&user_id) {
+        Ok(Some(row)) => Json(serde_json::json!({ "pending": row })).into_response(),
+        Ok(None) => Json(serde_json::json!({ "pending": null })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResolvePendingBody {
+    /// One of "approve" | "defer" | "cancel".
+    pub resolution: String,
+}
+
+/// POST /api/billing/pending-auto-recharge/:id/resolve — record the
+/// user's modal decision. On `approve` we immediately trigger the
+/// actual charge via `maybe_auto_recharge` using the stored billing
+/// method. `defer` and `cancel` just close the row; the next
+/// threshold-crossing creates a fresh pending row if needed.
+pub async fn handle_api_pending_auto_recharge_resolve(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(pending_id): Path<String>,
+    Json(body): Json<ResolvePendingBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(ref pm) = state.payment_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Payment subsystem disabled" })),
+        )
+            .into_response();
+    };
+    if !["approve", "defer", "cancel"].contains(&body.resolution.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "resolution must be approve|defer|cancel" })),
+        )
+            .into_response();
+    }
+
+    // Persist the decision first — we want the audit trail even if the
+    // downstream charge fails.
+    {
+        let pm_guard = pm.lock();
+        if let Err(e) = pm_guard.resolve_pending_auto_recharge(&pending_id, &body.resolution) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("{e}") })),
+            )
+                .into_response();
+        }
+    }
+
+    // On approve, actually run the charge through `maybe_auto_recharge`.
+    // On defer / cancel we return success without touching provider APIs.
+    if body.resolution != "approve" {
+        return Json(serde_json::json!({ "status": body.resolution })).into_response();
+    }
+
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+
+    let (balance, prefs, stripe_key, toss_key, callback_base) = {
+        let pm_guard = pm.lock();
+        let balance = pm_guard.get_balance(&user_id).unwrap_or(0);
+        let prefs = pm_guard.get_billing_preferences(&user_id).ok();
+        let cfg = state.config.lock();
+        (
+            balance,
+            prefs,
+            cfg.stripe_secret_key.clone(),
+            cfg.toss_secret_key.clone(),
+            format!("http://{}:{}", cfg.gateway.host, cfg.gateway.port),
+        )
+    };
+    let Some(prefs) = prefs else {
+        return Json(serde_json::json!({ "status": "approve", "charge": "skipped_no_prefs" }))
+            .into_response();
+    };
+    let Some(pkg_id) = prefs.auto_recharge_package_id.clone() else {
+        return Json(serde_json::json!({ "status": "approve", "charge": "skipped_no_package" }))
+            .into_response();
+    };
+    let Some(provider_str) = prefs.saved_method_provider.clone() else {
+        return Json(serde_json::json!({ "status": "approve", "charge": "skipped_no_provider" }))
+            .into_response();
+    };
+    let provider = match provider_str.as_str() {
+        "stripe" => crate::billing::CheckoutProvider::Stripe,
+        "toss" => crate::billing::CheckoutProvider::Toss,
+        _ => {
+            return Json(serde_json::json!({
+                "status": "approve",
+                "charge": "skipped_unknown_provider",
+            }))
+            .into_response();
+        }
+    };
+    let settings = crate::billing::AutoRechargeSettings {
+        enabled: true,
+        package_id: pkg_id,
+        provider,
+        saved_method_id: prefs.saved_method_id.clone(),
+    };
+    let outcome = crate::billing::checkout::maybe_auto_recharge(
+        &user_id,
+        balance,
+        &settings,
+        stripe_key.as_deref(),
+        toss_key.as_deref(),
+        &callback_base,
+    )
+    .await;
+    match outcome {
+        Ok(Some(tx)) => Json(serde_json::json!({
+            "status": "approve",
+            "charge": "ok",
+            "transaction_id": tx,
+        }))
+        .into_response(),
+        Ok(None) => Json(serde_json::json!({ "status": "approve", "charge": "skipped" })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "status": "approve",
+                "charge": "failed",
+                "error": format!("{e}"),
+            })),
+        )
+            .into_response(),
+    }
+}

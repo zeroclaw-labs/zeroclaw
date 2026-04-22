@@ -10,6 +10,7 @@ import { SetupWizard } from "./components/SetupWizard";
 import { LocalLlmBootstrap } from "./components/LocalLlmBootstrap";
 import { BillingPage } from "./components/BillingPage";
 import { LowBalanceBanner } from "./components/LowBalanceBanner";
+import { PendingAutoRechargeModal } from "./components/PendingAutoRechargeModal";
 import { GatewayStatus } from "./components/GatewayStatus";
 import { LockScreen } from "./components/LockScreen";
 import { DocumentEditor } from "./components/DocumentEditor";
@@ -778,6 +779,7 @@ function App() {
   return (
     <div className="app">
       {pythonBanner}
+      {isTauri() && isConnected && <PendingAutoRechargeModal locale={locale} />}
       <Sidebar
         chats={chats}
         activeChatId={activeChatId}

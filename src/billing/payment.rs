@@ -359,7 +359,33 @@ impl PaymentManager {
                 --   auto_recharge_threshold   — 3000 | 5000
                 --   saved_method_id           — Stripe customer / Toss billing key
                 --   saved_method_provider     — 'stripe' | 'toss'
-                CREATE TABLE IF NOT EXISTS billing_preferences (
+                -- Auto-recharge confirmation queue (spec, 2026-04-23).
+                -- Safeguard against runaway charges: when the scheduler
+                -- detects a balance drop below the user's threshold, we
+                -- write a row here instead of charging immediately and
+                -- wait for the user to approve from the modal popup. A
+                -- 10-minute timer transitions stale rows to
+                -- `resolution='timeout'` (treated as cancel) so an
+                -- abandoned browser tab doesn't leave the queue open
+                -- forever.
+                CREATE TABLE IF NOT EXISTS pending_auto_recharges (
+                    pending_id   TEXT PRIMARY KEY,
+                    user_id      TEXT NOT NULL,
+                    package_id   TEXT NOT NULL,
+                    balance_at   INTEGER NOT NULL,
+                    threshold_at INTEGER NOT NULL,
+                    created_at   INTEGER NOT NULL,
+                    resolved_at  INTEGER,
+                    resolution   TEXT
+                                  CHECK(resolution IN ('approve','defer','cancel','timeout'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_pending_recharges_user
+                    ON pending_auto_recharges(user_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_pending_recharges_unresolved
+                    ON pending_auto_recharges(created_at)
+                    WHERE resolved_at IS NULL;
+
+                                CREATE TABLE IF NOT EXISTS billing_preferences (
                     user_id                  TEXT PRIMARY KEY,
                     low_balance_threshold    INTEGER NOT NULL DEFAULT 5000,
                     auto_recharge_enabled    INTEGER NOT NULL DEFAULT 0,
@@ -1325,6 +1351,116 @@ impl PaymentManager {
         Ok(user_id)
     }
 
+
+    // ── Pending auto-recharge queue (spec, 2026-04-23) ───────────────
+    //
+    // The React client reads the oldest unresolved row via
+    // `list_oldest_pending_auto_recharge`, presents a modal, and POSTs
+    // the user's choice to `resolve_pending_auto_recharge`. A 10-minute
+    // timer in the scheduler flips stale rows to `resolution='timeout'`
+    // so an abandoned tab never leaves the queue open forever.
+
+    /// Insert a pending row. Returns the generated `pending_id` so the
+    /// caller can surface the modal key back to the client. Idempotent
+    /// at the spec level — the scheduler only inserts once per balance
+    /// descent because `LowBalanceAlertState::should_fire` keeps state.
+    pub fn create_pending_auto_recharge(
+        &self,
+        user_id: &str,
+        package_id: &str,
+        balance: u32,
+        threshold: u32,
+    ) -> anyhow::Result<String> {
+        let Some(ref conn) = self.conn else {
+            anyhow::bail!("Payment database not initialized");
+        };
+        let now = now_epoch();
+        let pending_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO pending_auto_recharges
+                (pending_id, user_id, package_id, balance_at, threshold_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![pending_id, user_id, package_id, balance, threshold, now],
+        )?;
+        Ok(pending_id)
+    }
+
+    /// Fetch the user's oldest unresolved pending row (the modal is
+    /// FIFO — one popup at a time). Returns `None` when the queue is
+    /// empty for this user.
+    pub fn list_oldest_pending_auto_recharge(
+        &self,
+        user_id: &str,
+    ) -> anyhow::Result<Option<PendingAutoRecharge>> {
+        let Some(ref conn) = self.conn else {
+            return Ok(None);
+        };
+        let row = conn
+            .query_row(
+                "SELECT pending_id, user_id, package_id, balance_at, threshold_at,
+                        created_at, resolved_at, resolution
+                 FROM pending_auto_recharges
+                 WHERE user_id = ?1 AND resolved_at IS NULL
+                 ORDER BY created_at ASC LIMIT 1",
+                params![user_id],
+                |r| {
+                    Ok(PendingAutoRecharge {
+                        pending_id: r.get::<_, String>(0)?,
+                        user_id: r.get::<_, String>(1)?,
+                        package_id: r.get::<_, String>(2)?,
+                        balance_at: r.get::<_, u32>(3)?,
+                        threshold_at: r.get::<_, u32>(4)?,
+                        created_at: r.get::<_, i64>(5)?,
+                        resolved_at: r.get::<_, Option<i64>>(6)?,
+                        resolution: r.get::<_, Option<String>>(7)?,
+                    })
+                },
+            )
+            .ok();
+        Ok(row)
+    }
+
+    /// Mark a pending row as resolved with the given outcome. `resolution`
+    /// must be one of the enum values accepted by the CHECK constraint.
+    pub fn resolve_pending_auto_recharge(
+        &self,
+        pending_id: &str,
+        resolution: &str,
+    ) -> anyhow::Result<()> {
+        const ALLOWED: [&str; 4] = ["approve", "defer", "cancel", "timeout"];
+        if !ALLOWED.contains(&resolution) {
+            anyhow::bail!("invalid resolution value");
+        }
+        let Some(ref conn) = self.conn else {
+            anyhow::bail!("Payment database not initialized");
+        };
+        let now = now_epoch();
+        conn.execute(
+            "UPDATE pending_auto_recharges
+             SET resolved_at = ?2, resolution = ?3
+             WHERE pending_id = ?1 AND resolved_at IS NULL",
+            params![pending_id, now, resolution],
+        )?;
+        Ok(())
+    }
+
+    /// Force-resolve every unresolved row older than
+    /// `PENDING_AUTO_RECHARGE_TIMEOUT_SECS` with `resolution='timeout'`.
+    /// Returns the number of rows touched so the scheduler can log it.
+    pub fn timeout_stale_pending_auto_recharges(&self) -> anyhow::Result<u32> {
+        let Some(ref conn) = self.conn else {
+            return Ok(0);
+        };
+        let cutoff = now_epoch() - PENDING_AUTO_RECHARGE_TIMEOUT_SECS;
+        let n = conn.execute(
+            "UPDATE pending_auto_recharges
+             SET resolved_at = ?2, resolution = 'timeout'
+             WHERE resolved_at IS NULL AND created_at < ?1",
+            params![cutoff, now_epoch()],
+        )?;
+        Ok(n as u32)
+    }
+
 }
 
 /// Active subscription row mirrored from the `subscriptions` table.
@@ -1380,6 +1516,28 @@ pub struct BillingPreferences {
     #[serde(default)]
     pub alert_sms_phone: Option<String>,
 }
+
+/// A single entry in the auto-recharge confirmation queue (see
+/// `pending_auto_recharges` schema). The scheduler writes these rows
+/// when a balance drop would normally trigger an auto-recharge; the
+/// React client surfaces the oldest unresolved row as a modal popup
+/// and POSTs back the user's choice within the 10-minute window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingAutoRecharge {
+    pub pending_id: String,
+    pub user_id: String,
+    pub package_id: String,
+    pub balance_at: u32,
+    pub threshold_at: u32,
+    pub created_at: i64,
+    pub resolved_at: Option<i64>,
+    pub resolution: Option<String>,
+}
+
+/// Default grace window before `pending_auto_recharges` rows are
+/// force-resolved as `timeout`. Keep in sync with the client-side
+/// modal auto-close timer in `PendingAutoRechargeModal.tsx`.
+pub const PENDING_AUTO_RECHARGE_TIMEOUT_SECS: i64 = 10 * 60;
 
 /// Default TTL applied to every non-subscription grant: 30 days.
 /// Subscriptions grant with a 30-day TTL as well but schedule a renewal

@@ -222,6 +222,15 @@ type TranslationKey =
   | "sidebar_billing_link"
   | "billing_subscribe_pending"
   | "billing_cancel_with_refund"
+  // Pending auto-recharge modal
+  | "pending_ar_title"
+  | "pending_ar_body"
+  | "pending_ar_timer"
+  | "pending_ar_approve"
+  | "pending_ar_defer"
+  | "pending_ar_cancel"
+  | "pending_ar_charge_ok"
+  | "pending_ar_charge_skipped"
   // Lock screen
   | "lock_title"
   | "lock_subtitle"
@@ -486,6 +495,14 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     sidebar_billing_link: "Billing & credits",
     billing_subscribe_pending: "Stripe checkout opened for {plan}. Credits land after payment completes.",
     billing_cancel_with_refund: "Subscription cancelled. Refund of {amount} processed via Stripe.",
+    pending_ar_title: "Auto-recharge confirmation",
+    pending_ar_body: "Your credits dropped to {balance} (threshold {threshold}). Charge {amount} to your saved card?",
+    pending_ar_timer: "Expires in {m}:{s}",
+    pending_ar_approve: "Charge now",
+    pending_ar_defer: "Remind me later",
+    pending_ar_cancel: "Cancel",
+    pending_ar_charge_ok: "Credits recharged.",
+    pending_ar_charge_skipped: "Charge skipped — {reason}. You can try a manual top-up.",
     // Lock screen
     lock_title: "MoA Locked",
     lock_subtitle: "Enter your password to unlock",
@@ -747,6 +764,14 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     sidebar_billing_link: "결제 및 크레딧",
     billing_subscribe_pending: "{plan} 결제창(Stripe)을 열었습니다. 결제 완료 후 크레딧이 지급됩니다.",
     billing_cancel_with_refund: "구독이 해지되었습니다. Stripe에서 {amount} 환불 처리되었습니다.",
+    pending_ar_title: "자동 충전 확인",
+    pending_ar_body: "남은 크레딧이 {balance}로 떨어졌어요 (임계값 {threshold}). 저장된 카드로 {amount}을(를) 결제할까요?",
+    pending_ar_timer: "{m}분 {s}초 후 자동 취소",
+    pending_ar_approve: "지금 결제",
+    pending_ar_defer: "나중에 다시 알림",
+    pending_ar_cancel: "취소",
+    pending_ar_charge_ok: "크레딧이 충전되었습니다.",
+    pending_ar_charge_skipped: "결제 건너뜀 — {reason}. 수동 충전을 시도해 주세요.",
     // Lock screen
     lock_title: "MoA \uc7a0\uae08",
     lock_subtitle: "\ube44\ubc00\ubc88\ud638\ub97c \uc785\ub825\ud558\uc5ec \uc7a0\uae08\uc744 \ud574\uc81c\ud558\uc138\uc694",

@@ -1178,6 +1178,28 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         });
     }
 
+    // Auto-recharge timeout sweep (spec, 2026-04-23). Flips pending
+    // rows older than PENDING_AUTO_RECHARGE_TIMEOUT_SECS to
+    // `resolution='timeout'` so an abandoned modal popup doesn't leave
+    // the user's queue open forever. Runs every minute — cheap query,
+    // bounded index scan.
+    if let Some(pm_arc) = payment_manager.clone() {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let n = {
+                    let pm = pm_arc.lock();
+                    pm.timeout_stale_pending_auto_recharges().unwrap_or(0)
+                };
+                if n > 0 {
+                    tracing::debug!(count = n, "auto-recharge pending rows timed out");
+                }
+            }
+        });
+    }
+
     // Toss 빌링키 recurring charge scheduler (spec, 2026-04-23). Fires
     // hourly; for every active Toss subscription whose `renewal_at` has
     // passed, charge the stored billing key for one more cycle, grant
@@ -1556,6 +1578,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route(
             "/api/checkout/toss-billing-callback",
             get(api::handle_api_checkout_toss_billing_callback),
+        )
+        .route(
+            "/api/billing/pending-auto-recharge",
+            get(api::handle_api_pending_auto_recharge_get),
+        )
+        .route(
+            "/api/billing/pending-auto-recharge/{id}/resolve",
+            post(api::handle_api_pending_auto_recharge_resolve),
         )
         // ── Payment callbacks (Kakao Pay redirects) ──
         .route("/api/payment/approve", get(api::handle_api_payment_approve))
