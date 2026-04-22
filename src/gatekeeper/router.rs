@@ -74,10 +74,29 @@ pub struct RoutingDecision {
     pub tool_needed: Option<String>,
     /// Routing target (local or cloud).
     pub target: RoutingTarget,
-    /// Confidence of the classification (0.0 – 1.0).
+    /// Raw classifier confidence (0.0 – 1.0) from the keyword
+    /// heuristic. See also `weighted_confidence`.
     pub confidence: f64,
     /// Human-readable reason for the decision.
     pub reason: String,
+    /// Macro-difficulty inferred by
+    /// `routing_policy::classify_question`. `None` when the policy
+    /// has not been applied yet (older callers of `classify` that
+    /// skip `process_message`). Spec (2026-04-23).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<super::routing_policy::QuestionDifficulty>,
+    /// Professional domain(s) detected by the classifier (e.g.
+    /// Medical + Legal for a medical-malpractice question).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<super::routing_policy::ProfessionalDomain>,
+    /// Weighted confidence that the SLM should be trusted for this
+    /// specific answer. Set once `process_message` has generated a
+    /// draft and evaluated it through
+    /// `routing_policy::weighted_confidence`. When `None`, callers
+    /// should fall back to comparing `confidence` against the
+    /// threshold for backwards compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weighted_confidence: Option<f64>,
 }
 
 impl RoutingDecision {
@@ -464,54 +483,100 @@ impl GatekeeperRouter {
     ///
     /// If `local_response` is `None`, the caller should forward to the cloud LLM.
     pub async fn process_message(&self, message: &str) -> GatekeeperResult {
-        let decision = self.classify(message);
+        use super::routing_policy;
+        // Spec (2026-04-23): the routing decision is now a two-stage
+        // weighted judgement instead of a single keyword confidence:
+        //
+        //   1. `classify_question` categorises the ask as Simple
+        //      (web-searchable fact / common knowledge),
+        //      Specialized (medical / legal / scientific / math /
+        //      coding / finance), or ComplexReasoning (multi-domain
+        //      composite / chain-of-thought heavy).
+        //   2. The raw keyword classifier (`self.classify`) still runs
+        //      to produce a baseline confidence number.
+        //   3. If the SLM is even eligible to answer, we generate the
+        //      draft answer BEFORE deciding — then evaluate answer
+        //      quality (length, hedging markers, tool outcomes) and
+        //      compute a weighted_confidence that folds difficulty
+        //      bias + quality penalties in. That is what the
+        //      threshold gate compares against, not the raw number.
+        //
+        // The net effect: a Simple fact question where the SLM
+        // invoked a web tool and got a clean answer sails through
+        // (base + 0.20 bias). A Specialized medical question with a
+        // hedged answer eats a large penalty and escalates even if
+        // the keyword classifier thought it was confident.
+        let classification = routing_policy::classify_question(message);
+        let mut decision = self.classify(message);
+        decision.difficulty = Some(classification.difficulty);
+        decision.domains = classification.domains.clone();
 
-        // Spec (2026-04-22): even for `RoutingTarget::Local` decisions,
-        // if the classifier's confidence sits below the configured
-        // threshold (default 0.6) the SLM is NOT trusted to answer and
-        // the chat handler escalates the prompt to the cloud LLM.
-        let confidence_below_floor = decision.confidence < self.confidence_threshold;
-        if confidence_below_floor {
-            tracing::info!(
-                confidence = decision.confidence,
-                threshold = self.confidence_threshold,
-                category = ?decision.category,
-                "SLM confidence below threshold — escalating to cloud LLM"
+        // Hard exits that short-circuit the whole policy:
+        //   * the keyword classifier already routed to Cloud;
+        //   * the SLM daemon is unavailable.
+        if decision.target != RoutingTarget::Local || !self.slm_available {
+            tracing::debug!(
+                target = ?decision.target,
+                slm_available = self.slm_available,
+                difficulty = ?classification.difficulty,
+                "Gatekeeper skipping SLM attempt"
             );
-        }
-
-        // Only attempt local response for Local-routed messages, when
-        // the SLM is reachable, AND when confidence clears the gate.
-        if decision.target != RoutingTarget::Local
-            || !self.slm_available
-            || confidence_below_floor
-        {
             return GatekeeperResult {
                 decision,
                 local_response: None,
             };
         }
 
-        // Attempt SLM response for simple/greeting messages.
-        match self.respond_locally(message).await {
-            Ok(response) => {
-                tracing::info!(
-                    category = ?decision.category,
-                    confidence = decision.confidence,
-                    "Gatekeeper handled locally via SLM"
-                );
-                GatekeeperResult {
-                    decision,
-                    local_response: Some(response),
-                }
-            }
+        // Generate the draft answer first — quality evaluation needs
+        // the actual text. On SLM failure we escalate immediately
+        // (cloud LLM is the safety net).
+        let slm_reply = match self.respond_locally(message).await {
+            Ok(r) => r,
             Err(e) => {
-                tracing::warn!("SLM local response failed, falling back to cloud: {e}");
-                GatekeeperResult {
+                tracing::warn!(error = %e, "SLM local response failed, escalating");
+                return GatekeeperResult {
                     decision,
                     local_response: None,
-                }
+                };
             }
+        };
+
+        // Evaluate answer quality. `tool_was_used` is threaded as
+        // `false` here because the router's `respond_locally` path
+        // does not invoke tools directly (the agent loop does, in
+        // the chat handler). A future refactor can carry the real
+        // tool outcome through so tool failures drive the penalty.
+        let quality =
+            routing_policy::evaluate_answer_quality(message, &slm_reply, false, None);
+        let weighted =
+            routing_policy::weighted_confidence(decision.confidence, &classification, &quality);
+        decision.weighted_confidence = Some(weighted);
+
+        if weighted < self.confidence_threshold {
+            tracing::info!(
+                base = decision.confidence,
+                weighted,
+                threshold = self.confidence_threshold,
+                difficulty = ?classification.difficulty,
+                hedged = quality.has_hedging,
+                tool_success = ?quality.tool_success,
+                "Weighted confidence below threshold — escalating to cloud LLM"
+            );
+            return GatekeeperResult {
+                decision,
+                local_response: None,
+            };
+        }
+
+        tracing::info!(
+            base = decision.confidence,
+            weighted,
+            difficulty = ?classification.difficulty,
+            "Gatekeeper handled locally via SLM (weighted policy)"
+        );
+        GatekeeperResult {
+            decision,
+            local_response: Some(slm_reply),
         }
     }
 
@@ -533,6 +598,9 @@ impl GatekeeperRouter {
                 target: RoutingTarget::Local,
                 confidence: 0.95,
                 reason: "Greeting detected — handled locally".into(),
+                difficulty: None,
+                domains: Vec::new(),
+                weighted_confidence: None,
             };
         }
 
@@ -545,6 +613,9 @@ impl GatekeeperRouter {
                     target: RoutingTarget::Cloud,
                     confidence: 0.85,
                     reason: format!("Specialized tool required: {tool}"),
+                    difficulty: None,
+                    domains: Vec::new(),
+                    weighted_confidence: None,
                 };
             }
         }
@@ -557,6 +628,9 @@ impl GatekeeperRouter {
                 target: RoutingTarget::Cloud,
                 confidence: 0.8,
                 reason: "Complex task — requires cloud LLM reasoning".into(),
+                difficulty: None,
+                domains: Vec::new(),
+                weighted_confidence: None,
             };
         }
 
@@ -569,6 +643,9 @@ impl GatekeeperRouter {
                     target: RoutingTarget::Local,
                     confidence: 0.8,
                     reason: format!("Tool invocation: {tool}"),
+                    difficulty: None,
+                    domains: Vec::new(),
+                    weighted_confidence: None,
                 };
             }
         }
@@ -581,6 +658,9 @@ impl GatekeeperRouter {
                 target: RoutingTarget::Local,
                 confidence: 0.75,
                 reason: "Simple query — handled locally".into(),
+                difficulty: None,
+                domains: Vec::new(),
+                weighted_confidence: None,
             };
         }
 
@@ -593,6 +673,9 @@ impl GatekeeperRouter {
                 confidence: 0.5,
                 reason: "Privacy-sensitive content detected — requires careful cloud handling"
                     .into(),
+                difficulty: None,
+                domains: Vec::new(),
+                weighted_confidence: None,
             };
         }
 
@@ -604,6 +687,9 @@ impl GatekeeperRouter {
                 target: RoutingTarget::Local,
                 confidence: 0.55,
                 reason: "Short message — attempting local handling".into(),
+                difficulty: None,
+                domains: Vec::new(),
+                weighted_confidence: None,
             };
         }
 
@@ -614,6 +700,9 @@ impl GatekeeperRouter {
             target: RoutingTarget::Cloud,
             confidence: DEFAULT_CONFIDENCE_THRESHOLD,
             reason: "Ambiguous intent — delegating to cloud LLM".into(),
+            difficulty: None,
+            domains: Vec::new(),
+            weighted_confidence: None,
         }
     }
 
@@ -626,6 +715,9 @@ impl GatekeeperRouter {
                 target: RoutingTarget::Local,
                 confidence: 1.0,
                 reason: format!("{pending_task_count} pending task(s) found"),
+                difficulty: None,
+                domains: Vec::new(),
+                weighted_confidence: None,
             }
         } else {
             RoutingDecision {
@@ -634,6 +726,9 @@ impl GatekeeperRouter {
                 target: RoutingTarget::Local,
                 confidence: 1.0,
                 reason: "No pending tasks".into(),
+                difficulty: None,
+                domains: Vec::new(),
+                weighted_confidence: None,
             }
         }
     }
@@ -910,7 +1005,10 @@ mod tests {
                 target: RoutingTarget::Cloud,
                 confidence: 0.8,
                 reason: "test".into(),
-            },
+                difficulty: None,
+                domains: Vec::new(),
+                weighted_confidence: None,
+},
             queued_at: 1000,
         };
 
@@ -944,7 +1042,10 @@ mod tests {
                         target: RoutingTarget::Cloud,
                         confidence: 0.5,
                         reason: "test".into(),
-                    },
+                        difficulty: None,
+                        domains: Vec::new(),
+                        weighted_confidence: None,
+},
                     queued_at: 0,
                 })
                 .await
@@ -963,7 +1064,10 @@ mod tests {
                     target: RoutingTarget::Cloud,
                     confidence: 0.5,
                     reason: "test".into(),
-                },
+                    difficulty: None,
+                    domains: Vec::new(),
+                    weighted_confidence: None,
+},
                 queued_at: 0,
             })
             .await;
@@ -980,7 +1084,10 @@ mod tests {
             target: RoutingTarget::Local,
             confidence: 0.9,
             reason: "test".into(),
-        };
+            difficulty: None,
+            domains: Vec::new(),
+            weighted_confidence: None,
+};
         assert!(local.is_local());
 
         let cloud = RoutingDecision {
@@ -989,7 +1096,10 @@ mod tests {
             target: RoutingTarget::Cloud,
             confidence: 0.9,
             reason: "test".into(),
-        };
+            difficulty: None,
+            domains: Vec::new(),
+            weighted_confidence: None,
+};
         assert!(!cloud.is_local());
     }
 
