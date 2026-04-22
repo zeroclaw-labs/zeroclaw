@@ -33,6 +33,7 @@ ZeroClaw 在启动时以 `INFO` 级别记录解析后的配置：
 | `backend` | `none` | 可观测性后端：`none`、`noop`、`log`、`prometheus`、`otel`、`opentelemetry` 或 `otlp` |
 | `otel_endpoint` | `http://localhost:4318` | 当后端为 `otel` 时使用的 OTLP HTTP 端点 |
 | `otel_service_name` | `zeroclaw` | 发送到 OTLP 收集器的服务名称 |
+| `otel_headers` | _(无)_ | OTLP 导出的可选 HTTP 头（例如授权）。以 TOML 表 `[observability.otel_headers]` 指定。直接编辑 `config.toml` — 无法通过 `zeroclaw config set` 设置。值以明文存储；请用 `chmod 600` 保护 `config.toml`。 |
 | `runtime_trace_mode` | `none` | 运行时跟踪存储模式：`none`、`rolling` 或 `full` |
 | `runtime_trace_path` | `state/runtime-trace.jsonl` | 运行时跟踪 JSONL 路径（除非绝对路径，否则相对于工作区） |
 | `runtime_trace_max_entries` | `200` | 当 `runtime_trace_mode = \"rolling\"` 时保留的最大事件数 |
@@ -57,6 +58,9 @@ otel_service_name = \"zeroclaw\"
 runtime_trace_mode = \"rolling\"
 runtime_trace_path = \"state/runtime-trace.jsonl\"
 runtime_trace_max_entries = 200
+
+[observability.otel_headers]
+Authorization = \"Bearer <your-token>\"
 ```
 
 ## 环境提供商覆盖
@@ -562,6 +566,8 @@ WhatsApp 在一个配置表下支持两个后端。
 | `verify_token` | 是 | Webhook 验证令牌 |
 | `app_secret` | 可选 | 启用 webhook 签名验证（`X-Hub-Signature-256`） |
 | `allowed_numbers` | 推荐 | 允许的入站号码（`[]` = 拒绝所有，`"*"` = 允许所有） |
+| `dm_mention_patterns` | 可选 | 私聊提及门控的正则表达式（不区分大小写）。当非空时，只有匹配至少一个模式的私聊消息才会被处理；匹配片段将被去除。示例：`["@?ZeroClaw"]` |
+| `group_mention_patterns` | 可选 | 群聊提及门控的正则表达式（不区分大小写）。当非空时，只有匹配至少一个模式的群聊消息才会被处理；匹配片段将被去除。示例：`["@?ZeroClaw"]` |
 
 WhatsApp Web 模式（原生客户端）：
 
@@ -571,6 +577,8 @@ WhatsApp Web 模式（原生客户端）：
 | `pair_phone` | 可选 | 配对码流程电话号码（仅数字） |
 | `pair_code` | 可选 | 自定义配对码（否则自动生成） |
 | `allowed_numbers` | 推荐 | 允许的入站号码（`[]` = 拒绝所有，`"*"` = 允许所有） |
+| `dm_mention_patterns` | 可选 | 私聊提及门控的正则表达式（不区分大小写）。当非空时，只有匹配至少一个模式的私聊消息才会被处理；匹配片段将被去除。示例：`["@?ZeroClaw"]` |
+| `group_mention_patterns` | 可选 | 群聊提及门控的正则表达式（不区分大小写）。当非空时，只有匹配至少一个模式的群聊消息才会被处理；匹配片段将被去除。示例：`["@?ZeroClaw"]` |
 
 注意事项：
 

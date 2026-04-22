@@ -713,6 +713,9 @@ pub struct ProviderRuntimeOptions {
     /// When true, system messages are merged into the first user message before
     /// sending. Propagated from `ModelProviderConfig::merge_system_into_user`.
     pub merge_system_into_user: bool,
+    /// Extra JSON parameters merged into API request bodies at the top level.
+    /// Propagated from `ModelProviderConfig::provider_extra`.
+    pub provider_extra: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
     pub tls_ca_cert_path: Option<String>,
 }
@@ -731,6 +734,7 @@ impl Default for ProviderRuntimeOptions {
             api_path: None,
             provider_max_tokens: None,
             merge_system_into_user: false,
+            provider_extra: None,
             tls_ca_cert_path: None,
         }
     }
@@ -776,6 +780,7 @@ pub fn provider_runtime_options_from_config(
         api_path: fallback.and_then(|e| e.api_path.clone()),
         provider_max_tokens: fallback.and_then(|e| e.max_tokens),
         merge_system_into_user,
+        provider_extra: fallback.and_then(|e| e.provider_extra.clone()),
         tls_ca_cert_path,
     }
 }
@@ -932,6 +937,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "fireworks" | "fireworks-ai" => vec!["FIREWORKS_API_KEY"],
         "novita" => vec!["NOVITA_API_KEY"],
         "perplexity" => vec!["PERPLEXITY_API_KEY"],
+        "copilot" | "github-copilot" => vec!["GITHUB_TOKEN"],
         "cohere" => vec!["COHERE_API_KEY"],
         name if is_moonshot_alias(name) => vec!["MOONSHOT_API_KEY"],
         "kimi-code" | "kimi_coding" | "kimi_for_coding" => {
@@ -1192,10 +1198,14 @@ fn create_provider_with_url_and_options(
             )?))
         }
         // ── Primary providers (custom implementations) ───────
-        "openrouter" => Ok(Box::new(
-            openrouter::OpenRouterProvider::new(key, options.provider_timeout_secs)
-                .with_max_tokens(options.provider_max_tokens),
-        )),
+        "openrouter" => {
+            let mut p = openrouter::OpenRouterProvider::new(key, options.provider_timeout_secs)
+                .with_max_tokens(options.provider_max_tokens);
+            if let Some(extra) = options.provider_extra.clone() {
+                p = p.with_extra_body(extra);
+            }
+            Ok(Box::new(p))
+        }
         "anthropic" => {
             let mut p = anthropic::AnthropicProvider::new(key);
             if let Some(mt) = options.provider_max_tokens {
@@ -1398,12 +1408,15 @@ fn create_provider_with_url_and_options(
         }
 
         // ── Extended ecosystem (community favorites) ─────────
-        "groq" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Groq",
-            "https://api.groq.com/openai/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        "groq" => Ok(compat(
+            OpenAiCompatibleProvider::new(
+                "Groq",
+                "https://api.groq.com/openai/v1",
+                key,
+                AuthStyle::Bearer,
+            )
+            .without_native_tools(),
+        )),
         "mistral" => Ok(compat(OpenAiCompatibleProvider::new(
             "Mistral",
             "https://api.mistral.ai/v1",

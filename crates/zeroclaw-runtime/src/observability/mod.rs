@@ -48,6 +48,7 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
             match OtelObserver::new(
                 config.otel_endpoint.as_deref(),
                 config.otel_service_name.as_deref(),
+                config.otel_headers.clone(),
             ) {
                 Ok(obs) => {
                     tracing::info!(

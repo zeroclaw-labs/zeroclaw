@@ -755,6 +755,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     mention_only: false,
                     ack_reactions: None,
                     proxy_url: None,
+                    approval_timeout_secs: 120,
                 });
             }
         }
@@ -915,6 +916,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     encrypt_key: None,
                     verification_token: None,
                     allowed_users: vec![],
+                    mention_only: false,
                     receive_mode: LarkReceiveMode::default(),
                     port: None,
                     proxy_url: None,
@@ -3500,6 +3502,7 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: 120,
         });
         apply_tui_selections_to_config(&app, &mut config);
         let tg = config.channels.telegram.as_ref().unwrap();

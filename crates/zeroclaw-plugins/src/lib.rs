@@ -5,6 +5,7 @@
 
 pub mod error;
 pub mod host;
+pub mod runtime;
 pub mod signature;
 pub mod wasm_channel;
 pub mod wasm_tool;
@@ -54,7 +55,7 @@ pub enum PluginCapability {
 }
 
 /// Permissions a plugin may request.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginPermission {
     /// Can make HTTP requests

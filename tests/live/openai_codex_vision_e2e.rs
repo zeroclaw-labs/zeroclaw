@@ -157,6 +157,7 @@ async fn openai_codex_second_vision_support() -> Result<()> {
         extra_headers: std::collections::HashMap::new(),
         api_path: None,
         merge_system_into_user: false,
+        provider_extra: None,
         tls_ca_cert_path: None,
     };
 

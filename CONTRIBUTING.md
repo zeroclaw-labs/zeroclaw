@@ -37,6 +37,8 @@ All PRs must target **`master`**. PRs targeting `main` will be rejected.
 > 3. Open a PR targeting `master`
 >
 > Do **not** create or push to a `main` branch. There is no `main` branch — it will not work.
+>
+> **Recommended:** keep "Allow edits from maintainers" enabled on your PRs. This is the default for PRs from personal forks and lets maintainers push small fixups directly rather than superseding your PR. See [`docs/contributing/pr-discipline.md`](docs/contributing/pr-discipline.md).
 
 ## First-Time Contributors
 

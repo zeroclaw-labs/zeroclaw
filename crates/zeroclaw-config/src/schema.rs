@@ -555,6 +555,12 @@ pub struct ModelProviderConfig {
     /// Merge system messages into first user message.
     #[serde(default)]
     pub merge_system_into_user: bool,
+    /// Extra JSON parameters to include in API requests.
+    /// Merged at the top level of the request body, allowing provider-specific
+    /// features (routing, transforms, etc.) without code changes.
+    /// Example: `provider_extra = { provider = { only = ["Anthropic"] } }`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_extra: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca_cert_path: Option<String>,
@@ -5386,6 +5392,15 @@ pub struct ObservabilityConfig {
     #[serde(default)]
     pub otel_service_name: Option<String>,
 
+    /// Optional HTTP headers sent with every OTLP export request (e.g. authorization).
+    /// Specified as key-value pairs in TOML:
+    /// ```toml
+    /// [observability.otel_headers]
+    /// Authorization = "Bearer sk-..."
+    /// ```
+    #[serde(default)]
+    pub otel_headers: Option<std::collections::HashMap<String, String>>,
+
     /// Runtime trace storage mode: "none" | "rolling" | "full".
     /// Controls whether model replies and tool-call diagnostics are persisted.
     #[serde(default = "default_runtime_trace_mode")]
@@ -5406,6 +5421,7 @@ impl Default for ObservabilityConfig {
             backend: "none".into(),
             otel_endpoint: None,
             otel_service_name: None,
+            otel_headers: None,
             runtime_trace_mode: default_runtime_trace_mode(),
             runtime_trace_path: default_runtime_trace_path(),
             runtime_trace_max_entries: default_runtime_trace_max_entries(),
@@ -6186,6 +6202,10 @@ pub struct CronJobDecl {
     /// Allowlist of tool names for agent jobs.
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
+    /// Whether to recall and inject memory context before this agent job runs.
+    /// Defaults to `true`; set to `false` for stateless digest jobs.
+    #[serde(default = "default_true")]
+    pub uses_memory: bool,
     /// Session target: `"isolated"` (default) or `"main"`.
     #[serde(default)]
     pub session_target: Option<String>,
@@ -6802,6 +6822,10 @@ fn default_multi_message_delay_ms() -> u64 {
     800
 }
 
+fn default_telegram_approval_timeout_secs() -> u64 {
+    120
+}
+
 fn default_matrix_draft_update_interval_ms() -> u64 {
     1500
 }
@@ -6842,6 +6866,10 @@ pub struct TelegramConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// How long (seconds) to wait for the operator to tap an inline-keyboard
+    /// button on a tool approval prompt before auto-denying. Default: 120.
+    #[serde(default = "default_telegram_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -7835,6 +7863,10 @@ pub struct FeishuConfig {
     /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, only respond to messages that @-mention the bot in groups.
+    /// Direct messages are always processed.
+    #[serde(default)]
+    pub mention_only: bool,
     /// Event receive mode: "websocket" (default) or "webhook"
     #[serde(default)]
     pub receive_mode: LarkReceiveMode,
@@ -11198,6 +11230,10 @@ impl_enum_prop_kind!(
     AutonomyLevel,
 );
 
+impl HasPropKind for serde_json::Value {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11691,6 +11727,7 @@ auto_save = true
                     mention_only: false,
                     ack_reactions: None,
                     proxy_url: None,
+                    approval_timeout_secs: default_telegram_approval_timeout_secs(),
                 }),
                 discord: None,
                 discord_history: None,
@@ -12413,6 +12450,7 @@ default_temperature = 0.7
             encrypt_key: Some("feishu-encrypt".into()),
             verification_token: Some("feishu-verify".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
@@ -12580,6 +12618,7 @@ default_temperature = 0.7
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: 120,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -14387,6 +14426,7 @@ default_model = "legacy-model"
             encrypt_key: Some("feishu-encrypt".into()),
             verification_token: Some("feishu-verify".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
@@ -15359,6 +15399,7 @@ default_model = "persisted-profile"
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["user_123".into(), "user_456".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
@@ -15381,6 +15422,7 @@ default_model = "persisted-profile"
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
@@ -15760,6 +15802,7 @@ require_otp_to_resume = true
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: default_telegram_approval_timeout_secs(),
         });
 
         // Save (triggers encryption)

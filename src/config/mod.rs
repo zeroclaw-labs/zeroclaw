@@ -219,6 +219,7 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: 120,
         };
 
         let discord = DiscordConfig {
@@ -256,6 +257,7 @@ mod tests {
             encrypt_key: None,
             verification_token: None,
             allowed_users: vec![],
+            mention_only: false,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,

@@ -62,7 +62,7 @@ fn protected_indices(messages: &[ChatMessage], keep_recent: usize) -> Vec<bool> 
 /// The Anthropic API (and others) reject these with a 400 error.
 ///
 /// Returns the number of messages removed.
-pub(crate) fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
+pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
     // Pass 1: Remove assistant(tool_calls) + their tool_results when the
     // assistant is preceded by another assistant. Normalization would merge
     // them, destroying structured tool_use blocks and orphaning the results.
@@ -70,18 +70,17 @@ pub(crate) fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> 
     let mut i = 0;
     while i < messages.len() {
         if messages[i].role == "assistant"
-            && messages[i].content.contains("tool_calls")
+            && extract_assistant_tool_call_ids(&messages[i].content).is_some()
             && i > 0
             && messages[i - 1].role == "assistant"
         {
-            // Collect tool_call_ids from this assistant to find matching tool_results.
-            let doomed_content = messages[i].content.clone();
+            let doomed_ids =
+                extract_assistant_tool_call_ids(&messages[i].content).unwrap_or_default();
             messages.remove(i);
             removed += 1;
-            // Remove following tool messages that reference this assistant.
             while i < messages.len() && messages[i].role == "tool" {
                 let dominated = match extract_tool_call_id(&messages[i].content) {
-                    Some(id) => doomed_content.contains(&id),
+                    Some(id) => doomed_ids.iter().any(|d| d == &id),
                     None => true,
                 };
                 if dominated {
@@ -97,7 +96,11 @@ pub(crate) fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> 
     }
 
     // Pass 2: Remove remaining orphan tool messages whose tool_call_id
-    // doesn't appear in the immediately preceding assistant.
+    // is not in the preceding assistant's structured tool_calls array.
+    // A substring match on the assistant's *text* is NOT sufficient —
+    // compaction summaries are instructed to preserve identifiers, so an
+    // id can appear in prose without an actual tool_use block backing it
+    // (see #5813).
     i = 0;
     while i < messages.len() {
         if messages[i].role != "tool" {
@@ -112,17 +115,13 @@ pub(crate) fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> 
 
         let is_orphan = match assistant_idx {
             None => true,
-            Some(idx) => {
-                let assistant_content = &messages[idx].content;
-                if assistant_content.contains("tool_calls") {
-                    match extract_tool_call_id(&messages[i].content) {
-                        Some(tool_call_id) => !assistant_content.contains(&tool_call_id),
-                        None => false,
-                    }
-                } else {
-                    true
-                }
-            }
+            Some(idx) => match extract_assistant_tool_call_ids(&messages[idx].content) {
+                None => true,
+                Some(ids) => match extract_tool_call_id(&messages[i].content) {
+                    Some(tool_call_id) => !ids.iter().any(|id| id == &tool_call_id),
+                    None => false,
+                },
+            },
         };
 
         if is_orphan {
@@ -154,6 +153,20 @@ fn extract_tool_call_id(content: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Extract the list of structured tool-call IDs an assistant message
+/// is claiming to have invoked, if any. Returns `None` when the content
+/// does not parse as a JSON object with a `tool_calls` array — meaning the
+/// assistant has no native tool_use blocks backing any tool_results.
+fn extract_assistant_tool_call_ids(content: &str) -> Option<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let arr = value.get("tool_calls")?.as_array()?;
+    let ids: Vec<String> = arr
+        .iter()
+        .filter_map(|call| call.get("id").and_then(|v| v.as_str()).map(str::to_owned))
+        .collect();
+    if ids.is_empty() { None } else { Some(ids) }
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -176,20 +189,32 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
     // forms an atomic group (tool_use + tool_result pairing). Collapsing only
     // part of the group would orphan tool_use blocks, causing API 400 errors
     // from providers that enforce pairing (e.g., Anthropic). See #4810.
+    //
+    // The group is collapsed only when *every* tool in it is unprotected —
+    // the same all-or-nothing rule Phase 2 uses. If `keep_recent` protects
+    // any tool in the group we skip the whole group. Partial collapse would
+    // leave a protected tool behind whose parent assistant has been
+    // rewritten to a summary with no "tool_calls" marker, which Phase 3's
+    // orphan sweep then evicts — silently violating `keep_recent`. See
+    // #5823.
     if config.collapse_tool_results {
         let mut i = 0;
         while i < messages.len() {
             let protected = protected_indices(messages, config.keep_recent);
             if messages[i].role == "assistant" && !protected[i] {
                 // Count consecutive tool messages following this assistant
+                // and remember whether any of them is protected.
                 let mut tool_count = 0;
+                let mut any_tool_protected = false;
                 while i + 1 + tool_count < messages.len()
                     && messages[i + 1 + tool_count].role == "tool"
-                    && !protected[i + 1 + tool_count]
                 {
+                    if protected[i + 1 + tool_count] {
+                        any_tool_protected = true;
+                    }
                     tool_count += 1;
                 }
-                if tool_count > 0 {
+                if tool_count > 0 && !any_tool_protected {
                     let summary =
                         format!("[Tool exchange: {tool_count} tool call(s) — results collapsed]");
                     messages[i] = ChatMessage {
@@ -200,6 +225,13 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
                         messages.remove(i + 1);
                     }
                     collapsed_pairs += tool_count;
+                    continue;
+                }
+                if tool_count > 0 {
+                    // Protected tool inside the group → skip the whole
+                    // group intact so Phase 3's orphan sweep has no
+                    // pretext to remove those tools.
+                    i += 1 + tool_count;
                     continue;
                 }
             }
@@ -752,6 +784,113 @@ mod tests {
         assert!(
             messages.iter().any(|m| m.content.contains("toolu_recent")),
             "Protected tool message was dropped by Phase 2 budget enforcement"
+        );
+    }
+
+    /// Regression test for issue #5813: a compaction summary preserves
+    /// identifiers by design (UUIDs, tokens, tool_call_ids). That means the
+    /// summary text may contain the tool_call_id of a tool_result whose
+    /// tool_use was dropped. The orphan detector must not be fooled by a
+    /// substring match on the summary — it must confirm the id appears in
+    /// a structured tool_calls array.
+    #[test]
+    fn orphan_tool_not_fooled_by_id_in_summary_text() {
+        let summary = "[CONTEXT SUMMARY \u{2014} 4 messages compressed]\n\
+             Earlier turns invoked shell with tool_calls id toolu_01Orphan \
+             and returned ok.";
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("assistant", summary),
+            msg(
+                "tool",
+                r#"{"tool_call_id":"toolu_01Orphan","content":"stale"}"#,
+            ),
+            msg("user", "new question"),
+        ];
+        let removed = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(
+            removed, 1,
+            "orphan must be removed even if its id is mentioned in summary text"
+        );
+        assert!(!messages.iter().any(|m| m.role == "tool"));
+    }
+
+    /// Regression test for issue #5743: MiniMax rejects orphaned tool-role
+    /// messages whose assistant (with `tool_calls`) was trimmed by the
+    /// channel orchestrator's proactive history trimming.
+    #[test]
+    fn orphan_tool_from_trimmed_channel_history() {
+        // Simulates the scenario: channel history was trimmed and the
+        // assistant message containing tool_calls was dropped, leaving
+        // orphaned tool results with MiniMax-style IDs.
+        let tool_result =
+            r#"{"content":"search results","tool_call_id":"chatcmpl-tool-92a12a15c14f3b36"}"#;
+        let mut messages = vec![
+            msg("system", "You are a helpful assistant"),
+            msg("tool", tool_result),
+            msg("assistant", "Here are the search results"),
+            msg("user", "Thanks, now summarize them"),
+        ];
+        let removed = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(removed, 1, "orphaned tool message should be removed");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[2].role, "user");
+    }
+
+    /// Regression for #5823:
+    ///
+    /// When `keep_recent` protects the *tail* of a multi-tool group but not
+    /// the preceding assistant, Phase 1 used to collapse the unprotected
+    /// tools and rewrite the assistant to a summary that no longer contained
+    /// `"tool_calls"`. Phase 3's orphan sweep then classified the still-live
+    /// protected tool as an orphan (because the new summary does not contain
+    /// `"tool_calls"`) and removed it — silently violating `keep_recent`.
+    ///
+    /// After the fix Phase 1 treats the group as atomic: if any tool in it
+    /// is protected, the entire group is left intact.
+    #[test]
+    fn prune_does_not_evict_protected_tool_when_group_straddles_keep_recent() {
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("user", "query"),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[
+                    {"id":"t1","name":"shell","arguments":"{}"},
+                    {"id":"t2","name":"web","arguments":"{}"}
+                ]}"#,
+            ),
+            msg("tool", r#"{"tool_call_id":"t1","content":"first"}"#),
+            msg(
+                "tool",
+                r#"{"tool_call_id":"t2","content":"PROTECTED second"}"#,
+            ),
+            msg("user", "follow up"),
+            msg("assistant", "final"),
+        ];
+
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            // Budget is well above the estimated token cost so Phase 2 does
+            // not drop anything; this test isolates the Phase 1 / Phase 3
+            // interaction.
+            max_tokens: 100_000,
+            keep_recent: 3,
+            collapse_tool_results: true,
+        };
+
+        let stats = prune_history(&mut messages, &config);
+
+        assert_eq!(stats.messages_before, 7);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.content.contains("PROTECTED second")),
+            "a tool message protected by keep_recent must survive; \
+             got roles {:?}",
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
         );
     }
 }

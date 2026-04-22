@@ -241,6 +241,8 @@ phone_number_id = \"123456789012345\"
 verify_token = \"your-verify-token\"
 app_secret = \"your-app-secret\"     # 可选但推荐
 allowed_numbers = [\"*\"]
+dm_mention_patterns = []           # 可选: 私聊提及匹配的正则表达式
+group_mention_patterns = []        # 可选: 群聊提及匹配的正则表达式
 ```
 
 WhatsApp 网页模式：
@@ -251,6 +253,8 @@ session_path = \"~/.zeroclaw/state/whatsapp-web/session.db\"
 pair_phone = \"15551234567\"         # 可选; 省略使用二维码流程
 pair_code = \"\"                     # 可选自定义配对码
 allowed_numbers = [\"*\"]
+dm_mention_patterns = []           # 可选: 私聊提及匹配的正则表达式
+group_mention_patterns = []        # 可选: 群聊提及匹配的正则表达式
 ```
 
 注意事项：
@@ -258,6 +262,7 @@ allowed_numbers = [\"*\"]
 - 使用 `cargo build --features whatsapp-web` 构建（或等效的运行命令）。
 - 将 `session_path` 保留在持久存储上，以避免重启后重新链接。
 - 回复路由使用发起聊天的 JID，因此直接和群组回复都能正常工作。
+- `dm_mention_patterns` 和 `group_mention_patterns` 分别为私聊和群聊提供基于正则表达式的提及门控。当非空时，只有匹配至少一个模式的消息才会被处理；匹配的片段将从转发内容中去除。模式不区分大小写。示例：`["@?ZeroClaw", "\\+?15555550123"]`。无效或过大的模式将被记录日志并跳过。
 
 ### 4.8 Webhook 渠道配置（网关）
 
