@@ -701,6 +701,10 @@ pub struct ProviderRuntimeOptions {
     /// HTTP request timeout in seconds for LLM provider API calls.
     /// `None` uses the provider's built-in default (120s for compatible providers).
     pub provider_timeout_secs: Option<u64>,
+    /// HTTP connect timeout in seconds for LLM provider API calls.
+    /// `None` uses the provider's built-in default (10s for the compatible stack).
+    /// See `ModelProviderConfig::connect_timeout_secs` for which implementations honor this.
+    pub provider_connect_timeout_secs: Option<u64>,
     /// Extra HTTP headers to include in provider API requests.
     /// These are merged from the config file and `ZEROCLAW_EXTRA_HEADERS` env var.
     pub extra_headers: std::collections::HashMap<String, String>,
@@ -728,6 +732,7 @@ impl Default for ProviderRuntimeOptions {
             reasoning_enabled: None,
             reasoning_effort: None,
             provider_timeout_secs: None,
+            provider_connect_timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
             provider_max_tokens: None,
@@ -769,6 +774,7 @@ pub fn provider_runtime_options_from_config(
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_effort: config.runtime.reasoning_effort.clone(),
         provider_timeout_secs: Some(fallback.and_then(|e| e.timeout_secs).unwrap_or(120)),
+        provider_connect_timeout_secs: fallback.and_then(|e| e.connect_timeout_secs),
         extra_headers: fallback
             .map(|e| e.extra_headers.clone())
             .unwrap_or_default(),
@@ -1118,6 +1124,7 @@ fn create_provider_with_url_and_options(
     // headers to OpenAI-compatible providers before boxing them as trait objects.
     let compat = {
         let timeout = options.provider_timeout_secs;
+        let connect_timeout = options.provider_connect_timeout_secs;
         let reasoning_effort = options.reasoning_effort.clone();
         let extra_headers = options.extra_headers.clone();
         let api_path = options.api_path.clone();
@@ -1126,6 +1133,9 @@ fn create_provider_with_url_and_options(
             let mut p = p;
             if let Some(t) = timeout {
                 p = p.with_timeout_secs(t);
+            }
+            if let Some(ct) = connect_timeout {
+                p = p.with_connect_timeout_secs(ct);
             }
             if let Some(ref effort) = reasoning_effort {
                 p = p.with_reasoning_effort(Some(effort.clone()));
@@ -1193,6 +1203,8 @@ fn create_provider_with_url_and_options(
                 .with_max_tokens(options.provider_max_tokens);
             if let Some(extra) = options.provider_extra.clone() {
                 p = p.with_extra_body(extra);
+            if let Some(ct) = options.provider_connect_timeout_secs {
+                p = p.with_connect_timeout_secs(ct);
             }
             Ok(Box::new(p))
         }

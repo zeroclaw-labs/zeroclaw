@@ -39,6 +39,8 @@ pub struct OpenAiCompatibleProvider {
     native_tool_calling: bool,
     /// HTTP request timeout in seconds for LLM API calls. Default: 120.
     timeout_secs: u64,
+    /// HTTP connect timeout in seconds. Default: 10.
+    connect_timeout_secs: u64,
     /// Extra HTTP headers to include in all API requests.
     extra_headers: std::collections::HashMap<String, String>,
     /// Optional reasoning effort for GPT-5/Codex-compatible backends.
@@ -242,6 +244,7 @@ impl OpenAiCompatibleProvider {
             merge_system_into_user,
             native_tool_calling: !merge_system_into_user,
             timeout_secs: 120,
+            connect_timeout_secs: 10,
             extra_headers: std::collections::HashMap::new(),
             reasoning_effort: None,
             api_path: None,
@@ -265,6 +268,12 @@ impl OpenAiCompatibleProvider {
     /// Override the HTTP request timeout for LLM API calls.
     pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Override the HTTP connect timeout for LLM API calls.
+    pub fn with_connect_timeout_secs(mut self, connect_timeout_secs: u64) -> Self {
+        self.connect_timeout_secs = connect_timeout_secs;
         self
     }
 
@@ -332,6 +341,7 @@ impl OpenAiCompatibleProvider {
 
     fn http_client(&self) -> Client {
         let timeout = self.timeout_secs;
+        let connect_timeout = self.connect_timeout_secs;
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
 
@@ -358,7 +368,7 @@ impl OpenAiCompatibleProvider {
 
             let builder = Client::builder()
                 .timeout(std::time::Duration::from_secs(timeout))
-                .connect_timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(std::time::Duration::from_secs(connect_timeout))
                 .default_headers(headers);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
                 builder,
@@ -376,7 +386,7 @@ impl OpenAiCompatibleProvider {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "provider.compatible",
             timeout,
-            10,
+            connect_timeout,
         )
     }
 
@@ -4093,9 +4103,21 @@ mod tests {
     }
 
     #[test]
+    fn default_connect_timeout_is_10s() {
+        let p = make_provider("test", "https://example.com", None);
+        assert_eq!(p.connect_timeout_secs, 10);
+    }
+
+    #[test]
     fn with_timeout_secs_overrides_default() {
         let p = make_provider("test", "https://example.com", None).with_timeout_secs(300);
         assert_eq!(p.timeout_secs, 300);
+    }
+
+    #[test]
+    fn with_connect_timeout_secs_overrides_default() {
+        let p = make_provider("test", "https://example.com", None).with_connect_timeout_secs(30);
+        assert_eq!(p.connect_timeout_secs, 30);
     }
 
     #[test]

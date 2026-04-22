@@ -16,6 +16,7 @@ use zeroclaw_api::tool::ToolSpec;
 pub struct OpenRouterProvider {
     credential: Option<String>,
     timeout_secs: u64,
+    connect_timeout_secs: u64,
     max_tokens: Option<u32>,
     extra_body: Option<serde_json::Value>,
 }
@@ -185,6 +186,7 @@ impl OpenRouterProvider {
             timeout_secs: timeout_secs
                 .filter(|secs| *secs > 0)
                 .unwrap_or(DEFAULT_OPENROUTER_TIMEOUT_SECS),
+            connect_timeout_secs: OPENROUTER_CONNECT_TIMEOUT_SECS,
             max_tokens: None,
             extra_body: None,
         }
@@ -193,6 +195,12 @@ impl OpenRouterProvider {
     /// Override the HTTP request timeout for LLM API calls.
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
+        self
+    }
+
+    /// Override the HTTP connect timeout for LLM API calls.
+    pub fn with_connect_timeout_secs(mut self, secs: u64) -> Self {
+        self.connect_timeout_secs = secs;
         self
     }
 
@@ -402,7 +410,7 @@ impl OpenRouterProvider {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "provider.openrouter",
             self.timeout_secs,
-            OPENROUTER_CONNECT_TIMEOUT_SECS,
+            self.connect_timeout_secs,
         )
     }
 }

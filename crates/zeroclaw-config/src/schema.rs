@@ -528,9 +528,21 @@ pub struct ModelProviderConfig {
     /// Model temperature (0.0–2.0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
-    /// HTTP timeout in seconds for API calls.
+    /// HTTP timeout in seconds for API calls (total request timeout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// HTTP connect timeout in seconds (time to establish the connection before the request runs).
+    ///
+    /// When set, this is only applied by provider factories that route through the OpenAI-compatible
+    /// HTTP stack (`OpenAiCompatibleProvider`, including `custom:` URLs and most named OpenAI-compat
+    /// integrations) and by the dedicated OpenRouter implementation. Other providers (for example
+    /// Anthropic, Gemini, native OpenAI, Ollama, Azure OpenAI, Bedrock, OpenAI Codex, and
+    /// `anthropic-custom:`) use their own built-in connect timeouts and currently ignore this field.
+    ///
+    /// When omitted, the selected provider keeps its implementation default (often 10s for the
+    /// compatible stack; other values elsewhere).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
     /// Extra HTTP headers for API requests.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub extra_headers: HashMap<String, String>,

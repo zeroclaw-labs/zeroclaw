@@ -1131,6 +1131,7 @@ data: [DONE]
             reasoning_enabled: None,
             reasoning_effort: None,
             provider_timeout_secs: None,
+            provider_connect_timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
             provider_max_tokens: None,
