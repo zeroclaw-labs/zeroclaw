@@ -39,6 +39,12 @@ impl CostTracker {
         &self.session_id
     }
 
+    /// Borrow the cost config this tracker was built with (holds the price
+    /// table used by `cost::lookup_price` and the daily/monthly limits).
+    pub fn cost_config(&self) -> &CostConfig {
+        &self.config
+    }
+
     fn lock_storage(&self) -> MutexGuard<'_, CostStorage> {
         self.storage.lock()
     }

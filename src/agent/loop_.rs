@@ -2016,6 +2016,7 @@ pub(crate) async fn agent_turn(
         None,
         &[],
         &[],
+        None,
     )
     .await
 }
@@ -2254,6 +2255,7 @@ pub(crate) async fn run_tool_call_loop(
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
+    cost_tracker: Option<&std::sync::Arc<crate::cost::CostTracker>>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2364,138 +2366,168 @@ pub(crate) async fn run_tool_call_loop(
             chat_future.await
         };
 
-        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
-            match chat_result {
-                Ok(resp) => {
-                    let (resp_input_tokens, resp_output_tokens) = resp
-                        .usage
-                        .as_ref()
-                        .map(|u| (u.input_tokens, u.output_tokens))
-                        .unwrap_or((None, None));
+        let (
+            response_text,
+            parsed_text,
+            tool_calls,
+            assistant_history_content,
+            native_tool_calls,
+            budget_check,
+        ) = match chat_result {
+            Ok(resp) => {
+                let (resp_input_tokens, resp_output_tokens) = resp
+                    .usage
+                    .as_ref()
+                    .map(|u| (u.input_tokens, u.output_tokens))
+                    .unwrap_or((None, None));
 
-                    observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
-                        duration: llm_started_at.elapsed(),
-                        success: true,
-                        error_message: None,
-                        input_tokens: resp_input_tokens,
-                        output_tokens: resp_output_tokens,
-                    });
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: true,
+                    error_message: None,
+                    input_tokens: resp_input_tokens,
+                    output_tokens: resp_output_tokens,
+                });
 
-                    let response_text = resp.text_or_empty().to_string();
-                    // First try native structured tool calls (OpenAI-format).
-                    // Fall back to text-based parsing (XML tags, markdown blocks,
-                    // GLM format) only if the provider returned no native calls —
-                    // this ensures we support both native and prompt-guided models.
-                    let mut calls = parse_structured_tool_calls(&resp.tool_calls);
-                    let mut parsed_text = String::new();
-
-                    if calls.is_empty() {
-                        let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-                        if !fallback_text.is_empty() {
-                            parsed_text = fallback_text;
-                        }
-                        calls = fallback_calls;
-                    }
-
-                    if let Some(parse_issue) = detect_tool_call_parse_issue(&response_text, &calls)
-                    {
-                        runtime_trace::record_event(
-                            "tool_call_parse_issue",
-                            Some(channel_name),
-                            Some(provider_name),
-                            Some(model),
-                            Some(&turn_id),
-                            Some(false),
-                            Some(&parse_issue),
-                            serde_json::json!({
-                                "iteration": iteration + 1,
-                                "response_excerpt": truncate_with_ellipsis(
-                                    &scrub_credentials(&response_text),
-                                    600
-                                ),
-                            }),
-                        );
-                    }
-
-                    runtime_trace::record_event(
-                        "llm_response",
-                        Some(channel_name),
-                        Some(provider_name),
-                        Some(model),
-                        Some(&turn_id),
-                        Some(true),
-                        None,
-                        serde_json::json!({
-                            "iteration": iteration + 1,
-                            "duration_ms": llm_started_at.elapsed().as_millis(),
-                            "input_tokens": resp_input_tokens,
-                            "output_tokens": resp_output_tokens,
-                            "raw_response": scrub_credentials(&response_text),
-                            "native_tool_calls": resp.tool_calls.len(),
-                            "parsed_tool_calls": calls.len(),
-                        }),
+                // Record this call's token usage (if tracker enabled) and
+                // capture the post-record budget state so we can bail out
+                // below if continuing the loop would spend past the limit.
+                let budget_check = crate::cost::record_llm_call(
+                    cost_tracker,
+                    provider_name,
+                    model,
+                    resp.usage.as_ref(),
+                );
+                if let Some(crate::cost::BudgetCheck::Warning {
+                    current_usd,
+                    limit_usd,
+                    period,
+                }) = &budget_check
+                {
+                    tracing::warn!(
+                        target: "cost",
+                        period = ?period,
+                        current_usd = current_usd,
+                        limit_usd = limit_usd,
+                        "Cost budget warning threshold crossed"
                     );
-
-                    // Preserve native tool call IDs in assistant history so role=tool
-                    // follow-up messages can reference the exact call id.
-                    let reasoning_content = resp.reasoning_content.clone();
-                    let assistant_history_content = if resp.tool_calls.is_empty() {
-                        if use_native_tools {
-                            build_native_assistant_history_from_parsed_calls(
-                                &response_text,
-                                &calls,
-                                reasoning_content.as_deref(),
-                            )
-                            .unwrap_or_else(|| response_text.clone())
-                        } else {
-                            response_text.clone()
-                        }
-                    } else {
-                        build_native_assistant_history(
-                            &response_text,
-                            &resp.tool_calls,
-                            reasoning_content.as_deref(),
-                        )
-                    };
-
-                    let native_calls = resp.tool_calls;
-                    (
-                        response_text,
-                        parsed_text,
-                        calls,
-                        assistant_history_content,
-                        native_calls,
-                    )
                 }
-                Err(e) => {
-                    let safe_error = crate::providers::sanitize_api_error(&e.to_string());
-                    observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
-                        duration: llm_started_at.elapsed(),
-                        success: false,
-                        error_message: Some(safe_error.clone()),
-                        input_tokens: None,
-                        output_tokens: None,
-                    });
+
+                let response_text = resp.text_or_empty().to_string();
+                // First try native structured tool calls (OpenAI-format).
+                // Fall back to text-based parsing (XML tags, markdown blocks,
+                // GLM format) only if the provider returned no native calls —
+                // this ensures we support both native and prompt-guided models.
+                let mut calls = parse_structured_tool_calls(&resp.tool_calls);
+                let mut parsed_text = String::new();
+
+                if calls.is_empty() {
+                    let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+                    if !fallback_text.is_empty() {
+                        parsed_text = fallback_text;
+                    }
+                    calls = fallback_calls;
+                }
+
+                if let Some(parse_issue) = detect_tool_call_parse_issue(&response_text, &calls) {
                     runtime_trace::record_event(
-                        "llm_response",
+                        "tool_call_parse_issue",
                         Some(channel_name),
                         Some(provider_name),
                         Some(model),
                         Some(&turn_id),
                         Some(false),
-                        Some(&safe_error),
+                        Some(&parse_issue),
                         serde_json::json!({
                             "iteration": iteration + 1,
-                            "duration_ms": llm_started_at.elapsed().as_millis(),
+                            "response_excerpt": truncate_with_ellipsis(
+                                &scrub_credentials(&response_text),
+                                600
+                            ),
                         }),
                     );
-                    return Err(e);
                 }
-            };
+
+                runtime_trace::record_event(
+                    "llm_response",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(true),
+                    None,
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "duration_ms": llm_started_at.elapsed().as_millis(),
+                        "input_tokens": resp_input_tokens,
+                        "output_tokens": resp_output_tokens,
+                        "raw_response": scrub_credentials(&response_text),
+                        "native_tool_calls": resp.tool_calls.len(),
+                        "parsed_tool_calls": calls.len(),
+                    }),
+                );
+
+                // Preserve native tool call IDs in assistant history so role=tool
+                // follow-up messages can reference the exact call id.
+                let reasoning_content = resp.reasoning_content.clone();
+                let assistant_history_content = if resp.tool_calls.is_empty() {
+                    if use_native_tools {
+                        build_native_assistant_history_from_parsed_calls(
+                            &response_text,
+                            &calls,
+                            reasoning_content.as_deref(),
+                        )
+                        .unwrap_or_else(|| response_text.clone())
+                    } else {
+                        response_text.clone()
+                    }
+                } else {
+                    build_native_assistant_history(
+                        &response_text,
+                        &resp.tool_calls,
+                        reasoning_content.as_deref(),
+                    )
+                };
+
+                let native_calls = resp.tool_calls;
+                (
+                    response_text,
+                    parsed_text,
+                    calls,
+                    assistant_history_content,
+                    native_calls,
+                    budget_check,
+                )
+            }
+            Err(e) => {
+                let safe_error = crate::providers::sanitize_api_error(&e.to_string());
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: false,
+                    error_message: Some(safe_error.clone()),
+                    input_tokens: None,
+                    output_tokens: None,
+                });
+                runtime_trace::record_event(
+                    "llm_response",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some(&safe_error),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "duration_ms": llm_started_at.elapsed().as_millis(),
+                    }),
+                );
+                return Err(e);
+            }
+        };
 
         let display_text =
             resolve_display_text(&response_text, &parsed_text, !tool_calls.is_empty());
@@ -2511,6 +2543,29 @@ pub(crate) async fn run_tool_call_loop(
                         tool_calls.len()
                     ))
                     .await;
+            }
+        }
+
+        // If budget is already exceeded AND we would otherwise make another
+        // LLM call to service tool results, abort before spending more. The
+        // empty-tool-calls branch below exits the loop anyway, so there's no
+        // need to gate it here (the current response is already "free" — it
+        // was recorded above).
+        if !tool_calls.is_empty() {
+            if let Some(crate::cost::BudgetCheck::Exceeded {
+                current_usd,
+                limit_usd,
+                period,
+            }) = &budget_check
+            {
+                anyhow::bail!(
+                    "Cost budget exceeded during agent loop: ${:.4} / ${:.2} USD ({:?}). \
+                     Aborting before further LLM calls. Raise the limit in [cost] or \
+                     wait for the period to reset.",
+                    current_usd,
+                    limit_usd,
+                    period,
+                );
             }
         }
 
@@ -3272,6 +3327,7 @@ pub async fn run(
             None,
             &[],
             &config.agent.tool_call_dedup_exempt,
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -3406,6 +3462,7 @@ pub async fn run(
                 None,
                 &[],
                 &config.agent.tool_call_dedup_exempt,
+                None,
             )
             .await
             {
@@ -4047,6 +4104,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -4094,6 +4152,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4135,6 +4194,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -4262,6 +4322,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -4332,6 +4393,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4394,6 +4456,7 @@ mod tests {
             None,
             &[],
             &exempt,
+            None,
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -4461,6 +4524,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await;
 
@@ -4522,6 +4586,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await;
 
@@ -4592,6 +4657,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await;
 
@@ -4667,6 +4733,7 @@ mod tests {
             None,
             &[],
             &exempt,
+            None,
         )
         .await
         .expect("loop should complete");
@@ -4721,6 +4788,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
         )
         .await
         .expect("native fallback id flow should complete");

@@ -2001,6 +2001,7 @@ async fn process_channel_message(
                     ctx.non_cli_excluded_tools.as_ref()
                 },
                 ctx.tool_call_dedup_exempt.as_ref(),
+                ctx.cost_tracker.as_ref(),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
