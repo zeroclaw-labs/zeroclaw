@@ -9,7 +9,7 @@ COPY web/ .
 RUN npm run build
 
 # ── Stage 1: Build ────────────────────────────────────────────
-FROM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b5708616050b1e8f60ed6 AS builder
+FROM rust:1.93-slim AS builder
 
 WORKDIR /app
 ARG ZEROCLAW_CARGO_FEATURES="channel-lark,whatsapp-web"
@@ -21,44 +21,23 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# 1. Copy manifests to cache dependencies
-COPY Cargo.toml Cargo.lock ./
-# Include every workspace member: Cargo.lock is generated for the full workspace.
-# Previously we used sed to drop `crates/robot-kit`, which made the manifest disagree
-# with the lockfile and caused `cargo --locked` to fail (Cargo refused to rewrite the lock).
-COPY crates/robot-kit/ crates/robot-kit/
-COPY crates/aardvark-sys/ crates/aardvark-sys/
-# Include tauri workspace member manifest (desktop app, but needed for workspace resolution).
-# .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
-COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
-# Create dummy targets declared in Cargo.toml so manifest parsing succeeds.
-RUN mkdir -p src benches apps/tauri/src \
-    && echo "fn main() {}" > src/main.rs \
-    && echo "" > src/lib.rs \
-    && echo "fn main() {}" > benches/agent_benchmarks.rs \
-    && echo "fn main() {}" > apps/tauri/src/main.rs \
-    && echo "fn main() {}" > apps/tauri/build.rs
-RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
-      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
-    else \
-      cargo build --release --locked; \
-    fi
-RUN rm -rf src benches
-
-# 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
+# Copy full workspace source. The original two-pass stub-and-rebuild optimization
+# required `COPY --parents` to grab only `crates/*/Cargo.toml` before real source,
+# which our BuildKit doesn't support. Single-pass build with cache mounts instead.
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY crates/ crates/
 COPY src/ src/
 COPY benches/ benches/
-COPY *.rs .
-RUN touch src/main.rs
+# apps/tauri: .dockerignore whitelists only Cargo.toml; stub src + build.rs so
+# workspace resolution succeeds without shipping the full desktop app source.
+COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
+RUN mkdir -p apps/tauri/src \
+    && echo "fn main() {}" > apps/tauri/src/main.rs \
+    && echo "fn main() {}" > apps/tauri/build.rs
+
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    rm -rf target/release/.fingerprint/zeroclawlabs-* \
-           target/release/deps/zeroclawlabs-* \
-           target/release/incremental/zeroclawlabs-* && \
     if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
       cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
     else \
