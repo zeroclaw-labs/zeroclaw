@@ -400,8 +400,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let tools_registry: Arc<Vec<ToolSpec>> =
         Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
 
-    // Cost tracker (optional)
-    let cost_tracker = crate::cost::try_build_tracker(&config.cost, &config.workspace_dir);
+    // Cost tracker (optional). Uses `shared_tracker` so gateway, channels,
+    // heartbeat, and agent::run all observe the same in-memory budget
+    // aggregate when they run in the same daemon process.
+    let cost_tracker = crate::cost::shared_tracker(&config.cost, &config.workspace_dir);
 
     // SSE broadcast channel for real-time events
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);

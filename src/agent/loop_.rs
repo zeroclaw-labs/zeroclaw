@@ -3121,6 +3121,12 @@ pub async fn run(
         &config.workspace_dir,
     ));
 
+    // Cost tracker: shared with gateway/channels/heartbeat so budget
+    // aggregates stay coherent across subsystems within one daemon.
+    // Standalone CLI invocations still work — the singleton is built
+    // lazily on first call and released when the process exits.
+    let cost_tracker = crate::cost::shared_tracker(&config.cost, &config.workspace_dir);
+
     // ── Memory (the brain) ────────────────────────────────────────
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
@@ -3418,7 +3424,7 @@ pub async fn run(
             None,
             &[],
             &config.agent.tool_call_dedup_exempt,
-            None,
+            cost_tracker.as_ref(),
         )
         .await?;
         final_output = response.clone();
@@ -3553,7 +3559,7 @@ pub async fn run(
                 None,
                 &[],
                 &config.agent.tool_call_dedup_exempt,
-                None,
+                cost_tracker.as_ref(),
             )
             .await
             {

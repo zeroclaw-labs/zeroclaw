@@ -3741,7 +3741,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
         tool_call_dedup_exempt: Arc::new(config.agent.tool_call_dedup_exempt.clone()),
         model_routes: Arc::new(config.model_routes.clone()),
-        cost_tracker: crate::cost::try_build_tracker(&config.cost, &config.workspace_dir),
+        cost_tracker: crate::cost::shared_tracker(&config.cost, &config.workspace_dir),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;

@@ -9,7 +9,19 @@ pub use types::{BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage, Us
 
 use crate::config::schema::{CostConfig, ModelPricing};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// Process-wide cost tracker. First caller into `shared_tracker` stores;
+/// subsequent callers (any subsystem — gateway, channels, heartbeat,
+/// cron, CLI's agent::run) receive the same `Arc<CostTracker>`.
+///
+/// Without this sharing, each subsystem would hold its own
+/// `Mutex<CostStorage>` with an independent in-memory aggregate. They'd
+/// all write to the same `state/costs.jsonl` (line-level atomic append,
+/// no corruption) but each tracker would miss peers' writes within a
+/// day — so `check_budget` could mis-enforce limits until the next
+/// period rollover forced a file re-read.
+static SHARED_TRACKER: OnceLock<Option<Arc<CostTracker>>> = OnceLock::new();
 
 /// Build an `Arc<CostTracker>` from config, honoring `enabled` and logging
 /// construction failures as warnings.
@@ -17,6 +29,11 @@ use std::sync::Arc;
 /// Returns `None` when cost tracking is disabled or initialization fails;
 /// callers can then treat absence as "cost tracking unavailable" without
 /// having to replicate the enabled check + error logging pattern.
+///
+/// This bypasses the process-wide cache — use `shared_tracker` for
+/// production daemon paths where gateway/channels/heartbeat must share
+/// one aggregate. Tests that need isolated instances should continue to
+/// call `try_build_tracker` or `CostTracker::new` directly.
 pub fn try_build_tracker(config: &CostConfig, workspace_dir: &Path) -> Option<Arc<CostTracker>> {
     if !config.enabled {
         return None;
@@ -28,6 +45,25 @@ pub fn try_build_tracker(config: &CostConfig, workspace_dir: &Path) -> Option<Ar
             None
         }
     }
+}
+
+/// Obtain the process-wide shared cost tracker.
+///
+/// The first call in the process builds the tracker via
+/// `try_build_tracker`; all subsequent calls return the cached
+/// `Arc<CostTracker>` (or `None` if cost tracking is disabled or the
+/// initial build failed).
+///
+/// Intended for production subsystems that all need to observe the same
+/// budget state (gateway dashboard, channel message handling, heartbeat
+/// tasks, cron jobs, CLI agent::run). Call with the process's single
+/// `Config` — downstream calls receive the same Arc regardless of the
+/// config argument, because the first call's config is frozen for the
+/// process lifetime (matching the "config is loaded at startup" model).
+pub fn shared_tracker(config: &CostConfig, workspace_dir: &Path) -> Option<Arc<CostTracker>> {
+    SHARED_TRACKER
+        .get_or_init(|| try_build_tracker(config, workspace_dir))
+        .clone()
 }
 
 /// Look up per-1M-token pricing for a `(provider, model)` pair in the cost
