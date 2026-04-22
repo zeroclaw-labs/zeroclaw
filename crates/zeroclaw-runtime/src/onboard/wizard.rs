@@ -4313,6 +4313,9 @@ fn setup_channels(
                         .unwrap_or(false),
                     thread_replies: existing_sl.and_then(|s| s.thread_replies),
                     mention_only: existing_sl.map(|s| s.mention_only).unwrap_or(false),
+                    strict_mention_in_thread: existing_sl
+                        .map(|s| s.strict_mention_in_thread)
+                        .unwrap_or(false),
                     use_markdown_blocks: existing_sl
                         .map(|s| s.use_markdown_blocks)
                         .unwrap_or(false),

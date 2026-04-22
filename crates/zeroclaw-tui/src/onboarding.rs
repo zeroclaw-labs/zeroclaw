@@ -788,6 +788,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     interrupt_on_new_message: false,
                     thread_replies: None,
                     mention_only: false,
+                    strict_mention_in_thread: false,
                     use_markdown_blocks: false,
                     proxy_url: None,
                     stream_drafts: false,
