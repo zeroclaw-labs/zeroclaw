@@ -38,6 +38,8 @@
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use dialoguer::{Password, Select};
+#[cfg(feature = "gateway")]
+use gateway::resolve_valid_web_dist_dir;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -2132,6 +2134,23 @@ async fn main() -> Result<()> {
             println!("Version:     {}", env!("CARGO_PKG_VERSION"));
             println!("Workspace:   {}", config.data_dir.display());
             println!("Config:      {}", config.config_path.display());
+            println!();
+
+            // Web UI detection for status reporting
+            #[cfg(feature = "gateway")]
+            {
+                let web_dist_dir = resolve_valid_web_dist_dir(config.gateway.web_dist_dir.clone());
+                let web_status = if let Some(dir) = web_dist_dir {
+                    format!("FOUND ({})", dir.display())
+                } else {
+                    "NOT FOUND (set gateway.web_dist_dir or ZEROCLAW_WEB_DIST_DIR)".to_string()
+                };
+                println!("🌐 Web UI:        {}", web_status);
+            }
+            #[cfg(not(feature = "gateway"))]
+            {
+                println!("🌐 Web UI:        DISABLED (build feature 'gateway' is off)");
+            }
             println!();
             println!(
                 "🤖 ModelProvider:      {}",

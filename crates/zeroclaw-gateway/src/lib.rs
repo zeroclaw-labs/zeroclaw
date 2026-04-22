@@ -441,6 +441,68 @@ pub struct AppState {
     pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Resolves the directory containing the Web UI distribution files (`web/dist/`).
+///
+/// Resolution priority (top to bottom):
+/// 1. Explicit configuration: `gateway.web_dist_dir` in `config.toml`.
+///    Note: The `ZEROCLAW_WEB_DIST_DIR` environment variable is automatically mapped to this
+///    field by the configuration system and should be passed via `web_dist_dir_opt`.
+/// 2. Developer mode: `$PWD/web/dist/` relative to current working directory
+/// 3. Local install: `web/dist/` sibling to the current executable
+/// 4. Docker layout: `/zeroclaw-data/web/dist/`
+/// 5. System package: `/usr/share/zeroclawlabs/web/dist/`
+/// 6. User data dir: `XDG_DATA_HOME/zeroclaw/web/dist/`
+/// 7. Nix wrapper: `ZEROCLAW_WEB_DIST_DIR_NIX` (least preferred, used by Nix flakes)
+///
+/// # Returns
+///
+/// Returns `Some(PathBuf)` containing the absolute or relative path to a directory
+/// containing an `index.html` file. Returns `None` if no valid directory is found
+/// through any resolution path, indicating the Web UI should be disabled.
+///
+/// # Panics
+///
+/// This function does not panic. Path resolution and filesystem checks are
+/// performed safely.
+pub fn resolve_valid_web_dist_dir(web_dist_dir_opt: Option<String>) -> Option<std::path::PathBuf> {
+    // 1. Explicit config (already includes ZEROCLAW_WEB_DIST_DIR env var if set)
+    if let Some(dir_str) = web_dist_dir_opt {
+        let dir = std::path::PathBuf::from(dir_str);
+        if dir.join("index.html").is_file() {
+            return Some(dir);
+        }
+    }
+
+    // 2-7. Auto-detection candidates
+    let mut candidates = vec![
+        // Relative to CWD (development: running from repo root)
+        std::path::PathBuf::from("web/dist"),
+        // Relative to binary (installed alongside binary)
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("web/dist")))
+            .unwrap_or_default(),
+        // Docker / packaged layout
+        std::path::PathBuf::from("/zeroclaw-data/web/dist"),
+        // AUR / system package
+        std::path::PathBuf::from("/usr/share/zeroclawlabs/web/dist"),
+    ];
+
+    // XDG data home (prebuilt binary installer)
+    if let Some(data_dir) = dirs_data_local() {
+        candidates.push(data_dir.join("zeroclaw/web/dist"));
+    }
+
+    // Nix package manager fallback
+    if let Ok(dir_str) = std::env::var("ZEROCLAW_WEB_DIST_DIR_NIX") {
+        candidates.push(std::path::PathBuf::from(dir_str));
+    }
+
+    candidates
+        .into_iter()
+        .find(|p| !p.as_os_str().is_empty() && p.join("index.html").is_file())
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 pub async fn run_gateway(
@@ -1027,50 +1089,23 @@ pub async fn run_gateway(
     // typo, missing build), fall back to auto-detect rather than hard-
     // failing every dashboard request. We log the demotion so the
     // operator can spot a misconfigured path.
-    let auto_detect_web_dist = || -> Option<std::path::PathBuf> {
-        let mut candidates = vec![
-            // Relative to CWD (development: running from repo root)
-            std::path::PathBuf::from("web/dist"),
-            // Relative to binary (installed alongside binary)
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("web/dist")))
-                .unwrap_or_default(),
-            // Docker / packaged layout
-            std::path::PathBuf::from("/zeroclaw-data/web/dist"),
-            // AUR / system package
-            std::path::PathBuf::from("/usr/share/zeroclawlabs/web/dist"),
-        ];
-        // XDG data home (prebuilt binary installer)
-        if let Some(data_dir) = dirs_data_local() {
-            candidates.push(data_dir.join("zeroclaw/web/dist"));
-        }
-        candidates
-            .into_iter()
-            .find(|p| !p.as_os_str().is_empty() && p.join("index.html").is_file())
-    };
+    let web_dist_dir: Option<std::path::PathBuf> =
+        resolve_valid_web_dist_dir(config.gateway.web_dist_dir.clone());
 
-    let web_dist_dir: Option<std::path::PathBuf> = match config
-        .gateway
-        .web_dist_dir
-        .as_ref()
-        .map(std::path::PathBuf::from)
-    {
-        Some(explicit) if explicit.join("index.html").is_file() => Some(explicit),
-        Some(stale) => {
+    if let Some(ref explicit) = config.gateway.web_dist_dir {
+        let explicit_path = std::path::PathBuf::from(explicit);
+        if web_dist_dir.as_ref() != Some(&explicit_path) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"configured": stale.display().to_string()})),
+                    .with_attrs(::serde_json::json!({"configured": explicit})),
                 "gateway.web_dist_dir points at a path that doesn't contain index.html on \
                  this machine; falling back to auto-detect. Update or remove the setting in \
                  config.toml to silence this warning."
             );
-            auto_detect_web_dist()
         }
-        None => auto_detect_web_dist(),
-    };
+    }
 
     if let Some(ref dir) = web_dist_dir {
         ::zeroclaw_log::record!(
