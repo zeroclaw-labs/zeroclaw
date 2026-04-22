@@ -220,6 +220,8 @@ type TranslationKey =
   | "low_balance_banner_text"
   | "low_balance_recharge"
   | "sidebar_billing_link"
+  | "billing_subscribe_pending"
+  | "billing_cancel_with_refund"
   // Lock screen
   | "lock_title"
   | "lock_subtitle"
@@ -482,6 +484,8 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     low_balance_banner_text: "{balance} credits left (threshold {threshold}). Time to recharge.",
     low_balance_recharge: "Recharge",
     sidebar_billing_link: "Billing & credits",
+    billing_subscribe_pending: "Stripe checkout opened for {plan}. Credits land after payment completes.",
+    billing_cancel_with_refund: "Subscription cancelled. Refund of {amount} processed via Stripe.",
     // Lock screen
     lock_title: "MoA Locked",
     lock_subtitle: "Enter your password to unlock",
@@ -741,6 +745,8 @@ const translations: Record<Locale, Record<TranslationKey, string>> = {
     low_balance_banner_text: "남은 크레딧: {balance} (임계값 {threshold}). 충전할 시점입니다.",
     low_balance_recharge: "충전하기",
     sidebar_billing_link: "결제 및 크레딧",
+    billing_subscribe_pending: "{plan} 결제창(Stripe)을 열었습니다. 결제 완료 후 크레딧이 지급됩니다.",
+    billing_cancel_with_refund: "구독이 해지되었습니다. Stripe에서 {amount} 환불 처리되었습니다.",
     // Lock screen
     lock_title: "MoA \uc7a0\uae08",
     lock_subtitle: "\ube44\ubc00\ubc88\ud638\ub97c \uc785\ub825\ud558\uc5ec \uc7a0\uae08\uc744 \ud574\uc81c\ud558\uc138\uc694",

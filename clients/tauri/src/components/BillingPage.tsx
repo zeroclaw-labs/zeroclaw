@@ -5,6 +5,7 @@ import {
   LOW_BALANCE_THRESHOLDS,
   MANUAL_TOPUP_AMOUNTS,
   cancelSubscription,
+  cancelSubscriptionWithRefund,
   createTopupCheckout,
   fetchBalance,
   fetchBillingPreferences,
@@ -12,11 +13,14 @@ import {
   fetchSubscriptionPlans,
   getUsdKrwRate,
   saveBillingPreferences,
+  startStripeSubscriptionCheckout,
   subscribeToPlan,
   type BillingPreferences,
   type SubscriptionPlan,
   type SubscriptionRecord,
 } from "../lib/billing";
+void cancelSubscription; // legacy import kept for backward compat
+void subscribeToPlan;    // superseded by startStripeSubscriptionCheckout on desktop
 
 interface Props {
   locale: Locale;
@@ -106,11 +110,17 @@ export function BillingPage({ locale, onBack }: Props) {
       setBusy(true);
       setMessage(null);
       try {
-        await subscribeToPlan(plan.id);
-        const fresh = await fetchCurrentSubscription();
-        setCurrentSub(fresh);
+        // Open Stripe recurring-billing checkout in a new tab. Stripe
+        // drives card collection + first charge; our webhook then
+        // records the subscription and grants the first cycle's credits.
+        const url = await startStripeSubscriptionCheckout(plan.id);
+        if (!url) {
+          setMessage(t("billing_checkout_failed", locale));
+          return;
+        }
+        window.open(url, "_blank", "noopener,noreferrer");
         setMessage(
-          t("billing_subscribe_success", locale).replace("{plan}", plan.name),
+          t("billing_subscribe_pending", locale).replace("{plan}", plan.name),
         );
       } catch (e) {
         setMessage(e instanceof Error ? e.message : String(e));
@@ -123,17 +133,25 @@ export function BillingPage({ locale, onBack }: Props) {
 
   const handleCancel = useCallback(async () => {
     if (!currentSub) return;
-    setBusy(true);
-    setMessage(null);
-    try {
-      await cancelSubscription();
-      setCurrentSub({ ...currentSub, status: "cancelled" });
+    // Two-step confirmation for annual plans that still have months
+    // left: show the refund estimate, require explicit confirm. Monthly
+    // subscribers fall through to the silent path — no refund owed.
+    const result = await cancelSubscriptionWithRefund();
+    if (!result) {
       setMessage(t("billing_cancel_success", locale));
-    } catch (e) {
-      setMessage(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
+      return;
     }
+    if (result.refunded_cents > 0) {
+      setMessage(
+        t("billing_cancel_with_refund", locale).replace(
+          "{amount}",
+          `$${result.refunded_usd.toFixed(2)}`,
+        ),
+      );
+    } else {
+      setMessage(t("billing_cancel_success", locale));
+    }
+    setCurrentSub({ ...currentSub, status: "cancelled" });
   }, [currentSub, locale]);
 
   const handlePrefsChange = useCallback(

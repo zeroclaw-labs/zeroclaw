@@ -1694,12 +1694,67 @@ pub async fn handle_api_checkout_webhook_stripe(
 
     match event_type {
         "checkout.session.completed" | "payment_intent.succeeded" => {
+            // Split: subscription-mode checkout sessions carry a
+            // `mode=subscription` and a subscription id that we must
+            // backfill into our ledger so future invoice.paid events can
+            // map to this user. Payment-mode sessions (one-off topups)
+            // continue to flow through `complete_payment` unchanged.
+            let mode = event
+                .pointer("/data/object/mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let tx_id = event
                 .pointer("/data/object/metadata/transaction_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let user_id = event
+                .pointer("/data/object/metadata/user_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let plan_id = event
+                .pointer("/data/object/metadata/plan_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let stripe_sub_id = event
+                .pointer("/data/object/subscription")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
 
-            if !tx_id.is_empty() {
+            if mode == "subscription" && !user_id.is_empty() && !plan_id.is_empty() {
+                if let (Some(plan), Some(ref pm)) = (
+                    crate::billing::find_subscription_plan(plan_id),
+                    state.payment_manager.as_ref(),
+                ) {
+                    let renewal_secs: i64 = if plan.interval == "year" {
+                        365 * 24 * 60 * 60
+                    } else {
+                        30 * 24 * 60 * 60
+                    };
+                    let pm_guard = pm.lock();
+                    if let Err(e) = pm_guard.upsert_subscription(
+                        user_id,
+                        plan.id,
+                        Some("stripe"),
+                        if stripe_sub_id.is_empty() { None } else { Some(stripe_sub_id) },
+                        renewal_secs,
+                    ) {
+                        tracing::warn!(%user_id, plan_id = plan.id, "Stripe subscription upsert failed: {e}");
+                    }
+                    if let Err(e) = pm_guard.add_bonus_credits(user_id, plan.credits_per_cycle) {
+                        tracing::warn!(%user_id, "Stripe subscription credit grant failed: {e}");
+                    }
+                    if let Err(e) = pm_guard.record_grant(
+                        "",
+                        user_id,
+                        plan.credits_per_cycle,
+                        "subscription",
+                        crate::billing::GRANT_TTL_SECS_30D,
+                    ) {
+                        tracing::warn!(%user_id, "subscription grant ledger insert failed: {e}");
+                    }
+                    tracing::info!(%user_id, plan_id = plan.id, %stripe_sub_id, "Stripe subscription activated");
+                }
+            } else if !tx_id.is_empty() {
                 if let Some(ref pm) = state.payment_manager {
                     let pm_guard = pm.lock();
                     if let Err(e) = pm_guard.complete_payment(tx_id) {
@@ -1707,6 +1762,71 @@ pub async fn handle_api_checkout_webhook_stripe(
                     } else {
                         tracing::info!(transaction_id = %tx_id, "Stripe webhook: credits granted");
                     }
+                }
+            }
+        }
+        "invoice.paid" => {
+            // Recurring renewal — Stripe drives the clock for subscriptions
+            // that were set up in subscription mode. Look up the user by
+            // the subscription id and top them up with one more cycle's
+            // worth of credits at the standard 30-day TTL.
+            let stripe_sub_id = event
+                .pointer("/data/object/subscription")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if stripe_sub_id.is_empty() {
+                tracing::debug!("invoice.paid without subscription id (probably one-off invoice)");
+            } else if let Some(ref pm) = state.payment_manager {
+                let (user_id, plan_id) = {
+                    let pm_guard = pm.lock();
+                    let uid = pm_guard.find_user_by_provider_sub_id(stripe_sub_id).ok().flatten();
+                    let pid = uid
+                        .as_ref()
+                        .and_then(|u| pm_guard.get_subscription(u).ok().flatten())
+                        .map(|r| r.plan_id);
+                    (uid, pid)
+                };
+                match (user_id, plan_id.as_deref().and_then(crate::billing::find_subscription_plan)) {
+                    (Some(uid), Some(plan)) => {
+                        let renewal_secs: i64 = if plan.interval == "year" {
+                            365 * 24 * 60 * 60
+                        } else {
+                            30 * 24 * 60 * 60
+                        };
+                        let pm_guard = pm.lock();
+                        let _ = pm_guard.upsert_subscription(
+                            &uid,
+                            plan.id,
+                            Some("stripe"),
+                            Some(stripe_sub_id),
+                            renewal_secs,
+                        );
+                        let _ = pm_guard.add_bonus_credits(&uid, plan.credits_per_cycle);
+                        let _ = pm_guard.record_grant(
+                            "",
+                            &uid,
+                            plan.credits_per_cycle,
+                            "subscription",
+                            crate::billing::GRANT_TTL_SECS_30D,
+                        );
+                        tracing::info!(user_id = %uid, plan_id = plan.id, %stripe_sub_id, "Stripe renewal credited");
+                    }
+                    _ => tracing::warn!(%stripe_sub_id, "invoice.paid: no matching local subscription"),
+                }
+            }
+        }
+        "customer.subscription.deleted" => {
+            let stripe_sub_id = event
+                .pointer("/data/object/id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if stripe_sub_id.is_empty() {
+                tracing::debug!("subscription.deleted without id");
+            } else if let Some(ref pm) = state.payment_manager {
+                let pm_guard = pm.lock();
+                if let Ok(Some(user_id)) = pm_guard.find_user_by_provider_sub_id(stripe_sub_id) {
+                    let _ = pm_guard.cancel_subscription(&user_id);
+                    tracing::info!(%user_id, %stripe_sub_id, "Stripe subscription deletion synced to local ledger");
                 }
             }
         }
@@ -3682,7 +3802,10 @@ pub async fn handle_api_subscription_subscribe(
     .into_response()
 }
 
-/// DELETE /api/subscriptions/current — cancel the caller's subscription.
+/// DELETE /api/subscriptions/current — cancel the caller's subscription
+/// and, for annual plans with whole months remaining, issue a prorated
+/// refund via Stripe. Returns the refund amount (in USD cents) so the
+/// billing page can surface "Refunded $X" immediately.
 pub async fn handle_api_subscription_cancel(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3702,12 +3825,151 @@ pub async fn handle_api_subscription_cancel(
         .as_ref()
         .map(|sc| sc.device_id().to_string())
         .unwrap_or_else(|| "local_user".to_string());
+
+    // Load the active subscription + plan once up front so we can decide
+    // whether a refund is owed before we touch Stripe.
+    let subscription = {
+        let pm_guard = pm.lock();
+        match pm_guard.get_subscription(&user_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "No active subscription" })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("Lookup failed: {e}") })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let stripe_key = {
+        let cfg = state.config.lock();
+        cfg.stripe_secret_key.clone()
+    };
+
+    // Issue the Stripe cancel + refund round-trip if we have enough info.
+    // If the subscription was never activated through Stripe (provider_sub_id
+    // missing), we just mark it cancelled locally — there is nothing to
+    // refund and nothing to detach on the provider side.
+    let mut refunded_cents: u32 = 0;
+    if let (Some(ref stripe_sub_id), Some(plan)) = (
+        subscription.provider_sub_id.clone(),
+        crate::billing::find_subscription_plan(&subscription.plan_id),
+    ) {
+        if let Some(ref key) = stripe_key {
+            match crate::billing::checkout::cancel_stripe_subscription(
+                key,
+                stripe_sub_id,
+                plan,
+                subscription.renewal_at,
+            )
+            .await
+            {
+                Ok((_cancelled_at, refund)) => {
+                    refunded_cents = refund;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        user_id = %user_id,
+                        %stripe_sub_id,
+                        "Stripe cancel/refund failed: {e} — proceeding with local-only cancel"
+                    );
+                }
+            }
+        }
+    }
+
     let pm_guard = pm.lock();
-    match pm_guard.cancel_subscription(&user_id) {
-        Ok(()) => Json(serde_json::json!({ "status": "cancelled" })).into_response(),
-        Err(e) => (
+    if let Err(e) = pm_guard.cancel_subscription(&user_id) {
+        return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("Cancel failed: {e}") })),
+        )
+            .into_response();
+    }
+    if refunded_cents > 0 {
+        if let Err(e) = pm_guard.mark_subscription_refunded(&user_id, refunded_cents) {
+            tracing::warn!(user_id = %user_id, "refund persisted on Stripe but local marker failed: {e}");
+        }
+    }
+
+    Json(serde_json::json!({
+        "status": "cancelled",
+        "refunded_usd": (refunded_cents as f64) / 100.0,
+        "refunded_cents": refunded_cents,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StripeSubscriptionCheckoutBody {
+    pub plan_id: String,
+}
+
+/// POST /api/subscriptions/stripe-checkout — create a Stripe Checkout
+/// Session in subscription mode for the selected plan. The returned URL
+/// opens Stripe's card-collection + first-charge flow; Stripe then calls
+/// our webhook with `checkout.session.completed` (first activation) and
+/// `invoice.paid` on every renewal cycle.
+pub async fn handle_api_subscription_stripe_checkout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<StripeSubscriptionCheckoutBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(plan) = crate::billing::find_subscription_plan(&body.plan_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Unknown plan_id {}", body.plan_id) })),
+        )
+            .into_response();
+    };
+    let (stripe_key, callback_base) = {
+        let cfg = state.config.lock();
+        (
+            cfg.stripe_secret_key.clone(),
+            format!("http://{}:{}", cfg.gateway.host, cfg.gateway.port),
+        )
+    };
+    let Some(key) = stripe_key else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Stripe not configured" })),
+        )
+            .into_response();
+    };
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    match crate::billing::checkout::create_stripe_subscription_session(
+        &key,
+        plan,
+        &transaction_id,
+        &user_id,
+        &callback_base,
+    )
+    .await
+    {
+        Ok(resp) => Json(serde_json::json!({
+            "checkout_url": resp.checkout_url,
+            "transaction_id": resp.transaction_id,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": format!("Stripe checkout error: {e}") })),
         )
             .into_response(),
     }

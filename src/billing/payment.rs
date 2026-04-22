@@ -339,15 +339,17 @@ impl PaymentManager {
                 -- `sweep_expired_grants` in run_gateway) tops users up after
                 -- it passes. `status` values: 'active' | 'cancelled' | 'past_due'.
                 CREATE TABLE IF NOT EXISTS subscriptions (
-                    user_id        TEXT PRIMARY KEY,
-                    plan_id        TEXT NOT NULL,
-                    provider       TEXT,
-                    provider_sub_id TEXT,
-                    status         TEXT NOT NULL DEFAULT 'active',
-                    started_at     INTEGER NOT NULL,
-                    renewal_at     INTEGER NOT NULL,
-                    expires_at     INTEGER NOT NULL,
-                    updated_at     INTEGER NOT NULL
+                    user_id                TEXT PRIMARY KEY,
+                    plan_id                TEXT NOT NULL,
+                    provider               TEXT,
+                    provider_sub_id        TEXT,
+                    status                 TEXT NOT NULL DEFAULT 'active',
+                    started_at             INTEGER NOT NULL,
+                    renewal_at             INTEGER NOT NULL,
+                    expires_at             INTEGER NOT NULL,
+                    refunded_at            INTEGER,
+                    refunded_amount_cents  INTEGER,
+                    updated_at             INTEGER NOT NULL
                 );
 
                 -- Per-user billing preferences (spec, 2026-04-22):
@@ -368,6 +370,26 @@ impl PaymentManager {
                     updated_at               INTEGER NOT NULL
                 );",
             )?;
+
+            // Additive migrations for upgraded DBs that predate the
+            // 2026-04-22 refund/Stripe-subscription columns. Each call
+            // is idempotent: SQLite complains if the column exists, so
+            // we swallow the duplicate-column error and move on.
+            // The `provider_sub_id` column already exists in the
+            // CREATE TABLE above and is what we fill from the Stripe
+            // subscription object on webhook — no separate migration
+            // needed. These two are pure additives for schemas created
+            // before the 2026-04-22 refund-tracking work landed.
+            for migration in [
+                "ALTER TABLE subscriptions ADD COLUMN refunded_at INTEGER",
+                "ALTER TABLE subscriptions ADD COLUMN refunded_amount_cents INTEGER",
+            ] {
+                if let Err(e) = conn.execute(migration, []) {
+                    if !e.to_string().contains("duplicate column name") {
+                        anyhow::bail!("subscription additive migration failed: {e}");
+                    }
+                }
+            }
             Some(conn)
         } else {
             None
@@ -1137,7 +1159,8 @@ impl PaymentManager {
         let row = conn
             .query_row(
                 "SELECT plan_id, provider, provider_sub_id, status,
-                        started_at, renewal_at, expires_at
+                        started_at, renewal_at, expires_at,
+                        refunded_at, refunded_amount_cents
                  FROM subscriptions WHERE user_id = ?1",
                 params![user_id],
                 |r| {
@@ -1150,6 +1173,8 @@ impl PaymentManager {
                         started_at: r.get::<_, i64>(4)?,
                         renewal_at: r.get::<_, i64>(5)?,
                         expires_at: r.get::<_, i64>(6)?,
+                        refunded_at: r.get::<_, Option<i64>>(7)?,
+                        refunded_amount_cents: r.get::<_, Option<u32>>(8)?,
                     })
                 },
             )
@@ -1170,6 +1195,72 @@ impl PaymentManager {
         Ok(())
     }
 
+    /// Record that a prorated refund has been issued for this user's
+    /// subscription. Called from the cancel flow after the Stripe
+    /// refund API round-trip succeeds so the UI can surface
+    /// `refunded_amount_cents` on the next balance refresh.
+    pub fn mark_subscription_refunded(
+        &self,
+        user_id: &str,
+        refunded_cents: u32,
+    ) -> anyhow::Result<()> {
+        let Some(ref conn) = self.conn else {
+            return Ok(());
+        };
+        let now = now_epoch();
+        conn.execute(
+            "UPDATE subscriptions
+             SET refunded_at = ?2,
+                 refunded_amount_cents = ?3,
+                 updated_at = ?2
+             WHERE user_id = ?1",
+            params![user_id, now, refunded_cents],
+        )?;
+        Ok(())
+    }
+
+    /// Backfill a subscription row with the Stripe subscription ID that
+    /// webhook events carry in `data.object.subscription`. Idempotent —
+    /// repeated calls with the same ID no-op.
+    pub fn set_subscription_provider_id(
+        &self,
+        user_id: &str,
+        provider_sub_id: &str,
+    ) -> anyhow::Result<()> {
+        let Some(ref conn) = self.conn else {
+            return Ok(());
+        };
+        let now = now_epoch();
+        conn.execute(
+            "UPDATE subscriptions
+             SET provider_sub_id = ?2, updated_at = ?3
+             WHERE user_id = ?1",
+            params![user_id, provider_sub_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Find the user who owns a given Stripe subscription ID. Used by
+    /// the webhook handler when Stripe emits `invoice.paid` /
+    /// `customer.subscription.deleted` and we need to map the event
+    /// back to our local user row.
+    pub fn find_user_by_provider_sub_id(
+        &self,
+        provider_sub_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(ref conn) = self.conn else {
+            return Ok(None);
+        };
+        let user_id: Option<String> = conn
+            .query_row(
+                "SELECT user_id FROM subscriptions WHERE provider_sub_id = ?1",
+                params![provider_sub_id],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(user_id)
+    }
+
 }
 
 /// Active subscription row mirrored from the `subscriptions` table.
@@ -1188,6 +1279,13 @@ pub struct SubscriptionRecord {
     pub started_at: i64,
     pub renewal_at: i64,
     pub expires_at: i64,
+    /// Unix epoch of prorated refund issuance, if the user cancelled
+    /// an annual plan with whole months remaining. None for active
+    /// subscriptions and for monthly-plan cancels (no refund ever).
+    pub refunded_at: Option<i64>,
+    /// Amount refunded in USD cents. Sums over multiple refunds if
+    /// cancellation is replayed; typically set once and immutable.
+    pub refunded_amount_cents: Option<u32>,
 }
 
 /// Per-user billing preferences persisted in SQLite (see

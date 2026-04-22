@@ -558,3 +558,230 @@ pub async fn maybe_auto_recharge(
         }
     }
 }
+
+// ── Stripe subscription (recurring) — spec, 2026-04-22 ───────────
+//
+// The earlier `create_stripe_session` creates a one-shot Checkout Session
+// in `mode=payment`, which is the right shape for one-off credit
+// top-ups. Subscriptions need `mode=subscription` and a recurring price
+// so Stripe itself drives monthly / annual renewal, emitting
+// `invoice.paid` every cycle. We price the subscription inline via
+// `price_data` + `recurring[interval]` so the operator does not have to
+// pre-create Stripe Price objects for the two plans — one less config
+// step, and the price stays in lockstep with `SUBSCRIPTION_PLANS`.
+//
+// The gateway scheduler used to poke a synthetic renewal when the
+// `subscriptions.renewal_at` clock expired, but once a subscription
+// goes through this path Stripe becomes the source of truth — see
+// the `invoice.paid` branch in `handle_api_checkout_webhook_stripe`.
+
+/// Create a Stripe Checkout Session in subscription mode.
+///
+/// On success the returned `checkout_url` leads the user through card
+/// entry + first-cycle charge. Stripe then invokes our webhook with
+/// `checkout.session.completed` (first activation) and
+/// `invoice.paid` on every subsequent renewal cycle.
+pub async fn create_stripe_subscription_session(
+    secret_key: &str,
+    plan: &SubscriptionPlan,
+    transaction_id: &str,
+    user_id: &str,
+    callback_base_url: &str,
+) -> anyhow::Result<CheckoutResponse> {
+    let client = reqwest::Client::new();
+    // Interval: monthly plan → month, annual plan → year. Stripe allows
+    // interval_count but spec plans cover exactly one interval unit each,
+    // so we keep the request minimal.
+    let interval = if plan.interval == "year" { "year" } else { "month" };
+
+    let params: Vec<(&str, String)> = vec![
+        ("mode", "subscription".to_string()),
+        (
+            "success_url",
+            format!(
+                "{callback_base_url}/api/checkout/success?tx={transaction_id}&provider=stripe&plan={plan_id}",
+                plan_id = plan.id,
+            ),
+        ),
+        (
+            "cancel_url",
+            format!("{callback_base_url}/api/checkout/cancel?tx={transaction_id}"),
+        ),
+        ("client_reference_id", transaction_id.to_string()),
+        ("metadata[user_id]", user_id.to_string()),
+        ("metadata[plan_id]", plan.id.to_string()),
+        ("metadata[transaction_id]", transaction_id.to_string()),
+        ("subscription_data[metadata][user_id]", user_id.to_string()),
+        ("subscription_data[metadata][plan_id]", plan.id.to_string()),
+        ("line_items[0][quantity]", "1".to_string()),
+        ("line_items[0][price_data][currency]", "usd".to_string()),
+        (
+            "line_items[0][price_data][unit_amount]",
+            // Stripe charges the full plan price each billing cycle.
+            // Monthly plan: 3_000 cents per cycle. Annual plan: 32_400
+            // cents per cycle (every 12 months).
+            (plan.price_cents / plan.cycles).to_string(),
+        ),
+        (
+            "line_items[0][price_data][product_data][name]",
+            format!("MoA Subscription — {}", plan.name),
+        ),
+        (
+            "line_items[0][price_data][recurring][interval]",
+            interval.to_string(),
+        ),
+    ];
+
+    let response = client
+        .post("https://api.stripe.com/v1/checkout/sessions")
+        .basic_auth(secret_key, Option::<&str>::None)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Stripe API error: {e}"))?;
+
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("Stripe response parse error: {e}"))?;
+
+    if !status.is_success() {
+        let msg = body
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown Stripe error");
+        anyhow::bail!("Stripe subscription error ({}): {}", status.as_u16(), msg);
+    }
+
+    let checkout_url = body
+        .get("url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Stripe response missing checkout URL"))?
+        .to_string();
+
+    Ok(CheckoutResponse {
+        checkout_url,
+        transaction_id: transaction_id.to_string(),
+        provider: CheckoutProvider::Stripe,
+    })
+}
+
+/// Cancel an active Stripe Subscription + optionally issue a prorated
+/// refund for unused months on the annual plan.
+///
+/// `subscription_id` is the `sub_…` identifier Stripe hands us in
+/// `subscription_data.metadata` on checkout completion. For the annual
+/// plan we compute the refund as `remaining_full_months × (plan.price /
+/// plan.cycles)` — i.e. unused whole months only. Partial months are
+/// forfeited; users who want a cleaner exit can wait until the month
+/// tick before cancelling.
+///
+/// Returns `(cancelled_at, refund_cents)` — `refund_cents = 0` if no
+/// refund was issued (monthly plan, or no full months remaining).
+pub async fn cancel_stripe_subscription(
+    secret_key: &str,
+    subscription_id: &str,
+    plan: &SubscriptionPlan,
+    renewal_at_unix: i64,
+) -> anyhow::Result<(i64, u32)> {
+    let client = reqwest::Client::new();
+
+    // 1) Cancel the subscription immediately (not at period end) so
+    //    Stripe stops billing in the same round-trip.
+    let cancel_resp = client
+        .delete(format!(
+            "https://api.stripe.com/v1/subscriptions/{subscription_id}"
+        ))
+        .basic_auth(secret_key, Option::<&str>::None)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Stripe cancel error: {e}"))?;
+    if !cancel_resp.status().is_success() {
+        let status = cancel_resp.status();
+        let body: serde_json::Value = cancel_resp.json().await.unwrap_or_default();
+        let msg = body
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown Stripe error");
+        anyhow::bail!("Stripe cancel failed ({}): {}", status.as_u16(), msg);
+    }
+    let now = chrono::Utc::now().timestamp();
+
+    // 2) No refund on the monthly plan — a user who cancels a $30 month
+    //    has already received the 20_000 credits for that cycle. Partial
+    //    refund only makes sense on the annual plan.
+    if plan.interval != "year" {
+        return Ok((now, 0));
+    }
+
+    // 3) Compute unused whole months. `renewal_at_unix` points at the
+    //    NEXT yearly renewal (start + 365d). Months remaining =
+    //    ceil((renewal - now) / 30d) rounded DOWN to whole months so
+    //    partial months are forfeited.
+    let seconds_remaining = (renewal_at_unix - now).max(0);
+    let month_secs: i64 = 30 * 24 * 60 * 60;
+    let months_remaining = (seconds_remaining / month_secs) as u32;
+    if months_remaining == 0 {
+        return Ok((now, 0));
+    }
+
+    // Annual plan charge per month = 32_400 / 12 = 2_700 cents ($27).
+    let per_month_cents = plan.price_cents / plan.cycles.max(1);
+    let refund_cents = months_remaining.saturating_mul(per_month_cents);
+    if refund_cents == 0 {
+        return Ok((now, 0));
+    }
+
+    // 4) Fetch the latest invoice attached to this subscription to grab
+    //    its payment_intent — Stripe Refunds API refunds a PaymentIntent
+    //    (or Charge), not a subscription directly.
+    let invoice_resp = client
+        .get("https://api.stripe.com/v1/invoices")
+        .basic_auth(secret_key, Option::<&str>::None)
+        .query(&[("subscription", subscription_id), ("limit", "1")])
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Stripe invoice fetch: {e}"))?;
+    let invoice_body: serde_json::Value = invoice_resp.json().await.unwrap_or_default();
+    let payment_intent_id = invoice_body
+        .pointer("/data/0/payment_intent")
+        .and_then(|v| v.as_str());
+    let Some(pi_id) = payment_intent_id else {
+        // Cancellation succeeded but we cannot issue the refund without
+        // the payment intent reference. Surface this to the caller as
+        // a refund amount of 0 — operator can reconcile manually.
+        tracing::warn!(
+            subscription_id,
+            "subscription cancelled but no payment_intent found for refund"
+        );
+        return Ok((now, 0));
+    };
+
+    let refund_params: Vec<(&str, String)> = vec![
+        ("payment_intent", pi_id.to_string()),
+        ("amount", refund_cents.to_string()),
+        ("reason", "requested_by_customer".to_string()),
+        ("metadata[reason]", "subscription_cancel_prorated".to_string()),
+        ("metadata[months_remaining]", months_remaining.to_string()),
+    ];
+
+    let refund_resp = client
+        .post("https://api.stripe.com/v1/refunds")
+        .basic_auth(secret_key, Option::<&str>::None)
+        .form(&refund_params)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Stripe refund error: {e}"))?;
+    if !refund_resp.status().is_success() {
+        let status = refund_resp.status();
+        let body: serde_json::Value = refund_resp.json().await.unwrap_or_default();
+        let msg = body
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown Stripe error");
+        anyhow::bail!("Stripe refund failed ({}): {}", status.as_u16(), msg);
+    }
+
+    Ok((now, refund_cents))
+}

@@ -106,6 +106,40 @@ export async function subscribeToPlan(planId: string, provider = "stripe"): Prom
   }
 }
 
+/**
+ * Kick off a real Stripe recurring-billing Checkout for this plan.
+ * Returns the Stripe-hosted checkout URL — caller is expected to open
+ * it in a new tab. On success Stripe invokes our webhook and we record
+ * the subscription locally; the UI then refreshes `fetchCurrentSubscription`.
+ */
+export async function startStripeSubscriptionCheckout(planId: string): Promise<string | null> {
+  const res = await fetch(`${apiClient.getServerUrl()}/api/subscriptions/stripe-checkout`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({ plan_id: planId }),
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data?.checkout_url ?? null;
+}
+
+export interface CancelResult {
+  status: string;
+  refunded_usd: number;
+  refunded_cents: number;
+}
+
+/** Cancel the active subscription. Returns the refund breakdown so the
+ *  UI can surface "Refunded $27 for 1 unused month" style messaging. */
+export async function cancelSubscriptionWithRefund(): Promise<CancelResult | null> {
+  const res = await fetch(`${apiClient.getServerUrl()}/api/subscriptions/current`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!res.ok) return null;
+  return res.json();
+}
+
 export async function cancelSubscription(): Promise<void> {
   const res = await fetch(`${apiClient.getServerUrl()}/api/subscriptions/current`, {
     method: "DELETE",

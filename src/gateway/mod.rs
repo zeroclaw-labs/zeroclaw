@@ -1446,6 +1446,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/subscriptions/subscribe",
             post(api::handle_api_subscription_subscribe),
         )
+        .route(
+            "/api/subscriptions/stripe-checkout",
+            post(api::handle_api_subscription_stripe_checkout),
+        )
         // ── Payment callbacks (Kakao Pay redirects) ──
         .route("/api/payment/approve", get(api::handle_api_payment_approve))
         .route("/api/payment/cancel", get(api::handle_api_payment_cancel))
