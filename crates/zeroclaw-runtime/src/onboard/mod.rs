@@ -654,9 +654,22 @@ async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, provider: &str) 
     let live_models = match zeroclaw_providers::create_provider(provider, None) {
         Ok(handle) => {
             ui.status("Fetching models...");
-            handle.list_models().await.ok()
+            match handle.list_models().await {
+                Ok(models) => Some(models),
+                Err(e) => {
+                    tracing::debug!(provider, error = ?e, "models.dev catalog fetch failed");
+                    None
+                }
+            }
         }
-        Err(_) => None,
+        Err(e) => {
+            tracing::debug!(
+                provider,
+                error = ?e,
+                "provider construction failed for model-list probe"
+            );
+            None
+        }
     };
 
     let new_value = match live_models.filter(|ms| !ms.is_empty()) {
@@ -669,10 +682,14 @@ async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, provider: &str) 
             }
         }
         None => {
-            // Live fetch failed / provider doesn't expose no-auth listing.
-            // Give the user a provider-flavored nudge so they don't have to
-            // guess the model-id format.
-            ui.note("Couldn't reach the provider's model catalog. Check the provider's docs for the exact model id format, then enter it manually.");
+            // Live fetch failed or returned empty (provider doesn't expose
+            // a no-auth listing). The underlying error was traced at debug
+            // level; surface a short provider-named nudge to the user and
+            // fall back to manual entry.
+            ui.note(&format!(
+                "Catalog lookup failed for {provider} — enter a model id manually \
+                 (see the provider's docs for the exact format)."
+            ));
             let default = if is_set { Some(current.as_str()) } else { None };
             match ui.string("Model id", default).await? {
                 Answer::Back => return Ok(Nav::Back),
