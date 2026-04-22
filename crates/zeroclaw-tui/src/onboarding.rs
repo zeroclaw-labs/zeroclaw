@@ -916,6 +916,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     encrypt_key: None,
                     verification_token: None,
                     allowed_users: vec![],
+                    mention_only: false,
                     receive_mode: LarkReceiveMode::default(),
                     port: None,
                     proxy_url: None,

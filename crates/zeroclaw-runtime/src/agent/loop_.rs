@@ -3757,6 +3757,37 @@ mod tests {
         assert_eq!(restored[1].content, "orphan");
     }
 
+    /// Regression test for issue #5813: a persisted session whose assistant
+    /// (tool_use) was lost to compaction must self-heal on load so the next
+    /// API call doesn't fail with "unexpected tool_use_id found in tool_result
+    /// blocks".
+    #[test]
+    fn load_interactive_session_heals_orphaned_tool_result() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let orphan_tool = ChatMessage::tool(
+            r#"{"tool_call_id":"toolu_01OrphanFromCompaction","content":"stale result"}"#,
+        );
+        let payload = serde_json::to_string_pretty(&InteractiveSessionState {
+            version: 1,
+            history: vec![
+                ChatMessage::system("sys"),
+                orphan_tool,
+                ChatMessage::user("next question"),
+            ],
+        })
+        .unwrap();
+        std::fs::write(&path, payload).unwrap();
+
+        let restored = load_interactive_session_history(&path, "fallback").unwrap();
+
+        assert!(
+            !restored.iter().any(|m| m.role == "tool"),
+            "orphaned tool_result should be removed on load; got roles {:?}",
+            restored.iter().map(|m| &m.role).collect::<Vec<_>>()
+        );
+    }
+
     use super::*;
     use async_trait::async_trait;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
