@@ -555,6 +555,12 @@ pub struct ModelProviderConfig {
     /// Merge system messages into first user message.
     #[serde(default)]
     pub merge_system_into_user: bool,
+    /// Extra JSON parameters to include in API requests.
+    /// Merged at the top level of the request body, allowing provider-specific
+    /// features (routing, transforms, etc.) without code changes.
+    /// Example: `provider_extra = { provider = { only = ["Anthropic"] } }`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_extra: Option<serde_json::Value>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
@@ -6193,6 +6199,10 @@ pub struct CronJobDecl {
     /// Allowlist of tool names for agent jobs.
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
+    /// Whether to recall and inject memory context before this agent job runs.
+    /// Defaults to `true`; set to `false` for stateless digest jobs.
+    #[serde(default = "default_true")]
+    pub uses_memory: bool,
     /// Session target: `"isolated"` (default) or `"main"`.
     #[serde(default)]
     pub session_target: Option<String>,
@@ -7850,6 +7860,10 @@ pub struct FeishuConfig {
     /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, only respond to messages that @-mention the bot in groups.
+    /// Direct messages are always processed.
+    #[serde(default)]
+    pub mention_only: bool,
     /// Event receive mode: "websocket" (default) or "webhook"
     #[serde(default)]
     pub receive_mode: LarkReceiveMode,
@@ -11187,6 +11201,10 @@ impl_enum_prop_kind!(
     AutonomyLevel,
 );
 
+impl HasPropKind for serde_json::Value {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12403,6 +12421,7 @@ default_temperature = 0.7
             encrypt_key: Some("feishu-encrypt".into()),
             verification_token: Some("feishu-verify".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
@@ -14378,6 +14397,7 @@ default_model = "legacy-model"
             encrypt_key: Some("feishu-encrypt".into()),
             verification_token: Some("feishu-verify".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
@@ -15350,6 +15370,7 @@ default_model = "persisted-profile"
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["user_123".into(), "user_456".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
@@ -15372,6 +15393,7 @@ default_model = "persisted-profile"
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,

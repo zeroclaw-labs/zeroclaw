@@ -240,6 +240,16 @@ impl PluginHost {
             .collect()
     }
 
+    /// Get tool-capable plugins with their resolved WASM file paths.
+    /// Returns `(manifest, resolved_wasm_path)` tuples for building `WasmTool`s.
+    pub fn tool_plugin_details(&self) -> Vec<(&PluginManifest, &Path)> {
+        self.loaded
+            .values()
+            .filter(|p| p.manifest.capabilities.contains(&PluginCapability::Tool))
+            .map(|p| (&p.manifest, p.wasm_path.as_path()))
+            .collect()
+    }
+
     /// Get channel-capable plugins.
     pub fn channel_plugins(&self) -> Vec<&PluginManifest> {
         self.loaded

@@ -123,7 +123,7 @@ impl Default for DeliveryConfig {
     }
 }
 
-fn default_true() -> bool {
+pub fn default_true() -> bool {
     true
 }
 
@@ -150,6 +150,11 @@ pub struct CronJob {
     /// When `None`, all tools are available (backward compatible default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
+    /// Whether to recall and inject memory context before this agent job runs.
+    /// Defaults to `true`; set to `false` for stateless digest jobs that should
+    /// not accumulate or consume memory entries.
+    #[serde(default = "default_true")]
+    pub uses_memory: bool,
     /// How the job was created: `"imperative"` (CLI/API) or `"declarative"` (config).
     #[serde(default = "default_source")]
     pub source: String,
@@ -183,6 +188,7 @@ pub struct CronJobPatch {
     pub session_target: Option<SessionTarget>,
     pub delete_after_run: Option<bool>,
     pub allowed_tools: Option<Vec<String>>,
+    pub uses_memory: Option<bool>,
 }
 
 #[cfg(test)]

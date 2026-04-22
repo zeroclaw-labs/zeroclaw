@@ -1355,6 +1355,13 @@ fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
         return true;
     }
 
+    // Skip raw per-turn user messages: re-injecting them causes each
+    // recalled entry to embed all prior generations, growing exponentially.
+    // Consolidated knowledge is already promoted to Core/Daily entries.
+    if zeroclaw_memory::is_user_autosave_key(key) {
+        return true;
+    }
+
     if zeroclaw_memory::should_skip_autosave_content(content) {
         return true;
     }
@@ -3056,6 +3063,8 @@ async fn process_channel_message(
                         ctx.context_token_budget,
                         None, // shared_budget
                         target_channel.as_deref(),
+                        None, // receipt_generator
+                        None, // collected_receipts
                     ),
                     ),
                     ),
@@ -5198,9 +5207,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
-    let tools_registry = Arc::new(built_tools);
-
     let skills = zeroclaw_runtime::skills::load_skills_with_config(&workspace, &config);
+
+    // Register skill-defined tools so the gateway can execute them (not just
+    // describe them in the prompt). Without this, skill tools like email.send
+    // appear in the system prompt but return "Unknown tool" when called.
+    zeroclaw_runtime::tools::register_skill_tools(&mut built_tools, &skills, security.clone());
+
+    let tools_registry = Arc::new(built_tools);
 
     // ── Load locale-aware tool descriptions ────────────────────────
     let i18n_locale = config
@@ -5610,6 +5624,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 msgs.push(closure);
                 orphans_closed += 1;
             }
+            // Self-heal: strip orphaned tool_result messages left by a prior
+            // compaction that dropped the assistant tool_use without its paired
+            // tool_result. Must run LAST, after every other mutation, so any
+            // future trim step inserted above is covered by the same guard.
+            // Without this, the session is bricked until the file is deleted
+            // because every API call fails with 400 "unexpected tool_use_id
+            // in tool_result blocks". See #5813.
+            zeroclaw_runtime::agent::history_pruner::remove_orphaned_tool_messages(&mut msgs);
             hydrated += 1;
             histories.push(key, msgs);
         }
@@ -5877,6 +5899,22 @@ mod tests {
         assert!(!should_skip_memory_context_entry(
             "telegram_user_msg_201",
             "plain text without tool results"
+        ));
+
+        // Per-turn user auto-save keys must be skipped to prevent exponential
+        // context bloat from re-injected conversation history.
+        assert!(should_skip_memory_context_entry(
+            "user_msg",
+            "original user message text"
+        ));
+        assert!(should_skip_memory_context_entry(
+            "user_msg_a1b2c3d4e5f6",
+            "follow-up message embedding prior context"
+        ));
+        // Channel-scoped keys (e.g. telegram_*) must NOT be affected.
+        assert!(!should_skip_memory_context_entry(
+            "telegram_user_msg_101",
+            "Please describe the image"
         ));
     }
 
