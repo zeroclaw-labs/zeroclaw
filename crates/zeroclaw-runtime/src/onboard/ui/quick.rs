@@ -15,6 +15,12 @@ use zeroclaw_config::traits::{Answer, OnboardUi, SelectItem};
 #[derive(Debug, Default)]
 pub struct QuickUi {
     answers: HashMap<String, String>,
+    /// Prompts that fire more than once per run (e.g. a "Channel" select
+    /// hit once to enter a channel and again to pick "Done") need distinct
+    /// answers per call. Sequence entries are consumed in order; if the
+    /// cursor runs off the end, lookup falls back to `answers`.
+    sequences: HashMap<String, Vec<String>>,
+    sequence_cursor: HashMap<String, usize>,
 }
 
 impl QuickUi {
@@ -26,12 +32,39 @@ impl QuickUi {
         self.answers.insert(prompt.into(), value.into());
         self
     }
+
+    /// Register a sequence of answers for a prompt that fires multiple
+    /// times. The first hit returns `values[0]`, second returns `values[1]`,
+    /// etc. After the sequence is exhausted, subsequent hits fall through
+    /// to `answers` / the prompt's own default.
+    pub fn with_sequence<I, S>(mut self, prompt: impl Into<String>, values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.sequences
+            .insert(prompt.into(), values.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Look up the next answer for `prompt`: sequence cursor first (and
+    /// advance it), then the single-answer map.
+    fn lookup(&mut self, prompt: &str) -> Option<String> {
+        if let Some(seq) = self.sequences.get(prompt) {
+            let cursor = self.sequence_cursor.entry(prompt.to_string()).or_insert(0);
+            if let Some(v) = seq.get(*cursor) {
+                *cursor += 1;
+                return Some(v.clone());
+            }
+        }
+        self.answers.get(prompt).cloned()
+    }
 }
 
 #[async_trait]
 impl OnboardUi for QuickUi {
     async fn confirm(&mut self, prompt: &str, default: bool) -> Result<Answer<bool>> {
-        Ok(Answer::Value(match self.answers.get(prompt) {
+        Ok(Answer::Value(match self.lookup(prompt) {
             Some(value) => matches!(
                 value.trim().to_ascii_lowercase().as_str(),
                 "true" | "yes" | "y" | "1"
@@ -41,8 +74,8 @@ impl OnboardUi for QuickUi {
     }
 
     async fn string(&mut self, prompt: &str, current: Option<&str>) -> Result<Answer<String>> {
-        if let Some(answer) = self.answers.get(prompt) {
-            return Ok(Answer::Value(answer.clone()));
+        if let Some(answer) = self.lookup(prompt) {
+            return Ok(Answer::Value(answer));
         }
         if let Some(value) = current {
             return Ok(Answer::Value(value.to_string()));
@@ -51,8 +84,8 @@ impl OnboardUi for QuickUi {
     }
 
     async fn secret(&mut self, prompt: &str, has_current: bool) -> Result<Answer<Option<String>>> {
-        match (self.answers.get(prompt), has_current) {
-            (Some(value), _) => Ok(Answer::Value(Some(value.clone()))),
+        match (self.lookup(prompt), has_current) {
+            (Some(value), _) => Ok(Answer::Value(Some(value))),
             (None, true) => Ok(Answer::Value(None)),
             (None, false) => {
                 bail!("quick mode: secret {prompt:?} is required but no value was supplied")
@@ -66,10 +99,10 @@ impl OnboardUi for QuickUi {
         items: &[SelectItem],
         current: Option<usize>,
     ) -> Result<Answer<usize>> {
-        if let Some(answer) = self.answers.get(prompt) {
+        if let Some(answer) = self.lookup(prompt) {
             if let Some(index) = items
                 .iter()
-                .position(|item| item.label.eq_ignore_ascii_case(answer))
+                .position(|item| item.label.eq_ignore_ascii_case(&answer))
             {
                 return Ok(Answer::Value(index));
             }

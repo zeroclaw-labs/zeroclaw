@@ -1212,6 +1212,74 @@ mod tests {
         );
     }
 
+    /// Smoke test: picking Telegram in the channels menu initializes the
+    /// subsection and the scripted bot-token lands via `set_prop`. Covers
+    /// the per-channel field-walk path that `channels_done_selection_*`
+    /// doesn't exercise (it picks Done immediately).
+    #[tokio::test]
+    async fn channels_telegram_selection_writes_entry() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+        let flags = Flags::default();
+
+        let mut ui = QuickUi::new()
+            .with("bot-token", "stub-tg-token")
+            // Optional Option<String> field with no default — QuickUi's
+            // `string` method bails when both answer and current prefill
+            // are None. An empty-string answer lets prompt_field's
+            // is-set-guard skip the persist, leaving the field None.
+            .with("proxy-url", "")
+            .with_sequence("Channel", ["telegram", "Done"]);
+        run(&mut cfg, &mut ui, Section::Channels, &flags)
+            .await
+            .unwrap();
+
+        let tg = cfg
+            .channels
+            .telegram
+            .as_ref()
+            .expect("telegram subsection should be initialized");
+        assert_eq!(tg.bot_token, "stub-tg-token");
+        assert!(
+            cfg.onboard_state
+                .completed_sections
+                .iter()
+                .any(|s| s == "channels"),
+            "channels section should mark completed"
+        );
+    }
+
+    /// Smoke test: picking Mochat walks the enabled-gate fields and the
+    /// resulting config has `enabled = true`, the scripted base URL, and
+    /// the scripted API token round-tripped via `set_prop`. Doubles as a
+    /// regression guard for the orchestrator's mochat enabled-check — a
+    /// config with `enabled = true` must reach the registration branch,
+    /// one with the default `false` must not.
+    #[tokio::test]
+    async fn channels_mochat_selection_persists_enabled_url_and_token() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+        let flags = Flags::default();
+
+        let mut ui = QuickUi::new()
+            .with("enabled", "true")
+            .with("api-url", "http://mochat-test:8080/v1")
+            .with("api-token", "stub-mochat-token")
+            .with_sequence("Channel", ["mochat", "Done"]);
+        run(&mut cfg, &mut ui, Section::Channels, &flags)
+            .await
+            .unwrap();
+
+        let mc = cfg
+            .channels
+            .mochat
+            .as_ref()
+            .expect("mochat subsection should be initialized");
+        assert!(mc.enabled, "mochat enabled should round-trip via set_prop");
+        assert_eq!(mc.api_url, "http://mochat-test:8080/v1");
+        assert_eq!(mc.api_token, "stub-mochat-token");
+    }
+
     /// Acceptance-criteria guarantee: a double run of the same section must
     /// produce identical on-disk TOML. The first run walks the workspace
     /// section with QuickUi's `confirm` defaults (enabled stays false),
