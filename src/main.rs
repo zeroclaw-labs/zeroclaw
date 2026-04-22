@@ -584,6 +584,24 @@ Examples:
         memory_command: MemoryCommands,
     },
 
+    /// Second-brain vault operations (legal ingest + graph)
+    #[command(long_about = "\
+Second-brain (vault) operations.
+
+Currently supports the legal-domain pipeline: walk a directory of statute
+and precedent markdown files, extract citations deterministically, and
+upsert into brain.db's vault_documents + vault_links so the graph search
+in src/vault/store.rs::search_graph() can traverse legal references.
+
+Examples:
+  zeroclaw vault legal ingest ~/law/markdown
+  zeroclaw vault legal ingest ~/law/markdown --dry-run
+  zeroclaw vault legal stats")]
+    Vault {
+        #[command(subcommand)]
+        vault_command: VaultCommands,
+    },
+
     /// Manage configuration
     #[command(long_about = "\
 Manage ZeroClaw configuration.
@@ -884,6 +902,31 @@ enum MemoryCommands {
         #[arg(long, default_value = "true")]
         progress: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum VaultCommands {
+    /// Legal-domain operations (statute + precedent ingestion, graph stats)
+    Legal {
+        #[command(subcommand)]
+        legal_command: VaultLegalCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum VaultLegalCommands {
+    /// Walk a directory of .md files, classify each as statute or case, and upsert.
+    ///
+    /// Safe to re-run — checksum short-circuits unchanged files.
+    Ingest {
+        /// Path to a directory (recursively walked) or a single .md file.
+        path: std::path::PathBuf,
+        /// Parse + report without touching brain.db (in-memory DB).
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show legal-graph node/edge counts in brain.db.
+    Stats,
 }
 
 #[tokio::main]
@@ -1361,6 +1404,15 @@ async fn main() -> Result<()> {
         Commands::Memory { memory_command } => {
             memory::cli::handle_command(memory_command, &config).await
         }
+
+        Commands::Vault { vault_command } => match vault_command {
+            VaultCommands::Legal { legal_command } => match legal_command {
+                VaultLegalCommands::Ingest { path, dry_run } => {
+                    vault::legal::cli::ingest_path(&config, path, dry_run).await
+                }
+                VaultLegalCommands::Stats => vault::legal::cli::stats(&config).await,
+            },
+        },
 
         Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,
 

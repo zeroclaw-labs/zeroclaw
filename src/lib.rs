@@ -405,6 +405,34 @@ pub enum MemoryCommands {
     },
 }
 
+/// Vault (second brain) subcommands.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VaultCommands {
+    /// Legal-domain operations (statute + precedent ingestion, graph stats).
+    Legal {
+        #[command(subcommand)]
+        legal_command: VaultLegalCommands,
+    },
+}
+
+/// `zeroclaw vault legal <subcommand>` — ingest Korean statute + precedent
+/// markdown into the second-brain graph (vault_documents + vault_links).
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VaultLegalCommands {
+    /// Walk a directory of .md files, classify each as statute or case, and upsert.
+    ///
+    /// Safe to re-run — checksum short-circuits unchanged files.
+    Ingest {
+        /// Path to a directory (recursively walked) or a single .md file.
+        path: std::path::PathBuf,
+        /// Parse + report without touching brain.db (in-memory DB).
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show legal-graph node/edge counts in brain.db.
+    Stats,
+}
+
 /// Integration subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum IntegrationCommands {
