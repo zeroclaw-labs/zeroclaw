@@ -518,43 +518,33 @@ pub async fn maybe_auto_recharge(
             }
         }
         CheckoutProvider::Toss => {
-            // TossPayments billing key auto-charge
+            // TossPayments recurring charge against a previously-issued
+            // billing key (issued via `exchange_toss_auth_key`). The
+            // prior draft called `/v1/billing/authorizations/card` which
+            // is actually the *issue* endpoint, not the charge endpoint
+            // — that would silently fail on every retry. Using
+            // `charge_toss_billing_key` here keeps the auth and charge
+            // paths sharing one well-tested call.
             let key = toss_key
                 .ok_or_else(|| anyhow::anyhow!("Toss key not configured for auto-recharge"))?;
-
-            let auth = base64_encode_key(key);
-            let client = reqwest::Client::new();
-
-            let body = serde_json::json!({
-                "billingKey": saved_method,
-                "customerKey": user_id,
-                "amount": package.price_krw,
-                "orderId": transaction_id,
-                "orderName": format!("MoA 크레딧 자동충전 — {} ({}크레딧)", package.name, package.credits),
-            });
-
-            let response = client
-                .post("https://api.tosspayments.com/v1/billing/authorizations/card")
-                .header("Authorization", format!("Basic {auth}"))
-                .header("Content-Type", "application/json")
-                .json(&body)
-                .send()
-                .await?;
-
-            let resp: serde_json::Value = response.json().await?;
-            let toss_status = resp.get("status").and_then(|v| v.as_str()).unwrap_or("");
-
-            if toss_status == "DONE" {
-                tracing::info!(
-                    user_id,
-                    package_id = package.id,
-                    credits = package.credits,
-                    "Auto-recharge succeeded via TossPayments"
-                );
-                Ok(Some(transaction_id))
-            } else {
-                anyhow::bail!("Auto-recharge TossPayments status: {}", toss_status);
-            }
+            let order_name =
+                format!("MoA 크레딧 자동충전 — {} ({}크레딧)", package.name, package.credits);
+            charge_toss_billing_key(
+                key,
+                saved_method,
+                user_id,
+                package.price_krw,
+                &transaction_id,
+                &order_name,
+            )
+            .await?;
+            tracing::info!(
+                user_id,
+                package_id = package.id,
+                credits = package.credits,
+                "Auto-recharge succeeded via TossPayments billing key"
+            );
+            Ok(Some(transaction_id))
         }
     }
 }
@@ -784,4 +774,148 @@ pub async fn cancel_stripe_subscription(
     }
 
     Ok((now, refund_cents))
+}
+
+// ── Toss 빌링키 (recurring) — spec, 2026-04-22 / 2026-04-23 ─────────
+//
+// Stripe does not issue merchant accounts to Korean entities, so Toss
+// becomes the primary rail for Korean subscribers. The Toss flow is:
+//
+//   1. Frontend invokes the Toss JS widget with a freshly generated
+//      `customerKey` (opaque UUID we own) + a success/fail callback URL.
+//   2. User authorises the card inside the Toss popup.
+//   3. Toss redirects to the success URL with `authKey` + `customerKey`.
+//   4. Our callback endpoint calls `exchange_toss_auth_key` to swap the
+//      `authKey` for a reusable `billingKey`, which we persist in
+//      `billing_preferences.saved_method_id` (provider = "toss").
+//   5. Every subsequent charge (first-cycle + renewals + auto-recharge)
+//      calls `charge_toss_billing_key` with the stored `billingKey`.
+//
+// We never handle raw card data — Toss does. Our DB only ever sees
+// the opaque billingKey.
+
+/// Exchange an `authKey` (returned by the Toss billing widget) for a
+/// persistent `billingKey` that can charge the user's card on demand.
+///
+/// `customer_key` must be the same value passed to the widget in step
+/// (1). Toss rejects the exchange if they disagree.
+pub async fn exchange_toss_auth_key(
+    secret_key: &str,
+    auth_key: &str,
+    customer_key: &str,
+) -> anyhow::Result<String> {
+    let client = reqwest::Client::new();
+    let auth = base64_encode_key(secret_key);
+    let body = serde_json::json!({
+        "authKey": auth_key,
+        "customerKey": customer_key,
+    });
+    let response = client
+        .post("https://api.tosspayments.com/v1/billing/authorizations/issue")
+        .header("Authorization", format!("Basic {auth}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("TossPayments auth exchange network error: {e}"))?;
+    let status = response.status();
+    let resp: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("TossPayments auth exchange parse error: {e}"))?;
+    if !status.is_success() {
+        let msg = resp.get("message").and_then(|v| v.as_str()).unwrap_or("unknown");
+        anyhow::bail!("TossPayments auth exchange failed ({}): {}", status.as_u16(), msg);
+    }
+    let billing_key = resp
+        .get("billingKey")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Toss response missing billingKey"))?
+        .to_string();
+    Ok(billing_key)
+}
+
+/// Charge a previously-issued Toss billing key. Returns the Toss
+/// `paymentKey` (handy for refunds) on `DONE` / success. The amount
+/// is in KRW because Toss is a Korean rail; USD → KRW conversion
+/// happens on the gateway side before this call.
+pub async fn charge_toss_billing_key(
+    secret_key: &str,
+    billing_key: &str,
+    customer_key: &str,
+    amount_krw: u32,
+    order_id: &str,
+    order_name: &str,
+) -> anyhow::Result<String> {
+    let client = reqwest::Client::new();
+    let auth = base64_encode_key(secret_key);
+    let body = serde_json::json!({
+        "customerKey": customer_key,
+        "amount": amount_krw,
+        "orderId": order_id,
+        "orderName": order_name,
+    });
+    let response = client
+        .post(format!(
+            "https://api.tosspayments.com/v1/billing/{billing_key}"
+        ))
+        .header("Authorization", format!("Basic {auth}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("TossPayments charge network error: {e}"))?;
+    let status = response.status();
+    let resp: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("TossPayments charge parse error: {e}"))?;
+    if !status.is_success() {
+        let msg = resp.get("message").and_then(|v| v.as_str()).unwrap_or("unknown");
+        anyhow::bail!("TossPayments charge failed ({}): {}", status.as_u16(), msg);
+    }
+    let toss_status = resp.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    if toss_status != "DONE" {
+        anyhow::bail!("TossPayments charge status: {}", toss_status);
+    }
+    Ok(resp
+        .get("paymentKey")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string())
+}
+
+/// Ask Toss to cancel a paid order (partial or full). Used for the
+/// prorated refund on annual-plan subscription cancellation when the
+/// subscriber paid via Toss. `payment_key` is what `charge_toss_billing_key`
+/// returned at charge time. `cancel_amount` in KRW; omit for a full cancel.
+pub async fn cancel_toss_payment(
+    secret_key: &str,
+    payment_key: &str,
+    cancel_reason: &str,
+    cancel_amount_krw: Option<u32>,
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let auth = base64_encode_key(secret_key);
+    let mut body = serde_json::json!({ "cancelReason": cancel_reason });
+    if let Some(amount) = cancel_amount_krw {
+        body["cancelAmount"] = serde_json::Value::from(amount);
+    }
+    let response = client
+        .post(format!(
+            "https://api.tosspayments.com/v1/payments/{payment_key}/cancel"
+        ))
+        .header("Authorization", format!("Basic {auth}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("TossPayments cancel network error: {e}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let resp: serde_json::Value = response.json().await.unwrap_or_default();
+        let msg = resp.get("message").and_then(|v| v.as_str()).unwrap_or("unknown");
+        anyhow::bail!("TossPayments cancel failed ({}): {}", status.as_u16(), msg);
+    }
+    Ok(())
 }

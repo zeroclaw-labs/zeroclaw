@@ -1243,6 +1243,46 @@ impl PaymentManager {
         Ok(())
     }
 
+    /// List every active subscription whose `renewal_at` has passed and
+    /// whose provider is `"toss"`. Used by the scheduler to drive the
+    /// Toss billing-key charge for the next cycle. Stripe subscriptions
+    /// are deliberately excluded — Stripe drives its own renewal clock
+    /// via `invoice.paid` webhooks and we don't want to double-charge.
+    pub fn list_due_toss_subscriptions(
+        &self,
+        now: i64,
+    ) -> anyhow::Result<Vec<SubscriptionRecord>> {
+        let Some(ref conn) = self.conn else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            "SELECT user_id, plan_id, provider, provider_sub_id, status,
+                    started_at, renewal_at, expires_at,
+                    refunded_at, refunded_amount_cents
+             FROM subscriptions
+             WHERE status = 'active'
+               AND provider = 'toss'
+               AND renewal_at <= ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![now], |r| {
+                Ok(SubscriptionRecord {
+                    user_id: r.get::<_, String>(0)?,
+                    plan_id: r.get::<_, String>(1)?,
+                    provider: r.get::<_, Option<String>>(2)?,
+                    provider_sub_id: r.get::<_, Option<String>>(3)?,
+                    status: r.get::<_, String>(4)?,
+                    started_at: r.get::<_, i64>(5)?,
+                    renewal_at: r.get::<_, i64>(6)?,
+                    expires_at: r.get::<_, i64>(7)?,
+                    refunded_at: r.get::<_, Option<i64>>(8)?,
+                    refunded_amount_cents: r.get::<_, Option<u32>>(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Backfill a subscription row with the Stripe subscription ID that
     /// webhook events carry in `data.object.subscription`. Idempotent —
     /// repeated calls with the same ID no-op.

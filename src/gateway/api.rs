@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use chrono::Datelike;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const MASKED_SECRET: &str = "***MASKED***";
 
@@ -3973,4 +3973,208 @@ pub async fn handle_api_subscription_stripe_checkout(
         )
             .into_response(),
     }
+}
+
+// ── Toss 빌링키 (recurring) endpoints — spec, 2026-04-23 ─────────
+
+#[derive(Debug, Deserialize)]
+pub struct TossSubscriptionSetupBody {
+    pub plan_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TossBillingSetupResponse {
+    /// Opaque key the client must pass to Toss's widget. Re-used on the
+    /// callback to prove the redirect belongs to the same session.
+    pub customer_key: String,
+    /// Our internal transaction id echoed back through the redirect so
+    /// we can pair the authKey with the plan the user selected.
+    pub transaction_id: String,
+    /// URL Toss should redirect the user to on successful card auth.
+    /// Points at `handle_api_checkout_toss_billing_callback`.
+    pub success_url: String,
+    /// URL Toss should redirect the user to on card auth failure.
+    pub fail_url: String,
+    /// KRW amount of the first cycle (Toss widget renders this).
+    pub price_krw: u32,
+    /// Plan name for the widget-side order description.
+    pub plan_name: String,
+}
+
+/// POST /api/subscriptions/toss-setup — start a Toss 빌링키 flow for
+/// the selected subscription plan. Returns a `customer_key` + widget
+/// URLs the React frontend hands to the TossPayments JS widget. Toss
+/// then takes the user through card authorisation and redirects back
+/// to `success_url` with `authKey` + `customerKey` query params.
+pub async fn handle_api_subscription_toss_setup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TossSubscriptionSetupBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let Some(plan) = crate::billing::find_subscription_plan(&body.plan_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Unknown plan_id {}", body.plan_id) })),
+        )
+            .into_response();
+    };
+    let callback_base = {
+        let cfg = state.config.lock();
+        format!("http://{}:{}", cfg.gateway.host, cfg.gateway.port)
+    };
+    let user_id = state
+        .sync_coordinator
+        .as_ref()
+        .map(|sc| sc.device_id().to_string())
+        .unwrap_or_else(|| "local_user".to_string());
+    let customer_key = format!("moa_{user_id}");
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let first_cycle_krw = plan.price_krw / plan.cycles.max(1);
+
+    Json(TossBillingSetupResponse {
+        customer_key,
+        transaction_id: transaction_id.clone(),
+        success_url: format!(
+            "{callback_base}/api/checkout/toss-billing-callback?tx={transaction_id}&plan={plan_id}",
+            plan_id = plan.id,
+        ),
+        fail_url: format!("{callback_base}/api/checkout/cancel?tx={transaction_id}"),
+        price_krw: first_cycle_krw,
+        plan_name: plan.name.to_string(),
+    })
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TossBillingCallbackQuery {
+    #[serde(rename = "authKey")]
+    pub auth_key: String,
+    #[serde(rename = "customerKey")]
+    pub customer_key: String,
+    pub tx: String,
+    pub plan: String,
+}
+
+/// GET /api/checkout/toss-billing-callback — redirect target Toss
+/// sends the user to after card authorisation. Exchanges the
+/// `authKey` for a persistent `billingKey`, charges the first cycle,
+/// and persists the subscription + the billing key for future
+/// recurring charges + auto-recharges.
+pub async fn handle_api_checkout_toss_billing_callback(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<TossBillingCallbackQuery>,
+) -> impl IntoResponse {
+    let Some(plan) = crate::billing::find_subscription_plan(&q.plan) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Unknown plan_id {}", q.plan) })),
+        )
+            .into_response();
+    };
+    let toss_key = {
+        let cfg = state.config.lock();
+        cfg.toss_secret_key.clone()
+    };
+    let Some(key) = toss_key else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Toss not configured" })),
+        )
+            .into_response();
+    };
+
+    // 1) authKey → billingKey
+    let billing_key = match crate::billing::checkout::exchange_toss_auth_key(
+        &key,
+        &q.auth_key,
+        &q.customer_key,
+    )
+    .await
+    {
+        Ok(bk) => bk,
+        Err(e) => {
+            tracing::warn!(error = %e, "Toss auth exchange failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": format!("{e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    // 2) First-cycle charge
+    let first_cycle_krw = plan.price_krw / plan.cycles.max(1);
+    if let Err(e) = crate::billing::checkout::charge_toss_billing_key(
+        &key,
+        &billing_key,
+        &q.customer_key,
+        first_cycle_krw,
+        &q.tx,
+        &format!("MoA 구독 — {}", plan.name),
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "Toss first-cycle charge failed");
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": format!("{e}") })),
+        )
+            .into_response();
+    }
+
+    // 3) Persist subscription row + billing key + grant first credits.
+    let user_id = q
+        .customer_key
+        .strip_prefix("moa_")
+        .unwrap_or(&q.customer_key)
+        .to_string();
+
+    if let Some(ref pm) = state.payment_manager {
+        let renewal_secs: i64 = if plan.interval == "year" {
+            365 * 24 * 60 * 60
+        } else {
+            30 * 24 * 60 * 60
+        };
+        let pm_guard = pm.lock();
+        let _ = pm_guard.upsert_subscription(
+            &user_id,
+            plan.id,
+            Some("toss"),
+            Some(&billing_key),
+            renewal_secs,
+        );
+        let _ = pm_guard.add_bonus_credits(&user_id, plan.credits_per_cycle);
+        let _ = pm_guard.record_grant(
+            "",
+            &user_id,
+            plan.credits_per_cycle,
+            "subscription",
+            crate::billing::GRANT_TTL_SECS_30D,
+        );
+        // Save the billing key into the user's preferences so the
+        // auto-recharge scheduler can reuse it without a second widget
+        // round-trip.
+        if let Ok(mut prefs) = pm_guard.get_billing_preferences(&user_id) {
+            prefs.saved_method_id = Some(billing_key);
+            prefs.saved_method_provider = Some("toss".into());
+            let _ = pm_guard.set_billing_preferences(&prefs);
+        }
+    }
+
+    // Friendly post-checkout redirect back to the billing page so the
+    // user lands on a visible "Subscribed ✓" state rather than the
+    // JSON blob of this handler.
+    let redirect_url = {
+        let cfg = state.config.lock();
+        format!("http://{}:{}/billing?toss=ok", cfg.gateway.host, cfg.gateway.port)
+    };
+    (
+        StatusCode::TEMPORARY_REDIRECT,
+        [("Location", redirect_url.as_str())],
+        Json(serde_json::json!({ "status": "ok" })),
+    )
+        .into_response()
 }

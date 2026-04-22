@@ -1178,6 +1178,104 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         });
     }
 
+    // Toss 빌링키 recurring charge scheduler (spec, 2026-04-23). Fires
+    // hourly; for every active Toss subscription whose `renewal_at` has
+    // passed, charge the stored billing key for one more cycle, grant
+    // credits, and bump `renewal_at` forward. Stripe subscriptions are
+    // excluded — Stripe drives its own renewal clock via `invoice.paid`
+    // webhooks. Non-fatal on a single charge failure: the row stays
+    // `status=active` + `renewal_at=past`, so the next tick retries;
+    // after three consecutive failures the operator can intervene from
+    // the admin dashboard.
+    if let Some(pm_arc) = payment_manager.clone() {
+        let config_lock = config_state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let now = chrono::Utc::now().timestamp();
+                let due = {
+                    let pm = pm_arc.lock();
+                    pm.list_due_toss_subscriptions(now).unwrap_or_default()
+                };
+                if due.is_empty() {
+                    continue;
+                }
+                let toss_key = {
+                    let cfg = config_lock.lock();
+                    cfg.toss_secret_key.clone()
+                };
+                let Some(ref key) = toss_key else {
+                    tracing::warn!(
+                        count = due.len(),
+                        "Toss subscriptions due for renewal but TOSS_SECRET_KEY is not configured"
+                    );
+                    continue;
+                };
+                for sub in due {
+                    let Some(plan) = crate::billing::find_subscription_plan(&sub.plan_id) else {
+                        tracing::warn!(plan_id = %sub.plan_id, "Toss renewal: plan not found; skipping");
+                        continue;
+                    };
+                    let Some(billing_key) = sub.provider_sub_id.as_deref() else {
+                        tracing::warn!(user_id = %sub.user_id, "Toss renewal: missing billing key");
+                        continue;
+                    };
+                    let customer_key = format!("moa_{}", sub.user_id);
+                    let cycle_krw = plan.price_krw / plan.cycles.max(1);
+                    let order_id = uuid::Uuid::new_v4().to_string();
+                    let order_name = format!("MoA 구독 갱신 — {}", plan.name);
+                    match crate::billing::checkout::charge_toss_billing_key(
+                        key,
+                        billing_key,
+                        &customer_key,
+                        cycle_krw,
+                        &order_id,
+                        &order_name,
+                    )
+                    .await
+                    {
+                        Ok(_payment_key) => {
+                            let renewal_secs: i64 = if plan.interval == "year" {
+                                365 * 24 * 60 * 60
+                            } else {
+                                30 * 24 * 60 * 60
+                            };
+                            let pm = pm_arc.lock();
+                            let _ = pm.upsert_subscription(
+                                &sub.user_id,
+                                plan.id,
+                                Some("toss"),
+                                Some(billing_key),
+                                renewal_secs,
+                            );
+                            let _ = pm.add_bonus_credits(&sub.user_id, plan.credits_per_cycle);
+                            let _ = pm.record_grant(
+                                "",
+                                &sub.user_id,
+                                plan.credits_per_cycle,
+                                "subscription",
+                                crate::billing::GRANT_TTL_SECS_30D,
+                            );
+                            tracing::info!(
+                                user_id = %sub.user_id,
+                                plan_id = plan.id,
+                                "Toss subscription renewed via billing key"
+                            );
+                        }
+                        Err(e) => tracing::warn!(
+                            user_id = %sub.user_id,
+                            plan_id = plan.id,
+                            error = %e,
+                            "Toss subscription renewal failed"
+                        ),
+                    }
+                }
+            }
+        });
+    }
+
     // Fire gateway start hook
     if let Some(ref hooks) = hooks {
         hooks.fire_gateway_start(host, actual_port).await;
@@ -1449,6 +1547,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route(
             "/api/subscriptions/stripe-checkout",
             post(api::handle_api_subscription_stripe_checkout),
+        )
+        // Toss 빌링키 path (primary for Korean users)
+        .route(
+            "/api/subscriptions/toss-setup",
+            post(api::handle_api_subscription_toss_setup),
+        )
+        .route(
+            "/api/checkout/toss-billing-callback",
+            get(api::handle_api_checkout_toss_billing_callback),
         )
         // ── Payment callbacks (Kakao Pay redirects) ──
         .route("/api/payment/approve", get(api::handle_api_payment_approve))
