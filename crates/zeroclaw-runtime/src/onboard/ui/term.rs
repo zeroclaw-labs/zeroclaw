@@ -96,7 +96,6 @@ impl OnboardUi for TermUi {
     async fn editor(&mut self, hint: &str, initial: &str) -> Result<Answer<String>> {
         let hint = hint.to_string();
         let buffer = initial.to_string();
-        let fallback = initial.to_string();
         tokio::task::spawn_blocking(move || -> Result<Answer<String>> {
             if !hint.is_empty() {
                 println!("  {hint}");
@@ -106,7 +105,7 @@ impl OnboardUi for TermUi {
             // unchanged buffer silently.
             match Editor::new().edit(&buffer)? {
                 Some(edited) => Ok(Answer::Value(edited)),
-                None => Ok(Answer::Value(fallback)),
+                None => Ok(Answer::Back),
             }
         })
         .await?
