@@ -17,6 +17,8 @@ pub mod pricing;
 pub mod tracker;
 
 #[allow(unused_imports)]
+pub mod alerts;
+
 pub use checkout::{
     find_subscription_plan, SubscriptionPlan, AUTO_RECHARGE_PACKAGE_IDS, SUBSCRIPTION_PLANS, 
     AutoRechargeSettings, CheckoutProvider, CheckoutRequest, CheckoutResponse, UsdCreditPackage,

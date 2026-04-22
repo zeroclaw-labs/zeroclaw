@@ -367,6 +367,10 @@ impl PaymentManager {
                     auto_recharge_threshold  INTEGER NOT NULL DEFAULT 5000,
                     saved_method_id          TEXT,
                     saved_method_provider    TEXT,
+                    alert_email_enabled      INTEGER NOT NULL DEFAULT 0,
+                    alert_email_address      TEXT,
+                    alert_sms_enabled        INTEGER NOT NULL DEFAULT 0,
+                    alert_sms_phone          TEXT,
                     updated_at               INTEGER NOT NULL
                 );",
             )?;
@@ -383,6 +387,10 @@ impl PaymentManager {
             for migration in [
                 "ALTER TABLE subscriptions ADD COLUMN refunded_at INTEGER",
                 "ALTER TABLE subscriptions ADD COLUMN refunded_amount_cents INTEGER",
+                "ALTER TABLE billing_preferences ADD COLUMN alert_email_enabled INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE billing_preferences ADD COLUMN alert_email_address TEXT",
+                "ALTER TABLE billing_preferences ADD COLUMN alert_sms_enabled INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE billing_preferences ADD COLUMN alert_sms_phone TEXT",
             ] {
                 if let Err(e) = conn.execute(migration, []) {
                     if !e.to_string().contains("duplicate column name") {
@@ -1042,7 +1050,9 @@ impl PaymentManager {
         )?;
         let row = conn.query_row(
             "SELECT low_balance_threshold, auto_recharge_enabled, auto_recharge_package_id,
-                    auto_recharge_threshold, saved_method_id, saved_method_provider
+                    auto_recharge_threshold, saved_method_id, saved_method_provider,
+                    alert_email_enabled, alert_email_address,
+                    alert_sms_enabled, alert_sms_phone
              FROM billing_preferences WHERE user_id = ?1",
             params![user_id],
             |r| {
@@ -1054,6 +1064,10 @@ impl PaymentManager {
                     auto_recharge_threshold: r.get::<_, u32>(3)?,
                     saved_method_id: r.get::<_, Option<String>>(4)?,
                     saved_method_provider: r.get::<_, Option<String>>(5)?,
+                    alert_email_enabled: r.get::<_, i64>(6)? != 0,
+                    alert_email_address: r.get::<_, Option<String>>(7)?,
+                    alert_sms_enabled: r.get::<_, i64>(8)? != 0,
+                    alert_sms_phone: r.get::<_, Option<String>>(9)?,
                 })
             },
         )?;
@@ -1086,8 +1100,10 @@ impl PaymentManager {
             "INSERT INTO billing_preferences
                 (user_id, low_balance_threshold, auto_recharge_enabled,
                  auto_recharge_package_id, auto_recharge_threshold,
-                 saved_method_id, saved_method_provider, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 saved_method_id, saved_method_provider,
+                 alert_email_enabled, alert_email_address,
+                 alert_sms_enabled, alert_sms_phone, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(user_id) DO UPDATE SET
                  low_balance_threshold    = excluded.low_balance_threshold,
                  auto_recharge_enabled    = excluded.auto_recharge_enabled,
@@ -1095,6 +1111,10 @@ impl PaymentManager {
                  auto_recharge_threshold  = excluded.auto_recharge_threshold,
                  saved_method_id          = excluded.saved_method_id,
                  saved_method_provider    = excluded.saved_method_provider,
+                 alert_email_enabled      = excluded.alert_email_enabled,
+                 alert_email_address      = excluded.alert_email_address,
+                 alert_sms_enabled        = excluded.alert_sms_enabled,
+                 alert_sms_phone          = excluded.alert_sms_phone,
                  updated_at               = excluded.updated_at",
             params![
                 prefs.user_id,
@@ -1104,6 +1124,10 @@ impl PaymentManager {
                 prefs.auto_recharge_threshold,
                 prefs.saved_method_id,
                 prefs.saved_method_provider,
+                if prefs.alert_email_enabled { 1 } else { 0 },
+                prefs.alert_email_address,
+                if prefs.alert_sms_enabled { 1 } else { 0 },
+                prefs.alert_sms_phone,
                 now,
             ],
         )?;
@@ -1300,6 +1324,21 @@ pub struct BillingPreferences {
     pub auto_recharge_threshold: u32,
     pub saved_method_id: Option<String>,
     pub saved_method_provider: Option<String>,
+    /// When `true` and `alert_email_address` is set, low-balance
+    /// alerts are sent via SMTP through the billing alerts module.
+    #[serde(default)]
+    pub alert_email_enabled: bool,
+    #[serde(default)]
+    pub alert_email_address: Option<String>,
+    /// When `true` and `alert_sms_phone` is set, low-balance alerts
+    /// are sent via Twilio (or whatever SMS backend is wired into
+    /// `billing::alerts::send_low_balance_sms`). Requires
+    /// `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_FROM_NUMBER`
+    /// env vars to be present on the gateway.
+    #[serde(default)]
+    pub alert_sms_enabled: bool,
+    #[serde(default)]
+    pub alert_sms_phone: Option<String>,
 }
 
 /// Default TTL applied to every non-subscription grant: 30 days.
