@@ -17104,6 +17104,30 @@ pub struct GatekeeperConfig {
     pub model: String,
     /// Timeout in seconds for SLM inference requests.
     pub timeout_secs: u64,
+    /// Confidence floor for the SLM's local answer. When the
+    /// gatekeeper's classified confidence (0.0..1.0) lies BELOW this
+    /// threshold, `process_message` returns `local_response=None` so
+    /// the chat handler escalates the prompt to a cloud LLM. Default
+    /// 0.6 mirrors the previous `CLOUD_DELEGATION_THRESHOLD` constant
+    /// in `gatekeeper::router`. Tunable per-deploy via
+    /// `[gatekeeper] confidence_threshold = 0.7` in config.toml.
+    #[serde(default = "default_gatekeeper_confidence_threshold")]
+    pub confidence_threshold: f64,
+    /// When true, every SLM→LLM escalation runs the prompt + recent
+    /// context through the bidirectional PII redactor in
+    /// `security::pii_redaction` before the text crosses the local
+    /// boundary, then restores originals in the LLM response. Default
+    /// `true` because the spec mandates the redaction round-trip.
+    #[serde(default = "default_redact_pii_on_escalation")]
+    pub redact_pii_on_escalation: bool,
+}
+
+fn default_gatekeeper_confidence_threshold() -> f64 {
+    0.6
+}
+
+fn default_redact_pii_on_escalation() -> bool {
+    true
 }
 
 impl Default for GatekeeperConfig {
@@ -17124,6 +17148,8 @@ impl Default for GatekeeperConfig {
             // key is set.
             model: "qwen3:0.6b".to_string(),
             timeout_secs: 10,
+            confidence_threshold: default_gatekeeper_confidence_threshold(),
+            redact_pii_on_escalation: default_redact_pii_on_escalation(),
         }
     }
 }

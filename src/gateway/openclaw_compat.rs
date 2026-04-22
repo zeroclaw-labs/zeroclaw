@@ -293,6 +293,20 @@ pub async fn handle_api_chat(
         gatekeeper_decision = Some(result.decision);
     }
 
+    // ── PII redactor at the SLM→LLM escalation boundary (spec, 2026-04-22) ──
+    //
+    // When the gatekeeper has decided to escalate (above) AND the
+    // operator hasn't disabled it, every piece of PII in the prompt
+    // is replaced with numbered placeholders before the message
+    // crosses the local boundary. The bidirectional map lives only
+    // for the duration of this request and is dropped at function
+    // return — never persisted, never logged. The LLM response is
+    // run through `restore_text` further down before reaching the
+    // user, so the placeholders never appear in the surface UI.
+    let pii_redact_enabled = state.config.lock().gatekeeper.redact_pii_on_escalation;
+    let mut pii_map = crate::security::pii_redaction::PiiRedactionMap::new();
+    let pii_active = pii_redact_enabled && gatekeeper_decision.is_some();
+
     // ── Build enriched message with optional context ──
     let mut enriched_message = if chat_body.context.is_empty() {
         message.to_string()
@@ -308,6 +322,22 @@ pub async fn handle_api_chat(
             context_block, message
         )
     };
+
+    // Redact PII from the prompt + recent context when escalating to a
+    // cloud LLM. Workspace / coding-context strings injected below
+    // contain no PII so they intentionally bypass this step.
+    if pii_active {
+        enriched_message = crate::security::pii_redaction::redact_text(
+            &enriched_message,
+            &mut pii_map,
+        );
+        if !pii_map.is_empty() {
+            tracing::debug!(
+                redacted_count = pii_map.len(),
+                "PII redacted before LLM escalation"
+            );
+        }
+    }
 
     // ── Inject coding-aware workspace context ──
     // When the user has explicitly connected a workspace (folder or GitHub repo),
@@ -978,7 +1008,7 @@ pub async fn handle_api_chat(
             // so the user is not silently served a flagged result. Uses the
             // revised response when the revision pass ran, or the original
             // executor output otherwise.
-            let final_reply = if advisor_review
+            let mut final_reply = if advisor_review
                 .as_ref()
                 .is_some_and(|r| r.verdict == crate::advisor::ReviewVerdict::Block)
             {
@@ -988,6 +1018,18 @@ pub async fn handle_api_chat(
             } else {
                 effective_response.clone()
             };
+
+            // Restore the originals that the redactor swapped out before
+            // we sent the prompt to the cloud. The map lives in the
+            // request scope and is dropped on return, so this is the
+            // last chance to put names / phone numbers / SSNs back into
+            // the answer the user actually sees.
+            if pii_active && !pii_map.is_empty() {
+                final_reply = crate::security::pii_redaction::restore_text(
+                    &final_reply,
+                    &pii_map,
+                );
+            }
 
             let advisor_meta = advisor_review.as_ref().map(|r| {
                 serde_json::json!({
