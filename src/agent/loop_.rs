@@ -12,8 +12,10 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::fmt::Write;
+use std::hash::{Hash, Hasher};
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -26,6 +28,11 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
+
+/// Number of consecutive iterations with identical successful tool-call fingerprints
+/// (tool name + output hash) required to bail out. Catches "same call → same output"
+/// loops even when the tool is in `tool_call_dedup_exempt` (e.g. `shell`).
+const MAX_CONSECUTIVE_IDENTICAL_RESULTS: u32 = 2;
 
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
@@ -409,6 +416,15 @@ fn tool_call_signature(name: &str, arguments: &serde_json::Value) -> (String, St
     let canonical_args = canonicalize_json_for_tool_signature(arguments);
     let args_json = serde_json::to_string(&canonical_args).unwrap_or_else(|_| "{}".to_string());
     (name.trim().to_ascii_lowercase(), args_json)
+}
+
+/// Hash a tool output for the repeat-result circuit breaker. Uses the standard
+/// library's non-cryptographic hasher — collisions here would only cause
+/// false-positive early-bail, which is acceptable for a safety net.
+fn hash_tool_output(output: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    output.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
@@ -2301,6 +2317,12 @@ pub(crate) async fn run_tool_call_loop(
     // (every call was deduplicated or otherwise skipped before dispatch).
     // When this reaches 2 the agent is stuck in a dedup loop and we bail early.
     let mut consecutive_all_deduped: u32 = 0;
+    // Fingerprint of the previous iteration's successful tool executions, used to
+    // detect non-progress loops where the model replays the same call and receives
+    // the same output — even when the tool is exempt from signature-based dedup
+    // (e.g. `shell`). Each entry is `(tool_name, output_hash)`.
+    let mut last_successful_fingerprint: Option<Vec<(String, u64)>> = None;
+    let mut consecutive_identical_results: u32 = 0;
 
     for iteration in 0..max_iterations {
         if cancellation_token
@@ -2929,6 +2951,54 @@ pub(crate) async fn run_tool_call_loop(
             }
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
+        }
+
+        // ── Repeat-result circuit breaker ─────────────────────────────────────
+        // If this iteration's successful tool executions produced the exact same
+        // (tool_name, output_hash) sequence as the previous iteration — and they
+        // do again next iteration — the model is looping: same call, same output,
+        // no progress. Bail after `MAX_CONSECUTIVE_IDENTICAL_RESULTS` consecutive
+        // identical rounds. This catches cases where dedup is bypassed because
+        // the tool (e.g. `shell`) is in `tool_call_dedup_exempt`.
+        let this_round_fingerprint: Vec<(String, u64)> = ordered_results
+            .iter()
+            .filter_map(|slot| slot.as_ref())
+            .filter(|(_, _, outcome)| outcome.success)
+            .map(|(name, _, outcome)| (name.clone(), hash_tool_output(&outcome.output)))
+            .collect();
+        if !this_round_fingerprint.is_empty() {
+            if last_successful_fingerprint.as_ref() == Some(&this_round_fingerprint) {
+                consecutive_identical_results += 1;
+                if consecutive_identical_results >= MAX_CONSECUTIVE_IDENTICAL_RESULTS {
+                    let tool_name = this_round_fingerprint
+                        .first()
+                        .map(|(n, _)| n.as_str())
+                        .unwrap_or("unknown");
+                    runtime_trace::record_event(
+                        "tool_loop_exhausted",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(model),
+                        Some(&turn_id),
+                        Some(false),
+                        Some("agent stuck in repeat-result loop"),
+                        serde_json::json!({
+                            "consecutive_identical_results": consecutive_identical_results + 1,
+                            "iteration": iteration + 1,
+                            "tool": tool_name,
+                        }),
+                    );
+                    anyhow::bail!(
+                        "Agent stuck: {} consecutive iterations produced identical tool \
+                         outputs (same call → same result, no progress). Last tool: '{}'.",
+                        consecutive_identical_results + 1,
+                        tool_name
+                    );
+                }
+            } else {
+                consecutive_identical_results = 0;
+            }
+            last_successful_fingerprint = Some(this_round_fingerprint);
         }
 
         for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
@@ -4695,6 +4765,78 @@ mod tests {
             invocations.load(Ordering::SeqCst),
             2,
             "tool should execute exactly twice (initial call + one retry)"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_bails_on_repeated_identical_results() {
+        // Scenario: a dedup-exempt tool (like `shell`) is called with identical args
+        // every iteration and produces identical output. Signature dedup is bypassed
+        // by the exemption, but the repeat-result circuit breaker must still catch
+        // the non-progress loop.
+        //
+        // With MAX_CONSECUTIVE_IDENTICAL_RESULTS = 2:
+        //   iter 1: execute → fingerprint X → last=X, count=0
+        //   iter 2: execute → fingerprint X matches last → count=1 (< 2)
+        //   iter 3: execute → fingerprint X matches last → count=2 (>= 2) → BAIL
+        let same_call = r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#;
+        let provider = ScriptedProvider::from_text_responses(vec![
+            same_call,
+            same_call,
+            same_call,
+            same_call,
+            "should not reach",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool"),
+        ];
+        let observer = NoopObserver;
+        let exempt = vec!["count_tool".to_string()];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "feishu",
+            &crate::config::MultimodalConfig::default(),
+            20,
+            None,
+            None,
+            None,
+            &[],
+            &exempt,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "loop must bail when dedup-exempt tool repeats same output"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("identical tool outputs") || err.contains("stuck"),
+            "error should mention identical outputs / stuck: {err}"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            3,
+            "tool should execute 3 times (first two build the repeat count, third trips the breaker)"
         );
     }
 
