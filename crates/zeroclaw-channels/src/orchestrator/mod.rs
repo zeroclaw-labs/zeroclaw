@@ -272,6 +272,11 @@ struct ChannelRuntimeDefaults {
     api_key: Option<String>,
     api_url: Option<String>,
     reliability: zeroclaw_config::schema::ReliabilityConfig,
+    /// When false, skip the "should I reply?" classifier pre-check and
+    /// always reply. Useful for DM-only bots with custom persona names
+    /// where the classifier's system prompt can't reliably identify
+    /// "addressed to the assistant" vs "addressed to Adi" (etc).
+    reply_intent_check_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -842,6 +847,7 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
             .fallback_provider()
             .and_then(|e| e.base_url.clone()),
         reliability: config.reliability.clone(),
+        reply_intent_check_enabled: config.agent.reply_intent_check_enabled,
     }
 }
 
@@ -869,6 +875,9 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         api_key: ctx.api_key.clone(),
         api_url: ctx.api_url.clone(),
         reliability: (*ctx.reliability).clone(),
+        // Fallback when the runtime config hasn't been loaded yet:
+        // default to the upstream-safe value (enabled).
+        reply_intent_check_enabled: true,
     }
 }
 
@@ -2799,15 +2808,25 @@ async fn process_channel_message(
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
-    let reply_intent = classify_channel_reply_intent(
-        active_provider.as_ref(),
-        history[0].content.as_str(),
-        &history,
-        route.model.as_str(),
-        runtime_defaults.temperature,
-    )
-    .await
-    .unwrap_or(AssistantChannelOutcome::Reply(String::new()));
+    // Skippable via [agent].reply_intent_check_enabled = false. When
+    // disabled, we short-circuit to REPLY — the full agent loop still
+    // runs, and any refusal happens in the main response rather than
+    // as a hardcoded NO_REPLY gate. Useful for personas with custom
+    // names ("Adi") where the classifier's generic "addressed to the
+    // assistant" prompt can't reliably map persona synonyms.
+    let reply_intent = if runtime_defaults.reply_intent_check_enabled {
+        classify_channel_reply_intent(
+            active_provider.as_ref(),
+            history[0].content.as_str(),
+            &history,
+            route.model.as_str(),
+            runtime_defaults.temperature,
+        )
+        .await
+        .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
+    } else {
+        AssistantChannelOutcome::Reply(String::new())
+    };
 
     if let AssistantChannelOutcome::NoReply { reason } = reply_intent {
         let history_response = AssistantChannelOutcome::NoReply {
@@ -7661,6 +7680,7 @@ BTC is currently around $65,000 based on latest tool output."#
                         api_key: None,
                         api_url: None,
                         reliability: zeroclaw_config::schema::ReliabilityConfig::default(),
+                        reply_intent_check_enabled: true,
                     },
                     last_applied_stamp: None,
                 },

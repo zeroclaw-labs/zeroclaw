@@ -61,3 +61,4 @@ rust_out
 
 # Auto-generated Tauri schemas
 apps/tauri/gen/schemas/
+deploy/zeroclaw/adi-persona/

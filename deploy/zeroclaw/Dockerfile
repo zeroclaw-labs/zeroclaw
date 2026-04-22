@@ -70,6 +70,60 @@ COPY deploy/zeroclaw/config.seed.toml /opt/zeroclaw.config.seed.toml
 COPY deploy/zeroclaw/entrypoint.sh    /entrypoint.sh
 RUN chmod 0755 /entrypoint.sh
 
+# Adi persona files — cloned at build time from the PRIVATE repo
+# srmcguirt/adi-persona (contains IDENTITY/SOUL/USER.*/memory/ with
+# personal data that must never land in this public zeroclaw fork).
+#
+# Pass ADI_PERSONA_REPO + a GitHub PAT with `repo` scope via
+# `--build-secret id=adi_persona_token,...`. Token is never baked
+# into layers (BuildKit secret mount).
+#
+# PERSONA (shane|meg) determines which USER.md + memory/<persona>/
+# content remains in the image; the other persona's files are deleted
+# so shane's image never contains meg's data and vice versa.
+ARG PERSONA
+ARG ADI_PERSONA_REPO=github.com/srmcguirt/adi-persona.git
+ARG ADI_PERSONA_REF=master
+# ADI_PERSONA_REV — the full commit SHA of the persona repo to pin to.
+# Changing this value busts the Docker layer cache and forces a fresh
+# git fetch, so pushing new persona content + bumping this SHA in
+# fly.{shane,meg}.toml = guaranteed refresh without --no-cache.
+ARG ADI_PERSONA_REV
+RUN test -n "$PERSONA" || (echo "ERROR: PERSONA build-arg required (shane|meg)" && exit 1)
+ENV PERSONA=$PERSONA
+
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+
+RUN --mount=type=secret,id=adi_persona_token,required=true \
+    set -e && \
+    TOKEN="$(cat /run/secrets/adi_persona_token)" && \
+    echo "cloning adi-persona ref=$ADI_PERSONA_REF rev=$ADI_PERSONA_REV" && \
+    git clone --depth 1 --branch "$ADI_PERSONA_REF" \
+        "https://x-access-token:${TOKEN}@${ADI_PERSONA_REPO}" \
+        /tmp/adi-persona && \
+    if [ -n "$ADI_PERSONA_REV" ]; then \
+      cd /tmp/adi-persona && \
+      actual_sha=$(git rev-parse HEAD) && \
+      if [ "$actual_sha" != "$ADI_PERSONA_REV" ]; then \
+        echo "WARNING: ADI_PERSONA_REV=$ADI_PERSONA_REV but HEAD is $actual_sha (OK: --depth=1 got latest; pin is informational)"; \
+      fi; \
+    fi && \
+    mkdir -p /opt/adi-persona/memory && \
+    cp /tmp/adi-persona/IDENTITY.md /tmp/adi-persona/SOUL.md \
+       /tmp/adi-persona/BRAND.md /tmp/adi-persona/FOXY.md \
+       /tmp/adi-persona/AGENTS.md /tmp/adi-persona/README.md \
+       /opt/adi-persona/ && \
+    cp -r /tmp/adi-persona/memory/shared /opt/adi-persona/memory/ && \
+    case "$PERSONA" in \
+      shane) cp /tmp/adi-persona/USER.shane.md /opt/adi-persona/USER.md && \
+             cp -r /tmp/adi-persona/memory/shane /opt/adi-persona/memory/private ;; \
+      meg)   cp /tmp/adi-persona/USER.meg.md /opt/adi-persona/USER.md && \
+             cp -r /tmp/adi-persona/memory/meg /opt/adi-persona/memory/private ;; \
+      *)     echo "ERROR: PERSONA must be shane or meg, got $PERSONA" && exit 1 ;; \
+    esac && \
+    rm -rf /tmp/adi-persona && \
+    chmod -R go-rwx /opt/adi-persona
+
 ENV LANG=C.UTF-8
 ENV HOME=/zeroclaw-data
 ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace

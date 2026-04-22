@@ -6,6 +6,15 @@
 app            = "adi-zeroclaw-shane"
 primary_region = "iad"
 
+[build]
+  [build.args]
+    PERSONA = "shane"
+    ZEROCLAW_CARGO_FEATURES = "channel-telegram,channel-slack,backend-postgres"
+    # Bump this when you push new content to srmcguirt/adi-persona and
+    # want the rebuild to pull it. Value can be any string that changes;
+    # using the HEAD SHA makes it traceable.
+    ADI_PERSONA_REV = "d89eb3ce283cffd415af581af9e32cacb0b3a18d"
+
 [experimental]
   # Needed so tailscaled can open /dev/net/tun.
   privileged = true

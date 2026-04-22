@@ -4,6 +4,13 @@
 app            = "adi-zeroclaw-meg"
 primary_region = "iad"
 
+[build]
+  [build.args]
+    PERSONA = "meg"
+    ZEROCLAW_CARGO_FEATURES = "channel-telegram,channel-slack,backend-postgres"
+    # Same note as fly.shane.toml — bump when adi-persona has new content.
+    ADI_PERSONA_REV = "d89eb3ce283cffd415af581af9e32cacb0b3a18d"
+
 [experimental]
   privileged = true
 

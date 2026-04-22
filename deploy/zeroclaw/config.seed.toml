@@ -11,10 +11,15 @@
 workspace_dir       = "/zeroclaw-data/workspace"
 config_path         = "/zeroclaw-data/.zeroclaw/config.toml"
 
-# LLM routing: all traffic goes through adi-cliproxy over the tailnet.
-# The tailnet DNS name resolves to adi-cliproxy's 100.x.y.z IP.
-default_provider    = "custom:http://adi-cliproxy.springhare-typhon.ts.net:8317/v1"
-default_model       = "anthropic/claude-sonnet-4-6"
+# LLM routing: all traffic goes through adi-cliproxy. Using Fly's 6PN
+# internal DNS (resolves to adi-cliproxy's private IPv6) instead of
+# Tailscale — Fly's private network is reachable from the container
+# without proxying, while Tailscale userspace-networking is not.
+default_provider    = "custom:http://adi-cliproxy.internal:8317/v1"
+# cliproxy passes the model name straight through to Claude, so no
+# OpenRouter-style "anthropic/" prefix. See openclaw.shane.json for
+# the full list: claude-sonnet-4-6 / claude-opus-4-6 / claude-haiku-4-5-20251001.
+default_model       = "claude-sonnet-4-6"
 default_temperature = 0.7
 
 [gateway]
@@ -52,17 +57,47 @@ connect_timeout_secs = 10
 # sections here enables the channel supervisor to start them.
 
 [channels.telegram]
-# Token is resolved from TELEGRAM_BOT_TOKEN env var at runtime.
-bot_token     = "${TELEGRAM_BOT_TOKEN}"
-# Empty list = allow all users who DM the bot. Tighten with Telegram
-# user IDs once you know who's expected to talk to this persona.
-allowed_users = []
+enabled   = true
+# Token is interpolated from TELEGRAM_BOT_TOKEN env var by entrypoint.sh.
+bot_token = "${TELEGRAM_BOT_TOKEN}"
+# Shane + Meg both allowed on both bots (from openclaw.{shane,meg}.json
+# channels.telegram.allowFrom). IDs are Telegram numeric user IDs.
+#   Shane: 7559901218
+#   Meg:   8636712032
+allowed_users = ["7559901218", "8636712032"]
 mention_only  = false
 
+# ── Agent behavior ──────────────────────────────────────────────────────
+[agent]
+# Disable the "should I reply?" classifier pre-check. The classifier is
+# a small LLM call that decides whether a channel message is addressed
+# to "the assistant". For personas with custom names (e.g. "Adi"), the
+# classifier can't reliably map "Hi Adi" to "addressed to the assistant"
+# even with IDENTITY.md guidance — it routinely returns NO_REPLY. Adi
+# can still refuse via the main response; we just skip the hardcoded
+# gate. This is our patched field (adds to upstream v0.7.3).
+reply_intent_check_enabled = false
+
+# ── Composio (managed OAuth tools — gives us Todoist + 1000 others) ─────
+# Zeroclaw has no native Todoist support; Todoist goes through Composio.
+# COMPOSIO_API_KEY is a Fly secret; entrypoint.sh interpolates it.
+# entity_id is per-persona so shane's Todoist OAuth and meg's don't
+# cross-wire. Values come from the entrypoint: PERSONA env is "shane" or "meg".
+[composio]
+enabled   = true
+api_key   = "${COMPOSIO_API_KEY}"
+entity_id = "${PERSONA}"
+
 [channels.slack]
-bot_token      = "${SLACK_BOT_TOKEN}"
-app_token      = "${SLACK_APP_TOKEN}"
-signing_secret = "${SLACK_SIGNING_SECRET}"
-# Socket Mode (app_token starts with xapp-) means no public webhook URL
-# needed — zeroclaw connects out to Slack.
-socket_mode    = true
+enabled   = true
+# SLACK_BOT_TOKEN = xoxb-... (bot OAuth token)
+bot_token = "${SLACK_BOT_TOKEN}"
+# SLACK_APP_TOKEN = xapp-... (app-level token, enables Socket Mode).
+# SLACK_SIGNING_SECRET exists as a Fly secret but zeroclaw's SlackConfig
+# doesn't use it — it's a webhook-mode thing, and we run Socket Mode.
+app_token = "${SLACK_APP_TOKEN}"
+# Slack user IDs (not workspace IDs) of Shane + Meg from
+# openclaw.{shane,meg}.json channels.slack.allowFrom.
+#   Shane: U0ATMP4SGDD
+#   Meg:   U0ATQKX5ZGD
+allowed_users = ["U0ATMP4SGDD", "U0ATQKX5ZGD"]

@@ -1462,6 +1462,19 @@ pub struct AgentConfig {
     #[serde(default)]
     pub context_aware_tools: bool,
 
+    /// Enable the channel reply-intent classifier pre-check.
+    ///
+    /// When true (the upstream default), each inbound channel message runs
+    /// through a small "should I reply?" classifier LLM call before the
+    /// main response. This is useful in group chats to avoid replying to
+    /// messages not addressed to the agent, but it can cause false
+    /// negatives in personas with custom names (the classifier doesn't
+    /// know that e.g. "Adi" is the assistant's name unless very clearly
+    /// told in the system prompt). Set to false to skip the pre-check
+    /// and always reply; useful for DM-only bots. Default: `true`.
+    #[serde(default = "default_reply_intent_check_enabled")]
+    pub reply_intent_check_enabled: bool,
+
     /// Post-response quality evaluator configuration.
     #[nested]
     #[serde(default)]
@@ -1539,8 +1552,13 @@ impl Default for AgentConfig {
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
+            reply_intent_check_enabled: default_reply_intent_check_enabled(),
         }
     }
+}
+
+fn default_reply_intent_check_enabled() -> bool {
+    true
 }
 
 // ── Pacing ────────────────────────────────────────────────────────
