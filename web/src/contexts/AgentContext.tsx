@@ -7,7 +7,7 @@ import {
   useCallback,
   type ReactNode,
 } from 'react';
-import { parse as parseTOML, stringify as stringifyTOML } from 'smol-toml';
+import { parse as parseTOML } from 'smol-toml';
 import { WebSocketClient } from '@/lib/ws';
 import type { WsMessage } from '@/types/api';
 import { generateUUID } from '@/lib/uuid';
@@ -139,22 +139,30 @@ export function AgentProvider({ children }: Props) {
     try {
       const configText = await getConfig();
 
-      // Parse TOML safely using smol-toml
+      // Parse TOML to verify which root-level key exists.
+      // We only use this for READ verification — never for re-serialization.
       const config = parseTOML(configText) as Record<string, unknown>;
 
-      // Update the model field - prefer "model" alias over "default_model"
-      // This ensures we write to the same key that was originally used
-      if ('model' in config) {
-        config.model = model;
-      } else if ('default_model' in config) {
-        config.default_model = model;
-      } else {
-        // If neither exists, add "model" (the more common alias)
-        config.model = model;
-      }
+      let newConfigText: string;
 
-      // Serialize back to TOML
-      const newConfigText = stringifyTOML(config);
+      if ('model' in config) {
+        // Surgical replacement: only touch the root-level `model = "..."` line.
+        // Anchor to start-of-line (^) with multiline flag so we never match
+        // `model` inside a [section] block.
+        newConfigText = configText.replace(
+          /^model\s*=\s*["'][^"']+["']/m,
+          `model = "${model}"`,
+        );
+      } else if ('default_model' in config) {
+        newConfigText = configText.replace(
+          /^default_model\s*=\s*["'][^"']+["']/m,
+          `default_model = "${model}"`,
+        );
+      } else {
+        // Neither key exists — prepend a root-level line at the top of the file.
+        // Avoids the round-trip re-serialization that would strip comments.
+        newConfigText = `model = "${model}"\n${configText}`;
+      }
 
       // Save config
       await putConfig(newConfigText);
