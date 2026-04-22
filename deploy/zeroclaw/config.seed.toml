@@ -26,7 +26,12 @@ default_temperature = 0.7
 port              = 42617
 host              = "[::]"
 allow_public_bind = true
-require_pairing   = false
+# Require the dashboard + API to be paired before use. Pairing happens
+# once per device: POST /pair with an X-Pairing-Code header. Generate
+# a code on the machine via `zeroclaw pair` over ssh or `fly proxy`.
+# Once paired, the device's bearer token persists and the dashboard
+# works normally.
+require_pairing   = true
 web_dist_dir      = "/app/web/dist"
 
 [autonomy]
