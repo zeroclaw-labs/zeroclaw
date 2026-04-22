@@ -4861,15 +4861,19 @@ fn collect_configured_channels(
     }
 
     if let Some(ref mc) = config.channels.mochat {
-        channels.push(ConfiguredChannel {
-            display_name: "Mochat",
-            channel: Arc::new(MochatChannel::new(
-                mc.api_url.clone(),
-                mc.api_token.clone(),
-                mc.allowed_users.clone(),
-                mc.poll_interval_secs,
-            )),
-        });
+        if mc.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "Mochat",
+                channel: Arc::new(MochatChannel::new(
+                    mc.api_url.clone(),
+                    mc.api_token.clone(),
+                    mc.allowed_users.clone(),
+                    mc.poll_interval_secs,
+                )),
+            });
+        } else {
+            tracing::info!("Mochat channel configured but disabled (enabled = false)");
+        }
     }
 
     if let Some(ref wc) = config.channels.wecom {
