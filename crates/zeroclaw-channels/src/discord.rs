@@ -6,9 +6,12 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage};
 
 /// Discord channel — connects via Gateway WebSocket for real-time messages
 pub struct DiscordChannel {
@@ -38,6 +41,8 @@ pub struct DiscordChannel {
     multi_message_thread_ts: Mutex<HashMap<String, Option<String>>>,
     /// Stall-watchdog timeout in seconds (0 = disabled).
     stall_timeout_secs: u64,
+    pending_approvals: Arc<AsyncMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    approval_timeout_secs: u64,
 }
 
 impl DiscordChannel {
@@ -65,12 +70,19 @@ impl DiscordChannel {
             multi_message_sent_len: Mutex::new(HashMap::new()),
             multi_message_thread_ts: Mutex::new(HashMap::new()),
             stall_timeout_secs: 0,
+            pending_approvals: Arc::new(AsyncMutex::new(HashMap::new())),
+            approval_timeout_secs: 300,
         }
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
+        self
+    }
+
+    pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
+        self.approval_timeout_secs = secs;
         self
     }
 
@@ -1166,6 +1178,17 @@ impl Channel for DiscordChannel {
                         format!("{clean_content}\n\n[Attachments]\n{attachment_text}")
                     };
 
+                    // Intercept approval replies before forwarding to the agent.
+                    if let Some((token, response)) =
+                        crate::util::parse_approval_reply(&final_content)
+                    {
+                        let mut map = self.pending_approvals.lock().await;
+                        if let Some(sender) = map.remove(&token) {
+                            let _ = sender.send(response);
+                            continue;
+                        }
+                    }
+
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let channel_id = d
                         .get("channel_id")
@@ -1641,6 +1664,57 @@ impl Channel for DiscordChannel {
         }
 
         Ok(())
+    }
+
+    async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        let token = crate::util::new_approval_token();
+        let text = format!(
+            "APPROVAL REQUIRED [{}]\nTool: {}\nArgs: {}\n\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
+            token,
+            request.tool_name,
+            request.arguments_summary,
+            token,
+            token,
+            token,
+        );
+
+        let (tx, rx) = oneshot::channel();
+        self.pending_approvals
+            .lock()
+            .await
+            .insert(token.clone(), tx);
+
+        // Strip thread suffix — approval message goes to the channel root.
+        let channel_id = recipient.split(':').next().unwrap_or(recipient);
+        if let Err(err) = self
+            .send(&SendMessage {
+                recipient: channel_id.to_string(),
+                content: text,
+                attachments: vec![],
+            })
+            .await
+        {
+            self.pending_approvals.lock().await.remove(&token);
+            return Err(err);
+        }
+
+        let response = match tokio::time::timeout(
+            Duration::from_secs(self.approval_timeout_secs),
+            rx,
+        )
+        .await
+        {
+            Ok(Ok(resp)) => resp,
+            _ => {
+                self.pending_approvals.lock().await.remove(&token);
+                ChannelApprovalResponse::Deny
+            }
+        };
+        Ok(Some(response))
     }
 }
 
@@ -2446,5 +2520,42 @@ mod tests {
     fn split_message_for_discord_multi_empty_input() {
         let chunks = split_message_for_discord_multi("", 2000);
         assert!(chunks.is_empty());
+    }
+
+    fn make_discord_channel() -> DiscordChannel {
+        DiscordChannel::new("token".into(), None, vec![], false, false)
+    }
+
+    #[test]
+    fn pending_approvals_map_is_initially_empty() {
+        let ch = make_discord_channel();
+        let map = ch.pending_approvals.try_lock().unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn approval_timeout_defaults_to_300_and_is_overridable() {
+        let ch = make_discord_channel();
+        assert_eq!(ch.approval_timeout_secs, 300);
+        let ch = ch.with_approval_timeout_secs(60);
+        assert_eq!(ch.approval_timeout_secs, 60);
+    }
+
+    #[tokio::test]
+    async fn pending_approval_oneshot_delivers_response() {
+        let ch = make_discord_channel();
+        let (tx, rx) = oneshot::channel();
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert("abc123".to_string(), tx);
+        let sender = ch
+            .pending_approvals
+            .lock()
+            .await
+            .remove("abc123")
+            .unwrap();
+        sender.send(ChannelApprovalResponse::Deny).unwrap();
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
     }
 }

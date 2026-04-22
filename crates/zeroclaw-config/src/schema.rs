@@ -6823,6 +6823,10 @@ fn default_telegram_approval_timeout_secs() -> u64 {
     120
 }
 
+fn default_channel_approval_timeout_secs() -> u64 {
+    300
+}
+
 fn default_matrix_draft_update_interval_ms() -> u64 {
     1500
 }
@@ -6928,6 +6932,9 @@ pub struct DiscordConfig {
     /// and retry if no progress is made within this duration. 0 = disabled.
     #[serde(default)]
     pub stall_timeout_secs: u64,
+    /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -7033,6 +7040,9 @@ pub struct SlackConfig {
     /// Leave unset to disable reaction-based cancellation.
     #[serde(default)]
     pub cancel_reaction: Option<String>,
+    /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
 }
 
 fn default_slack_draft_update_interval_ms() -> u64 {
@@ -7205,6 +7215,9 @@ pub struct MatrixConfig {
     #[secret]
     #[serde(default)]
     pub password: Option<String>,
+    /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -7246,6 +7259,9 @@ pub struct SignalConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
 }
 
 impl ChannelConfig for SignalConfig {
@@ -7371,6 +7387,9 @@ pub struct WhatsAppConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
 }
 
 impl ChannelConfig for WhatsAppConfig {
@@ -12624,6 +12643,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            approval_timeout_secs: 300,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -12646,6 +12666,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            approval_timeout_secs: 300,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -12705,6 +12726,7 @@ default_temperature = 0.7
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -12736,6 +12758,7 @@ default_temperature = 0.7
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -12772,6 +12795,7 @@ allowed_rooms = ["!ops:matrix.org"]
             ignore_attachments: true,
             ignore_stories: false,
             proxy_url: None,
+            approval_timeout_secs: 300,
         };
         let json = serde_json::to_string(&sc).unwrap();
         let parsed: SignalConfig = serde_json::from_str(&json).unwrap();
@@ -12794,6 +12818,7 @@ allowed_rooms = ["!ops:matrix.org"]
             ignore_attachments: false,
             ignore_stories: true,
             proxy_url: None,
+            approval_timeout_secs: 300,
         };
         let toml_str = toml::to_string(&sc).unwrap();
         let parsed: SignalConfig = toml::from_str(&toml_str).unwrap();
@@ -12842,6 +12867,7 @@ allowed_rooms = ["!ops:matrix.org"]
                 recovery_key: None,
                 mention_only: false,
                 password: None,
+                approval_timeout_secs: 300,
             }),
             signal: None,
             whatsapp: None,
@@ -13068,6 +13094,7 @@ bot_token = "xoxb-tok"
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
             proxy_url: None,
+            approval_timeout_secs: 300,
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -13097,6 +13124,7 @@ bot_token = "xoxb-tok"
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
             proxy_url: None,
+            approval_timeout_secs: 300,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -13131,6 +13159,7 @@ bot_token = "xoxb-tok"
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
             proxy_url: None,
+            approval_timeout_secs: 300,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -13157,6 +13186,7 @@ bot_token = "xoxb-tok"
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
             proxy_url: None,
+            approval_timeout_secs: 300,
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -13182,6 +13212,7 @@ bot_token = "xoxb-tok"
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
             proxy_url: None,
+            approval_timeout_secs: 300,
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -13218,6 +13249,7 @@ bot_token = "xoxb-tok"
                 dm_mention_patterns: vec![],
                 group_mention_patterns: vec![],
                 proxy_url: None,
+                approval_timeout_secs: 300,
             }),
             linq: None,
             wati: None,
@@ -16676,6 +16708,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
         let fields = mx.secret_fields();
         assert_eq!(fields.len(), 3);
@@ -16705,6 +16738,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
         let fields = mx.secret_fields();
         assert!(!fields[0].is_set);
@@ -16727,6 +16761,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
         mx.set_secret("channels.matrix.access-token", "new-token".into())
             .unwrap();
@@ -16750,6 +16785,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
         assert!(
             mx.set_secret("channels.matrix.nonexistent", "val".into())
@@ -16790,6 +16826,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         });
 
         let fields = config.secret_fields();
@@ -16816,6 +16853,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         });
 
         config
@@ -16842,6 +16880,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             recovery_key: None,
             password: None,
+            approval_timeout_secs: 300,
         });
         config
             .set_secret("channels.matrix.access-token", "sk-test".into())
@@ -16882,6 +16921,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
 
         // Encrypt
@@ -16914,6 +16954,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -16944,6 +16985,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -16969,6 +17011,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         }
     }
 
@@ -17389,5 +17432,60 @@ allowed_users = ["@u:m"]
             config.channels.matrix.as_ref().unwrap().enabled,
             "backfill should activate channel even when config has comments"
         );
+    }
+
+    #[test]
+    fn channel_approval_timeout_secs_defaults_to_300() {
+        // Omitting approval_timeout_secs from each config should deserialize to 300
+        let discord: DiscordConfig =
+            serde_json::from_str(r#"{"bot_token":"tok","enabled":true}"#).unwrap();
+        assert_eq!(discord.approval_timeout_secs, 300);
+
+        let slack: SlackConfig =
+            serde_json::from_str(r#"{"bot_token":"tok","enabled":true}"#).unwrap();
+        assert_eq!(slack.approval_timeout_secs, 300);
+
+        let signal: SignalConfig =
+            serde_json::from_str(r#"{"http_url":"http://localhost","account":"+1","enabled":true}"#)
+                .unwrap();
+        assert_eq!(signal.approval_timeout_secs, 300);
+
+        let matrix: MatrixConfig = serde_json::from_str(
+            r#"{"homeserver":"https://matrix.org","access_token":"tok","enabled":true}"#,
+        )
+        .unwrap();
+        assert_eq!(matrix.approval_timeout_secs, 300);
+
+        let whatsapp: WhatsAppConfig = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert_eq!(whatsapp.approval_timeout_secs, 300);
+    }
+
+    #[test]
+    fn channel_approval_timeout_secs_explicit_override() {
+        let discord: DiscordConfig =
+            serde_json::from_str(r#"{"bot_token":"tok","enabled":true,"approval_timeout_secs":60}"#)
+                .unwrap();
+        assert_eq!(discord.approval_timeout_secs, 60);
+
+        let slack: SlackConfig =
+            serde_json::from_str(r#"{"bot_token":"tok","enabled":true,"approval_timeout_secs":120}"#)
+                .unwrap();
+        assert_eq!(slack.approval_timeout_secs, 120);
+
+        let signal: SignalConfig = serde_json::from_str(
+            r#"{"http_url":"http://localhost","account":"+1","enabled":true,"approval_timeout_secs":90}"#,
+        )
+        .unwrap();
+        assert_eq!(signal.approval_timeout_secs, 90);
+
+        let matrix: MatrixConfig = serde_json::from_str(
+            r#"{"homeserver":"https://matrix.org","access_token":"tok","enabled":true,"approval_timeout_secs":45}"#,
+        )
+        .unwrap();
+        assert_eq!(matrix.approval_timeout_secs, 45);
+
+        let whatsapp: WhatsAppConfig =
+            serde_json::from_str(r#"{"enabled":true,"approval_timeout_secs":180}"#).unwrap();
+        assert_eq!(whatsapp.approval_timeout_secs, 180);
     }
 }

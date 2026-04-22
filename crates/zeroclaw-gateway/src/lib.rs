@@ -1724,6 +1724,16 @@ async fn handle_whatsapp_message(
             msg.sender,
             truncate_with_ellipsis(&msg.content, 50)
         );
+
+        // Route approval replies to pending approval requests before dispatching to agent
+        if let Some((token, response)) = zeroclaw_channels::util::parse_approval_reply(&msg.content) {
+            let mut map = wa.pending_approvals.lock().await;
+            if let Some(sender) = map.remove(&token) {
+                let _ = sender.send(response);
+                continue;
+            }
+        }
+
         let session_id = sender_session_id("whatsapp", msg);
 
         // Auto-save to memory

@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use regex::Regex;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage};
 
 /// `WhatsApp` channel — uses `WhatsApp` Business Cloud API
 ///
@@ -34,6 +37,8 @@ pub struct WhatsAppChannel {
     dm_mention_patterns: Vec<Regex>,
     /// Compiled mention patterns for group-chat mention gating.
     group_mention_patterns: Vec<Regex>,
+    pub pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    approval_timeout_secs: u64,
 }
 
 impl WhatsAppChannel {
@@ -51,7 +56,14 @@ impl WhatsAppChannel {
             proxy_url: None,
             dm_mention_patterns: Vec::new(),
             group_mention_patterns: Vec::new(),
+            pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+            approval_timeout_secs: 300,
         }
+    }
+
+    pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
+        self.approval_timeout_secs = secs;
+        self
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
@@ -339,6 +351,41 @@ impl Channel for WhatsAppChannel {
         }
 
         Ok(())
+    }
+
+    async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        let token = crate::util::new_approval_token();
+        let (tx_approval, rx_approval) = oneshot::channel();
+        {
+            let mut map = self.pending_approvals.lock().await;
+            map.insert(token.clone(), tx_approval);
+        }
+
+        let text = format!(
+            "APPROVAL REQUIRED [{}]\nTool: {}\nArgs: {}\n\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
+            token, request.tool_name, request.arguments_summary, token, token, token
+        );
+        self.send(&SendMessage {
+            content: text,
+            recipient: recipient.to_string(),
+            thread_ts: None,
+        })
+        .await?;
+
+        let timeout = std::time::Duration::from_secs(self.approval_timeout_secs);
+        let response = match tokio::time::timeout(timeout, rx_approval).await {
+            Ok(Ok(response)) => response,
+            _ => {
+                let mut map = self.pending_approvals.lock().await;
+                map.remove(&token);
+                ChannelApprovalResponse::Deny
+            }
+        };
+        Ok(Some(response))
     }
 
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -1818,5 +1865,20 @@ mod tests {
             "Group messages should pass through when only DM patterns are set"
         );
         assert_eq!(msgs[0].content, "Hello without mention");
+    }
+
+    #[test]
+    fn pending_approvals_map_is_initially_empty() {
+        let ch = make_channel();
+        let map = ch.pending_approvals.blocking_lock();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn approval_timeout_defaults_to_300_and_is_overridable() {
+        let ch = make_channel();
+        assert_eq!(ch.approval_timeout_secs, 300);
+        let ch2 = ch.with_approval_timeout_secs(60);
+        assert_eq!(ch2.approval_timeout_secs, 60);
     }
 }

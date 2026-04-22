@@ -3951,7 +3951,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     dc.multi_message_delay_ms,
                 )
                 .with_transcription(config.transcription.clone())
-                .with_stall_timeout(dc.stall_timeout_secs),
+                .with_stall_timeout(dc.stall_timeout_secs)
+                .with_approval_timeout_secs(dc.approval_timeout_secs),
             ))
         }
         "slack" => {
@@ -3971,7 +3972,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .with_markdown_blocks(sl.use_markdown_blocks)
                 .with_transcription(config.transcription.clone())
                 .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
-                .with_cancel_reaction(sl.cancel_reaction.clone()),
+                .with_cancel_reaction(sl.cancel_reaction.clone())
+                .with_approval_timeout_secs(sl.approval_timeout_secs),
             ))
         }
         "mattermost" => {
@@ -3995,14 +3997,17 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .signal
                 .as_ref()
                 .context("Signal channel is not configured")?;
-            Ok(Arc::new(SignalChannel::new(
-                sg.http_url.clone(),
-                sg.account.clone(),
-                sg.group_id.clone(),
-                sg.allowed_from.clone(),
-                sg.ignore_attachments,
-                sg.ignore_stories,
-            )))
+            Ok(Arc::new(
+                SignalChannel::new(
+                    sg.http_url.clone(),
+                    sg.account.clone(),
+                    sg.group_id.clone(),
+                    sg.allowed_from.clone(),
+                    sg.ignore_attachments,
+                    sg.ignore_stories,
+                )
+                .with_approval_timeout_secs(sg.approval_timeout_secs),
+            ))
         }
         "matrix" => {
             #[cfg(feature = "channel-matrix")]
@@ -4012,14 +4017,17 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     .matrix
                     .as_ref()
                     .context("Matrix channel is not configured")?;
-                Ok(Arc::new(MatrixChannel::new(
-                    mx.homeserver.clone(),
-                    mx.access_token.clone(),
-                    // "" sentinel = no specific room (join logic handles "allow all")
-                    mx.allowed_rooms.first().cloned().unwrap_or_default(),
-                    mx.allowed_users.clone(),
-                    mx.mention_only,
-                )))
+                Ok(Arc::new(
+                    MatrixChannel::new(
+                        mx.homeserver.clone(),
+                        mx.access_token.clone(),
+                        // "" sentinel = no specific room (join logic handles "allow all")
+                        mx.allowed_rooms.first().cloned().unwrap_or_default(),
+                        mx.allowed_users.clone(),
+                        mx.mention_only,
+                    )
+                    .with_approval_timeout_secs(mx.approval_timeout_secs),
+                ))
             }
             #[cfg(not(feature = "channel-matrix"))]
             {
@@ -4385,7 +4393,8 @@ fn collect_configured_channels(
                     )
                     .with_proxy_url(dc.proxy_url.clone())
                     .with_transcription(config.transcription.clone())
-                    .with_stall_timeout(dc.stall_timeout_secs),
+                    .with_stall_timeout(dc.stall_timeout_secs)
+                    .with_approval_timeout_secs(dc.approval_timeout_secs),
                 ),
             });
         } else {
@@ -4440,7 +4449,8 @@ fn collect_configured_channels(
                     .with_proxy_url(sl.proxy_url.clone())
                     .with_transcription(config.transcription.clone())
                     .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
-                    .with_cancel_reaction(sl.cancel_reaction.clone()),
+                    .with_cancel_reaction(sl.cancel_reaction.clone())
+                    .with_approval_timeout_secs(sl.approval_timeout_secs),
                 ),
             });
         } else {
@@ -4505,7 +4515,8 @@ fn collect_configured_channels(
                         mx.draft_update_interval_ms,
                         mx.multi_message_delay_ms,
                     )
-                    .with_transcription(config.transcription.clone()),
+                    .with_transcription(config.transcription.clone())
+                    .with_approval_timeout_secs(mx.approval_timeout_secs),
                 ),
             });
         } else {
@@ -4534,7 +4545,8 @@ fn collect_configured_channels(
                         sig.ignore_attachments,
                         sig.ignore_stories,
                     )
-                    .with_proxy_url(sig.proxy_url.clone()),
+                    .with_proxy_url(sig.proxy_url.clone())
+                    .with_approval_timeout_secs(sig.approval_timeout_secs),
                 ),
             });
         } else {
@@ -4565,7 +4577,8 @@ fn collect_configured_channels(
                                 )
                                 .with_proxy_url(wa.proxy_url.clone())
                                 .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
-                                .with_group_mention_patterns(wa.group_mention_patterns.clone()),
+                                .with_group_mention_patterns(wa.group_mention_patterns.clone())
+                                .with_approval_timeout_secs(wa.approval_timeout_secs),
                             ),
                         });
                     } else {
