@@ -42,13 +42,38 @@ pub enum ObserverEvent {
     /// A tool call is about to be executed.
     ToolCallStart {
         tool: String,
+        /// Provider-assigned tool call identifier, when the underlying tool
+        /// call originated from a native structured tool call block (e.g.
+        /// OpenAI `tool_calls[].id`, Anthropic `tool_use.id`). `None` for
+        /// text-parsed (XML/markdown) tool calls.
+        ///
+        /// Observers can correlate `ToolCallStart` → `ToolCall` → the
+        /// emitting LLM response via this id.
+        tool_call_id: Option<String>,
+        /// Full JSON arguments the agent passed to the tool. `None` when
+        /// arguments are unavailable at the call site.
         arguments: Option<String>,
     },
     /// A tool call has completed with a success/failure outcome.
     ToolCall {
         tool: String,
+        /// Provider-assigned tool call identifier, when present. See
+        /// [`ObserverEvent::ToolCallStart::tool_call_id`].
+        tool_call_id: Option<String>,
         duration: Duration,
         success: bool,
+        /// Full JSON arguments the agent passed to the tool.
+        ///
+        /// Carried here (in addition to `ToolCallStart`) so observers that
+        /// build a single completed span per tool call — e.g. the OTel
+        /// exporter — can attach arguments at span-end time without holding
+        /// per-call state.
+        arguments: Option<String>,
+        /// Scrubbed tool output or error reason. Populated for both success
+        /// and failure outcomes so backends can show the actual tool result
+        /// in trace viewers. Credentials are scrubbed before this field is
+        /// emitted.
+        result: Option<String>,
     },
     /// The agent produced a final answer for the current user message.
     TurnComplete,
@@ -247,8 +272,11 @@ mod tests {
     fn observer_event_and_metric_are_cloneable() {
         let event = ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: Some("call_abc123".into()),
             duration: Duration::from_millis(10),
             success: true,
+            arguments: Some(r#"{"command":"date"}"#.into()),
+            result: Some("Mon Apr 22 12:00:00 UTC 2026\n".into()),
         };
         let metric = ObserverMetric::RequestLatency(Duration::from_millis(8));
 
