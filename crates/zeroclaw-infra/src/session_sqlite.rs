@@ -66,6 +66,12 @@ impl SqliteSessionBackend {
              CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
                 INSERT INTO sessions_fts(sessions_fts, rowid, session_key, content)
                 VALUES ('delete', old.id, old.session_key, old.content);
+             END;
+             CREATE TRIGGER IF NOT EXISTS sessions_au AFTER UPDATE ON sessions BEGIN
+                INSERT INTO sessions_fts(sessions_fts, rowid, session_key, content)
+                VALUES ('delete', old.id, old.session_key, old.content);
+                INSERT INTO sessions_fts(rowid, session_key, content)
+                VALUES (new.id, new.session_key, new.content);
              END;",
         )
         .context("Failed to initialize session schema")?;
@@ -661,6 +667,49 @@ mod tests {
         });
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "code_chat");
+    }
+
+    #[test]
+    fn fts5_update_trigger_syncs_index() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend
+            .append("chat", &ChatMessage::user("hello world"))
+            .unwrap();
+
+        // Verify initial content is searchable
+        let results = backend.search(&SessionQuery {
+            keyword: Some("hello".into()),
+            limit: Some(10),
+        });
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "chat");
+
+        // Directly update the session content (simulates update_last behavior)
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "UPDATE sessions SET content = ?1 WHERE session_key = ?2",
+                params!["goodbye world", "chat"],
+            )
+            .unwrap();
+        }
+
+        // Old keyword should no longer match
+        let results = backend.search(&SessionQuery {
+            keyword: Some("hello".into()),
+            limit: Some(10),
+        });
+        assert!(results.is_empty());
+
+        // New keyword should match after UPDATE trigger syncs FTS index
+        let results = backend.search(&SessionQuery {
+            keyword: Some("goodbye".into()),
+            limit: Some(10),
+        });
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "chat");
     }
 
     #[test]
