@@ -1,0 +1,44 @@
+# deploy/zeroclaw/fly.shane.toml — Shane's zeroclaw persona.
+#
+# Build context: repo root. Invoke:
+#   flyctl deploy --config deploy/zeroclaw/fly.shane.toml --dockerfile deploy/zeroclaw/Dockerfile
+
+app            = "adi-zeroclaw-shane"
+primary_region = "iad"
+
+[experimental]
+  # Needed so tailscaled can open /dev/net/tun.
+  privileged = true
+
+[env]
+  ZEROCLAW_WORKSPACE = "/zeroclaw-data/workspace"
+  ZEROCLAW_MEMORY_POSTGRES_TABLE = "memories_shane"
+
+[[mounts]]
+  source       = "zeroclaw_shane_data"
+  destination  = "/zeroclaw-data"
+  initial_size = "3gb"
+
+[http_service]
+  internal_port        = 42617
+  force_https          = true
+  auto_start_machines  = true
+  auto_stop_machines   = "off"
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type       = "requests"
+    soft_limit = 25
+    hard_limit = 50
+
+[[http_service.checks]]
+  interval     = "30s"
+  timeout      = "5s"
+  grace_period = "30s"
+  method       = "get"
+  path         = "/health"
+
+[[vm]]
+  size     = "shared-cpu-1x"
+  memory   = "1024mb"
+  cpu_kind = "shared"

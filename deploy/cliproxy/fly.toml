@@ -1,0 +1,24 @@
+# deploy/cliproxy/fly.toml — standalone CLIProxyAPI for adi family.
+#
+# Runs cliproxy + tailscaled. No public http_service — reachable only
+# over Tailscale by tag:fly-gw peers (adi-zeroclaw-shane, adi-zeroclaw-meg).
+
+app            = "adi-cliproxy"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[experimental]
+  # Needed so tailscaled can open /dev/net/tun.
+  privileged = true
+
+[[mounts]]
+  source       = "cliproxy_data"
+  destination  = "/data"
+  initial_size = "1gb"
+
+[[vm]]
+  size     = "shared-cpu-1x"
+  memory   = "512mb"
+  cpu_kind = "shared"

@@ -1,0 +1,46 @@
+# deploy/cliproxy/config.seed.yaml — seeded once to /data/config.yaml on first boot.
+#
+# After the seed, /data/config.yaml is authoritative. Edit it with
+# `fly ssh console -a adi-cliproxy` when you need to add accounts or
+# rotate keys. OAuth tokens live at /data/auth/ and persist across redeploys.
+
+# Bind to 0.0.0.0 so Tailscale peers (shane + meg zeroclaw apps) can reach us.
+# Tailscale ACLs + the api-keys list below enforce auth; the Fly app itself
+# does NOT expose any public http_service (fly.toml has none).
+host: "0.0.0.0"
+port: 8317
+
+tls:
+  enable: false
+
+remote-management:
+  allow-remote: false
+  # Injected from CLIPROXY_MGMT_KEY Fly secret by entrypoint, or auto-generated.
+  secret-key: ""
+  disable-control-panel: true
+
+# Persisted on the Fly volume. Backed up by Fly volume snapshots.
+auth-dir: "/data/auth"
+
+# Client API keys. Entrypoint injects CLIPROXY_API_KEY (Fly secret) on first
+# boot. Shane and Meg use the same key so only one secret needs rotation.
+api-keys: []
+
+debug: false
+
+pprof:
+  enable: false
+
+commercial-mode: false
+
+logging-to-file: true
+logs-max-total-size-mb: 100
+error-logs-max-files: 5
+
+usage-statistics-enabled: true
+
+proxy-url: ""
+force-model-prefix: false
+passthrough-headers: false
+
+retry-count: 3

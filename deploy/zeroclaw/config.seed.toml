@@ -1,0 +1,47 @@
+# deploy/zeroclaw/config.seed.toml — seeded once to /zeroclaw-data/.zeroclaw/config.toml on first boot.
+#
+# Per-persona values (bot tokens, agent id) come from Fly secrets and are
+# NOT in this seed — zeroclaw reads TELEGRAM_BOT_TOKEN / SLACK_* / ANTHROPIC_API_KEY
+# from env at runtime. The seed only establishes the provider routing
+# (through adi-cliproxy) and the memory backend (Postgres → Supabase).
+#
+# After seed, /zeroclaw-data/.zeroclaw/config.toml is authoritative.
+# Edit via `fly ssh console` to add channels, adjust autonomy, etc.
+
+workspace_dir       = "/zeroclaw-data/workspace"
+config_path         = "/zeroclaw-data/.zeroclaw/config.toml"
+
+# LLM routing: all traffic goes through adi-cliproxy over the tailnet.
+# The tailnet DNS name resolves to adi-cliproxy's 100.x.y.z IP.
+default_provider    = "custom:http://adi-cliproxy.springhare-typhon.ts.net:8317/v1"
+default_model       = "anthropic/claude-sonnet-4-6"
+default_temperature = 0.7
+
+[gateway]
+port              = 42617
+host              = "[::]"
+allow_public_bind = true
+require_pairing   = false
+web_dist_dir      = "/app/web/dist"
+
+[autonomy]
+level = "supervised"
+auto_approve = [
+    "file_read", "file_write", "file_edit",
+    "memory_recall", "memory_store",
+    "web_search_tool", "web_fetch",
+    "calculator", "glob_search", "content_search",
+    "image_info", "weather", "git_operations"
+]
+
+[memory]
+backend = "postgres"
+
+[memory.postgres]
+# Pulled from POSTGRES_URL env (Fly secret). Table created on first
+# connection. Schema stays "public" to keep the default clean, but each
+# persona uses a distinct table name so shane and meg don't collide.
+# Table name is overridden by the per-persona fly.toml's ZEROCLAW_MEMORY_POSTGRES_TABLE env.
+schema           = "zeroclaw"
+max_connections  = 5
+connect_timeout_secs = 10

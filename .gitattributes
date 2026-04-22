@@ -64,3 +64,9 @@ Cargo.toml text eol=lf
 *.bz2 binary
 *.7z binary
 *.db binary
+
+# Shell scripts and Dockerfiles must stay LF for Linux containers.
+deploy/**/*.sh          text eol=lf
+deploy/**/Dockerfile    text eol=lf
+deploy/**/*.toml        text eol=lf
+deploy/**/*.yaml        text eol=lf
