@@ -54,51 +54,31 @@ fn protected_indices(messages: &[ChatMessage], keep_recent: usize) -> Vec<bool> 
 // Orphaned tool-message sanitiser
 // ---------------------------------------------------------------------------
 
-/// Remove `tool`-role messages whose `tool_call_id` has no matching
-/// `tool_use` / `tool_calls` entry in a preceding assistant message.
+/// Heal tool_use/tool_result pairing inconsistencies in a message history so
+/// downstream provider APIs do not reject the request with a 400.
 ///
-/// After any history truncation (drain, remove, prune) the first surviving
-/// message(s) may be `tool` results whose assistant request was trimmed away.
-/// The Anthropic API (and others) reject these with a 400 error.
+/// Both directions are sanitised:
+///
+/// * **Orphan tool result** — a `tool`-role message whose `tool_call_id` does
+///   not appear in the preceding assistant's structured `tool_calls` array
+///   (e.g. its assistant was dropped by trimming, compaction, or a session
+///   reload).
+/// * **Orphan assistant tool_calls** — an `assistant` message that emits
+///   `tool_calls` but whose `tool` responses for some IDs are missing
+///   (e.g. the tool result was dropped, never persisted, or stripped by an
+///   upstream cleanup pass). OpenAI rejects this with
+///   "An assistant message with 'tool_calls' must be followed by tool
+///   messages responding to each 'tool_call_id'".
 ///
 /// Returns the number of messages removed.
 pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
-    // Pass 1: Remove assistant(tool_calls) + their tool_results when the
-    // assistant is preceded by another assistant. Normalization would merge
-    // them, destroying structured tool_use blocks and orphaning the results.
     let mut removed = 0usize;
-    let mut i = 0;
-    while i < messages.len() {
-        if messages[i].role == "assistant"
-            && messages[i].content.contains("tool_calls")
-            && i > 0
-            && messages[i - 1].role == "assistant"
-        {
-            // Collect tool_call_ids from this assistant to find matching tool_results.
-            let doomed_content = messages[i].content.clone();
-            messages.remove(i);
-            removed += 1;
-            // Remove following tool messages that reference this assistant.
-            while i < messages.len() && messages[i].role == "tool" {
-                let dominated = match extract_tool_call_id(&messages[i].content) {
-                    Some(id) => doomed_content.contains(&id),
-                    None => true,
-                };
-                if dominated {
-                    messages.remove(i);
-                    removed += 1;
-                } else {
-                    break;
-                }
-            }
-        } else {
-            i += 1;
-        }
-    }
 
-    // Pass 2: Remove remaining orphan tool messages whose tool_call_id
-    // doesn't appear in the immediately preceding assistant.
-    i = 0;
+    // Pass 1: Remove orphan tool-role messages. Match tool_call_ids
+    // structurally against the preceding assistant's `tool_calls` array
+    // rather than substring-checking content (which can match summary text
+    // that incidentally mentions the ID).
+    let mut i = 0;
     while i < messages.len() {
         if messages[i].role != "tool" {
             i += 1;
@@ -112,17 +92,14 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
 
         let is_orphan = match assistant_idx {
             None => true,
-            Some(idx) => {
-                let assistant_content = &messages[idx].content;
-                if assistant_content.contains("tool_calls") {
-                    match extract_tool_call_id(&messages[i].content) {
-                        Some(tool_call_id) => !assistant_content.contains(&tool_call_id),
-                        None => false,
-                    }
-                } else {
-                    true
-                }
-            }
+            Some(idx) => match (
+                extract_assistant_tool_call_ids(&messages[idx].content),
+                extract_tool_call_id(&messages[i].content),
+            ) {
+                (Some(ids), Some(tool_call_id)) => !ids.iter().any(|id| id == &tool_call_id),
+                (Some(_), None) => false,
+                (None, _) => true,
+            },
         };
 
         if is_orphan {
@@ -132,6 +109,50 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> usize {
             i += 1;
         }
     }
+
+    // Pass 2: Remove orphan assistant(tool_calls) — assistants whose
+    // tool_calls do not all have matching tool responses immediately after.
+    // Strip the assistant and any partial tool responses as one unit.
+    i = 0;
+    while i < messages.len() {
+        if messages[i].role != "assistant" {
+            i += 1;
+            continue;
+        }
+        let Some(call_ids) = extract_assistant_tool_call_ids(&messages[i].content) else {
+            i += 1;
+            continue;
+        };
+
+        let mut responded: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut has_unparseable_response = false;
+        let mut j = i + 1;
+        while j < messages.len() && messages[j].role == "tool" {
+            match extract_tool_call_id(&messages[j].content) {
+                Some(id) => {
+                    responded.insert(id);
+                }
+                None => has_unparseable_response = true,
+            }
+            j += 1;
+        }
+
+        // Conservative: if any following tool message lacks a parseable
+        // tool_call_id, assume it might satisfy a missing pairing rather
+        // than risk dropping a valid (but oddly-encoded) response.
+        if has_unparseable_response || call_ids.iter().all(|id| responded.contains(id)) {
+            i += 1;
+            continue;
+        }
+
+        let to_remove = j - i;
+        for _ in 0..to_remove {
+            messages.remove(i);
+        }
+        removed += to_remove;
+        // i now points at whatever followed the removed group; do not bump.
+    }
+
     if removed > 0 {
         tracing::warn!(
             count = removed,
@@ -152,6 +173,22 @@ fn extract_tool_call_id(content: &str) -> Option<String> {
         .get("tool_call_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// Extract the list of `tool_call.id` values from an assistant message's
+/// structured JSON content. Returns `None` for plain-text assistants.
+fn extract_assistant_tool_call_ids(content: &str) -> Option<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let arr = value.get("tool_calls")?.as_array()?;
+    let ids: Vec<String> = arr
+        .iter()
+        .filter_map(|call| {
+            call.get("id")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .collect();
+    if ids.is_empty() { None } else { Some(ids) }
 }
 
 // ---------------------------------------------------------------------------
@@ -672,35 +709,66 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_assistant_with_tool_calls_stripped() {
-        // When poisoned turn removal leaves an assistant(text) followed by
-        // assistant(tool_calls), the second assistant and its tool_results
-        // must be removed — normalization would merge them, destroying the
-        // structured tool_use blocks and orphaning the results at the API.
-        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"toolu_DEAD","name":"shell","arguments":"{}"}]}"#;
+    fn consecutive_assistant_text_then_tool_calls_preserved() {
+        // Multi-iteration agent loops legitimately persist a text reply
+        // followed by an assistant(tool_calls) + matching tool result.
+        // Earlier the pruner aggressively removed the (tool_calls + tool)
+        // pair because the assistant was preceded by another assistant —
+        // a workaround for a normalize-time merge bug now fixed at the
+        // source. With that fix, removing the pair would orphan the
+        // assistant(tool_calls) on subsequent requests (OpenAI 400).
+        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"toolu_LIVE","name":"shell","arguments":"{}"}]}"#;
         let mut messages = vec![
             msg("system", "sys"),
             msg("user", "do something"),
-            msg("assistant", "Here are the results."),
+            msg("assistant", "Here are the partial results."),
             msg("assistant", tool_calls_assistant),
-            msg("tool", r#"{"content":"ok","tool_call_id":"toolu_DEAD"}"#),
-            msg("assistant", "The provider returned an empty response."),
+            msg("tool", r#"{"content":"ok","tool_call_id":"toolu_LIVE"}"#),
+            msg("assistant", "All done."),
         ];
         let removed = remove_orphaned_tool_messages(&mut messages);
-        assert_eq!(
-            removed, 2,
-            "should remove assistant(tool_calls) + tool_result"
-        );
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0].role, "system");
-        assert_eq!(messages[1].role, "user");
-        assert_eq!(messages[2].role, "assistant");
-        assert_eq!(messages[2].content, "Here are the results.");
-        assert_eq!(messages[3].role, "assistant");
-        assert_eq!(
-            messages[3].content,
-            "The provider returned an empty response."
-        );
+        assert_eq!(removed, 0, "valid tool_call pair must be preserved");
+        assert_eq!(messages.len(), 6);
+    }
+
+    #[test]
+    fn orphan_assistant_tool_calls_without_tool_response_removed() {
+        // Inverse of orphan tool: an assistant emits tool_calls but the
+        // matching tool response is missing (e.g. dropped by trimming or
+        // never persisted). Must remove the orphan assistant — OpenAI
+        // returns 400 "tool_call_ids did not have response messages".
+        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"call_X","name":"shell","arguments":"{}"}]}"#;
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("user", "go"),
+            msg("assistant", tool_calls_assistant),
+            // missing: tool with tool_call_id "call_X"
+            msg("user", "still there?"),
+        ];
+        let removed = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(removed, 1, "orphan assistant(tool_calls) must be removed");
+        assert_eq!(messages.len(), 3);
+        assert!(!messages.iter().any(|m| m.content.contains("call_X")));
+    }
+
+    #[test]
+    fn orphan_assistant_tool_calls_with_partial_response_removed() {
+        // Assistant emits two tool_calls but only one tool response exists.
+        // Must remove the assistant + the partial tool response together.
+        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"call_A","name":"f","arguments":"{}"},{"id":"call_B","name":"g","arguments":"{}"}]}"#;
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("user", "go"),
+            msg("assistant", tool_calls_assistant),
+            msg("tool", r#"{"content":"ok","tool_call_id":"call_A"}"#),
+            // missing: tool with tool_call_id "call_B"
+            msg("user", "next?"),
+        ];
+        let removed = remove_orphaned_tool_messages(&mut messages);
+        assert_eq!(removed, 2);
+        assert_eq!(messages.len(), 3);
+        assert!(!messages.iter().any(|m| m.content.contains("call_A")));
+        assert!(!messages.iter().any(|m| m.content.contains("call_B")));
     }
 
     #[test]

@@ -380,7 +380,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          token: ${{ secrets.RELEASE_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -439,27 +439,30 @@ jobs:
 
       - name: Create tag and release
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.validate.outputs.tag }}
           EVENT_NAME: ${{ github.event_name }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
-          # For manual dispatch, push the tag explicitly via git first using
-          # the RELEASE_TOKEN checkout (admin PAT bypasses tag protection rules),
-          # then create the release for the existing tag. This avoids the GitHub
-          # "tag_name was used by an immutable release" API error that --target
-          # triggers when a same-named tag was previously used by a deleted
-          # immutable release.
-          # For tag push, the tag already exists — skip straight to release creation.
+          # For manual dispatch, use --target to create tag + release atomically.
+          # For tag push, the tag already exists — just create the release.
+          # GITHUB_TOKEN with contents:write is sufficient for both paths.
+          # Note: workflow_dispatch requires github-actions[bot] to be on the
+          # tag protection allowlist if v* tags are protected.
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            git tag "$TAG" "$COMMIT_SHA"
-            git push origin "$TAG"
+            gh release create "$TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --notes-file release-notes.md \
+              --target "$COMMIT_SHA" \
+              --latest
+          else
+            gh release create "$TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --notes-file release-notes.md \
+              --latest
           fi
-          gh release create "$TAG" release-assets/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$TAG" \
-            --notes-file release-notes.md \
-            --latest
 
       - name: Remove CHANGELOG-next.md after stable release
         shell: bash

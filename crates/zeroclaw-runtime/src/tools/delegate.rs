@@ -1176,6 +1176,8 @@ impl DelegateTool {
                 0,    // context_token_budget: 0 = disabled for subagents
                 None, // shared_budget: TODO thread from parent in future
                 None, // channel: delegate subagents don't support approval
+                None, // receipt_generator
+                None, // collected_receipts
             ),
         )
         .await;

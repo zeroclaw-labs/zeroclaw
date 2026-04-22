@@ -1,4 +1,4 @@
-# Changelog — v0.6.9 → v0.7.0
+# Changelog — v0.6.9 → v0.7.3
 
 > Changes since the **v0.6.9** stable release. This release represents the largest
 > structural overhaul in ZeroClaw's history: the entire codebase has been split into a
@@ -35,6 +35,12 @@
   mentioned), encrypted media download restored, outbound attachment support added, and
   onboarding wizard preservation.
 
+- **GitHub Copilot onboarding** — GitHub Copilot is now selectable as a provider
+  through the onboarding wizard and `zeroclaw config` flow (#5321).
+
+- **Authenticated OTLP exporters** — New `otel_headers` config key lets you pass
+  custom headers (e.g. `Authorization: Bearer …`) to protected OTLP endpoints (#5700).
+
 ---
 
 ## What's New
@@ -63,8 +69,12 @@
 
 - **OpenRouterProvider** now supports streaming (#5717). Responses appear token-by-token
   instead of arriving all at once.
+- **GitHub Copilot** is now available as a selectable provider in the onboarding wizard
+  and `zeroclaw config` interactive flow (#5321).
 - Fixed: native tool-call messages are now stripped before sending to providers that
   have `native_tool_calling = false`, preventing provider errors (#5762).
+- Fixed: `tool_stream` events are no longer forwarded to non-Z.AI providers in the
+  streaming path, preventing unexpected provider errors (#5806).
 - Fixed: DeepSeek V3.2 system prompt escaping and token estimation corrected (#5454).
 
 ### Channels
@@ -73,6 +83,8 @@
 - **Matrix**: mention-only filtering — the agent can be configured to respond only when
   directly mentioned. Encrypted media download restored. Outbound attachment support
   added. Onboarding wizard settings now preserved across restarts (#5166, #5727).
+- **Telegram**: tool approval requests now include `inline_keyboard` markup, giving
+  users interactive approve/deny buttons instead of plain text (#5790).
 - Sender user ID is now propagated into the channel system prompt, giving the agent
   context about who it is talking to (#5526).
 - Email and VoiceCall channels now have an `enabled` field and are correctly wired into
@@ -102,15 +114,23 @@
 - Nostr, WhatsApp Web, and hardware wizard sections wired into the onboarding flow
   (#5640).
 
+### Observability
+
+- **`otel_headers`** — new config key for passing arbitrary HTTP headers to OTLP
+  endpoints. Enables authenticated exporters (e.g. Grafana Cloud, Honeycomb) without
+  environment variable workarounds (#5700).
+
 ### Web Dashboard
 
 - Voice mode added to the dashboard.
 - Plugins management page added.
+- Theme mode switch fixed — light/dark selection now applies correctly on load (#5724).
+- Visual preview swatches added to the theme mode selector (#5767).
 - Dashboard is now decoupled from the main binary — built separately and embedded at
-  release time. Included in binary releases, AUR, Homebrew, and `cargo install` (#5675,
-  #5665).
+  release time. Included in binary releases, AUR, Homebrew, and `cargo install`
+  (#5675, #5665).
 - Web build logic moved into the gateway crate; no-op recompiles (previously ~1 minute)
-  eliminated (#5ec5f2a6).
+  eliminated.
 
 ### Agent & Runtime
 
@@ -118,10 +138,13 @@
   sessions work again after the workspace split (#5802).
 - Duplicate `ToolCall` events in `turn_streamed` deduplicated; clients no longer see the
   same tool call reported twice (#5746).
+- Empty successful tool output is now normalised before being returned to the provider,
+  preventing downstream parse errors on blank responses (#5565).
 - Session integrity improvements: streaming refactor and history pruning for long
   conversations (#5167).
 - Cron agent jobs no longer trigger `auto_save`, preventing runaway memory consolidation
   on scheduled tasks (#5664).
+- Fixed: `cron_run` tool output was not being delivered to configured channels.
 - Windows: the shell console window is now hidden when running as a background process
   (#5563).
 
@@ -150,6 +173,12 @@
 - `rustls-webpki` and `rumqttc` bumped to resolve RUSTSEC-2026-0098 and
   RUSTSEC-2026-0099 (#5786).
 
+### Deployment
+
+- Sample Kubernetes and OpenShift deployment manifests added in `deploy-k8s/` with
+  hardened security context (`runAsNonRoot`, `readOnlyRootFilesystem`, `drop ALL` caps,
+  `seccompProfile: RuntimeDefault`) and pairing auth enabled by default (#5880).
+
 ---
 
 ## Bug Fixes (summary)
@@ -157,12 +186,16 @@
 | Area | Fix |
 |------|-----|
 | Provider | Strip native tool messages for non-native-tool-calling providers |
+| Provider | `tool_stream` events forwarded to non-Z.AI providers in streaming path |
 | Provider | DeepSeek V3.2 system prompt escaping and token estimation |
 | Agent | CLI channel factory missing in interactive mode |
 | Agent | Duplicate ToolCall events in streaming turns |
+| Agent | Normalize empty successful tool output |
 | Matrix | Encrypted media download; outbound attachments |
 | Channels | Missing Arc Provider forwarding methods |
 | Channels | `<think>` tag leaking into streaming draft updates |
+| Telegram | `inline_keyboard` missing from tool approval requests |
+| Cron | `cron_run` tool output not delivered to configured channels |
 | Config | False "Unknown config key" warnings on Option fields |
 | Config | Temperature validation missing from providers loop |
 | Config | Fallback key references nonexistent provider — now warns |
@@ -172,6 +205,10 @@
 | Install | install.sh broken after workspace split |
 | Runtime | Windows console window visible in background mode |
 | Distribution | Web dashboard missing from AUR and cargo install builds |
+| Docker | Workspace crate manifests missing from multi-stage build after workspace split (#5879) |
+| Agent | Streamed reasoning content lost during tool replay (#5606) |
+| Web | Theme mode switch not applying light/dark correctly |
+| Web | Theme mode selector missing visual preview swatches |
 
 ---
 
@@ -228,9 +265,11 @@ Thank you to everyone who contributed to this release:
 - @nayrosk
 - @niedbalski
 - @ninenox
+- @pavelanni
 - @singlerider
 - @theonlyhennygod
 - @titulus
+- @tompro
 - @UtopiaX
 - @vernonstinebaker
 - @WareWolf-MoonWall

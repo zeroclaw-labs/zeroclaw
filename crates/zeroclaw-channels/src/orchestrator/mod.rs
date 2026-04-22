@@ -683,9 +683,33 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
                 normalized.push(turn);
                 expecting_user = true;
             }
+            (true, "assistant") => {
+                // Multi-iteration agent loops persist consecutive assistants
+                // (e.g. text reply followed by a tool_calls JSON message).
+                // Merging structured tool_calls JSON with surrounding text
+                // produces invalid JSON, which downstream native conversion
+                // silently downgrades to plain text — dropping `tool_calls`
+                // and orphaning the next role=tool message (OpenAI 400).
+                // Preserve such turns as separate assistants instead.
+                let last_is_structured = normalized
+                    .last()
+                    .is_some_and(|t| looks_like_tool_calls_json(&t.content));
+                let new_is_structured = looks_like_tool_calls_json(&turn.content);
+
+                if last_is_structured || new_is_structured {
+                    normalized.push(turn);
+                } else if let Some(last_turn) = normalized.last_mut()
+                    && !turn.content.is_empty()
+                {
+                    if !last_turn.content.is_empty() {
+                        last_turn.content.push_str("\n\n");
+                    }
+                    last_turn.content.push_str(&turn.content);
+                }
+            }
             // Interrupted channel turns can produce consecutive user messages
             // (no assistant persisted yet). Merge instead of dropping.
-            (false, "user") | (true, "assistant") => {
+            (false, "user") => {
                 if let Some(last_turn) = normalized.last_mut()
                     && !turn.content.is_empty()
                 {
@@ -700,6 +724,11 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     }
 
     normalized
+}
+
+fn looks_like_tool_calls_json(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with('{') && trimmed.contains("\"tool_calls\"")
 }
 
 /// Remove `<tool_result …>…</tool_result>` blocks (and a leading `[Tool results]`
@@ -1354,6 +1383,13 @@ fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
 
 fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
     if zeroclaw_memory::is_assistant_autosave_key(key) {
+        return true;
+    }
+
+    // Skip raw per-turn user messages: re-injecting them causes each
+    // recalled entry to embed all prior generations, growing exponentially.
+    // Consolidated knowledge is already promoted to Core/Daily entries.
+    if zeroclaw_memory::is_user_autosave_key(key) {
         return true;
     }
 
@@ -3075,6 +3111,8 @@ async fn process_channel_message(
                         ctx.context_token_budget,
                         None, // shared_budget
                         target_channel.as_deref(),
+                        None, // receipt_generator
+                        None, // collected_receipts
                     ),
                     ),
                     ),
@@ -5256,9 +5294,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
-    let tools_registry = Arc::new(built_tools);
-
     let skills = zeroclaw_runtime::skills::load_skills_with_config(&workspace, &config);
+
+    // Register skill-defined tools so the gateway can execute them (not just
+    // describe them in the prompt). Without this, skill tools like email.send
+    // appear in the system prompt but return "Unknown tool" when called.
+    zeroclaw_runtime::tools::register_skill_tools(&mut built_tools, &skills, security.clone());
+
+    let tools_registry = Arc::new(built_tools);
 
     // ── Load locale-aware tool descriptions ────────────────────────
     let i18n_locale = config
@@ -5936,6 +5979,22 @@ mod tests {
             "telegram_user_msg_201",
             "plain text without tool results"
         ));
+
+        // Per-turn user auto-save keys must be skipped to prevent exponential
+        // context bloat from re-injected conversation history.
+        assert!(should_skip_memory_context_entry(
+            "user_msg",
+            "original user message text"
+        ));
+        assert!(should_skip_memory_context_entry(
+            "user_msg_a1b2c3d4e5f6",
+            "follow-up message embedding prior context"
+        ));
+        // Channel-scoped keys (e.g. telegram_*) must NOT be affected.
+        assert!(!should_skip_memory_context_entry(
+            "telegram_user_msg_101",
+            "Please describe the image"
+        ));
     }
 
     #[test]
@@ -6030,6 +6089,46 @@ mod tests {
         assert_eq!(normalized[2].role, "user");
         assert!(normalized[1].content.contains("assistant part 1"));
         assert!(normalized[1].content.contains("assistant part 2"));
+    }
+
+    /// Multi-iteration agent loops persist a text reply followed by a
+    /// tool_calls JSON message. Merging those two assistants would corrupt
+    /// the JSON, downstream native conversion would fall back to plain text
+    /// (dropping `tool_calls`), and the next role=tool turn would be
+    /// orphaned — provoking an OpenAI 400 on the following request.
+    #[test]
+    fn normalize_cached_channel_turns_preserves_tool_calls_json_after_text() {
+        let tool_calls_json = r#"{"content":null,"tool_calls":[{"id":"call_FUzv","type":"function","function":{"name":"file_write","arguments":"{}"}}]}"#;
+        let turns = vec![
+            ChatMessage::user("write a file"),
+            ChatMessage::assistant("已记下，下次再试"),
+            ChatMessage::assistant(tool_calls_json),
+            ChatMessage::tool(r#"{"tool_call_id":"call_FUzv","content":"Denied by user"}"#),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        assert_eq!(normalized.len(), 4, "tool_calls assistant must not be merged");
+        assert_eq!(normalized[1].role, "assistant");
+        assert_eq!(normalized[1].content, "已记下，下次再试");
+        assert_eq!(normalized[2].role, "assistant");
+        assert_eq!(normalized[2].content, tool_calls_json);
+        assert_eq!(normalized[3].role, "tool");
+    }
+
+    /// Mirror of the above — tool_calls JSON first, then a text continuation.
+    #[test]
+    fn normalize_cached_channel_turns_preserves_text_after_tool_calls_json() {
+        let tool_calls_json = r#"{"content":null,"tool_calls":[{"id":"call_x","type":"function","function":{"name":"f","arguments":"{}"}}]}"#;
+        let turns = vec![
+            ChatMessage::user("u"),
+            ChatMessage::assistant(tool_calls_json),
+            ChatMessage::assistant("post-tool reflection"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[1].content, tool_calls_json);
+        assert_eq!(normalized[2].content, "post-tool reflection");
     }
 
     /// Verify that an orphan user turn followed by a failure-marker assistant

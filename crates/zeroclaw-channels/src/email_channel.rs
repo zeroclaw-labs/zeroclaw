@@ -351,13 +351,17 @@ impl EmailChannel {
         }
     }
 
-    /// Main IDLE-based listen loop with automatic reconnection
-    async fn listen_with_idle(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
+    /// Main listen loop with automatic reconnection.
+    ///
+    /// Probes the server's CAPABILITY list after login and picks between:
+    /// - IMAP IDLE (RFC 2177) for instant push when the server advertises it.
+    /// - Periodic polling when the server does not support IDLE (e.g. seznam.cz).
+    async fn listen_with_reconnect(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(60);
 
         loop {
-            match self.run_idle_session(&tx).await {
+            match self.run_session(&tx).await {
                 Ok(()) => {
                     // Clean exit (channel closed)
                     return Ok(());
@@ -375,21 +379,48 @@ impl EmailChannel {
         }
     }
 
-    /// Run a single IDLE session until error or clean shutdown
-    async fn run_idle_session(&self, tx: &mpsc::Sender<ChannelMessage>) -> Result<()> {
+    /// Run a single IMAP session. Probes server capabilities and dispatches
+    /// to the IDLE or polling inner loop.
+    async fn run_session(&self, tx: &mpsc::Sender<ChannelMessage>) -> Result<()> {
         // Connect and authenticate
         let mut session = self.connect_imap().await?;
 
         // Select the mailbox
         session.select(&self.config.imap_folder).await?;
-        info!(
-            "Email IDLE listening on {} (instant push enabled)",
-            self.config.imap_folder
-        );
 
-        // Check for existing unseen messages first
+        // Probe the server's post-auth capabilities to decide IDLE vs poll.
+        // RFC 3501 allows capabilities to change after authentication, so we
+        // probe after login rather than before.
+        let has_idle = {
+            let caps = session.capabilities().await?;
+            caps.has_str("IDLE")
+        };
+
+        // Drain any existing unseen messages first, regardless of mode
         self.process_unseen(&mut session, tx).await?;
 
+        if has_idle {
+            info!(
+                "Email channel listening on {} (IMAP IDLE, instant push)",
+                self.config.imap_folder
+            );
+            self.run_idle_inner(session, tx).await
+        } else {
+            let poll_interval = Duration::from_secs(self.config.poll_interval_secs);
+            info!(
+                "Email channel listening on {} (IMAP polling, server lacks IDLE, interval: {:?})",
+                self.config.imap_folder, poll_interval
+            );
+            self.run_poll_inner(session, tx, poll_interval).await
+        }
+    }
+
+    /// IDLE-based wait loop. Consumes and returns the session across IDLE round trips.
+    async fn run_idle_inner(
+        &self,
+        mut session: ImapSession,
+        tx: &mpsc::Sender<ChannelMessage>,
+    ) -> Result<()> {
         loop {
             // Enter IDLE and wait for changes (consumes session, returns it via result)
             match self.wait_for_changes(session).await {
@@ -412,6 +443,24 @@ impl EmailChannel {
                     return Err(e);
                 }
             }
+        }
+    }
+
+    /// Polling-based wait loop. Used when the server does not advertise IDLE.
+    /// Sleeps for `poll_interval` between UNSEEN checks and sends a NOOP each
+    /// cycle to keep the connection alive and detect drops early.
+    async fn run_poll_inner(
+        &self,
+        mut session: ImapSession,
+        tx: &mpsc::Sender<ChannelMessage>,
+        poll_interval: Duration,
+    ) -> Result<()> {
+        loop {
+            sleep(poll_interval).await;
+            // NOOP both keeps the connection alive and causes the server to
+            // flush any pending EXISTS/EXPUNGE updates before we search.
+            session.noop().await?;
+            self.process_unseen(&mut session, tx).await?;
         }
     }
 
@@ -559,10 +608,10 @@ impl Channel for EmailChannel {
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
         info!(
-            "Starting email channel with IDLE support on {}",
+            "Starting email channel on {} (IDLE preferred, polling fallback)",
             self.config.imap_folder
         );
-        self.listen_with_idle(tx).await
+        self.listen_with_reconnect(tx).await
     }
 
     async fn health_check(&self) -> bool {
@@ -699,6 +748,7 @@ mod tests {
             password: "pass123".to_string(),
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1200,
+            poll_interval_secs: 60,
             allowed_senders: vec!["allowed@example.com".to_string()],
             default_subject: "Custom Subject".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
@@ -723,6 +773,7 @@ mod tests {
             password: "secret".to_string(),
             from_address: "bot@test.com".to_string(),
             idle_timeout_secs: 1740,
+            poll_interval_secs: 60,
             allowed_senders: vec!["*".to_string()],
             default_subject: "Test Subject".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
@@ -972,6 +1023,7 @@ mod tests {
             password: "password123".to_string(),
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1740,
+            poll_interval_secs: 60,
             allowed_senders: vec!["allowed@example.com".to_string()],
             default_subject: "Serialization Test".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
@@ -1019,7 +1071,11 @@ mod tests {
     }
 
     #[test]
-    fn idle_timeout_deserializes_legacy_poll_interval_alias() {
+    fn poll_interval_deserializes_as_independent_field() {
+        // poll_interval_secs is a separate field from idle_timeout_secs —
+        // used when the IMAP server does not advertise the IDLE capability.
+        // Previously (pre-polling-fallback) it was a misleading serde alias
+        // for idle_timeout_secs; that coupling has been removed.
         let json = r#"{
             "imap_host": "imap.test.com",
             "smtp_host": "smtp.test.com",
@@ -1029,7 +1085,21 @@ mod tests {
             "poll_interval_secs": 120
         }"#;
         let config: EmailConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.idle_timeout_secs, 120);
+        assert_eq!(config.poll_interval_secs, 120);
+        assert_eq!(config.idle_timeout_secs, 1740); // unchanged default
+    }
+
+    #[test]
+    fn poll_interval_has_default_when_unset() {
+        let json = r#"{
+            "imap_host": "imap.test.com",
+            "smtp_host": "smtp.test.com",
+            "username": "user",
+            "password": "pass",
+            "from_address": "bot@test.com"
+        }"#;
+        let config: EmailConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.poll_interval_secs, 60);
     }
 
     #[test]
