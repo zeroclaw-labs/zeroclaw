@@ -116,6 +116,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /zeroclaw-data /zeroclaw-data
+COPY --from=builder /app/web/dist /zeroclaw-data/web/dist
 
 # Environment setup
 # Ensure UTF-8 locale so CJK / multibyte input is handled correctly
