@@ -669,7 +669,7 @@ impl LarkChannel {
             config.verification_token.clone().unwrap_or_default(),
             config.port,
             config.allowed_users.clone(),
-            false,
+            config.mention_only,
             LarkPlatform::Feishu,
         );
         ch.receive_mode = config.receive_mode.clone();
@@ -3443,6 +3443,7 @@ mod tests {
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
@@ -3453,6 +3454,41 @@ mod tests {
         assert_eq!(ch.api_base(), FEISHU_BASE_URL);
         assert_eq!(ch.ws_base(), FEISHU_WS_BASE_URL);
         assert_eq!(ch.name(), "feishu");
+    }
+
+    #[test]
+    fn lark_from_feishu_config_propagates_mention_only() {
+        use zeroclaw_config::schema::{FeishuConfig, LarkReceiveMode};
+
+        let cfg_true = FeishuConfig {
+            enabled: true,
+            app_id: "cli_feishu_app123".into(),
+            app_secret: "secret456".into(),
+            encrypt_key: None,
+            verification_token: Some("vtoken789".into()),
+            allowed_users: vec!["*".into()],
+            mention_only: true,
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            proxy_url: None,
+        };
+
+        let cfg_false = FeishuConfig {
+            mention_only: false,
+            ..cfg_true.clone()
+        };
+
+        let ch_true = LarkChannel::from_feishu_config(&cfg_true);
+        let ch_false = LarkChannel::from_feishu_config(&cfg_false);
+
+        assert!(
+            ch_true.mention_only,
+            "mention_only = true must propagate through from_feishu_config"
+        );
+        assert!(
+            !ch_false.mention_only,
+            "mention_only = false must propagate through from_feishu_config"
+        );
     }
 
     #[tokio::test]
@@ -3643,6 +3679,7 @@ mod tests {
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: zeroclaw_config::schema::LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,

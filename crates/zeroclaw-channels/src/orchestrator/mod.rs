@@ -5681,6 +5681,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 msgs.push(closure);
                 orphans_closed += 1;
             }
+            // Self-heal: strip orphaned tool_result messages left by a prior
+            // compaction that dropped the assistant tool_use without its paired
+            // tool_result. Must run LAST, after every other mutation, so any
+            // future trim step inserted above is covered by the same guard.
+            // Without this, the session is bricked until the file is deleted
+            // because every API call fails with 400 "unexpected tool_use_id
+            // in tool_result blocks". See #5813.
+            zeroclaw_runtime::agent::history_pruner::remove_orphaned_tool_messages(&mut msgs);
             hydrated += 1;
             histories.push(key, msgs);
         }
