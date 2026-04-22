@@ -35,7 +35,7 @@ require_pairing   = true
 web_dist_dir      = "/app/web/dist"
 
 [autonomy]
-level = "supervised"
+level = "full"
 auto_approve = [
     "file_read", "file_write", "file_edit",
     "memory_recall", "memory_store",
