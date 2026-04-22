@@ -1203,6 +1203,7 @@ fn create_provider_with_url_and_options(
                 .with_max_tokens(options.provider_max_tokens);
             if let Some(extra) = options.provider_extra.clone() {
                 p = p.with_extra_body(extra);
+            }
             if let Some(ct) = options.provider_connect_timeout_secs {
                 p = p.with_connect_timeout_secs(ct);
             }
