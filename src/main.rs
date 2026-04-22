@@ -1961,19 +1961,16 @@ async fn main() -> Result<()> {
                 } else if let Some(val) = value {
                     config.set_prop(&path, &val)?;
                 } else {
-                    let variants = config
-                        .prop_fields()
-                        .into_iter()
-                        .find(|f| f.name == path)
-                        .and_then(|info| {
-                            let get_variants = info.enum_variants?;
-                            let variants = get_variants();
-                            let current_index = variants
-                                .iter()
-                                .position(|v| v == &info.display_value)
-                                .unwrap_or(0);
-                            Some((variants, current_index))
-                        });
+                    let field_info = config.prop_fields().into_iter().find(|f| f.name == path);
+                    let variants = field_info.as_ref().and_then(|info| {
+                        let get_variants = info.enum_variants?;
+                        let variants = get_variants();
+                        let current_index = variants
+                            .iter()
+                            .position(|v| v == &info.display_value)
+                            .unwrap_or(0);
+                        Some((variants, current_index))
+                    });
                     if let Some((variants, current_index)) = variants {
                         let selected = Select::new()
                             .with_prompt(format!("Select value for {path}"))
@@ -1981,6 +1978,42 @@ async fn main() -> Result<()> {
                             .default(current_index)
                             .interact()?;
                         config.set_prop(&path, &variants[selected])?;
+                    } else if field_info
+                        .as_ref()
+                        .is_some_and(|f| f.kind == crate::config::PropKind::StringArray)
+                    {
+                        let current_items: Vec<String> = field_info
+                            .as_ref()
+                            .and_then(|f| {
+                                let raw = toml::from_str::<toml::Value>(&format!(
+                                    "v = {}",
+                                    if f.display_value == "<unset>" {
+                                        "[]".to_string()
+                                    } else {
+                                        f.display_value.clone()
+                                    }
+                                ))
+                                .ok();
+                                raw.and_then(|v| v.get("v").cloned())
+                                    .and_then(|v| v.as_array().cloned())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                            .collect()
+                                    })
+                            })
+                            .unwrap_or_default();
+                        let editor_content = current_items.join("\n");
+                        let edited = dialoguer::Editor::new()
+                            .edit(&editor_content)?
+                            .unwrap_or(editor_content);
+                        let val = edited
+                            .lines()
+                            .map(|l| l.trim())
+                            .filter(|l| !l.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        config.set_prop(&path, &val)?;
                     } else {
                         anyhow::bail!("Value required. Usage: zeroclaw config set {path} <value>");
                     }
