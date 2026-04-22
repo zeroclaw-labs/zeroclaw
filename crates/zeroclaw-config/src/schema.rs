@@ -6559,6 +6559,9 @@ pub struct ChannelsConfig {
     /// MQTT channel configuration (SOP listener).
     #[nested]
     pub mqtt: Option<MqttConfig>,
+    /// WuKongIM channel configuration.
+    #[nested]
+    pub wukongim: Option<WuKongIMConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -6727,6 +6730,10 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.mqtt.as_ref())),
                 self.mqtt.is_some(),
             ),
+            (
+                Box::new(ConfigWrapper::new(self.wukongim.as_ref())),
+                self.wukongim.is_some(),
+            ),
         ]
     }
 
@@ -6785,6 +6792,7 @@ impl Default for ChannelsConfig {
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
+            wukongim: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
             show_tool_calls: false,
@@ -6821,6 +6829,10 @@ fn default_multi_message_delay_ms() -> u64 {
 
 fn default_telegram_approval_timeout_secs() -> u64 {
     120
+}
+
+fn default_wukongim_approval_timeout_secs() -> u64 {
+    300
 }
 
 fn default_matrix_draft_update_interval_ms() -> u64 {
@@ -7883,6 +7895,38 @@ impl ChannelConfig for FeishuConfig {
     }
     fn desc() -> &'static str {
         "Feishu Bot"
+    }
+}
+
+/// WuKongIM configuration for messaging integration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.wukongim"]
+pub struct WuKongIMConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// WebSocket URL for WuKongIM (e.g. ws://host:5200)
+    pub ws_url: String,
+    /// User ID
+    pub uid: String,
+    /// Auth token
+    #[secret]
+    pub token: String,
+    /// Allowed user IDs (empty = deny all, "*" = allow all)
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// How long (seconds) to wait for the operator to approve a tool call. Default: 300.
+    #[serde(default = "default_wukongim_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+}
+
+impl ChannelConfig for WuKongIMConfig {
+    fn name() -> &'static str {
+        "WuKongIM"
+    }
+    fn desc() -> &'static str {
+        "WuKongIM messaging channel"
     }
 }
 
@@ -11732,6 +11776,7 @@ auto_save = true
                 #[cfg(feature = "voice-wake")]
                 voice_wake: None,
                 mqtt: None,
+                wukongim: None,
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
@@ -12868,6 +12913,7 @@ allowed_rooms = ["!ops:matrix.org"]
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
+            wukongim: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
@@ -13242,6 +13288,7 @@ bot_token = "xoxb-tok"
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
+            wukongim: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,

@@ -109,6 +109,7 @@ channel-whatsapp-cloud = []
 channel-voice-call = []
 channel-acp-server = []
 channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
+channel-wukongim = []
 voice-wake = ["dep:cpal", "zeroclaw-config/voice-wake"]
 
 [dev-dependencies]

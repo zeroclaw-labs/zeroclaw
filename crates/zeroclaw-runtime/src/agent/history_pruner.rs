@@ -783,7 +783,8 @@ mod tests {
         // matching tool response is missing (e.g. dropped by trimming or
         // never persisted). Must remove the orphan assistant — OpenAI
         // returns 400 "tool_call_ids did not have response messages".
-        let tool_calls_assistant = r#"{"content":null,"tool_calls":[{"id":"call_X","name":"shell","arguments":"{}"}]}"#;
+        let tool_calls_assistant =
+            r#"{"content":null,"tool_calls":[{"id":"call_X","name":"shell","arguments":"{}"}]}"#;
         let mut messages = vec![
             msg("system", "sys"),
             msg("user", "go"),

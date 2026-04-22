@@ -258,7 +258,7 @@ agent-runtime = [
     "channel-linq", "channel-wati", "channel-nextcloud",
     "channel-mochat", "channel-wecom", "channel-clawdtalk",
     "channel-webhook", "channel-acp-server", "channel-whatsapp-cloud",
-    "channel-voice-call",
+    "channel-voice-call", "channel-wukongim",
 ]
 
 # Major subsystems — each forwards to exactly ONE crate
@@ -295,6 +295,7 @@ channel-acp-server = ["zeroclaw-channels/channel-acp-server"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
 channel-voice-call = ["zeroclaw-channels/channel-voice-call"]
 channel-feishu = ["channel-lark"]
+channel-wukongim = ["zeroclaw-channels/channel-wukongim"]
 whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
 voice-wake = ["zeroclaw-channels/voice-wake"]
 
