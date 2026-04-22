@@ -4451,6 +4451,16 @@ BTC is currently around $65,000 based on latest tool output."#
 
     struct MockPriceTool;
 
+    /// Variant of `MockPriceTool` that embeds a monotonic `tick` in each
+    /// response so successive calls produce unique `output_hash`es. Used by
+    /// tests that exercise the `max_tool_iterations` cap via
+    /// `IterativeToolProvider` — without varying output, the repeat-result
+    /// circuit breaker would bail before the iteration cap is reached.
+    #[derive(Default)]
+    struct VaryingOutputPriceTool {
+        tick: AtomicUsize,
+    }
+
     #[derive(Default)]
     struct ModelCaptureProvider {
         call_count: AtomicUsize,
@@ -4517,6 +4527,45 @@ BTC is currently around $65,000 based on latest tool output."#
             Ok(ToolResult {
                 success: true,
                 output: r#"{"symbol":"BTC","price_usd":65000}"#.to_string(),
+                error: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for VaryingOutputPriceTool {
+        fn name(&self) -> &str {
+            "mock_price"
+        }
+
+        fn description(&self) -> &str {
+            "Return a mocked BTC price with a monotonic tick"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "symbol": { "type": "string" }
+                },
+                "required": ["symbol"]
+            })
+        }
+
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            let symbol = args.get("symbol").and_then(serde_json::Value::as_str);
+            if symbol != Some("BTC") {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("unexpected symbol".to_string()),
+                });
+            }
+
+            let tick = self.tick.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: format!(r#"{{"symbol":"BTC","price_usd":65000,"tick":{tick}}}"#),
                 error: None,
             })
         }
@@ -5138,7 +5187,11 @@ BTC is currently around $65,000 based on latest tool output."#
             }),
             default_provider: Arc::new("test-provider".to_string()),
             memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            // VaryingOutputPriceTool varies its output per call so the new
+            // repeat-result circuit breaker (which bails on identical
+            // (tool_name, output_hash) across consecutive iterations) does
+            // not fire before we exercise the max_tool_iterations path.
+            tools_registry: Arc::new(vec![Box::new(VaryingOutputPriceTool::default())]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -5206,7 +5259,10 @@ BTC is currently around $65,000 based on latest tool output."#
             }),
             default_provider: Arc::new("test-provider".to_string()),
             memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            // See the sibling test for why varying output is required — the
+            // repeat-result circuit breaker would fire before we reach
+            // max_tool_iterations if the tool emitted identical output.
+            tools_registry: Arc::new(vec![Box::new(VaryingOutputPriceTool::default())]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
