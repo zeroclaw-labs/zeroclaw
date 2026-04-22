@@ -219,3 +219,45 @@ pub async fn maybe_fire_low_balance_alert(
 
     outcome
 }
+
+/// Convenience entry point for the chat handler: load the user's
+/// alert channel preferences from `PaymentManager`, then dispatch
+/// the low-balance email + SMS via `maybe_fire_low_balance_alert`.
+///
+/// Returns the same `AlertDispatchOutcome` so the caller can log /
+/// surface results. Non-fatal on every failure path: if preferences
+/// can't be loaded or SMTP/Twilio credentials are missing, the
+/// outcome simply records the error and the in-app banner remains
+/// the primary surface.
+pub async fn dispatch_for_user(
+    state: &LowBalanceAlertState,
+    payment_manager: &crate::billing::PaymentManager,
+    user_id: &str,
+    balance: u32,
+    smtp_cfg: &crate::config::schema::EmailVerificationConfig,
+) -> AlertDispatchOutcome {
+    let prefs = match payment_manager.get_billing_preferences(user_id) {
+        Ok(p) => p,
+        Err(e) => {
+            return AlertDispatchOutcome {
+                errors: vec![format!("preferences lookup failed: {e}")],
+                ..Default::default()
+            };
+        }
+    };
+    let channels = AlertChannels {
+        email_enabled: prefs.alert_email_enabled,
+        email_address: prefs.alert_email_address.clone(),
+        sms_enabled: prefs.alert_sms_enabled,
+        sms_phone: prefs.alert_sms_phone.clone(),
+    };
+    maybe_fire_low_balance_alert(
+        state,
+        user_id,
+        balance,
+        prefs.low_balance_threshold,
+        &channels,
+        smtp_cfg,
+    )
+    .await
+}
