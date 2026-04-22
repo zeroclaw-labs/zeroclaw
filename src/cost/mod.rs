@@ -118,9 +118,74 @@ pub fn record_llm_call(
     }
 
     match tracker.check_budget(0.0) {
-        Ok(check) => Some(check),
+        Ok(check) => Some(apply_allow_override(
+            check,
+            tracker.cost_config().allow_override,
+        )),
         Err(e) => {
             tracing::warn!(target: "cost", error = %e, "Failed to re-check budget after record");
+            None
+        }
+    }
+}
+
+/// Apply the `[cost] allow_override` policy to a raw `BudgetCheck`.
+///
+/// When `allow_override == true`, `BudgetCheck::Exceeded` is downgraded to
+/// `BudgetCheck::Warning` (soft-budget semantics): the operator wants
+/// visibility into budget overruns without hard-blocking requests. A
+/// `warn`-level log is emitted at each downgrade so soft-budget usage is
+/// still observable in the log stream.
+///
+/// When `allow_override == false` (default), the input is returned unchanged
+/// — callers see the raw state and are expected to enforce it (bail on
+/// `Exceeded`).
+pub fn apply_allow_override(check: BudgetCheck, allow_override: bool) -> BudgetCheck {
+    if !allow_override {
+        return check;
+    }
+    match check {
+        BudgetCheck::Exceeded {
+            current_usd,
+            limit_usd,
+            period,
+        } => {
+            tracing::warn!(
+                target: "cost",
+                period = ?period,
+                current_usd = current_usd,
+                limit_usd = limit_usd,
+                "Budget exceeded but [cost] allow_override=true; soft-budget permits call"
+            );
+            BudgetCheck::Warning {
+                current_usd,
+                limit_usd,
+                period,
+            }
+        }
+        other => other,
+    }
+}
+
+/// Pre-call gate: consult the tracker's current budget state (without
+/// recording anything) and apply the `allow_override` policy. Intended to
+/// be called ONCE at the start of an agent turn, before any LLM call is
+/// issued, so a budget that's already exceeded terminates the turn without
+/// burning an additional API call.
+///
+/// Returns `None` when tracking is unavailable (tracker `None`) or the
+/// underlying budget check errored; callers should treat `None` as
+/// "proceed" (fail-open — missing budget data should never block user
+/// requests, only clear over-limit states should).
+pub fn pre_call_budget_state(tracker: Option<&Arc<CostTracker>>) -> Option<BudgetCheck> {
+    let tracker = tracker?;
+    match tracker.check_budget(0.0) {
+        Ok(check) => Some(apply_allow_override(
+            check,
+            tracker.cost_config().allow_override,
+        )),
+        Err(e) => {
+            tracing::warn!(target: "cost", error = %e, "Pre-call budget check failed");
             None
         }
     }
@@ -233,5 +298,111 @@ mod tests {
         let summary = tracker.get_summary().unwrap();
         assert_eq!(summary.request_count, 1);
         assert!((summary.session_cost_usd - 2.10).abs() < 1e-6);
+    }
+
+    #[test]
+    fn apply_allow_override_passthrough_when_disabled() {
+        let exceeded = BudgetCheck::Exceeded {
+            current_usd: 30.0,
+            limit_usd: 20.0,
+            period: UsagePeriod::Day,
+        };
+        let result = apply_allow_override(exceeded, false);
+        assert!(matches!(result, BudgetCheck::Exceeded { .. }));
+    }
+
+    #[test]
+    fn apply_allow_override_downgrades_exceeded_to_warning() {
+        let exceeded = BudgetCheck::Exceeded {
+            current_usd: 30.0,
+            limit_usd: 20.0,
+            period: UsagePeriod::Day,
+        };
+        let result = apply_allow_override(exceeded, true);
+        match result {
+            BudgetCheck::Warning {
+                current_usd,
+                limit_usd,
+                period,
+            } => {
+                assert_eq!(current_usd, 30.0);
+                assert_eq!(limit_usd, 20.0);
+                assert_eq!(period, UsagePeriod::Day);
+            }
+            other => panic!("expected Warning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_allow_override_does_not_touch_warning_or_allowed() {
+        // Warning must pass through untouched even with override on — the
+        // policy is purely about downgrading Exceeded.
+        let warning = BudgetCheck::Warning {
+            current_usd: 16.0,
+            limit_usd: 20.0,
+            period: UsagePeriod::Day,
+        };
+        assert!(matches!(
+            apply_allow_override(warning, true),
+            BudgetCheck::Warning { .. }
+        ));
+        assert!(matches!(
+            apply_allow_override(BudgetCheck::Allowed, true),
+            BudgetCheck::Allowed
+        ));
+    }
+
+    #[test]
+    fn record_llm_call_soft_budget_downgrades_post_record_state() {
+        // Seed the tracker with a past record that already breaches the daily
+        // cap, turn on allow_override, then record another call. The returned
+        // BudgetCheck must be Warning, not Exceeded.
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = cost_config_with_prices(&[("qwen/qwen-plus", price(0.3, 1.8))]);
+        cfg.daily_limit_usd = 0.01;
+        cfg.allow_override = true;
+        let tracker = Arc::new(CostTracker::new(cfg, tmp.path()).unwrap());
+
+        let usage = ProviderTokenUsage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+        };
+        // Would normally be Exceeded (cost $2.10 » $0.01 limit).
+        let check = record_llm_call(Some(&tracker), "qwen", "qwen-plus", Some(&usage))
+            .expect("should return a budget check");
+        assert!(
+            matches!(check, BudgetCheck::Warning { .. }),
+            "soft budget should downgrade Exceeded → Warning, got {check:?}"
+        );
+    }
+
+    #[test]
+    fn pre_call_budget_state_returns_none_when_tracker_missing() {
+        assert!(pre_call_budget_state(None).is_none());
+    }
+
+    #[test]
+    fn pre_call_budget_state_returns_exceeded_without_recording() {
+        // Tracker with tiny daily limit + seeded record that already breaches.
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = cost_config_with_prices(&[("qwen/qwen-plus", price(0.3, 1.8))]);
+        cfg.daily_limit_usd = 0.01;
+        let tracker = Arc::new(CostTracker::new(cfg, tmp.path()).unwrap());
+
+        let usage = ProviderTokenUsage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+        };
+        record_llm_call(Some(&tracker), "qwen", "qwen-plus", Some(&usage)).expect("seed record");
+        let before = tracker.get_summary().unwrap().request_count;
+
+        let state = pre_call_budget_state(Some(&tracker)).expect("should return a state");
+        assert!(
+            matches!(state, BudgetCheck::Exceeded { .. }),
+            "should see Exceeded from seeded record, got {state:?}"
+        );
+        // Critically: pre_call_budget_state must not add a new record.
+        let after = tracker.get_summary().unwrap().request_count;
+        assert_eq!(before, after, "pre-call gate must not record");
     }
 }

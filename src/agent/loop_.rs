@@ -2263,6 +2263,27 @@ pub(crate) async fn run_tool_call_loop(
         max_tool_iterations
     };
 
+    // Pre-call budget gate: if the daily/monthly cap is already breached
+    // when this turn begins, abort before issuing the first LLM call.
+    // `allow_override = true` downgrades Exceeded to Warning inside
+    // `pre_call_budget_state`, so operators who prefer soft budgeting pass
+    // through here and only log a warn.
+    if let Some(crate::cost::BudgetCheck::Exceeded {
+        current_usd,
+        limit_usd,
+        period,
+    }) = crate::cost::pre_call_budget_state(cost_tracker)
+    {
+        anyhow::bail!(
+            "Cost budget already exceeded at turn start: ${:.4} / ${:.2} USD ({:?}). \
+             Refusing to send the request. Raise the limit in [cost], enable \
+             `allow_override` for soft budgeting, or wait for the period to reset.",
+            current_usd,
+            limit_usd,
+            period,
+        );
+    }
+
     let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
         .iter()
         .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
