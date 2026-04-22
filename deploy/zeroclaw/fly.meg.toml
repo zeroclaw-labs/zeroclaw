@@ -9,7 +9,7 @@ primary_region = "iad"
     PERSONA = "meg"
     ZEROCLAW_CARGO_FEATURES = "channel-telegram,channel-slack,backend-postgres"
     # Same note as fly.shane.toml — bump when adi-persona has new content.
-    ADI_PERSONA_REV = "d89eb3ce283cffd415af581af9e32cacb0b3a18d"
+    ADI_PERSONA_REV = "0766b29610f64cb6eb880c7a2893f1b982fa1d83"
 
 [experimental]
   privileged = true

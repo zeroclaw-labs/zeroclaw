@@ -13,7 +13,7 @@ primary_region = "iad"
     # Bump this when you push new content to srmcguirt/adi-persona and
     # want the rebuild to pull it. Value can be any string that changes;
     # using the HEAD SHA makes it traceable.
-    ADI_PERSONA_REV = "d89eb3ce283cffd415af581af9e32cacb0b3a18d"
+    ADI_PERSONA_REV = "0766b29610f64cb6eb880c7a2893f1b982fa1d83"
 
 [experimental]
   # Needed so tailscaled can open /dev/net/tun.
