@@ -374,6 +374,52 @@ pub fn record_usage(
             multiplier = OPERATOR_KEY_CREDIT_MULTIPLIER,
             "Operator key used — credits deducted (2.2× = 2× margin + VAT)"
         );
+
+        // Spec (2026-04-23): after every successful deduction, see if the
+        // user has crossed their auto-recharge trigger and queue a pending
+        // confirmation row so the React modal can prompt them. We do this
+        // synchronously here because (a) it's pure SQLite work and (b) the
+        // chat handler needs the alert decision to fire async dispatch
+        // immediately afterwards. We deliberately do NOT auto-charge —
+        // the safety gate is the modal popup the user must approve.
+        let post_balance = payment_manager.get_balance(user_id).unwrap_or(0);
+        if let Ok(prefs) = payment_manager.get_billing_preferences(user_id) {
+            if prefs.auto_recharge_enabled
+                && prefs.saved_method_id.is_some()
+                && prefs.auto_recharge_package_id.is_some()
+                && post_balance <= prefs.auto_recharge_threshold
+            {
+                // Don't double-queue if a pending row is already waiting
+                // for the user's modal decision.
+                let already_pending = matches!(
+                    payment_manager.list_oldest_pending_auto_recharge(user_id),
+                    Ok(Some(_))
+                );
+                if !already_pending {
+                    if let Some(pkg) = prefs.auto_recharge_package_id.as_deref() {
+                        match payment_manager.create_pending_auto_recharge(
+                            user_id,
+                            pkg,
+                            post_balance,
+                            prefs.auto_recharge_threshold,
+                        ) {
+                            Ok(pending_id) => tracing::info!(
+                                user_id,
+                                pending_id,
+                                balance = post_balance,
+                                threshold = prefs.auto_recharge_threshold,
+                                "queued pending auto-recharge confirmation"
+                            ),
+                            Err(e) => tracing::warn!(
+                                user_id,
+                                error = %e,
+                                "failed to queue pending auto-recharge"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(())

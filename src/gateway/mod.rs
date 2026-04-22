@@ -382,6 +382,12 @@ pub struct AppState {
     /// Payment manager for credit-based billing (Kakao Pay).
     /// Wrapped in Mutex because rusqlite::Connection is not Sync.
     pub payment_manager: Option<Arc<Mutex<PaymentManager>>>,
+    /// Edge-detection state for low-balance alert routing (spec,
+    /// 2026-04-23). Shared across chat handlers so one balance drop
+    /// fires at most one email + one SMS until the user recharges
+    /// back above the threshold. See
+    /// `billing::alerts::LowBalanceAlertState` for the semantics.
+    pub low_balance_alert_state: Arc<crate::billing::alerts::LowBalanceAlertState>,
     /// SQLite-backed user authentication store for multi-user auth.
     /// Used by channel auto-pairing and remote device access.
     pub auth_store: Option<Arc<crate::auth::store::AuthStore>>,
@@ -1423,6 +1429,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         }
     };
 
+    // Process-scoped state for low-balance alert edge detection.
+    // Lives outside `AppState` construction because we both store it on
+    // the state and reuse the same `Arc<...>` in any background tasks
+    // that observe balance changes.
+    let low_balance_alert_state = crate::billing::alerts::LowBalanceAlertState::new();
+
     let state = AppState {
         config: config_state,
         provider,
@@ -1458,6 +1470,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         sync_coordinator,
         relay_client: None, // RelayClient runs as background task, not stored in AppState
         payment_manager,
+        low_balance_alert_state: low_balance_alert_state.clone(),
         auth_store,
         channel_pairing,
         case_sessions: case_sessions_store,
@@ -4487,6 +4500,7 @@ mod tests {
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -4566,6 +4580,7 @@ mod tests {
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -4628,6 +4643,7 @@ mod tests {
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -4691,6 +4707,7 @@ mod tests {
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -5198,6 +5215,7 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -5289,6 +5307,7 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -5361,6 +5380,7 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -5434,6 +5454,7 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -5516,6 +5537,7 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -5590,6 +5612,7 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -5669,6 +5692,7 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -5774,6 +5798,7 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -5849,6 +5874,7 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -5929,6 +5955,7 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -6023,6 +6050,7 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -6096,6 +6124,7 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -6180,6 +6209,7 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -6269,6 +6299,7 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -6348,6 +6379,7 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -6420,6 +6452,7 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),
@@ -6491,6 +6524,7 @@ Reminder set successfully."#;
             sync_coordinator: None,
             relay_client: None,
             payment_manager: None,
+            low_balance_alert_state: crate::billing::alerts::LowBalanceAlertState::new(),
             auth_store: None,
             channel_pairing: None,
             case_sessions: Arc::new(crate::channels::case_session::CaseSessionStore::new()),

@@ -15,7 +15,10 @@ const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434/v1";
 const DEFAULT_SLM_MODEL: &str = "qwen3:0.6b";
 
 /// Confidence threshold below which we delegate to cloud.
-const CLOUD_DELEGATION_THRESHOLD: f64 = 0.6;
+/// Fallback threshold used by `GatekeeperRouter::new` and tests when
+/// no `GatekeeperConfig` is plumbed in. Production code reads
+/// `GatekeeperConfig::confidence_threshold` instead via `from_config`.
+const DEFAULT_CONFIDENCE_THRESHOLD: f64 = 0.6;
 
 // ── SLM task types ───────────────────────────────────────────────
 
@@ -339,6 +342,13 @@ pub struct GatekeeperRouter {
     client: reqwest::Client,
     /// Offline task queue.
     queue: OfflineQueue,
+    /// Confidence floor for the locally-classified decision. When the
+    /// classifier's `confidence` lies BELOW this value, `process_message`
+    /// suppresses the local SLM call and returns
+    /// `local_response=None` so the chat handler escalates to the
+    /// cloud LLM. Pulled from `GatekeeperConfig::confidence_threshold`
+    /// at construction time. Spec (2026-04-22).
+    confidence_threshold: f64,
 }
 
 impl GatekeeperRouter {
@@ -355,6 +365,7 @@ impl GatekeeperRouter {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             queue: OfflineQueue::new(100),
+            confidence_threshold: DEFAULT_CONFIDENCE_THRESHOLD,
         }
     }
 
@@ -370,6 +381,7 @@ impl GatekeeperRouter {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             queue: OfflineQueue::new(100),
+            confidence_threshold: config.confidence_threshold,
         }
     }
 
@@ -454,8 +466,26 @@ impl GatekeeperRouter {
     pub async fn process_message(&self, message: &str) -> GatekeeperResult {
         let decision = self.classify(message);
 
-        // Only attempt local response for Local-routed messages when SLM is available.
-        if decision.target != RoutingTarget::Local || !self.slm_available {
+        // Spec (2026-04-22): even for `RoutingTarget::Local` decisions,
+        // if the classifier's confidence sits below the configured
+        // threshold (default 0.6) the SLM is NOT trusted to answer and
+        // the chat handler escalates the prompt to the cloud LLM.
+        let confidence_below_floor = decision.confidence < self.confidence_threshold;
+        if confidence_below_floor {
+            tracing::info!(
+                confidence = decision.confidence,
+                threshold = self.confidence_threshold,
+                category = ?decision.category,
+                "SLM confidence below threshold — escalating to cloud LLM"
+            );
+        }
+
+        // Only attempt local response for Local-routed messages, when
+        // the SLM is reachable, AND when confidence clears the gate.
+        if decision.target != RoutingTarget::Local
+            || !self.slm_available
+            || confidence_below_floor
+        {
             return GatekeeperResult {
                 decision,
                 local_response: None,
@@ -582,7 +612,7 @@ impl GatekeeperRouter {
             category: TaskCategory::Complex,
             tool_needed: None,
             target: RoutingTarget::Cloud,
-            confidence: CLOUD_DELEGATION_THRESHOLD,
+            confidence: DEFAULT_CONFIDENCE_THRESHOLD,
             reason: "Ambiguous intent — delegating to cloud LLM".into(),
         }
     }

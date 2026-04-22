@@ -22,6 +22,7 @@ pub mod audit;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
 pub mod data_masking;
+pub mod pii_redaction;
 pub mod detect;
 pub mod device_binding;
 pub mod docker;
