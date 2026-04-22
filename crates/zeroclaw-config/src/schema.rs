@@ -7665,6 +7665,10 @@ pub struct IrcConfig {
     pub sasl_password: Option<String>,
     /// Verify TLS certificate (default: true)
     pub verify_tls: Option<bool>,
+    /// When true, only respond to messages that mention the bot.
+    /// Other messages in the channel are silently ignored.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 impl ChannelConfig for IrcConfig {

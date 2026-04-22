@@ -31,6 +31,7 @@ pub struct IrcChannel {
     nickserv_password: Option<String>,
     sasl_password: Option<String>,
     verify_tls: bool,
+    mention_only: bool,
     /// Shared write half of the TLS stream for sending messages.
     writer: Arc<Mutex<Option<WriteHalf>>>,
 }
@@ -233,6 +234,7 @@ pub struct IrcChannelConfig {
     pub nickserv_password: Option<String>,
     pub sasl_password: Option<String>,
     pub verify_tls: bool,
+    pub mention_only: bool,
 }
 
 impl IrcChannel {
@@ -249,6 +251,7 @@ impl IrcChannel {
             nickserv_password: cfg.nickserv_password,
             sasl_password: cfg.sasl_password,
             verify_tls: cfg.verify_tls,
+            mention_only: cfg.mention_only,
             writer: Arc::new(Mutex::new(None)),
         }
     }
@@ -538,6 +541,7 @@ impl Channel for IrcChannel {
                     let target = msg.params.first().map_or("", String::as_str);
                     let text = msg.params.get(1).map_or("", String::as_str);
                     let sender_nick = msg.nick().unwrap_or("unknown");
+                    let is_channel = target.starts_with('#') || target.starts_with('&');
 
                     // Skip messages from NickServ/ChanServ
                     if sender_nick.eq_ignore_ascii_case("NickServ")
@@ -550,9 +554,12 @@ impl Channel for IrcChannel {
                         continue;
                     }
 
+                    if self.mention_only && is_channel && !text.contains(&current_nick) {
+                        continue;
+                    }
+
                     // Determine reply target: if sent to a channel, reply to channel;
                     // if DM (target == our nick), reply to sender
-                    let is_channel = target.starts_with('#') || target.starts_with('&');
                     let reply_target = if is_channel {
                         target.to_string()
                     } else {

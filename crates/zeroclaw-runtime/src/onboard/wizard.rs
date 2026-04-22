@@ -5111,6 +5111,7 @@ fn setup_channels(
                         Some(sasl_password.trim().to_string())
                     },
                     verify_tls: Some(verify_tls),
+                    mention_only: false,
                 });
             }
             ChannelMenuChoice::Webhook => {

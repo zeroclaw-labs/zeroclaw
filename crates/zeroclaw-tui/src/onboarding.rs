@@ -847,6 +847,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     nickserv_password: None,
                     sasl_password: None,
                     verify_tls: None,
+                    mention_only: false,
                 });
             }
         }

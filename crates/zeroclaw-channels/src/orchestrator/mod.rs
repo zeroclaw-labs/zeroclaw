@@ -4203,6 +4203,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 nickserv_password: irc_cfg.nickserv_password.clone(),
                 sasl_password: irc_cfg.sasl_password.clone(),
                 verify_tls: irc_cfg.verify_tls.unwrap_or(true),
+                mention_only: irc_cfg.mention_only,
             })))
         }
         "twitter" => {
@@ -4712,6 +4713,7 @@ fn collect_configured_channels(
                     nickserv_password: irc.nickserv_password.clone(),
                     sasl_password: irc.sasl_password.clone(),
                     verify_tls: irc.verify_tls.unwrap_or(true),
+                    mention_only: irc.mention_only,
                 })),
             });
         } else {
