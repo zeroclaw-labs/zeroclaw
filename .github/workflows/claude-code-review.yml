@@ -1,0 +1,89 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Please review this pull request and provide feedback on:
+            - Code quality and best practices
+            - Potential bugs or issues
+            - Performance considerations
+            - Security concerns
+            - Test coverage
+
+            Use the repository's CLAUDE.md for guidance on style and conventions.
+            Be constructive and helpful in your feedback.
+
+            Use `gh pr comment` with your Bash tool to leave your review as a comment on the PR.
+          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
+
+      - name: Feed review to Paperclip
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DJANGO_SERVICE_TOKEN: ${{ secrets.DJANGO_SERVICE_TOKEN }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          if [ -z "$DJANGO_SERVICE_TOKEN" ]; then
+            echo "DJANGO_SERVICE_TOKEN not set, skipping Paperclip sync"
+            exit 0
+          fi
+
+          REVIEW=$(gh api "repos/${REPO_NAME}/issues/${PR_NUMBER}/comments" \
+            --jq '[.[] | select(.user.login == "claude[bot]")] | last | .body // empty')
+
+          if [ -z "$REVIEW" ]; then
+            echo "No review comment found, skipping"
+            exit 0
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg title "Code Review: ${PR_TITLE} (#${PR_NUMBER})" \
+            --arg repo "$REPO_NAME" \
+            --arg pr_num "$PR_NUMBER" \
+            --arg pr_url "$PR_URL" \
+            --arg author "$PR_AUTHOR" \
+            --arg review "$REVIEW" \
+            '{
+              title: $title,
+              description: ("**Repo:** " + $repo + "\n**PR:** #" + $pr_num + "\n**Author:** " + $author + "\n**URL:** " + $pr_url + "\n\n---\n\n" + $review),
+              status: "approved",
+              priority: "p4_low",
+              task_type: "chore",
+              task_category: "software_dev"
+            }')
+
+          curl -sf -X POST "https://api.lightwave-media.ltd/v1/createOS/tasks/" \
+            -H "X-Service-Token: ${DJANGO_SERVICE_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            && echo "Review synced to Paperclip" \
+            || echo "Paperclip sync failed (non-blocking)"
