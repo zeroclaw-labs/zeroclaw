@@ -689,29 +689,43 @@ impl Agent {
             }
         }
 
+        // Serialize arguments once (after hooks may have mutated them) and
+        // use the same string on the observer event so OTel exporters can
+        // attach the actual JSON payload to the tool span.
+        let args_json = tool_args.to_string();
+        let tool_call_id = call.tool_call_id.clone();
+
         // First try to find tool in static registry, then in activated MCP tools.
         let (result, success) =
             if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
                 match tool.execute(tool_args.clone()).await {
                     Ok(r) => {
-                        self.observer.record_event(&ObserverEvent::ToolCall {
-                            tool: tool_name.clone(),
-                            duration: start.elapsed(),
-                            success: r.success,
-                        });
-                        if r.success {
+                        let (outcome_text, ok) = if r.success {
                             (r.output, true)
                         } else {
                             (format!("Error: {}", r.error.unwrap_or(r.output)), false)
-                        }
-                    }
-                    Err(e) => {
+                        };
                         self.observer.record_event(&ObserverEvent::ToolCall {
                             tool: tool_name.clone(),
+                            tool_call_id: tool_call_id.clone(),
+                            duration: start.elapsed(),
+                            success: ok,
+                            arguments: Some(args_json.clone()),
+                            result: Some(super::loop_::scrub_credentials(&outcome_text)),
+                        });
+                        (outcome_text, ok)
+                    }
+                    Err(e) => {
+                        let err_text = format!("Error executing {}: {e}", tool_name);
+                        self.observer.record_event(&ObserverEvent::ToolCall {
+                            tool: tool_name.clone(),
+                            tool_call_id: tool_call_id.clone(),
                             duration: start.elapsed(),
                             success: false,
+                            arguments: Some(args_json.clone()),
+                            result: Some(super::loop_::scrub_credentials(&err_text)),
                         });
-                        (format!("Error executing {}: {e}", tool_name), false)
+                        (err_text, false)
                     }
                 }
             } else if let Some(activated_arc) = self.activated_tools.as_ref() {
@@ -719,24 +733,32 @@ impl Agent {
                 if let Some(tool) = activated_opt {
                     match tool.execute(tool_args.clone()).await {
                         Ok(r) => {
-                            self.observer.record_event(&ObserverEvent::ToolCall {
-                                tool: tool_name.clone(),
-                                duration: start.elapsed(),
-                                success: r.success,
-                            });
-                            if r.success {
+                            let (outcome_text, ok) = if r.success {
                                 (r.output, true)
                             } else {
                                 (format!("Error: {}", r.error.unwrap_or(r.output)), false)
-                            }
-                        }
-                        Err(e) => {
+                            };
                             self.observer.record_event(&ObserverEvent::ToolCall {
                                 tool: tool_name.clone(),
+                                tool_call_id: tool_call_id.clone(),
+                                duration: start.elapsed(),
+                                success: ok,
+                                arguments: Some(args_json.clone()),
+                                result: Some(super::loop_::scrub_credentials(&outcome_text)),
+                            });
+                            (outcome_text, ok)
+                        }
+                        Err(e) => {
+                            let err_text = format!("Error executing {}: {e}", tool_name);
+                            self.observer.record_event(&ObserverEvent::ToolCall {
+                                tool: tool_name.clone(),
+                                tool_call_id: tool_call_id.clone(),
                                 duration: start.elapsed(),
                                 success: false,
+                                arguments: Some(args_json.clone()),
+                                result: Some(super::loop_::scrub_credentials(&err_text)),
                             });
-                            (format!("Error executing {}: {e}", tool_name), false)
+                            (err_text, false)
                         }
                     }
                 } else {

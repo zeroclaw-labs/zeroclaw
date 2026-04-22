@@ -3829,6 +3829,7 @@ mod tests {
         let result = execute_one_tool(
             "unknown_tool",
             call_arguments,
+            None,
             &[],
             None,
             &observer,
@@ -3860,6 +3861,7 @@ mod tests {
         let outcome = execute_one_tool(
             "extract_text",
             serde_json::json!({ "value": "ok" }),
+            None,
             &[],
             Some(&activated),
             &observer,
@@ -3882,6 +3884,7 @@ mod tests {
         let outcome = execute_one_tool(
             "empty_success",
             serde_json::json!({}),
+            None,
             &tools,
             None,
             &observer,
