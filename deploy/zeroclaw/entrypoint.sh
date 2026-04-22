@@ -50,22 +50,33 @@ else
 fi
 
 # ── Seed config ───────────────────────────────────────────────────
-if [[ ! -f "$ZEROCLAW_CONFIG" ]]; then
-  log "seeding $ZEROCLAW_CONFIG from $ZEROCLAW_SEED"
-  cp "$ZEROCLAW_SEED" "$ZEROCLAW_CONFIG"
+# Always re-seed on boot. Idempotent. Config changes go into the image,
+# not the volume. Switch to "seed once" once we're past early iteration.
+log "seeding $ZEROCLAW_CONFIG from $ZEROCLAW_SEED (always-overwrite mode)"
+cp "$ZEROCLAW_SEED" "$ZEROCLAW_CONFIG"
+chmod 600 "$ZEROCLAW_CONFIG"
 
-  # Per-persona table name (default "memories" if env unset).
-  persona_table="${ZEROCLAW_MEMORY_POSTGRES_TABLE:-memories}"
-  log "setting [memory.postgres] table = $persona_table"
-  if grep -q '^\[memory.postgres\]' "$ZEROCLAW_CONFIG"; then
-    # Add table line under the [memory.postgres] section if missing; else replace.
-    if grep -qE '^\s*table\s*=' "$ZEROCLAW_CONFIG"; then
-      sed -i -E "s|^(\s*)table\s*=.*|\1table = \"$persona_table\"|" "$ZEROCLAW_CONFIG"
-    else
-      sed -i "/^\[memory.postgres\]/a table = \"$persona_table\"" "$ZEROCLAW_CONFIG"
-    fi
-  fi
+# Per-persona table name injected into [memory.postgres] table field.
+persona_table="${ZEROCLAW_MEMORY_POSTGRES_TABLE:-memories}"
+log "setting [memory.postgres] table = $persona_table"
+if grep -qE '^\s*table\s*=' "$ZEROCLAW_CONFIG"; then
+  sed -i -E "s|^(\s*)table\s*=.*|\1table = \"$persona_table\"|" "$ZEROCLAW_CONFIG"
+else
+  sed -i "/^\[memory.postgres\]/a table = \"$persona_table\"" "$ZEROCLAW_CONFIG"
 fi
+
+# ── Interpolate channel tokens from Fly secrets into config ───────
+# zeroclaw doesn't expand ${VAR} in TOML strings at runtime, so do it
+# ourselves. If a secret is unset, leave the ${...} placeholder so
+# zeroclaw will fail loudly at channel-init rather than silently.
+for var in TELEGRAM_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_SIGNING_SECRET; do
+  val="${!var:-}"
+  if [[ -n "$val" ]]; then
+    # Escape any sed-special chars in the value.
+    esc_val=$(printf '%s' "$val" | sed -e 's/[\/&]/\\&/g')
+    sed -i "s|\${$var}|$esc_val|g" "$ZEROCLAW_CONFIG"
+  fi
+done
 
 # ── Launch zeroclaw ───────────────────────────────────────────────
 log "starting zeroclaw daemon ($TAILSCALE_HOSTNAME)"

@@ -35,13 +35,34 @@ auto_approve = [
 ]
 
 [memory]
-backend = "postgres"
+backend   = "postgres"
+auto_save = true
 
 [memory.postgres]
 # Pulled from POSTGRES_URL env (Fly secret). Table created on first
-# connection. Schema stays "public" to keep the default clean, but each
-# persona uses a distinct table name so shane and meg don't collide.
-# Table name is overridden by the per-persona fly.toml's ZEROCLAW_MEMORY_POSTGRES_TABLE env.
-schema           = "zeroclaw"
-max_connections  = 5
+# connection. Per-persona table name is injected by entrypoint.sh from
+# ZEROCLAW_MEMORY_POSTGRES_TABLE (set in fly.<persona>.toml).
+schema               = "zeroclaw"
+max_connections      = 5
 connect_timeout_secs = 10
+
+# ── Channels ──────────────────────────────────────────────────────────
+# Bot tokens come from Fly secrets (TELEGRAM_BOT_TOKEN / SLACK_* —
+# zeroclaw reads them as env vars at runtime). Listing the channel
+# sections here enables the channel supervisor to start them.
+
+[channels.telegram]
+# Token is resolved from TELEGRAM_BOT_TOKEN env var at runtime.
+bot_token     = "${TELEGRAM_BOT_TOKEN}"
+# Empty list = allow all users who DM the bot. Tighten with Telegram
+# user IDs once you know who's expected to talk to this persona.
+allowed_users = []
+mention_only  = false
+
+[channels.slack]
+bot_token      = "${SLACK_BOT_TOKEN}"
+app_token      = "${SLACK_APP_TOKEN}"
+signing_secret = "${SLACK_SIGNING_SECRET}"
+# Socket Mode (app_token starts with xapp-) means no public webhook URL
+# needed — zeroclaw connects out to Slack.
+socket_mode    = true
