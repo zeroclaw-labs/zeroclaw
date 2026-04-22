@@ -771,7 +771,10 @@ mod tests {
             .unwrap();
 
         assert!(result.success, "edit should succeed: {:?}", result.error);
-        assert!(result.output.contains("Download:"), "output should contain Download: line");
+        assert!(
+            result.output.contains("Download:"),
+            "output should contain Download: line"
+        );
         let url_line = result
             .output
             .lines()
@@ -780,7 +783,10 @@ mod tests {
         let url = url_line.strip_prefix("Download: ").unwrap();
         assert!(url.contains("?expires="), "signed URL must contain expires");
         assert!(url.contains("&sig="), "signed URL must contain sig");
-        assert!(url.contains("/download/"), "URL must contain /download/ path");
+        assert!(
+            url.contains("/download/"),
+            "URL must contain /download/ path"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -805,7 +811,10 @@ mod tests {
             .unwrap();
 
         assert!(result.success);
-        assert!(!result.output.contains("Download:"), "no download URL without config");
+        assert!(
+            !result.output.contains("Download:"),
+            "no download URL without config"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -819,7 +828,9 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
         // `.csv` is on the user-deliverable whitelist.
-        tokio::fs::write(dir.join("data.csv"), "a,b\n1,alpha").await.unwrap();
+        tokio::fs::write(dir.join("data.csv"), "a,b\n1,alpha")
+            .await
+            .unwrap();
 
         let tool = FileEditTool::with_download(
             test_security(dir.clone()),

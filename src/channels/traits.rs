@@ -285,12 +285,7 @@ mod tests {
             ) -> anyhow::Result<()> {
                 Ok(())
             }
-            async fn finalize_draft(
-                &self,
-                _r: &str,
-                _id: &str,
-                _t: &str,
-            ) -> anyhow::Result<()> {
+            async fn finalize_draft(&self, _r: &str, _id: &str, _t: &str) -> anyhow::Result<()> {
                 self.finalize_drafts.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }

@@ -369,12 +369,16 @@ pub(crate) async fn deliver_announcement(
         #[cfg(feature = "channel-lark")]
         "feishu" | "lark" => {
             let channel = if let Some(fs) = config.channels_config.feishu.as_ref() {
-                crate::channels::LarkChannel::from_feishu_config(fs).with_workspace_dir(config.workspace_dir.clone())
+                crate::channels::LarkChannel::from_feishu_config(fs)
+                    .with_workspace_dir(config.workspace_dir.clone())
             } else if let Some(lk) = config.channels_config.lark.as_ref() {
                 if channel == "feishu" && !lk.use_feishu {
-                    anyhow::bail!("feishu channel not configured (lark channel exists but use_feishu=false)");
+                    anyhow::bail!(
+                        "feishu channel not configured (lark channel exists but use_feishu=false)"
+                    );
                 }
-                crate::channels::LarkChannel::from_config(lk).with_workspace_dir(config.workspace_dir.clone())
+                crate::channels::LarkChannel::from_config(lk)
+                    .with_workspace_dir(config.workspace_dir.clone())
             } else {
                 anyhow::bail!("{} channel not configured", channel);
             };

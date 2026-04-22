@@ -2139,10 +2139,8 @@ async fn process_channel_message(
                 crate::tools::extract_artifacts(&delivered_response);
             let delivered_response = cleaned_reply;
             let turn_artifacts: Vec<crate::tools::Artifact> = {
-                let mut merged =
-                    extract_artifacts_from_history(&history, history_len_before_tools);
-                let mut seen: HashSet<String> =
-                    merged.iter().map(|a| a.path.clone()).collect();
+                let mut merged = extract_artifacts_from_history(&history, history_len_before_tools);
+                let mut seen: HashSet<String> = merged.iter().map(|a| a.path.clone()).collect();
                 for art in reply_side_artifacts {
                     if seen.insert(art.path.clone()) {
                         merged.push(art);
@@ -7243,7 +7241,9 @@ This is an example JSON object for profile settings."#;
         crate::tools::append_artifacts(&mut raw_output, std::slice::from_ref(&art));
         let tool_result_msg = ChatMessage {
             role: "user".to_string(),
-            content: format!("[Tool results]\n<tool_result name=\"shell\">\n{raw_output}\n</tool_result>"),
+            content: format!(
+                "[Tool results]\n<tool_result name=\"shell\">\n{raw_output}\n</tool_result>"
+            ),
         };
         let artifacts = extract_artifacts_from_history(&[tool_result_msg], 0);
         assert_eq!(artifacts, vec![art]);
@@ -7316,7 +7316,9 @@ This is an example JSON object for profile settings."#;
         let history = vec![
             ChatMessage {
                 role: "user".into(),
-                content: "[Tool results]\n<tool_result name=\"shell\">\nplain output\n</tool_result>".into(),
+                content:
+                    "[Tool results]\n<tool_result name=\"shell\">\nplain output\n</tool_result>"
+                        .into(),
             },
             ChatMessage {
                 role: "assistant".into(),

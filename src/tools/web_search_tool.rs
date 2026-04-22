@@ -195,7 +195,11 @@ impl WebSearchTool {
         self.parse_tavily_results(&json, query)
     }
 
-    fn parse_tavily_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
+    fn parse_tavily_results(
+        &self,
+        json: &serde_json::Value,
+        query: &str,
+    ) -> anyhow::Result<String> {
         let results = json
             .get("results")
             .and_then(|r| r.as_array())
@@ -213,10 +217,7 @@ impl WebSearchTool {
                 .and_then(|t| t.as_str())
                 .unwrap_or("No title");
             let url = result.get("url").and_then(|u| u.as_str()).unwrap_or("");
-            let content = result
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
+            let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
 
             lines.push(format!("{}. {}", i + 1, title));
             lines.push(format!("   {}", url));
@@ -551,8 +552,15 @@ mod tests {
         .unwrap();
 
         // No boot key -- forces reload from config
-        let tool =
-            WebSearchTool::new_with_config("brave".to_string(), None, None, 5, 15, config_path, false);
+        let tool = WebSearchTool::new_with_config(
+            "brave".to_string(),
+            None,
+            None,
+            5,
+            15,
+            config_path,
+            false,
+        );
         let key = tool.resolve_brave_api_key().unwrap();
         assert_eq!(key, "fresh-key-from-disk");
     }
