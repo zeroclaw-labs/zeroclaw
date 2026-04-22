@@ -61,11 +61,28 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Marker placed on a content block to opt it into OpenRouter prompt caching.
+///
+/// Currently only `{"type": "ephemeral"}` is defined. OpenRouter forwards this
+/// field to upstream providers that support prompt caching (Anthropic,
+/// DeepSeek, Qwen). Providers without caching ignore the marker.
+#[derive(Debug, Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    cache_type: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum MessagePart {
-    Text { text: String },
-    ImageUrl { image_url: ImageUrlPart },
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+    ImageUrl {
+        image_url: ImageUrlPart,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -160,6 +177,17 @@ struct UsageInfo {
     prompt_tokens: Option<u64>,
     #[serde(default)]
     completion_tokens: Option<u64>,
+    /// Per-category prompt-token breakdown. Only present when the upstream
+    /// provider returns cached-token accounting. Absent for providers that
+    /// do not support prompt caching.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,6 +329,21 @@ impl OpenRouterProvider {
     }
 
     fn to_message_content(role: &str, content: &str) -> MessageContent {
+        if role == "system" {
+            // Serialize system messages as a single-text-part array so we can
+            // attach `cache_control: {"type": "ephemeral"}`. OpenRouter forwards
+            // this marker to upstream providers that support prompt caching
+            // (Anthropic, DeepSeek, Qwen); providers without caching ignore
+            // the field. The wire shape is identical to a plain-string system
+            // message for ignoring providers, so this is safe across the
+            // provider fleet.
+            return MessageContent::Parts(vec![MessagePart::Text {
+                text: content.to_string(),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                }),
+            }]);
+        }
         if role != "user" {
             return MessageContent::Text(content.to_string());
         }
@@ -315,6 +358,7 @@ impl OpenRouterProvider {
         if !trimmed_text.is_empty() {
             parts.push(MessagePart::Text {
                 text: trimmed_text.to_string(),
+                cache_control: None,
             });
         }
 
@@ -590,10 +634,14 @@ impl Provider for OpenRouterProvider {
             &resp_body,
             "native chat",
         )?;
+        // OpenRouter surfaces cached-token accounting via
+        // `usage.prompt_tokens_details.cached_tokens` when the upstream
+        // provider supports prompt caching. For providers without caching
+        // the field is absent and we report `None`.
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
-            cached_input_tokens: None,
+            cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
         });
         let message = native_response
             .choices
@@ -793,10 +841,14 @@ impl Provider for OpenRouterProvider {
             &resp_body,
             "native chat",
         )?;
+        // OpenRouter surfaces cached-token accounting via
+        // `usage.prompt_tokens_details.cached_tokens` when the upstream
+        // provider supports prompt caching. For providers without caching
+        // the field is absent and we report `None`.
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
-            cached_input_tokens: None,
+            cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
         });
         let message = native_response
             .choices
@@ -1303,6 +1355,192 @@ mod tests {
         let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.usage.is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // prompt caching: request-side serialization
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn system_message_serializes_as_content_block_with_cache_control() {
+        let content = OpenRouterProvider::to_message_content("system", "You are helpful.");
+        let json = serde_json::to_value(&content).unwrap();
+        let parts = json.as_array().expect("system content should be an array");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "You are helpful.");
+        assert_eq!(parts[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn user_message_without_images_serializes_as_plain_string() {
+        let content = OpenRouterProvider::to_message_content("user", "Hello");
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(json.is_string(), "user content should be a plain string");
+        assert_eq!(json.as_str().unwrap(), "Hello");
+    }
+
+    #[test]
+    fn assistant_message_serializes_as_plain_string() {
+        let content = OpenRouterProvider::to_message_content("assistant", "Hi there.");
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(
+            json.is_string(),
+            "assistant content should be a plain string"
+        );
+        assert_eq!(json.as_str().unwrap(), "Hi there.");
+    }
+
+    #[test]
+    fn tool_message_serializes_as_plain_string() {
+        let content = OpenRouterProvider::to_message_content(
+            "tool",
+            r#"{"tool_call_id":"call_1","content":"ok"}"#,
+        );
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(json.is_string(), "tool content should be a plain string");
+    }
+
+    #[test]
+    fn cache_control_absent_on_user_image_text_part() {
+        let content = OpenRouterProvider::to_message_content(
+            "user",
+            "Describe this\n\n[IMAGE:data:image/png;base64,abcd]",
+        );
+        let json = serde_json::to_value(&content).unwrap();
+        let parts = json
+            .as_array()
+            .expect("multimodal content should be an array");
+        let text_part = &parts[0];
+        assert_eq!(text_part["type"], "text");
+        assert!(
+            text_part.get("cache_control").is_none(),
+            "cache_control should not appear on user image text parts (got {:?})",
+            text_part.get("cache_control")
+        );
+    }
+
+    #[test]
+    fn full_native_request_serializes_system_as_blocks_user_as_string() {
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "Be helpful".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hi".into(),
+            },
+        ];
+        let native = OpenRouterProvider::convert_messages(&messages);
+        assert_eq!(native.len(), 2);
+
+        let sys_json = serde_json::to_value(&native[0].content).unwrap();
+        let sys_parts = sys_json.as_array().expect("system content should be array");
+        assert_eq!(sys_parts[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(sys_parts[0]["text"], "Be helpful");
+
+        let user_json = serde_json::to_value(&native[1].content).unwrap();
+        assert!(user_json.is_string(), "user content should be a string");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // prompt caching: response-side deserialization and token mapping
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn usage_info_deserializes_prompt_tokens_details() {
+        let json = r#"{
+            "prompt_tokens": 25000,
+            "completion_tokens": 500,
+            "prompt_tokens_details": {"cached_tokens": 20000}
+        }"#;
+        let usage: UsageInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.prompt_tokens, Some(25000));
+        assert_eq!(usage.completion_tokens, Some(500));
+        let details = usage
+            .prompt_tokens_details
+            .expect("prompt_tokens_details should deserialize");
+        assert_eq!(details.cached_tokens, Some(20000));
+    }
+
+    #[test]
+    fn usage_info_deserializes_without_prompt_tokens_details() {
+        let json = r#"{"prompt_tokens": 100, "completion_tokens": 50}"#;
+        let usage: UsageInfo = serde_json::from_str(json).unwrap();
+        assert!(
+            usage.prompt_tokens_details.is_none(),
+            "absent field should deserialize to None (backward compat with providers without caching)"
+        );
+    }
+
+    #[test]
+    fn usage_info_deserializes_empty_prompt_tokens_details() {
+        let json = r#"{
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {}
+        }"#;
+        let usage: UsageInfo = serde_json::from_str(json).unwrap();
+        let details = usage.prompt_tokens_details.unwrap();
+        assert!(details.cached_tokens.is_none());
+    }
+
+    #[test]
+    fn usage_info_deserializes_zero_cached_tokens_as_some_zero() {
+        let json = r#"{
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {"cached_tokens": 0}
+        }"#;
+        let usage: UsageInfo = serde_json::from_str(json).unwrap();
+        let details = usage.prompt_tokens_details.unwrap();
+        assert_eq!(details.cached_tokens, Some(0));
+    }
+
+    #[test]
+    fn native_response_maps_cached_tokens_into_token_usage() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 25000,
+                "completion_tokens": 500,
+                "prompt_tokens_details": {"cached_tokens": 15000}
+            }
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp
+            .usage
+            .map(|u| TokenUsage {
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
+                cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            })
+            .expect("usage should be Some");
+        assert_eq!(usage.input_tokens, Some(25000));
+        assert_eq!(usage.output_tokens, Some(500));
+        assert_eq!(usage.cached_input_tokens, Some(15000));
+    }
+
+    #[test]
+    fn native_response_maps_none_when_prompt_tokens_details_absent() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50}
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp
+            .usage
+            .map(|u| TokenUsage {
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
+                cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            })
+            .expect("usage should be Some");
+        assert!(
+            usage.cached_input_tokens.is_none(),
+            "absent details should map to None (providers without caching are unaffected)"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════
