@@ -10,7 +10,7 @@
 //!
 //! | Method            | Description                              |
 //! |-------------------|------------------------------------------|
-//! | `initialize`      | Handshake — returns server capabilities (incl. defaultModel) |
+//! | `initialize`      | Handshake — returns server capabilities (incl. defaultModel or null) |
 //! | `session/new`     | Create an isolated agent session          |
 //! | `session/prompt`  | Send a prompt, stream back `session/update` events |
 //! | `session/stop`    | Gracefully terminate a session            |
@@ -224,12 +224,13 @@ impl AcpServer {
     // ── Method handlers ──────────────────────────────────────────
 
     fn handle_initialize(&self, _params: &Value) -> RpcResult {
-        let default_model = self
+        let default_model: Value = self
             .config
             .providers
             .fallback_provider()
             .and_then(|e| e.model.clone())
-            .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string());
+            .map(|m| serde_json::json!(m))
+            .unwrap_or(Value::Null);
 
         Ok(serde_json::json!({
             "protocolVersion": "1.0",
@@ -737,5 +738,33 @@ mod tests {
         let missing_params = serde_json::json!({});
         let result = AcpServer::parse_prompt(&missing_params);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn handle_initialize_default_model_null_when_unconfigured() {
+        let server = AcpServer::new(Config::default(), AcpServerConfig::default());
+        let result = server.handle_initialize(&serde_json::json!({})).unwrap();
+        assert!(
+            result["capabilities"]["defaultModel"].is_null(),
+            "defaultModel must be null when no provider is configured, got: {}",
+            result["capabilities"]["defaultModel"]
+        );
+    }
+
+    #[test]
+    fn handle_initialize_default_model_reflects_configured_provider() {
+        use zeroclaw_config::schema::ModelProviderConfig;
+        let mut config = Config::default();
+        config.providers.fallback = Some("myprovider".to_string());
+        config.providers.models.insert(
+            "myprovider".to_string(),
+            ModelProviderConfig {
+                model: Some("llama3.2".to_string()),
+                ..Default::default()
+            },
+        );
+        let server = AcpServer::new(config, AcpServerConfig::default());
+        let result = server.handle_initialize(&serde_json::json!({})).unwrap();
+        assert_eq!(result["capabilities"]["defaultModel"], "llama3.2");
     }
 }
