@@ -74,3 +74,66 @@ async fn list_models_surfaces_non_2xx_as_error() {
     assert!(msg.contains("502"), "error should mention 502: {msg}");
     assert!(msg.contains("upstream down"), "error should include body: {msg}");
 }
+
+use std::io::Write;
+
+fn write_tiers_file(yaml: &str) -> tempfile::NamedTempFile {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(yaml.as_bytes()).unwrap();
+    f
+}
+
+#[tokio::test]
+async fn list_tiers_reads_yaml() {
+    let f = write_tiers_file(
+        "tiers:\n  - name: chat\n    model: claude-sonnet-4-6\n    description: default\n  - name: thinking\n    model: claude-opus-4-7\n    description: deep reasoning\n",
+    );
+    let server = MockServer::start().await;
+    let client = ModelCatalogClient::new(
+        format!("{}/v1", server.uri()),
+        "test-key",
+        f.path().to_path_buf(),
+    )
+    .unwrap();
+
+    let tiers = client.list_tiers().await.unwrap();
+    assert_eq!(tiers.len(), 2);
+    assert_eq!(tiers[0].name, "chat");
+    assert_eq!(tiers[1].model, "claude-opus-4-7");
+}
+
+#[tokio::test]
+async fn resolve_tier_returns_model_case_insensitive() {
+    let f = write_tiers_file(
+        "tiers:\n  - name: thinking\n    model: claude-opus-4-7\n    description: \"\"\n",
+    );
+    let server = MockServer::start().await;
+    let client = ModelCatalogClient::new(
+        format!("{}/v1", server.uri()),
+        "test-key",
+        f.path().to_path_buf(),
+    )
+    .unwrap();
+
+    let model = client.resolve_tier("Thinking").await.unwrap();
+    assert_eq!(model, "claude-opus-4-7");
+}
+
+#[tokio::test]
+async fn resolve_tier_rejects_unknown_tier() {
+    let f = write_tiers_file(
+        "tiers:\n  - name: chat\n    model: claude-sonnet-4-6\n    description: \"\"\n",
+    );
+    let server = MockServer::start().await;
+    let client = ModelCatalogClient::new(
+        format!("{}/v1", server.uri()),
+        "test-key",
+        f.path().to_path_buf(),
+    )
+    .unwrap();
+
+    let err = client.resolve_tier("ultra").await.unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("unknown tier"));
+    assert!(msg.contains("chat"));
+}

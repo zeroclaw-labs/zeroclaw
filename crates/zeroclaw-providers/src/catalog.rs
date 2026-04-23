@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -107,10 +107,26 @@ impl ModelCatalogClient {
     }
 
     pub async fn list_tiers(&self) -> Result<Vec<TierEntry>> {
-        anyhow::bail!("not yet implemented")
+        let bytes = tokio::fs::read(&self.tiers_path)
+            .await
+            .with_context(|| format!("reading tier config at {}", self.tiers_path.display()))?;
+        let parsed: TiersFile = serde_yaml::from_slice(&bytes)
+            .with_context(|| format!("parsing YAML at {}", self.tiers_path.display()))?;
+        Ok(parsed.tiers)
     }
 
-    pub async fn resolve_tier(&self, _tier: &str) -> Result<String> {
-        anyhow::bail!("not yet implemented")
+    pub async fn resolve_tier(&self, tier: &str) -> Result<String> {
+        let tiers = self.list_tiers().await?;
+        tiers
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(tier))
+            .map(|t| t.model.clone())
+            .ok_or_else(|| {
+                let available: Vec<&str> = tiers.iter().map(|t| t.name.as_str()).collect();
+                anyhow::anyhow!(
+                    "unknown tier '{tier}'. Available tiers: {}",
+                    available.join(", ")
+                )
+            })
     }
 }
