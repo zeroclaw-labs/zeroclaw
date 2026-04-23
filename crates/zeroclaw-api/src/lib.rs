@@ -33,4 +33,8 @@ tokio::task_local! {
     /// Override for tool choice mode, set by the agent loop.
     /// Read by providers that support native tool calling.
     pub static TOOL_CHOICE_OVERRIDE: Option<String>;
+
+    /// Session key for the currently active session.
+    /// Set by the gateway WebSocket handler, read by SessionsCurrentTool.
+    pub static TOOL_LOOP_SESSION_KEY: Option<String>;
 }

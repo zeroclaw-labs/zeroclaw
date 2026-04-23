@@ -428,7 +428,14 @@ async fn process_chat_message(
     // instead — `turn_streamed` writes to the channel and we drain it
     // from the other branch.
     let content_owned = content.to_string();
-    let turn_fut = async { agent.turn_streamed(&content_owned, event_tx).await };
+    let session_key_owned = session_key.to_string();
+    let turn_fut = async {
+        zeroclaw_runtime::agent::loop_::scope_session_key(
+            Some(session_key_owned),
+            agent.turn_streamed(&content_owned, event_tx),
+        )
+        .await
+    };
 
     // Drive both futures concurrently: the agent turn produces events
     // and we relay them over WebSocket.
