@@ -54,11 +54,39 @@ ARG TAILSCALE_VERSION=1.80.2
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates curl iproute2 procps tini \
+        unzip ripgrep \
+        libnss3 libnspr4 \
+        libatk1.0-0 libatk-bridge2.0-0 \
+        libcups2 libdrm2 libgbm1 \
+        libxcomposite1 libxdamage1 libxrandr2 libxfixes3 libxkbcommon0 \
+        libasound2 libpango-1.0-0 libcairo2 \
+        fonts-liberation \
     && curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_${TAILSCALE_VERSION}_amd64.tgz" -o /tmp/tailscale.tgz \
     && tar -xzf /tmp/tailscale.tgz -C /tmp \
     && install -m 0755 "/tmp/tailscale_${TAILSCALE_VERSION}_amd64/tailscaled" /usr/local/bin/tailscaled \
     && install -m 0755 "/tmp/tailscale_${TAILSCALE_VERSION}_amd64/tailscale"  /usr/local/bin/tailscale \
     && rm -rf /tmp/tailscale* /var/lib/apt/lists/*
+
+# ── Bun (pinned) + volume-backed global install state ───────────────
+# Bun binary lives in the image for fast, reproducible startup.
+# Global installs ($BUN_INSTALL) and per-project node_modules land on
+# /zeroclaw-data (Fly volume), so agent-installed packages survive
+# machine restarts and redeploys.
+ARG BUN_VERSION=1.1.38
+RUN curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip" -o /tmp/bun.zip \
+    && unzip -q /tmp/bun.zip -d /tmp \
+    && install -m 0755 /tmp/bun-linux-x64/bun /usr/local/bin/bun \
+    && ln -sf /usr/local/bin/bun /usr/local/bin/bunx \
+    && rm -rf /tmp/bun*
+
+ENV BUN_INSTALL=/zeroclaw-data/bun
+ENV PATH=/zeroclaw-data/bun/bin:$PATH
+
+# ── Claude Code CLI ─────────────────────────────────────────────────
+# Single native binary; no Node runtime required. Auth is not baked
+# in — set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN as a Fly
+# secret per persona.
+RUN curl -fsSL https://claude.ai/install.sh | bash -s -- --install-dir /usr/local
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=web-builder /web/dist /app/web/dist
