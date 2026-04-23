@@ -7,11 +7,10 @@ relates-to:
   - crates/zeroclaw-plugins
 ---
 
-# WASM Plugin Protocol Reference
+# Plugin Protocol
 
 This document defines the protocol between ZeroClaw's plugin host and WASM
-plugin modules. See [ADR-003](../../architecture/decisions/adr-003-wasm-extism-plugin-model.md)
-for the architectural rationale.
+plugin modules.
 
 ## Plugin structure
 

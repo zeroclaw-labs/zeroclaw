@@ -1,4 +1,4 @@
-# Custom Provider Configuration
+# Custom Providers
 
 ZeroClaw supports custom API endpoints for both OpenAI-compatible and Anthropic-compatible providers.
 

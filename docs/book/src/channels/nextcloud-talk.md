@@ -1,4 +1,4 @@
-# Nextcloud Talk Setup
+# Nextcloud Talk
 
 This guide covers native Nextcloud Talk integration for ZeroClaw.
 

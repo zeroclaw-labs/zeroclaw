@@ -1,4 +1,4 @@
-# Browser Automation Setup Guide
+# Browser Automation
 
 This guide covers setting up browser automation capabilities in ZeroClaw, including both headless automation and GUI access via VNC.
 

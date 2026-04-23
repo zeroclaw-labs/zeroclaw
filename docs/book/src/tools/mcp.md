@@ -1,4 +1,4 @@
-# MCP Server Registration
+# MCP
 
 ZeroClaw supports the **Model Context Protocol (MCP)**, allowing you to extend the agent's capabilities with external tools and context providers. This guide explains how to register and configure MCP servers.
 

@@ -1,4 +1,4 @@
-# Mattermost Integration Guide
+# Mattermost
 
 ZeroClaw supports native integration with Mattermost via its REST API v4. This integration is ideal for self-hosted, private, or air-gapped environments where sovereign communication is a requirement.
 

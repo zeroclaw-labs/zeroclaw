@@ -1,4 +1,4 @@
-# Z.AI GLM Setup
+# Z.AI GLM
 
 ZeroClaw supports Z.AI's GLM models through OpenAI-compatible endpoints.
 This guide covers practical setup options that match current ZeroClaw provider behavior.

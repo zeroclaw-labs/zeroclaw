@@ -1,4 +1,4 @@
-# Matrix E2EE Guide
+# Matrix
 
 This guide explains how to run ZeroClaw reliably in Matrix rooms, including end-to-end encrypted (E2EE) rooms.
 

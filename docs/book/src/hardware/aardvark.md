@@ -1,4 +1,4 @@
-# Aardvark Integration — How It Works
+# Aardvark
 
 A plain-language walkthrough of every piece and how they connect.
 

@@ -1,4 +1,4 @@
-# OpenAI Temperature Compatibility Reference
+# OpenAI Temperature Compatibility
 
 This document provides empirical evidence for temperature parameter compatibility across OpenAI models.
 

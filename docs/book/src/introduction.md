@@ -11,7 +11,9 @@ platform setup, operations, security, hardware, and developer extension points.
 ## Where to start
 
 - New to ZeroClaw? → [One-click bootstrap](./setup/one-click-bootstrap.md)
-- Wiring up a chat platform? → see **Setup Guides**
+- Wiring up a chat platform? → see **Channels**
+- Pointing it at an LLM? → see **Providers**
+- Adding capabilities? → see **Tools**
 - Running it in production? → [Operations runbook](./ops/operations-runbook.md)
 - Building on top of it? → see **Developing**
 - Looking up a flag or config key? → see **Reference**
