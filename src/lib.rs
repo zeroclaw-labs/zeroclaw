@@ -47,6 +47,7 @@ pub mod config;
 #[cfg(feature = "createos")]
 pub mod createos;
 pub mod daemon;
+pub mod fdx;
 pub mod gateway;
 pub mod health;
 pub(crate) mod hooks;

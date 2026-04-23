@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/lightwave-macos"]
+members = [".", "crates/lightwave-macos", "crates/lightwave-pyo3"]
 resolver = "2"
 
 [package]
@@ -59,6 +59,9 @@ urlencoding = "2.1"
 
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"
+
+# XML parsing (FDX screenplay parser)
+quick-xml = "0.37"
 
 # Browser automation backend (optional)
 fantoccini = { version = "0.22.1", optional = true, default-features = false, features = ["rustls-tls"] }

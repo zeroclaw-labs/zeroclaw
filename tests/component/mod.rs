@@ -1,5 +1,6 @@
 mod config_persistence;
 mod config_schema;
+mod fdx_parser;
 // Dockerfile was deleted in Phase 1.2 (Augusta is native macOS, no Docker)
 // mod dockerignore_test;
 #[cfg(feature = "gateway")]
