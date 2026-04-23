@@ -165,33 +165,33 @@ impl ModelSwitchTool {
             }
         }
 
-        if let Some(catalog) = &self.catalog {
-            if provider.starts_with("custom:") {
-                match catalog.list_models().await {
-                    Ok(models) => {
-                        let known = models.iter().any(|m| m.id == model);
-                        if !known {
-                            let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-                            return Ok(ToolResult {
-                                success: false,
-                                output: serde_json::to_string_pretty(&json!({
-                                    "available_models": ids
-                                }))?,
-                                error: Some(format!(
-                                    "Unknown model '{model}' for provider '{provider}'. See available_models."
-                                )),
-                            });
-                        }
-                    }
-                    Err(e) => {
+        if let Some(catalog) = &self.catalog
+            && provider.starts_with("custom:")
+        {
+            match catalog.list_models().await {
+                Ok(models) => {
+                    let known = models.iter().any(|m| m.id == model);
+                    if !known {
+                        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: serde_json::to_string_pretty(&json!({
+                                "available_models": ids
+                            }))?,
                             error: Some(format!(
-                                "cannot validate model: catalog unreachable: {e:#}"
+                                "Unknown model '{model}' for provider '{provider}'. See available_models."
                             )),
                         });
                     }
+                }
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "cannot validate model: catalog unreachable: {e:#}"
+                        )),
+                    });
                 }
             }
         }
@@ -243,29 +243,29 @@ impl ModelSwitchTool {
 
         // If a catalog is wired and the caller either asked for the catalog-
         // backed provider or omitted the parameter, return the live list.
-        if let Some(catalog) = &self.catalog {
-            if provider.is_empty() || provider.starts_with("custom:") {
-                match catalog.list_models().await {
-                    Ok(models) => {
-                        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-                        return Ok(ToolResult {
-                            success: true,
-                            output: serde_json::to_string_pretty(&json!({
-                                "provider": if provider.is_empty() { "catalog" } else { provider },
-                                "models": ids,
-                                "source": "live",
-                                "count": models.len()
-                            }))?,
-                            error: None,
-                        });
-                    }
-                    Err(e) => {
-                        return Ok(ToolResult {
-                            success: false,
-                            output: String::new(),
-                            error: Some(format!("catalog unavailable: {e:#}")),
-                        });
-                    }
+        if let Some(catalog) = &self.catalog
+            && (provider.is_empty() || provider.starts_with("custom:"))
+        {
+            match catalog.list_models().await {
+                Ok(models) => {
+                    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+                    return Ok(ToolResult {
+                        success: true,
+                        output: serde_json::to_string_pretty(&json!({
+                            "provider": if provider.is_empty() { "catalog" } else { provider },
+                            "models": ids,
+                            "source": "live",
+                            "count": models.len()
+                        }))?,
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("catalog unavailable: {e:#}")),
+                    });
                 }
             }
         }

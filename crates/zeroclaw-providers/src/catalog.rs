@@ -75,10 +75,10 @@ impl ModelCatalogClient {
     pub async fn list_models(&self) -> Result<Vec<ModelEntry>> {
         {
             let cache = self.cache.lock().await;
-            if let Some((models, fetched_at)) = &cache.models {
-                if fetched_at.elapsed() < CATALOG_TTL {
-                    return Ok(models.clone());
-                }
+            if let Some((models, fetched_at)) = &cache.models
+                && fetched_at.elapsed() < CATALOG_TTL
+            {
+                return Ok(models.clone());
             }
         }
 
