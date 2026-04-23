@@ -224,12 +224,19 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     let lim = i64::try_from(config.scheduler.max_tasks.max(1))
         .context("Scheduler max_tasks overflows i64")?;
     with_connection(config, |conn| {
+        // Safety net: skip jobs whose `remaining_runs` has been decremented to
+        // 0 but not yet removed (e.g. crash between apply_bounds_after_run's
+        // update and remove). `apply_bounds_after_run` is still the primary
+        // cleanup path; this filter just prevents re-execution if that path
+        // was interrupted mid-flight.
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                     allowed_tools, source, remaining_runs, expires_until
              FROM cron_jobs
-             WHERE enabled = 1 AND next_run <= ?1
+             WHERE enabled = 1
+               AND next_run <= ?1
+               AND (remaining_runs IS NULL OR remaining_runs > 0)
              ORDER BY next_run ASC
              LIMIT ?2",
         )?;
@@ -254,12 +261,15 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
 /// restart, etc.).
 pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     with_connection(config, |conn| {
+        // See `due_jobs` for why exhausted jobs are filtered here too.
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                     allowed_tools, source, remaining_runs, expires_until
              FROM cron_jobs
-             WHERE enabled = 1 AND next_run <= ?1
+             WHERE enabled = 1
+               AND next_run <= ?1
+               AND (remaining_runs IS NULL OR remaining_runs > 0)
              ORDER BY next_run ASC",
         )?;
 
@@ -1185,6 +1195,33 @@ mod tests {
         .unwrap();
         let due_after_disable = due_jobs(&config, far_future).unwrap();
         assert!(due_after_disable.is_empty());
+    }
+
+    #[test]
+    fn due_jobs_skips_exhausted_remaining_runs() {
+        // A job whose `remaining_runs` has been decremented to 0 but not yet
+        // removed (e.g. crashed between update and remove) must not be
+        // re-executed the next tick.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_job(&config, "* * * * *", "echo exhausted").unwrap();
+        update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                remaining_runs: Some(0),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        let far_future = Utc::now() + ChronoDuration::days(365);
+        let due = due_jobs(&config, far_future).unwrap();
+        assert!(
+            due.is_empty(),
+            "exhausted job must not be returned by due_jobs"
+        );
     }
 
     #[test]

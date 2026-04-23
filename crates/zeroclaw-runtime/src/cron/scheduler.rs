@@ -516,7 +516,11 @@ fn parse_shell_envelope(output: &str) -> Option<(String, String)> {
     let after_status = &rest[nl + 1..];
     let after_stdout = after_status.strip_prefix("stdout:\n")?;
     let stderr_marker = "\nstderr:\n";
-    let stderr_idx = after_stdout.find(stderr_marker)?;
+    // Match the LAST occurrence: the legitimate boundary between stdout and
+    // stderr is always the final `\nstderr:\n` in the envelope. Using `.find`
+    // would split at the wrong point if stdout itself contained the literal
+    // marker (e.g. a command that echoes the string "stderr:").
+    let stderr_idx = after_stdout.rfind(stderr_marker)?;
     let stdout = after_stdout[..stderr_idx].to_string();
     let stderr = after_stdout[stderr_idx + stderr_marker.len()..].to_string();
     Some((stdout, stderr))
@@ -528,14 +532,13 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         return Ok(());
     }
 
-    let channel = delivery
-        .channel
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("delivery.channel is required for announce mode"))?;
+    let channel = delivery.channel.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("delivery.channel is required when configuring channel delivery")
+    })?;
     let target = delivery
         .to
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
+        .ok_or_else(|| anyhow::anyhow!("delivery.to is required when delivery.channel is set"))?;
 
     deliver_announcement(config, channel, target, output).await
 }
@@ -812,6 +815,112 @@ mod tests {
         // Malformed envelope (e.g. security block message) is passed through.
         let msg = "blocked by security policy: ...";
         assert_eq!(format_output_for_delivery(&job, false, msg), msg);
+    }
+
+    #[test]
+    fn format_output_for_delivery_handles_embedded_stderr_marker_in_stdout() {
+        // If the command's stdout itself contains the literal `\nstderr:\n`
+        // sequence, `.find` would split at the first occurrence and misroute
+        // real stdout into stderr. `.rfind` binds to the real boundary.
+        let job = test_job("echo tricky");
+        let envelope = "status=exit status: 0\nstdout:\nline1\nstderr:\nfake\nstderr:\nreal";
+        // success=true, stderr="real" is non-empty → envelope is preserved
+        // verbatim. The test is that it parses correctly (no panic, no wrong
+        // split) rather than stripping it.
+        assert_eq!(format_output_for_delivery(&job, true, envelope), envelope);
+    }
+
+    #[test]
+    fn parse_shell_envelope_splits_at_last_stderr_marker() {
+        let envelope = "status=exit status: 0\nstdout:\nline1\nstderr:\nfake\nstderr:\nreal";
+        let (stdout, stderr) = parse_shell_envelope(envelope).unwrap();
+        assert_eq!(stdout, "line1\nstderr:\nfake");
+        assert_eq!(stderr, "real");
+    }
+
+    #[tokio::test]
+    async fn apply_bounds_decrements_remaining_runs_and_keeps_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, "*/5 * * * *", "echo x").unwrap();
+        cron::update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                remaining_runs: Some(2),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        apply_bounds_after_run(&config, &job.id);
+
+        let after = cron::get_job(&config, &job.id).unwrap();
+        assert_eq!(after.remaining_runs, Some(1));
+    }
+
+    #[tokio::test]
+    async fn apply_bounds_removes_job_when_remaining_runs_exhausts() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, "*/5 * * * *", "echo x").unwrap();
+        cron::update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                remaining_runs: Some(1),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        apply_bounds_after_run(&config, &job.id);
+
+        assert!(cron::get_job(&config, &job.id).is_err());
+    }
+
+    #[tokio::test]
+    async fn apply_bounds_removes_job_when_expiry_reached() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, "*/5 * * * *", "echo x").unwrap();
+        // next_run is set by add_job; force expires_until into the past so the
+        // apply_bounds check `current.next_run >= expiry` fires.
+        cron::update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                expires_until: Some(Utc::now() - ChronoDuration::hours(1)),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        apply_bounds_after_run(&config, &job.id);
+
+        assert!(cron::get_job(&config, &job.id).is_err());
+    }
+
+    #[tokio::test]
+    async fn apply_bounds_keeps_job_when_expiry_is_in_future() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, "*/5 * * * *", "echo x").unwrap();
+        cron::update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                expires_until: Some(Utc::now() + ChronoDuration::days(1)),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        apply_bounds_after_run(&config, &job.id);
+
+        let after = cron::get_job(&config, &job.id).unwrap();
+        assert_eq!(after.remaining_runs, None);
+        assert!(after.expires_until.is_some());
     }
 
     #[test]
