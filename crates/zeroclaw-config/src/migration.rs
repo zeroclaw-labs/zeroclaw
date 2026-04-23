@@ -202,54 +202,51 @@ pub fn migrate_v2_to_v3(table: &mut toml::Table) {
 }
 
 pub fn prepare_table(table: &mut toml::Table) {
-    // Migrate channels_config.matrix.room_id → channels_config.matrix.allowed_rooms
-    for key in &["channels_config", "channels"] {
-        if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
-            && let Some(toml::Value::Table(matrix)) = channels.get_mut("matrix")
-            && let Some(toml::Value::String(room_id)) = matrix.remove("room_id")
-            && !room_id.is_empty()
-        {
-            let rooms = matrix
-                .entry("allowed_rooms")
-                .or_insert_with(|| toml::Value::Array(Vec::new()));
-            if let toml::Value::Array(arr) = rooms {
-                let already_present = arr.iter().any(|v| v.as_str() == Some(room_id.as_str()));
-                if !already_present {
-                    arr.push(toml::Value::String(room_id));
-                }
-            }
-        }
-    }
-
-    // Migrate channels.slack.channel_id → channels.slack.channel_ids
-    for key in &["channels_config", "channels"] {
-        if let Some(toml::Value::Table(channels)) = table.get_mut(*key)
-            && let Some(toml::Value::Table(slack)) = channels.get_mut("slack")
-            && let Some(toml::Value::String(channel_id)) = slack.remove("channel_id")
-            && !channel_id.is_empty()
-            && channel_id != "*"
-        {
-            let ids = slack
-                .entry("channel_ids")
-                .or_insert_with(|| toml::Value::Array(Vec::new()));
-            if let toml::Value::Array(arr) = ids {
-                let already_present = arr.iter().any(|v| v.as_str() == Some(channel_id.as_str()));
-                if !already_present {
-                    arr.push(toml::Value::String(channel_id));
-                }
-            }
-        }
-    }
-
-    migrate_v2_to_v3(table);
-
-    // Rename legacy `channels_config` key to `channels`
+    // Rename legacy `channels_config` key to `channels` first so all subsequent
+    // migrations only need to look at `"channels"`.
     if table.contains_key("channels_config")
         && !table.contains_key("channels")
         && let Some(val) = table.remove("channels_config")
     {
         table.insert("channels".to_string(), val);
     }
+
+    // Migrate channels.matrix.room_id → channels.matrix.allowed_rooms
+    if let Some(toml::Value::Table(channels)) = table.get_mut("channels")
+        && let Some(toml::Value::Table(matrix)) = channels.get_mut("matrix")
+        && let Some(toml::Value::String(room_id)) = matrix.remove("room_id")
+        && !room_id.is_empty()
+    {
+        let rooms = matrix
+            .entry("allowed_rooms")
+            .or_insert_with(|| toml::Value::Array(Vec::new()));
+        if let toml::Value::Array(arr) = rooms {
+            let already_present = arr.iter().any(|v| v.as_str() == Some(room_id.as_str()));
+            if !already_present {
+                arr.push(toml::Value::String(room_id));
+            }
+        }
+    }
+
+    // Migrate channels.slack.channel_id → channels.slack.channel_ids
+    if let Some(toml::Value::Table(channels)) = table.get_mut("channels")
+        && let Some(toml::Value::Table(slack)) = channels.get_mut("slack")
+        && let Some(toml::Value::String(channel_id)) = slack.remove("channel_id")
+        && !channel_id.is_empty()
+        && channel_id != "*"
+    {
+        let ids = slack
+            .entry("channel_ids")
+            .or_insert_with(|| toml::Value::Array(Vec::new()));
+        if let toml::Value::Array(arr) = ids {
+            let already_present = arr.iter().any(|v| v.as_str() == Some(channel_id.as_str()));
+            if !already_present {
+                arr.push(toml::Value::String(channel_id));
+            }
+        }
+    }
+
+    migrate_v2_to_v3(table);
 }
 
 // ── File-level migration (comment-preserving) ───────────────────────────────
@@ -475,6 +472,7 @@ channel_id = "town-square"
         let mut table: toml::Table = toml::from_str(
             r#"
 [channels.mattermost]
+url = "https://mm.example.com"
 bot_token = "mytoken"
 "#,
         )
