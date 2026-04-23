@@ -187,7 +187,6 @@ description = "Ship safely"
             result.error.as_deref(),
             Some("Unknown skill 'calendar'. Available skills: weather")
         );
-    
     }
 
     #[tokio::test]
@@ -211,10 +210,7 @@ description = "Ship safely"
         // Construct with allow_scripts=true. Pre-fix this resolved to false
         // inside the loader and the skill was skipped.
         let tool = ReadSkillTool::new(tmp.path().join("workspace"), false, None, true);
-        let result = tool
-            .execute(json!({ "name": "setup" }))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({ "name": "setup" })).await.unwrap();
 
         assert!(
             result.success,
