@@ -115,6 +115,15 @@ impl ModelCatalogClient {
         Ok(parsed.tiers)
     }
 
+    /// Returns the provider key (e.g. `custom:http://adi-cliproxy.internal:8317/v1`)
+    /// that callers should use when staging a model switch that targets this
+    /// catalog's provider. The key preserves the `/v1` suffix because the
+    /// production config expects the full base URL to follow `custom:`.
+    pub fn provider_key(&self) -> String {
+        let trimmed = self.base_url.trim_end_matches('/');
+        format!("custom:{trimmed}")
+    }
+
     pub async fn resolve_tier(&self, tier: &str) -> Result<String> {
         let tiers = self.list_tiers().await?;
         tiers

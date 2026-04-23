@@ -74,7 +74,7 @@ impl Tool for ModelSwitchTool {
 
         match action {
             "get" => self.handle_get(),
-            "set" => self.handle_set(&args),
+            "set" => self.handle_set(&args).await,
             "set_tier" => self.handle_set_tier(&args).await,
             "list_providers" => self.handle_list_providers(),
             "list_models" => self.handle_list_models(&args).await,
@@ -106,7 +106,7 @@ impl ModelSwitchTool {
         })
     }
 
-    fn handle_set(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn handle_set(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         let provider = args.get("provider").and_then(|v| v.as_str());
 
         let provider = match provider {
@@ -158,6 +158,35 @@ impl ModelSwitchTool {
                         provider
                     )),
                 });
+            }
+        }
+
+        if let Some(catalog) = &self.catalog {
+            if provider.starts_with("custom:") {
+                match catalog.list_models().await {
+                    Ok(models) => {
+                        let known = models.iter().any(|m| m.id == model);
+                        if !known {
+                            let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+                            return Ok(ToolResult {
+                                success: false,
+                                output: serde_json::to_string_pretty(&json!({
+                                    "available_models": ids
+                                }))?,
+                                error: Some(format!(
+                                    "Unknown model '{model}' for provider '{provider}'. See available_models."
+                                )),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("cannot validate model: catalog unreachable: {e:#}")),
+                        });
+                    }
+                }
             }
         }
 
@@ -274,11 +303,49 @@ impl ModelSwitchTool {
         }
     }
 
-    async fn handle_set_tier(&self, _args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn handle_set_tier(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let Some(catalog) = &self.catalog else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("tier catalog not configured for this deployment".to_string()),
+            });
+        };
+
+        let Some(tier) = args.get("tier").and_then(|v| v.as_str()) else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Missing 'tier' parameter. Use 'list_tiers' to see options.".to_string()),
+            });
+        };
+
+        let model = match catalog.resolve_tier(tier).await {
+            Ok(m) => m,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("{e:#}")),
+                });
+            }
+        };
+
+        // Use the base_url-prefixed custom provider key so the switch resolves
+        // to the same provider the agent is already talking to.
+        let provider = catalog.provider_key();
+        let switch_state = get_model_switch_state();
+        *switch_state.lock().unwrap() = Some((provider.clone(), model.clone()));
+
         Ok(ToolResult {
-            success: false,
-            output: String::new(),
-            error: Some("set_tier not yet implemented".to_string()),
+            success: true,
+            output: serde_json::to_string_pretty(&json!({
+                "tier": tier,
+                "resolved_model": model,
+                "provider": provider,
+                "note": "Switch takes effect on next agent turn."
+            }))?,
+            error: None,
         })
     }
 }

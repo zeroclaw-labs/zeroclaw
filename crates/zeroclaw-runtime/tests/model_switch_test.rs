@@ -79,3 +79,94 @@ async fn list_tiers_returns_yaml_contents() {
         .iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names, vec!["chat", "thinking"]);
 }
+
+#[tokio::test]
+async fn set_tier_stages_resolved_model() {
+    let server = MockServer::start().await;
+    let f = write_tiers(
+        "tiers:\n  - name: thinking\n    model: claude-opus-4-7\n    description: deep\n",
+    );
+
+    let catalog = Arc::new(
+        ModelCatalogClient::new(
+            format!("{}/v1", server.uri()),
+            "test-key",
+            f.path().to_path_buf(),
+        )
+        .unwrap(),
+    );
+    let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()))
+        .with_catalog(catalog);
+
+    let result = tool
+        .execute(serde_json::json!({"action": "set_tier", "tier": "thinking"}))
+        .await
+        .unwrap();
+    assert!(result.success, "error: {:?}", result.error);
+
+    let v: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+    assert_eq!(v["tier"], "thinking");
+    assert_eq!(v["resolved_model"], "claude-opus-4-7");
+    assert!(v["provider"].as_str().unwrap().starts_with("custom:"));
+}
+
+#[tokio::test]
+async fn set_tier_rejects_unknown_tier() {
+    let server = MockServer::start().await;
+    let f = write_tiers(
+        "tiers:\n  - name: chat\n    model: claude-sonnet-4-6\n    description: \"\"\n",
+    );
+    let catalog = Arc::new(
+        ModelCatalogClient::new(
+            format!("{}/v1", server.uri()),
+            "test-key",
+            f.path().to_path_buf(),
+        )
+        .unwrap(),
+    );
+    let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()))
+        .with_catalog(catalog);
+
+    let result = tool
+        .execute(serde_json::json!({"action": "set_tier", "tier": "ultra"}))
+        .await
+        .unwrap();
+    assert!(!result.success);
+    assert!(result.error.unwrap().contains("unknown tier"));
+}
+
+#[tokio::test]
+async fn set_rejects_unknown_model_against_live_catalog() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "claude-sonnet-4-6", "object": "model", "owned_by": "anthropic"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let f = write_tiers("tiers: []\n");
+    let catalog = Arc::new(
+        ModelCatalogClient::new(
+            format!("{}/v1", server.uri()),
+            "test-key",
+            f.path().to_path_buf(),
+        )
+        .unwrap(),
+    );
+    let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()))
+        .with_catalog(catalog);
+
+    let result = tool
+        .execute(serde_json::json!({
+            "action": "set",
+            "provider": format!("custom:{}", server.uri()),
+            "model": "claude-sonnet-4-5"
+        }))
+        .await
+        .unwrap();
+    assert!(!result.success);
+    let err = result.error.unwrap();
+    assert!(err.contains("Unknown model"), "unexpected error: {err}");
+}
