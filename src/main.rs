@@ -49,15 +49,12 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     config::schema::validate_temperature(t)
 }
 
-fn print_no_command_help() -> Result<()> {
+fn print_no_command_help(cmd: clap::Command) -> Result<()> {
     println!("No command provided.");
     println!("Try `zeroclaw onboard` to initialize your workspace.");
     println!();
 
-    #[cfg(feature = "agent-runtime")]
-    crate::i18n::init(&crate::i18n::detect_locale());
-
-    let mut cmd = apply_i18n_to_command(Cli::command());
+    let mut cmd = cmd;
     cmd.print_help()?;
     println!();
 
@@ -988,16 +985,16 @@ async fn main() -> Result<()> {
         eprintln!("Warning: Failed to install default crypto provider: {e:?}");
     }
 
-    if std::env::args_os().len() <= 1 {
-        return print_no_command_help();
-    }
-
     #[cfg(feature = "agent-runtime")]
     crate::i18n::init(&crate::i18n::detect_locale());
 
-    let cli = Cli::from_arg_matches(
-        &apply_i18n_to_command(Cli::command()).get_matches()
-    ).map_err(|e| e.exit())?;
+    let cmd = apply_i18n_to_command(Cli::command());
+
+    if std::env::args_os().len() <= 1 {
+        return print_no_command_help(cmd);
+    }
+
+    let cli = Cli::from_arg_matches(&cmd.get_matches()).map_err(|e| e.exit())?;
 
     if let Some(config_dir) = &cli.config_dir {
         if config_dir.trim().is_empty() {
