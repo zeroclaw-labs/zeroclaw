@@ -1115,6 +1115,7 @@ impl Agent {
             let mut streamed_text = String::new();
             let mut streamed_tool_calls: Vec<zeroclaw_providers::traits::ToolCall> = Vec::new();
             let mut got_stream = false;
+            let mut last_pre_executed_call_id: Option<String> = None;
 
             while let Some(item) = stream.next().await {
                 match item {
@@ -1144,8 +1145,11 @@ impl Agent {
                             name,
                             args,
                         } => {
+                            let call_id = uuid::Uuid::new_v4().to_string();
+                            last_pre_executed_call_id = Some(call_id.clone());
                             let _ = event_tx
                                 .send(TurnEvent::ToolCall {
+                                    id: call_id,
                                     name,
                                     args: serde_json::from_str(&args).unwrap_or_default(),
                                 })
@@ -1156,7 +1160,16 @@ impl Agent {
                             name,
                             output,
                         } => {
-                            let _ = event_tx.send(TurnEvent::ToolResult { name, output }).await;
+                            let result_id = last_pre_executed_call_id
+                                .take()
+                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                            let _ = event_tx
+                                .send(TurnEvent::ToolResult {
+                                    id: result_id,
+                                    name,
+                                    output,
+                                })
+                                .await;
                         }
                         zeroclaw_providers::traits::StreamEvent::Final => break,
                     },
@@ -1199,7 +1212,7 @@ impl Agent {
                 }
             };
 
-            let (text, calls) = self.tool_dispatcher.parse_response(&response);
+            let (text, mut calls) = self.tool_dispatcher.parse_response(&response);
             if calls.is_empty() {
                 let final_text = if text.is_empty() {
                     response.text.unwrap_or_default()
@@ -1236,6 +1249,13 @@ impl Agent {
                 return Ok(final_text);
             }
 
+            // Pre-assign stable IDs to tool calls that don't have one
+            for call in &mut calls {
+                if call.tool_call_id.is_none() {
+                    call.tool_call_id = Some(uuid::Uuid::new_v4().to_string());
+                }
+            }
+
             // ── Tool calls ─────────────────────────────────────────────
             if !text.is_empty() {
                 self.history
@@ -1252,8 +1272,10 @@ impl Agent {
 
             // Notify about each tool call
             for call in &calls {
+                let call_id = call.tool_call_id.as_ref().unwrap().clone();
                 let _ = event_tx
                     .send(TurnEvent::ToolCall {
+                        id: call_id,
                         name: call.name.clone(),
                         args: call.arguments.clone(),
                     })
@@ -1264,8 +1286,10 @@ impl Agent {
 
             // Notify about each tool result
             for result in &results {
+                let result_id = result.tool_call_id.as_ref().unwrap().clone();
                 let _ = event_tx
                     .send(TurnEvent::ToolResult {
+                        id: result_id,
                         name: result.name.clone(),
                         output: result.output.clone(),
                     })
