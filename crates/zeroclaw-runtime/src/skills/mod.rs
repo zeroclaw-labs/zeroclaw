@@ -27,6 +27,12 @@ const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
 const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
 const MAX_CLAWHUB_ZIP_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
 
+// ─── Skills registry (zeroclaw-skills) ────────────────────────────────────────
+const SKILLS_REGISTRY_REPO_URL: &str = "https://github.com/zeroclaw-labs/zeroclaw-skills";
+const SKILLS_REGISTRY_DIR_NAME: &str = "skills-registry";
+const SKILLS_REGISTRY_SYNC_MARKER: &str = ".zeroclaw-skills-registry-sync";
+const SKILLS_REGISTRY_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24;
+
 /// A skill is a user-defined or community-built capability.
 /// Skills live in `~/.zeroclaw/workspace/skills/<name>/SKILL.md`
 /// and can include tool definitions, prompts, and automation scripts.
@@ -1356,5 +1362,212 @@ pub fn install_clawhub_skill_source(
             let _ = std::fs::remove_dir_all(&installed_dir);
             Err(err)
         }
+    }
+}
+
+// ─── Skills registry resolution ───────────────────────────────────────────────
+
+pub fn is_registry_source(source: &str) -> bool {
+    if source.is_empty() {
+        return false;
+    }
+    if source.contains('/') || source.contains('\\') || source.contains("..") {
+        return false;
+    }
+    if source.contains("://") || source.contains(':') {
+        return false;
+    }
+    if source.starts_with('.') || source.starts_with('~') {
+        return false;
+    }
+    source
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
+    if let Some(parent) = registry_dir.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create registry parent: {}", parent.display()))?;
+    }
+
+    let output = Command::new("git")
+        .args(["clone", "--depth", "1", repo_url])
+        .arg(registry_dir)
+        .output()
+        .context("failed to run git clone for skills registry")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("failed to clone skills registry: {stderr}");
+    }
+
+    tracing::info!("cloned skills registry to {}", registry_dir.display());
+    mark_skills_registry_synced(registry_dir)?;
+    Ok(())
+}
+
+fn pull_skills_registry(registry_dir: &Path) -> bool {
+    if !registry_dir.join(".git").exists() {
+        return true;
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(registry_dir)
+        .args(["pull", "--ff-only"])
+        .output();
+
+    match output {
+        Ok(result) if result.status.success() => true,
+        Ok(result) => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            tracing::warn!("failed to pull skills registry updates: {stderr}");
+            false
+        }
+        Err(err) => {
+            tracing::warn!("failed to run git pull for skills registry: {err}");
+            false
+        }
+    }
+}
+
+fn should_sync_skills_registry(registry_dir: &Path) -> bool {
+    let marker = registry_dir.join(SKILLS_REGISTRY_SYNC_MARKER);
+    let Ok(metadata) = std::fs::metadata(marker) else {
+        return true;
+    };
+    let Ok(modified_at) = metadata.modified() else {
+        return true;
+    };
+    let Ok(age) = SystemTime::now().duration_since(modified_at) else {
+        return true;
+    };
+    age >= Duration::from_secs(SKILLS_REGISTRY_SYNC_INTERVAL_SECS)
+}
+
+fn mark_skills_registry_synced(registry_dir: &Path) -> Result<()> {
+    std::fs::write(registry_dir.join(SKILLS_REGISTRY_SYNC_MARKER), b"synced")?;
+    Ok(())
+}
+
+fn ensure_skills_registry(workspace_dir: &Path, registry_url: Option<&str>) -> Result<PathBuf> {
+    let registry_dir = workspace_dir.join(SKILLS_REGISTRY_DIR_NAME);
+    let repo_url = registry_url.unwrap_or(SKILLS_REGISTRY_REPO_URL);
+
+    if !registry_dir.exists() {
+        clone_skills_registry(&registry_dir, repo_url)?;
+        return Ok(registry_dir);
+    }
+
+    if should_sync_skills_registry(&registry_dir) {
+        if pull_skills_registry(&registry_dir) {
+            let _ = mark_skills_registry_synced(&registry_dir);
+        } else {
+            tracing::warn!(
+                "skills registry update failed; using local copy from {}",
+                registry_dir.display()
+            );
+        }
+    }
+
+    Ok(registry_dir)
+}
+
+fn list_registry_skill_names(registry_dir: &Path) -> Vec<String> {
+    let skills_parent = registry_dir.join("skills");
+    let Ok(entries) = std::fs::read_dir(&skills_parent) else {
+        return vec![];
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    names
+}
+
+pub fn install_registry_skill_source(
+    source: &str,
+    skills_path: &Path,
+    allow_scripts: bool,
+    workspace_dir: &Path,
+    registry_url: Option<&str>,
+) -> Result<(PathBuf, usize)> {
+    let registry_dir = ensure_skills_registry(workspace_dir, registry_url)?;
+    let skill_dir = registry_dir.join("skills").join(source);
+
+    if !skill_dir.is_dir() {
+        let available = list_registry_skill_names(&registry_dir);
+        if available.is_empty() {
+            anyhow::bail!("skill '{source}' not found in the registry and no skills are available");
+        }
+        anyhow::bail!(
+            "skill '{source}' not found in the registry.\nAvailable skills: {}",
+            available.join(", ")
+        );
+    }
+
+    install_local_skill_source(
+        skill_dir.to_str().unwrap_or(source),
+        skills_path,
+        allow_scripts,
+    )
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[test]
+    fn test_is_registry_source_accepts_bare_names() {
+        assert!(is_registry_source("auto-coder"));
+        assert!(is_registry_source("web-researcher"));
+        assert!(is_registry_source("telegram-assistant"));
+        assert!(is_registry_source("data_analyst"));
+        assert!(is_registry_source("ci-helper"));
+        assert!(is_registry_source("selfimproving"));
+    }
+
+    #[test]
+    fn test_is_registry_source_rejects_empty() {
+        assert!(!is_registry_source(""));
+    }
+
+    #[test]
+    fn test_is_registry_source_rejects_paths() {
+        assert!(!is_registry_source("./my-skill"));
+        assert!(!is_registry_source("../my-skill"));
+        assert!(!is_registry_source("/abs/path"));
+        assert!(!is_registry_source("skills/auto-coder"));
+        assert!(!is_registry_source("some\\path"));
+        assert!(!is_registry_source("~/.zeroclaw/skills/foo"));
+    }
+
+    #[test]
+    fn test_is_registry_source_rejects_urls() {
+        assert!(!is_registry_source("https://github.com/foo/bar"));
+        assert!(!is_registry_source("http://example.com"));
+        assert!(!is_registry_source("ssh://git@host/repo"));
+        assert!(!is_registry_source("git://host/repo"));
+        assert!(!is_registry_source("git@github.com:user/repo"));
+    }
+
+    #[test]
+    fn test_is_registry_source_rejects_clawhub() {
+        assert!(!is_registry_source("clawhub:my-skill"));
+    }
+
+    #[test]
+    fn test_is_registry_source_rejects_traversal() {
+        assert!(!is_registry_source(".."));
+        assert!(!is_registry_source("foo..bar"));
+    }
+
+    #[test]
+    fn test_is_registry_source_rejects_special_chars() {
+        assert!(!is_registry_source(".hidden"));
+        assert!(!is_registry_source("~tilde"));
     }
 }
