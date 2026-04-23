@@ -69,7 +69,41 @@ impl ModelCatalogClient {
     }
 
     pub async fn list_models(&self) -> Result<Vec<ModelEntry>> {
-        anyhow::bail!("not yet implemented")
+        {
+            let cache = self.cache.lock().await;
+            if let Some((models, fetched_at)) = &cache.models {
+                if fetched_at.elapsed() < CATALOG_TTL {
+                    return Ok(models.clone());
+                }
+            }
+        }
+
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("model catalog fetch failed: status={status} body={body}");
+        }
+
+        let parsed: ModelsResponse = resp
+            .json()
+            .await
+            .context("parsing /v1/models response")?;
+
+        {
+            let mut cache = self.cache.lock().await;
+            cache.models = Some((parsed.data.clone(), Instant::now()));
+        }
+
+        Ok(parsed.data)
     }
 
     pub async fn list_tiers(&self) -> Result<Vec<TierEntry>> {
