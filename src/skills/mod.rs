@@ -142,12 +142,13 @@ pub fn load_skills_with_open_skills_settings(
     workspace_dir: &Path,
     open_skills_enabled: bool,
     open_skills_dir: Option<&str>,
+    allow_scripts: bool,
 ) -> Vec<Skill> {
     load_skills_with_open_skills_config(
         workspace_dir,
         Some(open_skills_enabled),
         open_skills_dir,
-        None,
+        Some(allow_scripts),
     )
 }
 
