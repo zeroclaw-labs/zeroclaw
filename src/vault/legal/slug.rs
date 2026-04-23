@@ -36,6 +36,22 @@ pub fn case_slug(case_number: &str) -> String {
     format!("case::{}", case_number.trim())
 }
 
+/// Slug for a statute's supplement (부칙). Keyed by the promulgation
+/// number (the `법률 제N호` inside the supplement's title) so each
+/// revision's 부칙 is uniquely addressable:
+///
+///   `statute::{법령명}::supplement::{anc_no}`
+///
+/// Example: `statute::근로기준법::supplement::21065` for the 부칙
+/// attached to 법률 제21065호 (2025. 10. 1.) of 근로기준법.
+pub fn supplement_slug(law_name: &str, promulgation_no: &str) -> String {
+    format!(
+        "statute::{}::supplement::{}",
+        law_name.trim(),
+        promulgation_no.trim()
+    )
+}
+
 /// Parse a Korean article reference like `제43조의2` or `제750조` into `(num, sub)`.
 /// Returns `None` for unparseable strings.
 pub fn parse_article(s: &str) -> Option<(u32, Option<u32>)> {

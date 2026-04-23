@@ -115,6 +115,11 @@ async fn handle_stats(State(state): State<AppState>) -> impl IntoResponse {
             [],
             |r| r.get(0),
         )?;
+        let supplements: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM vault_documents WHERE doc_type='statute_supplement'",
+            [],
+            |r| r.get(0),
+        )?;
         let cases: i64 = conn.query_row(
             "SELECT COUNT(*) FROM vault_documents WHERE doc_type='case'",
             [],
@@ -128,19 +133,20 @@ async fn handle_stats(State(state): State<AppState>) -> impl IntoResponse {
         let edges: i64 = conn.query_row(
             "SELECT COUNT(*) FROM vault_links vl
                JOIN vault_documents d ON d.id = vl.source_doc_id
-              WHERE d.doc_type IN ('statute_article','case')",
+              WHERE d.doc_type IN ('statute_article','statute_supplement','case')",
             [],
             |r| r.get(0),
         )?;
         let resolved: i64 = conn.query_row(
             "SELECT COUNT(*) FROM vault_links vl
                JOIN vault_documents d ON d.id = vl.source_doc_id
-              WHERE d.doc_type IN ('statute_article','case') AND vl.is_resolved = 1",
+              WHERE d.doc_type IN ('statute_article','statute_supplement','case') AND vl.is_resolved = 1",
             [],
             |r| r.get(0),
         )?;
         Ok(json!({
             "statute_articles": statutes,
+            "statute_supplements": supplements,
             "distinct_laws": laws,
             "cases": cases,
             "edges": edges,

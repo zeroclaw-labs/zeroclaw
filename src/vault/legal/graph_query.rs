@@ -1,5 +1,5 @@
 //! Read-only graph queries over `vault_documents` + `vault_links`, filtered
-//! to legal nodes (`doc_type IN ('statute_article','case')`).
+//! to legal nodes (`doc_type IN ('statute_article','statute_supplement','case')`).
 //!
 //! Shared by:
 //!   - Phase 2 agent tools in `src/tools/vault_graph.rs`
@@ -31,9 +31,15 @@ pub enum NodeKind {
 }
 
 impl NodeKind {
+    /// Map the `vault_documents.doc_type` string into our kind enum.
+    /// Both `statute_article` and `statute_supplement` map to
+    /// `Statute` — supplements are a sub-flavour of statute content
+    /// for graph-query purposes; callers that care about the
+    /// article/supplement distinction can check the `kind` frontmatter
+    /// entry (`"supplement"` for 부칙, absent / `"article"` otherwise).
     pub fn from_doc_type(s: &str) -> Option<Self> {
         match s {
-            "statute_article" => Some(Self::Statute),
+            "statute_article" | "statute_supplement" => Some(Self::Statute),
             "case" => Some(Self::Case),
             _ => None,
         }
@@ -100,7 +106,7 @@ pub fn get_node(conn: &Connection, slug: &str) -> Result<Option<Node>> {
     let row = conn
         .query_row(
             "SELECT id, doc_type FROM vault_documents
-              WHERE title = ?1 AND doc_type IN ('statute_article','case')",
+              WHERE title = ?1 AND doc_type IN ('statute_article','statute_supplement','case')",
             params![slug],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
         )
@@ -269,7 +275,7 @@ pub fn read_article(conn: &Connection, slug: &str) -> Result<Option<ArticleConte
     let row: Option<(i64, String, String)> = conn
         .query_row(
             "SELECT id, doc_type, content FROM vault_documents
-              WHERE title = ?1 AND doc_type IN ('statute_article','case')",
+              WHERE title = ?1 AND doc_type IN ('statute_article','statute_supplement','case')",
             params![slug],
             |r| {
                 Ok((
@@ -351,7 +357,7 @@ pub fn find_nodes(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Fi
             "SELECT d.title FROM vault_aliases va
                JOIN vault_documents d ON d.id = va.doc_id
               WHERE va.alias = ?1
-                AND d.doc_type IN ('statute_article','case')",
+                AND d.doc_type IN ('statute_article','statute_supplement','case')",
             params![q],
             |r| r.get::<_, String>(0),
         )
@@ -402,7 +408,7 @@ pub fn find_nodes(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Fi
                 "SELECT d.title
                    FROM vault_docs_fts f JOIN vault_documents d ON d.id = f.rowid
                   WHERE vault_docs_fts MATCH ?1
-                    AND d.doc_type IN ('statute_article','case')
+                    AND d.doc_type IN ('statute_article','statute_supplement','case')
                   ORDER BY bm25(vault_docs_fts)
                   LIMIT ?2",
             )?;
@@ -550,7 +556,7 @@ fn fetch_direct_neighbors(conn: &Connection, slug: &str) -> Result<Vec<String>> 
     let q = format!(
         "SELECT title FROM vault_documents
            WHERE title IN ({placeholders})
-             AND doc_type IN ('statute_article','case')"
+             AND doc_type IN ('statute_article','statute_supplement','case')"
     );
     let mut stmt = conn.prepare(&q)?;
     let params_dyn: Vec<&dyn rusqlite::ToSql> =
@@ -577,7 +583,7 @@ fn fetch_edges_within(conn: &Connection, slugs: &[String]) -> Result<Vec<Edge>> 
            FROM vault_links vl
            JOIN vault_documents src ON src.id = vl.source_doc_id
           WHERE src.title IN ({ph}) AND vl.target_raw IN ({ph})
-            AND src.doc_type IN ('statute_article','case')",
+            AND src.doc_type IN ('statute_article','statute_supplement','case')",
         ph = placeholders
     );
     let mut stmt = conn.prepare(&q)?;
@@ -642,6 +648,21 @@ fn load_frontmatter(conn: &Connection, doc_id: i64) -> Result<HashMap<String, St
 fn build_label(slug: &str, kind: NodeKind, fm: &HashMap<String, String>) -> String {
     match kind {
         NodeKind::Statute => {
+            // Supplement? — use its parent_law + pretty promulgation date.
+            if fm.get("kind").map(String::as_str) == Some("supplement") {
+                let law = fm.get("parent_law").cloned().unwrap_or_default();
+                let anc = fm.get("promulgation_no").cloned().unwrap_or_default();
+                let date = fm
+                    .get("promulgation_date")
+                    .filter(|d| d.len() == 8)
+                    .map(|d| format!("{}-{}-{}", &d[..4], &d[4..6], &d[6..8]))
+                    .unwrap_or_default();
+                return match (law.is_empty(), anc.is_empty(), date.is_empty()) {
+                    (false, false, false) => format!("{law} 부칙 (법률 제{anc}호, {date})"),
+                    (false, false, true) => format!("{law} 부칙 (법률 제{anc}호)"),
+                    _ => slug.to_string(),
+                };
+            }
             let law = fm.get("law_name").cloned().unwrap_or_default();
             let header = fm.get("article_header").cloned();
             if let Some(h) = header {

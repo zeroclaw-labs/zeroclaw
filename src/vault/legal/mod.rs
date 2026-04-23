@@ -37,4 +37,6 @@ pub use graph_query::{
 };
 pub use ingest::{ingest_case, ingest_statute, IngestCounts, IngestReport};
 pub use slug::{case_slug, statute_slug};
-pub use statute_extractor::{extract_statute, looks_like_statute, StatuteArticle, StatuteDoc};
+pub use statute_extractor::{
+    extract_statute, looks_like_statute, StatuteArticle, StatuteDoc, Supplement,
+};

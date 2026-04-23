@@ -22,8 +22,9 @@
 //! batch.
 
 use super::case_extractor::CaseDoc;
-use super::slug::statute_aliases;
-use super::statute_extractor::{StatuteArticle, StatuteDoc};
+use super::citation_patterns::extract_statute_citations;
+use super::slug::{statute_aliases, supplement_slug};
+use super::statute_extractor::{StatuteArticle, StatuteDoc, Supplement};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
@@ -37,6 +38,10 @@ pub struct IngestCounts {
     pub statute_articles_inserted: usize,
     pub statute_articles_skipped_unchanged: usize,
     pub statute_articles_updated: usize,
+    pub supplements_inserted: usize,
+    pub supplements_skipped_unchanged: usize,
+    pub supplements_updated: usize,
+    pub supplements_skipped_no_anc_no: usize,
     pub case_files: usize,
     pub cases_inserted: usize,
     pub cases_skipped_unchanged: usize,
@@ -79,6 +84,28 @@ pub fn ingest_statute(conn: &Arc<Mutex<Connection>>, doc: &StatuteDoc) -> Result
             }
         }
     }
+    // 부칙 — each supplement becomes its own statute_supplement node so
+    // it can be cited and cross-referenced independently of the main law.
+    // Supplements without a parseable promulgation number are skipped
+    // (they'd collide on slug) and recorded in the counts for visibility.
+    for sup in &doc.supplements {
+        match upsert_supplement(&tx, doc, sup)? {
+            SupplementOutcome::Inserted(doc_id) => {
+                counts.supplements_inserted += 1;
+                counts.edges_written += write_supplement_edges(&tx, doc, sup, doc_id)?;
+            }
+            SupplementOutcome::Updated(doc_id) => {
+                counts.supplements_updated += 1;
+                counts.edges_written += write_supplement_edges(&tx, doc, sup, doc_id)?;
+            }
+            SupplementOutcome::SkippedUnchanged => {
+                counts.supplements_skipped_unchanged += 1;
+            }
+            SupplementOutcome::SkippedNoAncNo => {
+                counts.supplements_skipped_no_anc_no += 1;
+            }
+        }
+    }
     tx.commit().context("committing statute ingest transaction")?;
     Ok(counts)
 }
@@ -87,6 +114,16 @@ enum ArticleOutcome {
     Inserted(i64),
     Updated(i64),
     SkippedUnchanged,
+}
+
+enum SupplementOutcome {
+    Inserted(i64),
+    Updated(i64),
+    SkippedUnchanged,
+    /// Title had no parseable `법률 제N호` — we can't produce a stable slug
+    /// so we skip. Count is reported so the operator knows coverage is
+    /// incomplete.
+    SkippedNoAncNo,
 }
 
 fn upsert_statute_article(
@@ -246,6 +283,175 @@ fn write_statute_edges(
             relation,
             Some(&cite.raw),
         )?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+fn upsert_supplement(
+    conn: &Connection,
+    doc: &StatuteDoc,
+    sup: &Supplement,
+) -> Result<SupplementOutcome> {
+    let Some(anc_no) = sup.promulgation_no.as_deref() else {
+        return Ok(SupplementOutcome::SkippedNoAncNo);
+    };
+    let slug = supplement_slug(&doc.law_name, anc_no);
+    let content = format!("# {} — {}\n\n{}\n", doc.law_name, sup.title.trim(), sup.body);
+    let checksum = hex_sha256(&content);
+    let now = unix_epoch();
+
+    let existing: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, checksum FROM vault_documents WHERE title = ?1",
+            params![slug],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok();
+
+    let doc_id: i64 = match existing {
+        Some((_id, existing_sum)) if existing_sum == checksum => {
+            return Ok(SupplementOutcome::SkippedUnchanged);
+        }
+        Some((id, _)) => {
+            conn.execute(
+                "UPDATE vault_documents
+                   SET content = ?1, checksum = ?2, char_count = ?3, updated_at = ?4,
+                       original_path = ?5, doc_type = 'statute_supplement',
+                       source_type = 'local_file'
+                 WHERE id = ?6",
+                params![
+                    content,
+                    checksum,
+                    content.chars().count() as i64,
+                    now as i64,
+                    doc.source_path,
+                    id,
+                ],
+            )?;
+            conn.execute(
+                "DELETE FROM vault_links WHERE source_doc_id = ?1",
+                params![id],
+            )?;
+            conn.execute(
+                "DELETE FROM vault_frontmatter WHERE doc_id = ?1",
+                params![id],
+            )?;
+            conn.execute("DELETE FROM vault_tags WHERE doc_id = ?1", params![id])?;
+            conn.execute("DELETE FROM vault_aliases WHERE doc_id = ?1", params![id])?;
+            id
+        }
+        None => {
+            let uuid = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO vault_documents
+                    (uuid, title, content, source_type, source_device_id, original_path,
+                     checksum, doc_type, char_count, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'local_file', ?4, ?5, ?6, 'statute_supplement', ?7, ?8, ?8)",
+                params![
+                    uuid,
+                    slug,
+                    content,
+                    "local",
+                    doc.source_path,
+                    checksum,
+                    content.chars().count() as i64,
+                    now as i64,
+                ],
+            )?;
+            conn.last_insert_rowid()
+        }
+    };
+
+    // Frontmatter: link back to parent law, preserve promulgation metadata.
+    let fm: &[(&str, Option<String>)] = &[
+        ("parent_law", Some(doc.law_name.clone())),
+        ("kind", Some("supplement".to_string())),
+        ("promulgation_no", Some(anc_no.to_string())),
+        ("promulgation_date", sup.promulgation_date.clone()),
+        ("supplement_note", sup.note.clone()),
+        ("supplement_title", Some(sup.title.clone())),
+    ];
+    for (k, v) in fm {
+        if let Some(val) = v {
+            conn.execute(
+                "INSERT OR IGNORE INTO vault_frontmatter (doc_id, key, value)
+                 VALUES (?1, ?2, ?3)",
+                params![doc_id, k, val],
+            )?;
+        }
+    }
+
+    // Aliases — humans cite supplements in a few recognisable ways.
+    let alias_forms: Vec<String> = {
+        let mut v = vec![
+            format!("{} 부칙 <법률 제{}호>", doc.law_name, anc_no),
+            format!("{} 부칙(법률 제{}호)", doc.law_name, anc_no),
+        ];
+        if let Some(d) = sup.promulgation_date.as_deref() {
+            if d.len() == 8 {
+                let pretty = format!("{}. {}. {}.", &d[..4], &d[4..6], &d[6..8]);
+                v.push(format!("{} 부칙({})", doc.law_name, pretty));
+            }
+        }
+        v
+    };
+    for alias in alias_forms {
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO vault_aliases (doc_id, alias) VALUES (?1, ?2)",
+            params![doc_id, alias],
+        );
+    }
+
+    // Tags.
+    insert_tag(conn, doc_id, "domain:legal", Some("domain"))?;
+    insert_tag(conn, doc_id, "kind:supplement", Some("kind"))?;
+    insert_tag(conn, doc_id, &format!("law:{}", doc.law_name), Some("law"))?;
+    if let Some(d) = sup.promulgation_date.as_deref() {
+        if d.len() >= 4 {
+            insert_tag(conn, doc_id, &format!("year:{}", &d[..4]), Some("year"))?;
+        }
+    }
+
+    // Edge to the parent law's 제1조 as a lightweight "belongs-to" pointer
+    // so agents can walk from a supplement to an article of its parent law
+    // cheaply. We point at 제1조 (always present) rather than a synthetic
+    // "law root" node.
+    let parent_article1 = super::slug::statute_slug(&doc.law_name, 1, None);
+    insert_edge(
+        conn,
+        doc_id,
+        &parent_article1,
+        "amends",
+        Some(&sup.title),
+    )?;
+
+    match existing {
+        Some(_) => Ok(SupplementOutcome::Updated(doc_id)),
+        None => Ok(SupplementOutcome::Inserted(doc_id)),
+    }
+}
+
+fn write_supplement_edges(
+    conn: &Connection,
+    doc: &StatuteDoc,
+    sup: &Supplement,
+    source_doc_id: i64,
+) -> Result<usize> {
+    // Run the same citation extractor over the supplement body; any
+    // statute references inside (e.g. `제2조의4(업무위탁 등) …`) produce
+    // edges just like regular articles. Current law is inherited for
+    // bare `제N조` forms.
+    let citations = extract_statute_citations(&sup.body, Some(&doc.law_name));
+    let mut written = 0usize;
+    for cite in &citations {
+        let target = super::slug::statute_slug(&cite.law_name, cite.article, cite.article_sub);
+        let relation = if cite.law_name == doc.law_name {
+            "internal-ref"
+        } else {
+            "cross-law"
+        };
+        insert_edge(conn, source_doc_id, &target, relation, Some(&cite.raw))?;
         written += 1;
     }
     Ok(written)
@@ -595,6 +801,78 @@ mod tests {
             )
             .unwrap();
         assert_eq!(resolved_cites, 2, "expected 2 resolved cites edges");
+    }
+
+    const STATUTE_WITH_SUPPLEMENT: &str = r#"# 근로기준법
+
+```json
+{
+  "meta": {"lsNm": "근로기준법", "ancYd": "20251001", "efYd": "20251001"},
+  "title": "근로기준법",
+  "articles": [
+    {"anchor": "J1:0", "number": "제1조(목적)", "text": "제1조(목적) 본법의 목적."}
+  ],
+  "supplements": [
+    {"title": "부칙  <법률 제21065호, 2025. 10. 1.>   (정부조직법)",
+     "body": "제8조 생략"},
+    {"title": "부칙 (오래된 형식)",
+     "body": "내용"}
+  ]
+}
+```
+"#;
+
+    #[test]
+    fn ingest_statute_creates_supplement_nodes_with_parsed_metadata() {
+        let conn = fresh_conn();
+        let doc =
+            extract_statute(STATUTE_WITH_SUPPLEMENT, "/x/20251001/근로기준법.md").unwrap();
+        let c = ingest_statute(&conn, &doc).unwrap();
+        assert_eq!(c.statute_articles_inserted, 1);
+        assert_eq!(c.supplements_inserted, 1, "one parseable supplement");
+        assert_eq!(
+            c.supplements_skipped_no_anc_no, 1,
+            "one legacy-format supplement without anc_no must be skipped"
+        );
+
+        let g = conn.lock();
+        // Supplement node exists under the promulgation-number slug.
+        let sup_id: i64 = g
+            .query_row(
+                "SELECT id FROM vault_documents WHERE title = 'statute::근로기준법::supplement::21065'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Frontmatter carries the parsed pieces.
+        let parent_law: String = g
+            .query_row(
+                "SELECT value FROM vault_frontmatter WHERE doc_id = ?1 AND key='parent_law'",
+                [sup_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent_law, "근로기준법");
+        let prom_date: String = g
+            .query_row(
+                "SELECT value FROM vault_frontmatter WHERE doc_id = ?1 AND key='promulgation_date'",
+                [sup_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prom_date, "20251001");
+    }
+
+    #[test]
+    fn ingest_statute_supplement_is_idempotent() {
+        let conn = fresh_conn();
+        let doc =
+            extract_statute(STATUTE_WITH_SUPPLEMENT, "/x/20251001/근로기준법.md").unwrap();
+        let first = ingest_statute(&conn, &doc).unwrap();
+        let second = ingest_statute(&conn, &doc).unwrap();
+        assert_eq!(first.supplements_inserted, 1);
+        assert_eq!(second.supplements_skipped_unchanged, 1);
+        assert_eq!(second.supplements_inserted, 0);
     }
 
     #[test]

@@ -106,6 +106,10 @@ fn merge(dst: &mut IngestCounts, src: IngestCounts) {
     dst.statute_articles_inserted += src.statute_articles_inserted;
     dst.statute_articles_skipped_unchanged += src.statute_articles_skipped_unchanged;
     dst.statute_articles_updated += src.statute_articles_updated;
+    dst.supplements_inserted += src.supplements_inserted;
+    dst.supplements_skipped_unchanged += src.supplements_skipped_unchanged;
+    dst.supplements_updated += src.supplements_updated;
+    dst.supplements_skipped_no_anc_no += src.supplements_skipped_no_anc_no;
     dst.case_files += src.case_files;
     dst.cases_inserted += src.cases_inserted;
     dst.cases_skipped_unchanged += src.cases_skipped_unchanged;
@@ -166,6 +170,13 @@ fn print_report(report: &IngestReport) {
         c.statute_articles_inserted,
         c.statute_articles_updated,
         c.statute_articles_skipped_unchanged,
+    );
+    println!(
+        "  supplements:   {} inserted, {} updated, {} unchanged, {} skipped (no 공포번호)",
+        c.supplements_inserted,
+        c.supplements_updated,
+        c.supplements_skipped_unchanged,
+        c.supplements_skipped_no_anc_no,
     );
     println!(
         "  case files:    {}   ({} inserted, {} updated, {} unchanged)",
@@ -368,6 +379,11 @@ pub async fn stats(config: &Config) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
+    let supplements: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM vault_documents WHERE doc_type = 'statute_supplement'",
+        [],
+        |r| r.get(0),
+    )?;
     let cases: i64 = conn.query_row(
         "SELECT COUNT(*) FROM vault_documents WHERE doc_type = 'case'",
         [],
@@ -376,14 +392,14 @@ pub async fn stats(config: &Config) -> Result<()> {
     let edges: i64 = conn.query_row(
         "SELECT COUNT(*) FROM vault_links vl
            JOIN vault_documents d ON d.id = vl.source_doc_id
-          WHERE d.doc_type IN ('statute_article','case')",
+          WHERE d.doc_type IN ('statute_article','statute_supplement','case')",
         [],
         |r| r.get(0),
     )?;
     let resolved: i64 = conn.query_row(
         "SELECT COUNT(*) FROM vault_links vl
            JOIN vault_documents d ON d.id = vl.source_doc_id
-          WHERE d.doc_type IN ('statute_article','case') AND vl.is_resolved = 1",
+          WHERE d.doc_type IN ('statute_article','statute_supplement','case') AND vl.is_resolved = 1",
         [],
         |r| r.get(0),
     )?;
@@ -395,6 +411,7 @@ pub async fn stats(config: &Config) -> Result<()> {
 
     println!("{}", style("legal graph stats").bold());
     println!("  statute articles: {statute_articles}");
+    println!("  supplements:      {supplements}");
     println!("  distinct laws:    {distinct_laws}");
     println!("  cases:            {cases}");
     println!(

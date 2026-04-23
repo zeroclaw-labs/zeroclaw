@@ -55,8 +55,50 @@ pub struct StatuteArticle {
 
 #[derive(Debug, Clone)]
 pub struct Supplement {
+    /// Full title as-is — e.g. `부칙  <법률 제21065호, 2025. 10. 1.>`.
     pub title: String,
     pub body: String,
+    /// Parsed promulgation number (the `N` in `법률 제N호`). `None` if the
+    /// title doesn't follow the standard format (e.g. legacy supplements).
+    pub promulgation_no: Option<String>,
+    /// Parsed promulgation date as `YYYYMMDD`. `None` if unparseable.
+    pub promulgation_date: Option<String>,
+    /// The "(다른 법률)" suffix some supplements carry — typically a
+    /// reference to the originating amending law (e.g.
+    /// `(가족관계의 등록 등에 관한 법률)`). Preserved verbatim.
+    pub note: Option<String>,
+}
+
+/// Parse a supplement title like
+///   `부칙  <법률 제21065호, 2025. 10. 1.>   (정부조직법)`
+/// into `(promulgation_no, "YYYYMMDD", note)`. All three fields are best-
+/// effort — missing pieces return `None` rather than erroring, because
+/// some historical supplements have unusual title formats that we don't
+/// want to fail ingestion over.
+fn parse_supplement_title(title: &str) -> (Option<String>, Option<String>, Option<String>) {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // <법률 제(\d+)호, (\d{4}). (\d+). (\d+).>    with optional trailing  (note)
+    let re = RE.get_or_init(|| {
+        Regex::new(
+            r"<\s*법률\s*제\s*(\d+)\s*호\s*,\s*(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.\s*>\s*(?:\(\s*([^)]+?)\s*\))?",
+        )
+        .unwrap()
+    });
+    let Some(caps) = re.captures(title) else {
+        return (None, None, None);
+    };
+    let num = caps.get(1).map(|m| m.as_str().to_string());
+    let date = match (caps.get(2), caps.get(3), caps.get(4)) {
+        (Some(y), Some(m), Some(d)) => Some(format!(
+            "{:04}{:02}{:02}",
+            y.as_str().parse::<u32>().unwrap_or(0),
+            m.as_str().parse::<u32>().unwrap_or(0),
+            d.as_str().parse::<u32>().unwrap_or(0),
+        )),
+        _ => None,
+    };
+    let note = caps.get(5).map(|m| m.as_str().trim().to_string());
+    (num, date, note)
 }
 
 // ───────── JSON schema (subset we actually use) ─────────
@@ -181,9 +223,15 @@ pub fn extract_statute(md: &str, source_path: &str) -> Result<StatuteDoc> {
         supplements: raw
             .supplements
             .into_iter()
-            .map(|s| Supplement {
-                title: s.title,
-                body: s.body,
+            .map(|s| {
+                let (promulgation_no, promulgation_date, note) = parse_supplement_title(&s.title);
+                Supplement {
+                    title: s.title,
+                    body: s.body,
+                    promulgation_no,
+                    promulgation_date,
+                    note,
+                }
             })
             .collect(),
     })
@@ -331,5 +379,30 @@ mod tests {
     fn rejects_file_without_json_block() {
         let bad = "# 근로기준법\nno json here";
         assert!(extract_statute(bad, "x.md").is_err());
+    }
+
+    #[test]
+    fn supplement_title_parser_handles_standard_format() {
+        let (num, date, note) = parse_supplement_title(
+            "부칙  <법률 제21065호, 2025. 10. 1.>   (정부조직법)",
+        );
+        assert_eq!(num.as_deref(), Some("21065"));
+        assert_eq!(date.as_deref(), Some("20251001"));
+        assert_eq!(note.as_deref(), Some("정부조직법"));
+    }
+
+    #[test]
+    fn supplement_title_parser_without_trailing_note() {
+        let (num, date, note) =
+            parse_supplement_title("부칙  <법률 제8561호, 2007. 7. 27.>");
+        assert_eq!(num.as_deref(), Some("8561"));
+        assert_eq!(date.as_deref(), Some("20070727"));
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn supplement_title_parser_returns_none_on_unrecognised() {
+        let (num, date, note) = parse_supplement_title("부칙 (오래된 형식)");
+        assert!(num.is_none() && date.is_none() && note.is_none());
     }
 }
