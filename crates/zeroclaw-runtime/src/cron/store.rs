@@ -314,6 +314,16 @@ pub fn record_last_run(
     output: &str,
 ) -> Result<()> {
     let status = if success { "ok" } else { "error" };
+    record_last_run_with_status(config, job_id, finished_at, status, output)
+}
+
+pub fn record_last_run_with_status(
+    config: &Config,
+    job_id: &str,
+    finished_at: DateTime<Utc>,
+    status: &str,
+    output: &str,
+) -> Result<()> {
     let bounded_output = truncate_cron_output(output);
     with_connection(config, |conn| {
         conn.execute(
@@ -333,8 +343,17 @@ pub fn reschedule_after_run(
     success: bool,
     output: &str,
 ) -> Result<()> {
-    let now = Utc::now();
     let status = if success { "ok" } else { "error" };
+    reschedule_after_run_with_status(config, job, status, output)
+}
+
+pub fn reschedule_after_run_with_status(
+    config: &Config,
+    job: &CronJob,
+    status: &str,
+    output: &str,
+) -> Result<()> {
+    let now = Utc::now();
     let bounded_output = truncate_cron_output(output);
 
     // One-shot `At` schedules have no future occurrence — record the run

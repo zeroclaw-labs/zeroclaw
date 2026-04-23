@@ -458,7 +458,6 @@ fn build_native_assistant_history(
     obj.to_string()
 }
 
-#[cfg(test)]
 fn resolve_display_text(
     response_text: &str,
     parsed_text: &str,
@@ -1360,11 +1359,12 @@ pub async fn run_tool_call_loop(
             }
         };
 
-        let display_text = if parsed_text.is_empty() {
-            response_text.clone()
-        } else {
-            parsed_text
-        };
+        let display_text = resolve_display_text(
+            &response_text,
+            &parsed_text,
+            !tool_calls.is_empty(),
+            !native_tool_calls.is_empty(),
+        );
 
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
