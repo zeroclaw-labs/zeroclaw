@@ -658,18 +658,17 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
     let mut collecting_multiline: Option<String> = None;
     let mut multiline_parts: Vec<String> = Vec::new();
 
-    let flush_multiline =
-        |key: &str, parts: &[String], meta: &mut SkillMarkdownMeta| {
-            let joined = parts.join(" ");
-            let val = joined.trim();
-            if !val.is_empty() {
-                match key {
-                    "description" => meta.description = Some(val.to_string()),
-                    "name" => meta.name = Some(val.to_string()),
-                    _ => {}
-                }
+    let flush_multiline = |key: &str, parts: &[String], meta: &mut SkillMarkdownMeta| {
+        let joined = parts.join(" ");
+        let val = joined.trim();
+        if !val.is_empty() {
+            match key {
+                "description" => meta.description = Some(val.to_string()),
+                "name" => meta.name = Some(val.to_string()),
+                _ => {}
             }
-        };
+        }
+    };
 
     for line in s.lines() {
         // Collect indented continuation lines for YAML block scalars (>- or |)
