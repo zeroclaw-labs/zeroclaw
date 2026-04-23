@@ -595,9 +595,15 @@ impl AcpServer {
 
 fn map_tool_kind(name: &str) -> &'static str {
     let n = name.to_lowercase();
-    if n.contains("read") || n.contains("get") || n.contains("list") {
+    if n.contains("read") || n.contains("get") || n.contains("list") || n.contains("recall") {
         "read"
-    } else if n.contains("write") || n.contains("edit") || n.contains("patch") {
+    } else if n.contains("write")
+        || n.contains("edit")
+        || n.contains("patch")
+        || n.contains("store")
+        || n.contains("save")
+        || n.contains("add")
+    {
         "edit"
     } else if n.contains("delete") || n.contains("remove") {
         "delete"
