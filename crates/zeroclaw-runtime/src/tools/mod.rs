@@ -255,6 +255,66 @@ pub fn register_skill_tools(
     }
 }
 
+/// Build a `ModelSwitchTool`, attaching a live [`ModelCatalogClient`] when
+/// the fallback provider is a `custom:` (OpenAI-compatible) endpoint with an
+/// available api_key. Failures to construct the catalog client are logged at
+/// warn level and the tool is returned without tier support — callers still
+/// get the baseline `list`/`current`/`switch` actions.
+fn build_model_switch_tool(
+    security: &Arc<SecurityPolicy>,
+    root_config: &zeroclaw_config::schema::Config,
+) -> ModelSwitchTool {
+    let mut tool = ModelSwitchTool::new(security.clone());
+
+    let Some(fallback_key) = root_config.providers.fallback.as_deref() else {
+        return tool;
+    };
+    let Some(base_url) = fallback_key.strip_prefix("custom:") else {
+        return tool;
+    };
+    let Some(provider_entry) = root_config.providers.models.get(fallback_key) else {
+        tracing::debug!(
+            provider = fallback_key,
+            "fallback provider not found in providers.models; catalog disabled"
+        );
+        return tool;
+    };
+    let Some(api_key) = provider_entry.api_key.as_deref() else {
+        tracing::warn!(
+            provider = fallback_key,
+            "no api_key configured for catalog provider; tiers disabled"
+        );
+        return tool;
+    };
+
+    // Tier file path: prod volume path when present, XDG config fallback for dev.
+    let prod_tiers = std::path::PathBuf::from("/zeroclaw-data/.zeroclaw/tiers.yaml");
+    let tiers_path = if prod_tiers.exists() {
+        prod_tiers
+    } else {
+        directories::ProjectDirs::from("", "", "zeroclaw")
+            .map(|d| d.config_dir().join("tiers.yaml"))
+            .unwrap_or_else(|| std::path::PathBuf::from("tiers.yaml"))
+    };
+
+    match zeroclaw_providers::ModelCatalogClient::new(
+        base_url.to_string(),
+        api_key.to_string(),
+        tiers_path,
+    ) {
+        Ok(catalog) => {
+            tool = tool.with_catalog(Arc::new(catalog));
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to build model catalog client; tiers disabled"
+            );
+        }
+    }
+    tool
+}
+
 /// Create full tool registry including memory tools and optional Composio
 #[allow(
     clippy::implicit_hasher,
@@ -362,7 +422,7 @@ pub fn all_tools_with_runtime(
             config.clone(),
             security.clone(),
         )),
-        Arc::new(ModelSwitchTool::new(security.clone())),
+        Arc::new(build_model_switch_tool(security, root_config)),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
         Arc::new(GitOperationsTool::new(
             security.clone(),
