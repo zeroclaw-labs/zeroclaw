@@ -11,4 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "net"] }
+tower-http = { version = "0.6", default-features = false, features = ["fs"] }

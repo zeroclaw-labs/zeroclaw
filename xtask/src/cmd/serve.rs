@@ -11,7 +11,6 @@ pub fn run(locale: &str) -> anyhow::Result<()> {
     require_tool("mdbook", "cargo install mdbook --locked")?;
     require_tool("mdbook-xgettext", "cargo install mdbook-i18n-helpers --locked")?;
     require_tool("mdbook-gettext", "cargo install mdbook-i18n-helpers --locked")?;
-    require_tool("python3", "https://python.org")?;
 
     let ref_dir = ref_dir(&root);
     if !ref_dir.join("cli.md").exists() || !ref_dir.join("config.md").exists() {
@@ -33,7 +32,7 @@ pub fn run(locale: &str) -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(&api_dest);
     copy_dir_all(root.join("target/doc"), &api_dest)?;
 
-    // Watch for source changes in background (no built-in HTTP server)
+    // Watch for source changes in background
     let mut watch = Command::new("mdbook")
         .args(["watch", "-d", "book"])
         .env("MDBOOK_BOOK__LANGUAGE", locale)
@@ -62,19 +61,27 @@ pub fn run(locale: &str) -> anyhow::Result<()> {
     let url = format!("http://localhost:{PORT}");
     println!("==> Serving locale '{locale}' at {url}");
     println!("    API reference: {url}/api/index.html");
-    println!("    (live-reload active — edit docs/book/src/ to trigger rebuild)");
+    println!("    Press Ctrl-C to stop.");
 
     let _ = Command::new("xdg-open").arg(&url).spawn()
         .or_else(|_| Command::new("open").arg(&url).spawn());
 
-    // python3 owns the terminal — blocks until Ctrl-C
-    let _ = Command::new("python3")
-        .args(["-m", "http.server", &PORT.to_string(), "--directory"])
-        .arg(&out_dir)
-        .status();
+    // Serve with axum + tower-http ServeDir — no Python required
+    let result = tokio::runtime::Runtime::new()?.block_on(serve_static(out_dir.clone()));
 
     running.store(false, Ordering::Relaxed);
     let _ = watch.kill();
     let _ = watch.wait();
+
+    result
+}
+
+async fn serve_static(dir: std::path::PathBuf) -> anyhow::Result<()> {
+    use axum::Router;
+    use tower_http::services::ServeDir;
+
+    let app = Router::new().fallback_service(ServeDir::new(&dir));
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{PORT}")).await?;
+    axum::serve(listener, app).await?;
     Ok(())
 }
