@@ -3261,17 +3261,18 @@ mod tests {
     }
 
     #[test]
-    fn minimax_provider_disables_native_tool_calling() {
-        let p = OpenAiCompatibleProvider::new_merge_system_into_user(
+    fn minimax_provider_supports_native_tool_calling_with_system_merge() {
+        let p = OpenAiCompatibleProvider::new(
             "MiniMax",
             "https://api.minimax.chat/v1",
             Some("k"),
             AuthStyle::Bearer,
-        );
+        )
+        .with_merge_system_into_user();
         let caps = <OpenAiCompatibleProvider as Provider>::capabilities(&p);
         assert!(
-            !caps.native_tool_calling,
-            "MiniMax should use prompt-guided tool calling, not native"
+            caps.native_tool_calling,
+            "MiniMax should preserve native tool calling when system messages are merged"
         );
         assert!(!caps.vision);
     }
