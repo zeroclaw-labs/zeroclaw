@@ -2,13 +2,19 @@
 
 Personal AI assistant you own, written in Rust.
 
-This site is the in-progress proof-of-concept for the ZeroClaw documentation
-pipeline: single-source-of-truth content authored in the code (rustdoc `///`
-comments, `clap` derives, etc.), rendered to markdown by established generators
-in the Rust ecosystem, and published through mdBook on GitHub Pages.
+This site is the documentation for ZeroClaw. Everything under **Reference →
+CLI** and **Reference → Config** is generated directly from the code at build
+time (via `clap` derives and the JSON schema), so it stays in sync with the
+binary you actually run. Everything else is hand-written user-facing material:
+platform setup, operations, security, hardware, and developer extension points.
 
-Nothing on this page is hand-maintained reference material yet — it's a
-delivery-surface smoke test. Generator-fed chapters land next.
+## Where to start
+
+- New to ZeroClaw? → [One-click bootstrap](./setup/one-click-bootstrap.md)
+- Wiring up a chat platform? → see **Setup Guides**
+- Running it in production? → [Operations runbook](./ops/operations-runbook.md)
+- Building on top of it? → see **Developing**
+- Looking up a flag or config key? → see **Reference**
 
 ## Source
 
