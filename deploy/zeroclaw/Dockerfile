@@ -83,10 +83,18 @@ ENV BUN_INSTALL=/zeroclaw-data/bun
 ENV PATH=/zeroclaw-data/bun/bin:$PATH
 
 # ── Claude Code CLI ─────────────────────────────────────────────────
-# Single native binary; no Node runtime required. Auth is not baked
-# in — set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN as a Fly
-# secret per persona.
-RUN curl -fsSL https://claude.ai/install.sh | bash -s -- --install-dir /usr/local
+# Single native binary; no Node runtime required. We bypass the
+# install.sh launcher (which writes to $HOME/.claude/ and assumes an
+# interactive shell) and download the versioned linux-x64 binary
+# directly into /usr/local/bin so it's available system-wide. Auth is
+# not baked in — set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN as
+# a Fly secret per persona.
+ARG CLAUDE_CODE_VERSION=2.1.117
+ARG CLAUDE_CODE_SHA256=b7246963d9e32ece439c3e1e7885f53773a4820e90a4d2433ef2a413a055a5fe
+RUN curl -fsSL "https://downloads.claude.ai/claude-code-releases/${CLAUDE_CODE_VERSION}/linux-x64/claude" -o /tmp/claude \
+    && echo "${CLAUDE_CODE_SHA256}  /tmp/claude" | sha256sum -c - \
+    && install -m 0755 /tmp/claude /usr/local/bin/claude \
+    && rm -f /tmp/claude
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=web-builder /web/dist /app/web/dist
