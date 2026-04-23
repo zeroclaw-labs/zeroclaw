@@ -103,6 +103,7 @@ COPY --from=web-builder /web/dist /app/web/dist
 RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace
 
 COPY deploy/zeroclaw/config.seed.toml /opt/zeroclaw.config.seed.toml
+COPY deploy/zeroclaw/tiers.seed.yaml  /opt/zeroclaw.tiers.seed.yaml
 COPY deploy/zeroclaw/entrypoint.sh    /entrypoint.sh
 RUN chmod 0755 /entrypoint.sh
 

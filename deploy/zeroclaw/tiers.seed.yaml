@@ -1,0 +1,15 @@
+# Seeded to /zeroclaw-data/.zeroclaw/tiers.yaml on first boot.
+#
+# After seeding, edit the live file and restart the machine to apply.
+# Model names must match cliproxy's /v1/models catalog; bad names will be
+# rejected by the model_switch tool with a list of valid options.
+tiers:
+  - name: chat
+    model: claude-sonnet-4-6
+    description: Default conversational model. Channel replies, routine tool use.
+  - name: thinking
+    model: claude-opus-4-7
+    description: Deep reasoning, planning, code review, multi-step analysis.
+  - name: fast
+    model: claude-haiku-4-5-20251001
+    description: Cheap classification, triage, short summarization.

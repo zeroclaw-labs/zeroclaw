@@ -144,6 +144,17 @@ else
   log "existing $ZEROCLAW_CONFIG preserved (seed-once mode)"
 fi
 
+# ── Seed tiers.yaml ────────────────────────────────────────────────
+ZEROCLAW_TIERS="/zeroclaw-data/.zeroclaw/tiers.yaml"
+ZEROCLAW_TIERS_SEED="/opt/zeroclaw.tiers.seed.yaml"
+if [[ ! -f "$ZEROCLAW_TIERS" ]]; then
+  log "seeding $ZEROCLAW_TIERS from $ZEROCLAW_TIERS_SEED (first boot)"
+  cp "$ZEROCLAW_TIERS_SEED" "$ZEROCLAW_TIERS"
+  chmod 644 "$ZEROCLAW_TIERS"
+else
+  log "existing $ZEROCLAW_TIERS preserved (edit-and-restart to update)"
+fi
+
 # ── Bridge CLIPROXY_API_KEY → ZEROCLAW_API_KEY ─────────────────────
 # The `custom:` provider auth key comes from ZEROCLAW_API_KEY / API_KEY
 # (see crates/zeroclaw-providers/src/lib.rs:996). We don't set
