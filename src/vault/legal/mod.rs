@@ -21,6 +21,7 @@
 pub mod case_extractor;
 pub mod citation_patterns;
 pub mod cli;
+pub mod graph_query;
 pub mod ingest;
 pub mod slug;
 pub mod statute_extractor;
@@ -28,6 +29,10 @@ pub mod statute_extractor;
 pub use case_extractor::{extract_case, looks_like_case, CaseDoc};
 pub use citation_patterns::{
     extract_case_numbers, extract_statute_citations, CaseRef, StatuteRef,
+};
+pub use graph_query::{
+    get_node, induced_subgraph, neighbors, shortest_path, Edge, Node, NodeKind, Subgraph,
+    MAX_NODES,
 };
 pub use ingest::{ingest_case, ingest_statute, IngestCounts, IngestReport};
 pub use slug::{case_slug, statute_slug};
