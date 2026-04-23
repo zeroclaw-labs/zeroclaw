@@ -836,31 +836,13 @@ impl Provider for OllamaProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
-        // Convert ToolSpec to OpenAI-compatible JSON and delegate to chat_with_tools.
-        if let Some(specs) = request.tools
-            && !specs.is_empty()
-        {
-            let tools: Vec<serde_json::Value> = specs
-                .iter()
-                .map(|s| {
-                    let params =
-                        zeroclaw_api::schema::SchemaCleanr::clean_for_openai(s.parameters.clone());
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": s.name,
-                            "description": s.description,
-                            "parameters": params
-                        }
-                    })
-                })
-                .collect();
-            return self
-                .chat_with_tools(request.messages, &tools, model, temperature)
-                .await;
+        if request.tools.is_some_and(|specs| !specs.is_empty()) {
+            tracing::debug!(
+                model = model,
+                "Ollama ignoring native tool specs and using prompt-guided tool calling"
+            );
         }
 
-        // No tools — fall back to plain text chat.
         let text = self
             .chat_with_history(request.messages, model, temperature)
             .await?;
@@ -1381,5 +1363,14 @@ mod tests {
         let text = result.unwrap();
         assert!(text.contains("<tool_call>"));
         assert!(text.contains("date"));
+    }
+
+    #[test]
+    fn capabilities_keep_native_tool_calling_disabled() {
+        let provider = OllamaProvider::new(None, None);
+        assert!(
+            !provider.supports_native_tools(),
+            "Ollama should not advertise native tool calling"
+        );
     }
 }
