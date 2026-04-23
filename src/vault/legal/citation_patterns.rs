@@ -53,21 +53,31 @@ fn bracketed_law_re() -> &'static Regex {
 /// The law-name side accepts:
 ///   - a run of Korean characters ending in `법`/`령`/`률`/`규칙`/`조례`
 ///     (official names — `근로기준법`, `행정절차법`, `국토계획법`, …), OR
-///   - a single-character short form in `['민','형','상']` followed by
-///     whitespace + `제N조` (covers the bare-character conventions
-///     `민 제750조` / `형 제250조`), OR
-///   - a registered short form anywhere in `law_aliases::LAW_ALIAS_TABLE`
-///     (e.g. `근기법`, `민소법`, `民法`, `刑法`) — these are checked
-///     post-match via `canonical_name` so a short form resolves to the
-///     same canonical law as its long form.
+///   - a hanja form or Korean abbreviation ending in `법` (`民法`,
+///     `刑法`, `근기법`, `민소법`, …) — capped at 6 chars to avoid
+///     over-matching arbitrary text. Short forms canonicalise
+///     post-match via `law_aliases::canonical_name`.
+///
+/// Optional `구\s+` prefix captures Korean legal "former law" references
+/// (`구 민법 제839조의2`). The prefix is outside the law-name capture
+/// group so the matched name stays clean; `canonical_name` would strip
+/// any residual prefix anyway via `strip_revision_prefix`.
+///
+/// Optional parenthetical between law name and `제N조` carries the
+/// revision-date context that typically follows `구 {법}` references —
+/// e.g. `구 민법 (2007. 12. 21. 법률 제8720호로 개정되기 전의 것)
+/// 제839조의2`. The parenthetical is non-capturing; the whole match's
+/// `raw` field preserves it as edge evidence.
 fn unbracketed_law_article_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         Regex::new(
-            // 1st alternative: official long-form names ending in 법|령|률|규칙|조례
-            // 2nd alternative: hanja forms (民法, 刑法) and Korean abbreviations ending in 법
-            //                  — capped at 8 chars to avoid over-matching arbitrary text.
-            r"((?:[가-힣][가-힣\s]{1,18}?(?:법|령|률|규칙|조례))|(?:[가-힣\p{Han}]{1,6}법))\s*제\s*(\d+)\s*조(?:의\s*(\d+))?(?:\s*제\s*(\d+)\s*항)?(?:\s*제\s*(\d+)\s*호)?"
+            // (?:구법?\s+)?                                     optional 구/구법 prefix
+            // ( official | abbreviation ) capture              law name
+            // (?:\s*\([^)]{1,200}\))?                           optional parenthetical (revision date, etc.)
+            // \s*제\s*(\d+)\s*조(?:의\s*(\d+))?                 article + sub
+            // (?:\s*제\s*(\d+)\s*항)?(?:\s*제\s*(\d+)\s*호)?    paragraph + item
+            r"(?:구법?\s+)?((?:[가-힣][가-힣\s]{1,18}?(?:법|령|률|규칙|조례))|(?:[가-힣\p{Han}]{1,6}법))(?:\s*\([^)]{1,200}\))?\s*제\s*(\d+)\s*조(?:의\s*(\d+))?(?:\s*제\s*(\d+)\s*항)?(?:\s*제\s*(\d+)\s*호)?"
         ).unwrap()
     })
 }
@@ -128,41 +138,51 @@ pub fn extract_statute_citations(text: &str, initial_law: Option<&str>) -> Vec<S
     // anchors where a law name is SET. Anchors come from bracketed markers
     // OR unbracketed law+article pairs. We merge these into a sorted list of
     // "law-context change" points.
-    let mut anchors: Vec<(usize, String)> = Vec::new();
+    // Anchor = (pick_position, span_start, law). `pick_position` is used for
+    // "most recent anchor before this article" lookup; `span_start` is the
+    // actual text index where the anchor's region BEGINS, so `raw` evidence
+    // captures the law name and any parenthetical (e.g. a revision-date
+    // block) in addition to the article reference.
+    let mut anchors: Vec<(usize, usize, String)> = Vec::new();
     for m in bracketed_law_re().captures_iter(text) {
         let whole = m.get(0).unwrap();
         let raw = m.get(1).unwrap().as_str().trim();
         // Canonicalise so `「근기법」 제43조` and `「근로기준법」 제43조`
         // produce the same citation (and thus the same slug).
         let law = super::law_aliases::canonical_name(raw);
-        anchors.push((whole.end(), law));
+        anchors.push((whole.end(), whole.start(), law));
     }
     for m in unbracketed_law_article_re().captures_iter(text) {
         let whole = m.get(0).unwrap();
         let raw = m.get(1).unwrap().as_str().trim();
         let law = super::law_aliases::canonical_name(raw);
-        // Anchor is set at the START of the match so the article inside
-        // the match itself uses this law.
-        anchors.push((whole.start(), law));
+        // For pick_position use whole.start() so the article inside the
+        // match itself uses this law (matches the existing test expecting
+        // `pos ≤ article_start + 1`).
+        anchors.push((whole.start(), whole.start(), law));
     }
-    anchors.sort_by_key(|&(pos, _)| pos);
+    anchors.sort_by_key(|&(pick, _, _)| pick);
 
     // Pass 2: for every bare article match, look up the most recent anchor
-    // whose position ≤ match.start(); use that law. Fall back to `current_law`.
+    // whose position ≤ match.start(); use that law. Fall back to
+    // `current_law`. The anchor's `span_start` becomes the start of the
+    // `raw` evidence slice so we preserve "구 민법 (2007. 12. 21. …로
+    // 개정되기 전의 것)" around `제839조의2 제1항`.
     for m in article_ref_re().captures_iter(text) {
         let whole = m.get(0).unwrap();
         let start = whole.start();
 
         // Find the applicable law context.
-        let law = anchors
+        let anchor_match = anchors
             .iter()
             .rev()
-            .find(|(pos, _)| *pos <= start + 1) // +1 so anchor at same start counts
-            .map(|(_, l)| l.clone())
-            .or_else(|| current_law.clone());
-
-        let Some(law) = law else {
-            continue; // no law context known — skip rather than guess
+            .find(|(pick, _, _)| *pick <= start + 1); // +1 so anchor at same start counts
+        let (law, raw_start) = match anchor_match {
+            Some((_, span_start, l)) => (l.clone(), *span_start),
+            None => match current_law.clone() {
+                Some(l) => (l, start),
+                None => continue, // no law context known — skip rather than guess
+            },
         };
 
         let article: u32 = match m.get(1).and_then(|x| x.as_str().parse().ok()) {
@@ -177,13 +197,24 @@ pub fn extract_statute_citations(text: &str, initial_law: Option<&str>) -> Vec<S
         // multiple chunks (not needed in this single-call flow, but cheap).
         current_law = Some(law.clone());
 
+        // Build evidence spanning from the anchor (if any) through the
+        // article reference. Guard against negative / crossed ranges that
+        // could arise if an anchor pick_position preceded its span_start
+        // (shouldn't happen but be defensive with char-boundary safety).
+        let end = whole.end();
+        let raw_slice = if raw_start < end && text.is_char_boundary(raw_start) && text.is_char_boundary(end) {
+            &text[raw_start..end]
+        } else {
+            whole.as_str()
+        };
+
         out.push(StatuteRef {
             law_name: law,
             article,
             article_sub,
             paragraph,
             item,
-            raw: whole.as_str().to_string(),
+            raw: raw_slice.to_string(),
         });
     }
 
@@ -352,5 +383,72 @@ mod tests {
         let r = extract_statute_citations(t, None);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].law_name, "지어낸법");
+    }
+
+    #[test]
+    fn old_law_prefix_stripped_simple() {
+        // `구 민법 제839조의2` resolves to the same law as `민법 제839조의2`.
+        let t = "구 민법 제839조의2";
+        let r = extract_statute_citations(t, None);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].law_name, "민법");
+        assert_eq!(r[0].article, 839);
+        assert_eq!(r[0].article_sub, Some(2));
+    }
+
+    #[test]
+    fn old_law_prefix_with_revision_date_parenthetical() {
+        // Real-world form with the long revision-date block between the
+        // law name and the article reference. The parenthetical is
+        // preserved in the `raw` evidence field but does not prevent
+        // the match.
+        let t = "구 민법(2007. 12. 21. 법률 제8720호로 개정되기 전의 것) 제839조의2 제1항";
+        let r = extract_statute_citations(t, None);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].law_name, "민법");
+        assert_eq!(r[0].article, 839);
+        assert_eq!(r[0].article_sub, Some(2));
+        assert_eq!(r[0].paragraph, Some(1));
+        // Evidence preserves the revision date so the edge's `context`
+        // carries full audit information.
+        assert!(r[0].raw.contains("2007. 12. 21."));
+        assert!(r[0].raw.contains("개정되기 전의 것"));
+    }
+
+    #[test]
+    fn old_law_prefix_with_spaced_parenthetical() {
+        // Same pattern, but with a space between the law name and `(`.
+        let t = "구 근로기준법 (2024. 10. 22. 법률 제20520호로 개정되기 전의 것) 제36조";
+        let r = extract_statute_citations(t, None);
+        assert!(r.iter().any(|c| c.law_name == "근로기준법" && c.article == 36));
+    }
+
+    #[test]
+    fn old_law_mixed_with_current_in_same_block() {
+        // Mixed refjo block: some references are current, some are 구법.
+        // All `민법` references (current or 구) must land on the same slug;
+        // all `근로기준법` references likewise. Edge evidence will tell
+        // the caller which was a current-version vs. historical citation.
+        let t = "민법 제750조, 구 민법(2007. 12. 21. 법률 제8720호로 개정되기 전의 것) 제839조의2, 근로기준법 제36조";
+        let r = extract_statute_citations(t, None);
+        let pairs: Vec<(&str, u32, Option<u32>)> = r
+            .iter()
+            .map(|c| (c.law_name.as_str(), c.article, c.article_sub))
+            .collect();
+        assert!(pairs.contains(&("민법", 750, None)));
+        assert!(pairs.contains(&("민법", 839, Some(2))));
+        assert!(pairs.contains(&("근로기준법", 36, None)));
+    }
+
+    #[test]
+    fn bracketed_old_law_also_canonicalises() {
+        // `「구 민법」 제839조의2` — 구 prefix inside the bracket.
+        // canonical_name strips the prefix so the slug is `statute::민법::839-2`.
+        let t = "「구 민법」 제839조의2";
+        let r = extract_statute_citations(t, None);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].law_name, "민법");
+        assert_eq!(r[0].article, 839);
+        assert_eq!(r[0].article_sub, Some(2));
     }
 }

@@ -108,8 +108,15 @@ const LAW_ALIAS_TABLE: &[(&str, &[&str])] = &[
 /// Whitespace is trimmed; internal spacing is preserved so forms like
 /// `근로자퇴직급여 보장법` (with space) and `근로자퇴직급여보장법`
 /// (without) both map to the same canonical.
+///
+/// A leading `구` / `구법` marker (Korean legal shorthand for "former
+/// version of — the law as it stood before a revision") is stripped
+/// before lookup: a `구 민법` reference is still **the same 민법**,
+/// just pointing at a historical version. The revision-date context
+/// (usually in a following parenthetical) is preserved by the caller
+/// as edge evidence (`vault_links.context`), not as a separate slug.
 pub fn canonical_name(input: &str) -> String {
-    let key = input.trim();
+    let key = strip_revision_prefix(input.trim());
     if key.is_empty() {
         return String::new();
     }
@@ -129,6 +136,26 @@ pub fn canonical_name(input: &str) -> String {
     // No alias table hit — return the trimmed (but space-preserved) input
     // so downstream code sees a stable form.
     key.to_string()
+}
+
+/// Strip a leading `구` / `구법` / `구 ` / `구\t` revision-version marker.
+/// Idempotent; returns the input slice unchanged if no marker is present.
+///
+/// Why: in Korean legal writing, `구 민법` means "former 민법" (the law
+/// as it stood before the revision identified by the following
+/// parenthetical). The slug for the law itself is unchanged — same law,
+/// different version. We strip the prefix here so both `구 민법 제750조`
+/// and `민법 제750조` canonicalise to `민법 제750조`.
+pub fn strip_revision_prefix(s: &str) -> &str {
+    // Try the longest markers first so `구법` doesn't leave an orphan 법
+    // when the input was `구법민법` (theoretical — no real law name
+    // starts with `법`, but the prefix logic must be deterministic).
+    for prefix in &["구법 ", "구법\t", "구 ", "구\t"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            return rest.trim_start();
+        }
+    }
+    s
 }
 
 /// Every known short form for `canonical`, empty if the name is unknown
@@ -266,5 +293,33 @@ mod tests {
                 "duplicate canonical: {canonical}"
             );
         }
+    }
+
+    #[test]
+    fn strip_revision_prefix_handles_common_forms() {
+        assert_eq!(strip_revision_prefix("구 민법"), "민법");
+        assert_eq!(strip_revision_prefix("구\t민법"), "민법");
+        assert_eq!(strip_revision_prefix("구법 민법"), "민법");
+        assert_eq!(strip_revision_prefix("구법\t민법"), "민법");
+        // Multiple trailing spaces after the marker are trimmed.
+        assert_eq!(strip_revision_prefix("구   근로기준법"), "근로기준법");
+        // No marker present → identity.
+        assert_eq!(strip_revision_prefix("민법"), "민법");
+        assert_eq!(strip_revision_prefix(""), "");
+        // `구` NOT followed by whitespace is left alone (could be a legit
+        // law name prefix — though none exist today, be conservative).
+        assert_eq!(strip_revision_prefix("구법인"), "구법인");
+    }
+
+    #[test]
+    fn revision_prefix_canonicalises_through_main_entry_point() {
+        // `구 민법` is still 민법 for slug purposes; the revision date
+        // lives in the citation's raw text / edge evidence, not the slug.
+        assert_eq!(canonical_name("구 민법"), "민법");
+        assert_eq!(canonical_name("구 근로기준법"), "근로기준법");
+        // Works through short forms too: `구 근기법` → 근로기준법.
+        assert_eq!(canonical_name("구 근기법"), "근로기준법");
+        // And hanja: `구 民法` → 민법.
+        assert_eq!(canonical_name("구 民法"), "민법");
     }
 }
