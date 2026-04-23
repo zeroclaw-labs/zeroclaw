@@ -345,8 +345,10 @@ impl AcpServer {
         });
 
         // Forward events as they arrive. Use standard ACP `session/update`
-        // notifications with `sessionUpdate` + structured `content` so that
-        // clients like agentic.nvim route them to MessageWriter.
+        // notifications: `tool_call` for initial (pending + title/kind for UI/icons),
+        // `tool_call_update` for completion (status + content/rawOutput). This
+        // enables proper pending→completed flow, folding, diff previews, and
+        // rendering in clients like agentic.nvim's MessageWriter / permission UI.
         while let Some(event) = event_rx.recv().await {
             let notification = match &event {
                 TurnEvent::Chunk { delta } => JsonRpcNotification {
@@ -378,16 +380,25 @@ impl AcpServer {
                         }
                     }),
                 },
-                TurnEvent::ToolResult { id, name: _, output } => JsonRpcNotification {
+                TurnEvent::ToolResult { id, name, output } => JsonRpcNotification {
                     jsonrpc: "2.0",
                     method: "session/update",
                     params: serde_json::json!({
                         "sessionId": session_id,
                         "update": {
-                            "sessionUpdate": "tool_call",
+                            "sessionUpdate": "tool_call_update",
                             "toolCallId": id,
+                            "title": name,
+                            "kind": map_tool_kind(name),
                             "status": "completed",
-                            "rawOutput": output
+                            "rawOutput": output,
+                            "content": [{
+                                "type": "content",
+                                "content": {
+                                    "type": "text",
+                                    "text": output
+                                }
+                            }]
                         }
                     }),
                 },
@@ -767,5 +778,66 @@ mod tests {
         let missing_params = serde_json::json!({});
         let result = AcpServer::parse_prompt(&missing_params);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tool_call_and_update_serialization() {
+        // Test tool_call (initial pending event)
+        let tool_call_notif = JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": "test-sid",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc-12345",
+                    "title": "shell",
+                    "kind": "execute",
+                    "rawInput": {"command": "ls -la"},
+                    "status": "pending"
+                }
+            }),
+        };
+        let json1 = serde_json::to_string(&tool_call_notif).unwrap();
+        assert!(json1.contains("\"sessionUpdate\":\"tool_call\""));
+        assert!(json1.contains("\"toolCallId\":\"tc-12345\""));
+        assert!(json1.contains("\"title\":\"shell\""));
+        assert!(json1.contains("\"kind\":\"execute\""));
+        assert!(json1.contains("\"status\":\"pending\""));
+        assert!(json1.contains("\"rawInput\""));
+
+        // Test tool_call_update with content field (completion)
+        let tool_update_notif = JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": "test-sid",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-12345",
+                    "title": "shell",
+                    "kind": "execute",
+                    "status": "completed",
+                    "rawOutput": "file1.txt\nfile2.txt",
+                    "content": [{
+                        "type": "content",
+                        "content": {
+                            "type": "text",
+                            "text": "file1.txt\nfile2.txt"
+                        }
+                    }]
+                }
+            }),
+        };
+        let json2 = serde_json::to_string(&tool_update_notif).unwrap();
+        assert!(json2.contains("\"sessionUpdate\":\"tool_call_update\""));
+        assert!(json2.contains("\"toolCallId\":\"tc-12345\""));
+        assert!(json2.contains("\"status\":\"completed\""));
+        assert!(json2.contains("\"rawOutput\""));
+        assert!(json2.contains("\"content\""));
+        assert!(json2.contains("\"type\":\"content\""));
+        assert!(json2.contains("file1.txt"));
+        // Verify matching toolCallId across events
+        assert!(json1.contains("tc-12345") && json2.contains("tc-12345"));
     }
 }
