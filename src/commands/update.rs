@@ -178,6 +178,19 @@ fn current_target_triple() -> &'static str {
         } else {
             "x86_64-unknown-linux-gnu"
         }
+    } else if cfg!(target_os = "windows") {
+        match (
+            cfg!(target_arch = "aarch64"),
+            cfg!(target_arch = "x86"),
+            cfg!(target_env = "gnu"),
+        ) {
+            (true, _, true) => "aarch64-pc-windows-gnu",
+            (true, _, false) => "aarch64-pc-windows-msvc",
+            (_, true, true) => "i686-pc-windows-gnu",
+            (_, true, false) => "i686-pc-windows-msvc",
+            (_, _, true) => "x86_64-pc-windows-gnu",
+            _ => "x86_64-pc-windows-msvc",
+        }
     } else {
         "unknown"
     }
@@ -420,6 +433,16 @@ mod tests {
         assert!(
             triple.matches('-').count() >= 2,
             "triple should have at least two hyphens: {triple}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn current_target_triple_windows_uses_windows_suffix() {
+        let triple = current_target_triple();
+        assert!(
+            triple.contains("windows"),
+            "windows targets should include windows in the triple: {triple}"
         );
     }
 
