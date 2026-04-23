@@ -1797,6 +1797,14 @@ impl Provider for OpenAiCompatibleProvider {
             let status = response.status();
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
+            tracing::warn!(
+                provider = %self.name,
+                url = %url,
+                status = %status,
+                model = %model,
+                body = %sanitized,
+                "LLM provider returned non-2xx"
+            );
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
@@ -1810,7 +1818,13 @@ impl Provider for OpenAiCompatibleProvider {
                     });
             }
 
-            anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
+            anyhow::bail!(
+                "provider '{}' returned HTTP {} for model '{}': {}",
+                self.name,
+                status,
+                model,
+                sanitized
+            );
         }
 
         let body = response.text().await?;
@@ -1909,7 +1923,23 @@ impl Provider for OpenAiCompatibleProvider {
                     });
             }
 
-            return Err(super::api_error(&self.name, response).await);
+            let body = response.text().await.unwrap_or_default();
+            let sanitized = super::sanitize_api_error(&body);
+            tracing::warn!(
+                provider = %self.name,
+                url = %url,
+                status = %status,
+                model = %model,
+                body = %sanitized,
+                "LLM provider returned non-2xx"
+            );
+            anyhow::bail!(
+                "provider '{}' returned HTTP {} for model '{}': {}",
+                self.name,
+                status,
+                model,
+                sanitized
+            );
         }
 
         let body = response.text().await?;
@@ -1998,7 +2028,24 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         if !response.status().is_success() {
-            return Err(super::api_error(&self.name, response).await);
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let sanitized = super::sanitize_api_error(&body);
+            tracing::warn!(
+                provider = %self.name,
+                url = %url,
+                status = %status,
+                model = %model,
+                body = %sanitized,
+                "LLM provider returned non-2xx"
+            );
+            anyhow::bail!(
+                "provider '{}' returned HTTP {} for model '{}': {}",
+                self.name,
+                status,
+                model,
+                sanitized
+            );
         }
 
         let body = response.text().await?;
@@ -2104,6 +2151,14 @@ impl Provider for OpenAiCompatibleProvider {
             let status = response.status();
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
+            tracing::warn!(
+                provider = %self.name,
+                url = %url,
+                status = %status,
+                model = %model,
+                body = %sanitized,
+                "LLM provider returned non-2xx"
+            );
 
             if Self::is_native_tool_schema_unsupported(status, &sanitized) {
                 let fallback_messages =
@@ -2137,7 +2192,13 @@ impl Provider for OpenAiCompatibleProvider {
                     });
             }
 
-            anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
+            anyhow::bail!(
+                "provider '{}' returned HTTP {} for model '{}': {}",
+                self.name,
+                status,
+                model,
+                sanitized
+            );
         }
 
         let native_response: ApiChatResponse = response.json().await?;
@@ -2242,6 +2303,8 @@ impl Provider for OpenAiCompatibleProvider {
         let client = self.http_client();
         let auth_header = self.auth_header.clone();
         let count_tokens = options.count_tokens;
+        let provider_name = self.name.clone();
+        let model_owned = model.to_string();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
@@ -2265,8 +2328,20 @@ impl Provider for OpenAiCompatibleProvider {
                     Ok(text) => text,
                     Err(_) => format!("HTTP error: {}", status),
                 };
+                let sanitized = super::sanitize_api_error(&error);
+                tracing::warn!(
+                    provider = %provider_name,
+                    url = %url,
+                    status = %status,
+                    model = %model_owned,
+                    body = %sanitized,
+                    "LLM provider returned non-2xx (streaming)"
+                );
                 let _ = tx
-                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
+                    .send(Err(StreamError::Provider(format!(
+                        "provider '{}' returned HTTP {} for model '{}': {}",
+                        provider_name, status, model_owned, sanitized
+                    ))))
                     .await;
                 return;
             }
@@ -2334,6 +2409,8 @@ impl Provider for OpenAiCompatibleProvider {
         let url = self.chat_completions_url();
         let client = self.http_client();
         let auth_header = self.auth_header.clone();
+        let provider_name = self.name.clone();
+        let model_owned = model.to_string();
 
         // Use a channel to bridge the async HTTP response to the stream
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
@@ -2364,8 +2441,20 @@ impl Provider for OpenAiCompatibleProvider {
                     Ok(e) => e,
                     Err(_) => format!("HTTP error: {}", status),
                 };
+                let sanitized = super::sanitize_api_error(&error);
+                tracing::warn!(
+                    provider = %provider_name,
+                    url = %url,
+                    status = %status,
+                    model = %model_owned,
+                    body = %sanitized,
+                    "LLM provider returned non-2xx (streaming)"
+                );
                 let _ = tx
-                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
+                    .send(Err(StreamError::Provider(format!(
+                        "provider '{}' returned HTTP {} for model '{}': {}",
+                        provider_name, status, model_owned, sanitized
+                    ))))
                     .await;
                 return;
             }
@@ -2421,6 +2510,8 @@ impl Provider for OpenAiCompatibleProvider {
         let url = self.chat_completions_url();
         let client = self.http_client();
         let auth_header = self.auth_header.clone();
+        let provider_name = self.name.clone();
+        let model_owned = model.to_string();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
@@ -2443,8 +2534,20 @@ impl Provider for OpenAiCompatibleProvider {
                     Ok(e) => e,
                     Err(_) => format!("HTTP error: {}", status),
                 };
+                let sanitized = super::sanitize_api_error(&error);
+                tracing::warn!(
+                    provider = %provider_name,
+                    url = %url,
+                    status = %status,
+                    model = %model_owned,
+                    body = %sanitized,
+                    "LLM provider returned non-2xx (streaming)"
+                );
                 let _ = tx
-                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
+                    .send(Err(StreamError::Provider(format!(
+                        "provider '{}' returned HTTP {} for model '{}': {}",
+                        provider_name, status, model_owned, sanitized
+                    ))))
                     .await;
                 return;
             }
