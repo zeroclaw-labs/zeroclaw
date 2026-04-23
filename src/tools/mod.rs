@@ -173,7 +173,8 @@ pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 pub use vault_graph::{
-    LegalGraphNeighborsTool, LegalGraphShortestPathTool, LegalGraphSubgraphTool,
+    LegalGraphFindTool, LegalGraphNeighborsTool, LegalGraphShortestPathTool,
+    LegalGraphSubgraphTool, LegalReadArticleTool,
 };
 pub use wasm_module::WasmModuleTool;
 // Consumed from src/tools/registry.rs once the smart_search cascade is
@@ -399,6 +400,9 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory, security.clone())),
         // Second-brain legal graph tools — read-only, backed by brain.db.
+        Arc::new(LegalGraphFindTool::new(Arc::new(
+            workspace_dir.to_path_buf(),
+        ))),
         Arc::new(LegalGraphNeighborsTool::new(Arc::new(
             workspace_dir.to_path_buf(),
         ))),
@@ -406,6 +410,9 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
         ))),
         Arc::new(LegalGraphSubgraphTool::new(Arc::new(
+            workspace_dir.to_path_buf(),
+        ))),
+        Arc::new(LegalReadArticleTool::new(Arc::new(
             workspace_dir.to_path_buf(),
         ))),
         Arc::new(document_fetch::DocumentFetchTool::new(Arc::new(

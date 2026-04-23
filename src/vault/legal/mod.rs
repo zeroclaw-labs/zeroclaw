@@ -31,8 +31,8 @@ pub use citation_patterns::{
     extract_case_numbers, extract_statute_citations, CaseRef, StatuteRef,
 };
 pub use graph_query::{
-    get_node, induced_subgraph, neighbors, shortest_path, Edge, Node, NodeKind, Subgraph,
-    MAX_NODES,
+    find_nodes, get_node, induced_subgraph, neighbors, read_article, shortest_path,
+    ArticleContent, Edge, FindHit, Node, NodeKind, Subgraph, MAX_NODES,
 };
 pub use ingest::{ingest_case, ingest_statute, IngestCounts, IngestReport};
 pub use slug::{case_slug, statute_slug};

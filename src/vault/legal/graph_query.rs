@@ -248,7 +248,248 @@ pub fn induced_subgraph(conn: &Connection, slugs: &[String]) -> Result<Subgraph>
     })
 }
 
+/// Body content read back from a single legal node. Layout mirrors the
+/// frontmatter we write in ingest, so the agent can quote accurately without
+/// needing to retrieve the surrounding graph first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArticleContent {
+    pub slug: String,
+    pub kind: NodeKind,
+    pub label: String,
+    /// Full vault_documents.content (statute: law + header + body; case: full md).
+    pub content: String,
+    /// Structured metadata (law_name, article_num, case_number, verdict_date, …).
+    pub metadata: HashMap<String, String>,
+    /// Sections parsed from case markdown (`판시사항`, `판결요지`, `참조조문`,
+    /// `참조판례`, `판례내용`). Empty for statutes.
+    pub sections: HashMap<String, String>,
+}
+
+pub fn read_article(conn: &Connection, slug: &str) -> Result<Option<ArticleContent>> {
+    let row: Option<(i64, String, String)> = conn
+        .query_row(
+            "SELECT id, doc_type, content FROM vault_documents
+              WHERE title = ?1 AND doc_type IN ('statute_article','case')",
+            params![slug],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .ok();
+    let Some((id, doc_type, content)) = row else {
+        return Ok(None);
+    };
+    let kind = NodeKind::from_doc_type(&doc_type).unwrap();
+    let metadata = load_frontmatter(conn, id)?;
+    let label = build_label(slug, kind, &metadata);
+    let sections = match kind {
+        NodeKind::Case => parse_case_sections(&content),
+        NodeKind::Statute => HashMap::new(),
+    };
+    Ok(Some(ArticleContent {
+        slug: slug.to_string(),
+        kind,
+        label,
+        content,
+        metadata,
+        sections,
+    }))
+}
+
+/// Lightweight hit from [`find_nodes`] — carries just enough to disambiguate
+/// before calling [`read_article`] or [`neighbors`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindHit {
+    pub slug: String,
+    pub kind: NodeKind,
+    pub label: String,
+    /// Why this hit matched (`"exact-slug"` / `"exact-alias"` / `"parsed-citation"` /
+    /// `"parsed-case-number"` / `"fts-fallback"`). Helps the caller weigh
+    /// confidence.
+    pub matched_via: &'static str,
+}
+
+/// Find legal nodes matching a human-readable query like:
+///   - `statute::민법::839-2` (canonical slug)
+///   - `민법 제839조의2` (natural-language citation)
+///   - `민법 제839조의2(재산분할청구권)` (citation w/ parenthetical subtitle)
+///   - `2024노3424` (bare case number)
+///   - `대법원 2024노3424` (court-qualified alias)
+///
+/// Strategy (cheap → expensive):
+///   1. Exact `vault_documents.title` match.
+///   2. Exact `vault_aliases.alias` match.
+///   3. Parse as statute citation → construct slug → exact lookup.
+///   4. Parse as case number → construct slug → exact lookup.
+///   5. FTS5 fallback on `vault_docs_fts` (trigram) — top-`limit` hits,
+///      restricted to legal `doc_type`.
+///
+/// Returns up to `limit` hits with provenance tags for disambiguation.
+pub fn find_nodes(conn: &Connection, query: &str, limit: usize) -> Result<Vec<FindHit>> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(vec![]);
+    }
+    let limit = limit.clamp(1, 20);
+    let mut out: Vec<FindHit> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    // 1. Exact slug — 100% confidence; short-circuit so the FTS fallback
+    //    doesn't pollute the result with low-signal neighbours.
+    if let Some(n) = get_node(conn, q)? {
+        push_hit(&mut out, &mut seen, &n, "exact-slug");
+        return Ok(out);
+    }
+
+    // 2. Exact alias — same 100% confidence; short-circuit.
+    let alias_hit: Option<String> = conn
+        .query_row(
+            "SELECT d.title FROM vault_aliases va
+               JOIN vault_documents d ON d.id = va.doc_id
+              WHERE va.alias = ?1
+                AND d.doc_type IN ('statute_article','case')",
+            params![q],
+            |r| r.get::<_, String>(0),
+        )
+        .ok();
+    if let Some(slug) = alias_hit {
+        if let Some(n) = get_node(conn, &slug)? {
+            push_hit(&mut out, &mut seen, &n, "exact-alias");
+            return Ok(out);
+        }
+    }
+
+    // 3. Parse as statute citation (using the same regex as body-scanning).
+    if out.len() < limit {
+        let parsed = super::citation_patterns::extract_statute_citations(q, None);
+        for pr in parsed {
+            let slug = super::slug::statute_slug(&pr.law_name, pr.article, pr.article_sub);
+            if let Some(n) = get_node(conn, &slug)? {
+                push_hit(&mut out, &mut seen, &n, "parsed-citation");
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+
+    // 4. Parse as bare case number.
+    if out.len() < limit {
+        let cases = super::citation_patterns::extract_case_numbers(q);
+        for cr in cases {
+            let slug = super::slug::case_slug(&cr.case_number);
+            if let Some(n) = get_node(conn, &slug)? {
+                push_hit(&mut out, &mut seen, &n, "parsed-case-number");
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+
+    // 5. FTS5 fallback. Trigram tokenizer requires ≥3-char substrings; the
+    //    vault_docs_fts view is over title+content so hits for e.g.
+    //    `재산분할` will surface 제839조의2.
+    if out.len() < limit && q.chars().count() >= 3 {
+        let remaining = limit - out.len();
+        let fts_query = fts_escape(q);
+        if !fts_query.is_empty() {
+            let mut stmt = conn.prepare(
+                "SELECT d.title
+                   FROM vault_docs_fts f JOIN vault_documents d ON d.id = f.rowid
+                  WHERE vault_docs_fts MATCH ?1
+                    AND d.doc_type IN ('statute_article','case')
+                  ORDER BY bm25(vault_docs_fts)
+                  LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![fts_query, remaining as i64], |r| {
+                r.get::<_, String>(0)
+            })?;
+            for slug in rows.filter_map(Result::ok) {
+                if seen.contains(&slug) {
+                    continue;
+                }
+                if let Some(n) = get_node(conn, &slug)? {
+                    push_hit(&mut out, &mut seen, &n, "fts-fallback");
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 // ───────── Internals ─────────
+
+fn push_hit(
+    out: &mut Vec<FindHit>,
+    seen: &mut HashSet<String>,
+    node: &Node,
+    matched_via: &'static str,
+) {
+    if seen.insert(node.slug.clone()) {
+        out.push(FindHit {
+            slug: node.slug.clone(),
+            kind: node.kind,
+            label: node.label.clone(),
+            matched_via,
+        });
+    }
+}
+
+/// Minimal FTS5 escape: strip punctuation that breaks the query parser,
+/// leaving a whitespace-separated phrase. Empty if nothing useful remains.
+fn fts_escape(q: &str) -> String {
+    // Replace FTS operator characters with space; collapse whitespace.
+    let cleaned: String = q
+        .chars()
+        .map(|c| match c {
+            '"' | '\'' | '(' | ')' | ':' | '*' | '-' | '+' | '^' => ' ',
+            other => other,
+        })
+        .collect();
+    let parts: Vec<&str> = cleaned.split_whitespace().filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    // Quote each term so trigram tokenizer matches substrings across our
+    // ingested Korean content.
+    parts
+        .iter()
+        .map(|p| format!("\"{}\"", p.replace('"', "")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_case_sections(md: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut key: Option<String> = None;
+    let mut val = String::new();
+    for line in md.lines() {
+        if let Some(rest) = line.strip_prefix("## ") {
+            if let Some(k) = key.take() {
+                out.insert(k, std::mem::take(&mut val).trim().to_string());
+            }
+            key = Some(rest.trim().to_string());
+        } else if key.is_some() {
+            val.push_str(line);
+            val.push('\n');
+        }
+    }
+    if let Some(k) = key {
+        out.insert(k, val.trim().to_string());
+    }
+    out
+}
+
+// ───────── Graph traversal internals ─────────
 
 fn pass_kinds(filter: &[NodeKind], kind: NodeKind) -> bool {
     filter.is_empty() || filter.contains(&kind)
@@ -558,5 +799,86 @@ body
         let p =
             shortest_path(&g, "statute::근로기준법::36", "statute::없는법::1", 3).unwrap();
         assert!(p.is_none());
+    }
+
+    #[test]
+    fn read_article_statute_returns_body_and_frontmatter() {
+        let conn_a = setup();
+        let g = conn_a.lock();
+        let a = read_article(&g, "statute::근로기준법::43").unwrap().unwrap();
+        assert_eq!(a.kind, NodeKind::Statute);
+        assert!(a.content.contains("제43조"));
+        assert_eq!(a.metadata.get("law_name").map(String::as_str), Some("근로기준법"));
+        assert_eq!(a.metadata.get("article_key").map(String::as_str), Some("43"));
+        assert!(a.sections.is_empty()); // statutes don't have ## sections
+    }
+
+    #[test]
+    fn read_article_case_parses_sections() {
+        let conn_a = setup();
+        let g = conn_a.lock();
+        let a = read_article(&g, "case::2024노3424").unwrap().unwrap();
+        assert_eq!(a.kind, NodeKind::Case);
+        assert!(a.sections.contains_key("판결요지"));
+        assert!(a.sections.contains_key("참조조문"));
+        assert_eq!(a.metadata.get("case_number").map(String::as_str), Some("2024노3424"));
+    }
+
+    #[test]
+    fn read_article_missing_slug_returns_none() {
+        let conn_a = setup();
+        let g = conn_a.lock();
+        assert!(read_article(&g, "statute::없는법::1").unwrap().is_none());
+    }
+
+    #[test]
+    fn find_nodes_exact_slug() {
+        let conn_a = setup();
+        let g = conn_a.lock();
+        let hits = find_nodes(&g, "statute::근로기준법::43", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].matched_via, "exact-slug");
+    }
+
+    #[test]
+    fn find_nodes_exact_alias_human_form() {
+        let conn_a = setup();
+        let g = conn_a.lock();
+        // Aliases generated by ingest include `근로기준법 제43조` (with space).
+        let hits = find_nodes(&g, "근로기준법 제43조", 5).unwrap();
+        assert!(
+            hits.iter().any(|h| h.slug == "statute::근로기준법::43"),
+            "got: {:?}",
+            hits
+        );
+    }
+
+    #[test]
+    fn find_nodes_parses_natural_language_citation() {
+        let conn_a = setup();
+        let g = conn_a.lock();
+        // Not an exact alias — but the citation regex should parse it.
+        let hits = find_nodes(&g, "근로기준법 제36조 제1항", 5).unwrap();
+        assert!(
+            hits.iter().any(|h| h.slug == "statute::근로기준법::36"),
+            "got: {:?}",
+            hits
+        );
+    }
+
+    #[test]
+    fn find_nodes_parses_bare_case_number() {
+        let conn_a = setup();
+        let g = conn_a.lock();
+        let hits = find_nodes(&g, "2024노3424", 5).unwrap();
+        assert!(hits.iter().any(|h| h.slug == "case::2024노3424"));
+    }
+
+    #[test]
+    fn find_nodes_empty_query_is_empty() {
+        let conn_a = setup();
+        let g = conn_a.lock();
+        assert!(find_nodes(&g, "", 5).unwrap().is_empty());
+        assert!(find_nodes(&g, "   ", 5).unwrap().is_empty());
     }
 }
