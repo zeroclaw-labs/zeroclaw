@@ -963,13 +963,23 @@ async fn main() -> Result<()> {
     }
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO.
-    // matrix_sdk crates are suppressed to warn because they are extremely
-    // noisy at info level. To restore SDK-level output for Matrix debugging:
-    //   RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info
+    // For the ACP command, we default to WARN to avoid INFO logs corrupting the stdio protocol.
+    // We also always redirect logs to stderr so stdout remains clean for data.
+    let default_log_level = if matches!(cli.command, Commands::Acp { .. }) {
+        "warn"
+    } else {
+        // matrix_sdk crates are suppressed to warn because they are extremely
+        // noisy at info level. To restore SDK-level output for Matrix debugging:
+        //   RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info
+        // acp_server has to be WARN because INFO injects junk data into the JSON stream.
+        "info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn"
+    };
+
     let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn")
-        }))
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_level)),
+        )
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
@@ -1961,19 +1971,16 @@ async fn main() -> Result<()> {
                 } else if let Some(val) = value {
                     config.set_prop(&path, &val)?;
                 } else {
-                    let variants = config
-                        .prop_fields()
-                        .into_iter()
-                        .find(|f| f.name == path)
-                        .and_then(|info| {
-                            let get_variants = info.enum_variants?;
-                            let variants = get_variants();
-                            let current_index = variants
-                                .iter()
-                                .position(|v| v == &info.display_value)
-                                .unwrap_or(0);
-                            Some((variants, current_index))
-                        });
+                    let field_info = config.prop_fields().into_iter().find(|f| f.name == path);
+                    let variants = field_info.as_ref().and_then(|info| {
+                        let get_variants = info.enum_variants?;
+                        let variants = get_variants();
+                        let current_index = variants
+                            .iter()
+                            .position(|v| v == &info.display_value)
+                            .unwrap_or(0);
+                        Some((variants, current_index))
+                    });
                     if let Some((variants, current_index)) = variants {
                         let selected = Select::new()
                             .with_prompt(format!("Select value for {path}"))
@@ -1981,6 +1988,42 @@ async fn main() -> Result<()> {
                             .default(current_index)
                             .interact()?;
                         config.set_prop(&path, &variants[selected])?;
+                    } else if field_info
+                        .as_ref()
+                        .is_some_and(|f| f.kind == crate::config::PropKind::StringArray)
+                    {
+                        let current_items: Vec<String> = field_info
+                            .as_ref()
+                            .and_then(|f| {
+                                let raw = toml::from_str::<toml::Value>(&format!(
+                                    "v = {}",
+                                    if f.display_value == "<unset>" {
+                                        "[]".to_string()
+                                    } else {
+                                        f.display_value.clone()
+                                    }
+                                ))
+                                .ok();
+                                raw.and_then(|v| v.get("v").cloned())
+                                    .and_then(|v| v.as_array().cloned())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                            .collect()
+                                    })
+                            })
+                            .unwrap_or_default();
+                        let editor_content = current_items.join("\n");
+                        let edited = dialoguer::Editor::new()
+                            .edit(&editor_content)?
+                            .unwrap_or(editor_content);
+                        let val = edited
+                            .lines()
+                            .map(|l| l.trim())
+                            .filter(|l| !l.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        config.set_prop(&path, &val)?;
                     } else {
                         anyhow::bail!("Value required. Usage: zeroclaw config set {path} <value>");
                     }
