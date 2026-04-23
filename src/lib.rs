@@ -461,6 +461,19 @@ pub enum VaultLegalCommands {
         /// raw `{nodes, edges, __meta}`, also graphify-compatible.
         #[arg(long, default_value = "html")]
         format: String,
+        /// Inline the Cytoscape + dagre JS from the local vendor cache so
+        /// the output HTML renders with no CDN calls. Requires a prior
+        /// `vault legal vendor-download`. Ignored for `--format json`.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Download Cytoscape.js + dagre + cytoscape-dagre into the workspace
+    /// vendor cache so `export --offline` and the gateway can serve them
+    /// without CDN calls. Safe to re-run.
+    VendorDownload {
+        /// Re-download even if the files already exist.
+        #[arg(long)]
+        force: bool,
     },
 }
 

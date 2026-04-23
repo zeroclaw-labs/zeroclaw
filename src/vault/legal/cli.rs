@@ -230,9 +230,47 @@ pub enum ExportFormat {
     Json,
 }
 
+/// Download the three Cytoscape/dagre JS assets into the workspace
+/// vendor cache so subsequent `--offline` exports can inline them
+/// (and so the gateway can serve them over `/legal-graph/vendor/*`).
+/// Idempotent — files already present with non-zero size are skipped
+/// unless `force` is set.
+pub async fn vendor_download(config: &Config, force: bool) -> Result<()> {
+    println!(
+        "{} fetching Cytoscape + dagre + cytoscape-dagre → {}",
+        style("vendor-download:").bold().cyan(),
+        super::vendor::vendor_dir(&config.workspace_dir).display()
+    );
+    let report = super::vendor::download_all(&config.workspace_dir, force).await?;
+    for (name, bytes) in &report.downloaded {
+        println!(
+            "  {} {} ({:.1} KB)",
+            style("downloaded").green(),
+            name,
+            *bytes as f64 / 1024.0
+        );
+    }
+    for name in &report.skipped_existing {
+        println!("  {} {} (already present; use --force to re-download)", style("skip").yellow(), name);
+    }
+    for err in &report.failed {
+        eprintln!("  {} {err}", style("FAIL").red());
+    }
+    if !report.failed.is_empty() {
+        anyhow::bail!("{} asset(s) failed to download", report.failed.len());
+    }
+    Ok(())
+}
+
 /// Compute a subgraph rooted at `root_slug` up to `depth` hops, filtered by
 /// `kinds` (comma-separated `statute,case`), and write it to `out` as either
 /// a standalone HTML viewer or raw JSON.
+///
+/// `offline`: when `true`, inlines the Cytoscape + dagre JS libraries from
+/// the vendor cache (populated by `zeroclaw vault legal vendor-download`)
+/// into the output HTML so the file renders without any CDN calls. When
+/// `false` (the default), the output keeps the CDN `<script src>` tags —
+/// smaller file, but needs network on first open.
 pub fn export_subgraph(
     config: &Config,
     root: &str,
@@ -240,6 +278,7 @@ pub fn export_subgraph(
     kinds: Option<&str>,
     format: ExportFormat,
     out: &Path,
+    offline: bool,
 ) -> Result<()> {
     let db_path = config.workspace_dir.join("memory").join("brain.db");
     if !db_path.exists() {
@@ -277,7 +316,11 @@ pub fn export_subgraph(
                 .with_context(|| format!("writing {}", out.display()))?;
         }
         ExportFormat::Html => {
-            let html = build_snapshot_html(&sg_json);
+            let html = if offline {
+                build_snapshot_html_offline(&sg_json, &config.workspace_dir)?
+            } else {
+                build_snapshot_html(&sg_json)
+            };
             std::fs::write(out, html.as_bytes())
                 .with_context(|| format!("writing {}", out.display()))?;
         }
@@ -335,6 +378,71 @@ fn build_snapshot_html(subgraph_json: &str) -> String {
     html
 }
 
+/// Build a fully-self-contained snapshot HTML — same as
+/// [`build_snapshot_html`] but with the three CDN `<script src>` tags
+/// replaced by inlined `<script>…</script>` blocks loaded from the
+/// vendor cache. Errors if the cache is missing the required files
+/// (run `vault legal vendor-download` first).
+fn build_snapshot_html_offline(
+    subgraph_json: &str,
+    workspace_dir: &Path,
+) -> Result<String> {
+    if !super::vendor::has_all_assets(workspace_dir) {
+        anyhow::bail!(
+            "--offline requested but vendor assets are missing in {} — run \
+             `zeroclaw vault legal vendor-download` first",
+            super::vendor::vendor_dir(workspace_dir).display()
+        );
+    }
+
+    // Same prebundle-injection as the online path, just with the script
+    // sources rewritten to inline bodies. We operate on a clone of the
+    // template to avoid mutating the static reference.
+    let mut html = VIEWER_TEMPLATE.to_string();
+
+    // Replace each `<script src="…cdn…"></script>` line with an inlined
+    // `<script>…</script>` block. Matching on the version-pinned URL
+    // keeps behaviour deterministic even if the template gains another
+    // script tag pointing elsewhere.
+    let replacements: &[(&str, &str)] = &[
+        (
+            r#"<script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>"#,
+            "cytoscape.min.js",
+        ),
+        (
+            r#"<script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>"#,
+            "dagre.min.js",
+        ),
+        (
+            r#"<script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>"#,
+            "cytoscape-dagre.js",
+        ),
+    ];
+    for (needle, asset) in replacements {
+        let body = super::vendor::load_asset(workspace_dir, asset)?
+            .ok_or_else(|| anyhow::anyhow!("vendor asset {asset} vanished mid-export"))?;
+        // Escape `</script>` inside the JS to neutralise any embedded
+        // terminator (unlikely for minified vendor code but cheap to do).
+        let safe = body.replace("</script>", "<\\/script>");
+        let inlined = format!("<script>\n{safe}\n</script>");
+        if let Some(idx) = html.find(needle) {
+            html.replace_range(idx..idx + needle.len(), &inlined);
+        }
+    }
+
+    // Inject prebundled subgraph before </body> (same as online path).
+    let safe_json = subgraph_json.replace("</", "<\\/");
+    let injection = format!(
+        "<script type=\"application/json\" id=\"__prebundled_subgraph__\">{safe_json}</script>\n</body>"
+    );
+    if let Some(idx) = html.rfind("</body>") {
+        html.replace_range(idx..idx + "</body>".len(), &injection);
+    } else {
+        html.push_str(&injection);
+    }
+    Ok(html)
+}
+
 const VIEWER_TEMPLATE: &str = include_str!("../../gateway/legal_graph_viewer.html");
 
 #[cfg(test)]
@@ -383,6 +491,44 @@ mod tests {
         assert_eq!(parse_kinds_csv(Some("")), Vec::<NodeKind>::new());
         assert_eq!(parse_kinds_csv(Some("statute")), vec![Statute]);
         assert_eq!(parse_kinds_csv(Some("case, statute, bogus")), vec![Case, Statute]);
+    }
+
+    #[test]
+    fn offline_export_bails_when_vendor_cache_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let r = build_snapshot_html_offline(
+            r#"{"nodes":[],"edges":[]}"#,
+            tmp.path(),
+        );
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.contains("vendor-download") || msg.contains("vendor assets are missing"),
+            "expected actionable error mentioning vendor-download, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn offline_export_inlines_cached_assets() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = super::super::vendor::vendor_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        // Plausible stub bodies — just need non-empty files.
+        std::fs::write(dir.join("cytoscape.min.js"), b"/*CYTO*/").unwrap();
+        std::fs::write(dir.join("dagre.min.js"), b"/*DAGRE*/").unwrap();
+        std::fs::write(dir.join("cytoscape-dagre.js"), b"/*CDAG*/").unwrap();
+        let html = build_snapshot_html_offline(
+            r#"{"nodes":[{"slug":"x"}],"edges":[]}"#,
+            tmp.path(),
+        )
+        .unwrap();
+        // CDN script tags must be gone.
+        assert!(!html.contains("unpkg.com"), "CDN tag must be removed when inlining");
+        // Inlined stubs must be present.
+        assert!(html.contains("/*CYTO*/"));
+        assert!(html.contains("/*DAGRE*/"));
+        assert!(html.contains("/*CDAG*/"));
+        // Prebundled subgraph still injected.
+        assert!(html.contains("__prebundled_subgraph__"));
     }
 
     #[tokio::test]

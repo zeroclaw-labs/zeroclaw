@@ -27,6 +27,7 @@ pub mod ingest;
 pub mod law_aliases;
 pub mod slug;
 pub mod statute_extractor;
+pub mod vendor;
 
 pub use case_extractor::{extract_case, looks_like_case, CaseDoc};
 pub use citation_patterns::{

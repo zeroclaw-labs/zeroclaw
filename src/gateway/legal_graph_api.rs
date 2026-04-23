@@ -32,6 +32,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/legal/graph/path", get(handle_path))
         .route("/api/legal/graph/stats", get(handle_stats))
         .route("/legal-graph/viewer", get(handle_viewer))
+        .route("/legal-graph/vendor/{asset}", get(handle_vendor_asset))
 }
 
 // ───────── /api/legal/graph/subgraph ─────────
@@ -171,6 +172,53 @@ async fn handle_viewer() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         VIEWER_HTML,
     )
+}
+
+/// Serve a cached Cytoscape/dagre asset from
+/// `<workspace>/memory/vault_vendor/legal_graph/`. 404 if the file isn't
+/// present — the operator populates the cache by running
+/// `zeroclaw vault legal vendor-download`. The viewer HTML itself still
+/// points at CDN by default so the live gateway works without
+/// pre-download; this route exists so snapshot HTML files (and advanced
+/// viewer deployments) can serve assets locally.
+async fn handle_vendor_asset(
+    State(state): State<AppState>,
+    axum::extract::Path(asset): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    // Restrict to the three known filenames — rejects path traversal and
+    // unknown files with a clean 404.
+    let allowed = crate::vault::legal::vendor::ASSETS
+        .iter()
+        .any(|(name, _)| *name == asset);
+    if !allowed {
+        return http_error(StatusCode::NOT_FOUND, "unknown vendor asset");
+    }
+    let workspace = state.config.lock().workspace_dir.clone();
+    let bytes = match crate::vault::legal::vendor::load_asset_bytes(&workspace, &asset) {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return http_error(
+                StatusCode::NOT_FOUND,
+                "asset not cached — run `zeroclaw vault legal vendor-download`",
+            );
+        }
+        Err(e) => return http_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let content_type = if asset.ends_with(".js") {
+        "application/javascript; charset=utf-8"
+    } else {
+        "application/octet-stream"
+    };
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type),
+            // Cache aggressively — version is pinned in the filename pattern.
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 // ───────── Helpers ─────────

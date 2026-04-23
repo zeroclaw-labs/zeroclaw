@@ -953,6 +953,15 @@ enum VaultLegalCommands {
         /// raw `{nodes, edges, __meta}`, also graphify-compatible.
         #[arg(long, default_value = "html")]
         format: String,
+        /// Inline the Cytoscape + dagre JS from the local vendor cache so
+        /// the output HTML renders without any CDN calls.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Download Cytoscape + dagre into the workspace vendor cache.
+    VendorDownload {
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1447,6 +1456,7 @@ async fn main() -> Result<()> {
                     kinds,
                     out,
                     format,
+                    offline,
                 } => {
                     let fmt = match format.to_ascii_lowercase().as_str() {
                         "html" => vault::legal::cli::ExportFormat::Html,
@@ -1462,7 +1472,11 @@ async fn main() -> Result<()> {
                         kinds.as_deref(),
                         fmt,
                         &out,
+                        offline,
                     )
+                }
+                VaultLegalCommands::VendorDownload { force } => {
+                    vault::legal::cli::vendor_download(&config, force).await
                 }
             },
         },
