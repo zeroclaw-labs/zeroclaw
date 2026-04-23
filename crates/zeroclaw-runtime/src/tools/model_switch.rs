@@ -5,14 +5,24 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_providers::ModelCatalogClient;
 
 pub struct ModelSwitchTool {
     security: Arc<SecurityPolicy>,
+    catalog: Option<Arc<ModelCatalogClient>>,
 }
 
 impl ModelSwitchTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self { security }
+        Self {
+            security,
+            catalog: None,
+        }
+    }
+
+    pub fn with_catalog(mut self, catalog: Arc<ModelCatalogClient>) -> Self {
+        self.catalog = Some(catalog);
+        self
     }
 }
 
