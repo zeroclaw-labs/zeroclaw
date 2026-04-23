@@ -344,10 +344,10 @@ impl Tool for SessionsCurrentTool {
         };
 
         let mut output = format!("Current session: {key}\n");
-        if let Some(name) = self.backend.get_session_name(&key).ok().flatten() {
-            if !name.is_empty() {
-                let _ = writeln!(output, "Name: {name}");
-            }
+        if let Some(name) = self.backend.get_session_name(&key).ok().flatten()
+            && !name.is_empty()
+        {
+            let _ = writeln!(output, "Name: {name}");
         }
         let messages = self.backend.load(&key);
         if !messages.is_empty() {
