@@ -11,7 +11,7 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
 use anyhow::Result;
 use chrono::{Datelike, Timelike};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
@@ -1115,7 +1115,7 @@ impl Agent {
             let mut streamed_text = String::new();
             let mut streamed_tool_calls: Vec<zeroclaw_providers::traits::ToolCall> = Vec::new();
             let mut got_stream = false;
-            let mut last_pre_executed_call_id: Option<String> = None;
+            let mut pre_executed_call_ids: HashMap<String, VecDeque<String>> = HashMap::new();
 
             while let Some(item) = stream.next().await {
                 match item {
@@ -1146,7 +1146,10 @@ impl Agent {
                             args,
                         } => {
                             let call_id = uuid::Uuid::new_v4().to_string();
-                            last_pre_executed_call_id = Some(call_id.clone());
+                            pre_executed_call_ids
+                                .entry(name.clone())
+                                .or_default()
+                                .push_back(call_id.clone());
                             let _ = event_tx
                                 .send(TurnEvent::ToolCall {
                                     id: call_id,
@@ -1160,8 +1163,9 @@ impl Agent {
                             name,
                             output,
                         } => {
-                            let result_id = last_pre_executed_call_id
-                                .take()
+                            let result_id = pre_executed_call_ids
+                                .get_mut(&name)
+                                .and_then(|ids| ids.pop_front())
                                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                             let _ = event_tx
                                 .send(TurnEvent::ToolResult {
@@ -2049,6 +2053,131 @@ mod tests {
             "Generated ID should be a valid UUID: got '{}'",
             call_id
         );
+    }
+
+    struct PreExecutedToolProvider;
+
+    #[async_trait]
+    impl Provider for PreExecutedToolProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<String> {
+            Ok(String::new())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::stream::{self, StreamExt};
+
+            stream::iter(vec![
+                Ok(
+                    zeroclaw_providers::traits::StreamEvent::PreExecutedToolCall {
+                        name: "file_read".into(),
+                        args: "{\"path\":\"a.txt\"}".into(),
+                    },
+                ),
+                Ok(
+                    zeroclaw_providers::traits::StreamEvent::PreExecutedToolCall {
+                        name: "shell".into(),
+                        args: "{\"command\":\"pwd\"}".into(),
+                    },
+                ),
+                Ok(
+                    zeroclaw_providers::traits::StreamEvent::PreExecutedToolResult {
+                        name: "file_read".into(),
+                        output: "a".into(),
+                    },
+                ),
+                Ok(
+                    zeroclaw_providers::traits::StreamEvent::PreExecutedToolResult {
+                        name: "shell".into(),
+                        output: "b".into(),
+                    },
+                ),
+                Ok(zeroclaw_providers::traits::StreamEvent::Final),
+            ])
+            .boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_executed_tool_results_keep_ids_when_calls_overlap() {
+        let provider = Box::new(PreExecutedToolProvider);
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let _ = agent
+            .turn_streamed("use pre-executed tools", event_tx)
+            .await
+            .unwrap();
+
+        let mut call_ids = HashMap::new();
+        let mut result_ids = HashMap::new();
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                TurnEvent::ToolCall { id, name, .. } => {
+                    call_ids.insert(name, id);
+                }
+                TurnEvent::ToolResult { id, name, .. } => {
+                    result_ids.insert(name, id);
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(call_ids.len(), 2, "expected two pre-executed tool calls");
+        assert_eq!(
+            result_ids.len(),
+            2,
+            "expected two pre-executed tool results"
+        );
+        assert_eq!(call_ids.get("file_read"), result_ids.get("file_read"));
+        assert_eq!(call_ids.get("shell"), result_ids.get("shell"));
     }
 
     /// Reproduction test for the orphan-tool_results trim bug.

@@ -346,9 +346,9 @@ impl AcpServer {
 
         // Forward events as they arrive. Use standard ACP `session/update`
         // notifications: `tool_call` for initial (pending + title/kind for UI/icons),
-        // `tool_call_update` for completion (status + content/rawOutput). This
-        // enables proper pending→completed flow, folding, diff previews, and
-        // rendering in clients like agentic.nvim's MessageWriter / permission UI.
+        // `tool_call_update` for completion (status + rawOutput). This enables
+        // proper pending→completed flow without duplicating large tool output in
+        // multiple fields on the wire.
         while let Some(event) = event_rx.recv().await {
             let notification = match &event {
                 TurnEvent::Chunk { delta } => JsonRpcNotification {
@@ -391,14 +391,7 @@ impl AcpServer {
                             "title": name,
                             "kind": map_tool_kind(name),
                             "status": "completed",
-                            "rawOutput": output,
-                            "content": [{
-                                "type": "content",
-                                "content": {
-                                    "type": "text",
-                                    "text": output
-                                }
-                            }]
+                            "rawOutput": output
                         }
                     }),
                 },
@@ -605,32 +598,50 @@ impl AcpServer {
 }
 
 fn map_tool_kind(name: &str) -> &'static str {
-    let n = name.to_lowercase();
-    if n.contains("read") || n.contains("get") || n.contains("list") || n.contains("recall") {
-        "read"
-    } else if n.contains("write")
-        || n.contains("edit")
-        || n.contains("patch")
-        || n.contains("store")
-        || n.contains("save")
-        || n.contains("add")
-    {
-        "edit"
-    } else if n.contains("delete") || n.contains("remove") {
-        "delete"
-    } else if n.contains("move") || n.contains("rename") {
-        "move"
-    } else if n.contains("search") || n.contains("find") || n.contains("glob") || n.contains("grep")
-    {
-        "search"
-    } else if n.contains("shell") || n.contains("run") || n.contains("execute") {
-        "execute"
-    } else if n.contains("fetch") || n.contains("request") {
-        "fetch"
-    } else if n.contains("think") {
-        "think"
-    } else {
-        "other"
+    match name {
+        "ask_user" | "calculator" | "claude_code" | "claude_code_runner" | "codex_cli"
+        | "composio" | "delegate" | "escalate_to_human" | "execute_pipeline" | "gemini_cli"
+        | "jira" | "llm_task" | "opencode_cli" | "schedule" | "security_ops" | "shell"
+        | "sop_advance" | "sop_approve" | "sop_execute" | "swarm" | "vi_verify" => "execute",
+        "backup" | "browser_open" | "canvas" | "cloud_ops" | "file_edit" | "file_write"
+        | "memory_export" | "memory_store" | "report_template" => "edit",
+        "cron_add" | "poll" | "reaction" => "edit",
+        "memory_forget" | "memory_purge" => "delete",
+        "content_search" | "discord_search" | "glob_search" | "knowledge" | "search"
+        | "tool_search" | "web_search_tool" => "search",
+        "browser"
+        | "browser_delegate"
+        | "cloud_patterns"
+        | "data_management"
+        | "file_read"
+        | "git_operations"
+        | "google_workspace"
+        | "hardware_board_info"
+        | "hardware_memory_map"
+        | "hardware_memory_read"
+        | "image_info"
+        | "linkedin"
+        | "microsoft365"
+        | "model_routing_config"
+        | "model_switch"
+        | "pdf_read"
+        | "project_intel"
+        | "proxy_config"
+        | "read_skill"
+        | "sessions_history"
+        | "sessions_list"
+        | "sop_list"
+        | "sop_status"
+        | "text_browser"
+        | "weather"
+        | "workspace" => "read",
+        "cron_list" | "cron_runs" | "memory_recall" => "read",
+        "http_request" | "web_fetch" => "fetch",
+        "image_gen" => "other",
+        "cron_remove" => "delete",
+        "cron_run" => "execute",
+        "sessions_send" => "execute",
+        _ => "other",
     }
 }
 
@@ -806,7 +817,7 @@ mod tests {
         assert!(json1.contains("\"status\":\"pending\""));
         assert!(json1.contains("\"rawInput\""));
 
-        // Test tool_call_update with content field (completion)
+        // Test tool_call_update completion payload
         let tool_update_notif = JsonRpcNotification {
             jsonrpc: "2.0",
             method: "session/update",
@@ -818,14 +829,7 @@ mod tests {
                     "title": "shell",
                     "kind": "execute",
                     "status": "completed",
-                    "rawOutput": "file1.txt\nfile2.txt",
-                    "content": [{
-                        "type": "content",
-                        "content": {
-                            "type": "text",
-                            "text": "file1.txt\nfile2.txt"
-                        }
-                    }]
+                    "rawOutput": "file1.txt\nfile2.txt"
                 }
             }),
         };
@@ -834,10 +838,20 @@ mod tests {
         assert!(json2.contains("\"toolCallId\":\"tc-12345\""));
         assert!(json2.contains("\"status\":\"completed\""));
         assert!(json2.contains("\"rawOutput\""));
-        assert!(json2.contains("\"content\""));
-        assert!(json2.contains("\"type\":\"content\""));
+        assert!(!json2.contains("\"content\""));
         assert!(json2.contains("file1.txt"));
         // Verify matching toolCallId across events
         assert!(json1.contains("tc-12345") && json2.contains("tc-12345"));
+    }
+
+    #[test]
+    fn map_tool_kind_uses_explicit_tool_names() {
+        assert_eq!(map_tool_kind("memory_forget"), "delete");
+        assert_eq!(map_tool_kind("memory_purge"), "delete");
+        assert_eq!(map_tool_kind("cron_run"), "execute");
+        assert_eq!(map_tool_kind("file_read"), "read");
+        assert_eq!(map_tool_kind("file_write"), "edit");
+        assert_eq!(map_tool_kind("web_fetch"), "fetch");
+        assert_eq!(map_tool_kind("unknown_tool"), "other");
     }
 }
