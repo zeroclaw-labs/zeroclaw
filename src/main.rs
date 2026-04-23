@@ -54,7 +54,10 @@ fn print_no_command_help() -> Result<()> {
     println!("Try `zeroclaw onboard` to initialize your workspace.");
     println!();
 
-    let mut cmd = Cli::command();
+    #[cfg(feature = "agent-runtime")]
+    crate::i18n::init(&crate::i18n::detect_locale());
+
+    let mut cmd = apply_i18n_to_command(Cli::command());
     cmd.print_help()?;
     println!();
 
