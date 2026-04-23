@@ -363,31 +363,31 @@ impl AcpServer {
                         }
                     }),
                 },
-                TurnEvent::ToolCall { name, args } => JsonRpcNotification {
+                TurnEvent::ToolCall { id, name, args } => JsonRpcNotification {
                     jsonrpc: "2.0",
                     method: "session/update",
                     params: serde_json::json!({
                         "sessionId": session_id,
                         "update": {
                             "sessionUpdate": "tool_call",
-                            "toolCallId": name,  // simplistic; full impl would generate UUID
-                            "name": name,
-                            "kind": "other",
-                            "argument": args,
+                            "toolCallId": id,
+                            "title": name,
+                            "kind": map_tool_kind(&name),
+                            "rawInput": args,
                             "status": "pending"
                         }
                     }),
                 },
-                TurnEvent::ToolResult { name, output } => JsonRpcNotification {
+                TurnEvent::ToolResult { id, name: _, output } => JsonRpcNotification {
                     jsonrpc: "2.0",
                     method: "session/update",
                     params: serde_json::json!({
                         "sessionId": session_id,
                         "update": {
-                            "sessionUpdate": "tool_call_update",
-                            "toolCallId": name,
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": id,
                             "status": "completed",
-                            "body": output
+                            "rawOutput": output
                         }
                     }),
                 },
@@ -590,6 +590,30 @@ impl AcpServer {
                 error!("Failed to serialize JSON-RPC message: {e}");
             }
         }
+    }
+}
+
+fn map_tool_kind(name: &str) -> &'static str {
+    let n = name.to_lowercase();
+    if n.contains("read") || n.contains("get") || n.contains("list") {
+        "read"
+    } else if n.contains("write") || n.contains("edit") || n.contains("patch") {
+        "edit"
+    } else if n.contains("delete") || n.contains("remove") {
+        "delete"
+    } else if n.contains("move") || n.contains("rename") {
+        "move"
+    } else if n.contains("search") || n.contains("find") || n.contains("glob") || n.contains("grep")
+    {
+        "search"
+    } else if n.contains("shell") || n.contains("run") || n.contains("execute") {
+        "execute"
+    } else if n.contains("fetch") || n.contains("request") {
+        "fetch"
+    } else if n.contains("think") {
+        "think"
+    } else {
+        "other"
     }
 }
 
