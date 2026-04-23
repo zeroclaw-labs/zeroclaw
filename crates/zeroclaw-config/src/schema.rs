@@ -9913,7 +9913,16 @@ impl Config {
         }
 
         if let Some(base_url) = base_url {
-            self.providers.fallback = Some(format!("custom:{base_url}"));
+            let canonical_key = format!("custom:{base_url}");
+            // Mirror the profile under the canonical key so runtime
+            // `fallback_provider()` lookups resolve — without this the rename
+            // would orphan the entry still keyed under the original profile name.
+            if !self.providers.models.contains_key(&canonical_key)
+                && let Some(entry) = self.providers.models.get(&profile_key).cloned()
+            {
+                self.providers.models.insert(canonical_key.clone(), entry);
+            }
+            self.providers.fallback = Some(canonical_key);
         }
     }
 
@@ -13948,6 +13957,17 @@ requires_openai_auth = true
                 .and_then(|e| e.base_url.as_deref()),
             Some("https://api.tonsof.blue/v1")
         );
+        // The entry is also mirrored under the canonical fallback key so
+        // runtime fallback_provider() lookups resolve.
+        assert_eq!(
+            config
+                .providers
+                .models
+                .get("custom:https://api.tonsof.blue/v1")
+                .and_then(|e| e.base_url.as_deref()),
+            Some("https://api.tonsof.blue/v1")
+        );
+        assert!(config.providers.fallback_provider().is_some());
     }
 
     #[test]
