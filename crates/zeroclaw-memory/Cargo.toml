@@ -22,6 +22,10 @@ sha2 = "0.10"
 tokio = { version = "1.50", default-features = false, features = ["fs", "sync", "time"] }
 tracing = { version = "0.1", default-features = false }
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
+
+[features]
+memory-postgres = ["dep:postgres"]
 
 [dev-dependencies]
 tempfile = "3.26"

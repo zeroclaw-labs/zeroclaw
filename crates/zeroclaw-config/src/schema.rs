@@ -5042,6 +5042,14 @@ pub struct StorageProviderConfig {
     /// Optional connection timeout in seconds for remote providers.
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,
+
+    /// Enable pgvector extension for hybrid vector+keyword recall.
+    #[serde(default)]
+    pub pgvector_enabled: bool,
+
+    /// Vector dimensions for pgvector embeddings (default: 1536).
+    #[serde(default = "default_pgvector_dimensions")]
+    pub pgvector_dimensions: usize,
 }
 
 fn default_storage_schema() -> String {
@@ -5052,6 +5060,10 @@ fn default_storage_table() -> String {
     "memories".into()
 }
 
+fn default_pgvector_dimensions() -> usize {
+    1536
+}
+
 impl Default for StorageProviderConfig {
     fn default() -> Self {
         Self {
@@ -5060,6 +5072,8 @@ impl Default for StorageProviderConfig {
             schema: default_storage_schema(),
             table: default_storage_table(),
             connect_timeout_secs: None,
+            pgvector_enabled: false,
+            pgvector_dimensions: default_pgvector_dimensions(),
         }
     }
 }
@@ -5121,8 +5135,9 @@ pub enum SearchMode {
 #[prefix = "memory"]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
-    /// "sqlite" | "lucid" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
+    /// "sqlite" | "lucid" | "postgres" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
     ///
+    /// `postgres` uses `[storage.provider.config].db_url`; requires `--features memory-postgres` build.
     /// `qdrant` uses `[memory.qdrant]` config or `QDRANT_URL` env var.
     pub backend: String,
     /// Auto-save user-stated conversation input to memory (assistant output is excluded)
@@ -11611,6 +11626,34 @@ auto_save = true
         assert_eq!(storage.provider.config.schema, "public");
         assert_eq!(storage.provider.config.table, "memories");
         assert!(storage.provider.config.connect_timeout_secs.is_none());
+        assert!(!storage.provider.config.pgvector_enabled);
+        assert_eq!(storage.provider.config.pgvector_dimensions, 1536);
+    }
+
+    #[test]
+    async fn storage_provider_config_pgvector_roundtrip() {
+        let toml = r#"
+            provider = "postgres"
+            db_url = "postgres://localhost/zeroclaw"
+            pgvector_enabled = true
+            pgvector_dimensions = 768
+        "#;
+        let parsed: StorageProviderConfig = toml::from_str(toml).unwrap();
+        assert!(parsed.pgvector_enabled);
+        assert_eq!(parsed.pgvector_dimensions, 768);
+
+        let serialized = toml::to_string(&parsed).unwrap();
+        let reparsed: StorageProviderConfig = toml::from_str(&serialized).unwrap();
+        assert!(reparsed.pgvector_enabled);
+        assert_eq!(reparsed.pgvector_dimensions, 768);
+    }
+
+    #[test]
+    async fn storage_provider_config_pgvector_defaults_when_omitted() {
+        let toml = r#"provider = "postgres""#;
+        let parsed: StorageProviderConfig = toml::from_str(toml).unwrap();
+        assert!(!parsed.pgvector_enabled);
+        assert_eq!(parsed.pgvector_dimensions, 1536);
     }
 
     #[test]

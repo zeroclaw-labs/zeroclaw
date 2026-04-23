@@ -19,6 +19,10 @@
 pub mod audit;
 pub mod backend;
 pub mod chunker;
+#[cfg(feature = "memory-postgres")]
+pub mod knowledge_graph_pg;
+#[cfg(feature = "memory-postgres")]
+pub mod postgres;
 pub mod conflict;
 pub mod consolidation;
 pub mod decay;
@@ -48,6 +52,9 @@ pub use backend::{
 };
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
+#[cfg(feature = "memory-postgres")]
+#[allow(unused_imports)]
+pub use postgres::PostgresMemory;
 pub use namespaced::NamespacedMemory;
 pub use none::NoneMemory;
 #[allow(unused_imports)]
@@ -66,6 +73,32 @@ use std::path::Path;
 use std::sync::Arc;
 use zeroclaw_config::schema::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
 
+#[cfg(feature = "memory-postgres")]
+fn build_postgres_memory(storage_provider: &StorageProviderConfig) -> anyhow::Result<Box<dyn Memory>> {
+    use postgres::PostgresMemory;
+    let db_url = storage_provider
+        .db_url
+        .as_deref()
+        .context("memory backend 'postgres' requires [storage.provider.config].db_url")?;
+    let memory = PostgresMemory::new(
+        db_url,
+        &storage_provider.schema,
+        &storage_provider.table,
+        storage_provider.connect_timeout_secs,
+        Some(storage_provider.pgvector_enabled),
+        Some(storage_provider.pgvector_dimensions),
+    )?;
+    Ok(Box::new(memory))
+}
+
+#[cfg(not(feature = "memory-postgres"))]
+fn build_postgres_memory(_storage_provider: &StorageProviderConfig) -> anyhow::Result<Box<dyn Memory>> {
+    anyhow::bail!(
+        "memory backend 'postgres' requested but this build was compiled without \
+         `memory-postgres`; rebuild with `--features memory-postgres`"
+    )
+}
+
 fn create_memory_with_builders<F>(
     backend_name: &str,
     workspace_dir: &Path,
@@ -80,6 +113,9 @@ where
         MemoryBackendKind::Lucid => {
             let local = sqlite_builder()?;
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
+        }
+        MemoryBackendKind::Postgres => {
+            build_postgres_memory(&StorageProviderConfig::default())
         }
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
@@ -378,6 +414,12 @@ pub fn create_memory_with_storage_and_routes(
         )));
     }
 
+    if matches!(backend_kind, MemoryBackendKind::Postgres) {
+        let fallback = StorageProviderConfig::default();
+        let provider = storage_provider.unwrap_or(&fallback);
+        return build_postgres_memory(provider);
+    }
+
     create_memory_with_builders(
         &backend_name,
         workspace_dir,
@@ -516,6 +558,23 @@ mod tests {
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
         assert_eq!(mem.name(), "none");
+    }
+
+    #[cfg(not(feature = "memory-postgres"))]
+    #[test]
+    fn factory_postgres_without_feature_gives_clear_error() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "postgres".into(),
+            ..MemoryConfig::default()
+        };
+        let error = create_memory(&cfg, tmp.path(), None)
+            .err()
+            .expect("backend=postgres without memory-postgres feature should fail");
+        assert!(
+            error.to_string().contains("memory-postgres"),
+            "error should mention the feature flag: {error}"
+        );
     }
 
     #[test]
