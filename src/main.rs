@@ -963,13 +963,23 @@ async fn main() -> Result<()> {
     }
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO.
-    // matrix_sdk crates are suppressed to warn because they are extremely
-    // noisy at info level. To restore SDK-level output for Matrix debugging:
-    //   RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info
+    // For the ACP command, we default to WARN to avoid INFO logs corrupting the stdio protocol.
+    // We also always redirect logs to stderr so stdout remains clean for data.
+    let default_log_level = if matches!(cli.command, Commands::Acp { .. }) {
+        "warn"
+    } else {
+        // matrix_sdk crates are suppressed to warn because they are extremely
+        // noisy at info level. To restore SDK-level output for Matrix debugging:
+        //   RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info
+        // acp_server has to be WARN because INFO injects junk data into the JSON stream.
+        "info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn"
+    };
+
     let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn")
-        }))
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_level)),
+        )
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
