@@ -5078,18 +5078,18 @@ impl Default for StorageProviderConfig {
 pub struct PostgresMemoryConfig {
     /// Enable pgvector extension for hybrid vector+keyword recall.
     #[serde(default)]
-    pub pgvector_enabled: bool,
+    pub vector_enabled: bool,
 
     /// Vector dimensions for pgvector embeddings (default: 1536).
     #[serde(default = "default_pgvector_dimensions")]
-    pub pgvector_dimensions: usize,
+    pub vector_dimensions: usize,
 }
 
 impl Default for PostgresMemoryConfig {
     fn default() -> Self {
         Self {
-            pgvector_enabled: false,
-            pgvector_dimensions: default_pgvector_dimensions(),
+            vector_enabled: false,
+            vector_dimensions: default_pgvector_dimensions(),
         }
     }
 }
@@ -11653,8 +11653,8 @@ auto_save = true
     #[test]
     async fn memory_config_pgvector_defaults() {
         let memory = MemoryConfig::default();
-        assert!(!memory.postgres.pgvector_enabled);
-        assert_eq!(memory.postgres.pgvector_dimensions, 1536);
+        assert!(!memory.postgres.vector_enabled);
+        assert_eq!(memory.postgres.vector_dimensions, 1536);
     }
 
     #[test]
@@ -11662,25 +11662,25 @@ auto_save = true
         let toml = r#"
             backend = "postgres"
             [postgres]
-            pgvector_enabled = true
-            pgvector_dimensions = 768
+            vector_enabled = true
+            vector_dimensions = 768
         "#;
         let parsed: MemoryConfig = toml::from_str(toml).unwrap();
-        assert!(parsed.postgres.pgvector_enabled);
-        assert_eq!(parsed.postgres.pgvector_dimensions, 768);
+        assert!(parsed.postgres.vector_enabled);
+        assert_eq!(parsed.postgres.vector_dimensions, 768);
 
         let serialized = toml::to_string(&parsed).unwrap();
         let reparsed: MemoryConfig = toml::from_str(&serialized).unwrap();
-        assert!(reparsed.postgres.pgvector_enabled);
-        assert_eq!(reparsed.postgres.pgvector_dimensions, 768);
+        assert!(reparsed.postgres.vector_enabled);
+        assert_eq!(reparsed.postgres.vector_dimensions, 768);
     }
 
     #[test]
     async fn memory_config_pgvector_defaults_when_omitted() {
         let toml = r#"backend = "postgres""#;
         let parsed: MemoryConfig = toml::from_str(toml).unwrap();
-        assert!(!parsed.postgres.pgvector_enabled);
-        assert_eq!(parsed.postgres.pgvector_dimensions, 1536);
+        assert!(!parsed.postgres.vector_enabled);
+        assert_eq!(parsed.postgres.vector_dimensions, 1536);
     }
 
     #[test]

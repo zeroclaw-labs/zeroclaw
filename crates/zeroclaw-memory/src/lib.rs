@@ -88,8 +88,8 @@ fn build_postgres_memory(
         &storage_provider.schema,
         &storage_provider.table,
         storage_provider.connect_timeout_secs,
-        Some(memory_config.postgres.pgvector_enabled),
-        Some(memory_config.postgres.pgvector_dimensions),
+        Some(memory_config.postgres.vector_enabled),
+        Some(memory_config.postgres.vector_dimensions),
     )?;
     Ok(Box::new(memory))
 }
