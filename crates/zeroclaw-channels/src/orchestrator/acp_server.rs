@@ -374,7 +374,7 @@ impl AcpServer {
                             "sessionUpdate": "tool_call",
                             "toolCallId": id,
                             "title": name,
-                            "kind": map_tool_kind(&name),
+                            "kind": map_tool_kind(name),
                             "rawInput": args,
                             "status": "pending"
                         }
