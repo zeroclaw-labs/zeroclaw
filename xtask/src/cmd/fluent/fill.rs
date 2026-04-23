@@ -60,10 +60,12 @@ fn fill_ftl_file(
         return Ok(());
     }
 
-    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    let api_key = std::env::var("ANTHROPIC_API_TOKEN")
+        .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+        .unwrap_or_default();
     if api_key.is_empty() {
         println!(
-            "==> {locale}/{}: {} entries need translation (set ANTHROPIC_API_KEY to auto-fill)",
+            "==> {locale}/{}: {} entries need translation (set ANTHROPIC_API_TOKEN to auto-fill)",
             en_path.file_name().unwrap().to_string_lossy(),
             to_translate.len()
         );
@@ -119,7 +121,7 @@ fn call_api(
 
     let body = serde_json::json!({
         "model": model,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "system": system,
         "messages": [
             {
