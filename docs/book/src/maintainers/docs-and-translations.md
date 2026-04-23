@@ -11,19 +11,7 @@ They are filled separately and stored separately. Both use Claude as the transla
 
 ## Building the docs locally
 
-See [Building the docs locally](../developing/building-docs.md) for the full local workflow, required tools, and tips.
-
-Quick reference:
-
-```bash
-cargo mdbook serve              # serve all locales at http://localhost:3000/en/
-cargo mdbook serve --locale ja  # live-reload against Japanese source
-cargo mdbook build              # static build → docs/book/book/{en,ja}/
-cargo mdbook refs               # regenerate cli.md and config.md from code
-cargo mdbook sync               # extract + merge + AI-fill .po delta
-cargo mdbook stats              # show translation coverage per locale
-cargo mdbook check              # validate .po format
-```
+{{#include ../developing/building-docs.md}}
 
 ## Filling app strings (Fluent)
 
