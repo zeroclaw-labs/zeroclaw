@@ -426,32 +426,43 @@ export default function Cron() {
                 <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
                   {t('cron.job_type')}
                 </label>
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setFormJobType('shell')}
-                    className={`flex-1 px-3 py-2.5 rounded-xl text-sm font-medium border transition-colors ${
-                      formJobType === 'shell'
-                        ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
-                        : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
-                    }`}
-                    style={formJobType === 'shell' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
+                {isEditing ? (
+                  <span
+                    className="inline-flex items-center px-3 py-2 rounded-xl text-sm font-medium border"
+                    style={formJobType === 'agent'
+                      ? { color: 'var(--pc-accent)', borderColor: 'rgba(0, 128, 255, 0.2)', background: 'rgba(0, 128, 255, 0.06)' }
+                      : { color: 'var(--pc-text-secondary)', borderColor: 'var(--pc-border)', background: 'transparent' }}
                   >
-                    {t('cron.job_type_shell')}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setFormJobType('agent')}
-                    className={`flex-1 px-3 py-2.5 rounded-xl text-sm font-medium border transition-colors ${
-                      formJobType === 'agent'
-                        ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
-                        : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
-                    }`}
-                    style={formJobType === 'agent' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
-                  >
-                    {t('cron.job_type_agent')}
-                  </button>
-                </div>
+                    {t(formJobType === 'shell' ? 'cron.job_type_shell' : 'cron.job_type_agent')}
+                  </span>
+                ) : (
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setFormJobType('shell')}
+                      className={`flex-1 px-3 py-2.5 rounded-xl text-sm font-medium border transition-colors ${
+                        formJobType === 'shell'
+                          ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
+                          : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
+                      }`}
+                      style={formJobType === 'shell' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
+                    >
+                      {t('cron.job_type_shell')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setFormJobType('agent')}
+                      className={`flex-1 px-3 py-2.5 rounded-xl text-sm font-medium border transition-colors ${
+                        formJobType === 'agent'
+                          ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
+                          : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
+                      }`}
+                      style={formJobType === 'agent' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
+                    >
+                      {t('cron.job_type_agent')}
+                    </button>
+                  </div>
+                )}
               </div>
               <div>
                 <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
@@ -494,61 +505,65 @@ export default function Cron() {
                       className="input-electric w-full px-3 py-2.5 text-sm resize-y"
                     />
                   </div>
-                  <div>
-                    <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
-                      {t('cron.model_optional')}
-                    </label>
-                    <input
-                      type="text"
-                      value={formModel}
-                      onChange={(e) => setFormModel(e.target.value)}
-                      placeholder={t('cron.model_placeholder')}
-                      className="input-electric w-full px-3 py-2.5 text-sm"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
-                      {t('cron.session_target')}
-                    </label>
-                    <div className="flex gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setFormSessionTarget('isolated')}
-                        className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${
-                          formSessionTarget === 'isolated'
-                            ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
-                            : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
-                        }`}
-                        style={formSessionTarget === 'isolated' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
-                      >
-                        {t('cron.session_isolated')}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setFormSessionTarget('main')}
-                        className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${
-                          formSessionTarget === 'main'
-                            ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
-                            : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
-                        }`}
-                        style={formSessionTarget === 'main' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
-                      >
-                        {t('cron.session_main')}
-                      </button>
-                    </div>
-                  </div>
-                  <div>
-                    <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
-                      {t('cron.allowed_tools_optional')}
-                    </label>
-                    <input
-                      type="text"
-                      value={formAllowedTools}
-                      onChange={(e) => setFormAllowedTools(e.target.value)}
-                      placeholder={t('cron.allowed_tools_placeholder')}
-                      className="input-electric w-full px-3 py-2.5 text-sm font-mono"
-                    />
-                  </div>
+                  {!isEditing && (
+                    <>
+                      <div>
+                        <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                          {t('cron.model_optional')}
+                        </label>
+                        <input
+                          type="text"
+                          value={formModel}
+                          onChange={(e) => setFormModel(e.target.value)}
+                          placeholder={t('cron.model_placeholder')}
+                          className="input-electric w-full px-3 py-2.5 text-sm"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                          {t('cron.session_target')}
+                        </label>
+                        <div className="flex gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setFormSessionTarget('isolated')}
+                            className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${
+                              formSessionTarget === 'isolated'
+                                ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
+                                : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
+                            }`}
+                            style={formSessionTarget === 'isolated' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
+                          >
+                            {t('cron.session_isolated')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setFormSessionTarget('main')}
+                            className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${
+                              formSessionTarget === 'main'
+                                ? 'border-[var(--pc-accent)] text-[var(--pc-accent)]'
+                                : 'border-[var(--pc-border)] text-[var(--pc-text-muted)]'
+                            }`}
+                            style={formSessionTarget === 'main' ? { background: 'rgba(0, 128, 255, 0.08)' } : { background: 'transparent' }}
+                          >
+                            {t('cron.session_main')}
+                          </button>
+                        </div>
+                      </div>
+                      <div>
+                        <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                          {t('cron.allowed_tools_optional')}
+                        </label>
+                        <input
+                          type="text"
+                          value={formAllowedTools}
+                          onChange={(e) => setFormAllowedTools(e.target.value)}
+                          placeholder={t('cron.allowed_tools_placeholder')}
+                          className="input-electric w-full px-3 py-2.5 text-sm font-mono"
+                        />
+                      </div>
+                    </>
+                  )}
                 </>
               )}
             </div>
