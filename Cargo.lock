@@ -12276,6 +12276,7 @@ dependencies = [
  "uuid",
  "webpki-roots 1.0.6",
  "which",
+ "wiremock",
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-infra",

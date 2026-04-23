@@ -76,7 +76,7 @@ impl Tool for ModelSwitchTool {
             "get" => self.handle_get(),
             "set" => self.handle_set(&args),
             "list_providers" => self.handle_list_providers(),
-            "list_models" => self.handle_list_models(&args),
+            "list_models" => self.handle_list_models(&args).await,
             _ => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -201,81 +201,44 @@ impl ModelSwitchTool {
         })
     }
 
-    fn handle_list_models(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
-        let provider = args.get("provider").and_then(|v| v.as_str());
+    async fn handle_list_models(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let provider = args.get("provider").and_then(|v| v.as_str()).unwrap_or("");
 
-        let provider = match provider {
-            Some(p) => p,
-            None => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(
-                        "Missing 'provider' parameter for 'list_models' action".to_string(),
-                    ),
-                });
+        // If a catalog is wired and the caller either asked for the catalog-
+        // backed provider or omitted the parameter, return the live list.
+        if let Some(catalog) = &self.catalog {
+            if provider.is_empty() || provider.starts_with("custom:") {
+                match catalog.list_models().await {
+                    Ok(models) => {
+                        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+                        return Ok(ToolResult {
+                            success: true,
+                            output: serde_json::to_string_pretty(&json!({
+                                "provider": if provider.is_empty() { "catalog" } else { provider },
+                                "models": ids,
+                                "source": "live",
+                                "count": models.len()
+                            }))?,
+                            error: None,
+                        });
+                    }
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("catalog unavailable: {e:#}")),
+                        });
+                    }
+                }
             }
-        };
-
-        // Return common models for known providers
-        let models = match provider.to_lowercase().as_str() {
-            "openai" => vec![
-                "gpt-4o",
-                "gpt-4o-mini",
-                "gpt-4-turbo",
-                "gpt-4",
-                "gpt-3.5-turbo",
-            ],
-            "anthropic" => vec![
-                "claude-sonnet-4-6",
-                "claude-sonnet-4-5",
-                "claude-3-5-sonnet",
-                "claude-3-opus",
-                "claude-3-haiku",
-            ],
-            "openrouter" => vec![
-                "anthropic/claude-sonnet-4-6",
-                "openai/gpt-4o",
-                "google/gemini-pro",
-                "meta-llama/llama-3-70b-instruct",
-            ],
-            "groq" => vec![
-                "llama-3.3-70b-versatile",
-                "mixtral-8x7b-32768",
-                "llama-3.1-70b-speculative",
-            ],
-            "ollama" => vec!["llama3", "llama3.1", "mistral", "codellama", "phi3"],
-            "deepseek" => vec!["deepseek-chat", "deepseek-coder"],
-            "mistral" => vec![
-                "mistral-large-latest",
-                "mistral-small-latest",
-                "mistral-nemo",
-            ],
-            "google" | "gemini" => vec!["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
-            "xai" | "grok" => vec!["grok-2", "grok-2-vision", "grok-beta"],
-            _ => vec![],
-        };
-
-        if models.is_empty() {
-            return Ok(ToolResult {
-                success: true,
-                output: serde_json::to_string_pretty(&json!({
-                    "provider": provider,
-                    "models": [],
-                    "note": "No common models listed for this provider. Check provider documentation for available models."
-                }))?,
-                error: None,
-            });
         }
 
         Ok(ToolResult {
-            success: true,
-            output: serde_json::to_string_pretty(&json!({
-                "provider": provider,
-                "models": models,
-                "example": "Use action 'set' with this provider and a model ID to switch"
-            }))?,
-            error: None,
+            success: false,
+            output: String::new(),
+            error: Some(format!(
+                "No live catalog configured for provider '{provider}'. Use action 'list_providers' or set action='list_models' without specifying a provider to query the catalog."
+            )),
         })
     }
 }
