@@ -33,7 +33,7 @@ impl Tool for ModelSwitchTool {
     }
 
     fn description(&self) -> &str {
-        "Switch the AI model at runtime. Use 'get' to see current model, 'list_providers' to see available providers, 'list_models' to see models for a provider, or 'set' to switch to a different model. The switch takes effect immediately for the current conversation."
+        "Switch the AI model at runtime. Use 'list_tiers' and 'set_tier' (chat/thinking/fast) for semantic switching, or 'list_models' / 'set' for raw model IDs. 'get' shows current model."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -42,8 +42,8 @@ impl Tool for ModelSwitchTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["get", "set", "list_providers", "list_models"],
-                    "description": "Action to perform: get current model, set a new model, list available providers, or list models for a provider"
+                    "enum": ["get", "set", "set_tier", "list_providers", "list_models", "list_tiers"],
+                    "description": "Action to perform: get current model, set a new model, set a tier (chat/thinking/fast), list available providers, list models for a provider, or list tiers"
                 },
                 "provider": {
                     "type": "string",
@@ -75,13 +75,15 @@ impl Tool for ModelSwitchTool {
         match action {
             "get" => self.handle_get(),
             "set" => self.handle_set(&args),
+            "set_tier" => self.handle_set_tier(&args).await,
             "list_providers" => self.handle_list_providers(),
             "list_models" => self.handle_list_models(&args).await,
+            "list_tiers" => self.handle_list_tiers().await,
             _ => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Unknown action: {}. Valid actions: get, set, list_providers, list_models",
+                    "Unknown action: {}. Valid actions: get, set, set_tier, list_providers, list_models, list_tiers",
                     action
                 )),
             }),
@@ -239,6 +241,44 @@ impl ModelSwitchTool {
             error: Some(format!(
                 "No live catalog configured for provider '{provider}'. Use action 'list_providers' or set action='list_models' without specifying a provider to query the catalog."
             )),
+        })
+    }
+
+    async fn handle_list_tiers(&self) -> anyhow::Result<ToolResult> {
+        let Some(catalog) = &self.catalog else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("tier catalog not configured for this deployment".to_string()),
+            });
+        };
+
+        match catalog.list_tiers().await {
+            Ok(tiers) => Ok(ToolResult {
+                success: true,
+                output: serde_json::to_string_pretty(&json!({
+                    "tiers": tiers.iter().map(|t| json!({
+                        "name": t.name,
+                        "model": t.model,
+                        "description": t.description,
+                    })).collect::<Vec<_>>(),
+                    "usage": "Call set_tier with {\"tier\": \"chat\" | \"thinking\" | \"fast\"}"
+                }))?,
+                error: None,
+            }),
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("failed to load tiers: {e:#}")),
+            }),
+        }
+    }
+
+    async fn handle_set_tier(&self, _args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        Ok(ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some("set_tier not yet implemented".to_string()),
         })
     }
 }

@@ -45,3 +45,37 @@ async fn list_models_returns_live_catalog() {
     assert_eq!(ids, vec!["claude-opus-4-7", "claude-sonnet-4-6"]);
     assert_eq!(v["source"], "live");
 }
+
+use std::io::Write;
+
+fn write_tiers(yaml: &str) -> tempfile::NamedTempFile {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(yaml.as_bytes()).unwrap();
+    f
+}
+
+#[tokio::test]
+async fn list_tiers_returns_yaml_contents() {
+    let server = MockServer::start().await;
+    let f = write_tiers(
+        "tiers:\n  - name: chat\n    model: claude-sonnet-4-6\n    description: default\n  - name: thinking\n    model: claude-opus-4-7\n    description: deep reasoning\n",
+    );
+
+    let catalog = Arc::new(
+        ModelCatalogClient::new(
+            format!("{}/v1", server.uri()),
+            "test-key",
+            f.path().to_path_buf(),
+        )
+        .unwrap(),
+    );
+    let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()))
+        .with_catalog(catalog);
+
+    let result = tool.execute(serde_json::json!({"action": "list_tiers"})).await.unwrap();
+    assert!(result.success, "error: {:?}", result.error);
+    let v: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+    let names: Vec<&str> = v["tiers"].as_array().unwrap()
+        .iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["chat", "thinking"]);
+}
