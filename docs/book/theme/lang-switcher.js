@@ -1,8 +1,8 @@
 // Language switcher injected into mdBook's menu bar.
 //
 // Detects the current locale from the URL by finding a path segment that
-// matches one of LOCALES, then renders a globe-icon dropdown linking to the
-// same page in every other locale.
+// matches one of LOCALES, then renders a dropdown linking to the same page
+// in every other locale.
 //
 // Mirror the LOCALES list in: scripts/docs.sh (LOCALES array),
 // scripts/sync-translations.sh (LOCALES default), po/ directory,
@@ -19,6 +19,7 @@
   );
   if (localeIndex < 0) return;
   const currentLocale = pathSegments[localeIndex];
+  const currentLabel = LOCALES.find((l) => l.code === currentLocale)?.label ?? currentLocale.toUpperCase();
 
   const urlForLocale = (code) => {
     const next = pathSegments.slice();
@@ -29,6 +30,12 @@
   const menuRight = document.querySelector(".menu-bar .right-buttons");
   if (!menuRight) return;
 
+  // Wrapper provides the `position: relative` anchor for the dropdown.
+  const wrapper = document.createElement("div");
+  wrapper.style.position = "relative";
+  wrapper.style.display = "inline-flex";
+  wrapper.style.alignItems = "center";
+
   const button = document.createElement("button");
   button.id = "language-toggle";
   button.className = "icon-button";
@@ -38,19 +45,10 @@
   button.setAttribute("aria-haspopup", "true");
   button.setAttribute("aria-expanded", "false");
   button.setAttribute("aria-controls", "language-list");
-  // Inline SVG globe matches mdBook 0.5.x's icon pattern (.fa-svg wrapper,
-  // currentColor stroke so it picks up the theme).
-  button.innerHTML =
-    '<span class="fa-svg">' +
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" ' +
-    'fill="none" stroke="currentColor" stroke-width="2" ' +
-    'stroke-linecap="round" stroke-linejoin="round">' +
-    '<circle cx="12" cy="12" r="10"/>' +
-    '<line x1="2" y1="12" x2="22" y2="12"/>' +
-    '<path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 ' +
-    '15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>' +
-    "</svg>" +
-    "</span>";
+  button.style.fontWeight = "bold";
+  button.style.fontSize = "0.8em";
+  button.style.letterSpacing = "0.03em";
+  button.textContent = currentLabel;
 
   const list = document.createElement("ul");
   list.id = "language-list";
@@ -58,20 +56,24 @@
   list.setAttribute("aria-label", "Languages");
   list.setAttribute("role", "menu");
   list.style.display = "none";
+  list.style.position = "absolute";
+  list.style.top = "100%";
+  list.style.right = "0";
+  list.style.left = "auto";
+  list.style.zIndex = "1000";
+  list.style.minWidth = "8em";
 
   for (const { code, label } of LOCALES) {
     const li = document.createElement("li");
     li.setAttribute("role", "none");
     if (code === currentLocale) li.classList.add("theme-selected");
-    const item = document.createElement("button");
-    item.setAttribute("role", "menuitem");
-    item.className = "theme";
+
     const link = document.createElement("a");
-    link.id = code;
+    link.className = "theme";
+    link.setAttribute("role", "menuitem");
     link.textContent = label;
     link.href = urlForLocale(code);
-    item.appendChild(link);
-    li.appendChild(item);
+    li.appendChild(link);
     list.appendChild(li);
   }
 
@@ -81,13 +83,15 @@
     list.style.display = open ? "none" : "block";
     button.setAttribute("aria-expanded", String(!open));
   });
+
   document.addEventListener("click", (event) => {
-    if (!list.contains(event.target) && event.target !== button) {
+    if (!wrapper.contains(event.target)) {
       list.style.display = "none";
       button.setAttribute("aria-expanded", "false");
     }
   });
 
-  menuRight.prepend(list);
-  menuRight.prepend(button);
+  wrapper.appendChild(button);
+  wrapper.appendChild(list);
+  menuRight.prepend(wrapper);
 })();
