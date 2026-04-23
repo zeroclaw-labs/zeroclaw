@@ -83,6 +83,15 @@ async fn list_tiers_returns_yaml_contents() {
 #[tokio::test]
 async fn set_tier_stages_resolved_model() {
     let server = MockServer::start().await;
+    // set_tier now validates the resolved model against /v1/models, so the
+    // mock must include the tier-resolved model in its catalog.
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "claude-opus-4-7", "object": "model", "owned_by": "anthropic"}]
+        })))
+        .mount(&server)
+        .await;
     let f = write_tiers(
         "tiers:\n  - name: thinking\n    model: claude-opus-4-7\n    description: deep\n",
     );
@@ -108,6 +117,43 @@ async fn set_tier_stages_resolved_model() {
     assert_eq!(v["tier"], "thinking");
     assert_eq!(v["resolved_model"], "claude-opus-4-7");
     assert!(v["provider"].as_str().unwrap().starts_with("custom:"));
+}
+
+#[tokio::test]
+async fn set_tier_rejects_when_resolved_model_not_in_catalog() {
+    let server = MockServer::start().await;
+    // Live catalog has only sonnet-4-6, but tiers.yaml points thinking at opus-4-7
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "claude-sonnet-4-6", "object": "model", "owned_by": "anthropic"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let f = write_tiers(
+        "tiers:\n  - name: thinking\n    model: claude-opus-4-7\n    description: stale\n",
+    );
+
+    let catalog = Arc::new(
+        ModelCatalogClient::new(
+            format!("{}/v1", server.uri()),
+            "test-key",
+            f.path().to_path_buf(),
+        )
+        .unwrap(),
+    );
+    let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()))
+        .with_catalog(catalog);
+
+    let result = tool
+        .execute(serde_json::json!({"action": "set_tier", "tier": "thinking"}))
+        .await
+        .unwrap();
+    assert!(!result.success, "should reject stale tier model");
+    let err = result.error.unwrap();
+    assert!(err.contains("not in the live catalog"),
+        "unexpected error: {err}");
 }
 
 #[tokio::test]

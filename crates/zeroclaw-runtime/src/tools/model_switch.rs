@@ -52,6 +52,10 @@ impl Tool for ModelSwitchTool {
                 "model": {
                     "type": "string",
                     "description": "Model ID (e.g., 'gpt-4o', 'claude-sonnet-4-6'). Required for 'set' action."
+                },
+                "tier": {
+                    "type": "string",
+                    "description": "Tier name (one of: chat, thinking, fast). Required for 'set_tier' action."
                 }
             },
             "required": ["action"]
@@ -330,6 +334,34 @@ impl ModelSwitchTool {
                 });
             }
         };
+
+        // Defense-in-depth: a stale tiers.yaml could resolve a tier to a model the
+        // provider no longer serves. Validate against the live catalog before staging.
+        match catalog.list_models().await {
+            Ok(models) => {
+                if !models.iter().any(|m| m.id == model) {
+                    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+                    return Ok(ToolResult {
+                        success: false,
+                        output: serde_json::to_string_pretty(&json!({
+                            "tier": tier,
+                            "resolved_model": model,
+                            "available_models": ids,
+                        }))?,
+                        error: Some(format!(
+                            "Tier '{tier}' resolves to '{model}', but that model is not in the live catalog. Edit tiers.yaml to use one of the available models."
+                        )),
+                    });
+                }
+            }
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("cannot validate tier model: catalog unreachable: {e:#}")),
+                });
+            }
+        }
 
         // Use the base_url-prefixed custom provider key so the switch resolves
         // to the same provider the agent is already talking to.
