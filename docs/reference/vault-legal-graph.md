@@ -1,0 +1,380 @@
+# Vault · Legal Graph
+
+Second-brain reference: a Korean-legal-domain graph database layered on
+the existing vault (`src/vault/`). Ingests statute and precedent
+markdown, extracts citations deterministically, and exposes the result
+as a searchable graph through three independent paths — Agent Tools,
+HTTP endpoints, and static HTML snapshots.
+
+Last verified: **April 23, 2026**.
+
+---
+
+## Mental model
+
+```
+local markdown                      brain.db (single SQLite file)            agent / gateway / file
+──────────────           ┌───────────────────────────────────────┐           ──────────────────────
+ 법령/*.md                │  vault_documents (one row per article) │
+ 판례/*.md    ─ ingest ─> │  vault_links     (cites / ref-case /  │
+                          │                   internal-ref /       │
+                          │                   cross-law)           │
+                          │  vault_aliases   (근기법 제43조 등)    │
+                          │  vault_frontmatter, vault_tags         │
+                          └───────────────────────────────────────┘
+                                           │ read-only
+                                           ▼
+                            src/vault/legal/graph_query.rs
+                            (iterative BFS, MAX_NODES=500)
+                                           │
+                     ┌─────────────────────┼─────────────────────┐
+                     ▼                     ▼                     ▼
+                5 agent tools         HTTP + viewer       HTML/JSON snapshot
+                (Phase 2)             (Phase 3)           (Phase 4)
+```
+
+All three consumers share the **same** graph-query module — BFS rules,
+kind filters, node caps, and alias canonicalisation are defined once
+and applied uniformly.
+
+---
+
+## Slug conventions (canonical IDs)
+
+Every node in the legal graph has a canonical slug, stored as
+`vault_documents.title`:
+
+| Kind | Slug format | Example |
+|---|---|---|
+| Statute article | `statute::{법령명}::{N}[-M]` | `statute::근로기준법::43-2` |
+| Case | `case::{사건번호}` | `case::2024노3424` |
+
+- `{법령명}` is always the **canonical long name** (see [law aliases](#law-name-aliases) below).
+- Sub-articles (조의 N) use hyphen separator: `제43조의2` → `43-2`.
+- Paragraph / sub-paragraph refs (제1항, 제5호) are captured as edge
+  metadata, not node keys — they don't split the graph.
+
+---
+
+## Edge relations
+
+Stored in `vault_links.display_text` (`link_type` is always `wikilink`
+to fit the existing CHECK constraint):
+
+| Relation | Source → Target | Meaning |
+|---|---|---|
+| `cites` | case → statute | 참조조문 — the direct link between 판례 and 법령 |
+| `ref-case` | case → case | 참조판례 — precedent references |
+| `internal-ref` | statute → statute (same law) | 조문 내부 상호참조 (예: 제109조 → 제36조) |
+| `cross-law` | statute → statute (different law) | 법령 간 인용 (예: 근로기준법 → 근퇴법) |
+
+Evidence (the actual citing substring) is in `vault_links.context`.
+
+---
+
+## CLI
+
+### Ingest
+
+```bash
+# Walk a directory of .md files; routes each to the statute or case
+# extractor based on content ("## 사건번호" → case, JSON meta → statute).
+zeroclaw vault legal ingest ~/law/markdown
+
+# Parse-only, no DB writes (useful for smoke-testing extractor coverage).
+zeroclaw vault legal ingest ~/law/markdown --dry-run
+```
+
+Idempotent: per-file checksum short-circuits unchanged files; changed
+files have their links/tags/frontmatter replaced atomically in a
+transaction.
+
+After the batch, a `resolve_pending_links` pass wires up edges whose
+target was ingested later in the same batch.
+
+### Stats
+
+```bash
+zeroclaw vault legal stats
+```
+
+### Export a subgraph
+
+```bash
+# Standalone HTML (offline Cytoscape viewer with data embedded inline).
+zeroclaw vault legal export \
+  --root "statute::근로기준법::36" --depth 2 \
+  --kinds statute,case --out ./graph.html
+
+# graphify-compatible JSON (`{nodes, edges, __meta}`).
+zeroclaw vault legal export \
+  --root "case::2024노3424" --depth 2 \
+  --out ./subgraph.json --format json
+```
+
+`--depth` is clamped 1-3 (deeper walks on a well-connected node can
+reach hundreds of articles). `--kinds` is optional; omit for both.
+
+---
+
+## Agent tools
+
+Registered automatically in the default registry (`all_tools_with_runtime`).
+All are read-only and `safe_for_slm=true`.
+
+### `legal_graph_find`
+
+Resolve a human-readable reference to a canonical slug.
+
+```json
+{ "query": "근로기준법 제43조의2(체불사업주 명단 공개)" }
+```
+
+Lookup cascade (cheap → expensive, short-circuits on exact match):
+
+1. Exact `vault_documents.title` (slug form)
+2. Exact `vault_aliases.alias` (e.g. `근기법 제43조의2`)
+3. Parse as statute citation via the same regex used for body scanning
+4. Parse as bare case number
+5. FTS5 trigram fallback on full content
+
+Each hit carries a `matched_via` tag so the agent can weigh confidence.
+
+### `legal_graph_neighbors`
+
+```json
+{ "node": "statute::근로기준법::36", "depth": 1, "kinds": ["case"] }
+```
+
+Returns a human-readable summary of reachable nodes and edges (both
+directions: cited-by + citing).
+
+### `legal_graph_shortest_path`
+
+```json
+{ "from": "case::2024노3424", "to": "statute::근로기준법::109", "max_depth": 4 }
+```
+
+BFS undirected hop-count. Returns the slug sequence or `null` if no
+path within `max_depth`.
+
+### `legal_graph_subgraph`
+
+Same input as `neighbors`, but returns the full graphify-compatible
+JSON payload (`{nodes, edges, truncated}`). For programmatic handoff
+(to viewer / snapshot exporter / external tooling).
+
+### `legal_read_article`
+
+```json
+{ "slug": "case::2024노3424", "sections": ["판결요지", "참조조문"] }
+```
+
+Returns the full body of a node. For statutes: article header + body
+text + frontmatter. For cases: full markdown (or filtered `##`
+sections if `sections` is specified). Use before quoting legal
+language so the agent can cite verbatim.
+
+---
+
+## HTTP endpoints
+
+Served by the main gateway when `zeroclaw gateway` is running. Read-only.
+
+| Method | Path | Returns |
+|---|---|---|
+| `GET` | `/api/legal/graph/subgraph?node=<slug>&depth=<N>&kinds=<csv>` | `{nodes, edges, truncated}` |
+| `GET` | `/api/legal/graph/path?from=<slug>&to=<slug>&max_depth=<N>` | `{path: […] \| null}` |
+| `GET` | `/api/legal/graph/stats` | counts |
+| `GET` | `/legal-graph/viewer[?node=…&depth=…&kinds=…]` | Cytoscape viewer (HTML) |
+
+Each request opens a fresh `SQLITE_OPEN_READ_ONLY` connection; SQLite
+WAL handles concurrent readers.
+
+### Viewer UX
+
+- Node-kind colour-coding (statute = blue, case = amber)
+- Dashed edges for unresolved links
+- Click a node → detail pane shows metadata + all incident edges with
+  evidence snippets
+- **Double-click** a node → re-root at that slug (graph-walk UX)
+- "Export JSON" downloads the current view as graphify JSON
+- Deep-link via URL params for agent handoff
+
+---
+
+## Static HTML snapshot
+
+`zeroclaw vault legal export --out graph.html` produces a **single
+self-contained file** with the Cytoscape viewer and data embedded
+inline — no gateway, no network, no dependencies except a CDN-loaded
+`cytoscape.min.js`. Share as email attachment or cold archive.
+
+Injection security: the JSON payload has `</` escaped to `<\/` so a
+malicious citation can't break out of the embedding script tag.
+
+---
+
+## Extraction pipeline
+
+### Statute markdown
+
+Expected shape (produced by user's ingest pipeline from
+`국가법령정보 API`):
+
+```md
+# 근로기준법
+
+- **MST(법령 마스터 번호)**: 276849
+- **공포일자**: 20251001
+- **시행일**: 20251001
+
+```json
+{
+  "meta": {"lsNm": "근로기준법", "ancYd": "20251001", …},
+  "title": "근로기준법",
+  "articles": [
+    {"anchor": "J36:0", "number": "제36조(금품 청산)", "text": "…"},
+    {"anchor": "J43:2", "number": "제43조의2(체불사업주 명단 공개)", "text": "…"}
+  ],
+  "supplements": [{"title": "부      칙…", "body": "…"}]
+}
+```
+```
+
+The JSON block is authoritative; the extractor parses it structurally,
+then runs the citation regex on each article's `text` field with the
+outer law name as the "current-law" context.
+
+### Case markdown
+
+Expected shape:
+
+```md
+## 사건번호
+2024노3424
+
+## 선고일자
+20250530
+
+## 법원명
+수원지방법원
+
+## 참조조문
+형사소송법 제327조 제6호, 근로기준법 제36조, 제109조
+
+## 참조판례
+대법원 2012. 9. 13. 선고 2012도3166 판결
+
+## 판결요지
+…
+```
+
+Filename is also parsed:
+`{case#}_{catcode}_{kind}_{serial}_{verdict}_{court}_{casename}.md`.
+Parent directory name is the 선고일자 (`YYYYMMDD`).
+
+### Citation regex
+
+Two layers:
+
+1. **Anchors** — law-name markers that set context:
+   - `「법령명」` bracketed
+   - `{법령명|short form} 제N조` unbracketed
+   Each anchor passes the matched name through `law_aliases::canonical_name`
+   before storing, so `근기법`, `근로기준법`, `근로자퇴직급여 보장법`
+   all canonicalise correctly.
+2. **Bare article refs** — `제N조[의M][제K항][제L호]` inherit the
+   most recent anchor's law name. `initial_law` param on
+   `extract_statute_citations` handles the "current-law" case inside
+   a statute's own body.
+
+Case numbers: `YYYY{유형}NNNNN` where 유형 is 1-3 Korean chars
+(covers civil/criminal/constitutional/administrative — 다/노/도/가단/
+고정/헌바 etc.).
+
+---
+
+## Law-name aliases
+
+`src/vault/legal/law_aliases.rs` carries a hand-curated table of ~40
+Korean laws with their widely-used short forms:
+
+| Canonical | Short forms |
+|---|---|
+| 민법 | 민, 民法 |
+| 형법 | 형, 刑法 |
+| 근로기준법 | 근기법 |
+| 근로자퇴직급여 보장법 | 근로자퇴직급여보장법, 근퇴법 |
+| 민사소송법 | 민소법, 민소, 민사소송 |
+| 형사소송법 | 형소법, 형소, 형사소송 |
+| 행정소송법 | 행소법, 행소 |
+| 국세기본법 | 국기법 |
+| 주택임대차보호법 | 주임법 |
+| 독점규제 및 공정거래에 관한 법률 | 공정거래법 |
+
+…and more. Two invariants are compile-time-enforced by tests:
+
+1. No short form maps to two different canonicals (no ambiguity).
+2. No canonical appears twice.
+
+Adding a new row is a single line in `LAW_ALIAS_TABLE`. Unknown law
+names pass through unchanged — we never invent a slug from a name we
+don't recognise.
+
+---
+
+## What's NOT automatic yet (deferred)
+
+These are **known gaps**, not bugs:
+
+### Korean noun extraction for 판결요지 keywords
+
+The original Phase 1 plan listed "판결요지에 포함된 명사 중에서 핵심
+키워드" as a keyword source. This requires a Korean morphological
+analyser (KoNLPy / mecab-ko / khaiii / …) which isn't currently a
+ZeroClaw dependency.
+
+**Workaround in place**: the full 판결요지 text is indexed by FTS5
+with a trigram tokenizer (`vault_docs_fts`), so keyword-style search
+("반의사불벌죄", "재산분할") works today via
+`legal_graph_find` → FTS fallback or direct FTS against the vault.
+What's missing is **explicit keyword list extraction** for each 판례.
+
+Adding this would need a Cargo dep for Korean tokenisation and a
+nightly job that fills a `vault_tags` row for each extracted noun.
+Design note + issue to track this is TODO.
+
+### Historical-version references
+
+`구 민법 (2007. 12. 21. 법률 제8720호로 개정되기 전의 것) 제839조의2`
+currently extracts as the **current** 민법 제839조의2 — the "구" /
+revision-date qualifier is dropped. A version-aware slug
+(`statute::민법::839-2@20071221`) is the planned fix. Not yet
+implemented.
+
+### Ontology / cross-recall integration
+
+Explicitly out of scope:
+
+- Wiring `src/vault/unified_search` into `SqliteMemory::cross_recall`
+  (the unified 4-dim vault search is not yet called from the main
+  episodic-memory recall pipeline).
+- Extending `src/ontology` with an RRF search dimension (schema is
+  present, traversal code is not).
+- Tauri desktop frontend integration.
+
+Each is a separate follow-up PR.
+
+---
+
+## Source files
+
+- `src/vault/legal/` — extractors, ingest, graph_query, law_aliases, cli, slug, citation_patterns
+- `src/tools/vault_graph.rs` — 5 agent tools
+- `src/gateway/legal_graph_api.rs` — HTTP endpoints
+- `src/gateway/legal_graph_viewer.html` — embedded Cytoscape viewer
+
+All 54 unit tests (as of commit `e401f4e`) live inline in the module
+they cover. The user-provided 근로기준법 + 2024노3424 samples serve as
+fixtures for the extraction layer.
