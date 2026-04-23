@@ -53,6 +53,18 @@ check:
 doc:
     cargo doc --no-deps --open
 
+# Serve the docs site locally (English by default; pass LOCALE=ja for Japanese)
+docs LOCALE="en":
+    ./scripts/docs.sh serve --locale {{LOCALE}}
+
+# Build the full docs site (all locales) to docs/book/book/
+docs-build:
+    ./scripts/docs.sh build
+
+# Regenerate reference/cli.md and reference/config.md from code
+docs-refs:
+    ./scripts/docs.sh refs
+
 # Update dependencies
 update:
     cargo update

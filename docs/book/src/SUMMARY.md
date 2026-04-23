@@ -52,6 +52,7 @@
 
 - [Plugin protocol](./developing/plugin-protocol.md)
 - [Extension examples](./developing/extension-examples.md)
+- [Building the docs locally](./developing/building-docs.md)
 
 # Reference
 
