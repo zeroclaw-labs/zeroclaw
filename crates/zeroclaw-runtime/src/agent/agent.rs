@@ -1878,7 +1878,7 @@ mod tests {
                 Ok(zeroclaw_providers::ChatResponse {
                     text: Some(String::new()),
                     tool_calls: vec![zeroclaw_providers::ToolCall {
-                        id: "tc_stream_1".into(),
+                        id: "00000000-0000-0000-0000-000000000001".into(),
                         name: "echo".into(),
                         arguments: "{}".into(),
                     }],
@@ -1916,7 +1916,7 @@ mod tests {
             if *count == 1 {
                 let tc = zeroclaw_providers::traits::StreamEvent::ToolCall(
                     zeroclaw_providers::ToolCall {
-                        id: "tc_stream_1".into(),
+                        id: "00000000-0000-0000-0000-000000000001".into(),
                         name: "echo".into(),
                         arguments: "{}".into(),
                     },
@@ -2013,6 +2013,41 @@ mod tests {
         assert!(
             has_tool_result,
             "Should have emitted a ToolResult event for 'echo'"
+        );
+
+        // Verify ID correlation
+        let call_id = events
+            .iter()
+            .find_map(|e| {
+                if let TurnEvent::ToolCall { id, .. } = e {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("ToolCall should have an ID");
+
+        let result_id = events
+            .iter()
+            .find_map(|e| {
+                if let TurnEvent::ToolResult { id, .. } = e {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("ToolResult should have an ID");
+
+        assert_eq!(
+            call_id, result_id,
+            "ToolCall and ToolResult should share the same ID for correlation"
+        );
+
+        // Verify it's a valid UUID
+        assert!(
+            uuid::Uuid::parse_str(&call_id).is_ok(),
+            "Generated ID should be a valid UUID: got '{}'",
+            call_id
         );
     }
 
