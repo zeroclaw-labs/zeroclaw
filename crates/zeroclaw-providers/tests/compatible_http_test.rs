@@ -56,10 +56,7 @@ async fn non_2xx_surfaces_structured_error() {
     );
 
     let msg = format!("{err:#}");
-    assert!(
-        msg.contains("502"),
-        "error should contain status: {msg}"
-    );
+    assert!(msg.contains("502"), "error should contain status: {msg}");
     assert!(
         msg.contains("unknown provider for model"),
         "error should include upstream body: {msg}"

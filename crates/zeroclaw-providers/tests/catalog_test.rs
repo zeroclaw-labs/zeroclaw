@@ -72,7 +72,10 @@ async fn list_models_surfaces_non_2xx_as_error() {
     let err = client.list_models().await.unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("502"), "error should mention 502: {msg}");
-    assert!(msg.contains("upstream down"), "error should include body: {msg}");
+    assert!(
+        msg.contains("upstream down"),
+        "error should include body: {msg}"
+    );
 }
 
 use std::io::Write;

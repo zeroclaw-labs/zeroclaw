@@ -187,7 +187,9 @@ impl ModelSwitchTool {
                         return Ok(ToolResult {
                             success: false,
                             output: String::new(),
-                            error: Some(format!("cannot validate model: catalog unreachable: {e:#}")),
+                            error: Some(format!(
+                                "cannot validate model: catalog unreachable: {e:#}"
+                            )),
                         });
                     }
                 }
@@ -320,7 +322,9 @@ impl ModelSwitchTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("Missing 'tier' parameter. Use 'list_tiers' to see options.".to_string()),
+                error: Some(
+                    "Missing 'tier' parameter. Use 'list_tiers' to see options.".to_string(),
+                ),
             });
         };
 
@@ -358,7 +362,9 @@ impl ModelSwitchTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("cannot validate tier model: catalog unreachable: {e:#}")),
+                    error: Some(format!(
+                        "cannot validate tier model: catalog unreachable: {e:#}"
+                    )),
                 });
             }
         }

@@ -33,15 +33,18 @@ async fn list_models_returns_live_catalog() {
         .unwrap(),
     );
 
-    let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()))
-        .with_catalog(catalog);
+    let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default())).with_catalog(catalog);
 
     let args = serde_json::json!({"action": "list_models"});
     let result = tool.execute(args).await.unwrap();
     assert!(result.success, "expected success, got {:?}", result.error);
     let v: serde_json::Value = serde_json::from_str(&result.output).unwrap();
-    let ids: Vec<&str> = v["models"].as_array().unwrap()
-        .iter().map(|x| x.as_str().unwrap()).collect();
+    let ids: Vec<&str> = v["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
     assert_eq!(ids, vec!["claude-opus-4-7", "claude-sonnet-4-6"]);
     assert_eq!(v["source"], "live");
 }
@@ -69,14 +72,20 @@ async fn list_tiers_returns_yaml_contents() {
         )
         .unwrap(),
     );
-    let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()))
-        .with_catalog(catalog);
+    let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default())).with_catalog(catalog);
 
-    let result = tool.execute(serde_json::json!({"action": "list_tiers"})).await.unwrap();
+    let result = tool
+        .execute(serde_json::json!({"action": "list_tiers"}))
+        .await
+        .unwrap();
     assert!(result.success, "error: {:?}", result.error);
     let v: serde_json::Value = serde_json::from_str(&result.output).unwrap();
-    let names: Vec<&str> = v["tiers"].as_array().unwrap()
-        .iter().map(|t| t["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = v["tiers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
     assert_eq!(names, vec!["chat", "thinking"]);
 }
 
@@ -104,8 +113,7 @@ async fn set_tier_stages_resolved_model() {
         )
         .unwrap(),
     );
-    let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()))
-        .with_catalog(catalog);
+    let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default())).with_catalog(catalog);
 
     let result = tool
         .execute(serde_json::json!({"action": "set_tier", "tier": "thinking"}))
@@ -143,8 +151,7 @@ async fn set_tier_rejects_when_resolved_model_not_in_catalog() {
         )
         .unwrap(),
     );
-    let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()))
-        .with_catalog(catalog);
+    let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default())).with_catalog(catalog);
 
     let result = tool
         .execute(serde_json::json!({"action": "set_tier", "tier": "thinking"}))
@@ -152,8 +159,10 @@ async fn set_tier_rejects_when_resolved_model_not_in_catalog() {
         .unwrap();
     assert!(!result.success, "should reject stale tier model");
     let err = result.error.unwrap();
-    assert!(err.contains("not in the live catalog"),
-        "unexpected error: {err}");
+    assert!(
+        err.contains("not in the live catalog"),
+        "unexpected error: {err}"
+    );
 }
 
 #[tokio::test]
@@ -170,8 +179,7 @@ async fn set_tier_rejects_unknown_tier() {
         )
         .unwrap(),
     );
-    let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()))
-        .with_catalog(catalog);
+    let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default())).with_catalog(catalog);
 
     let result = tool
         .execute(serde_json::json!({"action": "set_tier", "tier": "ultra"}))
@@ -201,8 +209,7 @@ async fn set_rejects_unknown_model_against_live_catalog() {
         )
         .unwrap(),
     );
-    let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()))
-        .with_catalog(catalog);
+    let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default())).with_catalog(catalog);
 
     let result = tool
         .execute(serde_json::json!({

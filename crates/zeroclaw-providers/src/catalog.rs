@@ -53,7 +53,11 @@ pub struct ModelCatalogClient {
 }
 
 impl ModelCatalogClient {
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>, tiers_path: impl Into<PathBuf>) -> Result<Self> {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        tiers_path: impl Into<PathBuf>,
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))
@@ -93,10 +97,7 @@ impl ModelCatalogClient {
             anyhow::bail!("model catalog fetch failed: status={status} body={body}");
         }
 
-        let parsed: ModelsResponse = resp
-            .json()
-            .await
-            .context("parsing /v1/models response")?;
+        let parsed: ModelsResponse = resp.json().await.context("parsing /v1/models response")?;
 
         {
             let mut cache = self.cache.lock().await;
