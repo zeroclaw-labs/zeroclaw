@@ -1,45 +1,14 @@
 ## Summary
 
-Describe this PR in 2-5 bullets:
-
-- Base branch target (`master` for all contributions):
-- Problem:
-- Why it matters:
-- What changed:
-- What did **not** change (scope boundary):
-
-## Label Snapshot (required)
-
-- Risk label (`risk: low|medium|high`):
-- Size label (`size: XS|S|M|L|XL`, auto-managed/read-only):
-- Scope labels (`core|agent|channel|config|cron|daemon|doctor|gateway|health|heartbeat|integration|memory|observability|onboard|provider|runtime|security|service|skillforge|skills|tool|tunnel|docs|dependencies|ci|tests|scripts|dev`, comma-separated):
-- Module labels (`<module>: <component>`, for example `channel: telegram`, `provider: kimi`, `tool: shell`):
-- Contributor tier label (`trusted contributor|experienced contributor|principal contributor|distinguished contributor`, auto-managed/read-only; author merged PRs >=5/10/20/50):
-- If any auto-label is incorrect, note requested correction:
-
-## Change Metadata
-
-- Change type (`bug|feature|refactor|docs|security|chore`):
-- Primary scope (`runtime|provider|channel|memory|security|ci|docs|multi`):
-
-## Linked Issue
-
-- Closes #
-- Related #
-- Depends on # (if stacked)
-- Supersedes # (if replacing older PR)
-
-## Supersede Attribution (required when `Supersedes #` is used)
-
-- Superseded PRs + authors (`#<pr> by @<author>`, one per line):
-- Integrated scope by source PR (what was materially carried forward):
-- `Co-authored-by` trailers added for materially incorporated contributors? (`Yes/No`)
-- If `No`, explain why (for example: inspiration-only, no direct code/design carry-over):
-- Trailer format check (separate lines, no escaped `\n`): (`Pass/Fail`)
+- **Base branch:** `master` (all contributions)
+- **What changed and why:** (2–5 bullets — the diff shows *what*, you explain *why*)
+- **Scope boundary:** (what this PR explicitly does NOT change)
+- **Blast radius:** (what other subsystems or consumers could be affected)
+- **Linked issue(s):** `Closes #`, `Related #`, `Depends on #` (stacked), `Supersedes #` (replacing older PR)
 
 ## Validation Evidence (required)
 
-Commands and result summary:
+Local validation is the signal CI cannot replace. Run the full battery and paste literal output (tails, failures, warnings — not "all passed").
 
 ```bash
 cargo fmt --all -- --check
@@ -47,68 +16,56 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-- Evidence provided (test/log/trace/screenshot/perf):
-- If any command is intentionally skipped, explain why:
+Docs-only changes: replace with markdown lint + link-integrity (`scripts/ci/docs_quality_gate.sh`). Bootstrap scripts: add `bash -n install.sh`.
 
-## Security Impact (required)
+- **Commands run and tail output:**
+- **Beyond CI — what did you manually verify?** (scenarios, edge cases, what you did NOT verify)
+- **If any command was intentionally skipped, why:**
 
-- New permissions/capabilities? (`Yes/No`)
+## Security & Privacy Impact (required)
+
+Yes/No for each. Answer any `Yes` with a 1–2 sentence explanation.
+
+- New permissions, capabilities, or file system access scope? (`Yes/No`)
 - New external network calls? (`Yes/No`)
-- Secrets/tokens handling changed? (`Yes/No`)
-- File system access scope changed? (`Yes/No`)
-- If any `Yes`, describe risk and mitigation:
+- Secrets / tokens / credentials handling changed? (`Yes/No`)
+- PII, real identities, or personal data in diff, tests, fixtures, or docs? (`Yes/No`)
+- If any `Yes`, describe the risk and mitigation:
 
-## Privacy and Data Hygiene (required)
-
-- Data-hygiene status (`pass|needs-follow-up`):
-- Redaction/anonymization notes:
-- Neutral wording confirmation (use ZeroClaw/project-native labels if identity-like wording is needed):
-
-## Compatibility / Migration
+## Compatibility (required)
 
 - Backward compatible? (`Yes/No`)
-- Config/env changes? (`Yes/No`)
-- Migration needed? (`Yes/No`)
-- If yes, exact upgrade steps:
+- Config / env / CLI surface changed? (`Yes/No`)
+- If `No` or `Yes` to either: exact upgrade steps for existing users:
 
-## i18n Follow-Through (required when docs or user-facing wording changes)
+## Rollback (required for `risk: medium` and `risk: high`)
 
-- i18n follow-through triggered? (`Yes/No`)
-- If `Yes`, locale navigation parity updated in `README*`, `docs/README*`, and `docs/SUMMARY.md` for supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`)? (`Yes/No`)
-- If `Yes`, localized runtime-contract docs updated where equivalents exist (minimum for `fr`/`vi`: `commands-reference`, `config-reference`, `troubleshooting`)? (`Yes/No/N.A.`)
-- If `Yes`, Vietnamese canonical docs under `docs/i18n/vi/**` synced and compatibility shims under `docs/*.vi.md` validated? (`Yes/No/N.A.`)
-- If any `No`/`N.A.`, link follow-up issue/PR and explain scope decision:
+Low-risk PRs: `git revert <sha>` is the plan unless otherwise noted.
 
-## Human Verification (required)
+Medium/high-risk PRs must fill:
 
-What was personally validated beyond CI:
+- **Fast rollback command/path:**
+- **Feature flags or config toggles:** (or `None`)
+- **Observable failure symptoms:** (what to grep logs for, which metric moves, which alert fires)
 
-- Verified scenarios:
-- Edge cases checked:
-- What was not verified:
+## Supersede Attribution (required only when `Supersedes #` is used)
 
-## Side Effects / Blast Radius (required)
+- Superseded PRs + authors (`#<pr> by @<author>`, one per line):
+- Scope materially carried forward:
+- `Co-authored-by` trailers added in commit messages for incorporated contributors? (`Yes/No`)
+- If `No`, why (inspiration-only, no direct code/design carry-over):
 
-- Affected subsystems/workflows:
-- Potential unintended effects:
-- Guardrails/monitoring for early detection:
+## i18n Follow-Through (required only when docs or user-facing wording change)
 
-## Agent Collaboration Notes (recommended)
+- Locale navigation parity updated in `README*`, `docs/README*`, and `docs/SUMMARY.md` for supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`)? (`Yes/No/N.A.`)
+- Localized runtime-contract docs updated where equivalents exist (minimum for `fr`/`vi`: `commands-reference`, `config-reference`, `troubleshooting`)? (`Yes/No/N.A.`)
+- Vietnamese canonical docs under `docs/i18n/vi/**` synced and compatibility shims under `docs/*.vi.md` validated? (`Yes/No/N.A.`)
+- If any `N.A.`, explain scope decision:
 
-- Agent tools used (if any):
-- Workflow/plan summary (if any):
-- Verification focus:
-- Confirmation: naming + architecture boundaries followed (`AGENTS.md` + `CONTRIBUTING.md`):
+---
 
-## Rollback Plan (required)
+**Labels** live in the GitHub label UI, not in the body. Set `risk:*`, `size:*`, and scope labels via the sidebar. Auto-label corrections: add `risk: manual` and the intended label.
 
-- Fast rollback command/path:
-- Feature flags or config toggles (if any):
-- Observable failure symptoms:
+**Commit trailers** capture AI-assisted collaboration (`Co-Authored-By: Claude ...`) — no separate section needed.
 
-## Risks and Mitigations
-
-List real risks in this PR (or write `None`).
-
-- Risk:
-  - Mitigation:
+**Privacy contract** (`docs/contributing/pr-discipline.md`) is a merge gate. Never commit real identities, secrets, personal emails, or PII in diff, tests, fixtures, or docs.

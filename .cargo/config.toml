@@ -1,6 +1,13 @@
 [target.x86_64-unknown-linux-musl]
 rustflags = ["-C", "link-arg=-static"]
 
+# ARM64 Linux (Raspberry Pi 4/5, AWS Graviton, etc.)
+# Prerequisite: aarch64-linux-gnu-gcc must be installed.
+#   Arch:   sudo pacman -S aarch64-linux-gnu-gcc
+#   Debian: sudo apt install gcc-aarch64-linux-gnu
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
 [target.aarch64-unknown-linux-musl]
 rustflags = ["-C", "link-arg=-static", "-C", "link-arg=-Wl,-z,stack-size=8388608"]
 

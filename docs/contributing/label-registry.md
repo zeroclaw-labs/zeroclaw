@@ -174,6 +174,19 @@ Defined in `.github/label-policy.json`. Based on the author's merged PR count qu
 
 ---
 
+## Status labels
+
+Track the lifecycle state of RFCs and work items. Applied manually.
+
+| Label | Color | Description | Applied by |
+|---|---|---|---|
+| `status:in-progress` | `0075ca` (blue) | An open PR is actively targeting this issue. | Manual |
+| `status:accepted` | `0e8a16` (green) | RFC or work item accepted and ratified by the team. | Manual |
+
+**Automation:** none. Applied manually when an RFC transitions from active discussion to ratified, or when a PR is opened against a tracked issue.
+
+---
+
 ## Response and triage labels
 
 Defined in `pr-workflow.md` §8. Applied manually.
@@ -201,8 +214,9 @@ Defined in `pr-workflow.md` §8. Applied manually.
 | Size | 5 | No | Manual |
 | Risk | 4 | No | Manual |
 | Contributor tier | 4 | No | Manual |
+| Status | 2 | No | Manual |
 | Response/triage | 7 | No | Manual |
-| **Total** | **99** | | |
+| **Total** | **101** | | |
 
 ---
 

@@ -3,7 +3,7 @@
 pub struct SecretFieldInfo {
     /// Full dotted name (e.g. `channels.matrix.access-token`)
     pub name: &'static str,
-    /// Category for grouping in `zeroclaw props list`
+    /// Category for grouping in `zeroclaw config list`
     pub category: &'static str,
     /// Whether this field currently has a non-empty value
     pub is_set: bool,
@@ -18,6 +18,8 @@ pub enum PropKind {
     Float,
     /// An enum or other serde-serializable type (parsed as TOML string).
     Enum,
+    /// A `Vec<String>` field; set via comma-separated input.
+    StringArray,
 }
 
 /// Maps Rust types to PropKind at compile time.
@@ -49,6 +51,9 @@ impl_prop_kind!(
     i64,
     isize
 );
+impl HasPropKind for Vec<String> {
+    const PROP_KIND: PropKind = PropKind::StringArray;
+}
 
 /// Describes a single property field discovered via `#[derive(Configurable)]`.
 #[derive(Clone)]

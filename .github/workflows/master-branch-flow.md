@@ -1,133 +1,146 @@
 # Master Branch Delivery Flows
 
-This document explains what runs when code is proposed to `master` and released.
+How code moves from a PR to a shipped release.
 
-Use this with:
+Use with:
 
-- [`docs/ci-map.md`](../../docs/contributing/ci-map.md)
-- [`docs/pr-workflow.md`](../../docs/contributing/pr-workflow.md)
-- [`docs/release-process.md`](../../docs/contributing/release-process.md)
+- [`docs/contributing/ci-map.md`](../../docs/contributing/ci-map.md)
+- [`docs/maintainers/release-runbook.md`](../../docs/maintainers/release-runbook.md)
+
+Last updated: **May 2026** (post-v0.7.4 cleanup).
+
+---
 
 ## Branching Model
 
-ZeroClaw uses a single default branch: `master`. All contributor PRs target `master` directly. There is no `dev` or promotion branch.
+ZeroClaw uses a single default branch: `master`. All contributor PRs target
+`master` directly. There is no `dev` or promotion branch.
 
-Current maintainers with PR approval authority: `theonlyhennygod`, `JordanTheJet`, and `SimianAstronaut7`.
+Maintainers with merge authority: `theonlyhennygod` and `JordanTheJet`.
+
+---
 
 ## Active Workflows
 
 | File | Trigger | Purpose |
-| --- | --- | --- |
-| `checks-on-pr.yml` | `pull_request` → `master` | Lint + test + build + security audit on every PR |
-| `cross-platform-build-manual.yml` | `workflow_dispatch` | Full platform build matrix (manual) |
-| `release-beta-on-push.yml` | `push` → `master` | Beta release on every master commit |
-| `release-stable-manual.yml` | `workflow_dispatch` | Stable release (manual, version-gated) |
+|---|---|---|
+| `ci.yml` | `pull_request` → `master` | Lint + test + build on every PR |
+| `release-stable-manual.yml` | `workflow_dispatch`, tag push `v*` | Stable release (manual, version-gated) |
+| `cross-platform-build-manual.yml` | `workflow_dispatch` | Full platform build matrix (manual smoke check) |
+| `pr-path-labeler.yml` | `pull_request` lifecycle | Automatic path-based PR labeling |
+
+---
 
 ## Event Summary
 
-| Event | Workflows triggered |
-| --- | --- |
-| PR opened or updated against `master` | `checks-on-pr.yml` |
-| Push to `master` (including after merge) | `release-beta-on-push.yml` |
-| Manual dispatch | `cross-platform-build-manual.yml`, `release-stable-manual.yml` |
+| Event | What runs |
+|---|---|
+| PR opened or updated against `master` | `ci.yml` (full lint + test + build + strict delta) |
+| Manual dispatch | `cross-platform-build-manual.yml` or `release-stable-manual.yml` |
+| Tag push `vX.Y.Z` | `release-stable-manual.yml` (full release pipeline) |
 
-## Step-By-Step
+There is no automatic CI run on push to master and no automatic release on
+merge. Releases are always intentional — either a manual dispatch or a
+deliberate tag push.
+
+---
+
+## Step-by-Step
 
 ### 1) PR → `master`
 
-1. Contributor opens or updates a PR against `master`.
-2. `checks-on-pr.yml` starts:
-   - `lint` job: runs `cargo fmt --check` and `cargo clippy -D warnings`.
-   - `test` job: runs `cargo nextest run --locked` on `ubuntu-latest` with Rust 1.92.0 and mold linker.
-   - `build` job (matrix): compiles release binary on `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`.
-   - `security` job: runs `cargo audit` and `cargo deny check licenses sources`.
-   - Concurrency group cancels in-progress runs for the same PR on new pushes.
-3. All jobs must pass before merge.
-4. Maintainer (`theonlyhennygod`, `JordanTheJet`, or `SimianAstronaut7`) merges PR once checks and review policy are satisfied.
-5. Merge emits a `push` event on `master` (see section 2).
+1. Contributor opens or updates a PR targeting `master`.
+2. `ci.yml` runs:
+   - `lint` — `cargo fmt --all -- --check`, `cargo clippy -D warnings`,
+     `cargo check --features ci-all`, strict delta lint on changed lines
+     (PRs only).
+   - `build` — matrix across `x86_64-unknown-linux-gnu`,
+     `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`.
+   - `check` — matrix: all features + no default features.
+   - `check-32bit` — `i686-unknown-linux-gnu`, no default features.
+   - `bench` — benchmarks compile check.
+   - `test` — `cargo nextest run --locked` on `ubuntu-latest`.
+   - `security` — `cargo deny check`.
+   - `CI Required Gate` — composite job; branch protection requires this.
+3. Maintainer reviews and merges once the gate is green and review policy is
+   satisfied.
 
-### 2) Push to `master` (including after merge)
+### 2) Stable Release (manual)
 
-1. Commit reaches `master`.
-2. `release-beta-on-push.yml` (Release Beta) starts:
-   - `version` job: computes beta tag as `v{cargo_version}-beta.{run_number}`.
-   - `build` job (matrix, 6 targets): `x86_64-linux`, `aarch64-linux`, `armv7-linux`, `aarch64-darwin`, `aarch64-android`, `x86_64-windows`.
-   - `publish` job: generates `SHA256SUMS`, creates a GitHub pre-release with all artifacts. Artifact retention: 7 days.
-   - `docker` job: builds multi-platform image (`linux/amd64,linux/arm64`) and pushes to `ghcr.io` with `:beta` and the versioned beta tag.
-3. This runs on every push to `master` without filtering. Every merged PR produces a beta pre-release.
+See [`docs/maintainers/release-runbook.md`](../../docs/maintainers/release-runbook.md)
+for the full procedure. In summary:
 
-### 3) Stable Release (manual)
+1. Maintainer verifies CI is green on the version bump PR.
+2. Version bump PR is merged.
+3. Maintainer triggers `release-stable-manual.yml` via `workflow_dispatch`
+   with the version number, or pushes an annotated tag `vX.Y.Z`.
+4. Workflow builds all targets, creates the GitHub Release, publishes to
+   crates.io, pushes Docker images, and notifies distribution channels.
+5. Maintainer approves the three environment gates
+   (`github-releases`, `crates-io`, `docker`) when prompted.
 
-1. Maintainer runs `release-stable-manual.yml` via `workflow_dispatch` with a version input (e.g. `0.2.0`).
-2. `validate` job checks:
-   - Input matches semver `X.Y.Z` format.
-   - `Cargo.toml` version matches input exactly.
-   - Tag `vX.Y.Z` does not already exist on the remote.
-3. `build` job (matrix, 7 targets): `x86_64-linux`, `aarch64-linux`, `armv7-linux`, `arm-unknown-linux-gnueabihf (ARMv6)`, `aarch64-darwin`, `aarch64-android`, `x86_64-windows`.
-4. `publish` job: generates `SHA256SUMS`, creates a stable GitHub Release (not pre-release). Artifact retention: 14 days.
-5. `docker` job: pushes to `ghcr.io` with `:latest` and `:vX.Y.Z`.
-
-### 4) Full Platform Build (manual)
+### 3) Full Platform Build (manual)
 
 1. Maintainer runs `cross-platform-build-manual.yml` via `workflow_dispatch`.
-2. `build` job (matrix, 3 targets): `aarch64-linux-gnu`, `x86_64-darwin` (macOS 15 Intel), `x86_64-windows-msvc`.
-3. Build-only, no tests, no publish. Used to verify cross-compilation on platforms not covered by `checks-on-pr.yml`.
+2. Build-only across additional targets not covered by the PR build matrix.
+3. No tests, no publish. Used to verify cross-compilation health.
+
+---
 
 ## Build Targets by Workflow
 
-| Target | `checks-on-pr.yml` | `cross-platform-build-manual.yml` | `release-beta-on-push.yml` | `release-stable-manual.yml` |
-| --- | :---: | :---: | :---: | :---: |
-| `x86_64-unknown-linux-gnu` | ✓ | | ✓ | ✓ |
-| `aarch64-unknown-linux-gnu` | | ✓ | ✓ | ✓ |
-| `armv7-unknown-linux-gnueabihf` | | | ✓ | ✓ |
-| `arm-unknown-linux-gnueabihf` | | | | ✓ |
-| `aarch64-apple-darwin` | ✓ | | ✓ | ✓ |
-| `aarch64-linux-android` | | | ✓ | ✓ |
-| `x86_64-apple-darwin` | | ✓ | | |
-| `x86_64-pc-windows-msvc` | ✓ | ✓ | ✓ | ✓ |
+| Target | `ci.yml` | `cross-platform-build-manual.yml` | `release-stable-manual.yml` |
+|---|:---:|:---:|:---:|
+| `x86_64-unknown-linux-gnu` | ✓ | | ✓ |
+| `aarch64-unknown-linux-gnu` | | ✓ | ✓ |
+| `armv7-unknown-linux-gnueabihf` | | | ✓ |
+| `arm-unknown-linux-gnueabihf` | | | ✓ |
+| `aarch64-apple-darwin` | ✓ | | ✓ |
+| `aarch64-linux-android` | | | ✓ (experimental) |
+| `x86_64-apple-darwin` | | ✓ | |
+| `x86_64-pc-windows-msvc` | ✓ | ✓ | ✓ |
 
-## Mermaid Diagrams
+---
 
-### PR to Master
+## Diagrams
 
-```mermaid
-flowchart TD
-  A["PR opened or updated → master"] --> B["checks-on-pr.yml"]
-  B --> B0["lint: fmt + clippy"]
-  B --> B1["test: cargo nextest (ubuntu-latest)"]
-  B --> B2["build: x86_64-linux + aarch64-darwin"]
-  B --> B3["security: audit + deny"]
-  B0 & B1 & B2 & B3 --> C{"Checks pass?"}
-  C -->|No| D["PR stays open"]
-  C -->|Yes| E["Maintainer merges"]
-  E --> F["push event on master"]
-```
-
-### Beta Release (on every master push)
+### PR to master
 
 ```mermaid
 flowchart TD
-  A["Push to master"] --> B["release-beta-on-push.yml"]
-  B --> B1["version: compute v{x.y.z}-beta.{N}"]
-  B1 --> B2["build: 6 targets"]
-  B2 --> B3["publish: GitHub pre-release + SHA256SUMS"]
-  B2 --> B4["docker: push ghcr.io :beta + versioned tag"]
+  A["PR opened or updated → master"] --> B["ci.yml"]
+  B --> L["lint\nfmt · clippy · check-features · strict-delta"]
+  L --> T["test\ncargo nextest"]
+  L --> BLD["build\nLinux · macOS · Windows"]
+  L --> CHK["check\nall features · no default features"]
+  L --> C32["check-32bit\ni686-unknown-linux-gnu"]
+  L --> BCH["bench\ncompile check"]
+  L --> SEC["security\ncargo deny check"]
+  T & BLD & CHK & C32 & BCH & SEC --> G["CI Required Gate"]
+  G -->|red| D["PR stays open"]
+  G -->|green| R["Maintainer merges"]
 ```
 
-### Stable Release (manual)
+### Stable release
 
 ```mermaid
 flowchart TD
-  A["workflow_dispatch: version=X.Y.Z"] --> B["release-stable-manual.yml"]
-  B --> B1["validate: semver + Cargo.toml + tag uniqueness"]
-  B1 --> B2["build: 7 targets"]
-  B2 --> B3["publish: GitHub stable release + SHA256SUMS"]
-  B2 --> B4["docker: push ghcr.io :latest + :vX.Y.Z"]
+  A["workflow_dispatch: version=X.Y.Z\nor tag push vX.Y.Z"] --> V["validate\nsemver · Cargo.toml match · tag uniqueness"]
+  V --> BLD["build all targets"]
+  BLD --> PUB["publish\nGitHub Release · SHA256SUMS"]
+  PUB --> CR["crates-io"]
+  PUB --> DOC["docker\nGHCR :vX.Y.Z + :latest"]
+  PUB --> DIST["scoop · aur · homebrew"]
+  PUB --> ANN["discord · tweet"]
 ```
 
-## Quick Troubleshooting
+---
 
-1. **Quality gate failing on PR**: check `lint` job for formatting/clippy issues; check `test` job for test failures; check `build` job for compile errors; check `security` job for audit/deny failures.
-2. **Beta release not appearing**: confirm the push landed on `master` (not another branch); check `release-beta-on-push.yml` run status.
-3. **Stable release failing at validate**: ensure `Cargo.toml` version matches the input version and the tag does not already exist.
-4. **Full matrix build needed**: run `cross-platform-build-manual.yml` manually from the Actions tab.
+## Troubleshooting
+
+1. **Gate red on PR** — check the `lint` job first (fmt/clippy failures are
+   the most common cause), then `test`, then `build`.
+2. **Release validate failed** — `Cargo.toml` version does not match the
+   input, or the tag already exists. Fix the version bump PR and re-trigger.
+3. **Need a full cross-platform build** — run `cross-platform-build-manual.yml`
+   manually from the Actions tab.

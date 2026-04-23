@@ -3,31 +3,36 @@ members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw
 resolver = "2"
 
 [workspace.package]
-version = "0.6.9"
+version = "0.7.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
 rust-version = "1.87"
 
 [workspace.dependencies]
-zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.6.9" }
-zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.6.9" }
-zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.6.9", default-features = false }
-zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.6.9" }
-zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.6.9" }
-zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.6.9", default-features = false }
-zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.6.9" }
-zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.6.9", default-features = false }
-zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.6.9" }
-zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.6.9" }
-zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.6.9" }
-zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.6.9" }
-zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.6.9" }
-zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.6.9" }
+zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.7.3" }
+zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.7.3" }
+zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.7.3", default-features = false }
+zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.7.3" }
+zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.7.3" }
+zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.7.3", default-features = false }
+zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.7.3" }
+zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.7.3", default-features = false }
+zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.7.3" }
+zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.7.3" }
+zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.7.3" }
+zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.7.3" }
+zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.7.3" }
+zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.7.3" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 
 [package]
 name = "zeroclawlabs"
+# Publishing blocked during microkernel workspace transition — see #5811.
+# All 14 workspace sub-crates are publish = false and therefore unresolvable
+# on crates.io. Flip or remove this once the multi-crate publish topology is
+# designed per RFC #5579.
+publish = false
 version.workspace = true
 edition.workspace = true
 authors = ["theonlyhennygod"]
@@ -92,6 +97,7 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 # Config
 directories = "6.0"
 toml = "1.0"
+toml_edit = "0.25"  # already a transitive dep via toml — zero added compile/binary cost
 shellexpand = "3.1"
 
 # JSON Schema generation for config export
@@ -111,7 +117,7 @@ urlencoding = "2.1"
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"
 
-rumqttc = "0.24"
+rumqttc = "0.25"
 
 # Tarball extraction for binary updates
 flate2 = "1"
@@ -293,7 +299,10 @@ whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
 voice-wake = ["zeroclaw-channels/voice-wake"]
 
 # Backends and platform flags — each forwards to ONE crate
-observability-prometheus = ["zeroclaw-runtime/observability-prometheus"]
+observability-prometheus = [
+    "zeroclaw-runtime/observability-prometheus",
+    "zeroclaw-gateway/observability-prometheus",
+]
 observability-otel = ["zeroclaw-runtime/observability-otel"]
 hardware = ["dep:zeroclaw-hardware", "zeroclaw-hardware/hardware"]
 peripheral-rpi = ["dep:zeroclaw-hardware", "zeroclaw-hardware/peripheral-rpi"]

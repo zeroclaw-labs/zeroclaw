@@ -537,13 +537,26 @@ Examples:
     #[command(long_about = "\
 Manage ZeroClaw configuration.
 
-Inspect and export configuration settings. Use 'schema' to dump \
-the full JSON Schema for the config file, which documents every \
-available key, type, and default value.
+View, set, or initialize config properties by dotted path. \
+Use 'schema' to dump the full JSON Schema for the config file.
+
+Properties are addressed by dotted path (e.g. channels.matrix.mention-only).
+Secret fields (API keys, tokens) automatically use masked input.
+Enum fields offer interactive selection when value is omitted.
 
 Examples:
-  zeroclaw config schema              # print JSON Schema to stdout
-  zeroclaw config schema > schema.json")]
+  zeroclaw config list                                  # list all properties
+  zeroclaw config list --secrets                        # list only secrets
+  zeroclaw config list --filter channels.matrix         # filter by prefix
+  zeroclaw config get channels.matrix.mention-only      # get a value
+  zeroclaw config set channels.matrix.mention-only true # set a value
+  zeroclaw config set channels.matrix.access-token      # secret: masked input
+  zeroclaw config set channels.matrix.stream-mode       # enum: interactive select
+  zeroclaw config init channels.matrix                  # init section with defaults
+  zeroclaw config schema                                # print JSON Schema to stdout
+  zeroclaw config schema > schema.json
+
+Property path tab completion is included automatically in `zeroclaw completions <shell>`.")]
     Config {
         #[command(subcommand)]
         config_command: ConfigCommands,
@@ -630,28 +643,11 @@ Examples:
         install: bool,
     },
 
-    /// View or change config properties by dotted path
-    #[command(long_about = "\
-View, set, or initialize config properties.
-
-Properties are addressed by dotted path (e.g. channels.matrix.mention-only).
-Secret fields (API keys, tokens) automatically use masked input.
-Enum fields offer interactive selection when value is omitted.
-
-Examples:
-  zeroclaw props list                                  # list all properties
-  zeroclaw props list --secrets                        # list only secrets
-  zeroclaw props list --filter channels.matrix         # filter by prefix
-  zeroclaw props get channels.matrix.mention-only      # get a value
-  zeroclaw props set channels.matrix.mention-only true # set a value
-  zeroclaw props set channels.matrix.access-token      # secret: masked input
-  zeroclaw props set channels.matrix.stream-mode       # enum: interactive select
-  zeroclaw props init channels.matrix                  # init section with defaults
-
-Property path tab completion is included automatically in `zeroclaw completions <shell>`.")]
+    /// Deprecated: use `zeroclaw config` instead
+    #[command(hide = true)]
     Props {
         #[command(subcommand)]
-        props_command: PropsCommands,
+        props_command: DeprecatedPropsCommands,
     },
 
     /// Manage WASM plugins
@@ -662,8 +658,40 @@ Property path tab completion is included automatically in `zeroclaw completions 
     },
 }
 
+/// Stub enum that mirrors the old `props` subcommands so clap can still parse
+/// `zeroclaw props <anything>` and print a deprecation message.
 #[derive(Subcommand, Debug)]
-enum PropsCommands {
+enum DeprecatedPropsCommands {
+    #[command(external_subcommand)]
+    Any(Vec<String>),
+}
+
+#[cfg(feature = "plugins-wasm")]
+#[derive(Subcommand, Debug)]
+enum PluginCommands {
+    /// List installed plugins
+    List,
+    /// Install a plugin from a directory or URL
+    Install {
+        /// Path to plugin directory or manifest
+        source: String,
+    },
+    /// Remove an installed plugin
+    Remove {
+        /// Plugin name
+        name: String,
+    },
+    /// Show information about a plugin
+    Info {
+        /// Plugin name
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommands {
+    /// Dump the full configuration JSON Schema to stdout
+    Schema,
     /// List all config properties with current values
     List {
         /// Filter by path prefix (e.g. "channels.telegram")
@@ -693,40 +721,14 @@ enum PropsCommands {
         /// Section prefix (e.g. channels.matrix). Omit to init all.
         section: Option<String>,
     },
+    /// Migrate config.toml to the current schema version on disk (preserves comments)
+    Migrate,
     /// Print matching property paths for shell completion (hidden)
     #[command(hide = true)]
     Complete {
         /// Partial path to complete
         partial: Option<String>,
     },
-}
-
-#[cfg(feature = "plugins-wasm")]
-#[derive(Subcommand, Debug)]
-enum PluginCommands {
-    /// List installed plugins
-    List,
-    /// Install a plugin from a directory or URL
-    Install {
-        /// Path to plugin directory or manifest
-        source: String,
-    },
-    /// Remove an installed plugin
-    Remove {
-        /// Plugin name
-        name: String,
-    },
-    /// Show information about a plugin
-    Info {
-        /// Plugin name
-        name: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum ConfigCommands {
-    /// Dump the full configuration JSON Schema to stdout
-    Schema,
 }
 
 #[derive(Subcommand, Debug)]
@@ -960,10 +962,23 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO
+    // Initialize logging - respects RUST_LOG env var, defaults to INFO.
+    // For the ACP command, we default to WARN to avoid INFO logs corrupting the stdio protocol.
+    // We also always redirect logs to stderr so stdout remains clean for data.
+    let default_log_level = if matches!(cli.command, Commands::Acp { .. }) {
+        "warn"
+    } else {
+        // matrix_sdk crates are suppressed to warn because they are extremely
+        // noisy at info level. To restore SDK-level output for Matrix debugging:
+        //   RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info
+        // acp_server has to be WARN because INFO injects junk data into the JSON stream.
+        "info,matrix_sdk=warn,matrix_sdk_base=warn,matrix_sdk_crypto=warn"
+    };
+
     let subscriber = fmt::Subscriber::builder()
+        .with_writer(std::io::stderr)
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_level)),
         )
         .finish();
 
@@ -1140,26 +1155,34 @@ async fn main() -> Result<()> {
                 temperature,
                 ..
             } => {
-                let final_temperature = temperature.unwrap_or(config.default_temperature);
+                let fallback = config.providers.fallback_provider();
+                let final_temperature = temperature
+                    .unwrap_or_else(|| fallback.and_then(|e| e.temperature).unwrap_or(0.7));
                 if let Some(p) = &provider {
-                    config.default_provider = Some(p.clone());
+                    config.providers.fallback = Some(p.clone());
                 }
                 if let Some(m) = &model {
-                    config.default_model = Some(m.clone());
+                    config.ensure_fallback_provider().model = Some(m.clone());
                 }
-                config.default_temperature = final_temperature;
+                config.ensure_fallback_provider().temperature = Some(final_temperature);
 
-                let provider_name = config.default_provider.as_deref().unwrap_or("openai");
-                let provider =
-                    zeroclaw::providers::create_provider(provider_name, config.api_key.as_deref())?;
+                let provider_name = config.providers.fallback.as_deref().unwrap_or("openai");
+                let provider = zeroclaw::providers::create_provider(
+                    provider_name,
+                    config
+                        .providers
+                        .fallback_provider()
+                        .and_then(|e| e.api_key.as_deref()),
+                )?;
+                let model_name = config
+                    .providers
+                    .fallback_provider()
+                    .and_then(|e| e.model.as_deref())
+                    .unwrap_or("default");
                 match message {
                     Some(msg) => {
                         let response = provider
-                            .simple_chat(
-                                &msg,
-                                config.default_model.as_deref().unwrap_or("default"),
-                                final_temperature,
-                            )
+                            .simple_chat(&msg, model_name, final_temperature)
                             .await?;
                         println!("{response}");
                     }
@@ -1174,11 +1197,7 @@ async fn main() -> Result<()> {
                                 break;
                             }
                             let response = provider
-                                .simple_chat(
-                                    line.trim(),
-                                    config.default_model.as_deref().unwrap_or("default"),
-                                    final_temperature,
-                                )
+                                .simple_chat(line.trim(), model_name, final_temperature)
                                 .await?;
                             println!("{response}");
                         }
@@ -1207,7 +1226,18 @@ async fn main() -> Result<()> {
             temperature,
             peripheral,
         } => {
-            let final_temperature = temperature.unwrap_or(config.default_temperature);
+            let final_temperature = temperature.unwrap_or_else(|| {
+                config
+                    .providers
+                    .fallback_provider()
+                    .and_then(|e| e.temperature)
+                    .unwrap_or(0.7)
+            });
+
+            // Wire CLI channel for interactive mode
+            zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
+                Box::new(zeroclaw_channels::cli::CliChannel::new())
+            }));
 
             Box::pin(agent::run(
                 config,
@@ -1451,11 +1481,15 @@ async fn main() -> Result<()> {
             println!();
             println!(
                 "🤖 Provider:      {}",
-                config.default_provider.as_deref().unwrap_or("openrouter")
+                config.providers.fallback.as_deref().unwrap_or("openrouter")
             );
             println!(
                 "   Model:         {}",
-                config.default_model.as_deref().unwrap_or("(default)")
+                config
+                    .providers
+                    .fallback_provider()
+                    .and_then(|e| e.model.as_deref())
+                    .unwrap_or("(default)")
             );
             println!("📊 Observability:  {}", config.observability.backend);
             println!(
@@ -1543,7 +1577,7 @@ async fn main() -> Result<()> {
             println!();
             println!("Channels:");
             println!("  CLI:      ✅ always");
-            for (channel, configured) in config.channels_config.channels() {
+            for (channel, configured) in config.channels.channels() {
                 println!(
                     "  {:9} {}",
                     channel.name(),
@@ -1605,7 +1639,8 @@ async fn main() -> Result<()> {
         Commands::Providers => {
             let providers = providers::list_providers();
             let current = config
-                .default_provider
+                .providers
+                .fallback
                 .as_deref()
                 .unwrap_or("openrouter")
                 .trim()
@@ -1859,10 +1894,7 @@ async fn main() -> Result<()> {
                 );
                 Ok(())
             }
-        },
-
-        Commands::Props { props_command } => match props_command {
-            PropsCommands::List { filter, secrets } => {
+            ConfigCommands::List { filter, secrets } => {
                 let entries = config.prop_fields();
                 let mut current_category = "";
                 for entry in &entries {
@@ -1889,7 +1921,7 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             }
-            PropsCommands::Get { path } => {
+            ConfigCommands::Get { path } => {
                 if Config::prop_is_secret(&path) {
                     let entries = config.prop_fields();
                     let is_set = entries
@@ -1910,16 +1942,15 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             }
-            PropsCommands::Set {
+            ConfigCommands::Set {
                 path,
                 value,
                 no_interactive,
             } => {
                 if no_interactive {
-                    // Scripted mode: require value on CLI, no prompts
                     let val = value.ok_or_else(|| {
                         anyhow::anyhow!(
-                            "Value required in --no-interactive mode. Usage: zeroclaw props set --no-interactive {path} <value>"
+                            "Value required in --no-interactive mode. Usage: zeroclaw config set --no-interactive {path} <value>"
                         )
                     })?;
                     config.set_prop(&path, &val)?;
@@ -1940,20 +1971,16 @@ async fn main() -> Result<()> {
                 } else if let Some(val) = value {
                     config.set_prop(&path, &val)?;
                 } else {
-                    // Enum fields get interactive selection; everything else needs a value
-                    let variants = config
-                        .prop_fields()
-                        .into_iter()
-                        .find(|f| f.name == path)
-                        .and_then(|info| {
-                            let get_variants = info.enum_variants?;
-                            let variants = get_variants();
-                            let current_index = variants
-                                .iter()
-                                .position(|v| v == &info.display_value)
-                                .unwrap_or(0);
-                            Some((variants, current_index))
-                        });
+                    let field_info = config.prop_fields().into_iter().find(|f| f.name == path);
+                    let variants = field_info.as_ref().and_then(|info| {
+                        let get_variants = info.enum_variants?;
+                        let variants = get_variants();
+                        let current_index = variants
+                            .iter()
+                            .position(|v| v == &info.display_value)
+                            .unwrap_or(0);
+                        Some((variants, current_index))
+                    });
                     if let Some((variants, current_index)) = variants {
                         let selected = Select::new()
                             .with_prompt(format!("Select value for {path}"))
@@ -1961,15 +1988,51 @@ async fn main() -> Result<()> {
                             .default(current_index)
                             .interact()?;
                         config.set_prop(&path, &variants[selected])?;
+                    } else if field_info
+                        .as_ref()
+                        .is_some_and(|f| f.kind == crate::config::PropKind::StringArray)
+                    {
+                        let current_items: Vec<String> = field_info
+                            .as_ref()
+                            .and_then(|f| {
+                                let raw = toml::from_str::<toml::Value>(&format!(
+                                    "v = {}",
+                                    if f.display_value == "<unset>" {
+                                        "[]".to_string()
+                                    } else {
+                                        f.display_value.clone()
+                                    }
+                                ))
+                                .ok();
+                                raw.and_then(|v| v.get("v").cloned())
+                                    .and_then(|v| v.as_array().cloned())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                            .collect()
+                                    })
+                            })
+                            .unwrap_or_default();
+                        let editor_content = current_items.join("\n");
+                        let edited = dialoguer::Editor::new()
+                            .edit(&editor_content)?
+                            .unwrap_or(editor_content);
+                        let val = edited
+                            .lines()
+                            .map(|l| l.trim())
+                            .filter(|l| !l.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        config.set_prop(&path, &val)?;
                     } else {
-                        anyhow::bail!("Value required. Usage: zeroclaw props set {path} <value>");
+                        anyhow::bail!("Value required. Usage: zeroclaw config set {path} <value>");
                     }
                 }
                 config.save().await?;
                 println!("{path} updated.");
                 Ok(())
             }
-            PropsCommands::Init { section } => {
+            ConfigCommands::Init { section } => {
                 let initialized = config.init_defaults(section.as_deref());
                 if initialized.is_empty() {
                     println!("All sections already configured.");
@@ -1982,11 +2045,35 @@ async fn main() -> Result<()> {
                         println!("  {name}");
                     }
                     config.save().await?;
-                    println!("\nRun `zeroclaw props list` to review, then set required fields.");
+                    println!("\nRun `zeroclaw config list` to review, then set required fields.");
                 }
                 Ok(())
             }
-            PropsCommands::Complete { partial } => {
+            ConfigCommands::Migrate => {
+                let raw = tokio::fs::read_to_string(&config.config_path)
+                    .await
+                    .context("Failed to read config file")?;
+                match crate::config::migration::migrate_file(&raw)? {
+                    Some(migrated) => {
+                        let backup_path = config.config_path.with_extension("toml.bak");
+                        tokio::fs::copy(&config.config_path, &backup_path)
+                            .await
+                            .context("Failed to create config backup")?;
+                        tokio::fs::write(&config.config_path, &migrated).await?;
+                        let to = crate::config::migration::CURRENT_SCHEMA_VERSION;
+                        println!("Backed up to {}", backup_path.display());
+                        println!(
+                            "Migrated {} to schema version {to}.",
+                            config.config_path.display()
+                        );
+                    }
+                    None => {
+                        println!("Config already at current schema version.");
+                    }
+                }
+                Ok(())
+            }
+            ConfigCommands::Complete { partial } => {
                 let prefix = partial.as_deref().unwrap_or("");
                 for entry in config.prop_fields() {
                     if entry.name.starts_with(prefix) {
@@ -1996,6 +2083,13 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+
+        Commands::Props { .. } => {
+            anyhow::bail!(
+                "`zeroclaw props` has been renamed to `zeroclaw config`. \
+                 Replace `props` with `config` in your command and try again."
+            );
+        }
 
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
@@ -2446,17 +2540,17 @@ fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> R
     match shell {
         CompletionShell::Bash => {
             generate(shells::Bash, &mut cmd, bin_name.clone(), writer);
-            // Wrap clap's _zeroclaw to inject dynamic props path completion
+            // Wrap clap's _zeroclaw to inject dynamic config path completion
             writeln!(
                 writer,
                 r#"
-# Dynamic completion for zeroclaw props get/set paths
+# Dynamic completion for zeroclaw config get/set paths
 if type _zeroclaw &>/dev/null; then
     _zeroclaw_clap_orig() {{ _zeroclaw "$@"; }}
     _zeroclaw() {{
         local cur="${{COMP_WORDS[COMP_CWORD]}}"
-        if [[ "${{COMP_WORDS[*]}}" =~ "props "(get|set)" " ]]; then
-            COMPREPLY=($(compgen -W "$(zeroclaw props complete "$cur" 2>/dev/null)" -- "$cur"))
+        if [[ "${{COMP_WORDS[*]}}" =~ "config "(get|set)" " ]]; then
+            COMPREPLY=($(compgen -W "$(zeroclaw config complete "$cur" 2>/dev/null)" -- "$cur"))
             return
         fi
         _zeroclaw_clap_orig "$@"
@@ -2469,24 +2563,24 @@ fi"#
             writeln!(
                 writer,
                 r#"
-# Dynamic completion for zeroclaw props get/set paths
-complete -c zeroclaw -n '__fish_seen_subcommand_from props; and __fish_seen_subcommand_from get set' \
-    -a '(zeroclaw props complete (commandline -ct) 2>/dev/null)' -f"#
+# Dynamic completion for zeroclaw config get/set paths
+complete -c zeroclaw -n '__fish_seen_subcommand_from config; and __fish_seen_subcommand_from get set' \
+    -a '(zeroclaw config complete (commandline -ct) 2>/dev/null)' -f"#
             )?;
         }
         CompletionShell::Zsh => {
             generate(shells::Zsh, &mut cmd, bin_name.clone(), writer);
-            // Wrap clap's _zeroclaw to inject dynamic props path completion
+            // Wrap clap's _zeroclaw to inject dynamic config path completion
             writeln!(
                 writer,
                 r#"
-# Dynamic completion for zeroclaw props get/set paths
+# Dynamic completion for zeroclaw config get/set paths
 if (( $+functions[_zeroclaw] )); then
     functions[_zeroclaw_clap_orig]=$functions[_zeroclaw]
     _zeroclaw() {{
-        if [[ "${{words[*]}}" == *"props "(get|set)* ]] && (( CURRENT > 3 )); then
+        if [[ "${{words[*]}}" == *"config "(get|set)* ]] && (( CURRENT > 3 )); then
             local -a props
-            props=(${{(f)"$(zeroclaw props complete "$words[CURRENT]" 2>/dev/null)"}})
+            props=(${{(f)"$(zeroclaw config complete "$words[CURRENT]" 2>/dev/null)"}})
             compadd -a props
             return
         fi
@@ -3539,12 +3633,18 @@ mod tests {
     fn agent_fallback_uses_config_default_temperature() {
         // Test that when user doesn't provide --temperature,
         // the fallback logic works correctly
-        let mut config = Config::default(); // default_temperature = 0.7
-        config.default_temperature = 1.5;
+        let mut config = Config::default();
+        config.ensure_fallback_provider().temperature = Some(1.5);
 
         // Simulate None temperature (user didn't provide --temperature)
         let user_temperature: Option<f64> = std::hint::black_box(None);
-        let final_temperature = user_temperature.unwrap_or(config.default_temperature);
+        let final_temperature = user_temperature.unwrap_or_else(|| {
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.temperature)
+                .unwrap_or(0.7)
+        });
 
         assert!((final_temperature - 1.5).abs() < f64::EPSILON);
     }
@@ -3553,11 +3653,17 @@ mod tests {
     #[cfg(feature = "agent-runtime")]
     fn agent_fallback_uses_hardcoded_when_config_uses_default() {
         // Test that when config uses default value (0.7), fallback still works
-        let config = Config::default(); // default_temperature = 0.7
+        let config = Config::default();
 
         // Simulate None temperature (user didn't provide --temperature)
         let user_temperature: Option<f64> = std::hint::black_box(None);
-        let final_temperature = user_temperature.unwrap_or(config.default_temperature);
+        let final_temperature = user_temperature.unwrap_or_else(|| {
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.temperature)
+                .unwrap_or(0.7)
+        });
 
         assert!((final_temperature - 0.7).abs() < f64::EPSILON);
     }

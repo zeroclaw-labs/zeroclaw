@@ -331,6 +331,9 @@ fn default_imap_folder() -> String {
 fn default_idle_timeout() -> u64 {
     1740
 }
+fn default_poll_interval_secs() -> u64 {
+    60
+}
 fn default_true() -> bool {
     true
 }
@@ -345,6 +348,8 @@ fn default_max_attachment_bytes() -> usize {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.email"]
 pub struct EmailConfig {
+    #[serde(default)]
+    pub enabled: bool,
     pub imap_host: String,
     #[serde(default = "default_imap_port")]
     pub imap_port: u16,
@@ -359,8 +364,12 @@ pub struct EmailConfig {
     #[secret]
     pub password: String,
     pub from_address: String,
-    #[serde(default = "default_idle_timeout", alias = "poll_interval_secs")]
+    #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
+    /// Polling interval used when the IMAP server does not advertise the IDLE
+    /// capability (RFC 2177). Ignored when IDLE is available.
+    #[serde(default = "default_poll_interval_secs")]
+    pub poll_interval_secs: u64,
     #[serde(default)]
     pub allowed_senders: Vec<String>,
     #[serde(default = "default_subject")]
@@ -381,6 +390,7 @@ impl ChannelConfig for EmailConfig {
 impl Default for EmailConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             imap_host: String::new(),
             imap_port: default_imap_port(),
             imap_folder: default_imap_folder(),
@@ -391,6 +401,7 @@ impl Default for EmailConfig {
             password: String::new(),
             from_address: String::new(),
             idle_timeout_secs: default_idle_timeout(),
+            poll_interval_secs: default_poll_interval_secs(),
             allowed_senders: Vec::new(),
             default_subject: default_subject(),
             max_attachment_bytes: default_max_attachment_bytes(),
@@ -508,6 +519,8 @@ fn default_max_call_duration() -> u64 {
 #[prefix = "channels.voice-call"]
 pub struct VoiceCallConfig {
     #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
     pub provider: VoiceProvider,
     pub account_id: String,
     pub auth_token: String,
@@ -529,6 +542,7 @@ pub struct VoiceCallConfig {
 impl Default for VoiceCallConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             provider: VoiceProvider::default(),
             account_id: String::new(),
             auth_token: String::new(),
