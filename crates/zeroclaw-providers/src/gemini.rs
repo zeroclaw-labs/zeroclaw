@@ -447,10 +447,10 @@ fn build_oauth_refresh_form(
     // caller's stored credentials are missing.
     let effective_client_id = client_id
         .and_then(GeminiProvider::normalize_non_empty)
-        .unwrap_or_else(|| gemini_cli_default_client_id());
+        .unwrap_or_else(gemini_cli_default_client_id);
     let effective_client_secret = client_secret
         .and_then(GeminiProvider::normalize_non_empty)
-        .unwrap_or_else(|| gemini_cli_default_client_secret());
+        .unwrap_or_else(gemini_cli_default_client_secret);
 
     vec![
         ("grant_type", "refresh_token".to_string()),
