@@ -40,7 +40,9 @@ const TELEGRAM_BIND_COMMAND: &str = "/bind";
 const TELEGRAM_MAX_BOT_COMMANDS: usize = 100;
 /// Telegram command names: 1-32 lowercase a-z, 0-9, and underscore.
 const TELEGRAM_COMMAND_NAME_MAX_LEN: usize = 32;
-/// Telegram command descriptions are at most 256 characters, but we keep much lower to avoid `BOT_COMMANDS_TOO_MUCH` error
+/// Telegram command descriptions nominally allow up to 256 characters per the API docs,
+/// but empirical testing shows the API returns errors for descriptions substantially
+/// longer than 100 characters. This conservative cap avoids that in practice.
 const TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN: usize = 100;
 
 /// Sanitize a skill name into a valid Telegram command name.
@@ -67,10 +69,12 @@ fn sanitize_telegram_command_name(raw: &str) -> String {
     }
 }
 
-/// Truncate a description to Telegram's 256-character limit.
+/// Truncate a description to the conservative `TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN` cap.
+/// The API nominally supports 256 characters, but empirical testing shows errors occur
+/// for descriptions substantially longer than 100 characters.
 fn truncate_telegram_command_description(raw: &str) -> String {
     let trimmed = raw.trim();
-    if trimmed.len() <= TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN {
+    if trimmed.chars().count() <= TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN {
         return trimmed.to_string();
     }
     let mut truncated: String = trimmed
@@ -5557,6 +5561,20 @@ mod tests {
         assert!(result.ends_with('…'));
     }
 
+    #[test]
+    fn truncate_telegram_command_description_multibyte_within_char_limit() {
+        // 31 chars but >100 bytes in UTF-8 — must be returned unchanged without trailing '…'
+        let desc = "Show current weather 🌤️🌧️⛈️🌨️🌩️🌪️🌊💨🌡️🌬️";
+        assert!(desc.chars().count() <= TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN);
+        assert!(desc.len() > TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN);
+        let result = truncate_telegram_command_description(desc);
+        assert!(
+            !result.ends_with('…'),
+            "should not append ellipsis when within char limit"
+        );
+        assert_eq!(result, desc.trim());
+    }
+
     #[tokio::test]
     async fn register_bot_commands_includes_skills() {
         use wiremock::matchers::{body_json, method, path_regex};
@@ -5604,31 +5622,39 @@ mod tests {
 
     #[tokio::test]
     async fn register_bot_commands_includes_tools_from_config() {
-        use wiremock::matchers::{method, path_regex};
-        use wiremock::{Mock, MockServer};
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
 
+        let expected_body = serde_json::json!({
+            "commands": [
+                { "command": "new",       "description": "Start a new conversation session" },
+                { "command": "stop",      "description": "Cancel the current in-flight task" },
+                { "command": "model",     "description": "Show or switch the current model" },
+                { "command": "models",    "description": "List available providers or switch provider" },
+                { "command": "config",    "description": "Show current configuration" },
+                { "command": "test_tool", "description": "A test tool" },
+            ]
+        });
+
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .and(body_json(&expected_body))
             .respond_with(
-                wiremock::ResponseTemplate::new(200)
+                ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({ "ok": true, "result": true })),
             )
             .expect(1)
             .mount(&mock_server)
             .await;
 
-        // Pass a sample tool spec to verify it gets registered
         let specs = vec![("test_tool".to_string(), "A test tool".to_string())];
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false)
             .with_api_base(mock_server.uri())
             .with_tool_command_specs(specs);
 
         ch.register_bot_commands().await;
-
-        // Just verify the mock was called — tool count depends on default config.
-        // The 5 runtime commands + N tool commands should all be registered.
     }
 
     // ── Approval inline keyboard tests ────────────────────────
