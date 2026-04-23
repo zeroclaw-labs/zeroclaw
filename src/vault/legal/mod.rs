@@ -23,6 +23,7 @@ pub mod citation_patterns;
 pub mod cli;
 pub mod graph_query;
 pub mod ingest;
+pub mod law_aliases;
 pub mod slug;
 pub mod statute_extractor;
 

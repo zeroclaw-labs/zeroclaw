@@ -47,19 +47,33 @@ pub fn parse_article(s: &str) -> Option<(u32, Option<u32>)> {
     Some((num, sub))
 }
 
-/// Common human-readable alias forms for a statute article, for `vault_aliases`.
-/// Keep conservative — aliases are UNIQUE globally so collisions matter.
+/// Common human-readable alias forms for a statute article, for
+/// `vault_aliases`. Keep conservative — aliases are UNIQUE globally so
+/// collisions matter.
+///
+/// For every known short form of the law (from
+/// `super::law_aliases::short_forms`), we also emit the shortened
+/// citations (e.g. `근기법 제36조`, `근기법제36조`). This lets
+/// `legal_graph_find` resolve abbreviations like "근기법 43조의2" to the
+/// same article as "근로기준법 제43조의2".
 pub fn statute_aliases(law_name: &str, num: u32, sub: Option<u32>) -> Vec<String> {
-    let mut out = Vec::new();
     let law = law_name.trim();
-    match sub {
-        Some(s) if s > 0 => {
-            out.push(format!("{law} 제{num}조의{s}"));
-            out.push(format!("{law}제{num}조의{s}"));
-        }
-        _ => {
-            out.push(format!("{law} 제{num}조"));
-            out.push(format!("{law}제{num}조"));
+    let mut names: Vec<String> = vec![law.to_string()];
+    for s in super::law_aliases::short_forms(law) {
+        names.push(s.to_string());
+    }
+
+    let mut out = Vec::with_capacity(names.len() * 2);
+    for name in names {
+        match sub {
+            Some(s) if s > 0 => {
+                out.push(format!("{name} 제{num}조의{s}"));
+                out.push(format!("{name}제{num}조의{s}"));
+            }
+            _ => {
+                out.push(format!("{name} 제{num}조"));
+                out.push(format!("{name}제{num}조"));
+            }
         }
     }
     out
@@ -96,5 +110,22 @@ mod tests {
         let a = statute_aliases("근로기준법", 43, Some(2));
         assert!(a.contains(&"근로기준법 제43조의2".to_string()));
         assert!(a.contains(&"근로기준법제43조의2".to_string()));
+    }
+
+    #[test]
+    fn aliases_include_short_law_forms_when_known() {
+        let a = statute_aliases("근로기준법", 43, Some(2));
+        // `근기법` is the commonly used abbreviation.
+        assert!(
+            a.contains(&"근기법 제43조의2".to_string()),
+            "expected 근기법 short form, got: {a:?}"
+        );
+        assert!(a.contains(&"근기법제43조의2".to_string()));
+    }
+
+    #[test]
+    fn aliases_for_unknown_law_only_include_official_name() {
+        let a = statute_aliases("존재하지않는법", 1, None);
+        assert_eq!(a, vec!["존재하지않는법 제1조", "존재하지않는법제1조"]);
     }
 }

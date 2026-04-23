@@ -49,14 +49,25 @@ fn bracketed_law_re() -> &'static Regex {
 
 /// Matches a bare law name followed by `제N조`. Used after a bracketed-law
 /// pass to catch unbracketed references like `근로기준법 제36조`.
-/// The law-name side is conservative: Korean + space, 1-20 chars, ending in
-/// `법` or `령` or `규칙` or `조례` or `보장법` etc. — we just match any run
-/// of Korean that ends in `법`/`령`/`률` before `제N조`.
+///
+/// The law-name side accepts:
+///   - a run of Korean characters ending in `법`/`령`/`률`/`규칙`/`조례`
+///     (official names — `근로기준법`, `행정절차법`, `국토계획법`, …), OR
+///   - a single-character short form in `['민','형','상']` followed by
+///     whitespace + `제N조` (covers the bare-character conventions
+///     `민 제750조` / `형 제250조`), OR
+///   - a registered short form anywhere in `law_aliases::LAW_ALIAS_TABLE`
+///     (e.g. `근기법`, `민소법`, `民法`, `刑法`) — these are checked
+///     post-match via `canonical_name` so a short form resolves to the
+///     same canonical law as its long form.
 fn unbracketed_law_article_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         Regex::new(
-            r"([가-힣][가-힣\s]{1,18}?(?:법|령|률|규칙|조례))\s*제\s*(\d+)\s*조(?:의\s*(\d+))?(?:\s*제\s*(\d+)\s*항)?(?:\s*제\s*(\d+)\s*호)?"
+            // 1st alternative: official long-form names ending in 법|령|률|규칙|조례
+            // 2nd alternative: hanja forms (民法, 刑法) and Korean abbreviations ending in 법
+            //                  — capped at 8 chars to avoid over-matching arbitrary text.
+            r"((?:[가-힣][가-힣\s]{1,18}?(?:법|령|률|규칙|조례))|(?:[가-힣\p{Han}]{1,6}법))\s*제\s*(\d+)\s*조(?:의\s*(\d+))?(?:\s*제\s*(\d+)\s*항)?(?:\s*제\s*(\d+)\s*호)?"
         ).unwrap()
     })
 }
@@ -120,12 +131,16 @@ pub fn extract_statute_citations(text: &str, initial_law: Option<&str>) -> Vec<S
     let mut anchors: Vec<(usize, String)> = Vec::new();
     for m in bracketed_law_re().captures_iter(text) {
         let whole = m.get(0).unwrap();
-        let law = m.get(1).unwrap().as_str().trim().to_string();
+        let raw = m.get(1).unwrap().as_str().trim();
+        // Canonicalise so `「근기법」 제43조` and `「근로기준법」 제43조`
+        // produce the same citation (and thus the same slug).
+        let law = super::law_aliases::canonical_name(raw);
         anchors.push((whole.end(), law));
     }
     for m in unbracketed_law_article_re().captures_iter(text) {
         let whole = m.get(0).unwrap();
-        let law = m.get(1).unwrap().as_str().trim().to_string();
+        let raw = m.get(1).unwrap().as_str().trim();
+        let law = super::law_aliases::canonical_name(raw);
         // Anchor is set at the START of the match so the article inside
         // the match itself uses this law.
         anchors.push((whole.start(), law));
@@ -293,5 +308,49 @@ mod tests {
         let t = "제43조에 따른 기준";
         let r = extract_statute_citations(t, None);
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn short_form_citations_canonicalise_to_official_law() {
+        // `근기법 제36조` should resolve to 근로기준법.
+        let t = "근기법 제36조, 제109조";
+        let r = extract_statute_citations(t, None);
+        assert_eq!(r.len(), 2);
+        assert!(r.iter().all(|c| c.law_name == "근로기준법"));
+    }
+
+    #[test]
+    fn mixed_short_and_long_forms_in_one_block() {
+        // A refjo-like block mixing 근기법 + 근퇴법 + 형소법.
+        let t = "근기법 제36조, 근퇴법 제9조 제1항, 형소법 제327조";
+        let r = extract_statute_citations(t, None);
+        let pairs: Vec<(&str, u32)> = r
+            .iter()
+            .map(|c| (c.law_name.as_str(), c.article))
+            .collect();
+        assert!(pairs.contains(&("근로기준법", 36)));
+        assert!(pairs.contains(&("근로자퇴직급여 보장법", 9)));
+        assert!(pairs.contains(&("형사소송법", 327)));
+    }
+
+    #[test]
+    fn bracketed_short_form_also_canonicalises() {
+        let t = "「근기법」 제43조의2";
+        let r = extract_statute_citations(t, None);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].law_name, "근로기준법");
+        assert_eq!(r[0].article, 43);
+        assert_eq!(r[0].article_sub, Some(2));
+    }
+
+    #[test]
+    fn unknown_law_name_passes_through_unchanged() {
+        // An unrecognised name shouldn't be aliased away — we preserve
+        // whatever the user wrote so we don't silently re-anchor to a
+        // different law.
+        let t = "지어낸법 제5조";
+        let r = extract_statute_citations(t, None);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].law_name, "지어낸법");
     }
 }
