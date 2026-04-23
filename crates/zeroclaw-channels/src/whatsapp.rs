@@ -1,12 +1,30 @@
 use async_trait::async_trait;
 use regex::Regex;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
+
+/// Module-level `pending_approvals` map shared across every
+/// `Arc<WhatsAppChannel>` regardless of who constructs it.
+///
+/// WhatsApp uses webhooks, so `request_approval()` (called by the runtime's
+/// channel pool) and the reply intercept (in the gateway's
+/// `handle_whatsapp_message`) can run on *different* `Arc<WhatsAppChannel>`
+/// instances — the orchestrator constructs one, the gateway constructs
+/// another. An instance-local pending-approvals map would leave one side
+/// registering tokens the other side can never find, silently timing out
+/// every approval request.
+///
+/// Hoisting the map to a process-wide static sidesteps the Arc-sharing
+/// problem entirely: whoever calls `request_approval()` inserts; whoever
+/// receives the webhook reply looks up; both hit the same `HashMap`.
+type PendingApprovalsMap = Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>;
+static PENDING_APPROVALS: LazyLock<Arc<PendingApprovalsMap>> =
+    LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 /// `WhatsApp` channel — uses `WhatsApp` Business Cloud API
 ///
@@ -39,7 +57,6 @@ pub struct WhatsAppChannel {
     dm_mention_patterns: Vec<Regex>,
     /// Compiled mention patterns for group-chat mention gating.
     group_mention_patterns: Vec<Regex>,
-    pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
     approval_timeout_secs: u64,
 }
 
@@ -58,7 +75,6 @@ impl WhatsAppChannel {
             proxy_url: None,
             dm_mention_patterns: Vec::new(),
             group_mention_patterns: Vec::new(),
-            pending_approvals: Arc::new(Mutex::new(HashMap::new())),
             approval_timeout_secs: 300,
         }
     }
@@ -68,10 +84,11 @@ impl WhatsAppChannel {
         self
     }
 
-    pub fn pending_approvals(
-        &self,
-    ) -> &Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>> {
-        &self.pending_approvals
+    /// Access the process-wide pending-approvals map shared across every
+    /// `WhatsAppChannel` instance. See [`PENDING_APPROVALS`] for why this
+    /// must be a static rather than per-instance.
+    pub fn pending_approvals(&self) -> &Arc<PendingApprovalsMap> {
+        &PENDING_APPROVALS
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
@@ -369,7 +386,7 @@ impl Channel for WhatsAppChannel {
         let token = crate::util::new_approval_token();
         let (tx_approval, rx_approval) = oneshot::channel();
         {
-            let mut map = self.pending_approvals.lock().await;
+            let mut map = PENDING_APPROVALS.lock().await;
             map.insert(token.clone(), tx_approval);
         }
 
@@ -383,7 +400,7 @@ impl Channel for WhatsAppChannel {
         let response = match tokio::time::timeout(timeout, rx_approval).await {
             Ok(Ok(response)) => response,
             _ => {
-                let mut map = self.pending_approvals.lock().await;
+                let mut map = PENDING_APPROVALS.lock().await;
                 map.remove(&token);
                 ChannelApprovalResponse::Deny
             }
@@ -1871,17 +1888,39 @@ mod tests {
     }
 
     #[test]
-    fn pending_approvals_map_is_initially_empty() {
-        let ch = make_channel();
-        let map = ch.pending_approvals.blocking_lock();
-        assert!(map.is_empty());
-    }
-
-    #[test]
     fn approval_timeout_defaults_to_300_and_is_overridable() {
         let ch = make_channel();
         assert_eq!(ch.approval_timeout_secs, 300);
         let ch2 = ch.with_approval_timeout_secs(60);
         assert_eq!(ch2.approval_timeout_secs, 60);
+    }
+
+    #[tokio::test]
+    async fn pending_approvals_are_shared_across_instances() {
+        // Two independent WhatsAppChannel instances — the orchestrator's and
+        // the gateway's — must see the same pending-approvals map so that a
+        // reply intercepted on one instance resolves a token registered on
+        // the other. Without the module-level static this test would fail.
+        let orchestrator_ch = make_channel();
+        let gateway_ch = make_channel();
+
+        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        {
+            let mut map = orchestrator_ch.pending_approvals().lock().await;
+            map.insert("test_share_tok".to_string(), tx);
+        }
+        {
+            let map = gateway_ch.pending_approvals().lock().await;
+            assert!(
+                map.contains_key("test_share_tok"),
+                "gateway instance must see orchestrator's registration"
+            );
+        }
+        // Cleanup so later tests aren't polluted by this entry.
+        gateway_ch
+            .pending_approvals()
+            .lock()
+            .await
+            .remove("test_share_tok");
     }
 }
