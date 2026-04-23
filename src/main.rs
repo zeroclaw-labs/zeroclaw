@@ -36,7 +36,7 @@
 )]
 
 use anyhow::{Context, Result, bail};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use dialoguer::{Password, Select};
 use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write};
@@ -939,6 +939,35 @@ enum MemoryCommands {
     },
 }
 
+fn apply_i18n_to_command(cmd: clap::Command) -> clap::Command {
+    #[cfg(feature = "agent-runtime")]
+    {
+        apply_cmd_translations(cmd, "cli")
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    cmd
+}
+
+#[cfg(feature = "agent-runtime")]
+fn apply_cmd_translations(cmd: clap::Command, prefix: &str) -> clap::Command {
+    let sub_names: Vec<String> = cmd.get_subcommands()
+        .map(|s| s.get_name().to_string())
+        .collect();
+
+    let about_key = format!("{prefix}-about");
+    let cmd = match crate::i18n::get_cli_string(&about_key) {
+        Some(about) => cmd.about(about),
+        None => cmd,
+    };
+
+    let mut cmd = cmd;
+    for name in &sub_names {
+        let child_prefix = format!("{prefix}-{name}");
+        cmd = cmd.mut_subcommand(name, |sub| apply_cmd_translations(sub, &child_prefix));
+    }
+    cmd
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
@@ -954,7 +983,12 @@ async fn main() -> Result<()> {
         return print_no_command_help();
     }
 
-    let cli = Cli::parse();
+    #[cfg(feature = "agent-runtime")]
+    crate::i18n::init(&crate::i18n::detect_locale());
+
+    let cli = Cli::from_arg_matches(
+        &apply_i18n_to_command(Cli::command()).get_matches()
+    ).map_err(|e| e.exit())?;
 
     if let Some(config_dir) = &cli.config_dir {
         if config_dir.trim().is_empty() {

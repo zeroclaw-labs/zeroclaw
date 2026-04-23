@@ -8,10 +8,12 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 static DESCRIPTIONS: OnceLock<HashMap<String, String>> = OnceLock::new();
+static CLI_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 
 /// Initialize with a specific locale. No-op after first call.
 pub fn init(locale: &str) {
     DESCRIPTIONS.get_or_init(|| load_descriptions(locale));
+    CLI_STRINGS.get_or_init(|| load_cli_strings(locale));
 }
 
 /// Get a tool description by tool name (e.g. "shell", "file_read").
@@ -21,10 +23,26 @@ pub fn get_tool_description(tool_name: &str) -> Option<&'static str> {
     map.get(&key).map(String::as_str)
 }
 
+/// Get a CLI string by key (e.g. "cli-config-about").
+pub fn get_cli_string(key: &str) -> Option<String> {
+    let map = CLI_STRINGS.get_or_init(|| load_cli_strings(&detect_locale()));
+    map.get(key).cloned()
+}
+
 fn load_descriptions(locale: &str) -> HashMap<String, String> {
     let mut map = format_ftl_messages(include_str!("../locales/en/tools.ftl"), "en");
     if locale != "en"
         && let Some(locale_ftl) = load_ftl_from_disk(locale, "tools.ftl")
+    {
+        map.extend(format_ftl_messages(&locale_ftl, locale));
+    }
+    map
+}
+
+fn load_cli_strings(locale: &str) -> HashMap<String, String> {
+    let mut map = format_ftl_messages(include_str!("../locales/en/cli.ftl"), "en");
+    if locale != "en"
+        && let Some(locale_ftl) = load_ftl_from_disk(locale, "cli.ftl")
     {
         map.extend(format_ftl_messages(&locale_ftl, locale));
     }
@@ -75,11 +93,17 @@ pub fn detect_locale() -> String {
 }
 
 fn read_config_table() -> Option<toml::Table> {
-    let config_path = directories::BaseDirs::new()?
-        .config_dir()
-        .join("zeroclaw/config.toml");
-    let contents = std::fs::read_to_string(config_path).ok()?;
-    contents.parse().ok()
+    let base = directories::BaseDirs::new()?;
+    let candidates = [
+        base.home_dir().join(".zeroclaw/config.toml"),
+        base.config_dir().join("zeroclaw/config.toml"),
+    ];
+    for path in &candidates {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            return contents.parse().ok();
+        }
+    }
+    None
 }
 
 fn locale_from_config() -> Option<String> {
