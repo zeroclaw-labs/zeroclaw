@@ -5,35 +5,21 @@ The docs site you're reading is published from `docs/book/`. You can build the s
 ## One-command quickstart
 
 ```bash
-just docs              # serve English at http://localhost:3000 with auto-reload
-just docs ja           # same, but in Japanese
-just docs-build        # static build of every locale into docs/book/book/
-just docs-refs         # regenerate the auto-generated reference pages
-just docs-sync         # after editing English source: re-extract + AI-fill delta
-just docs-sync-locale ja            # sync one locale only
-just docs-translate-force           # force-retranslate everything (quality pass)
-just docs-translate-force-locale ja # force-retranslate one locale
-just docs-translate-stats           # show translated/fuzzy/untranslated per locale
-just docs-translate-check           # validate .po format (run before a translation PR)
-```
-
-These wrap `scripts/docs.sh` and `scripts/sync-translations.sh`, which you can also call directly:
-
-```bash
-./scripts/docs.sh                  # serve English
-./scripts/docs.sh --locale ja      # serve Japanese
-./scripts/docs.sh build            # static build of all locales
-./scripts/docs.sh refs             # regenerate cli.md, config.md, and rustdoc API
-
-./scripts/sync-translations.sh                  # sync all locales
-./scripts/sync-translations.sh --locale ja      # sync one locale
-./scripts/sync-translations.sh --force          # re-translate everything
-./scripts/sync-translations.sh --locale ja --force
+cargo mdbook serve                       # serve all locales at http://localhost:3000/en/
+cargo mdbook serve --locale ja           # live-reload against Japanese source
+cargo mdbook build                       # static build of every locale into docs/book/book/
+cargo mdbook refs                        # regenerate the auto-generated reference pages
+cargo mdbook sync                        # after editing English source: re-extract + AI-fill delta
+cargo mdbook sync --locale ja            # sync one locale only
+cargo mdbook sync --force                # force-retranslate everything (quality pass)
+cargo mdbook sync --locale ja --force    # force-retranslate one locale
+cargo mdbook stats                       # show translated/fuzzy/untranslated per locale
+cargo mdbook check                       # validate .po format (run before a translation PR)
 ```
 
 ## Required tools
 
-The script will fail fast and tell you what's missing, but for reference:
+`cargo mdbook` will fail fast and tell you what's missing, but for reference:
 
 | Tool | Install |
 |---|---|
@@ -57,18 +43,18 @@ The two `reference/*.md` files are generated from the actual `clap` derives and 
 
 English markdown is the only source maintained by humans. Translations are stored in `docs/book/po/<locale>.po` files, which act as a cache — not as copies of the docs.
 
-When English source changes, `just docs-sync` runs two stages:
+When English source changes, `cargo mdbook sync` runs two stages:
 
 1. **Extract**: `mdbook-xgettext` regenerates `po/messages.pot` from the current English source
 2. **Merge**: `msgmerge` updates each locale's `.po` file — new strings get an empty `msgstr ""`; changed strings get marked `#, fuzzy` with the old translation preserved as a starting point
 
-Then the script counts fuzzy + untranslated entries. If there's a delta and `ANTHROPIC_API_KEY` is set, the `fill-translations` Rust binary (built from `tools/fill-translations/`) translates only those entries via Claude. **Unchanged strings cost nothing** — the `.po` file cache means re-running against unchanged source is a no-op.
+Then the command counts fuzzy + untranslated entries. If there's a delta and `ANTHROPIC_API_TOKEN` is set, the `fill-translations` tool translates only those entries via Claude. **Unchanged strings cost nothing** — the `.po` file cache means re-running against unchanged source is a no-op.
 
-Without `ANTHROPIC_API_KEY`, `docs-sync` still runs extract + merge and reports how many entries need translation. Strings without a `msgstr` fall back to English at render time — partial translations are valid.
+Without `ANTHROPIC_API_TOKEN`, `cargo mdbook sync` still runs extract + merge and reports how many entries need translation. Strings without a `msgstr` fall back to English at render time — partial translations are valid.
 
 ## Adding a new locale
 
-1. Run `just docs-sync` to ensure `docs/book/po/messages.pot` is current.
+1. Run `cargo mdbook sync` to ensure `docs/book/po/messages.pot` is current.
 
 2. Bootstrap the new locale's `.po` file:
    ```bash
@@ -77,19 +63,19 @@ Without `ANTHROPIC_API_KEY`, `docs-sync` still runs extract + merge and reports 
      --output=docs/book/po/xx.po
    ```
 
-3. Set `ANTHROPIC_API_KEY` and run `just docs-sync` to fill all entries for the new locale.
+3. Set `ANTHROPIC_API_TOKEN` and run `cargo mdbook sync --locale xx` to fill all entries for the new locale.
 
 4. Update LOCALES in all four places — they must stay in sync:
-   - `scripts/docs.sh` — bash array `LOCALES=(en ja xx)`
-   - `scripts/sync-translations.sh` — default `LOCALES="${LOCALES:-en ja xx}"`
+   - `xtask/src/util.rs` — `locales()` slice
    - `docs/book/theme/lang-switcher.js` — add `{ code: "xx", label: "Language Name" }`
    - `.github/workflows/docs-deploy.yml` — `LOCALES: en ja xx`
+   - `crates/zeroclaw-runtime/locales/` — create the locale directory and run `cargo fluent fill --locale xx`
 
 5. Validate and preview:
    ```bash
-   just docs-translate-check   # exits non-zero on format errors
-   just docs-translate-stats   # show coverage counts
-   just docs ja                # replace ja with your locale
+   cargo mdbook check              # exits non-zero on format errors
+   cargo mdbook stats              # show coverage counts
+   cargo mdbook serve --locale xx
    ```
 
 ## Release translation workflow
@@ -100,21 +86,19 @@ You can do this locally or via the GitHub Actions manual trigger.
 ### Local (recommended)
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+export ANTHROPIC_API_TOKEN=sk-ant-...
 
 # Fast/cheap delta pass (only new or changed strings since last release)
-just docs-sync
+cargo mdbook sync
 
 # OR: quality pass — re-translate everything with a stronger model
-FILL_MODEL=claude-opus-4-7 just docs-translate-force
+FILL_MODEL=claude-opus-4-7 cargo mdbook sync --force
 
-just docs-translate-check   # validate before committing
-just docs-translate-stats   # review coverage
+cargo mdbook check   # validate before committing
+cargo mdbook stats   # review coverage
 ```
 
-The `FILL_MODEL` environment variable overrides the default model (`claude-haiku-4-5-20251001`)
-without any flag changes. `claude-sonnet-4-6` is a good middle-ground for
-release quality at reasonable cost.
+The `FILL_MODEL` environment variable overrides the default model (`claude-haiku-4-5-20251001`). `claude-sonnet-4-6` is a good middle-ground for release quality at reasonable cost.
 
 ### Via GitHub Actions (`.github/workflows/docs-translate.yml`)
 
@@ -131,7 +115,7 @@ Requires the `ANTHROPIC_API_KEY` repository secret.
 
 ## Tips
 
-- **Fast iteration on prose:** use `just docs` (mdbook's serve mode auto-rebuilds on save). Skip `docs-refs` unless you've changed CLI flags or config schema.
+- **Fast iteration on prose:** `cargo mdbook serve` auto-rebuilds on save. Skip `cargo mdbook refs` unless you've changed CLI flags or config schema.
 - **Fast iteration on translations:** edit `po/<locale>.po` and reload the browser — mdbook serve detects `.po` changes and rebuilds automatically.
 - **Cleaning up:** `rm -rf docs/book/book target/doc` removes everything generated.
-- **Zero-cost re-runs:** `just docs-sync` against unchanged English source completes in seconds — no AI calls, no cost.
+- **Zero-cost re-runs:** `cargo mdbook sync` against unchanged English source completes in seconds — no AI calls, no cost.
