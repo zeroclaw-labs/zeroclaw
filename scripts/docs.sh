@@ -101,17 +101,47 @@ cmd_refs() {
 
 cmd_serve() {
     local locale="$1"
+    local port=3000
     check_tools_serve
+
     if [[ ! -f "$REF_DIR/cli.md" ]] || [[ ! -f "$REF_DIR/config.md" ]]; then
         build_refs
     fi
-    if [[ ! -d "$BOOK_DIR/book/api" ]]; then
+    if [[ ! -d "$REPO_ROOT/target/doc" ]]; then
         build_api
-        mkdir -p "$BOOK_DIR/book"
-        cp -r "$REPO_ROOT/target/doc" "$BOOK_DIR/book/api"
     fi
-    echo "==> Serving locale '$locale' at http://localhost:3000"
-    (cd "$BOOK_DIR" && MDBOOK_BOOK__LANGUAGE="$locale" mdbook serve --open)
+
+    local out_dir="$BOOK_DIR/book"
+
+    # Initial build into output dir.
+    (cd "$BOOK_DIR" && MDBOOK_BOOK__LANGUAGE="$locale" mdbook build -d "book")
+    cp -r "$REPO_ROOT/target/doc" "$out_dir/api"
+
+    # Watch for source changes and rebuild (no built-in HTTP server).
+    (cd "$BOOK_DIR" && MDBOOK_BOOK__LANGUAGE="$locale" mdbook watch -d "book" >/dev/null 2>&1) &
+    local watch_pid=$!
+
+    # Re-copy api whenever mdbook's clean-on-rebuild removes it.
+    (
+        while kill -0 "$watch_pid" 2>/dev/null; do
+            sleep 1
+            if [[ -d "$out_dir" && ! -d "$out_dir/api" && -d "$REPO_ROOT/target/doc" ]]; then
+                cp -r "$REPO_ROOT/target/doc" "$out_dir/api"
+            fi
+        done
+    ) &
+    local sync_pid=$!
+
+    echo "==> Serving locale '$locale' at http://localhost:$port"
+    echo "    API reference: http://localhost:$port/api/index.html"
+    echo "    (live-reload active — edit docs/book/src/ to trigger rebuild)"
+
+    { command -v xdg-open &>/dev/null && xdg-open "http://localhost:$port"; } || \
+    { command -v open     &>/dev/null && open     "http://localhost:$port"; } || true
+
+    # shellcheck disable=SC2064
+    trap "kill $watch_pid $sync_pid 2>/dev/null; exit" INT TERM EXIT
+    python3 -m http.server "$port" --directory "$out_dir"
 }
 
 # Argument parsing

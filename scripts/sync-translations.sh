@@ -98,7 +98,7 @@ for locale in $locales_to_sync; do
         # Force mode: translate everything regardless of delta
         if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
             echo "==> $locale: --force: re-translating all entries"
-            python3 "$REPO_ROOT/scripts/fill-translations.py" \
+            cargo run --release -q --manifest-path "$REPO_ROOT/tools/fill-translations/Cargo.toml" -- \
                 --po "$po_file" --locale "$locale" --force
         else
             echo "==> $locale: --force requested but ANTHROPIC_API_KEY not set — skipping AI step"
@@ -108,7 +108,7 @@ for locale in $locales_to_sync; do
         if [[ "$delta" -gt 0 ]]; then
             if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
                 echo "==> $locale: AI-filling $delta entries"
-                python3 "$REPO_ROOT/scripts/fill-translations.py" \
+                cargo run --release -q --manifest-path "$REPO_ROOT/tools/fill-translations/Cargo.toml" -- \
                     --po "$po_file" --locale "$locale"
             else
                 echo "==> $locale: $delta entries need translation (set ANTHROPIC_API_KEY to auto-fill)"

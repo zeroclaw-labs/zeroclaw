@@ -61,8 +61,8 @@ jobs:
       - name: Install gettext tools
         run: sudo apt-get install -y --no-install-recommends gettext
 
-      - name: Install Python deps
-        run: pip install polib anthropic
+      - name: Build fill-translations
+        run: cargo build --release -p fill-translations
 
       - name: Sync + AI-fill translations
         env:

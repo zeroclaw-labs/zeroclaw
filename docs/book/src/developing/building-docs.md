@@ -41,7 +41,6 @@ The script will fail fast and tell you what's missing, but for reference:
 | [`mdbook-i18n-helpers`](https://github.com/google/mdbook-i18n-helpers) | `cargo install mdbook-i18n-helpers --locked` |
 | `cargo` | <https://rustup.rs> |
 | `gettext` (msgfmt, msgmerge, msginit) | `apt install gettext` / `brew install gettext` |
-| `polib` + `anthropic` (Python) | `pip install polib anthropic` (for `docs-sync` AI step) |
 
 ## What gets built where
 
@@ -63,7 +62,7 @@ When English source changes, `just docs-sync` runs two stages:
 1. **Extract**: `mdbook-xgettext` regenerates `po/messages.pot` from the current English source
 2. **Merge**: `msgmerge` updates each locale's `.po` file — new strings get an empty `msgstr ""`; changed strings get marked `#, fuzzy` with the old translation preserved as a starting point
 
-Then the script counts fuzzy + untranslated entries. If there's a delta and `ANTHROPIC_API_KEY` is set, `fill-translations.py` translates only those entries via Claude. **Unchanged strings cost nothing** — the `.po` file cache means re-running against unchanged source is a no-op.
+Then the script counts fuzzy + untranslated entries. If there's a delta and `ANTHROPIC_API_KEY` is set, the `fill-translations` Rust binary (built from `tools/fill-translations/`) translates only those entries via Claude. **Unchanged strings cost nothing** — the `.po` file cache means re-running against unchanged source is a no-op.
 
 Without `ANTHROPIC_API_KEY`, `docs-sync` still runs extract + merge and reports how many entries need translation. Strings without a `msgstr` fall back to English at render time — partial translations are valid.
 
