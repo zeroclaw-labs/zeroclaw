@@ -9,9 +9,14 @@ pub enum TurnEvent {
     Thinking { delta: String },
     /// The agent is invoking a tool.
     ToolCall {
+        id: String,
         name: String,
         args: serde_json::Value,
     },
     /// A tool has returned a result.
-    ToolResult { name: String, output: String },
+    ToolResult {
+        id: String,
+        name: String,
+        output: String,
+    },
 }

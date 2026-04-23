@@ -441,11 +441,11 @@ async fn process_chat_message(
                 TurnEvent::Thinking { delta } => {
                     serde_json::json!({ "type": "thinking", "content": delta })
                 }
-                TurnEvent::ToolCall { name, args } => {
-                    serde_json::json!({ "type": "tool_call", "name": name, "args": args })
+                TurnEvent::ToolCall { id, name, args } => {
+                    serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
                 }
-                TurnEvent::ToolResult { name, output } => {
-                    serde_json::json!({ "type": "tool_result", "name": name, "output": output })
+                TurnEvent::ToolResult { id, name, output } => {
+                    serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
                 }
             };
             let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
