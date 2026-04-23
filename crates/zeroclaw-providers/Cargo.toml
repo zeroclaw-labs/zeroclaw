@@ -25,6 +25,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 ring = "0.17"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+serde_yaml = "0.9"
 sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "fs"] }
@@ -38,3 +39,4 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 hyper = { version = "1", features = ["http1", "server"] }
 tempfile = "3.26"
 scopeguard = "1.2"
+wiremock = "0.6"

@@ -20,6 +20,7 @@ pub mod anthropic;
 pub mod auth;
 pub mod azure_openai;
 pub mod bedrock;
+pub mod catalog;
 pub mod claude_code;
 pub mod compatible;
 pub mod copilot;
@@ -42,6 +43,8 @@ pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ProviderCapabilityError,
     ToolCall, ToolResultMessage,
 };
+
+pub use catalog::{ModelCatalogClient, ModelEntry, TierEntry};
 
 use crate::auth::AuthService;
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
