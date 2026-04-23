@@ -180,7 +180,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                     allowed_tools, source, uses_memory
              FROM cron_jobs
-             WHERE enabled = 1 AND next_run <= ?1
+             WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL
              ORDER BY next_run ASC
              LIMIT ?2",
         )?;
@@ -210,7 +210,7 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                     allowed_tools, source, uses_memory
              FROM cron_jobs
-             WHERE enabled = 1 AND next_run <= ?1
+             WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL
              ORDER BY next_run ASC",
         )?;
 
@@ -224,6 +224,52 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
             }
         }
         Ok(jobs)
+    })
+}
+
+/// Atomically claim a cron job for execution by setting `locked_at`.
+///
+/// Returns `true` if the claim succeeded (the job was not already locked),
+/// `false` if another execution already holds the lock.
+pub fn claim_job(config: &Config, job_id: &str) -> Result<bool> {
+    let now = Utc::now();
+    with_connection(config, |conn| {
+        let changed = conn
+            .execute(
+                "UPDATE cron_jobs SET locked_at = ?1 WHERE id = ?2 AND locked_at IS NULL",
+                params![now.to_rfc3339(), job_id],
+            )
+            .context("Failed to claim cron job")?;
+        Ok(changed > 0)
+    })
+}
+
+/// Release the execution lock on a cron job.
+pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
+    with_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET locked_at = NULL WHERE id = ?1",
+            params![job_id],
+        )
+        .context("Failed to release cron job lock")?;
+        Ok(())
+    })
+}
+
+/// Unlock all jobs. Called once at scheduler startup to clear stale locks
+/// left behind by a previous process crash.
+pub fn unlock_all_jobs(config: &Config) -> Result<()> {
+    with_connection(config, |conn| {
+        let changed = conn
+            .execute(
+                "UPDATE cron_jobs SET locked_at = NULL WHERE locked_at IS NOT NULL",
+                [],
+            )
+            .context("Failed to unlock cron jobs")?;
+        if changed > 0 {
+            tracing::info!(count = changed, "Unlocked stale cron jobs after restart");
+        }
+        Ok(())
     })
 }
 
@@ -944,6 +990,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "allowed_tools", "TEXT")?;
     add_column_if_missing(&conn, "source", "TEXT DEFAULT 'imperative'")?;
     add_column_if_missing(&conn, "uses_memory", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(&conn, "locked_at", "TEXT")?;
 
     f(&conn)
 }
@@ -1704,5 +1751,96 @@ schedule = { kind = "every", every_ms = 300000 }
             parsed.jobs[1].schedule,
             zeroclaw_config::schema::CronScheduleDecl::Every { every_ms: 300_000 }
         ));
+    }
+
+    // ── Job locking tests ──────────────────────────────────────────
+
+    #[test]
+    fn claim_job_prevents_duplicate_claims() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_job(&config, "*/5 * * * *", "echo lock-test").unwrap();
+
+        // First claim should succeed
+        assert!(claim_job(&config, &job.id).unwrap());
+
+        // Second claim should fail (already locked)
+        assert!(!claim_job(&config, &job.id).unwrap());
+    }
+
+    #[test]
+    fn release_job_allows_reclaim() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_job(&config, "*/5 * * * *", "echo lock-test").unwrap();
+
+        assert!(claim_job(&config, &job.id).unwrap());
+        release_job(&config, &job.id).unwrap();
+
+        // After release, claim should succeed again
+        assert!(claim_job(&config, &job.id).unwrap());
+    }
+
+    #[test]
+    fn due_jobs_excludes_locked_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_job(&config, "* * * * *", "echo due").unwrap();
+        let far_future = Utc::now() + ChronoDuration::days(365);
+
+        // Job should be due
+        let due = due_jobs(&config, far_future).unwrap();
+        assert_eq!(due.len(), 1);
+
+        // Lock the job
+        assert!(claim_job(&config, &job.id).unwrap());
+
+        // Locked job should no longer appear as due
+        let due_after_lock = due_jobs(&config, far_future).unwrap();
+        assert!(due_after_lock.is_empty(), "locked job should not be due");
+    }
+
+    #[test]
+    fn all_overdue_jobs_excludes_locked_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_job(&config, "* * * * *", "echo overdue").unwrap();
+        let far_future = Utc::now() + ChronoDuration::days(365);
+
+        let overdue = all_overdue_jobs(&config, far_future).unwrap();
+        assert_eq!(overdue.len(), 1);
+
+        claim_job(&config, &job.id).unwrap();
+
+        let overdue_after_lock = all_overdue_jobs(&config, far_future).unwrap();
+        assert!(
+            overdue_after_lock.is_empty(),
+            "locked job should not be overdue"
+        );
+    }
+
+    #[test]
+    fn unlock_all_jobs_clears_stale_locks() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job1 = add_job(&config, "* * * * *", "echo unlock-1").unwrap();
+        let job2 = add_job(&config, "* * * * *", "echo unlock-2").unwrap();
+
+        claim_job(&config, &job1.id).unwrap();
+        claim_job(&config, &job2.id).unwrap();
+
+        let far_future = Utc::now() + ChronoDuration::days(365);
+        assert!(due_jobs(&config, far_future).unwrap().is_empty());
+
+        unlock_all_jobs(&config).unwrap();
+
+        // After unlock_all_jobs, both jobs should be due again
+        let due = due_jobs(&config, far_future).unwrap();
+        assert_eq!(due.len(), 2);
     }
 }
