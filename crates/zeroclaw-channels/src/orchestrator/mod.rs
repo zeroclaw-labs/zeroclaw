@@ -2,8 +2,9 @@
 //!
 //! This module provides the multi-channel messaging infrastructure that connects
 //! ZeroClaw to external platforms. Each channel implements the [`Channel`] trait
-//! defined in [`traits`], which provides a uniform interface for sending messages,
-//! listening for incoming messages, health checking, and typing indicators.
+//! defined in the `traits` submodule, which provides a uniform interface for
+//! sending messages, listening for incoming messages, health checking, and typing
+//! indicators.
 //!
 //! Channels are instantiated by [`start_channels`] based on the runtime configuration.
 //! The subsystem manages per-sender conversation history, concurrent message processing

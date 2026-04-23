@@ -2997,7 +2997,7 @@ pub struct WebSearchConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub brave_api_key: Option<String>,
-    /// SearXNG instance URL (required if provider is "searxng"), e.g. "https://searx.example.com"
+    /// SearXNG instance URL (required if provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
     /// Maximum results per search (1-10)
@@ -5091,7 +5091,7 @@ impl Default for StorageProviderConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "memory.qdrant"]
 pub struct QdrantConfig {
-    /// Qdrant server URL (e.g. "http://localhost:6333").
+    /// Qdrant server URL (e.g. `"http://localhost:6333"`).
     /// Falls back to `QDRANT_URL` env var if not set.
     #[serde(default)]
     pub url: Option<String>,
@@ -5398,7 +5398,7 @@ pub struct ObservabilityConfig {
     /// "none" | "log" | "verbose" | "prometheus" | "otel"
     pub backend: String,
 
-    /// OTLP endpoint (e.g. "http://localhost:4318"). Only used when backend = "otel".
+    /// OTLP endpoint (e.g. `"http://localhost:4318"`). Only used when backend = `"otel"`.
     #[serde(default)]
     pub otel_endpoint: Option<String>,
 
@@ -7253,7 +7253,7 @@ pub struct SignalConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
     #[serde(default)]
     pub enabled: bool,
-    /// Base URL for the signal-cli HTTP daemon (e.g. "http://127.0.0.1:8686").
+    /// Base URL for the signal-cli HTTP daemon (e.g. `"http://127.0.0.1:8686"`).
     pub http_url: String,
     /// E.164 phone number of the signal-cli account (e.g. "+1234567890").
     pub account: String,
@@ -7495,7 +7495,7 @@ pub struct NextcloudTalkConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
     #[serde(default)]
     pub enabled: bool,
-    /// Nextcloud base URL (e.g. "https://cloud.example.com").
+    /// Nextcloud base URL (e.g. `"https://cloud.example.com"`).
     pub base_url: String,
     /// Bot app token used for OCS API bearer auth.
     #[secret]
@@ -7993,7 +7993,7 @@ pub struct WebAuthnConfig {
     /// Relying Party ID (domain name, e.g. "example.com"). Default: "localhost".
     #[serde(default = "default_webauthn_rp_id")]
     pub rp_id: String,
-    /// Relying Party origin URL (e.g. "https://example.com"). Default: "http://localhost:42617".
+    /// Relying Party origin URL (e.g. `"https://example.com"`). Default: `"http://localhost:42617"`.
     #[serde(default = "default_webauthn_rp_origin")]
     pub rp_origin: String,
     /// Relying Party display name. Default: "ZeroClaw".
@@ -8924,13 +8924,13 @@ pub struct CloudOpsConfig {
     /// Supported cloud providers. Default: [`aws`, `azure`, `gcp`].
     #[serde(default = "default_cloud_ops_supported_clouds")]
     pub supported_clouds: Vec<String>,
-    /// Supported IaC tools for review. Default: [`terraform`].
+    /// Supported IaC tools for review. Default: \[`terraform`\].
     #[serde(default = "default_cloud_ops_iac_tools")]
     pub iac_tools: Vec<String>,
     /// Monthly USD threshold to flag cost items. Default: 100.0.
     #[serde(default = "default_cloud_ops_cost_threshold")]
     pub cost_threshold_monthly_usd: f64,
-    /// Well-Architected Frameworks to check against. Default: [`aws-waf`].
+    /// Well-Architected Frameworks to check against. Default: \[`aws-waf`\].
     #[serde(default = "default_cloud_ops_waf")]
     pub well_architected_frameworks: Vec<String>,
 }

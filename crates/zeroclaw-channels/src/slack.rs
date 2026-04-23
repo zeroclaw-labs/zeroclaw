@@ -443,7 +443,7 @@ impl SlackChannel {
     /// Update an existing Slack message in-place using `chat.update`.
     ///
     /// `channel` is the channel ID and `ts` is the timestamp of the original
-    /// message (returned by [`post_message`]).
+    /// message (returned by `post_message`).
     pub async fn update_message(&self, channel: &str, ts: &str, text: &str) -> anyhow::Result<()> {
         let body = serde_json::json!({
             "channel": channel,

@@ -7,7 +7,7 @@
 //!
 //! Run: `cargo bench`
 //!
-//! Ref: https://github.com/zeroclaw-labs/zeroclaw/issues/618 (item 7)
+//! Ref: <https://github.com/zeroclaw-labs/zeroclaw/issues/618> (item 7)
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;

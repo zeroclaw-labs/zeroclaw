@@ -1,7 +1,7 @@
 //! Forward-only config schema migration.
 //!
 //! Old config layouts are typed structs. Migration deserializes into the legacy
-//! struct, moves field values into the new layout, and returns a clean [`Config`].
+//! struct, moves field values into the new layout, and returns a clean `Config`.
 //!
 //! The on-disk file is never rewritten by migration.
 //!

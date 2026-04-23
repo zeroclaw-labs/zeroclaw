@@ -24,7 +24,7 @@ impl Default for LinkEnricherConfig {
     }
 }
 
-/// URL regex: matches http:// and https:// URLs, stopping at whitespace, angle
+/// URL regex: matches `http://` and `https://` URLs, stopping at whitespace, angle
 /// brackets, or double-quotes.
 static URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).expect("URL regex must compile"));
