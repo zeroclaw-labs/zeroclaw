@@ -431,6 +431,17 @@ pub enum VaultLegalCommands {
     },
     /// Show legal-graph node/edge counts in brain.db.
     Stats,
+    /// Populate `vault_embeddings` for every legal node that doesn't yet
+    /// have one. Uses the `memory.embedding_provider/model/dimensions`
+    /// config plus the resolved API key. Safe to re-run.
+    Embed {
+        /// Cap the number of docs embedded in a single run (default: all).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Batch size for the provider's `embed()` call (default 8, max 32).
+        #[arg(long, default_value = "8")]
+        batch: usize,
+    },
     /// Export a subgraph rooted at a slug to a standalone HTML snapshot
     /// (Cytoscape viewer with data embedded) or graphify-compatible JSON.
     Export {

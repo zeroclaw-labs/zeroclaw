@@ -927,6 +927,13 @@ enum VaultLegalCommands {
     },
     /// Show legal-graph node/edge counts in brain.db.
     Stats,
+    /// Populate vault_embeddings for legal nodes missing one.
+    Embed {
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value = "8")]
+        batch: usize,
+    },
     /// Export a subgraph rooted at a slug to a standalone HTML snapshot
     /// (Cytoscape viewer with data embedded) or graphify-compatible JSON.
     Export {
@@ -1431,6 +1438,9 @@ async fn main() -> Result<()> {
                     vault::legal::cli::ingest_path(&config, path, dry_run).await
                 }
                 VaultLegalCommands::Stats => vault::legal::cli::stats(&config).await,
+                VaultLegalCommands::Embed { limit, batch } => {
+                    vault::legal::cli::embed_legal(&config, limit, batch).await
+                }
                 VaultLegalCommands::Export {
                     root,
                     depth,

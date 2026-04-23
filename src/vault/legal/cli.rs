@@ -384,6 +384,176 @@ mod tests {
         assert_eq!(parse_kinds_csv(Some("statute")), vec![Statute]);
         assert_eq!(parse_kinds_csv(Some("case, statute, bogus")), vec![Case, Statute]);
     }
+
+    #[tokio::test]
+    async fn embed_bails_cleanly_when_no_provider_configured() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.workspace_dir = tmp.path().to_path_buf();
+        cfg.memory.embedding_provider = "none".to_string();
+        let err = embed_legal(&cfg, None, 8).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("embedding_provider") || msg.contains("embedding provider"),
+            "error should mention missing embedding provider: {msg}"
+        );
+    }
+}
+
+/// `zeroclaw vault legal embed` — populate `vault_embeddings` rows for
+/// every legal node that doesn't yet have one. Uses the memory config's
+/// embedding provider (`config.memory.embedding_provider/model/dimensions`)
+/// plus the resolved API key pulled from the configured provider chain.
+///
+/// Safe to re-run: documents already present in `vault_embeddings` are
+/// skipped. Also re-embeds if `vault_documents.embedding_version` differs
+/// from the provider's current version (schema drift).
+pub async fn embed_legal(config: &Config, limit: Option<usize>, batch: usize) -> Result<()> {
+    use crate::memory::embedding::{create_embedding_provider, EmbeddingProvider};
+    use crate::memory::vector::vec_to_bytes;
+
+    let batch = batch.max(1).min(32);
+
+    let provider_name = config.memory.embedding_provider.clone();
+    if provider_name == "none" || provider_name.is_empty() {
+        anyhow::bail!(
+            "no embedding provider configured — set `memory.embedding_provider` to `openai` / \
+             `openrouter` / `custom:<url>` / `local_fastembed` before running `vault legal embed`"
+        );
+    }
+    // Embedding API key resolution (in order of specificity):
+    //   1. `OPENAI_API_KEY` env var (standard cloud deployment)
+    //   2. The top-level `config.api_key` (shared chat+embedding key)
+    //   3. Any per-provider key in `config.model_providers`
+    // local_fastembed + custom:URL don't need a key; they can tolerate None.
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .or_else(|| config.api_key.clone().filter(|k| !k.trim().is_empty()))
+        .or_else(|| {
+            config
+                .model_providers
+                .values()
+                .find_map(|p| p.api_key.clone().filter(|k| !k.trim().is_empty()))
+        });
+
+    let provider: Box<dyn EmbeddingProvider> = create_embedding_provider(
+        &provider_name,
+        api_key.as_deref(),
+        &config.memory.embedding_model,
+        config.memory.embedding_dimensions,
+    );
+    let dims = provider.dimensions();
+    if dims == 0 {
+        anyhow::bail!(
+            "embedding provider `{provider_name}` reported dim=0 — check the provider feature \
+             flag (e.g. `--features embedding-local`) or the provider config"
+        );
+    }
+
+    let db_path = config.workspace_dir.join("memory").join("brain.db");
+    if !db_path.exists() {
+        anyhow::bail!("no brain.db at {}", db_path.display());
+    }
+
+    println!(
+        "{} provider: {} / model: {} / dims: {}",
+        style("embedding legal nodes").bold(),
+        provider.name(),
+        provider.model(),
+        dims
+    );
+
+    // Pull work list: legal docs that either have no vault_embeddings row
+    // or whose recorded embedding schema version is stale.
+    let conn = Connection::open(&db_path)?;
+    crate::vault::schema::init_schema(&conn)?;
+    let cur_version = provider.version() as i64;
+    let limit_sql = limit.unwrap_or(usize::MAX) as i64;
+    let mut stmt = conn.prepare(
+        "SELECT d.id, d.content
+           FROM vault_documents d
+           LEFT JOIN vault_embeddings e ON e.doc_id = d.id
+          WHERE d.doc_type IN ('statute_article','statute_supplement','case')
+            AND (
+                e.doc_id IS NULL
+             OR COALESCE(d.embedding_version, 0) <> ?1
+            )
+          LIMIT ?2",
+    )?;
+    let work: Vec<(i64, String)> = stmt
+        .query_map(rusqlite::params![cur_version, limit_sql], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    drop(stmt);
+
+    if work.is_empty() {
+        println!("nothing to do — all legal nodes already embedded at version {cur_version}");
+        return Ok(());
+    }
+
+    println!("  {} nodes to embed (batch size {batch})", work.len());
+    let total = work.len();
+    let mut done = 0usize;
+    let mut embedded = 0usize;
+    let mut skipped_empty = 0usize;
+
+    for chunk in work.chunks(batch) {
+        let texts: Vec<&str> = chunk.iter().map(|(_id, c)| c.as_str()).collect();
+        let vectors = provider.embed(&texts).await.with_context(|| {
+            format!("embedding batch of {} texts failed", texts.len())
+        })?;
+        for ((doc_id, _content), vec) in chunk.iter().zip(vectors.iter()) {
+            if vec.is_empty() {
+                skipped_empty += 1;
+                continue;
+            }
+            let bytes = vec_to_bytes(vec);
+            // Upsert embedding row + update the doc's schema-version fields.
+            conn.execute(
+                "INSERT INTO vault_embeddings (doc_id, embedding, dim)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(doc_id) DO UPDATE SET embedding = excluded.embedding,
+                                                   dim = excluded.dim,
+                                                   created_at = unixepoch()",
+                rusqlite::params![doc_id, bytes, vec.len() as i64],
+            )?;
+            conn.execute(
+                "UPDATE vault_documents
+                    SET embedding_model = ?1,
+                        embedding_dim = ?2,
+                        embedding_provider = ?3,
+                        embedding_version = ?4,
+                        embedding_created_at = unixepoch()
+                  WHERE id = ?5",
+                rusqlite::params![
+                    provider.model(),
+                    vec.len() as i64,
+                    provider.name(),
+                    cur_version,
+                    doc_id,
+                ],
+            )?;
+            embedded += 1;
+        }
+        done += chunk.len();
+        if total > batch {
+            println!(
+                "  {} / {} ({:>3}%)",
+                done,
+                total,
+                (done * 100).checked_div(total).unwrap_or(100)
+            );
+        }
+    }
+
+    println!(
+        "{} embedded {embedded} / skipped {skipped_empty} (empty vectors)",
+        style("done").green().bold()
+    );
+    Ok(())
 }
 
 pub async fn stats(config: &Config) -> Result<()> {
