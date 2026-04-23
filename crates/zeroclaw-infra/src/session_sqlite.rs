@@ -377,6 +377,39 @@ impl SessionBackend for SqliteSessionBackend {
         .map_err(std::io::Error::other)
     }
 
+    fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT session_key, created_at, last_activity, message_count, name
+             FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| {
+                let key: String = row.get(0)?;
+                let created_str: String = row.get(1)?;
+                let activity_str: String = row.get(2)?;
+                let count: i64 = row.get(3)?;
+                let name: Option<String> = row.get(4)?;
+
+                let created = DateTime::parse_from_rfc3339(&created_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                let activity = DateTime::parse_from_rfc3339(&activity_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                Ok(SessionMetadata {
+                    key,
+                    name,
+                    created_at: created,
+                    last_activity: activity,
+                    message_count: count as usize,
+                })
+            },
+        )
+        .ok()
+    }
+
     fn set_session_state(
         &self,
         session_key: &str,
@@ -921,5 +954,48 @@ mod tests {
 
         let meta = backend.list_sessions_with_metadata();
         assert!(meta[0].name.is_none());
+    }
+
+    // ── get_session_metadata tests ─────────────────────────────────
+
+    #[test]
+    fn get_session_metadata_returns_full_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.append("s1", &ChatMessage::assistant("hi")).unwrap();
+        backend.set_session_name("s1", "My Chat").unwrap();
+
+        let meta = backend.get_session_metadata("s1").unwrap();
+        assert_eq!(meta.key, "s1");
+        assert_eq!(meta.name.as_deref(), Some("My Chat"));
+        assert_eq!(meta.message_count, 2);
+    }
+
+    #[test]
+    fn get_session_metadata_returns_none_for_missing() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert!(backend.get_session_metadata("nonexistent").is_none());
+    }
+
+    #[test]
+    fn get_session_metadata_matches_list() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("a")).unwrap();
+        backend.append("s1", &ChatMessage::user("b")).unwrap();
+        backend.append("s2", &ChatMessage::user("c")).unwrap();
+
+        let single = backend.get_session_metadata("s1").unwrap();
+        let all = backend.list_sessions_with_metadata();
+        let from_list = all.iter().find(|m| m.key == "s1").unwrap();
+
+        assert_eq!(single.message_count, from_list.message_count);
+        assert_eq!(single.name, from_list.name);
+        assert_eq!(single.created_at, from_list.created_at);
+        assert_eq!(single.last_activity, from_list.last_activity);
     }
 }

@@ -95,6 +95,22 @@ pub trait SessionBackend: Send + Sync {
         Ok(None)
     }
 
+    /// Look up metadata for a single session by key.
+    /// Default impl loads all messages to derive count — override for O(1) lookup.
+    fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
+        let messages = self.load(session_key);
+        if messages.is_empty() {
+            return None;
+        }
+        Some(SessionMetadata {
+            key: session_key.to_string(),
+            name: self.get_session_name(session_key).ok().flatten(),
+            created_at: Utc::now(),
+            last_activity: Utc::now(),
+            message_count: messages.len(),
+        })
+    }
+
     /// Set the session state (e.g. "idle", "running", "error").
     /// `turn_id` identifies the current turn (set when running, cleared on idle).
     fn set_session_state(
