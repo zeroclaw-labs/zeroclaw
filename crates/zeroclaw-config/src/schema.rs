@@ -2670,7 +2670,7 @@ pub struct BrowserConfig {
     /// Headless mode for rust-native backend
     #[serde(default = "default_true")]
     pub native_headless: bool,
-    /// WebDriver endpoint URL for rust-native backend (e.g. http://127.0.0.1:9515)
+    /// WebDriver endpoint URL for rust-native backend (e.g. `http://127.0.0.1:9515`)
     #[serde(default = "default_browser_webdriver_url")]
     pub native_webdriver_url: String,
     /// Optional Chrome/Chromium executable path for rust-native backend
@@ -7459,7 +7459,7 @@ pub struct WatiConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_token: String,
-    /// WATI API base URL (default: https://live-mt-server.wati.io).
+    /// WATI API base URL (default: <https://live-mt-server.wati.io>).
     #[serde(default = "default_wati_api_url")]
     pub api_url: String,
     /// Tenant ID for multi-channel setups (optional).

@@ -414,8 +414,8 @@ Examples:
   zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
   zeroclaw cron add-every 60000 'Ping heartbeat'
   zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
-  zeroclaw cron pause <task-id>
-  zeroclaw cron update <task-id> --expression '0 8 * * *' --tz Europe/London")]
+  zeroclaw cron pause TASK_ID
+  zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London")]
     Cron {
         #[command(subcommand)]
         cron_command: CronCommands,
@@ -528,7 +528,7 @@ Examples:
   zeroclaw memory stats
   zeroclaw memory list
   zeroclaw memory list --category core --limit 10
-  zeroclaw memory get <key>
+  zeroclaw memory get KEY
   zeroclaw memory clear --category conversation --yes")]
     Memory {
         #[command(subcommand)]

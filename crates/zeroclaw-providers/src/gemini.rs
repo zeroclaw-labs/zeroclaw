@@ -321,7 +321,7 @@ struct GeminiCliOAuthCreds {
 const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 
 /// Internal API endpoint used by Gemini CLI for OAuth users.
-/// See: https://github.com/google-gemini/gemini-cli/issues/19200
+/// See: <https://github.com/google-gemini/gemini-cli/issues/19200>
 const CLOUDCODE_PA_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1internal";
 
 /// loadCodeAssist endpoint for resolving the project ID.
@@ -822,7 +822,7 @@ impl GeminiProvider {
     /// The Gemini CLI OAuth tokens are scoped for the internal Code Assist API,
     /// not the public API. Sending them to the public endpoint results in
     /// "400 Bad Request: API key not valid" errors.
-    /// See: https://github.com/google-gemini/gemini-cli/issues/19200
+    /// See: <https://github.com/google-gemini/gemini-cli/issues/19200>
     fn build_generate_content_url(model: &str, auth: &GeminiAuth) -> String {
         match auth {
             GeminiAuth::OAuthToken(_) | GeminiAuth::ManagedOAuth => {
