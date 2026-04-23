@@ -1,4 +1,6 @@
 cli-about = 最速で最小のAIアシスタント。
+cli-no-command-provided = コマンドが指定されていません。
+cli-try-onboard = `zeroclaw onboard` を実行してワークスペースを初期化してください。
 cli-onboard-about = ワークスペースと設定を初期化
 cli-agent-about = AIエージェントループを開始
 cli-gateway-about = ゲートウェイサーバー (ウェブフック、ウェブソケット) を管理
@@ -86,3 +88,166 @@ cli-sop-list-about = ロードされた SOP を一覧表示
 cli-sop-validate-about = SOP 定義を検証
 cli-sop-show-about = SOP の詳細を表示
 cli-migrate-openclaw-about = OpenClaw ワークスペースからこの ZeroClaw ワークスペースにメモリをインポート
+cli-agent-long-about =
+    AI エージェントループを起動します。
+
+    設定された AI プロバイダーでインタラクティブなチャットセッションを起動します。単一ショットクエリの場合は --message を使用し、インタラクティブモードに入りません。
+
+    例:
+    zeroclaw agent                              # インタラクティブセッション
+    zeroclaw agent -m "Summarize today's logs"  # 単一メッセージ
+    zeroclaw agent -p anthropic --model claude-sonnet-4-20250514
+    zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0
+cli-gateway-long-about =
+    ゲートウェイサーバー（webhook、websocket）を管理します。
+
+    受信 webhook イベントと WebSocket 接続を受け入れる HTTP/WebSocket ゲートウェイを起動、再起動、または検査します。
+
+    例:
+    zeroclaw gateway start              # ゲートウェイを起動
+    zeroclaw gateway restart            # ゲートウェイを再起動
+    zeroclaw gateway get-paircode       # ペアリングコードを表示
+cli-acp-long-about =
+    ACP サーバーを起動します（stdio 上の JSON-RPC 2.0）。
+
+    IDE とツール統合用に stdin/stdout で JSON-RPC 2.0 サーバーを起動します。セッション管理と通知としてのストリーミングエージェント応答に対応しています。
+
+    メソッド: initialize、session/new、session/prompt、session/stop。
+
+    例:
+    zeroclaw acp                        # ACP サーバーを起動
+    zeroclaw acp --max-sessions 5       # 同時セッション数を制限
+cli-daemon-long-about =
+    長時間実行の自律型デーモンを起動します。
+
+    完全な ZeroClaw ランタイムを起動します: ゲートウェイサーバー、すべての設定されたチャネル（Telegram、Discord、Slack など）、ハートビートモニター、および cron スケジューラー。これは本番環境またはオンアシスタントとして ZeroClaw を実行する推奨方法です。
+
+    デーモンを OS サービス（systemd/launchd）として登録し、ブート時に自動起動するには「zeroclaw service install」を使用してください。
+
+    例:
+    zeroclaw daemon                   # 設定デフォルトを使用
+    zeroclaw daemon -p 9090           # ポート 9090 のゲートウェイ
+    zeroclaw daemon --host 127.0.0.1  # ローカルホストのみ
+cli-cron-long-about =
+    スケジュール済みタスクを設定および管理します。
+
+    cron 式、RFC 3339 タイムスタンプ、期間、または固定間隔を使用して、定期的、ワンショット、または間隔ベースのタスクをスケジュールします。
+
+    Cron 式は標準 5 フィールド形式を使用します: 「min hour day month weekday」。タイムゾーンはデフォルトで UTC です。--tz と IANA タイムゾーン名で上書きしてください。
+
+    例:
+    zeroclaw cron list
+    zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
+    zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
+    zeroclaw cron add '*/5 * * * *' 'echo ok'
+    zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
+    zeroclaw cron add-every 60000 'Ping heartbeat'
+    zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
+    zeroclaw cron pause TASK_ID
+    zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London
+cli-channel-long-about =
+    通信チャネルを管理します。
+
+    ZeroClaw をメッセージングプラットフォームに接続するチャネルを追加、削除、一覧表示、送信、およびヘルスチェックします。サポートされるチャネルタイプ: telegram、discord、slack、whatsapp、matrix、imessage、email。
+
+    例:
+    zeroclaw channel list
+    zeroclaw channel doctor
+    zeroclaw channel add telegram '{ "{" }"bot_token":"..."、"name":"my-bot"{ "}" }'
+    zeroclaw channel remove my-bot
+    zeroclaw channel bind-telegram zeroclaw_user
+    zeroclaw channel send 'Alert!' --channel-id telegram --recipient 123456789
+cli-hardware-long-about =
+    USB ハードウェアを検出して内省します。
+
+    接続されている USB デバイスを列挙し、既知の開発ボード（STM32 Nucleo、Arduino、ESP32）を特定し、probe-rs/ST-Link 経由でチップ情報を取得します。
+
+    例:
+    zeroclaw hardware discover
+    zeroclaw hardware introspect /dev/ttyACM0
+    zeroclaw hardware info --chip STM32F401RETx
+cli-peripheral-long-about =
+    ハードウェアペリフェラルを管理します。
+
+    エージェントにツール（GPIO、センサー、アクチュエーター）を公開するハードウェアボードを追加、一覧表示、フラッシュ、および設定します。サポートされるボード: nucleo-f401re、rpi-gpio、esp32、arduino-uno。
+
+    例:
+    zeroclaw peripheral list
+    zeroclaw peripheral add nucleo-f401re /dev/ttyACM0
+    zeroclaw peripheral add rpi-gpio native
+    zeroclaw peripheral flash --port /dev/cu.usbmodem12345
+    zeroclaw peripheral flash-nucleo
+cli-memory-long-about =
+    エージェントメモリエントリを管理します。
+
+    エージェントが保存したメモリエントリを一覧表示、検査、クリアします。カテゴリとセッション別のフィルタリング、ページネーション、および確認付きバッククリアをサポートしています。
+
+    例:
+    zeroclaw memory stats
+    zeroclaw memory list
+    zeroclaw memory list --category core --limit 10
+    zeroclaw memory get KEY
+    zeroclaw memory clear --category conversation --yes
+cli-config-long-about =
+    ZeroClaw 設定を管理します。
+
+    ドット記法で設定プロパティを表示、設定、または初期化します。「schema」を使用して、設定ファイルの完全な JSON スキーマをダンプします。
+
+    プロパティはドット記法でアドレス指定されます（例: channels.matrix.mention-only）。
+    シークレットフィールド（API キー、トークン）は自動的にマスクされた入力を使用します。
+    列挙フィールドは、値が省略された場合、インタラクティブ選択を提供します。
+
+    例:
+    zeroclaw config list                                  # すべてのプロパティを一覧表示
+    zeroclaw config list --secrets                        # シークレットのみを一覧表示
+    zeroclaw config list --filter channels.matrix         # プレフィックスでフィルタリング
+    zeroclaw config get channels.matrix.mention-only      # 値を取得
+    zeroclaw config set channels.matrix.mention-only true # 値を設定
+    zeroclaw config set channels.matrix.access-token      # シークレット: マスクされた入力
+    zeroclaw config set channels.matrix.stream-mode       # 列挙: インタラクティブ選択
+    zeroclaw config init channels.matrix                  # デフォルト値でセクションを初期化
+    zeroclaw config schema                                # JSON Schema を stdout に出力
+    zeroclaw config schema > schema.json
+
+    プロパティパスタブ補完は `zeroclaw completions <shell>` に自動的に含まれます。
+cli-update-long-about =
+    ZeroClaw 更新を確認して適用します。
+
+    デフォルトでは、6 段階のパイプライン（プリフライト、ダウンロード、バックアップ、検証、スワップ、スモークテスト）で最新リリースをダウンロードしてインストールします。失敗時に自動ロールバックします。
+
+    更新を確認するだけでインストールしない場合は --check を使用してください。
+    インストール確認プロンプトをスキップするには --force を使用してください。
+    最新ではなく特定のリリースをターゲットにするには --version を使用してください。
+
+    例:
+    zeroclaw update                      # 最新をダウンロードしてインストール
+    zeroclaw update --check              # チェックのみ、インストールしない
+    zeroclaw update --force              # 確認なしでインストール
+    zeroclaw update --version 0.6.0      # 特定のバージョンをインストール
+cli-self-test-long-about =
+    診断自己テストを実行して ZeroClaw インストールを検証します。
+
+    デフォルトでは、ネットワークチェック（ゲートウェイヘルス、メモリラウンドトリップ）を含む完全なテストスイートを実行します。--quick を使用して、ネットワークチェックをスキップしてより高速なオフライン検証を実行してください。
+
+    例:
+    zeroclaw self-test             # 完全なスイート
+    zeroclaw self-test --quick     # 高速チェックのみ（ネットワークなし）
+cli-completions-long-about =
+    `zeroclaw` のシェル補完スクリプトを生成します。
+
+    スクリプトは stdout に出力されるため、直接ソースできます:
+
+    例:
+    source <(zeroclaw completions bash)
+    zeroclaw completions zsh > ~/.zfunc/_zeroclaw
+    zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish
+cli-desktop-long-about =
+    ZeroClaw コンパニオンデスクトップアプリを起動します。
+
+    コンパニオンアプリは、CLI と同じゲートウェイに接続する軽量のメニューバー/システムトレイアプリケーションです。ダッシュボードへのクイックアクセス、ステータス監視、およびデバイスペアリングを提供します。
+
+    --install を使用して、プラットフォーム用の事前ビルドコンパニオンアプリをダウンロードしてください。
+
+    例:
+    zeroclaw desktop              # コンパニオンアプリを起動
+    zeroclaw desktop --install    # ダウンロードしてインストール
