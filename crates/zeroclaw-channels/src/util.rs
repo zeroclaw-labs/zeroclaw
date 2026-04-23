@@ -171,9 +171,18 @@ pub fn parse_attachment_markers(message: &str) -> (String, Vec<(String, String)>
 }
 
 /// Generate a short 6-character lowercase alphanumeric approval token.
+///
+/// Uses the full `[a-z0-9]` alphabet (36 options per position, 36^6 ≈ 2.2B
+/// combinations) — not UUID hex (which would give only 16^6 ≈ 16.7M and
+/// would materially weaken the WhatsApp no-per-sender-check design
+/// described in the PR #6010 security note).
 pub(crate) fn new_approval_token() -> String {
-    let id = uuid::Uuid::new_v4().to_string().replace('-', "");
-    id[..6].to_string()
+    use rand::RngExt;
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::rng();
+    (0..6)
+        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
+        .collect()
 }
 
 /// Parse an approval reply of the form `"TOKEN yes|no|always ..."`.

@@ -17452,7 +17452,7 @@ allowed_users = ["@u:m"]
         assert_eq!(signal.approval_timeout_secs, 300);
 
         let matrix: MatrixConfig = serde_json::from_str(
-            r#"{"homeserver":"https://matrix.org","access_token":"tok","enabled":true}"#,
+            r#"{"homeserver":"https://matrix.org","access_token":"tok","enabled":true,"allowed_users":[]}"#,
         )
         .unwrap();
         assert_eq!(matrix.approval_timeout_secs, 300);
@@ -17482,7 +17482,7 @@ allowed_users = ["@u:m"]
         assert_eq!(signal.approval_timeout_secs, 90);
 
         let matrix: MatrixConfig = serde_json::from_str(
-            r#"{"homeserver":"https://matrix.org","access_token":"tok","enabled":true,"approval_timeout_secs":45}"#,
+            r#"{"homeserver":"https://matrix.org","access_token":"tok","enabled":true,"allowed_users":[],"approval_timeout_secs":45}"#,
         )
         .unwrap();
         assert_eq!(matrix.approval_timeout_secs, 45);
