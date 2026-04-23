@@ -700,11 +700,40 @@ fn strip_wrapping_quotes(token: &str) -> &str {
     token.trim_matches(|c| c == '"' || c == '\'')
 }
 
+fn looks_like_tilde_path(candidate: &str) -> bool {
+    if candidate == "~" || candidate.starts_with("~/") {
+        return true;
+    }
+
+    let Some(rest) = candidate.strip_prefix('~') else {
+        return false;
+    };
+
+    if rest == "+" || rest == "-" || rest.starts_with("+/") || rest.starts_with("-/") {
+        return true;
+    }
+
+    let user = rest.split('/').next().unwrap_or_default();
+    if user.is_empty() {
+        return false;
+    }
+
+    let mut chars = user.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_' || first == '-') {
+        return false;
+    }
+
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
 fn looks_like_path(candidate: &str) -> bool {
     candidate.starts_with('/')
         || candidate.starts_with("./")
         || candidate.starts_with("../")
-        || candidate.starts_with('~')
+        || looks_like_tilde_path(candidate)
         || candidate == "."
         || candidate == ".."
         || candidate.contains('/')
@@ -2625,6 +2654,13 @@ mod tests {
             p.forbidden_path_argument("ls ~nobody"),
             Some("~nobody".into())
         );
+    }
+
+    #[test]
+    fn forbidden_path_argument_does_not_treat_tilde_numbers_as_paths() {
+        let p = default_policy();
+        assert_eq!(p.forbidden_path_argument("echo ~120 BPM"), None);
+        assert_eq!(p.forbidden_path_argument("printf '%s' '~120'"), None);
     }
 
     #[test]

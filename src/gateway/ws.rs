@@ -51,6 +51,14 @@ struct ConnectParams {
     capabilities: Vec<String>,
 }
 
+fn connected_ack(session_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "connected",
+        "session_id": session_id,
+        "message": "Connection established"
+    })
+}
+
 /// The sub-protocol we support for the chat WebSocket.
 const WS_PROTOCOL: &str = "zeroclaw.v1";
 
@@ -250,10 +258,7 @@ async fn handle_socket(
                         if let Some(sid) = &cp.session_id {
                             agent.set_memory_session_id(Some(sid.clone()));
                         }
-                        let ack = serde_json::json!({
-                            "type": "connected",
-                            "message": "Connection established"
-                        });
+                        let ack = connected_ack(&session_id);
                         let _ = sender.send(Message::Text(ack.to_string().into())).await;
                     } else {
                         // Not a connect message — fall through to normal processing
@@ -626,5 +631,13 @@ mod tests {
             "zeroclaw.v1, bearer.zc_tok, other".parse().unwrap(),
         );
         assert_eq!(extract_ws_token(&headers, None), Some("zc_tok"));
+    }
+
+    #[test]
+    fn connected_ack_includes_session_id() {
+        let ack = connected_ack("session-123");
+        assert_eq!(ack["type"], "connected");
+        assert_eq!(ack["session_id"], "session-123");
+        assert_eq!(ack["message"], "Connection established");
     }
 }

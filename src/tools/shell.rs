@@ -79,7 +79,7 @@ impl ShellTool {
     }
 }
 
-fn is_valid_env_var_name(name: &str) -> bool {
+pub(crate) fn is_valid_env_var_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
@@ -88,7 +88,7 @@ fn is_valid_env_var_name(name: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
+pub(crate) fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for key in SAFE_ENV_VARS
@@ -105,6 +105,28 @@ fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
         }
     }
     out
+}
+
+pub(crate) fn populate_shell_environment(
+    cmd: &mut tokio::process::Command,
+    security: &SecurityPolicy,
+) {
+    cmd.env_clear();
+
+    for var in collect_allowed_shell_env_vars(security) {
+        if let Ok(val) = std::env::var(&var) {
+            cmd.env(&var, val);
+        }
+    }
+
+    let session_id = crate::agent::loop_::TOOL_LOOP_REPLY_TARGET
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .or_else(|| std::env::var("ZEROCLAW_SESSION_ID").ok());
+    if let Some(ref sid) = session_id {
+        cmd.env("ZEROCLAW_SESSION_ID", sid);
+    }
 }
 
 #[async_trait]
@@ -180,22 +202,7 @@ impl Tool for ShellTool {
             .wrap_command(cmd.as_std_mut())
             .map_err(|e| anyhow::anyhow!("Sandbox error: {}", e))?;
 
-        cmd.env_clear();
-
-        for var in collect_allowed_shell_env_vars(&self.security) {
-            if let Ok(val) = std::env::var(&var) {
-                cmd.env(&var, val);
-            }
-        }
-
-        let session_id = crate::agent::loop_::TOOL_LOOP_REPLY_TARGET
-            .try_with(Clone::clone)
-            .ok()
-            .flatten()
-            .or_else(|| std::env::var("ZEROCLAW_SESSION_ID").ok());
-        if let Some(ref sid) = session_id {
-            cmd.env("ZEROCLAW_SESSION_ID", sid);
-        }
+        populate_shell_environment(&mut cmd, &self.security);
 
         let timeout_secs = self.timeout_secs;
         let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;

@@ -5,10 +5,12 @@
 //! prefixed with the skill name (e.g. `my_skill.run_lint`) to avoid collisions
 //! with built-in tools.
 
+use super::shell::populate_shell_environment;
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +25,7 @@ pub struct SkillShellTool {
     tool_description: String,
     command_template: String,
     args: HashMap<String, String>,
+    working_dir: PathBuf,
     security: Arc<SecurityPolicy>,
 }
 
@@ -36,13 +39,42 @@ impl SkillShellTool {
         tool: &crate::skills::SkillTool,
         security: Arc<SecurityPolicy>,
     ) -> Self {
+        let working_dir = security.workspace_dir.clone();
         Self {
             tool_name: format!("{}.{}", skill_name, tool.name),
             tool_description: tool.description.clone(),
             command_template: tool.command.clone(),
             args: tool.args.clone(),
+            working_dir,
             security,
         }
+    }
+
+    pub fn with_working_dir(mut self, working_dir: PathBuf) -> Self {
+        self.working_dir = working_dir;
+        self
+    }
+
+    fn resolve_working_dir(&self) -> Result<PathBuf, String> {
+        let canonical_wd = self.working_dir.canonicalize().map_err(|_| {
+            format!(
+                "skill working directory '{}' does not exist or is not accessible",
+                self.working_dir.display()
+            )
+        })?;
+
+        if !canonical_wd.is_dir() {
+            return Err(format!(
+                "skill working directory '{}' is not a directory",
+                canonical_wd.display()
+            ));
+        }
+
+        if !self.security.is_resolved_path_allowed(&canonical_wd) {
+            return Err(self.security.resolved_path_violation_message(&canonical_wd));
+        }
+
+        Ok(canonical_wd)
     }
 
     fn build_parameters_schema(&self) -> serde_json::Value {
@@ -129,6 +161,17 @@ impl Tool for SkillShellTool {
             });
         }
 
+        let working_dir = match self.resolve_working_dir() {
+            Ok(path) => path,
+            Err(reason) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(reason),
+                });
+            }
+        };
+
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
@@ -140,17 +183,8 @@ impl Tool for SkillShellTool {
         // Build and execute the command
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg(&command);
-        cmd.current_dir(&self.security.workspace_dir);
-        cmd.env_clear();
-
-        // Only pass safe environment variables
-        for var in &[
-            "PATH", "HOME", "TERM", "LANG", "LC_ALL", "USER", "SHELL", "TMPDIR",
-        ] {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
-        }
+        cmd.current_dir(&working_dir);
+        populate_shell_environment(&mut cmd, &self.security);
 
         let result =
             tokio::time::timeout(Duration::from_secs(SKILL_SHELL_TIMEOUT_SECS), cmd.output()).await;
@@ -208,6 +242,7 @@ mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::skills::SkillTool;
+    use tempfile::tempdir;
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -310,6 +345,146 @@ mod tests {
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_executes_relative_script_from_skill_dir() {
+        let workspace = tempdir().unwrap();
+        let skill_dir = workspace.path().join("skills").join("demo");
+        let scripts_dir = skill_dir.join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        std::fs::write(
+            scripts_dir.join("hello.py"),
+            "print('relative-skill-script')\n",
+        )
+        .unwrap();
+
+        let st = SkillTool {
+            name: "hello".to_string(),
+            description: "Say hello".to_string(),
+            kind: "shell".to_string(),
+            command: "python3 scripts/hello.py".to_string(),
+            args: HashMap::new(),
+        };
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = SkillShellTool::new("test", &st, security).with_working_dir(skill_dir);
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("relative-skill-script"));
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_blocks_working_dir_outside_workspace_allowlist() {
+        let workspace = tempdir().unwrap();
+        let external = tempdir().unwrap();
+
+        let st = SkillTool {
+            name: "hello".to_string(),
+            description: "Say hello".to_string(),
+            kind: "shell".to_string(),
+            command: "echo hello-skill".to_string(),
+            args: HashMap::new(),
+        };
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = SkillShellTool::new("test", &st, security)
+            .with_working_dir(external.path().to_path_buf());
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Resolved path escapes workspace allowlist")
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_allows_working_dir_in_allowed_root() {
+        let workspace = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        let skill_dir = external.path().join("demo");
+        let scripts_dir = skill_dir.join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        std::fs::write(
+            scripts_dir.join("hello.py"),
+            "print('allowed-root-skill-script')\n",
+        )
+        .unwrap();
+
+        let st = SkillTool {
+            name: "hello".to_string(),
+            description: "Say hello".to_string(),
+            kind: "shell".to_string(),
+            command: "python3 scripts/hello.py".to_string(),
+            args: HashMap::new(),
+        };
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_roots: vec![external.path().canonicalize().unwrap()],
+            ..SecurityPolicy::default()
+        });
+        let tool = SkillShellTool::new("test", &st, security).with_working_dir(skill_dir);
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("allowed-root-skill-script"));
+    }
+
+    #[tokio::test]
+    async fn skill_shell_tool_passes_through_allowed_env_vars() {
+        let workspace = tempdir().unwrap();
+        let skill_dir = workspace.path().join("skills").join("demo");
+        let scripts_dir = skill_dir.join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        std::fs::write(
+            scripts_dir.join("print_env.py"),
+            "import os\nprint(os.environ.get('ZEROCLAW_GATEWAY_TOKEN', ''), end='')\n",
+        )
+        .unwrap();
+
+        let st = SkillTool {
+            name: "env".to_string(),
+            description: "Print env".to_string(),
+            kind: "shell".to_string(),
+            command: "python3 scripts/print_env.py".to_string(),
+            args: HashMap::new(),
+        };
+        let original = std::env::var("ZEROCLAW_GATEWAY_TOKEN").ok();
+        unsafe {
+            std::env::set_var("ZEROCLAW_GATEWAY_TOKEN", "gateway-token-test");
+        }
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            shell_env_passthrough: vec!["ZEROCLAW_GATEWAY_TOKEN".into()],
+            ..SecurityPolicy::default()
+        });
+        let tool = SkillShellTool::new("test", &st, security).with_working_dir(skill_dir);
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+
+        match original {
+            Some(value) => unsafe {
+                std::env::set_var("ZEROCLAW_GATEWAY_TOKEN", value);
+            },
+            None => unsafe {
+                std::env::remove_var("ZEROCLAW_GATEWAY_TOKEN");
+            },
+        }
+
+        assert!(result.success);
+        assert_eq!(result.output, "gateway-token-test");
     }
 
     #[test]

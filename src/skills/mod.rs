@@ -878,11 +878,19 @@ pub fn skills_to_tools(
         for tool in &skill.tools {
             match tool.kind.as_str() {
                 "shell" | "script" => {
-                    tools.push(Box::new(crate::tools::skill_tool::SkillShellTool::new(
+                    let mut shell_tool = crate::tools::skill_tool::SkillShellTool::new(
                         &skill.name,
                         tool,
                         security.clone(),
-                    )));
+                    );
+                    if let Some(skill_dir) = skill
+                        .location
+                        .as_ref()
+                        .and_then(|location| location.parent())
+                    {
+                        shell_tool = shell_tool.with_working_dir(skill_dir.to_path_buf());
+                    }
+                    tools.push(Box::new(shell_tool));
                 }
                 "http" => {
                     tools.push(Box::new(crate::tools::skill_http::SkillHttpTool::new(

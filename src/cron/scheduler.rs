@@ -675,7 +675,9 @@ pub(crate) async fn deliver_announcement(
         #[cfg(feature = "one2x")]
         "web" => {
             if let Some(web_channel) = crate::one2x::web_channel::get_web_channel() {
-                web_channel.send(&SendMessage::new(safe_output.as_str(), target)).await?;
+                web_channel
+                    .send(&SendMessage::new(safe_output.as_str(), target))
+                    .await?;
             } else {
                 anyhow::bail!("web channel not initialized");
             }
@@ -690,24 +692,9 @@ pub(crate) async fn deliver_announcement(
                 } else {
                     anyhow::bail!("lark/feishu channel not configured");
                 };
-                channel.send(&SendMessage::new(safe_output.as_str(), target)).await?;
-            }
-            #[cfg(not(feature = "channel-lark"))]
-            {
-                anyhow::bail!("lark/feishu delivery requires `channel-lark` feature");
-            }
-        }
-        "lark" | "feishu" => {
-            #[cfg(feature = "channel-lark")]
-            {
-                let channel = if let Some(cfg) = &config.channels_config.lark {
-                    crate::channels::lark::LarkChannel::from_config(cfg)
-                } else if let Some(cfg) = &config.channels_config.feishu {
-                    crate::channels::lark::LarkChannel::from_feishu_config(cfg)
-                } else {
-                    anyhow::bail!("lark/feishu channel not configured");
-                };
-                channel.send(&SendMessage::new(output, target)).await?;
+                channel
+                    .send(&SendMessage::new(safe_output.as_str(), target))
+                    .await?;
             }
             #[cfg(not(feature = "channel-lark"))]
             {
