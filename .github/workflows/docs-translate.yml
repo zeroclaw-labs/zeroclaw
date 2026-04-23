@@ -1,0 +1,90 @@
+name: Translate docs (manual)
+
+# Run this before a release to AI-fill any untranslated or fuzzy strings.
+# Commits updated .po files back to the current branch so CI can deploy them.
+#
+# Requires: ANTHROPIC_API_KEY repository secret.
+
+on:
+  workflow_dispatch:
+    inputs:
+      locales:
+        description: 'Space-separated locales to translate (default: all configured)'
+        required: false
+        default: ''
+      force:
+        description: 'Force re-translate ALL entries (quality pass, costs more)'
+        type: boolean
+        required: false
+        default: false
+      model:
+        description: 'Claude model (haiku = fast/cheap, opus = highest quality)'
+        type: choice
+        required: false
+        default: claude-haiku-4-5-20251001
+        options:
+          - claude-haiku-4-5-20251001
+          - claude-sonnet-4-6
+          - claude-opus-4-7
+
+jobs:
+  translate:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          # Use default GITHUB_TOKEN — fine for committing to the same branch
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install mdBook (aarch64 musl, ~3 MB)
+        run: |
+          curl -sSL \
+            "https://github.com/rust-lang/mdBook/releases/download/v0.5.2/mdbook-v0.5.2-aarch64-unknown-linux-musl.tar.gz" \
+            | tar -xz -C /usr/local/bin
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: docs-translate
+          cache-all-crates: true
+
+      - name: Install mdbook-i18n-helpers
+        run: cargo install --locked mdbook-i18n-helpers
+
+      - name: Install gettext tools
+        run: sudo apt-get install -y --no-install-recommends gettext
+
+      - name: Install Python deps
+        run: pip install polib anthropic
+
+      - name: Sync + AI-fill translations
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LOCALES: ${{ inputs.locales != '' && inputs.locales || 'ja' }}
+          FILL_MODEL: ${{ inputs.model }}
+        run: |
+          FORCE_FLAG=""
+          [[ "${{ inputs.force }}" == "true" ]] && FORCE_FLAG="--force"
+          ./scripts/sync-translations.sh $FORCE_FLAG
+
+      - name: Commit updated .po files
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/book/po/*.po
+          if git diff --staged --quiet; then
+            echo "No translation changes — .po files already up to date"
+          else
+            FORCE_NOTE=""
+            [[ "${{ inputs.force }}" == "true" ]] && FORCE_NOTE=" (force)"
+            git commit -m "chore(i18n): sync translations via ${{ inputs.model }}${FORCE_NOTE}"
+            git push
+            echo "Pushed updated .po files."
+          fi

@@ -69,6 +69,19 @@ docs-refs:
 docs-sync:
     ./scripts/sync-translations.sh
 
+# Sync a single locale (e.g.: just docs-sync-locale ja)
+docs-sync-locale LOCALE:
+    ./scripts/sync-translations.sh --locale {{LOCALE}}
+
+# Force-retranslate everything for a quality pass (costs more — use before a release)
+# Optionally override model: FILL_MODEL=claude-opus-4-7 just docs-translate-force
+docs-translate-force:
+    ./scripts/sync-translations.sh --force
+
+# Force-retranslate a single locale
+docs-translate-force-locale LOCALE:
+    ./scripts/sync-translations.sh --locale {{LOCALE}} --force
+
 # Show translation status: translated/fuzzy/untranslated counts per locale
 docs-translate-stats:
     @for po in docs/book/po/*.po; do \

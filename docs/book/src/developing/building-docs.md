@@ -10,8 +10,11 @@ just docs ja           # same, but in Japanese
 just docs-build        # static build of every locale into docs/book/book/
 just docs-refs         # regenerate the auto-generated reference pages
 just docs-sync         # after editing English source: re-extract + AI-fill delta
-just docs-translate-stats   # show translated/fuzzy/untranslated counts per locale
-just docs-translate-check   # validate .po format (run before a translation PR)
+just docs-sync-locale ja            # sync one locale only
+just docs-translate-force           # force-retranslate everything (quality pass)
+just docs-translate-force-locale ja # force-retranslate one locale
+just docs-translate-stats           # show translated/fuzzy/untranslated per locale
+just docs-translate-check           # validate .po format (run before a translation PR)
 ```
 
 These wrap `scripts/docs.sh` and `scripts/sync-translations.sh`, which you can also call directly:
@@ -21,6 +24,11 @@ These wrap `scripts/docs.sh` and `scripts/sync-translations.sh`, which you can a
 ./scripts/docs.sh --locale ja      # serve Japanese
 ./scripts/docs.sh build            # static build of all locales
 ./scripts/docs.sh refs             # regenerate cli.md, config.md, and rustdoc API
+
+./scripts/sync-translations.sh                  # sync all locales
+./scripts/sync-translations.sh --locale ja      # sync one locale
+./scripts/sync-translations.sh --force          # re-translate everything
+./scripts/sync-translations.sh --locale ja --force
 ```
 
 ## Required tools
@@ -85,8 +93,46 @@ Without `ANTHROPIC_API_KEY`, `docs-sync` still runs extract + merge and reports 
    just docs ja                # replace ja with your locale
    ```
 
+## Release translation workflow
+
+Before tagging a release, run a full translation pass so the docs ship in every locale.
+You can do this locally or via the GitHub Actions manual trigger.
+
+### Local (recommended)
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# Fast/cheap delta pass (only new or changed strings since last release)
+just docs-sync
+
+# OR: quality pass — re-translate everything with a stronger model
+FILL_MODEL=claude-opus-4-7 just docs-translate-force
+
+just docs-translate-check   # validate before committing
+just docs-translate-stats   # review coverage
+```
+
+The `FILL_MODEL` environment variable overrides the default model (`claude-haiku-4-5-20251001`)
+without any flag changes. `claude-sonnet-4-6` is a good middle-ground for
+release quality at reasonable cost.
+
+### Via GitHub Actions (`.github/workflows/docs-translate.yml`)
+
+Go to **Actions → Translate docs (manual) → Run workflow**:
+
+| Input | Description |
+|---|---|
+| `locales` | Space-separated locales (`ja ko fr`), or leave blank for all |
+| `force` | Re-translate everything, not just the delta |
+| `model` | `claude-haiku-4-5-20251001` (default), `claude-sonnet-4-6`, or `claude-opus-4-7` |
+
+The workflow commits updated `.po` files back to the branch automatically.
+Requires the `ANTHROPIC_API_KEY` repository secret.
+
 ## Tips
 
 - **Fast iteration on prose:** use `just docs` (mdbook's serve mode auto-rebuilds on save). Skip `docs-refs` unless you've changed CLI flags or config schema.
 - **Fast iteration on translations:** edit `po/<locale>.po` and reload the browser — mdbook serve detects `.po` changes and rebuilds automatically.
 - **Cleaning up:** `rm -rf docs/book/book target/doc` removes everything generated.
+- **Zero-cost re-runs:** `just docs-sync` against unchanged English source completes in seconds — no AI calls, no cost.

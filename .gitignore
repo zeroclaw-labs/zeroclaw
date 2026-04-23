@@ -1,8 +1,11 @@
 /target
 /target-*/
 /docs/book/book/
+/docs/book/po/messages.pot
+/docs/book/po-extract/
 /docs/book/src/reference/cli.md
 /docs/book/src/reference/config.md
+.secrets
 firmware/*/target
 web/dist/*
 !web/dist/.gitkeep

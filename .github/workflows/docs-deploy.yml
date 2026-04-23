@@ -52,6 +52,9 @@ jobs:
           shared-key: docs-deploy
           cache-all-crates: true
 
+      - name: Install gettext tools
+        run: sudo apt-get install -y --no-install-recommends gettext
+
       - name: Install mdbook-i18n-helpers
         run: cargo install --locked mdbook-i18n-helpers
 
@@ -64,6 +67,14 @@ jobs:
 
       - name: Generate API reference (rustdoc)
         run: cargo doc --no-deps --workspace --exclude zeroclaw-desktop
+
+      - name: Validate .po format
+        run: |
+          ok=0
+          for po in docs/book/po/*.po; do
+            msgfmt --check-format "$po" -o /dev/null || ok=1
+          done
+          exit $ok
 
       - name: Build mdBook per locale
         working-directory: docs/book
