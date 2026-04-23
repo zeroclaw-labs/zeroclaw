@@ -956,23 +956,13 @@ fn apply_cmd_translations(cmd: clap::Command, prefix: &str) -> clap::Command {
 
     let about_key = format!("{prefix}-about");
     let cmd = match crate::i18n::get_cli_string(&about_key) {
-        Some(about) => {
-            // about controls -h listings; long_about controls --help header.
-            // Replace only the first line of long_about (which mirrors about) with the translation.
-            let cmd = if let Some(existing_long) = cmd.get_long_about() {
-                let long_str = existing_long.to_string();
-                let after_first = long_str.lines().skip(1).collect::<Vec<_>>().join("\n");
-                let new_long = if after_first.trim().is_empty() {
-                    about.clone()
-                } else {
-                    format!("{about}\n{after_first}")
-                };
-                cmd.about(about).long_about(new_long)
-            } else {
-                cmd.about(about)
-            };
-            cmd
-        }
+        Some(about) => cmd.about(about),
+        None => cmd,
+    };
+
+    let long_about_key = format!("{prefix}-long-about");
+    let cmd = match crate::i18n::get_cli_string(&long_about_key) {
+        Some(long_about) => cmd.long_about(long_about),
         None => cmd,
     };
 

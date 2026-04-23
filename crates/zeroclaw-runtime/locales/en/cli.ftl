@@ -101,3 +101,180 @@ cli-sop-validate-about = Validate SOP definitions
 cli-sop-show-about = Show details of an SOP
 
 cli-migrate-openclaw-about = Import memory from an OpenClaw workspace into this ZeroClaw workspace
+
+cli-agent-long-about =
+    Start the AI agent loop.
+
+    Launches an interactive chat session with the configured AI provider. Use --message for single-shot queries without entering interactive mode.
+
+    Examples:
+      zeroclaw agent                              # interactive session
+      zeroclaw agent -m "Summarize today's logs"  # single message
+      zeroclaw agent -p anthropic --model claude-sonnet-4-20250514
+      zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0
+
+cli-gateway-long-about =
+    Manage the gateway server (webhooks, websockets).
+
+    Start, restart, or inspect the HTTP/WebSocket gateway that accepts incoming webhook events and WebSocket connections.
+
+    Examples:
+      zeroclaw gateway start              # start gateway
+      zeroclaw gateway restart            # restart gateway
+      zeroclaw gateway get-paircode       # show pairing code
+
+cli-acp-long-about =
+    Start the ACP server (JSON-RPC 2.0 over stdio).
+
+    Launches a JSON-RPC 2.0 server on stdin/stdout for IDE and tool integration. Supports session management and streaming agent responses as notifications.
+
+    Methods: initialize, session/new, session/prompt, session/stop.
+
+    Examples:
+      zeroclaw acp                        # start ACP server
+      zeroclaw acp --max-sessions 5       # limit concurrent sessions
+
+cli-daemon-long-about =
+    Start the long-running autonomous daemon.
+
+    Launches the full ZeroClaw runtime: gateway server, all configured channels (Telegram, Discord, Slack, etc.), heartbeat monitor, and the cron scheduler. This is the recommended way to run ZeroClaw in production or as an always-on assistant.
+
+    Use 'zeroclaw service install' to register the daemon as an OS service (systemd/launchd) for auto-start on boot.
+
+    Examples:
+      zeroclaw daemon                   # use config defaults
+      zeroclaw daemon -p 9090           # gateway on port 9090
+      zeroclaw daemon --host 127.0.0.1  # localhost only
+
+cli-cron-long-about =
+    Configure and manage scheduled tasks.
+
+    Schedule recurring, one-shot, or interval-based tasks using cron expressions, RFC 3339 timestamps, durations, or fixed intervals.
+
+    Cron expressions use the standard 5-field format: 'min hour day month weekday'. Timezones default to UTC; override with --tz and an IANA timezone name.
+
+    Examples:
+      zeroclaw cron list
+      zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
+      zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
+      zeroclaw cron add '*/5 * * * *' 'echo ok'
+      zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
+      zeroclaw cron add-every 60000 'Ping heartbeat'
+      zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
+      zeroclaw cron pause TASK_ID
+      zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London
+
+cli-channel-long-about =
+    Manage communication channels.
+
+    Add, remove, list, send, and health-check channels that connect ZeroClaw to messaging platforms. Supported channel types: telegram, discord, slack, whatsapp, matrix, imessage, email.
+
+    Examples:
+      zeroclaw channel list
+      zeroclaw channel doctor
+      zeroclaw channel add telegram '{ "{" }"bot_token":"...","name":"my-bot"{ "}" }'
+      zeroclaw channel remove my-bot
+      zeroclaw channel bind-telegram zeroclaw_user
+      zeroclaw channel send 'Alert!' --channel-id telegram --recipient 123456789
+
+cli-hardware-long-about =
+    Discover and introspect USB hardware.
+
+    Enumerate connected USB devices, identify known development boards (STM32 Nucleo, Arduino, ESP32), and retrieve chip information via probe-rs / ST-Link.
+
+    Examples:
+      zeroclaw hardware discover
+      zeroclaw hardware introspect /dev/ttyACM0
+      zeroclaw hardware info --chip STM32F401RETx
+
+cli-peripheral-long-about =
+    Manage hardware peripherals.
+
+    Add, list, flash, and configure hardware boards that expose tools to the agent (GPIO, sensors, actuators). Supported boards: nucleo-f401re, rpi-gpio, esp32, arduino-uno.
+
+    Examples:
+      zeroclaw peripheral list
+      zeroclaw peripheral add nucleo-f401re /dev/ttyACM0
+      zeroclaw peripheral add rpi-gpio native
+      zeroclaw peripheral flash --port /dev/cu.usbmodem12345
+      zeroclaw peripheral flash-nucleo
+
+cli-memory-long-about =
+    Manage agent memory entries.
+
+    List, inspect, and clear memory entries stored by the agent. Supports filtering by category and session, pagination, and batch clearing with confirmation.
+
+    Examples:
+      zeroclaw memory stats
+      zeroclaw memory list
+      zeroclaw memory list --category core --limit 10
+      zeroclaw memory get KEY
+      zeroclaw memory clear --category conversation --yes
+
+cli-config-long-about =
+    Manage ZeroClaw configuration.
+
+    View, set, or initialize config properties by dotted path. Use 'schema' to dump the full JSON Schema for the config file.
+
+    Properties are addressed by dotted path (e.g. channels.matrix.mention-only).
+    Secret fields (API keys, tokens) automatically use masked input.
+    Enum fields offer interactive selection when value is omitted.
+
+    Examples:
+      zeroclaw config list                                  # list all properties
+      zeroclaw config list --secrets                        # list only secrets
+      zeroclaw config list --filter channels.matrix         # filter by prefix
+      zeroclaw config get channels.matrix.mention-only      # get a value
+      zeroclaw config set channels.matrix.mention-only true # set a value
+      zeroclaw config set channels.matrix.access-token      # secret: masked input
+      zeroclaw config set channels.matrix.stream-mode       # enum: interactive select
+      zeroclaw config init channels.matrix                  # init section with defaults
+      zeroclaw config schema                                # print JSON Schema to stdout
+      zeroclaw config schema > schema.json
+
+    Property path tab completion is included automatically in `zeroclaw completions <shell>`.
+
+cli-update-long-about =
+    Check for and apply ZeroClaw updates.
+
+    By default, downloads and installs the latest release with a 6-phase pipeline: preflight, download, backup, validate, swap, and smoke test. Automatic rollback on failure.
+
+    Use --check to only check for updates without installing.
+    Use --force to skip the confirmation prompt.
+    Use --version to target a specific release instead of latest.
+
+    Examples:
+      zeroclaw update                      # download and install latest
+      zeroclaw update --check              # check only, don't install
+      zeroclaw update --force              # install without confirmation
+      zeroclaw update --version 0.6.0      # install specific version
+
+cli-self-test-long-about =
+    Run diagnostic self-tests to verify the ZeroClaw installation.
+
+    By default, runs the full test suite including network checks (gateway health, memory round-trip). Use --quick to skip network checks for faster offline validation.
+
+    Examples:
+      zeroclaw self-test             # full suite
+      zeroclaw self-test --quick     # quick checks only (no network)
+
+cli-completions-long-about =
+    Generate shell completion scripts for `zeroclaw`.
+
+    The script is printed to stdout so it can be sourced directly:
+
+    Examples:
+      source <(zeroclaw completions bash)
+      zeroclaw completions zsh > ~/.zfunc/_zeroclaw
+      zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish
+
+cli-desktop-long-about =
+    Launch the ZeroClaw companion desktop app.
+
+    The companion app is a lightweight menu bar / system tray application that connects to the same gateway as the CLI. It provides quick access to the dashboard, status monitoring, and device pairing.
+
+    Use --install to download the pre-built companion app for your platform.
+
+    Examples:
+      zeroclaw desktop              # launch the companion app
+      zeroclaw desktop --install    # download and install it

@@ -192,19 +192,76 @@ fn call_api(
 }
 
 /// Parse an FTL file into an ordered list of (key, value) pairs.
-/// Comment lines and blank lines are ignored; the order of keys is preserved.
+/// Handles both single-line (`key = value`) and multi-line (indented continuation) FTL values.
 fn parse_ftl(src: &str) -> Vec<(String, String)> {
-    let mut entries = vec![];
+    let mut entries: Vec<(String, String)> = vec![];
+    let mut current_key: Option<String> = None;
+    let mut current_lines: Vec<String> = vec![];
+
     for line in src.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('-') {
+        // Continuation line of a multi-line value (4-space or tab indent)
+        if (line.starts_with("    ") || line.starts_with('\t')) && current_key.is_some() {
+            current_lines.push(line.trim().to_string());
             continue;
         }
+
+        let trimmed = line.trim();
+
+        // Blank line: part of multi-line value if inside one, otherwise ignored
+        if trimmed.is_empty() {
+            if current_key.is_some() {
+                current_lines.push(String::new());
+            }
+            continue;
+        }
+
+        // Comment or term: flush pending entry and skip
+        if trimmed.starts_with('#') || trimmed.starts_with('-') {
+            flush_entry(&mut entries, &mut current_key, &mut current_lines);
+            continue;
+        }
+
+        // New `key = value` line
         if let Some((key, value)) = trimmed.split_once(" = ") {
-            entries.push((key.trim().to_string(), value.to_string()));
+            flush_entry(&mut entries, &mut current_key, &mut current_lines);
+            current_key = Some(key.trim().to_string());
+            let value = value.trim();
+            if !value.is_empty() {
+                current_lines.push(value.to_string());
+            }
         }
     }
+
+    flush_entry(&mut entries, &mut current_key, &mut current_lines);
     entries
+}
+
+fn flush_entry(entries: &mut Vec<(String, String)>, key: &mut Option<String>, lines: &mut Vec<String>) {
+    if let Some(k) = key.take() {
+        while lines.last().map_or(false, |l| l.is_empty()) {
+            lines.pop();
+        }
+        let value = lines.join("\n");
+        if !value.is_empty() {
+            entries.push((k, value));
+        }
+        lines.clear();
+    }
+}
+
+fn write_ftl_entry(out: &mut String, key: &str, value: &str) {
+    if value.contains('\n') {
+        out.push_str(&format!("{key} =\n"));
+        for line in value.lines() {
+            if line.is_empty() {
+                out.push('\n');
+            } else {
+                out.push_str(&format!("    {line}\n"));
+            }
+        }
+    } else {
+        out.push_str(&format!("{key} = {value}\n"));
+    }
 }
 
 /// Write a locale FTL file, using en_entries to preserve key order and comments.
@@ -221,10 +278,9 @@ fn write_ftl(
 
     let mut out = String::new();
 
-    // Write keys in en order
     for (key, _en_value) in en_entries {
         if let Some(translated) = locale_map.get(key.as_str()) {
-            out.push_str(&format!("{key} = {translated}\n"));
+            write_ftl_entry(&mut out, key, translated);
         }
         // Keys not yet translated are omitted (runtime falls back to English)
     }
@@ -233,7 +289,7 @@ fn write_ftl(
     let en_set: std::collections::HashSet<&str> = en_entries.iter().map(|(k, _)| k.as_str()).collect();
     for (key, value) in locale_entries {
         if !en_set.contains(key.as_str()) {
-            out.push_str(&format!("{key} = {value}\n"));
+            write_ftl_entry(&mut out, key, value);
         }
     }
 
