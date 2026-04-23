@@ -74,7 +74,10 @@ use std::sync::Arc;
 use zeroclaw_config::schema::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
 
 #[cfg(feature = "memory-postgres")]
-fn build_postgres_memory(storage_provider: &StorageProviderConfig) -> anyhow::Result<Box<dyn Memory>> {
+fn build_postgres_memory(
+    memory_config: &MemoryConfig,
+    storage_provider: &StorageProviderConfig,
+) -> anyhow::Result<Box<dyn Memory>> {
     use postgres::PostgresMemory;
     let db_url = storage_provider
         .db_url
@@ -85,14 +88,17 @@ fn build_postgres_memory(storage_provider: &StorageProviderConfig) -> anyhow::Re
         &storage_provider.schema,
         &storage_provider.table,
         storage_provider.connect_timeout_secs,
-        Some(storage_provider.pgvector_enabled),
-        Some(storage_provider.pgvector_dimensions),
+        Some(memory_config.pgvector_enabled),
+        Some(memory_config.pgvector_dimensions),
     )?;
     Ok(Box::new(memory))
 }
 
 #[cfg(not(feature = "memory-postgres"))]
-fn build_postgres_memory(_storage_provider: &StorageProviderConfig) -> anyhow::Result<Box<dyn Memory>> {
+fn build_postgres_memory(
+    _memory_config: &MemoryConfig,
+    _storage_provider: &StorageProviderConfig,
+) -> anyhow::Result<Box<dyn Memory>> {
     anyhow::bail!(
         "memory backend 'postgres' requested but this build was compiled without \
          `memory-postgres`; rebuild with `--features memory-postgres`"
@@ -115,7 +121,10 @@ where
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
         MemoryBackendKind::Postgres => {
-            build_postgres_memory(&StorageProviderConfig::default())
+            build_postgres_memory(
+                &MemoryConfig::default(),
+                &StorageProviderConfig::default(),
+            )
         }
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
@@ -417,7 +426,7 @@ pub fn create_memory_with_storage_and_routes(
     if matches!(backend_kind, MemoryBackendKind::Postgres) {
         let fallback = StorageProviderConfig::default();
         let provider = storage_provider.unwrap_or(&fallback);
-        return build_postgres_memory(provider);
+        return build_postgres_memory(config, provider);
     }
 
     create_memory_with_builders(

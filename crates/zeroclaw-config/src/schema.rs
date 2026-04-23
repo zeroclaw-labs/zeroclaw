@@ -5042,14 +5042,6 @@ pub struct StorageProviderConfig {
     /// Optional connection timeout in seconds for remote providers.
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,
-
-    /// Enable pgvector extension for hybrid vector+keyword recall.
-    #[serde(default)]
-    pub pgvector_enabled: bool,
-
-    /// Vector dimensions for pgvector embeddings (default: 1536).
-    #[serde(default = "default_pgvector_dimensions")]
-    pub pgvector_dimensions: usize,
 }
 
 fn default_storage_schema() -> String {
@@ -5060,10 +5052,6 @@ fn default_storage_table() -> String {
     "memories".into()
 }
 
-fn default_pgvector_dimensions() -> usize {
-    1536
-}
-
 impl Default for StorageProviderConfig {
     fn default() -> Self {
         Self {
@@ -5072,8 +5060,6 @@ impl Default for StorageProviderConfig {
             schema: default_storage_schema(),
             table: default_storage_table(),
             connect_timeout_secs: None,
-            pgvector_enabled: false,
-            pgvector_dimensions: default_pgvector_dimensions(),
         }
     }
 }
@@ -5259,6 +5245,17 @@ pub struct MemoryConfig {
     #[serde(default)]
     #[nested]
     pub qdrant: QdrantConfig,
+
+    // ── PostgreSQL backend options ─────────────────────────────
+    /// Enable pgvector extension for hybrid vector+keyword recall.
+    /// Only used when `backend = "postgres"`.
+    #[serde(default)]
+    pub pgvector_enabled: bool,
+
+    /// Vector dimensions for pgvector embeddings (default: 1536).
+    /// Only used when `backend = "postgres"` and `pgvector_enabled = true`.
+    #[serde(default = "default_pgvector_dimensions")]
+    pub pgvector_dimensions: usize,
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
@@ -5297,6 +5294,10 @@ fn default_conflict_threshold() -> f64 {
 }
 fn default_audit_retention_days() -> u32 {
     30
+}
+
+fn default_pgvector_dimensions() -> usize {
+    1536
 }
 
 fn default_embedding_provider() -> String {
@@ -5382,6 +5383,8 @@ impl Default for MemoryConfig {
             policy: MemoryPolicyConfig::default(),
             sqlite_open_timeout_secs: None,
             qdrant: QdrantConfig::default(),
+            pgvector_enabled: false,
+            pgvector_dimensions: default_pgvector_dimensions(),
         }
     }
 }
@@ -11626,32 +11629,36 @@ auto_save = true
         assert_eq!(storage.provider.config.schema, "public");
         assert_eq!(storage.provider.config.table, "memories");
         assert!(storage.provider.config.connect_timeout_secs.is_none());
-        assert!(!storage.provider.config.pgvector_enabled);
-        assert_eq!(storage.provider.config.pgvector_dimensions, 1536);
     }
 
     #[test]
-    async fn storage_provider_config_pgvector_roundtrip() {
+    async fn memory_config_pgvector_defaults() {
+        let memory = MemoryConfig::default();
+        assert!(!memory.pgvector_enabled);
+        assert_eq!(memory.pgvector_dimensions, 1536);
+    }
+
+    #[test]
+    async fn memory_config_pgvector_roundtrip() {
         let toml = r#"
-            provider = "postgres"
-            db_url = "postgres://localhost/zeroclaw"
+            backend = "postgres"
             pgvector_enabled = true
             pgvector_dimensions = 768
         "#;
-        let parsed: StorageProviderConfig = toml::from_str(toml).unwrap();
+        let parsed: MemoryConfig = toml::from_str(toml).unwrap();
         assert!(parsed.pgvector_enabled);
         assert_eq!(parsed.pgvector_dimensions, 768);
 
         let serialized = toml::to_string(&parsed).unwrap();
-        let reparsed: StorageProviderConfig = toml::from_str(&serialized).unwrap();
+        let reparsed: MemoryConfig = toml::from_str(&serialized).unwrap();
         assert!(reparsed.pgvector_enabled);
         assert_eq!(reparsed.pgvector_dimensions, 768);
     }
 
     #[test]
-    async fn storage_provider_config_pgvector_defaults_when_omitted() {
-        let toml = r#"provider = "postgres""#;
-        let parsed: StorageProviderConfig = toml::from_str(toml).unwrap();
+    async fn memory_config_pgvector_defaults_when_omitted() {
+        let toml = r#"backend = "postgres""#;
+        let parsed: MemoryConfig = toml::from_str(toml).unwrap();
         assert!(!parsed.pgvector_enabled);
         assert_eq!(parsed.pgvector_dimensions, 1536);
     }
