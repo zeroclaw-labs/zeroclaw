@@ -82,6 +82,25 @@ fn unbracketed_law_article_re() -> &'static Regex {
     })
 }
 
+/// Matches `제N1조[의M1] {범위 구분자} 제N2조[의M2]` — a closed article
+/// range. Used to expand citations like `제36조 내지 제40조` into
+/// individual references for every integer in the range.
+///
+/// Supports two range separators seen in Korean legal writing:
+///   - `내지` (the formal legal term, by far the most common)
+///   - `부터 ... 까지` (less common; captured but the `까지` tail is
+///     consumed as context — the underlying regex simplification is
+///     that `(?:내지|부터)` produces a clean "from-to" bracket)
+fn article_range_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(
+            r"제\s*(\d+)\s*조(?:의\s*(\d+))?\s*(?:내지|부터)\s*제\s*(\d+)\s*조(?:의\s*(\d+))?",
+        )
+        .unwrap()
+    })
+}
+
 /// Matches `제N조[의M][제K항][제L호]` — a bare article reference. Used once
 /// a law-name context has been established by a prior match.
 fn article_ref_re() -> &'static Regex {
@@ -163,6 +182,89 @@ pub fn extract_statute_citations(text: &str, initial_law: Option<&str>) -> Vec<S
     }
     anchors.sort_by_key(|&(pick, _, _)| pick);
 
+    // Pass 1.5: expand `제N1조 내지 제N2조` ranges BEFORE the bare-article
+    // pass consumes the endpoints individually. For each range we emit one
+    // StatuteRef per integer in [N1, N2] (main article numbers only —
+    // sub-articles like `제36조의2` inside the range would require per-law
+    // knowledge to enumerate correctly, so we emit just the start/end
+    // sub-articles if present). Hard cap of `MAX_RANGE_EXPANSION`
+    // protects against pathological `제1조 내지 제1000조`.
+    const MAX_RANGE_EXPANSION: u32 = 50;
+    let mut ranges_consumed: Vec<(usize, usize)> = Vec::new();
+    for m in article_range_re().captures_iter(text) {
+        let whole = m.get(0).unwrap();
+        let start = whole.start();
+        let start_art: u32 = match m.get(1).and_then(|x| x.as_str().parse().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let start_sub: Option<u32> = m.get(2).and_then(|x| x.as_str().parse().ok());
+        let end_art: u32 = match m.get(3).and_then(|x| x.as_str().parse().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let end_sub: Option<u32> = m.get(4).and_then(|x| x.as_str().parse().ok());
+        if end_art < start_art {
+            continue; // malformed range; leave for Pass 2 to handle endpoints individually
+        }
+        // Find applicable law.
+        let anchor = anchors.iter().rev().find(|(pick, _, _)| *pick <= start + 1);
+        let (law, raw_start) = match anchor {
+            Some((_, s, l)) => (l.clone(), *s),
+            None => match current_law.clone() {
+                Some(l) => (l, start),
+                None => continue,
+            },
+        };
+        let raw_slice = if raw_start < whole.end()
+            && text.is_char_boundary(raw_start)
+            && text.is_char_boundary(whole.end())
+        {
+            text[raw_start..whole.end()].to_string()
+        } else {
+            whole.as_str().to_string()
+        };
+        // Emit the endpoints (with their sub-articles if any).
+        out.push(StatuteRef {
+            law_name: law.clone(),
+            article: start_art,
+            article_sub: start_sub,
+            paragraph: None,
+            item: None,
+            raw: raw_slice.clone(),
+        });
+        // Middle articles — cap at MAX_RANGE_EXPANSION to avoid blow-up.
+        let span_len = end_art.saturating_sub(start_art);
+        let capped_end = if span_len > MAX_RANGE_EXPANSION {
+            start_art + MAX_RANGE_EXPANSION
+        } else {
+            end_art
+        };
+        for n in (start_art + 1)..capped_end {
+            out.push(StatuteRef {
+                law_name: law.clone(),
+                article: n,
+                article_sub: None,
+                paragraph: None,
+                item: None,
+                raw: raw_slice.clone(),
+            });
+        }
+        // Final endpoint (use end_sub if same as capped; otherwise the raw regex end).
+        if capped_end == end_art {
+            out.push(StatuteRef {
+                law_name: law.clone(),
+                article: end_art,
+                article_sub: end_sub,
+                paragraph: None,
+                item: None,
+                raw: raw_slice.clone(),
+            });
+        }
+        current_law = Some(law);
+        ranges_consumed.push((whole.start(), whole.end()));
+    }
+
     // Pass 2: for every bare article match, look up the most recent anchor
     // whose position ≤ match.start(); use that law. Fall back to
     // `current_law`. The anchor's `span_start` becomes the start of the
@@ -171,6 +273,16 @@ pub fn extract_statute_citations(text: &str, initial_law: Option<&str>) -> Vec<S
     for m in article_ref_re().captures_iter(text) {
         let whole = m.get(0).unwrap();
         let start = whole.start();
+
+        // Skip matches that fall inside a range already expanded by
+        // Pass 1.5 — otherwise the endpoints of `제36조 내지 제40조`
+        // would produce duplicate StatuteRefs.
+        if ranges_consumed
+            .iter()
+            .any(|(s, e)| *s <= start && whole.end() <= *e)
+        {
+            continue;
+        }
 
         // Find the applicable law context.
         let anchor_match = anchors
@@ -450,5 +562,72 @@ mod tests {
         assert_eq!(r[0].law_name, "민법");
         assert_eq!(r[0].article, 839);
         assert_eq!(r[0].article_sub, Some(2));
+    }
+
+    #[test]
+    fn range_naeji_expands_to_every_article_in_between() {
+        // `제36조 내지 제40조` → articles 36, 37, 38, 39, 40.
+        let t = "근로기준법 제36조 내지 제40조";
+        let r = extract_statute_citations(t, None);
+        let nums: Vec<u32> = r.iter().map(|c| c.article).collect();
+        assert_eq!(nums, vec![36, 37, 38, 39, 40]);
+        assert!(r.iter().all(|c| c.law_name == "근로기준법"));
+        // Range endpoints Pass 2 would have matched must not be
+        // duplicated — the ranges_consumed guard suppresses them.
+        assert_eq!(r.len(), 5);
+    }
+
+    #[test]
+    fn range_honors_sub_articles_at_endpoints() {
+        let t = "근로기준법 제43조의2 내지 제43조의5";
+        let r = extract_statute_citations(t, None);
+        // Start and end get their sub-articles; middle fillers use the
+        // main article number only (can't infer sub-articles without
+        // per-law knowledge).
+        assert_eq!(r.first().unwrap().article_sub, Some(2));
+        assert_eq!(r.last().unwrap().article_sub, Some(5));
+        // Middle articles share the same main number 43 without subs.
+        assert!(r[1..r.len() - 1]
+            .iter()
+            .all(|c| c.article == 43 && c.article_sub.is_none()));
+    }
+
+    #[test]
+    fn range_caps_huge_expansions_at_50() {
+        let t = "민법 제1조 내지 제1000조";
+        let r = extract_statute_citations(t, None);
+        // Cap of 50 articles; endpoint included separately only if within cap.
+        assert!(r.len() <= 51, "expected ≤51 refs, got {}", r.len());
+        assert_eq!(r[0].article, 1);
+    }
+
+    #[test]
+    fn middle_dot_list_matches_each_article_independently() {
+        // Middle-dot separators (`·` U+00B7 and `ㆍ` U+318D) must not
+        // break the law-name anchor inheritance for the subsequent
+        // articles. Tests both variants.
+        for sep in &["·", "ㆍ", ", "] {
+            let t = format!("근로기준법 제36조{s}제43조{s}제56조", s = sep);
+            let r = extract_statute_citations(&t, None);
+            let nums: Vec<u32> = r.iter().map(|c| c.article).collect();
+            assert_eq!(
+                nums,
+                vec![36, 43, 56],
+                "separator `{sep}` failed: {:?}",
+                r
+            );
+            assert!(r.iter().all(|c| c.law_name == "근로기준법"));
+        }
+    }
+
+    #[test]
+    fn malformed_range_falls_through_to_individual_endpoints() {
+        // Reverse-order range — we treat it as malformed and let Pass 2
+        // pick up the endpoints as independent citations.
+        let t = "근로기준법 제40조 내지 제36조";
+        let r = extract_statute_citations(t, None);
+        let nums: Vec<u32> = r.iter().map(|c| c.article).collect();
+        // Two individual matches (40 and 36), no range expansion.
+        assert_eq!(nums, vec![40, 36]);
     }
 }
