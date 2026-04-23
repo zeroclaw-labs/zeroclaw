@@ -5219,6 +5219,12 @@ fn setup_channels(
                     allowed_users,
                     proxy_url: existing_nc.and_then(|n| n.proxy_url.clone()),
                     bot_name: existing_nc.and_then(|n| n.bot_name.clone()),
+                    stream_mode: existing_nc
+                        .map(|n| n.stream_mode)
+                        .unwrap_or(StreamMode::Off),
+                    draft_update_interval_ms: existing_nc
+                        .map(|n| n.draft_update_interval_ms)
+                        .unwrap_or(1000),
                 });
 
                 println!("  {} Nextcloud Talk configured", style("✅").green().bold());
@@ -8368,6 +8374,8 @@ mod tests {
             allowed_users: vec!["*".into()],
             proxy_url: None,
             bot_name: None,
+            stream_mode: zeroclaw_config::schema::StreamMode::default(),
+            draft_update_interval_ms: 1000,
         });
         assert!(has_launchable_channels(&channels));
 

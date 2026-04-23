@@ -904,6 +904,8 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     allowed_users: vec![],
                     proxy_url: None,
                     bot_name: None,
+                    stream_mode: StreamMode::default(),
+                    draft_update_interval_ms: 1000,
                 });
             }
         }
