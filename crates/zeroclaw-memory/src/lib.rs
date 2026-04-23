@@ -19,10 +19,6 @@
 pub mod audit;
 pub mod backend;
 pub mod chunker;
-#[cfg(feature = "memory-postgres")]
-pub mod knowledge_graph_pg;
-#[cfg(feature = "memory-postgres")]
-pub mod postgres;
 pub mod conflict;
 pub mod consolidation;
 pub mod decay;
@@ -30,11 +26,15 @@ pub mod embeddings;
 pub mod hygiene;
 pub mod importance;
 pub mod knowledge_graph;
+#[cfg(feature = "memory-postgres")]
+pub mod knowledge_graph_pg;
 pub mod lucid;
 pub mod markdown;
 pub mod namespaced;
 pub mod none;
 pub mod policy;
+#[cfg(feature = "memory-postgres")]
+pub mod postgres;
 pub mod qdrant;
 pub mod response_cache;
 pub mod retrieval;
@@ -52,13 +52,13 @@ pub use backend::{
 };
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
-#[cfg(feature = "memory-postgres")]
-#[allow(unused_imports)]
-pub use postgres::PostgresMemory;
 pub use namespaced::NamespacedMemory;
 pub use none::NoneMemory;
 #[allow(unused_imports)]
 pub use policy::PolicyEnforcer;
+#[cfg(feature = "memory-postgres")]
+#[allow(unused_imports)]
+pub use postgres::PostgresMemory;
 pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
 #[allow(unused_imports)]
@@ -121,10 +121,7 @@ where
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
         MemoryBackendKind::Postgres => {
-            build_postgres_memory(
-                &MemoryConfig::default(),
-                &StorageProviderConfig::default(),
-            )
+            build_postgres_memory(&MemoryConfig::default(), &StorageProviderConfig::default())
         }
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
