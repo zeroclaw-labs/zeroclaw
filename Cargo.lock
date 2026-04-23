@@ -3049,6 +3049,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fill-fluent"
+version = "0.7.3"
+dependencies = [
+ "anyhow",
+ "clap",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "fill-translations"
 version = "0.7.3"
 dependencies = [
@@ -12858,8 +12869,6 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
- "reqwest 0.12.28",
- "serde_json",
  "tokio",
  "tower-http",
 ]
