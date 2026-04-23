@@ -50,8 +50,16 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
 }
 
 fn print_no_command_help(cmd: clap::Command) -> Result<()> {
-    println!("No command provided.");
-    println!("Try `zeroclaw onboard` to initialize your workspace.");
+    #[cfg(feature = "agent-runtime")]
+    {
+        println!("{}", crate::i18n::get_cli_string("cli-no-command-provided").as_deref().unwrap_or("No command provided."));
+        println!("{}", crate::i18n::get_cli_string("cli-try-onboard").as_deref().unwrap_or("Try `zeroclaw onboard` to initialize your workspace."));
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        println!("No command provided.");
+        println!("Try `zeroclaw onboard` to initialize your workspace.");
+    }
     println!();
 
     let mut cmd = cmd;

@@ -1,4 +1,6 @@
 cli-about = The fastest, smallest AI assistant.
+cli-no-command-provided = No command provided.
+cli-try-onboard = Try `zeroclaw onboard` to initialize your workspace.
 
 cli-onboard-about = Initialize your workspace and configuration
 cli-agent-about = Start the AI agent loop
