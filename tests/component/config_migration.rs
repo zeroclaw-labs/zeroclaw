@@ -215,7 +215,7 @@ allowed_users = ["@user:matrix.org"]
 #[test]
 fn migrate_file_returns_none_when_current() {
     let raw = r#"
-schema_version = 2
+schema_version = 3
 
 [providers]
 fallback = "openrouter"
