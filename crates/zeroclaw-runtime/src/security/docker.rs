@@ -58,7 +58,10 @@ impl DockerSandbox {
 
     pub fn with_image(image: String) -> std::io::Result<Self> {
         if Self::is_installed() {
-            Ok(Self { image, workspace_dir: None })
+            Ok(Self {
+                image,
+                workspace_dir: None,
+            })
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -259,5 +262,4 @@ mod tests {
         let sandbox = DockerSandbox::default();
         assert_eq!(sandbox.workspace_dir, None);
     }
-
 }

@@ -11,7 +11,11 @@ use zeroclaw_config::schema::{SandboxBackend, SecurityConfig};
 /// (e.g. `"native"`, `"docker"`). When the caller has set `runtime.kind = "native"`,
 /// Docker must never be selected as the sandbox backend during auto-detection —
 /// the user explicitly opted out of container wrapping.
-pub fn create_sandbox(config: &SecurityConfig, runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<dyn Sandbox> {
+pub fn create_sandbox(
+    config: &SecurityConfig,
+    runtime_kind: &str,
+    workspace_dir: Option<&Path>,
+) -> Arc<dyn Sandbox> {
     let backend = &config.sandbox.backend;
 
     // If explicitly disabled, return noop
