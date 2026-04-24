@@ -24,8 +24,30 @@ pub fn pot_file(root: &Path) -> PathBuf {
     root.join("docs/book/po/messages.pot")
 }
 
-pub fn locales() -> &'static [&'static str] {
-    &["en", "ja"]
+pub struct LocaleEntry {
+    pub code: String,
+    pub label: String,
+}
+
+pub fn locale_entries() -> Vec<LocaleEntry> {
+    let path = repo_root().join("locales.toml");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("locales.toml not found at {}", path.display()));
+    let table: toml::Table = raw.parse().expect("locales.toml is invalid TOML");
+    table.get("locale")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("locales.toml missing [[locale]] entries"))
+        .iter()
+        .filter_map(|entry| {
+            let code = entry.get("code")?.as_str()?.to_string();
+            let label = entry.get("label")?.as_str()?.to_string();
+            Some(LocaleEntry { code, label })
+        })
+        .collect()
+}
+
+pub fn locales() -> Vec<String> {
+    locale_entries().into_iter().map(|e| e.code).collect()
 }
 
 pub fn require_tool(cmd: &str, install_hint: &str) -> anyhow::Result<()> {

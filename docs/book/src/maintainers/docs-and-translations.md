@@ -7,7 +7,7 @@ ZeroClaw has two independent translation layers:
 | **App strings** | Mozilla Fluent (`.ftl`) | CLI help text, command descriptions, runtime messages |
 | **Docs** | gettext (`.po`) | Everything in this mdBook |
 
-They are filled separately and stored separately. Both use Claude as the translation backend.
+They are filled separately and stored separately. Both use a configurable provider (see `[providers.models.<name>]` in `~/.zeroclaw/config.toml`; CI uses Anthropic via `ANTHROPIC_API_KEY`).
 
 ## Building the docs locally
 
@@ -53,27 +53,21 @@ cargo mdbook sync --provider ollama --force
 
 ## Adding a new locale
 
-1. Add the locale code to `crates/zeroclaw-runtime/locales/` — create the directory and run `cargo fluent fill --locale <code>`.
-
-2. Add the locale to `xtask/src/util.rs` → `locales()`:
-   ```rust
-   &["en", "ja", "<code>"]
+1. Edit `locales.toml` at the repo root — the **only** file you need to touch:
+   ```toml
+   [[locale]]
+   code = "<code>"
+   label = "Language Name"
    ```
 
-3. Bootstrap the `.po` file for docs:
+2. Translate the app strings:
    ```bash
-   msginit --no-translator --locale=<code> \
-     --input=docs/book/po/messages.pot \
-     --output=docs/book/po/<code>.po
-   ```
-   Then run `cargo mdbook sync --locale <code>` to fill it.
-
-4. Register the locale in the lang switcher — `docs/book/theme/lang-switcher.js`:
-   ```js
-   { code: "<code>", label: "Language Name" },
+   cargo fluent fill --locale <code> --provider ollama
    ```
 
-5. Add the locale to the deploy workflow — `.github/workflows/docs-deploy.yml`:
-   ```yaml
-   LOCALES: en ja <code>
+3. Bootstrap and fill the docs `.po` file:
+   ```bash
+   cargo mdbook sync --locale <code> --provider ollama
    ```
+
+Everything else — `lang-switcher.js`, CI deploy — reads from `locales.toml` automatically.

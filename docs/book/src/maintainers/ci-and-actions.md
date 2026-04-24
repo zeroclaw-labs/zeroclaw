@@ -20,7 +20,7 @@ What it does:
 1. Generates `docs/book/src/reference/cli.md` and `config.md` from the live code
 2. Generates the rustdoc API reference
 3. Validates `.po` format — **fails the deploy if any `.po` file is malformed**
-4. Builds mdBook for every locale in `LOCALES: en ja` → `docs/book/book/{locale}/`
+4. Builds mdBook for every locale in `locales.toml` → `docs/book/book/{locale}/`
 5. Assembles the Pages artifact (rustdoc + locale redirect `index.html`)
 6. Deploys to GitHub Pages
 
@@ -44,7 +44,7 @@ Run this before a release to AI-fill any untranslated or fuzzy strings in the `.
 
 | Input | Options | Default | Notes |
 |---|---|---|---|
-| `locales` | Space-separated codes | all (`ja`) | Leave blank for all configured locales |
+| `locales` | Space-separated codes | all (from `locales.toml`) | Leave blank for all configured locales |
 | `force` | true / false | false | Re-translate everything, not just the delta |
 | `model` | haiku / sonnet / opus | `claude-haiku-4-5-20251001` | Haiku is fast and cheap for delta fills; use sonnet or opus for release quality passes |
 

@@ -1,0 +1,12 @@
+[[locale]]
+code = "en"
+label = "English"
+
+[[locale]]
+code = "ja"
+label = "日本語"
+
+[[locale]]
+code = "es"
+label = "Español"
+

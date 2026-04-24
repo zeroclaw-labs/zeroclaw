@@ -26,7 +26,7 @@ cargo mdbook check                       # validate .po format (run before a tra
 | [`mdbook`](https://rust-lang.github.io/mdBook/) | `cargo install mdbook --locked` |
 | [`mdbook-i18n-helpers`](https://github.com/google/mdbook-i18n-helpers) | `cargo install mdbook-i18n-helpers --locked` |
 | `cargo` | <https://rustup.rs> |
-| `gettext` (msgfmt, msgmerge, msginit) | `apt install gettext` / `brew install gettext` |
+| `gettext` (msgfmt, msgmerge) | `apt install gettext` / `brew install gettext` |
 
 ## What gets built where
 
@@ -54,18 +54,21 @@ Without `--provider`, `cargo mdbook sync` still runs extract + merge and reports
 
 ## Adding a new locale
 
-1. Run `cargo mdbook sync --locale xx --provider <name>` — if the `.po` file doesn't exist it bootstraps it automatically, then fills all entries:
+1. Edit `locales.toml` at the repo root — the **only** file you need to touch:
+   ```toml
+   [[locale]]
+   code = "xx"
+   label = "Language Name"
+   ```
+   Everything else (`lang-switcher.js`, CI, `cargo fluent fill`, `cargo mdbook sync`) reads from this file automatically.
+
+2. Bootstrap and fill the docs translations:
    ```bash
    cargo mdbook sync --locale xx --provider ollama
    ```
+   If the `.po` file doesn't exist it's bootstrapped automatically, then all entries are filled.
 
-4. Update LOCALES in all four places — they must stay in sync:
-   - `xtask/src/util.rs` — `locales()` slice
-   - `docs/book/theme/lang-switcher.js` — add `{ code: "xx", label: "Language Name" }`
-   - `.github/workflows/docs-deploy.yml` — `LOCALES: en ja xx`
-   - `crates/zeroclaw-runtime/locales/` — create the locale directory and run `cargo fluent fill --locale xx`
-
-5. Validate and preview:
+3. Validate and preview:
    ```bash
    cargo mdbook check              # exits non-zero on format errors
    cargo mdbook stats              # show coverage counts
@@ -98,12 +101,12 @@ Go to **Actions → Translate docs (manual) → Run workflow**:
 
 | Input | Description |
 |---|---|
-| `locales` | Space-separated locales (`ja ko fr`), or leave blank for all |
+| `locales` | Space-separated locale codes, or leave blank for all in `locales.toml` |
 | `force` | Re-translate everything, not just the delta |
-| `model` | `claude-haiku-4-5-20251001` (default), `claude-sonnet-4-6`, or `claude-opus-4-7` |
+| `model` | Claude model to use — haiku (fast/cheap), sonnet, or opus |
 
 The workflow commits updated `.po` files back to the branch automatically.
-Requires the `ANTHROPIC_API_KEY` repository secret (used by the CI runner; configure your own provider locally).
+Requires the `ANTHROPIC_API_KEY` repository secret.
 
 ## Tips
 

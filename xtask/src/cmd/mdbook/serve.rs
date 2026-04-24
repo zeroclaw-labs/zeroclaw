@@ -57,8 +57,9 @@ pub fn run(locale: &str) -> anyhow::Result<()> {
 
     let url = format!("http://localhost:{PORT}");
     println!("==> Serving all locales at {url}");
-    println!("    English:        {url}/en/");
-    println!("    Japanese:       {url}/ja/");
+    for entry in locale_entries() {
+        println!("    {:<16} {url}/{}/", entry.label, entry.code);
+    }
     println!("    API reference:  {url}/api/index.html");
     println!("    Live-reload:    watching locale '{locale}'");
     println!("    Press Ctrl-C to stop.");

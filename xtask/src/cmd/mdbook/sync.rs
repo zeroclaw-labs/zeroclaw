@@ -36,13 +36,13 @@ pub fn run(locale: Option<&str>, force: bool, provider: Option<&str>) -> anyhow:
     }
 
     // Step 2+3: per-locale merge + AI fill
-    let targets: Vec<&str> = match locale {
-        Some(l) => vec![l],
-        None => locales().iter().copied().filter(|&l| l != "en").collect(),
+    let targets: Vec<String> = match locale {
+        Some(l) => vec![l.to_string()],
+        None => locales().into_iter().filter(|l| l != "en").collect(),
     };
 
     for locale in &targets {
-        if *locale == "en" {
+        if locale == "en" {
             continue;
         }
         let po_file = po_dir.join(format!("{locale}.po"));
@@ -87,7 +87,7 @@ pub fn run(locale: Option<&str>, force: bool, provider: Option<&str>) -> anyhow:
 
     println!("\n==> Translation summary:");
     for locale in &targets {
-        if *locale == "en" { continue; }
+        if locale == "en" { continue; }
         let po_file = po_dir.join(format!("{locale}.po"));
         if !po_file.exists() { continue; }
         print!("    {locale:<8} ");

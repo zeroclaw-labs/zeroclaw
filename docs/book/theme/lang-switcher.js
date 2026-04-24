@@ -4,9 +4,8 @@
 // matches one of LOCALES, then renders a dropdown linking to the same page
 // in every other locale.
 //
-// Mirror the LOCALES list in: scripts/docs.sh (LOCALES array),
-// scripts/sync-translations.sh (LOCALES default), po/ directory,
-// and .github/workflows/docs-deploy.yml (env.LOCALES). All four must stay in sync.
+// LOCALES is generated from locales.toml at build time by `cargo mdbook build`.
+// Edit locales.toml at the repo root to add or remove locales.
 (function () {
   const LOCALES = [
     { code: "en", label: "English" },

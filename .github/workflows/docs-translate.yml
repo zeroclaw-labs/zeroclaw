@@ -37,7 +37,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          # Use default GITHUB_TOKEN — fine for committing to the same branch
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install mdBook (aarch64 musl, ~3 MB)
@@ -61,18 +60,28 @@ jobs:
       - name: Install gettext tools
         run: sudo apt-get install -y --no-install-recommends gettext
 
-      - name: Build fill-translations
-        run: cargo build --release -p fill-translations
+      - name: Write provider config
+        run: |
+          mkdir -p ~/.zeroclaw
+          cat > ~/.zeroclaw/config.toml <<EOF
+          [providers.models.anthropic]
+          base_url = "https://api.anthropic.com"
+          model = "${{ inputs.model }}"
+          api_key = "${{ secrets.ANTHROPIC_API_KEY }}"
+          EOF
 
       - name: Sync + AI-fill translations
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          LOCALES: ${{ inputs.locales != '' && inputs.locales || 'ja' }}
-          FILL_MODEL: ${{ inputs.model }}
         run: |
           FORCE_FLAG=""
           [[ "${{ inputs.force }}" == "true" ]] && FORCE_FLAG="--force"
-          ./scripts/sync-translations.sh $FORCE_FLAG
+
+          if [[ -n "${{ inputs.locales }}" ]]; then
+            for locale in ${{ inputs.locales }}; do
+              cargo mdbook sync --locale "$locale" --provider anthropic $FORCE_FLAG
+            done
+          else
+            cargo mdbook sync --provider anthropic $FORCE_FLAG
+          fi
 
       - name: Commit updated .po files
         run: |

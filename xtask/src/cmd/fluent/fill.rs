@@ -25,9 +25,9 @@ pub fn run(locale: Option<&str>, force: bool, provider: Option<&str>) -> anyhow:
         anyhow::bail!("English locale dir not found: {}", en_dir.display());
     }
 
-    let targets: Vec<&str> = match locale {
-        Some(l) => vec![l],
-        None => locales().iter().copied().filter(|&l| l != "en").collect(),
+    let targets: Vec<String> = match locale {
+        Some(l) => vec![l.to_string()],
+        None => locales().into_iter().filter(|l| l != "en").collect(),
     };
 
     let provider_name = provider.ok_or_else(|| anyhow::anyhow!("--provider <name> is required (configured in [providers.models.<name>] in config.toml)"))?;

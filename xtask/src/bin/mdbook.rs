@@ -34,6 +34,8 @@ enum Cmd {
     Stats,
     /// Validate .po file format for all locales
     Check,
+    /// Print space-separated locale codes from locales.toml (for CI use)
+    Locales,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -45,5 +47,6 @@ fn main() -> anyhow::Result<()> {
         Cmd::Sync { locale, force, provider } => cmd::mdbook::sync::run(locale.as_deref(), force, provider.as_deref()),
         Cmd::Stats                  => cmd::mdbook::stats::run(),
         Cmd::Check                  => cmd::mdbook::check::run(),
+        Cmd::Locales                => { cmd::mdbook::build::print_locales(); Ok(()) },
     }
 }

@@ -25,7 +25,6 @@ env:
   MDBOOK_VERSION: v0.5.2
   CARGO_FLAGS: --no-default-features --features schema-export
   REF_DIR: docs/book/src/reference
-  LOCALES: en ja
 
 jobs:
   deploy:
@@ -77,8 +76,9 @@ jobs:
           exit $ok
 
       - name: Build mdBook per locale
-        working-directory: docs/book
         run: |
+          LOCALES=$(cargo mdbook locales)
+          cd docs/book
           for locale in $LOCALES; do
             MDBOOK_BOOK__LANGUAGE="$locale" mdbook build -d "book/$locale"
           done
