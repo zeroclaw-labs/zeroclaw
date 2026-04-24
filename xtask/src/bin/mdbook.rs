@@ -29,6 +29,9 @@ enum Cmd {
         /// Provider name from [providers.models.<name>] in config.toml
         #[arg(long)]
         provider: Option<String>,
+        /// Entries per API call (default: 50)
+        #[arg(long)]
+        batch: Option<usize>,
     },
     /// Show translation statistics per locale
     Stats,
@@ -44,7 +47,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Serve { locale }       => cmd::mdbook::serve::run(&locale),
         Cmd::Build                  => cmd::mdbook::build::run(),
         Cmd::Refs                   => cmd::mdbook::refs::run(),
-        Cmd::Sync { locale, force, provider } => cmd::mdbook::sync::run(locale.as_deref(), force, provider.as_deref()),
+        Cmd::Sync { locale, force, provider, batch } => cmd::mdbook::sync::run(locale.as_deref(), force, provider.as_deref(), batch),
         Cmd::Stats                  => cmd::mdbook::stats::run(),
         Cmd::Check                  => cmd::mdbook::check::run(),
         Cmd::Locales                => { cmd::mdbook::build::print_locales(); Ok(()) },

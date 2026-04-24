@@ -1,7 +1,7 @@
 msgid ""
 msgstr ""
 "Project-Id-Version: ZeroClaw Docs\n"
-"POT-Creation-Date: 2026-04-24T10:31:48+10:00\n"
+"POT-Creation-Date: 2026-04-24T11:21:44+10:00\n"
 "PO-Revision-Date: 2026-04-23 00:00+0000\n"
 "Language-Team: ZeroClaw Labs <contact@shane.gg>\n"
 "Language: ja\n"
@@ -1348,8 +1348,8 @@ msgstr "フラグ"
 #: src/ops/network-deployment.md:195
 #: src/hardware/hardware-peripherals-design.md:110
 #: src/developing/plugin-protocol.md:44 src/developing/plugin-protocol.md:53
-#: src/developing/building-docs.md:99
-#: src/maintainers/docs-and-translations.md:112 src/reference/config.md:5
+#: src/developing/building-docs.md:102
+#: src/maintainers/docs-and-translations.md:115 src/reference/config.md:5
 #: src/reference/config.md:82 src/reference/config.md:104
 #: src/reference/config.md:113 src/reference/config.md:130
 #: src/reference/config.md:138 src/reference/config.md:149
@@ -3640,8 +3640,8 @@ msgstr ""
 "]\n"
 "```"
 
-#: src/tools/mcp.md:32 src/developing/building-docs.md:108
-#: src/maintainers/docs-and-translations.md:121
+#: src/tools/mcp.md:32 src/developing/building-docs.md:111
+#: src/maintainers/docs-and-translations.md:124
 msgid "Tips"
 msgstr "ヒント"
 
@@ -9756,8 +9756,8 @@ msgstr "<https://rustup.rs>"
 
 #: src/developing/building-docs.md:29
 #: src/maintainers/docs-and-translations.md:42
-msgid "`gettext` (msgfmt, msgmerge, msginit)"
-msgstr "`gettext` (msgfmt、msgmerge、msginit)"
+msgid "`gettext` (msgfmt, msgmerge)"
+msgstr ""
 
 #: src/developing/building-docs.md:29
 #: src/maintainers/docs-and-translations.md:42
@@ -9906,71 +9906,68 @@ msgstr ""
 
 #: src/developing/building-docs.md:55
 #: src/maintainers/docs-and-translations.md:68
-#: src/maintainers/docs-and-translations.md:166
+#: src/maintainers/docs-and-translations.md:169
 msgid "Adding a new locale"
 msgstr "新しいロケールの追加"
 
 #: src/developing/building-docs.md:57
 #: src/maintainers/docs-and-translations.md:70
+#: src/maintainers/docs-and-translations.md:171
 msgid ""
-"Run `cargo mdbook sync --locale xx --provider <name>` — if the `.po` file "
-"doesn't exist it bootstraps it automatically, then fills all entries:"
+"Edit `locales.toml` at the repo root — the **only** file you need to touch:"
 msgstr ""
 
-#: src/developing/building-docs.md:62
-#: src/maintainers/docs-and-translations.md:75
-msgid "Update LOCALES in all four places — they must stay in sync:"
+#: src/developing/building-docs.md:58
+#: src/maintainers/docs-and-translations.md:71
+msgid ""
+"```toml\n"
+"[[locale]]\n"
+"code = \"xx\"\n"
+"label = \"Language Name\"\n"
+"```"
 msgstr ""
-"4つの場所すべてで LOCALES を更新します — それらは同期を保つ必要があります:"
 
 #: src/developing/building-docs.md:63
 #: src/maintainers/docs-and-translations.md:76
-msgid "`xtask/src/util.rs` — `locales()` slice"
-msgstr ""
-
-#: src/developing/building-docs.md:64
-#: src/maintainers/docs-and-translations.md:77
 msgid ""
-"`docs/book/theme/lang-switcher.js` — add `{ code: \"xx\", label: \"Language "
-"Name\" }`"
+"Everything else (`lang-switcher.js`, CI, `cargo fluent fill`, `cargo mdbook "
+"sync`) reads from this file automatically."
 msgstr ""
-"`docs/book/theme/lang-switcher.js` — `{ code: \"xx\", label: \"Language "
-"Name\" }` を追加します"
 
 #: src/developing/building-docs.md:65
 #: src/maintainers/docs-and-translations.md:78
-msgid "`.github/workflows/docs-deploy.yml` — `LOCALES: en ja xx`"
-msgstr "`.github/workflows/docs-deploy.yml` — `LOCALES: en ja xx`"
-
-#: src/developing/building-docs.md:66
-#: src/maintainers/docs-and-translations.md:79
-msgid ""
-"`crates/zeroclaw-runtime/locales/` — create the locale directory and run "
-"`cargo fluent fill --locale xx`"
+msgid "Bootstrap and fill the docs translations:"
 msgstr ""
 
-#: src/developing/building-docs.md:68
-#: src/maintainers/docs-and-translations.md:81
-msgid "Validate and preview:"
-msgstr "検証とプレビュー:"
-
-#: src/developing/building-docs.md:70
-#: src/maintainers/docs-and-translations.md:83
-msgid "# exits non-zero on format errors\n"
-msgstr "# フォーマットエラーで0以外で終了します\n"
+#: src/developing/building-docs.md:69
+#: src/maintainers/docs-and-translations.md:82
+msgid ""
+"If the `.po` file doesn't exist it's bootstrapped automatically, then all "
+"entries are filled."
+msgstr ""
 
 #: src/developing/building-docs.md:71
 #: src/maintainers/docs-and-translations.md:84
+msgid "Validate and preview:"
+msgstr "検証とプレビュー:"
+
+#: src/developing/building-docs.md:73
+#: src/maintainers/docs-and-translations.md:86
+msgid "# exits non-zero on format errors\n"
+msgstr "# フォーマットエラーで0以外で終了します\n"
+
+#: src/developing/building-docs.md:74
+#: src/maintainers/docs-and-translations.md:87
 msgid "# show coverage counts\n"
 msgstr "# カバレッジカウントを表示します\n"
 
-#: src/developing/building-docs.md:75
-#: src/maintainers/docs-and-translations.md:88
+#: src/developing/building-docs.md:78
+#: src/maintainers/docs-and-translations.md:91
 msgid "Release translation workflow"
 msgstr "リリース翻訳ワークフロー"
 
-#: src/developing/building-docs.md:77
-#: src/maintainers/docs-and-translations.md:90
+#: src/developing/building-docs.md:80
+#: src/maintainers/docs-and-translations.md:93
 msgid ""
 "Before tagging a release, run a full translation pass so the docs ship in "
 "every locale. You can do this locally or via the GitHub Actions manual "
@@ -9980,79 +9977,79 @@ msgstr ""
 "ロケールで配布されるようにします。これはローカルで、またはGitHub Actionsの手"
 "動トリガーを使用して実行できます。"
 
-#: src/developing/building-docs.md:80
-#: src/maintainers/docs-and-translations.md:93
+#: src/developing/building-docs.md:83
+#: src/maintainers/docs-and-translations.md:96
 msgid "Local (recommended)"
 msgstr "ローカル (推奨)"
 
-#: src/developing/building-docs.md:83
-#: src/maintainers/docs-and-translations.md:96
+#: src/developing/building-docs.md:86
+#: src/maintainers/docs-and-translations.md:99
 msgid "# Fast delta pass (only new or changed strings since last release)\n"
 msgstr ""
 
-#: src/developing/building-docs.md:85
-#: src/maintainers/docs-and-translations.md:98
+#: src/developing/building-docs.md:88
+#: src/maintainers/docs-and-translations.md:101
 msgid "# OR: quality pass — re-translate everything\n"
 msgstr ""
 
-#: src/developing/building-docs.md:89
-#: src/maintainers/docs-and-translations.md:102
+#: src/developing/building-docs.md:92
+#: src/maintainers/docs-and-translations.md:105
 msgid "# validate before committing\n"
 msgstr "# コミット前に検証します\n"
 
-#: src/developing/building-docs.md:90
-#: src/maintainers/docs-and-translations.md:103
+#: src/developing/building-docs.md:93
+#: src/maintainers/docs-and-translations.md:106
 msgid "# review coverage\n"
 msgstr "# カバレッジを確認します\n"
 
-#: src/developing/building-docs.md:93
-#: src/maintainers/docs-and-translations.md:106
+#: src/developing/building-docs.md:96
+#: src/maintainers/docs-and-translations.md:109
 msgid ""
 "The model used is whatever is configured in `[providers.models.<name>]` in "
 "`config.toml`."
 msgstr ""
 
-#: src/developing/building-docs.md:95
-#: src/maintainers/docs-and-translations.md:108
+#: src/developing/building-docs.md:98
+#: src/maintainers/docs-and-translations.md:111
 msgid "Via GitHub Actions (`.github/workflows/docs-translate.yml`)"
 msgstr "GitHub Actions 経由 (`.github/workflows/docs-translate.yml`)"
 
-#: src/developing/building-docs.md:97
-#: src/maintainers/docs-and-translations.md:110
+#: src/developing/building-docs.md:100
+#: src/maintainers/docs-and-translations.md:113
 msgid "Go to **Actions → Translate docs (manual) → Run workflow**:"
 msgstr "**Actions → Translate docs (manual) → Run workflow** に移動します:"
 
-#: src/developing/building-docs.md:99
-#: src/maintainers/docs-and-translations.md:112
+#: src/developing/building-docs.md:102
+#: src/maintainers/docs-and-translations.md:115
 #: src/maintainers/ci-and-actions.md:45
 msgid "Input"
 msgstr "入力"
 
-#: src/developing/building-docs.md:101
-#: src/maintainers/docs-and-translations.md:114
+#: src/developing/building-docs.md:104
+#: src/maintainers/docs-and-translations.md:117
 #: src/maintainers/ci-and-actions.md:47
 msgid "`locales`"
 msgstr "`locales`"
 
-#: src/developing/building-docs.md:101
-#: src/maintainers/docs-and-translations.md:114
-msgid "Space-separated locales (`ja ko fr`), or leave blank for all"
-msgstr "スペース区切りのロケール (`ja ko fr`)、または空白のままですべて"
+#: src/developing/building-docs.md:104
+#: src/maintainers/docs-and-translations.md:117
+msgid "Space-separated locale codes, or leave blank for all in `locales.toml`"
+msgstr ""
 
-#: src/developing/building-docs.md:102
-#: src/maintainers/docs-and-translations.md:115
+#: src/developing/building-docs.md:105
+#: src/maintainers/docs-and-translations.md:118
 #: src/maintainers/ci-and-actions.md:48
 msgid "`force`"
 msgstr "`force`"
 
-#: src/developing/building-docs.md:102
-#: src/maintainers/docs-and-translations.md:115
+#: src/developing/building-docs.md:105
+#: src/maintainers/docs-and-translations.md:118
 #: src/maintainers/ci-and-actions.md:48
 msgid "Re-translate everything, not just the delta"
 msgstr "デルタだけでなく、すべてを再翻訳します"
 
-#: src/developing/building-docs.md:103
-#: src/maintainers/docs-and-translations.md:116
+#: src/developing/building-docs.md:106
+#: src/maintainers/docs-and-translations.md:119
 #: src/maintainers/ci-and-actions.md:49 src/reference/config.md:1198
 #: src/reference/config.md:1208 src/reference/config.md:1227
 #: src/reference/config.md:1863 src/reference/config.md:1882
@@ -10060,32 +10057,29 @@ msgstr "デルタだけでなく、すべてを再翻訳します"
 msgid "`model`"
 msgstr "`model`"
 
-#: src/developing/building-docs.md:103
-#: src/maintainers/docs-and-translations.md:116
-msgid ""
-"`claude-haiku-4-5-20251001` (default), `claude-sonnet-4-6`, or `claude-"
-"opus-4-7`"
+#: src/developing/building-docs.md:106
+#: src/maintainers/docs-and-translations.md:119
+msgid "Claude model to use — haiku (fast/cheap), sonnet, or opus"
 msgstr ""
-"`claude-haiku-4-5-20251001` (既定値)、`claude-sonnet-4-6`、または `claude-"
-"opus-4-7`"
 
-#: src/developing/building-docs.md:105
-#: src/maintainers/docs-and-translations.md:118
+#: src/developing/building-docs.md:108
+#: src/maintainers/docs-and-translations.md:121
 msgid ""
 "The workflow commits updated `.po` files back to the branch automatically. "
-"Requires the `ANTHROPIC_API_KEY` repository secret (used by the CI runner; "
-"configure your own provider locally)."
+"Requires the `ANTHROPIC_API_KEY` repository secret."
 msgstr ""
+"ワークフローは更新された `.po` ファイルをブランチに自動的にコミットバックしま"
+"す。`ANTHROPIC_API_KEY` リポジトリシークレットが必要です。"
 
-#: src/developing/building-docs.md:110
-#: src/maintainers/docs-and-translations.md:123
+#: src/developing/building-docs.md:113
+#: src/maintainers/docs-and-translations.md:126
 msgid ""
 "**Fast iteration on prose:** `cargo mdbook serve` auto-rebuilds on save. "
 "Skip `cargo mdbook refs` unless you've changed CLI flags or config schema."
 msgstr ""
 
-#: src/developing/building-docs.md:111
-#: src/maintainers/docs-and-translations.md:124
+#: src/developing/building-docs.md:114
+#: src/maintainers/docs-and-translations.md:127
 msgid ""
 "**Fast iteration on translations:** edit `po/<locale>.po` and reload the "
 "browser — mdbook serve detects `.po` changes and rebuilds automatically."
@@ -10093,8 +10087,8 @@ msgstr ""
 "**翻訳の高速イテレーション:** `po/<locale>.po` を編集してブラウザをリロードし"
 "てください — mdbook serve は `.po` の変更を検出して自動的に再構築されます。"
 
-#: src/developing/building-docs.md:112
-#: src/maintainers/docs-and-translations.md:125
+#: src/developing/building-docs.md:115
+#: src/maintainers/docs-and-translations.md:128
 msgid ""
 "**Cleaning up:** `rm -rf docs/book/book target/doc` removes everything "
 "generated."
@@ -10102,8 +10096,8 @@ msgstr ""
 "**クリーンアップ:** `rm -rf docs/book/book target/doc` は生成されたすべてのも"
 "のを削除します。"
 
-#: src/developing/building-docs.md:113
-#: src/maintainers/docs-and-translations.md:126
+#: src/developing/building-docs.md:116
+#: src/maintainers/docs-and-translations.md:129
 msgid ""
 "**Zero-cost re-runs:** `cargo mdbook sync` against unchanged English source "
 "completes in seconds — no AI calls, no cost."
@@ -10177,26 +10171,27 @@ msgstr ""
 
 #: src/maintainers/docs-and-translations.md:10
 msgid ""
-"They are filled separately and stored separately. Both use Claude as the "
-"translation backend."
+"They are filled separately and stored separately. Both use a configurable "
+"provider (see `[providers.models.<name>]` in `~/.zeroclaw/config.toml`; CI "
+"uses Anthropic via `ANTHROPIC_API_KEY`)."
 msgstr ""
 
-#: src/maintainers/docs-and-translations.md:128
+#: src/maintainers/docs-and-translations.md:131
 msgid "Filling app strings (Fluent)"
 msgstr ""
 
-#: src/maintainers/docs-and-translations.md:130
+#: src/maintainers/docs-and-translations.md:133
 msgid ""
 "App strings live in `crates/zeroclaw-runtime/locales/`. English is the "
 "source of truth and is embedded at compile time. Non-English locales are "
 "loaded from `~/.zeroclaw/workspace/locales/` at runtime."
 msgstr ""
 
-#: src/maintainers/docs-and-translations.md:132
+#: src/maintainers/docs-and-translations.md:135
 msgid "Configure a provider in `config.toml` once:"
 msgstr ""
 
-#: src/maintainers/docs-and-translations.md:134
+#: src/maintainers/docs-and-translations.md:137
 msgid ""
 "```toml\n"
 "[providers.models.ollama]\n"
@@ -10206,41 +10201,41 @@ msgid ""
 "```"
 msgstr ""
 
-#: src/maintainers/docs-and-translations.md:141
+#: src/maintainers/docs-and-translations.md:144
 msgid "Then:"
 msgstr ""
 
-#: src/maintainers/docs-and-translations.md:144
+#: src/maintainers/docs-and-translations.md:147
 msgid "# coverage per locale\n"
 msgstr ""
 
-#: src/maintainers/docs-and-translations.md:145
+#: src/maintainers/docs-and-translations.md:148
 msgid "# validate .ftl syntax\n"
 msgstr ""
 
-#: src/maintainers/docs-and-translations.md:146
+#: src/maintainers/docs-and-translations.md:149
 msgid "# fill missing keys\n"
 msgstr ""
 
-#: src/maintainers/docs-and-translations.md:147
+#: src/maintainers/docs-and-translations.md:150
 msgid "# retranslate everything\n"
 msgstr ""
 
-#: src/maintainers/docs-and-translations.md:148
+#: src/maintainers/docs-and-translations.md:151
 msgid "# find stale or missing keys vs Rust source\n"
 msgstr ""
 
-#: src/maintainers/docs-and-translations.md:151
+#: src/maintainers/docs-and-translations.md:154
 msgid ""
 "After filling, copy the updated `.ftl` file to your workspace and rebuild "
 "the binary to pick up the changes:"
 msgstr ""
 
-#: src/maintainers/docs-and-translations.md:157
+#: src/maintainers/docs-and-translations.md:160
 msgid "Filling doc translations (gettext)"
 msgstr ""
 
-#: src/maintainers/docs-and-translations.md:159
+#: src/maintainers/docs-and-translations.md:162
 msgid ""
 "Doc translations live in `docs/book/po/`. `cargo mdbook sync` runs extract → "
 "merge → AI-fill in one step. Without `--provider`, sync still runs extract + "
@@ -10248,58 +10243,27 @@ msgid ""
 "fall back to English at render time."
 msgstr ""
 
-#: src/maintainers/docs-and-translations.md:168
+#: src/maintainers/docs-and-translations.md:172
 msgid ""
-"Add the locale code to `crates/zeroclaw-runtime/locales/` — create the "
-"directory and run `cargo fluent fill --locale <code>`."
+"```toml\n"
+"[[locale]]\n"
+"code = \"<code>\"\n"
+"label = \"Language Name\"\n"
+"```"
 msgstr ""
 
-#: src/maintainers/docs-and-translations.md:170
-msgid "Add the locale to `xtask/src/util.rs` → `locales()`:"
-msgstr ""
-
-#: src/maintainers/docs-and-translations.md:172
-msgid "\"en\""
-msgstr ""
-
-#: src/maintainers/docs-and-translations.md:172
-msgid "\"ja\""
-msgstr ""
-
-#: src/maintainers/docs-and-translations.md:172
-#: src/maintainers/docs-and-translations.md:185
-msgid "\"<code>\""
-msgstr ""
-
-#: src/maintainers/docs-and-translations.md:175
-msgid "Bootstrap the `.po` file for docs:"
-msgstr ""
-
-#: src/maintainers/docs-and-translations.md:181
-msgid "Then run `cargo mdbook sync --locale <code>` to fill it."
+#: src/maintainers/docs-and-translations.md:178
+msgid "Translate the app strings:"
 msgstr ""
 
 #: src/maintainers/docs-and-translations.md:183
-msgid ""
-"Register the locale in the lang switcher — `docs/book/theme/lang-"
-"switcher.js`:"
-msgstr ""
-
-#: src/maintainers/docs-and-translations.md:185
-msgid "\"Language Name\""
+msgid "Bootstrap and fill the docs `.po` file:"
 msgstr ""
 
 #: src/maintainers/docs-and-translations.md:188
 msgid ""
-"Add the locale to the deploy workflow — `.github/workflows/docs-deploy.yml`:"
-msgstr ""
-
-#: src/maintainers/docs-and-translations.md:190
-msgid "LOCALES"
-msgstr ""
-
-#: src/maintainers/docs-and-translations.md:190
-msgid "en ja <code>"
+"Everything else — `lang-switcher.js`, CI deploy — reads from `locales.toml` "
+"automatically."
 msgstr ""
 
 #: src/maintainers/ci-and-actions.md:3
@@ -10355,8 +10319,7 @@ msgstr ""
 
 #: src/maintainers/ci-and-actions.md:23
 msgid ""
-"Builds mdBook for every locale in `LOCALES: en ja` → `docs/book/book/"
-"{locale}/`"
+"Builds mdBook for every locale in `locales.toml` → `docs/book/book/{locale}/`"
 msgstr ""
 
 #: src/maintainers/ci-and-actions.md:24
@@ -10498,7 +10461,7 @@ msgid "Space-separated codes"
 msgstr ""
 
 #: src/maintainers/ci-and-actions.md:47
-msgid "all (`ja`)"
+msgid "all (from `locales.toml`)"
 msgstr ""
 
 #: src/maintainers/ci-and-actions.md:47
@@ -23751,6 +23714,33 @@ msgstr ""
 "SOP 固有の集計は `sop_status` (with `include_metrics: true`) を通じて利用可能"
 "です。"
 
+#~ msgid "`gettext` (msgfmt, msgmerge, msginit)"
+#~ msgstr "`gettext` (msgfmt、msgmerge、msginit)"
+
+#~ msgid "Update LOCALES in all four places — they must stay in sync:"
+#~ msgstr ""
+#~ "4つの場所すべてで LOCALES を更新します — それらは同期を保つ必要があります:"
+
+#~ msgid ""
+#~ "`docs/book/theme/lang-switcher.js` — add `{ code: \"xx\", label: "
+#~ "\"Language Name\" }`"
+#~ msgstr ""
+#~ "`docs/book/theme/lang-switcher.js` — `{ code: \"xx\", label: \"Language "
+#~ "Name\" }` を追加します"
+
+#~ msgid "`.github/workflows/docs-deploy.yml` — `LOCALES: en ja xx`"
+#~ msgstr "`.github/workflows/docs-deploy.yml` — `LOCALES: en ja xx`"
+
+#~ msgid "Space-separated locales (`ja ko fr`), or leave blank for all"
+#~ msgstr "スペース区切りのロケール (`ja ko fr`)、または空白のままですべて"
+
+#~ msgid ""
+#~ "`claude-haiku-4-5-20251001` (default), `claude-sonnet-4-6`, or `claude-"
+#~ "opus-4-7`"
+#~ msgstr ""
+#~ "`claude-haiku-4-5-20251001` (既定値)、`claude-sonnet-4-6`、または `claude-"
+#~ "opus-4-7`"
+
 #~ msgid "# serve English at http://localhost:3000 with auto-reload\n"
 #~ msgstr "# http://localhost:3000 で自動リロード付きで英語を提供する\n"
 
@@ -23866,13 +23856,6 @@ msgstr ""
 #~ "`FILL_MODEL` 環境変数は、フラグの変更なしにデフォルトモデル (`claude-"
 #~ "haiku-4-5-20251001`) をオーバーライドします。`claude-sonnet-4-6` は、リ"
 #~ "リース品質で妥当なコストの良い中間点です。"
-
-#~ msgid ""
-#~ "The workflow commits updated `.po` files back to the branch "
-#~ "automatically. Requires the `ANTHROPIC_API_KEY` repository secret."
-#~ msgstr ""
-#~ "ワークフローは更新された `.po` ファイルをブランチに自動的にコミットバック"
-#~ "します。`ANTHROPIC_API_KEY` リポジトリシークレットが必要です。"
 
 #~ msgid ""
 #~ "**Fast iteration on prose:** use `just docs` (mdbook's serve mode auto-"
