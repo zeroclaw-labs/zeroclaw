@@ -103,6 +103,12 @@ pub struct Edge {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
     pub resolved: bool,
+    /// Highest-priority applicable-law signal — populated when the
+    /// source citation was a `구 {법}(YYYY. M. D. 개정되기 전의 것)`
+    /// form. YYYYMMDD string; the applicable law version is whichever
+    /// effective_date ≤ this date - 1 day.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision_cutoff: Option<String>,
 }
 
 /// Graphify-compatible subgraph JSON shape:
@@ -609,12 +615,18 @@ fn fetch_edges_within(conn: &Connection, slugs: &[String]) -> Result<Vec<Edge>> 
         .map(|s| s as &dyn rusqlite::ToSql)
         .collect();
     let rows = stmt.query_map(params_dyn.as_slice(), |r| {
+        let evidence: Option<String> = r.get(3)?;
+        // `[pre:YYYYMMDD] …` prefix carries the 구법 applicable-law
+        // signal. Strip it from `evidence` (cleaner display) and
+        // surface as a structured field.
+        let (revision_cutoff, evidence) = split_pre_marker(evidence);
         Ok(Edge {
             source_slug: r.get(0)?,
             target_slug: r.get(1)?,
             relation: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-            evidence: r.get::<_, Option<String>>(3)?,
+            evidence,
             resolved: r.get::<_, i64>(4)? != 0,
+            revision_cutoff,
         })
     })?;
     let mut edges: Vec<Edge> = rows.filter_map(Result::ok).collect();
@@ -631,6 +643,23 @@ fn fetch_edges_within(conn: &Connection, slugs: &[String]) -> Result<Vec<Edge>> 
             ))
     });
     Ok(edges)
+}
+
+/// If `evidence` starts with `[pre:YYYYMMDD] `, split into
+/// `(Some(YYYYMMDD), remainder)`. Otherwise `(None, original)`.
+fn split_pre_marker(evidence: Option<String>) -> (Option<String>, Option<String>) {
+    let Some(s) = evidence else {
+        return (None, None);
+    };
+    if let Some(rest) = s.strip_prefix("[pre:") {
+        if let Some(end) = rest.find("] ") {
+            let date = &rest[..end];
+            if date.len() == 8 && date.chars().all(|c| c.is_ascii_digit()) {
+                return (Some(date.to_string()), Some(rest[end + 2..].to_string()));
+            }
+        }
+    }
+    (None, Some(s))
 }
 
 fn hydrate_node(conn: &Connection, id: i64, slug: &str, kind: NodeKind) -> Result<Node> {

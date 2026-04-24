@@ -143,63 +143,99 @@ pub fn extract_article_amendment_dates(body: &str) -> Vec<String> {
     dates.into_iter().map(fmt_yyyymmdd).collect()
 }
 
-/// Infer the filing year of a judgment's originating case when no date
-/// literals were found in the body. Korean case numbers encode the year
-/// the complaint / indictment was filed as their leading 4 digits —
-/// and per the 행위시법 원칙, that year tracks the 사건발생일 closely
-/// enough to serve as a fallback for `effective_date` matching.
+/// Fallback signal when 판례 body has no explicit date literal. Each
+/// variant carries the year the caller should base the incident-date
+/// range on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncidentDateFallback {
+    /// Year extracted from the `【원심판결】 … YYYY유형NNNN …` line.
+    /// Caller should widen to `[Y-2, Y-1]` to cover both 항소심
+    /// (원심 = 1심, one level below) and 대법원 (원심 = 항소심, two
+    /// levels below) — each court tier takes roughly one year.
+    WonsimYear(u16),
+    /// Filing year of the judgment's own case number. Used when the
+    /// body has no `【원심판결】` marker, typical of 1st-instance
+    /// judgments where the 소장 접수년도 ≈ 사건발생년도.
+    OwnCaseYear(u16),
+    /// No usable signal.
+    None,
+}
+
+/// Infer a year-granularity incident-date signal when the case body has
+/// no explicit date literal. Applies the domain rule the user specified:
 ///
-/// Why the fallback exists
-/// ───────────────────────
-/// Supreme Court and appellate judgments frequently omit explicit
-/// incident dates — the 1st-instance judgment already carries them, so
-/// higher courts only reference the 사건번호. If the body carries no
-/// date literals but contains references to other cases (e.g.
-/// `【원심판결】 수원지법 2024. 5. 9. 선고 2024고정48 판결`), we take
-/// the earliest year across all referenced case numbers — excluding
-/// the current judgment's own case number — as the filing-year proxy.
+///   * **참고판례** / **관련사건** references across the body are
+///     ignored — they're OTHER cases unrelated to this judgment's
+///     incident date.
+///   * **`【원심판결】`** is the ONLY trustworthy signal for 2심 /
+///     상고심 judgments. The case number on that line encodes the
+///     year of the preceding court's filing; incidents happen
+///     1-2 years earlier (a 1심 takes ~1 year, an 항소심 another ~1).
+///   * 1심 judgments (no 원심판결) fall back to their own case year,
+///     which approximates the filing = incident year.
 ///
-/// Returns the year as a 4-digit string (`"2024"`) on success, `None`
-/// when there are no usable references. Year sanity check: 1950 ≤ year
-/// ≤ current year + 1 rejects accidental 4-digit-number captures.
-pub fn infer_filing_year_from_case_refs(
+/// The returned year is sanity-checked to `1950 ≤ y ≤ current+1` so
+/// 4-digit captures from ID strings can't poison the result.
+pub fn infer_incident_date_fallback(
     body: &str,
     own_case_number: &str,
-) -> Option<u16> {
-    use super::citation_patterns::extract_case_numbers;
+) -> IncidentDateFallback {
+    let cur_year = chrono::Utc::now().year() as u16 + 1;
+    let ok = |y: u16| -> bool { (1950..=cur_year).contains(&y) };
 
+    if let Some(y) = extract_wonsim_case_year(body).filter(|&y| ok(y)) {
+        return IncidentDateFallback::WonsimYear(y);
+    }
     let own_year: Option<u16> = own_case_number
         .chars()
         .take(4)
         .collect::<String>()
         .parse()
-        .ok();
-
-    let cur_year = chrono::Utc::now().year() as u16 + 1;
-
-    let mut candidates: Vec<u16> = extract_case_numbers(body)
-        .into_iter()
-        .filter(|c| c.case_number != own_case_number)
-        .filter_map(|c| {
-            c.case_number
-                .chars()
-                .take(4)
-                .collect::<String>()
-                .parse::<u16>()
-                .ok()
-        })
-        .filter(|&y| (1950..=cur_year).contains(&y))
-        .filter(|&y| Some(y) != own_year) // skip same-year as own case
-        .collect();
-
-    if candidates.is_empty() {
-        // If ALL candidates were the same year as own case (or there were
-        // none except the current one), fall back to the own year itself
-        // — it's still better than nothing for range matching.
-        return own_year.filter(|&y| (1950..=cur_year).contains(&y));
+        .ok()
+        .filter(|&y| ok(y));
+    match own_year {
+        Some(y) => IncidentDateFallback::OwnCaseYear(y),
+        None => IncidentDateFallback::None,
     }
-    candidates.sort();
-    candidates.first().copied()
+}
+
+/// Extract the case-number year from the `【원심판결】` line, or `None`
+/// if the marker is absent. We scope to the single logical line (up to
+/// 300 bytes or the next newline) so unrelated later references
+/// — notably 참고판례 (`참조판례`) blocks — can't leak into the match.
+fn extract_wonsim_case_year(body: &str) -> Option<u16> {
+    // Korean case files use both 【원심판결】 and 【원심】 in practice.
+    let pos = body
+        .find("【원심판결】")
+        .or_else(|| body.find("【원심】"))
+        .or_else(|| body.find("원심판결】"))?;
+    let rest = &body[pos..];
+    let end = rest
+        .find('\n')
+        .unwrap_or(rest.len())
+        .min(300);
+    let end = std::cmp::min(end, rest.len());
+    // Snap to char boundary so we don't slice mid-UTF-8.
+    let scope = if rest.is_char_boundary(end) {
+        &rest[..end]
+    } else {
+        // Walk back to the nearest char boundary.
+        let mut e = end;
+        while e > 0 && !rest.is_char_boundary(e) {
+            e -= 1;
+        }
+        &rest[..e]
+    };
+
+    let cases = super::citation_patterns::extract_case_numbers(scope);
+    cases.first().and_then(|c| {
+        c.case_number
+            .chars()
+            .take(4)
+            .collect::<String>()
+            .parse::<u16>()
+            .ok()
+    })
 }
 
 // ───────── Internals ─────────
@@ -376,37 +412,46 @@ mod tests {
     }
 
     #[test]
-    fn filing_year_fallback_picks_earliest_referenced_case() {
-        // Typical Supreme-Court judgment body with no literal dates in the
-        // reasoning section — only referenced case numbers.
+    fn fallback_uses_wonsim_line_only_ignoring_references() {
+        // 참고판례 / 관련사건 have OTHER incident dates; only 【원심판결】
+        // carries a signal that tracks the current judgment's timeline.
         let body = "【원심판결】 수원지법 안산지원 선고 2024고정48 판결. \
-                    참고판례: 대법원 2012도3166. 관련 민사사건: 2023가단92476.";
-        let y = infer_filing_year_from_case_refs(body, "2024노3424");
-        assert_eq!(y, Some(2012));
+                    참조판례: 대법원 2012. 9. 13. 선고 2012도3166 판결. \
+                    관련 민사사건: 2023가단92476.";
+        let fb = infer_incident_date_fallback(body, "2024노3424");
+        // Must pick 2024 from the 원심판결 line, NOT 2012 from 참조판례.
+        assert_eq!(fb, IncidentDateFallback::WonsimYear(2024));
     }
 
     #[test]
-    fn filing_year_fallback_excludes_own_case_number() {
+    fn fallback_falls_through_to_own_year_when_no_wonsim_marker() {
+        // 1st-instance judgment — no 원심판결 marker at all. Own case
+        // year is the best approximation.
         let body = "본건은 2024노3424 사건이다.";
-        // Only the current case's own number is present → no usable
-        // alternative, but we fall back to own year (2024) as last resort.
-        let y = infer_filing_year_from_case_refs(body, "2024노3424");
-        assert_eq!(y, Some(2024));
+        let fb = infer_incident_date_fallback(body, "2024노3424");
+        assert_eq!(fb, IncidentDateFallback::OwnCaseYear(2024));
     }
 
     #[test]
-    fn filing_year_fallback_returns_none_on_empty_body() {
-        let y = infer_filing_year_from_case_refs("", "2024노3424");
-        assert_eq!(y, Some(2024)); // own-case fallback
+    fn fallback_handles_short_wonsim_marker_variant() {
+        // Some judgments abbreviate to 【원심】.
+        let body = "【원심】 서울고등법원 2023나12345 판결";
+        let fb = infer_incident_date_fallback(body, "2024다67890");
+        assert_eq!(fb, IncidentDateFallback::WonsimYear(2023));
     }
 
     #[test]
-    fn filing_year_fallback_rejects_implausible_years() {
-        // A mangled reference with year 9999 must not poison the result.
-        let body = "참고: 9999다12345";
-        let y = infer_filing_year_from_case_refs(body, "2024노3424");
-        // The implausible year is rejected; only the own-case year remains
-        // as the last-resort fallback.
-        assert_eq!(y, Some(2024));
+    fn fallback_returns_none_only_when_own_case_year_is_malformed() {
+        let fb = infer_incident_date_fallback("", "잘못된사건번호");
+        assert_eq!(fb, IncidentDateFallback::None);
+    }
+
+    #[test]
+    fn fallback_rejects_implausible_years() {
+        // 9999 is future; rejected in both 원심 extraction and own-case.
+        let body = "【원심판결】 9999다12345";
+        let fb = infer_incident_date_fallback(body, "2024노3424");
+        // 원심 year rejected → falls through to own case year.
+        assert_eq!(fb, IncidentDateFallback::OwnCaseYear(2024));
     }
 }

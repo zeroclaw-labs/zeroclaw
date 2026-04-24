@@ -291,16 +291,31 @@ fn write_statute_edges(
         } else {
             "cross-law"
         };
+        let evidence = evidence_with_cutoff(&cite.raw, cite.revision_cutoff.as_deref());
         insert_edge(
             conn,
             source_doc_id,
             &target_slug,
             relation,
-            Some(&cite.raw),
+            Some(&evidence),
         )?;
         written += 1;
     }
     Ok(written)
+}
+
+/// Prepend the structured `[pre:YYYYMMDD] ` marker when this citation
+/// referenced a `구 {법}(... 개정되기 전의 것)` version. Downstream
+/// consumers (the viewer, graph-query tools, and the planned
+/// `legal_applicable_version` tool) parse this marker as the
+/// highest-priority applicable-law signal — bypassing any incident-date
+/// derived matching. Evidence itself is always preserved verbatim after
+/// the marker.
+fn evidence_with_cutoff(raw: &str, cutoff: Option<&str>) -> String {
+    match cutoff {
+        Some(c) if c.len() == 8 => format!("[pre:{c}] {raw}"),
+        _ => raw.to_string(),
+    }
 }
 
 fn upsert_supplement(
@@ -578,13 +593,21 @@ pub fn ingest_case(conn: &Arc<Mutex<Connection>>, doc: &CaseDoc) -> Result<Inges
 
     // Fallback: Supreme / appellate judgments routinely omit explicit
     // incident dates because the 1st-instance judgment already carried
-    // them. If no date literal was found, we infer the filing year from
-    // referenced case numbers — the first 4 digits of a Korean case
-    // number = 소장 접수 년도, which per 행위시법 원칙 aligns with the
-    // applicable statute's 시행일. We store `{year}0101` / `{year}1231`
-    // as sentinel earliest/latest so range queries still function, and
-    // surface `incident_date_source` = `filing_year_fallback` so
-    // consumers know the tolerance is ±1 year rather than exact.
+    // them. Two-tier fallback (domain-informed):
+    //
+    //   1. `【원심판결】 … YYYY유형NNNN …` line — the preceding court's
+    //      case number. Incident is 1-2 years earlier than that
+    //      court's filing (each tier takes ~1 year), so the range is
+    //      `[원심연도 - 2, 원심연도 - 1]`. This covers 항소심 (원심 =
+    //      1심) AND 대법원 (원심 = 항소심) symmetrically, which is
+    //      critical for tax law where statute revisions happen yearly.
+    //   2. No 원심판결 marker (typical of 1st-instance judgments) →
+    //      use the judgment's OWN filing year as incident year, since
+    //      1심 소장 접수 ≈ 사건발생.
+    //
+    // `참고판례` / `관련사건` references are deliberately IGNORED —
+    // they reference unrelated other cases and have no bearing on this
+    // judgment's incident date.
     let (incident_dates_csv, incident_earliest, incident_latest, incident_source) =
         if !incident_dates_capped.is_empty() {
             (
@@ -594,21 +617,32 @@ pub fn ingest_case(conn: &Arc<Mutex<Connection>>, doc: &CaseDoc) -> Result<Inges
                 "body",
             )
         } else {
-            match super::date_parse::infer_filing_year_from_case_refs(
+            match super::date_parse::infer_incident_date_fallback(
                 &body_for_dates,
                 &doc.case_number,
             ) {
-                Some(year) => {
-                    let earliest = format!("{year}0101");
-                    let latest = format!("{year}1231");
+                super::date_parse::IncidentDateFallback::WonsimYear(y) => {
+                    // Shift back by 1-2 years relative to 원심's filing.
+                    let earliest = format!("{:04}0101", y.saturating_sub(2));
+                    let latest = format!("{:04}1231", y.saturating_sub(1));
                     (
                         Some(format!("{earliest},{latest}")),
                         Some(earliest),
                         Some(latest),
-                        "filing_year_fallback",
+                        "wonsim_offset",
                     )
                 }
-                None => (None, None, None, "none"),
+                super::date_parse::IncidentDateFallback::OwnCaseYear(y) => {
+                    let earliest = format!("{y}0101");
+                    let latest = format!("{y}1231");
+                    (
+                        Some(format!("{earliest},{latest}")),
+                        Some(earliest),
+                        Some(latest),
+                        "own_case_year",
+                    )
+                }
+                super::date_parse::IncidentDateFallback::None => (None, None, None, "none"),
             }
         };
 
@@ -666,11 +700,14 @@ pub fn ingest_case(conn: &Arc<Mutex<Connection>>, doc: &CaseDoc) -> Result<Inges
         }
     }
 
-    // Edges: case → statute articles.
+    // Edges: case → statute articles. Carries the `[pre:YYYYMMDD]`
+    // marker forward for 구법 citations so the applicable-version
+    // signal survives into the graph.
     let mut edges = 0usize;
     for cite in &doc.statute_citations {
         let target = super::slug::statute_slug(&cite.law_name, cite.article, cite.article_sub);
-        insert_edge(&tx, doc_id, &target, "cites", Some(&cite.raw))?;
+        let evidence = evidence_with_cutoff(&cite.raw, cite.revision_cutoff.as_deref());
+        insert_edge(&tx, doc_id, &target, "cites", Some(&evidence))?;
         edges += 1;
     }
     // Edges: case → case.

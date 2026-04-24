@@ -29,6 +29,14 @@ pub struct StatuteRef {
     pub item: Option<u32>,
     /// Evidence — the raw matched substring.
     pub raw: String,
+    /// **Highest-priority applicable-law signal** (per domain rule).
+    /// Present when the citation was prefixed with
+    /// `구 {법령}(YYYY. M. D. … 개정되기 전의 것)`. The YYYYMMDD
+    /// string here is the revision cutoff: the applicable law is the
+    /// version whose `effective_date ≤ cutoff - 1 day`. 100% reliable
+    /// by convention — every Korean judgment that needs the pre-
+    /// revision version MUST mark it this way in 적용법조 / 적용법령.
+    pub revision_cutoff: Option<String>,
 }
 
 /// A Korean case number pulled from free text.
@@ -162,25 +170,28 @@ pub fn extract_statute_citations(text: &str, initial_law: Option<&str>) -> Vec<S
     // actual text index where the anchor's region BEGINS, so `raw` evidence
     // captures the law name and any parenthetical (e.g. a revision-date
     // block) in addition to the article reference.
-    let mut anchors: Vec<(usize, usize, String)> = Vec::new();
+    // Anchor: (pick_pos, span_start, law_name, revision_cutoff).
+    // `revision_cutoff` is populated for `구 {법}(YYYY. M. D. 개정되기
+    // 전의 것)` citations — the 최우선 applicable-law signal
+    // specifying that the law version effective *before* this date
+    // applies. Per domain rule, when present this is 100% reliable
+    // and should bypass incident-date-based version matching.
+    let mut anchors: Vec<(usize, usize, String, Option<String>)> = Vec::new();
     for m in bracketed_law_re().captures_iter(text) {
         let whole = m.get(0).unwrap();
         let raw = m.get(1).unwrap().as_str().trim();
-        // Canonicalise so `「근기법」 제43조` and `「근로기준법」 제43조`
-        // produce the same citation (and thus the same slug).
         let law = super::law_aliases::canonical_name(raw);
-        anchors.push((whole.end(), whole.start(), law));
+        let cutoff = find_revision_cutoff_near(text, whole.end());
+        anchors.push((whole.end(), whole.start(), law, cutoff));
     }
     for m in unbracketed_law_article_re().captures_iter(text) {
         let whole = m.get(0).unwrap();
         let raw = m.get(1).unwrap().as_str().trim();
         let law = super::law_aliases::canonical_name(raw);
-        // For pick_position use whole.start() so the article inside the
-        // match itself uses this law (matches the existing test expecting
-        // `pos ≤ article_start + 1`).
-        anchors.push((whole.start(), whole.start(), law));
+        let cutoff = find_revision_cutoff_near(text, whole.start());
+        anchors.push((whole.start(), whole.start(), law, cutoff));
     }
-    anchors.sort_by_key(|&(pick, _, _)| pick);
+    anchors.sort_by_key(|&(pick, _, _, _)| pick);
 
     // Pass 1.5: expand `제N1조 내지 제N2조` ranges BEFORE the bare-article
     // pass consumes the endpoints individually. For each range we emit one
@@ -207,12 +218,12 @@ pub fn extract_statute_citations(text: &str, initial_law: Option<&str>) -> Vec<S
         if end_art < start_art {
             continue; // malformed range; leave for Pass 2 to handle endpoints individually
         }
-        // Find applicable law.
-        let anchor = anchors.iter().rev().find(|(pick, _, _)| *pick <= start + 1);
-        let (law, raw_start) = match anchor {
-            Some((_, s, l)) => (l.clone(), *s),
+        // Find applicable law + any 구법 revision cutoff.
+        let anchor = anchors.iter().rev().find(|(pick, _, _, _)| *pick <= start + 1);
+        let (law, raw_start, cutoff) = match anchor {
+            Some((_, s, l, c)) => (l.clone(), *s, c.clone()),
             None => match current_law.clone() {
-                Some(l) => (l, start),
+                Some(l) => (l, start, None),
                 None => continue,
             },
         };
@@ -232,6 +243,7 @@ pub fn extract_statute_citations(text: &str, initial_law: Option<&str>) -> Vec<S
             paragraph: None,
             item: None,
             raw: raw_slice.clone(),
+            revision_cutoff: cutoff.clone(),
         });
         // Middle articles — cap at MAX_RANGE_EXPANSION to avoid blow-up.
         let span_len = end_art.saturating_sub(start_art);
@@ -248,6 +260,7 @@ pub fn extract_statute_citations(text: &str, initial_law: Option<&str>) -> Vec<S
                 paragraph: None,
                 item: None,
                 raw: raw_slice.clone(),
+                revision_cutoff: cutoff.clone(),
             });
         }
         // Final endpoint (use end_sub if same as capped; otherwise the raw regex end).
@@ -259,6 +272,7 @@ pub fn extract_statute_citations(text: &str, initial_law: Option<&str>) -> Vec<S
                 paragraph: None,
                 item: None,
                 raw: raw_slice.clone(),
+                revision_cutoff: cutoff.clone(),
             });
         }
         current_law = Some(law);
@@ -284,15 +298,15 @@ pub fn extract_statute_citations(text: &str, initial_law: Option<&str>) -> Vec<S
             continue;
         }
 
-        // Find the applicable law context.
+        // Find the applicable law context + any 구법 revision cutoff.
         let anchor_match = anchors
             .iter()
             .rev()
-            .find(|(pick, _, _)| *pick <= start + 1); // +1 so anchor at same start counts
-        let (law, raw_start) = match anchor_match {
-            Some((_, span_start, l)) => (l.clone(), *span_start),
+            .find(|(pick, _, _, _)| *pick <= start + 1); // +1 so anchor at same start counts
+        let (law, raw_start, revision_cutoff) = match anchor_match {
+            Some((_, span_start, l, c)) => (l.clone(), *span_start, c.clone()),
             None => match current_law.clone() {
-                Some(l) => (l, start),
+                Some(l) => (l, start, None),
                 None => continue, // no law context known — skip rather than guess
             },
         };
@@ -327,10 +341,65 @@ pub fn extract_statute_citations(text: &str, initial_law: Option<&str>) -> Vec<S
             paragraph,
             item,
             raw: raw_slice.to_string(),
+            revision_cutoff,
         });
     }
 
     out
+}
+
+/// Scan a window around `anchor_pos` for a revision-cutoff parenthetical of
+/// the form `(YYYY. M. D. … 개정되기 전의 것)` and return its date as
+/// `YYYYMMDD`. Scans ±250 bytes so the parenthetical can sit either side
+/// of the bracketed law name (`「구 민법」 (2007. 12. 21. …)`) or be
+/// embedded next to an unbracketed law name (`구 민법(2007. 12. 21. …)`).
+///
+/// Invalid month/day combinations are rejected. Returns `None` when no
+/// qualifying parenthetical is in range.
+fn find_revision_cutoff_near(text: &str, anchor_pos: usize) -> Option<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // `[^)]*?` absorbs optional `법률 제N호로` between the date and
+        // the "개정되기 전의 것" marker.
+        Regex::new(
+            r"\(\s*(\d{4})\s*\.\s*(\d{1,2})\s*\.\s*(\d{1,2})\s*\.?\s*[^)]*?개정되기\s*전의\s*것\s*\)",
+        )
+        .unwrap()
+    });
+
+    let pre = anchor_pos.saturating_sub(250);
+    let post = anchor_pos.saturating_add(250).min(text.len());
+    // Snap to char boundaries.
+    let mut s = pre;
+    while s > 0 && !text.is_char_boundary(s) {
+        s -= 1;
+    }
+    let mut e = post;
+    while e < text.len() && !text.is_char_boundary(e) {
+        e += 1;
+    }
+    let window = &text[s..e];
+
+    // Pick the cutoff closest to the anchor (by distance to the
+    // parenthetical's opening bracket). This keeps `구 민법(a) … 민법(b)
+    // 제X조` from attaching `a`'s cutoff to the second reference.
+    let anchor_rel = anchor_pos - s;
+    let mut best: Option<(usize, String)> = None;
+    for caps in re.captures_iter(window) {
+        let whole = caps.get(0)?;
+        let dist = whole.start().abs_diff(anchor_rel);
+        let y: u32 = caps.get(1)?.as_str().parse().ok()?;
+        let m: u32 = caps.get(2)?.as_str().parse().ok()?;
+        let d: u32 = caps.get(3)?.as_str().parse().ok()?;
+        if !(1..=12).contains(&m) || !(1..=31).contains(&d) || !(1900..=2100).contains(&y) {
+            continue;
+        }
+        let stamp = format!("{y:04}{m:02}{d:02}");
+        if best.as_ref().is_none_or(|(d2, _)| dist < *d2) {
+            best = Some((dist, stamp));
+        }
+    }
+    best.map(|(_, s)| s)
 }
 
 /// Extract case numbers from text. Associates with a court name if the
@@ -533,6 +602,55 @@ mod tests {
         let t = "구 근로기준법 (2024. 10. 22. 법률 제20520호로 개정되기 전의 것) 제36조";
         let r = extract_statute_citations(t, None);
         assert!(r.iter().any(|c| c.law_name == "근로기준법" && c.article == 36));
+    }
+
+    #[test]
+    fn revision_cutoff_is_captured_as_yyyymmdd() {
+        let t = "구 민법(2007. 12. 21. 법률 제8720호로 개정되기 전의 것) 제839조의2";
+        let r = extract_statute_citations(t, None);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].revision_cutoff.as_deref(), Some("20071221"));
+    }
+
+    #[test]
+    fn revision_cutoff_absent_for_current_version_citations() {
+        let t = "민법 제750조";
+        let r = extract_statute_citations(t, None);
+        assert_eq!(r.len(), 1);
+        assert!(r[0].revision_cutoff.is_none());
+    }
+
+    #[test]
+    fn revision_cutoff_attaches_only_to_citations_under_same_anchor() {
+        // Two anchors with different cutoffs — each reference below its
+        // own anchor picks up its own cutoff, not its neighbour's.
+        let t = "구 민법(2007. 12. 21. 개정되기 전의 것) 제839조의2, \
+                 구 근로기준법(2024. 10. 22. 개정되기 전의 것) 제36조";
+        let r = extract_statute_citations(t, None);
+        let minbeop = r.iter().find(|c| c.law_name == "민법").unwrap();
+        let geunbeop = r.iter().find(|c| c.law_name == "근로기준법").unwrap();
+        assert_eq!(minbeop.revision_cutoff.as_deref(), Some("20071221"));
+        assert_eq!(geunbeop.revision_cutoff.as_deref(), Some("20241022"));
+    }
+
+    #[test]
+    fn revision_cutoff_rejects_impossible_dates() {
+        // Regex pattern matches but 2007-13-45 is rejected during validation.
+        let t = "구 민법(2007. 13. 45. 개정되기 전의 것) 제839조의2";
+        let r = extract_statute_citations(t, None);
+        assert_eq!(r.len(), 1);
+        assert!(r[0].revision_cutoff.is_none());
+    }
+
+    #[test]
+    fn revision_cutoff_flows_through_range_expansion() {
+        // `내지` range expansion must propagate the cutoff to every
+        // generated citation — otherwise middle articles lose the
+        // 구법 signal.
+        let t = "구 민법(2007. 12. 21. 개정되기 전의 것) 제830조 내지 제833조";
+        let r = extract_statute_citations(t, None);
+        assert!(r.iter().all(|c| c.revision_cutoff.as_deref() == Some("20071221")));
+        assert_eq!(r.len(), 4); // 830, 831, 832, 833
     }
 
     #[test]

@@ -376,22 +376,66 @@ explicit provenance tag:
 - `incident_date_source = "none"` → no reliable signal; match by
   `verdict_date` or widen the time window
 
-### Applying the principle
+### Applying the principle — three-tier signal priority
 
-Given a resolved chain `case → cites → statute_article`:
+The ingester and graph query now surface three independent signals
+for picking the applicable statute version. They are listed in order
+of decreasing authority; a higher-tier signal's answer **overrides**
+lower-tier ones.
+
+**Tier 1 — `revision_cutoff` on the citation edge (최우선, 100% reliable)**
+
+When a judgment writes a citation as `구 {법}(YYYY. M. D. 법률 제N호로
+개정되기 전의 것) 제N조`, the date inside the parenthetical IS the
+revision boundary. The applicable law is unambiguously the version
+whose `effective_date ≤ cutoff - 1 day`. This is by Korean legal
+convention — every judgment that needs a pre-revision version MUST
+mark it this way in 적용법조 / 적용법령. No inference, no tolerance.
+
+Implementation:
+- `StatuteRef.revision_cutoff` (YYYYMMDD) populated by the citation
+  extractor via a window scan around each law anchor for the
+  `(… 개정되기 전의 것)` parenthetical.
+- Flows into `vault_links.context` prepended as `[pre:YYYYMMDD] {raw}`.
+- `Edge.revision_cutoff` surfaces in HTTP / snapshot / agent-tool
+  JSON, with the `[pre:…]` prefix stripped from the `evidence` field
+  for clean display.
+
+**Tier 2 — case `incident_date_earliest` (date-literal match)**
+
+No `구법` mark? Use the 행위시법 match:
 
 ```
-case.incident_date_earliest   ≥   statute.effective_version.effective_date
-                                  AND
-case.incident_date_earliest   <    statute.effective_version.next_effective_date
+statute.effective_version :=
+    max(effective_date)
+    subject to effective_date ≤ case.incident_date_earliest
 ```
 
-is the normal determination. The current implementation **stores** all
-three dates on nodes but does **not yet compute** the
-applicable-version pick — that requires version-aware statute nodes
-(a deliberate deferral; same article, one slug today). A follow-up
-will add a `legal_applicable_version` tool that does this lookup for
-the agent.
+This is standard range matching against `supplement.effective_date`.
+
+**Tier 3 — `incident_date_source` fallback tolerance**
+
+- `"body"` → exact-day match (high confidence)
+- `"wonsim_offset"` → recommended tolerance ±6 months around the
+  stored `[YYYY0101, YYYY1231]` range, because the year is only
+  accurate to ±1 year of the 원심's filing year
+- `"own_case_year"` → same tolerance as wonsim_offset (1심 filing
+  usually 0-12 months after incident)
+- `"none"` → fall back to `verdict_date` or widen aggressively
+
+### Not yet automated (current deferral)
+
+The three signals above are all **stored**. The ingester does not yet
+automatically:
+
+1. Pick the applicable version (would need version-aware statute
+   nodes like `statute::민법::839-2@20071221`).
+2. Compose Tier 1 overrides with Tier 2 ranges for mixed judgments.
+
+A planned `legal_applicable_version(case_slug, statute_slug)` tool
+will run the three-tier decision. Today, agents should inspect
+`Edge.revision_cutoff` + case frontmatter dates and reason
+manually — all the data is there.
 
 ### The 형사사건 exception (유일한 예외)
 
