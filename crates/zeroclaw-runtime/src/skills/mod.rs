@@ -64,6 +64,9 @@ pub struct SkillTool {
     pub command: String,
     #[serde(default)]
     pub args: HashMap<String, String>,
+    /// Override the default 60s execution timeout (seconds).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Skill manifest parsed from SKILL.toml
