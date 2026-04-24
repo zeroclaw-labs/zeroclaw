@@ -116,16 +116,42 @@ const LAW_ALIAS_TABLE: &[(&str, &[&str])] = &[
         "폭력행위 등 처벌에 관한 법률",
         &["폭력행위등처벌에관한법률", "폭처법", "폭력행위처벌법"],
     ),
+    (
+        "아동ㆍ청소년의 성보호에 관한 법률",
+        &[
+            "아동·청소년의 성보호에 관한 법률",
+            "아동 청소년의 성보호에 관한 법률",
+            "아동청소년의성보호에관한법률",
+            "아청법",
+        ],
+    ),
+    // ── IT / Telecom ──
+    (
+        "정보통신망 이용촉진 및 정보보호 등에 관한 법률",
+        &[
+            "정보통신망이용촉진및정보보호등에관한법률",
+            "정보통신망법",
+            "정통법",
+            "망법",
+        ],
+    ),
     // ── IP / competition ──
     ("저작권법", &[]),
     ("특허법", &[]),
     ("상표법", &[]),
     ("디자인보호법", &[]),
     ("독점규제 및 공정거래에 관한 법률", &["공정거래법"]),
-    ("부정경쟁방지 및 영업비밀보호에 관한 법률", &["부경법"]),
+    (
+        "부정경쟁방지 및 영업비밀보호에 관한 법률",
+        &["부경법", "부정경쟁방지법"],
+    ),
     // ── Banking / credit ──
     ("은행법", &[]),
     ("신용정보의 이용 및 보호에 관한 법률", &["신정법"]),
+    ("부정수표단속법", &["부수법"]),
+    ("여신전문금융업법", &["여전법"]),
+    // ── Traffic / roads ──
+    ("도로교통법", &["도교법"]),
     // ── Judicial officers / courts ──
     ("법원조직법", &[]),
     ("검찰청법", &[]),
@@ -300,6 +326,62 @@ mod tests {
         assert_eq!(
             canonical_name("마약류관리법"),
             "마약류 관리에 관한 법률"
+        );
+    }
+
+    #[test]
+    fn traffic_banking_and_it_telecom_shortforms() {
+        assert_eq!(canonical_name("도교법"), "도로교통법");
+        assert_eq!(canonical_name("부수법"), "부정수표단속법");
+        assert_eq!(canonical_name("여전법"), "여신전문금융업법");
+        assert_eq!(
+            canonical_name("정보통신망법"),
+            "정보통신망 이용촉진 및 정보보호 등에 관한 법률"
+        );
+        assert_eq!(
+            canonical_name("정통법"),
+            "정보통신망 이용촉진 및 정보보호 등에 관한 법률"
+        );
+        assert_eq!(
+            canonical_name("망법"),
+            "정보통신망 이용촉진 및 정보보호 등에 관한 법률"
+        );
+    }
+
+    #[test]
+    fn child_youth_sex_protection_accepts_multiple_middle_dot_forms() {
+        // The law is often written with either ㆍ (U+318D), · (U+00B7),
+        // or just a plain space between 아동 and 청소년. All three
+        // must canonicalise, as must the common abbreviation 아청법.
+        assert_eq!(
+            canonical_name("아청법"),
+            "아동ㆍ청소년의 성보호에 관한 법률"
+        );
+        assert_eq!(
+            canonical_name("아동·청소년의 성보호에 관한 법률"),
+            "아동ㆍ청소년의 성보호에 관한 법률"
+        );
+        assert_eq!(
+            canonical_name("아동 청소년의 성보호에 관한 법률"),
+            "아동ㆍ청소년의 성보호에 관한 법률"
+        );
+        assert_eq!(
+            canonical_name("아동청소년의성보호에관한법률"),
+            "아동ㆍ청소년의 성보호에 관한 법률"
+        );
+    }
+
+    #[test]
+    fn unfair_competition_law_has_both_short_forms() {
+        // `부경법` (old abbreviation) and `부정경쟁방지법` (modern short)
+        // must both resolve to the same canonical.
+        assert_eq!(
+            canonical_name("부경법"),
+            "부정경쟁방지 및 영업비밀보호에 관한 법률"
+        );
+        assert_eq!(
+            canonical_name("부정경쟁방지법"),
+            "부정경쟁방지 및 영업비밀보호에 관한 법률"
         );
     }
 
