@@ -1,252 +1,177 @@
-# Network Deployment — ZeroClaw on Raspberry Pi and Local Network
+# Network Deployment
 
-This document covers deploying ZeroClaw on a Raspberry Pi or other host on your local network, with Telegram and optional webhook channels.
+Deploying ZeroClaw so it can receive inbound traffic: gateway exposure, webhook channels, tunnels, and LAN-only vs. public-facing configurations. Raspberry Pis and other home-network hosts are first-class targets here.
 
----
+## When inbound ports matter
 
-## 1. Overview
+| Mode | Needs inbound port | Notes |
+|---|:---:|---|
+| Telegram (long-poll) | No | ZeroClaw polls `api.telegram.org` — works behind NAT |
+| Matrix / Mattermost / Nextcloud Talk | No | Sync/WebSocket — outbound only |
+| Discord / Slack (Socket Mode) | No | Outbound WebSocket |
+| Signal (`signal-cli-rest-api`) | No | Localhost container |
+| Nostr / IMAP / MQTT | No | All outbound |
+| Webhooks (GitHub, Slack Events API, WhatsApp, Nextcloud Talk bot, custom) | **Yes** | Public POST endpoint required |
+| Gateway pairing from LAN | Yes (LAN-scope) | Bind to `0.0.0.0` or use a tunnel |
+| Discord / Slack (HTTP Events) | Yes | If you don't use Socket Mode |
 
-| Mode | Inbound port needed? | Use case |
-|------|----------------------|----------|
-| **Telegram polling** | No | ZeroClaw polls Telegram API; works from anywhere |
-| **Matrix sync (including E2EE)** | No | ZeroClaw syncs via Matrix client API; no inbound webhook required |
-| **Discord/Slack** | No | Same — outbound only |
-| **Nostr** | No | Connects to relays via WebSocket; outbound only |
-| **Gateway webhook** | Yes | POST /webhook, /whatsapp, /linq, /nextcloud-talk need a public URL |
-| **Gateway pairing** | Yes | If you pair clients via the gateway |
-| **Alpine/OpenRC service** | No | System-wide background service on Alpine Linux |
+**Upshot:** a Telegram-only bot runs on a Pi behind a consumer router with zero port forwarding. Anything webhook-based needs a reachable URL — which is where tunnels come in.
 
-**Key:** Telegram, Discord, Slack, and Nostr use **outbound connections** — ZeroClaw connects to external servers/relays. No port forwarding or public IP required.
+## Binding the gateway
 
----
+By default the gateway binds to `127.0.0.1` — unreachable from other devices. Three options to expose it:
 
-## 2. ZeroClaw on Raspberry Pi
+### Option 1 — Public bind (LAN)
 
-### 2.1 Prerequisites
-
-- Raspberry Pi (3/4/5) with Raspberry Pi OS
-- USB peripherals (Arduino, Nucleo) if using serial transport
-- Optional: `rppal` for native GPIO (`peripheral-rpi` feature)
-
-### 2.2 Install
-
-```bash
-# Build for RPi (or cross-compile from host)
-cargo build --release --features hardware
-
-# Or install via your preferred method
+```toml
+[gateway]
+host = "0.0.0.0"
+port = 42617
+allow_public_bind = true     # required safety flag
 ```
 
-### 2.3 Config
+Then any device on the LAN can reach `http://<pi-ip>:42617`. Doesn't help for internet-reachable webhooks — your router's public IP isn't forwarded to the Pi.
 
-Configure peripherals (`[peripherals]` + `[[peripherals.boards]]`), Telegram (`[channels_config.telegram]`), and gateway bind (`[gateway]`) in `~/.zeroclaw/config.toml`. See the [Config reference](../reference/config.md) for all fields and defaults.
+**Safety:** `allow_public_bind = true` is required because binding to `0.0.0.0` is a significant posture change. Without it, the daemon refuses. This is deliberate.
 
-### 2.4 Run Daemon (Local Only)
+### Option 2 — Tunnel (internet-reachable)
 
-```bash
-zeroclaw daemon --host 127.0.0.1 --port 42617
+```toml
+[tunnel]
+provider = "tailscale"       # or "cloudflare", "ngrok"
 ```
 
-- Gateway binds to `127.0.0.1` — not reachable from other machines
-- Telegram channel works: ZeroClaw polls Telegram API (outbound)
-- No firewall or port forwarding needed
+Then restart the daemon — the tunnel is managed declaratively from config, starting alongside the gateway.
 
----
+The tunnel forwards from a public URL to the gateway on `127.0.0.1`. No router config, no opened ports. All three supported tunnels work similarly:
 
-## 3. Binding to 0.0.0.0 (Local Network)
+| Provider | Setup friction | Cost | Good for |
+|---|---|---|---|
+| Tailscale Funnel | Create account, install client | Free tier | Long-term, stable URLs |
+| Cloudflare Tunnel | Create Cloudflare account, install `cloudflared` | Free | Custom domains |
+| ngrok | Sign up, install CLI | Free with limits | Testing, short-lived |
 
-To allow other devices on your LAN to hit the gateway (e.g. for pairing or webhooks):
+### Option 3 — Reverse proxy
 
-### 3.1 Option A: Explicit Opt-In
+Run nginx / Caddy / Traefik in front of the gateway. Terminate TLS there, proxy to `localhost:42617`. Suitable for:
 
-Set `[gateway].host = "0.0.0.0"` + `allow_public_bind = true` in config, then:
+- Servers with a real public IP
+- Existing reverse-proxy setups with Let's Encrypt
+- Serving multiple services on the same host
 
-```bash
-zeroclaw daemon --host 0.0.0.0 --port 42617
+A minimal Caddy config:
+
+```caddy
+agent.example.com {
+    reverse_proxy localhost:42617
+}
 ```
 
-**Security:** `allow_public_bind = true` exposes the gateway to your local network. Only use on trusted LANs.
+The gateway stays bound to `127.0.0.1` — the proxy does the listening.
 
-### 3.2 Option B: Tunnel (Recommended for Webhooks)
+## Raspberry Pi deployment
 
-If you need a **public URL** (e.g. WhatsApp webhook, external clients):
+### Prerequisites
 
-1. Run gateway on localhost:
-   ```bash
-   zeroclaw daemon --host 127.0.0.1 --port 42617
-   ```
+- Raspberry Pi 3/4/5 (or similar SBC) with Raspberry Pi OS or Alpine
+- Network connectivity (WiFi or Ethernet)
+- Optional: USB peripherals for hardware integration
 
-2. Start a tunnel by configuring the `[tunnel]` section (`provider = "tailscale" | "ngrok" | "cloudflare"`), or use `zeroclaw tunnel`.
+### Install
 
-3. ZeroClaw will refuse `0.0.0.0` unless `allow_public_bind = true` or a tunnel is active.
-
----
-
-## 4. Telegram Polling (No Inbound Port)
-
-Telegram uses **long-polling** by default:
-
-- ZeroClaw calls `https://api.telegram.org/bot{token}/getUpdates`
-- No inbound port or public IP needed
-- Works behind NAT, on RPi, in a home lab
-
-Set `[channels_config.telegram].bot_token` (and `allowed_users = []` for deny-by-default), then run `zeroclaw daemon` — the Telegram channel starts automatically.
-
-To approve one Telegram account at runtime:
+For a Pi running Raspberry Pi OS:
 
 ```bash
-zeroclaw channel bind-telegram <IDENTITY>
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash -s -- --prefer-prebuilt
 ```
 
-`<IDENTITY>` can be a numeric Telegram user ID or a username (without `@`).
+Prefer `--prefer-prebuilt` on a Pi — compiling from source can take 30+ minutes.
 
-### 4.1 Single Poller Rule (Important)
+For a Pi running Alpine:
 
-Telegram Bot API `getUpdates` supports only one active poller per bot token.
-
-- Keep one runtime instance for the same token (recommended: `zeroclaw daemon` service).
-- Do not run `cargo run -- channel start` or another bot process at the same time.
-
-If you hit this error:
-
-`Conflict: terminated by other getUpdates request`
-
-you have a polling conflict. Stop extra instances and restart only one daemon.
-
----
-
-## 5. Webhook Channels (WhatsApp, Nextcloud Talk, Custom)
-
-Webhook-based channels need a **public URL** so Meta (WhatsApp) or your client can POST events.
-
-### 5.1 Tailscale Funnel
-
-Set `[tunnel].provider = "tailscale"`. Tailscale Funnel exposes your gateway via a `*.ts.net` URL — no port forwarding required.
-
-### 5.2 ngrok
-
-Set `[tunnel].provider = "ngrok"`, or run ngrok manually:
 ```bash
-ngrok http 42617
-# Use the HTTPS URL for your webhook
+apk add curl rust cargo openssl-dev pkgconf
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
-### 5.3 Cloudflare Tunnel
-
-Configure Cloudflare Tunnel to forward to `127.0.0.1:42617`, then set your webhook URL to the tunnel's public hostname.
-
----
-
-## 6. Checklist: RPi Deployment
-
-- [ ] Build with `--features hardware` (and `peripheral-rpi` if using native GPIO)
-- [ ] Configure `[peripherals]` and `[channels_config.telegram]`
-- [ ] Run `zeroclaw daemon --host 127.0.0.1 --port 42617` (Telegram works without 0.0.0.0)
-- [ ] For LAN access: `--host 0.0.0.0` + `allow_public_bind = true` in config
-- [ ] For webhooks: use Tailscale, ngrok, or Cloudflare tunnel
-
----
-
-## 7. OpenRC (Alpine Linux Service)
-
-ZeroClaw supports OpenRC for Alpine Linux and other distributions using the OpenRC init system. OpenRC services run **system-wide** and require root/sudo.
-
-### 7.1 Prerequisites
-
-- Alpine Linux (or another OpenRC-based distro)
-- Root or sudo access
-- A dedicated `zeroclaw` system user (created during install)
-
-### 7.2 Install Service
+### Hardware features
 
 ```bash
-# Install service (OpenRC is auto-detected on Alpine)
+cargo install --locked --path . --features "hardware peripheral-rpi"
+```
+
+Grants access to GPIO, I2C, SPI via `rppal`. The stock service unit already adds the user to the `gpio`, `spi`, `i2c` groups.
+
+### Checklist
+
+- [ ] Install the binary (prefer prebuilt on a Pi)
+- [ ] Run `zeroclaw onboard`
+- [ ] Configure your channels — Telegram needs no port; webhooks need a tunnel
+- [ ] Install the service: `zeroclaw service install && zeroclaw service start`
+- [ ] For LAN access: set `[gateway] host = "0.0.0.0"` + `allow_public_bind = true`
+- [ ] For webhooks: configure `[tunnel]` with a provider
+
+## Alpine Linux (OpenRC)
+
+OpenRC services run system-wide. Install as root:
+
+```bash
 sudo zeroclaw service install
 ```
 
-This creates:
-- Init script: `/etc/init.d/zeroclaw`
-- Config directory: `/etc/zeroclaw/`
-- Log directory: `/var/log/zeroclaw/`
+Creates:
 
-### 7.3 Configuration
+- `/etc/init.d/zeroclaw` — init script
+- `/etc/zeroclaw/` — config directory
+- `/var/log/zeroclaw/` — log files
 
-Manual config copy is usually not required.
-
-`sudo zeroclaw service install` automatically prepares `/etc/zeroclaw`, migrates existing runtime state from your user setup when available, and sets ownership/permissions for the `zeroclaw` service user.
-
-If no prior runtime state is available to migrate, create `/etc/zeroclaw/config.toml` before starting the service.
-
-### 7.4 Enable and Start
+Enable and start:
 
 ```bash
-# Add to default runlevel
 sudo rc-update add zeroclaw default
-
-# Start the service
 sudo rc-service zeroclaw start
-
-# Check status
 sudo rc-service zeroclaw status
 ```
 
-### 7.5 Manage Service
-
-| Command | Description |
-|---------|-------------|
-| `sudo rc-service zeroclaw start` | Start the daemon |
-| `sudo rc-service zeroclaw stop` | Stop the daemon |
-| `sudo rc-service zeroclaw status` | Check service status |
-| `sudo rc-service zeroclaw restart` | Restart the daemon |
-| `sudo zeroclaw service status` | ZeroClaw status wrapper (uses `/etc/zeroclaw` config) |
-
-### 7.6 Logs
-
-OpenRC routes logs to:
-
-| Log | Path |
-|-----|------|
-| Access/stdout | `/var/log/zeroclaw/access.log` |
-| Errors/stderr | `/var/log/zeroclaw/error.log` |
-
-View logs:
+Logs:
 
 ```bash
 sudo tail -f /var/log/zeroclaw/error.log
 ```
 
-### 7.7 Uninstall
+### OpenRC notes
 
-```bash
-# Stop and remove from runlevel
-sudo rc-service zeroclaw stop
-sudo rc-update del zeroclaw default
+- Service runs as `zeroclaw:zeroclaw` (least privilege)
+- Config path is fixed: `/etc/zeroclaw/config.toml`
+- System-wide only — no user-level OpenRC services
+- All service operations need `sudo`
 
-# Remove init script
-sudo zeroclaw service uninstall
-```
+## Telegram polling caveat
 
-### 7.8 Notes
+Telegram Bot API's `getUpdates` is single-poller per bot token. You cannot run two instances with the same token — the second gets `Conflict: terminated by other getUpdates request`.
 
-- OpenRC is **system-wide only** (no user-level services)
-- Requires `sudo` or root for all service operations
-- The service runs as the `zeroclaw:zeroclaw` user (least privilege)
-- Config must be at `/etc/zeroclaw/config.toml` (explicit path in init script)
-- If the `zeroclaw` user does not exist, install will fail with instructions to create it
+If you see this:
 
-### 7.9 Checklist: Alpine/OpenRC Deployment
+1. `ps aux | grep zeroclaw` and confirm only one daemon is running
+2. Check you don't have `cargo run --bin zeroclaw -- channel start telegram` from a dev session hanging around
+3. If stale, reset Telegram's poll session:
+   ```bash
+   curl -X POST "https://api.telegram.org/bot$TOKEN/close"
+   ```
 
-- [ ] Install: `sudo zeroclaw service install`
-- [ ] Enable: `sudo rc-update add zeroclaw default`
-- [ ] Start: `sudo rc-service zeroclaw start`
-- [ ] Verify: `sudo rc-service zeroclaw status`
-- [ ] Check logs: `/var/log/zeroclaw/error.log`
+## Exposing webhooks safely
 
----
+A publicly-reachable webhook URL is attack surface. At minimum:
 
-## 8. References
+- **HMAC signature verification** — `secret` configured on each webhook channel
+- **Source IP allowlist** where the service has fixed egress IPs (GitHub, AWS SNS)
+- **Rate limiting** — `rate_limit_per_sec` in the webhook channel config
 
-- [Config reference](../reference/config.md) — generated config field index
-- [Matrix](../channels/matrix.md) — Matrix setup and encrypted-room troubleshooting
-- [Hardware peripherals design](../hardware/hardware-peripherals-design.md) — peripherals design
-- [Adding boards and tools](../hardware/adding-boards-and-tools.md) — hardware setup and adding boards
+See [Channels → Webhooks](../channels/webhook.md) for the full set of knobs.
+
+## See also
+
+- [Setup → Container](../setup/container.md) — Docker-specific network config
+- [Setup → Service management](../setup/service.md) — platform service integration
+- [Operations → Overview](./overview.md)
+- [Security → Overview](../security/overview.md)

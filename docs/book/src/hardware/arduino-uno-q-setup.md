@@ -115,7 +115,7 @@ nano ~/.zeroclaw/config.toml
 
 ### 3.2 Minimal config
 
-At minimum, set `api_key` / `default_provider` / `default_model`, plus `[channels_config.telegram]` with your `bot_token`. Leave `[peripherals]` disabled until Phase 4 below. See the [Config reference](../reference/config.md) for all fields.
+At minimum, set `api_key` / `default_provider` / `default_model`, plus `[channels.telegram]` with your `bot_token`. Leave `[peripherals]` disabled until Phase 4 below. See the [Config reference](../reference/config.md) for all fields.
 
 ---
 
