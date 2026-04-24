@@ -10866,6 +10866,36 @@ impl Config {
         {
             self.storage.provider.config.connect_timeout_secs = Some(timeout_secs);
         }
+        if let Some(ref mut sl) = self.channels.slack {
+            if let Ok(v) = std::env::var("SLACK_BOT_TOKEN") {
+                if !v.is_empty() { sl.bot_token = v; }
+            }
+            if let Ok(v) = std::env::var("ZEROCLAW_SLACK_BOT_TOKEN") {
+                if !v.is_empty() { sl.bot_token = v; }
+            }
+            if let Ok(v) = std::env::var("SLACK_APP_TOKEN") {
+                if !v.is_empty() { sl.app_token = Some(v); }
+            }
+            if let Ok(v) = std::env::var("ZEROCLAW_SLACK_APP_TOKEN") {
+                if !v.is_empty() { sl.app_token = Some(v); }
+            }
+        }
+        if let Some(ref mut dc) = self.channels.discord {
+            if let Ok(v) = std::env::var("DISCORD_BOT_TOKEN") {
+                if !v.is_empty() { dc.bot_token = v; }
+            }
+            if let Ok(v) = std::env::var("ZEROCLAW_DISCORD_BOT_TOKEN") {
+                if !v.is_empty() { dc.bot_token = v; }
+            }
+        }
+        if let Some(ref mut tg) = self.channels.telegram {
+            if let Ok(v) = std::env::var("TELEGRAM_BOT_TOKEN") {
+                if !v.is_empty() { tg.bot_token = v; }
+            }
+            if let Ok(v) = std::env::var("ZEROCLAW_TELEGRAM_BOT_TOKEN") {
+                if !v.is_empty() { tg.bot_token = v; }
+            }
+        }
         // Proxy enabled flag: ZEROCLAW_PROXY_ENABLED
         let explicit_proxy_enabled = std::env::var("ZEROCLAW_PROXY_ENABLED")
             .ok()
