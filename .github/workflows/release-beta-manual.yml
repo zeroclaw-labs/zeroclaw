@@ -1,8 +1,10 @@
 name: Release Beta
 
 on:
+  workflow_dispatch:
   push:
-    branches: [master]
+    tags:
+      - "v*-beta*"
 
 concurrency:
   group: release
