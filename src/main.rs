@@ -1388,7 +1388,7 @@ async fn main() -> Result<()> {
                         .runtime
                         .docker
                         .memory_limit_mb
-                        .map_or(false, |mb| mb > 0);
+                        .is_some_and(|mb| mb > 0);
                 if (sandbox_docker || runtime_docker_mem)
                     && !zeroclaw_runtime::security::linux_memcg_available()
                 {
