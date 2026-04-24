@@ -2,7 +2,7 @@ name: Daily Advisory Scan
 
 on:
   schedule:
-    - cron: '0 9 * * *'
+    - cron: "0 9 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -62,24 +62,22 @@ jobs:
 
           advisory_output=$(cat /tmp/advisory-output.txt)
 
+          {
+            printf '## Advisory scan failed\n\n'
+            printf 'Workflow run: %s\n\n' "${RUN_URL}"
+            printf '```\n%s\n```\n\n' "${advisory_output}"
+            printf 'Review `deny.toml` for the current ignore list. If this advisory is a known\n'
+            printf 'acceptable risk, add an entry with a `reason` field. If it requires a\n'
+            printf 'dependency update, open a tracking issue and link it here.\n\n'
+            printf 'cc @JordanTheJet @theonlyhennygod\n'
+          } > /tmp/issue-body.md
+
           gh issue create \
             --repo "$GITHUB_REPOSITORY" \
             --title "ci: Advisory scan failed — $(date -u +%Y-%m-%d)" \
             --label "security" \
             --label "risk: high" \
-            --body "## Advisory scan failed
-
-Workflow run: ${RUN_URL}
-
-\`\`\`
-${advisory_output}
-\`\`\`
-
-Review \`deny.toml\` for the current ignore list. If this advisory is a known
-acceptable risk, add an entry with a \`reason\` field. If it requires a
-dependency update, open a tracking issue and link it here.
-
-cc @JordanTheJet @theonlyhennygod"
+            --body-file /tmp/issue-body.md
 
       - name: Propagate scan failure
         if: steps.scan.outcome == 'failure'
