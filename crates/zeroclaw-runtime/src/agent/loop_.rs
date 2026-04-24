@@ -204,6 +204,8 @@ where
 }
 
 /// Run a future with the session key set in task-local storage.
+/// The scope wraps the entire agent turn, so all tools invoked during
+/// the turn (including nested calls) see the same session key.
 /// SessionsCurrentTool reads this to identify the active session.
 pub async fn scope_session_key<F>(session_key: Option<String>, future: F) -> F::Output
 where
