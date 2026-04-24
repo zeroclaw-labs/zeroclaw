@@ -1,6 +1,7 @@
 //! Auto-detection of available security features
 
 use crate::security::traits::Sandbox;
+use std::path::Path;
 use std::sync::Arc;
 use zeroclaw_config::schema::{SandboxBackend, SecurityConfig};
 
@@ -10,7 +11,7 @@ use zeroclaw_config::schema::{SandboxBackend, SecurityConfig};
 /// (e.g. `"native"`, `"docker"`). When the caller has set `runtime.kind = "native"`,
 /// Docker must never be selected as the sandbox backend during auto-detection —
 /// the user explicitly opted out of container wrapping.
-pub fn create_sandbox(config: &SecurityConfig, runtime_kind: &str) -> Arc<dyn Sandbox> {
+pub fn create_sandbox(config: &SecurityConfig, runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<dyn Sandbox> {
     let backend = &config.sandbox.backend;
 
     // If explicitly disabled, return noop
@@ -63,7 +64,15 @@ pub fn create_sandbox(config: &SecurityConfig, runtime_kind: &str) -> Arc<dyn Sa
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Docker => {
-            if let Ok(sandbox) = super::docker::DockerSandbox::new() {
+            let result = if let Some(ws) = workspace_dir {
+                super::docker::DockerSandbox::with_workspace(
+                    super::docker::DockerSandbox::default_image(),
+                    ws.to_path_buf(),
+                )
+            } else {
+                super::docker::DockerSandbox::new()
+            };
+            if let Ok(sandbox) = result {
                 return Arc::new(sandbox);
             }
             tracing::warn!("Docker requested but not available, falling back to application-layer");
@@ -83,7 +92,7 @@ pub fn create_sandbox(config: &SecurityConfig, runtime_kind: &str) -> Arc<dyn Sa
         }
         SandboxBackend::Auto | SandboxBackend::None => {
             // Auto-detect best available, skipping Docker when native runtime is in use
-            detect_best_sandbox(runtime_kind)
+            detect_best_sandbox(runtime_kind, workspace_dir)
         }
     }
 }
@@ -93,7 +102,7 @@ pub fn create_sandbox(config: &SecurityConfig, runtime_kind: &str) -> Arc<dyn Sa
 /// When `runtime_kind` is `"native"` the caller has explicitly opted out of
 /// container wrapping, so Docker is excluded from consideration even if it is
 /// installed on the host.
-fn detect_best_sandbox(runtime_kind: &str) -> Arc<dyn Sandbox> {
+fn detect_best_sandbox(runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<dyn Sandbox> {
     let skip_docker = runtime_kind == "native";
 
     #[cfg(target_os = "linux")]
@@ -137,7 +146,15 @@ fn detect_best_sandbox(runtime_kind: &str) -> Arc<dyn Sandbox> {
     // container wrapping, and forcing Docker would break Python skills (Alpine
     // has no python3) and workspace access on resource-constrained hosts.
     if !skip_docker {
-        if let Ok(sandbox) = super::docker::DockerSandbox::probe() {
+        let docker_result = if let Some(ws) = workspace_dir {
+            super::docker::DockerSandbox::with_workspace(
+                super::docker::DockerSandbox::default_image(),
+                ws.to_path_buf(),
+            )
+        } else {
+            super::docker::DockerSandbox::probe()
+        };
+        if let Ok(sandbox) = docker_result {
             tracing::info!("Docker sandbox enabled");
             return Arc::new(sandbox);
         }
@@ -159,7 +176,7 @@ mod tests {
 
     #[test]
     fn detect_best_sandbox_returns_something() {
-        let sandbox = detect_best_sandbox("");
+        let sandbox = detect_best_sandbox("", None);
         // Should always return at least NoopSandbox
         assert!(sandbox.is_available());
     }
@@ -174,7 +191,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let sandbox = create_sandbox(&config, "");
+        let sandbox = create_sandbox(&config, "", None);
         assert_eq!(sandbox.name(), "none");
     }
 
@@ -188,7 +205,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let sandbox = create_sandbox(&config, "");
+        let sandbox = create_sandbox(&config, "", None);
         // Should return some sandbox (at least NoopSandbox)
         assert!(sandbox.is_available());
     }
@@ -198,7 +215,7 @@ mod tests {
         // When runtime.kind = "native", Docker must be skipped in auto-detection
         // even when Docker is installed on the host. The sandbox must be
         // NoopSandbox or something OS-native (Landlock, Firejail, Seatbelt).
-        let sandbox = detect_best_sandbox("native");
+        let sandbox = detect_best_sandbox("native", None);
         assert_ne!(sandbox.name(), "docker");
     }
 
@@ -214,7 +231,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let sandbox = create_sandbox(&config, "native");
+        let sandbox = create_sandbox(&config, "native", None);
         // If Docker is available, it will be selected; if not, NoopSandbox fallback.
         // The point is that runtime.kind doesn't override explicit `backend = "docker"`.
         assert!(sandbox.is_available());

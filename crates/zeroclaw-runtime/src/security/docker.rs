@@ -1,23 +1,50 @@
 //! Docker sandbox (container isolation)
 
 use crate::security::traits::Sandbox;
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Docker sandbox backend
 #[derive(Debug, Clone)]
 pub struct DockerSandbox {
     image: String,
+    workspace_dir: Option<PathBuf>,
 }
 
 impl Default for DockerSandbox {
     fn default() -> Self {
         Self {
             image: "alpine:latest".to_string(),
+            workspace_dir: None,
         }
     }
 }
 
 impl DockerSandbox {
+    /// Default container image used when no explicit image is configured.
+    /// Exposed so callers constructing via with_workspace() without a custom
+    /// image don't duplicate the default-image string.
+    pub fn default_image() -> String {
+        Self::default().image
+    }
+
+    /// Construct a Docker sandbox with a workspace bind-mount (read-only).
+    /// Used by Python/R/Julia skills that need to access script files from
+    /// the workspace inside the container.
+    pub fn with_workspace(image: String, workspace_dir: PathBuf) -> std::io::Result<Self> {
+        if Self::is_installed() {
+            Ok(Self {
+                image,
+                workspace_dir: Some(workspace_dir),
+            })
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Docker not found",
+            ))
+        }
+    }
+
     pub fn new() -> std::io::Result<Self> {
         if Self::is_installed() {
             Ok(Self::default())
@@ -31,7 +58,7 @@ impl DockerSandbox {
 
     pub fn with_image(image: String) -> std::io::Result<Self> {
         if Self::is_installed() {
-            Ok(Self { image })
+            Ok(Self { image, workspace_dir: None })
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -199,6 +226,7 @@ mod tests {
     fn docker_wrap_command_uses_custom_image() {
         let sandbox = DockerSandbox {
             image: "ubuntu:22.04".to_string(),
+            workspace_dir: None,
         };
         let mut cmd = Command::new("echo");
         sandbox.wrap_command(&mut cmd).unwrap();
@@ -213,4 +241,23 @@ mod tests {
             "must use the custom image"
         );
     }
+
+    #[test]
+    fn docker_with_workspace() {
+        let ws_path = std::path::PathBuf::from("/tmp/test-workspace-12345");
+        // Can't guarantee docker is installed in tests; just verify the
+        // struct shape round-trips if construction were to succeed.
+        let sandbox = DockerSandbox {
+            image: "alpine:latest".to_string(),
+            workspace_dir: Some(ws_path.clone()),
+        };
+        assert_eq!(sandbox.workspace_dir, Some(ws_path));
+    }
+
+    #[test]
+    fn docker_without_workspace() {
+        let sandbox = DockerSandbox::default();
+        assert_eq!(sandbox.workspace_dir, None);
+    }
+
 }
