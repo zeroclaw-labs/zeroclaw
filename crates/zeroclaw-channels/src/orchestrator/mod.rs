@@ -421,12 +421,20 @@ fn conversation_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> Strin
 pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     // Include reply_target for per-channel isolation (e.g. distinct Discord/Slack
     // channels) and thread_ts for per-topic isolation in forum groups.
+    //
+    // Sanitize ':' in reply_target to "__" so the composite key survives
+    // session_store::session_path's filename sanitizer unchanged.  That function
+    // maps every char that is not alphanumeric, '_', or '-' to '_'; "__" is
+    // already in the allow-list and cannot collide with the single-underscore
+    // field separators used in the format! strings below.  Both the JSONL
+    // write path (via session_path) and the in-memory read path (histories.get)
+    // must agree on the same key form — deriving it once here ensures they do.
+    let safe_target = msg.reply_target.replace(':', "__");
     match &msg.thread_ts {
         Some(tid) => format!(
-            "{}_{}_{}_{}",
-            msg.channel, msg.reply_target, tid, msg.sender
+            "{}_{}_{}_{}", msg.channel, safe_target, tid, msg.sender
         ),
-        None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
+        None => format!("{}_{}_{}", msg.channel, safe_target, msg.sender),
     }
 }
 
