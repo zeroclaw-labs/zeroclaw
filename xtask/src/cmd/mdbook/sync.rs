@@ -58,7 +58,7 @@ pub fn run(locale: Option<&str>, force: bool, provider: Option<&str>, batch: Opt
         } else {
             println!("==> {locale}: msgmerge");
             run_cmd(Command::new("msgmerge")
-                .args(["--update", "--backup=none", "--no-fuzzy-matching"])
+                .args(["--update", "--backup=none", "--no-fuzzy-matching", "--no-obsolete"])
                 .arg(&po_file)
                 .arg(&pot))?;
         }
