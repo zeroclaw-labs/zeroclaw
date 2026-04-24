@@ -115,10 +115,13 @@ fn call_api(
         .collect();
 
     let system = format!(
-        "You are a translator. Translate the UI strings from English to {locale_name}. \
-         Return ONLY a JSON object mapping each key to its translated string value. \
-         Preserve any Fluent special syntax ({{\"{{\"}}...{{\"}}\"}}). \
-         Do not translate proper nouns, technical identifiers, or code examples."
+        "You are a translator. Translate UI strings from English to {locale_name}.\n\
+         Rules:\n\
+         - Return ONLY a JSON object mapping each key to its translated string value.\n\
+         - Do NOT translate: proper nouns, brand names (e.g. ZeroClaw, Anthropic), command names, \
+           technical identifiers, or code examples.\n\
+         - Preserve exactly: Fluent placeholders ({{ variable }}), special syntax, and escape sequences.\n\
+         - Do NOT wrap output in markdown code fences."
     );
 
     let rt = tokio::runtime::Builder::new_current_thread()

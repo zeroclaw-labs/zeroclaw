@@ -262,12 +262,16 @@ async fn translate_batch(
         .join("\n");
 
     let prompt = format!(
-        "Translate these English documentation strings to locale '{locale}'.\n\
-         Return ONLY a JSON array of translated strings in the same order as the input.\n\
-         No explanation, no item prefixes. Preserve backticks, bold (**), and code spans exactly.\n\
-         Do not escape backslashes or newlines — preserve them byte-for-byte.\n\
-         If a string is already in the target language or is a code literal, return it unchanged.\n\n\
-         {items}"
+        "Translate the following English documentation strings to {locale}.\n\
+         Rules:\n\
+         - Return ONLY a JSON array with exactly {count} strings, in the same order as the input.\n\
+         - Do NOT translate: proper nouns, brand names (e.g. ZeroClaw, Anthropic, GitHub), command names, code literals, or strings that are already in {locale}.\n\
+         - Preserve exactly: backticks, bold (**text**), inline code, URLs, escape sequences (\\n, \\t, etc.), and leading/trailing whitespace.\n\
+         - Do NOT add item numbers, bullet points, or any prefix to translated strings.\n\
+         - Do NOT wrap output in markdown code fences.\n\n\
+         Strings to translate:\n\
+         {items}",
+        count = batch.len()
     );
 
     let body = serde_json::json!({
