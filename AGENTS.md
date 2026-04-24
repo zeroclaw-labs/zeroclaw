@@ -5,104 +5,130 @@ Cross-tool agent instructions for any AI coding assistant working on this reposi
 ## Commands
 
 ```bash
+# Format, lint, and test (fast, no Docker)
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-```
 
-Full pre-PR validation (recommended):
-
-```bash
+# Full validation (runs in Docker — from repo root or dev/)
 ./dev/ci.sh all
+
+# Sub-commands for partial validation:
+./dev/ci.sh lint-strict    # clippy with warnings-as-errors (strict gate)
+./dev/ci.sh lint-delta     # lint only changed lines
+./dev/ci.sh test-component # unit tests
+./dev/ci.sh test-integration
+./dev/ci.sh test-system
+./dev/ci.sh test-live      # requires real credentials
 ```
 
 Docs-only changes: run markdown lint and link-integrity checks. If touching bootstrap scripts: `bash -n install.sh`.
 
 ## Project Snapshot
 
-ZeroClaw is a Rust-first autonomous agent runtime optimized for performance, efficiency, stability, extensibility, sustainability, and security.
+ZeroClaw is a Rust-first autonomous agent runtime. Core architecture is trait-driven and modular.
 
-Core architecture is trait-driven and modular. Extend by implementing traits and registering in factory modules.
+Rust edition **2024** (workspace-level, `Cargo.toml:7`). Requires Rust 1.87+.
 
-Key extension points:
+Key extension traits (`crates/zeroclaw-api/src/`):
 
-- `crates/zeroclaw-api/src/provider.rs` (`Provider`)
-- `crates/zeroclaw-api/src/channel.rs` (`Channel`)
-- `crates/zeroclaw-api/src/tool.rs` (`Tool`)
-- `crates/zeroclaw-api/src/memory_traits.rs` (`Memory`)
-- `crates/zeroclaw-api/src/observability_traits.rs` (`Observer`)
-- `crates/zeroclaw-api/src/runtime_traits.rs` (`RuntimeAdapter`)
-- `crates/zeroclaw-api/src/peripherals_traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
+- `provider.rs` — `Provider`
+- `channel.rs` — `Channel`, `ChannelApprovalRequest`, `ChannelApprovalResponse`
+- `tool.rs` — `Tool`
+- `memory_traits.rs` — `Memory`
+- `observability_traits.rs` — `Observer`
+- `runtime_traits.rs` — `RuntimeAdapter`
+- `peripherals_traits.rs` — `Peripheral`
 
 ## Stability Tiers
 
-Every workspace crate carries a stability tier per the Microkernel Architecture RFC.
-
-| Crate | Tier | Notes |
-|-------|------|-------|
-| `zeroclaw-api` | Experimental | Stable at v1.0.0 (formal milestone) |
-| `zeroclaw-config` | Beta | Stable at v0.8.0 |
-| `zeroclaw-providers` | Beta | — |
-| `zeroclaw-memory` | Beta | — |
-| `zeroclaw-infra` | Beta | — |
-| `zeroclaw-tool-call-parser` | Beta | Stable at v0.8.0 |
-| `zeroclaw-channels` | Experimental | Plugin migration at v1.0.0 |
-| `zeroclaw-tools` | Experimental | Plugin migration at v1.0.0 |
-| `zeroclaw-runtime` | Experimental | Agent runtime (agent loop, security, cron, SOP, skills, observability) |
-| `zeroclaw-gateway` | Experimental | Separate binary at v0.9.0 |
-| `zeroclaw-tui` | Experimental | TUI onboarding wizard |
-| `zeroclaw-plugins` | Experimental | WASM plugin system — foundation for v1.0.0 plugin ecosystem |
-| `zeroclaw-hardware` | Experimental | USB discovery, peripherals, serial |
-| `zeroclaw-macros` | Beta | Tightly coupled to config schema |
-
-**Tiers**: Stable = covered by breaking-change policy. Beta = breaking changes permitted in MINOR with changelog notes. Experimental = no stability guarantee.
-
-Tiers are promoted, never demoted, through deliberate team decision.
+| Crate | Tier |
+|-------|------|
+| `zeroclaw-api` | Experimental |
+| `zeroclaw-config` | Beta |
+| `zeroclaw-providers` | Beta |
+| `zeroclaw-memory` | Beta |
+| `zeroclaw-infra` | Beta |
+| `zeroclaw-tool-call-parser` | Beta |
+| `zeroclaw-channels` | Experimental |
+| `zeroclaw-tools` | Experimental |
+| `zeroclaw-runtime` | Experimental |
+| `zeroclaw-gateway` | Experimental |
+| `zeroclaw-tui` | Experimental |
+| `zeroclaw-plugins` | Experimental |
+| `zeroclaw-hardware` | Experimental |
+| `zeroclaw-macros` | Beta |
 
 ## Repository Map
 
-- `src/main.rs` — CLI entrypoint and command routing
-- `src/lib.rs` — module re-exports and CLI command enum definitions
-- `crates/zeroclaw-api/` — public trait definitions (Provider, Channel, Tool, Memory, Observer, Peripheral)
-- `crates/zeroclaw-config/` — schema, config loading/merging
-- `crates/zeroclaw-macros/` — Configurable derive macro
-- `crates/zeroclaw-providers/` — model providers and resilient wrapper
-- `crates/zeroclaw-channels/` — messaging platform integrations (30+ channels)
-- `crates/zeroclaw-channels/src/orchestrator/` — channel lifecycle, routing, media pipeline
-- `crates/zeroclaw-tools/` — tool execution surface (shell, file, memory, browser)
-- `crates/zeroclaw-runtime/` — agent loop, security, cron, SOP, skills, onboarding wizard, observability
-- `crates/zeroclaw-memory/` — memory backends (markdown, sqlite, embeddings, vector merge)
-- `crates/zeroclaw-infra/` — shared infrastructure (debounce, session, stall watchdog)
+- `src/main.rs` — CLI entrypoint
+- `src/lib.rs` — module re-exports, command enum
+- `crates/zeroclaw-api/` — trait definitions
+- `crates/zeroclaw-runtime/src/agent/loop_.rs` — **agent loop**: tool call execution, approval flow
+- `crates/zeroclaw-runtime/src/approval/mod.rs` — `ApprovalManager`, `ApprovalRequest`, `summarize_args()`
+- `crates/zeroclaw-channels/` — channel implementations; each implements `Channel` trait
+  - `src/wukongim.rs` — WuKongIM channel with structured approval card (type=20)
+  - `src/lark.rs` — Lark channel with approval support
+  - `src/telegram.rs` — Telegram channel (HTML-formatted approval)
+  - `src/orchestrator/` — channel lifecycle and routing
+- `crates/zeroclaw-runtime/src/sop/` — SOP engine, dispatch, audit
+- `crates/zeroclaw-runtime/src/skills/` — skill loading, skill-to-tool conversion
+- `crates/zeroclaw-config/` — schema, config loading/merging (published separately on crates.io)
+- `crates/zeroclaw-tools/` — built-in tool implementations (shell, file, memory, browser, etc.)
+- `crates/zeroclaw-providers/` — model providers
+- `crates/zeroclaw-memory/` — memory backends
+- `crates/zeroclaw-infra/` — shared infra (debounce, session, stall watchdog)
 - `crates/zeroclaw-gateway/` — webhook/gateway server (separate binary)
 - `crates/zeroclaw-hardware/` — USB discovery, peripherals, serial, GPIO
 - `crates/zeroclaw-tui/` — TUI onboarding wizard
 - `crates/zeroclaw-plugins/` — WASM plugin system
-- `crates/zeroclaw-tool-call-parser/` — tool call parsing
-- `docs/` — topic-based documentation (setup-guides, reference, ops, security, hardware, contributing, maintainers)
-- `.github/` — CI, templates, automation workflows
+- `crates/zeroclaw-tool-call-parser/` — tool call parsing (XML, markdown, GLM formats)
+- `.claude/skills/` — AI assistant skills (zeroclaw, github-pr-review-session, changelog-generation, etc.)
+- `docs/` — documentation (setup-guides, reference, ops, security, hardware, contributing)
+- `dev/` — CI scripts (`ci.sh`) and Docker configuration
+
+## Approval Architecture (Tool Call)
+
+```
+LLM tool_calls: [{ name: "tool_name", arguments: "{...}" }]
+  ↓
+loop_.rs:1562 → needs_approval(tool_name) — uses ApprovalManager
+  ↓
+loop_.rs:1564 → ApprovalRequest { tool_name, arguments: Value }
+  ↓
+loop_.rs:1575 → ChannelApprovalRequest { tool_name, arguments_summary, ... }
+  ↓
+channel.request_approval(recipient, request) → ChannelApprovalResponse
+  ↓
+ApprovalResponse: Approve / Deny / AlwaysApprove
+```
+
+**Skill tools** follow the same flow. Their names are prefixed with the skill name (e.g., `weather_skill.get_weather`). Skill shell tools always require explicit approval (`security.validate_command_execution(cmd, approved=true)`).
+
+**`summarize_args()`** in `crates/zeroclaw-runtime/src/approval/mod.rs:224` converts raw JSON arguments into a flattened key-value string for display. **This is lossy** — truncates string values to 80 chars, collapses nested objects to `to_string()`. New approval code should pass structured data instead.
 
 ## Risk Tiers
 
-- **Low risk**: docs/chore/tests-only changes
-- **Medium risk**: most `crates/*/src/**` behavior changes without boundary/security impact
-- **High risk**: `crates/zeroclaw-runtime/src/**` (especially `src/security/`), `crates/zeroclaw-gateway/src/**`, `crates/zeroclaw-tools/src/**`, `.github/workflows/**`, access-control boundaries
+- **Low**: docs/chore/tests-only
+- **Medium**: most `crates/*/src/**` behavior changes without boundary/security impact
+- **High**: `crates/zeroclaw-runtime/src/**` (especially `src/security/`), `crates/zeroclaw-gateway/src/**`, `crates/zeroclaw-tools/src/**`, `.github/workflows/**`, access-control boundaries
 
-When uncertain, classify as higher risk.
+When uncertain, classify higher.
 
 ## Workflow
 
-1. **Read before write** — inspect existing module, factory wiring, and adjacent tests before editing.
+1. **Read before write** — inspect existing module, factory wiring, and adjacent tests.
 2. **One concern per PR** — avoid mixed feature+refactor+infra patches.
 3. **Implement minimal patch** — no speculative abstractions, no config keys without a concrete use case.
-4. **Validate by risk tier** — docs-only: lightweight checks. Code changes: full relevant checks.
-5. **Document impact** — update PR notes for behavior, risk, side effects, and rollback.
-6. **Queue hygiene** — stacked PR: declare `Depends on #...`. Replacing old PR: declare `Supersedes #...`.
+4. **Validate by risk tier** — low: lightweight checks; code: full checks (`cargo clippy`, `cargo test`).
+5. **Document impact** — update PR notes for behavior, risk, side effects, rollback.
+6. **Stacked PRs**: declare `Depends on #...`. Replacing old PR: declare `Supersedes #...`.
 
-Branch/commit/PR rules:
-- Work from a non-`master` branch. Open a PR to `master`; do not push directly.
-- Use conventional commit titles. Prefer small PRs (`size: XS/S/M`).
-- Follow `.github/pull_request_template.md` fully.
-- Never commit secrets, personal data, or real identity information (see `@docs/contributing/pr-discipline.md`).
+Branch/PR rules:
+- Work from a non-`master` branch. Open PR to `master`; do not push directly.
+- Use conventional commit titles (`size: XS/S/M` prefix helpful).
+- Follow `.github/pull_request_template.md`.
+- Never commit secrets, personal data, or real identity info (see `docs/contributing/pr-discipline.md`).
 
 ## Anti-Patterns
 
@@ -113,17 +139,22 @@ Branch/commit/PR rules:
 - Do not modify unrelated modules "while here".
 - Do not bypass failing checks without explicit explanation.
 - Do not hide behavior-changing side effects in refactor commits.
-- Do not include personal identity or sensitive information in test data, examples, docs, or commits.
+- Do not include personal identity or sensitive info in test data, examples, docs, or commits.
 
 ## Skills
 
-AI coding assistant skills live in `.claude/skills/`. Use the right one for the job:
+AI coding assistant skills live in `.claude/skills/`. Use the right one:
 
-- `.claude/skills/github-pr-review-session/SKILL.md` — PR review co-pilot; assists **you** as the human reviewer. Posts reviews as WareWolf-MoonWall using the RFC feedback taxonomy (🔴/🟡/✅/🔵/🟢). Trigger: `review 1234`, `re-review 1234`, `go through the queue`.
-- `.claude/skills/changelog-generation/SKILL.md` — generates `CHANGELOG-next.md` between stable tags, resolves contributors via GraphQL, feeds the release workflow. Trigger: `generate changelog`, `release notes for v0.7.x`.
+- `.claude/skills/github-pr-review-session/SKILL.md` — PR review co-pilot. Trigger: `review 1234`, `re-review 1234`, `go through the queue`. Posts as WareWolf-MoonWall.
+- `.claude/skills/changelog-generation/SKILL.md` — generates `CHANGELOG-next.md` between stable tags. Trigger: `generate changelog`, `release notes for v0.7.x`.
+- `.claude/skills/zeroclaw/SKILL.md` — ZeroClaw CLI and gateway API operations. Trigger: anything involving `zeroclaw` binary, gateway API, memory, cron jobs, channels.
+- `.claude/skills/systematic-debugging/SKILL.md` — bug/test failure investigation. Trigger: any bug or unexpected behavior.
+- `.claude/skills/test-driven-development/SKILL.md` — TDD workflow. Trigger: implementing features or bugfixes.
+- `.claude/skills/writing-plans/SKILL.md` — write implementation plans. Trigger: multi-step tasks with a spec or requirements.
+- `.claude/skills/brainstorming/SKILL.md` — design exploration before implementation. Trigger: creating features, components, or modifying behavior.
 
 ## Linked References
 
-- `@docs/contributing/change-playbooks.md` — adding providers, channels, tools, peripherals; security/gateway changes; architecture boundaries
-- `@docs/contributing/pr-discipline.md` — privacy rules, superseded-PR attribution/templates, handoff template
-- `@docs/contributing/docs-contract.md` — docs system contract, i18n rules, locale parity
+- `docs/contributing/change-playbooks.md` — adding providers, channels, tools, peripherals; security/gateway changes
+- `docs/contributing/pr-discipline.md` — privacy rules, superseded-PR attribution/templates
+- `docs/contributing/docs-contract.md` — docs system contract, i18n rules
