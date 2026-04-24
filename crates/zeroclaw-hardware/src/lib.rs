@@ -47,6 +47,10 @@ pub mod aardvark_tools;
 #[cfg(feature = "hardware")]
 pub mod datasheet;
 
+/// Interactive hardware onboarding wizard UI.
+#[cfg(feature = "hardware")]
+pub mod wizard;
+
 /// Raspberry Pi self-discovery and native GPIO tools.
 /// Only compiled on Linux with the `peripheral-rpi` feature.
 #[cfg(all(feature = "peripheral-rpi", target_os = "linux"))]

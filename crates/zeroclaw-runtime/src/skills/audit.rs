@@ -47,11 +47,12 @@ pub fn audit_skill_directory_with_options(
         .with_context(|| format!("failed to canonicalize {}", skill_dir.display()))?;
     let mut report = SkillAuditReport::default();
 
-    let has_manifest =
-        canonical_root.join("SKILL.md").is_file() || canonical_root.join("SKILL.toml").is_file();
+    let has_manifest = canonical_root.join("SKILL.md").is_file()
+        || canonical_root.join("SKILL.toml").is_file()
+        || canonical_root.join("manifest.toml").is_file();
     if !has_manifest {
         report.findings.push(
-            "Skill root must include SKILL.md or SKILL.toml for deterministic auditing."
+            "Skill root must include SKILL.md, SKILL.toml, or manifest.toml for deterministic auditing."
                 .to_string(),
         );
     }

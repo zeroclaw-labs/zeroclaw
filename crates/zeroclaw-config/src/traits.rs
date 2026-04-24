@@ -18,6 +18,8 @@ pub enum PropKind {
     Float,
     /// An enum or other serde-serializable type (parsed as TOML string).
     Enum,
+    /// A `Vec<String>` field; set via comma-separated input.
+    StringArray,
 }
 
 /// Maps Rust types to PropKind at compile time.
@@ -49,6 +51,9 @@ impl_prop_kind!(
     i64,
     isize
 );
+impl HasPropKind for Vec<String> {
+    const PROP_KIND: PropKind = PropKind::StringArray;
+}
 
 /// Describes a single property field discovered via `#[derive(Configurable)]`.
 #[derive(Clone)]
