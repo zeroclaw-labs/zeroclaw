@@ -977,6 +977,7 @@ mod tests {
         assert_eq!(ch.nickserv_password.as_deref(), Some("nspass"));
         assert_eq!(ch.sasl_password.as_deref(), Some("saslpass"));
         assert!(!ch.verify_tls);
+        assert!(!ch.mention_only);
     }
 
     // ── Config serde ────────────────────────────────────────
@@ -997,6 +998,7 @@ mod tests {
             nickserv_password: Some("secret".into()),
             sasl_password: None,
             verify_tls: Some(true),
+            mention_only: false,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -1011,6 +1013,7 @@ mod tests {
         assert_eq!(parsed.nickserv_password.as_deref(), Some("secret"));
         assert!(parsed.sasl_password.is_none());
         assert_eq!(parsed.verify_tls, Some(true));
+        assert_eq!(parsed.mention_only, false);
     }
 
     #[test]
@@ -1032,6 +1035,7 @@ nickname = "bot"
         assert!(parsed.nickserv_password.is_none());
         assert!(parsed.sasl_password.is_none());
         assert!(parsed.verify_tls.is_none());
+        assert_eq!(parsed.mention_only, false);
     }
 
     #[test]
