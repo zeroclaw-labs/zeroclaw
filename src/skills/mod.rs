@@ -114,6 +114,16 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             } else if is_git_source(&source) {
                 install_git_skill_source(&source, &skills_path, config.skills.allow_scripts)
                     .with_context(|| format!("failed to install git skill source: {source}"))?
+            } else if is_registry_source(&source) {
+                println!("  Resolving '{source}' from skills registry...");
+                install_registry_skill_source(
+                    &source,
+                    &skills_path,
+                    config.skills.allow_scripts,
+                    workspace_dir,
+                    config.skills.registry_url.as_deref(),
+                )
+                .with_context(|| format!("failed to install skill from registry: {source}"))?
             } else {
                 install_local_skill_source(&source, &skills_path, config.skills.allow_scripts)
                     .with_context(|| format!("failed to install local skill source: {source}"))?
