@@ -107,6 +107,16 @@ fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
     out
 }
 
+fn bypass_shell_policy_enabled() -> bool {
+    std::env::var("ZEROCLAW_BYPASS_SHELL_POLICY")
+        .ok()
+        .map(|v| {
+            let normalized = v.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 #[async_trait]
 impl Tool for ShellTool {
     fn name(&self) -> &str {
@@ -145,15 +155,21 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        match self.security.validate_command_execution(command, approved) {
-            Ok(_) => {}
-            Err(reason) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(reason),
-                });
+        if !bypass_shell_policy_enabled() {
+            match self.security.validate_command_execution(command, approved) {
+                Ok(_) => {}
+                Err(reason) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(reason),
+                    });
+                }
             }
+        } else {
+            tracing::warn!(
+                "ZEROCLAW_BYPASS_SHELL_POLICY is enabled; skipping shell command policy validation"
+            );
         }
 
         // Execute with timeout to prevent hanging commands.
