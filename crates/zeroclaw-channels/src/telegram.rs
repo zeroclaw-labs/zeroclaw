@@ -314,6 +314,12 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
 /// Telegram Bot API maximum file download size (20 MB).
 const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 
+type MediaGroupBuffer = Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<String, (Vec<serde_json::Value>, std::time::Instant)>,
+    >,
+>;
+
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
     bot_token: String,
@@ -338,6 +344,7 @@ pub struct TelegramChannel {
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pending_voice:
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
+    pending_media_groups: MediaGroupBuffer,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
     /// Pending approval requests: callback_data key → oneshot sender.
@@ -397,6 +404,7 @@ impl TelegramChannel {
             tts_config: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_media_groups: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
@@ -1319,6 +1327,160 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         Some(ChannelMessage {
             id: format!("telegram_{chat_id}_{message_id}"),
+            sender: sender_identity,
+            reply_target,
+            content,
+            channel: "telegram".to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            thread_ts: thread_id,
+            interruption_scope_id: None,
+            attachments: vec![],
+        })
+    }
+
+    fn extract_media_group_id(update: &serde_json::Value) -> Option<String> {
+        update
+            .get("message")
+            .and_then(|m| m.get("media_group_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(String::from)
+    }
+
+    async fn merge_media_group(&self, updates: &[serde_json::Value]) -> Option<ChannelMessage> {
+        if updates.is_empty() {
+            return None;
+        }
+        let first_message = updates[0].get("message")?;
+        let (username, sender_id, sender_identity) = Self::extract_sender_info(first_message);
+
+        let mut identities = vec![username.as_str()];
+        if let Some(id) = sender_id.as_deref() {
+            identities.push(id);
+        }
+        if !self.is_any_user_allowed(identities.iter().copied()) {
+            return None;
+        }
+
+        let chat_id = first_message
+            .get("chat")
+            .and_then(|chat| chat.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string())?;
+
+        let first_message_id = first_message
+            .get("message_id")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+
+        let thread_id = first_message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string());
+
+        let reply_target = if let Some(ref tid) = thread_id {
+            format!("{}:{}", chat_id, tid)
+        } else {
+            chat_id.clone()
+        };
+
+        let workspace = self.workspace_dir.as_ref().or_else(|| {
+            tracing::warn!("Cannot save attachment: workspace_dir not configured");
+            None
+        })?;
+
+        let save_dir = workspace.join("telegram_files");
+        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
+            tracing::warn!("Failed to create telegram_files directory: {e}");
+            return None;
+        }
+
+        let mut content_parts: Vec<String> = Vec::new();
+        let mut shared_caption: Option<String> = None;
+
+        for update in updates {
+            let Some(message) = update.get("message") else { continue };
+            let Some(attachment) = Self::parse_attachment_metadata(message) else { continue };
+
+            if let Some(size) = attachment.file_size {
+                if size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES {
+                    tracing::info!("Skipping media-group attachment: file size {size} bytes exceeds limit");
+                    continue;
+                }
+            }
+
+            if shared_caption.is_none() {
+                if let Some(ref cap) = attachment.caption {
+                    if !cap.is_empty() {
+                        shared_caption = Some(cap.clone());
+                    }
+                }
+            }
+
+            let message_id = message
+                .get("message_id")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+
+            let tg_file_path = match self.get_file_path(&attachment.file_id).await {
+                Ok(p) => p,
+                Err(e) => { tracing::warn!("Failed to get media-group file path: {e}"); continue; }
+            };
+
+            let file_data = match self.download_file(&tg_file_path).await {
+                Ok(d) => d,
+                Err(e) => { tracing::warn!("Failed to download media-group attachment: {e}"); continue; }
+            };
+
+            let local_filename = match &attachment.file_name {
+                Some(name) => name.clone(),
+                None => {
+                    let ext = tg_file_path.rsplit('.').next().unwrap_or("jpg");
+                    format!("photo_{chat_id}_{message_id}.{ext}")
+                }
+            };
+
+            let local_path = save_dir.join(&local_filename);
+            if let Err(e) = tokio::fs::write(&local_path, &file_data).await {
+                tracing::warn!("Failed to save media-group attachment to {}: {e}", local_path.display());
+                continue;
+            }
+
+            content_parts.push(format_attachment_content(
+                attachment.kind,
+                &local_filename,
+                &local_path,
+            ));
+        }
+
+        if content_parts.is_empty() {
+            return None;
+        }
+
+        let mut content = content_parts.join("\n");
+
+        if let Some(caption) = shared_caption {
+            use std::fmt::Write;
+            let _ = write!(content, "\n\n{caption}");
+        }
+
+        if let Some(quote) = self.extract_reply_context(first_message) {
+            content = format!("{quote}\n\n{content}");
+        }
+
+        if let Some(attr) = Self::format_forward_attribution(first_message) {
+            content = format!("{attr}{content}");
+        }
+
+        tracing::info!(
+            "Merged media group with {} attachments for chat {chat_id}",
+            content_parts.len()
+        );
+
+        Some(ChannelMessage {
+            id: format!("telegram_{chat_id}_{first_message_id}"),
             sender: sender_identity,
             reply_target,
             content,
@@ -2946,10 +3108,26 @@ Ensure only one `zeroclaw` process is using this bot token."
             }
 
             if let Some(results) = data.get("result").and_then(serde_json::Value::as_array) {
+                let mut batch_media_group_ids: Vec<String> = Vec::new();
+
                 for update in results {
                     // Advance offset past this update
                     if let Some(uid) = update.get("update_id").and_then(serde_json::Value::as_i64) {
                         offset = uid + 1;
+                    }
+
+                    if let Some(mg_id) = Self::extract_media_group_id(update) {
+                        if let Ok(mut groups) = self.pending_media_groups.lock() {
+                            let entry = groups
+                                .entry(mg_id.clone())
+                                .or_insert_with(|| (Vec::new(), std::time::Instant::now()));
+                            entry.0.push(update.clone());
+                            entry.1 = std::time::Instant::now();
+                        }
+                        if !batch_media_group_ids.contains(&mg_id) {
+                            batch_media_group_ids.push(mg_id);
+                        }
+                        continue;
                     }
 
                     // ── Handle callback_query (inline keyboard taps) ──
@@ -3049,6 +3227,44 @@ Ensure only one `zeroclaw` process is using this bot token."
 
                     if tx.send(msg).await.is_err() {
                         return Ok(());
+                    }
+                }
+
+                for mg_id in &batch_media_group_ids {
+                    let updates_buf = if let Ok(mut groups) = self.pending_media_groups.lock() {
+                        groups.remove(mg_id).map(|(v, _)| v)
+                    } else {
+                        None
+                    };
+
+                    if let Some(buf) = updates_buf {
+                        if let Some(msg) = self.merge_media_group(&buf).await {
+                            if self.ack_reactions {
+                                if let Some((reaction_chat_id, reaction_message_id)) =
+                                    Self::extract_update_message_target(&buf[0])
+                                {
+                                    self.try_add_ack_reaction_nonblocking(
+                                        reaction_chat_id,
+                                        reaction_message_id,
+                                    );
+                                }
+                            }
+
+                            let typing_body = serde_json::json!({
+                                "chat_id": &msg.reply_target,
+                                "action": "typing"
+                            });
+                            let _ = self
+                                .http_client()
+                                .post(self.api_url("sendChatAction"))
+                                .json(&typing_body)
+                                .send()
+                                .await;
+
+                            if tx.send(msg).await.is_err() {
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }
