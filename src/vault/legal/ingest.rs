@@ -48,6 +48,18 @@ pub struct IngestCounts {
     pub cases_updated: usize,
     pub edges_written: usize,
     pub edges_resolved_after_pass: usize,
+    /// Historical (연혁법령) article versions written as additional
+    /// `statute::{법}::{N}@YYYYMMDD` nodes. Counts increment on top of
+    /// the canonical-slug counts above, so a 현행법령 ingestion writing
+    /// both canonical and versioned forms increments BOTH sets.
+    pub statute_versions_inserted: usize,
+    pub statute_versions_skipped_unchanged: usize,
+    pub statute_versions_updated: usize,
+    /// Historical articles where no publish date was extractable
+    /// (path had no `YYYYMMDD` folder AND the JSON block's `ancYd`
+    /// was missing). These are still written to the canonical slug
+    /// where possible, but without a versioned record.
+    pub statute_versions_skipped_no_date: usize,
     pub errors: Vec<String>,
 }
 
@@ -64,24 +76,78 @@ pub fn ingest_statute(conn: &Arc<Mutex<Connection>>, doc: &StatuteDoc) -> Result
         ..Default::default()
     };
 
+    // Source-path meta drives the canonical-vs-versioned write policy.
+    // `Current`  → write canonical + versioned (current is both latest AND a dated revision).
+    // `Historical` → write versioned only (canonical must not be overwritten by an old version).
+    // `Unknown`  → write canonical only (backward compat with ad-hoc paths).
+    let path_meta = super::source_path::parse(&doc.source_path);
+    let publish_date: Option<String> = path_meta
+        .publish_date
+        .clone()
+        .or_else(|| doc.promulgated_at.clone());
+
+    let write_canonical = !matches!(
+        path_meta.category,
+        super::source_path::SourceCategory::Historical
+    );
+    let write_versioned = publish_date.is_some()
+        && matches!(
+            path_meta.category,
+            super::source_path::SourceCategory::Current
+                | super::source_path::SourceCategory::Historical
+        );
+
     // Run the whole statute as one transaction — all-or-nothing.
     let mut guard = conn.lock();
     let tx = guard
         .transaction()
         .context("starting transaction for statute ingest")?;
+
     for article in &doc.articles {
-        match upsert_statute_article(&tx, doc, article)? {
-            ArticleOutcome::Inserted(doc_id) => {
-                counts.statute_articles_inserted += 1;
-                counts.edges_written += write_statute_edges(&tx, doc, article, doc_id)?;
+        // 1. Canonical slug — citation-resolution target + graph node.
+        if write_canonical {
+            match upsert_statute_article(&tx, doc, article)? {
+                ArticleOutcome::Inserted(doc_id) => {
+                    counts.statute_articles_inserted += 1;
+                    counts.edges_written += write_statute_edges(&tx, doc, article, doc_id)?;
+                }
+                ArticleOutcome::Updated(doc_id) => {
+                    counts.statute_articles_updated += 1;
+                    counts.edges_written += write_statute_edges(&tx, doc, article, doc_id)?;
+                }
+                ArticleOutcome::SkippedUnchanged => {
+                    counts.statute_articles_skipped_unchanged += 1;
+                }
             }
-            ArticleOutcome::Updated(doc_id) => {
-                counts.statute_articles_updated += 1;
-                counts.edges_written += write_statute_edges(&tx, doc, article, doc_id)?;
+        }
+
+        // 2. Versioned slug — storage for historical body text. No edges
+        //    from here; all citations flow through the canonical slug so
+        //    graph walks stay uncluttered by history duplicates.
+        if write_versioned {
+            if let Some(pd) = publish_date.as_deref() {
+                let vslug = super::slug::versioned_statute_slug(
+                    &doc.law_name,
+                    article.article_num,
+                    article.article_sub,
+                    pd,
+                );
+                match upsert_versioned_article(&tx, doc, article, &vslug, pd, path_meta.category)? {
+                    ArticleOutcome::Inserted(_) => counts.statute_versions_inserted += 1,
+                    ArticleOutcome::Updated(_) => counts.statute_versions_updated += 1,
+                    ArticleOutcome::SkippedUnchanged => {
+                        counts.statute_versions_skipped_unchanged += 1;
+                    }
+                }
             }
-            ArticleOutcome::SkippedUnchanged => {
-                counts.statute_articles_skipped_unchanged += 1;
-            }
+        } else if matches!(
+            path_meta.category,
+            super::source_path::SourceCategory::Historical
+        ) {
+            // Historical path but no usable publish date → the version
+            // is not pinpointable; flag it so the operator knows to fix
+            // the folder layout before re-running.
+            counts.statute_versions_skipped_no_date += 1;
         }
     }
     // 부칙 — each supplement becomes its own statute_supplement node so
@@ -302,6 +368,152 @@ fn write_statute_edges(
         written += 1;
     }
     Ok(written)
+}
+
+/// Write an article row keyed by its **versioned** slug
+/// (`statute::{법}::{N}@YYYYMMDD`). Used for 연혁법령 snapshots and also
+/// written alongside the canonical slug for 현행법령 ingestions so
+/// future amendments don't erase the current version's body text.
+///
+/// Intentionally writes NO edges — versioned nodes are read-only
+/// archives consulted by `legal_applicable_version` +
+/// `legal_read_article`. All citation graph traversal continues to go
+/// through canonical slugs.
+fn upsert_versioned_article(
+    conn: &Connection,
+    doc: &StatuteDoc,
+    article: &StatuteArticle,
+    vslug: &str,
+    publish_date: &str,
+    category: super::source_path::SourceCategory,
+) -> Result<ArticleOutcome> {
+    let content = format!(
+        "# {} {} (공포 {})\n\n{}\n",
+        doc.law_name, article.header, publish_date, article.body
+    );
+    let checksum = hex_sha256(&content);
+    let now = unix_epoch();
+
+    let existing: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, checksum FROM vault_documents WHERE title = ?1",
+            params![vslug],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok();
+
+    let doc_id: i64 = match existing {
+        Some((_id, existing_sum)) if existing_sum == checksum => {
+            return Ok(ArticleOutcome::SkippedUnchanged);
+        }
+        Some((id, _)) => {
+            conn.execute(
+                "UPDATE vault_documents
+                   SET content = ?1, checksum = ?2, char_count = ?3, updated_at = ?4,
+                       original_path = ?5, doc_type = 'statute_article_version',
+                       source_type = 'local_file'
+                 WHERE id = ?6",
+                params![
+                    content,
+                    checksum,
+                    content.chars().count() as i64,
+                    now as i64,
+                    doc.source_path,
+                    id,
+                ],
+            )?;
+            conn.execute(
+                "DELETE FROM vault_frontmatter WHERE doc_id = ?1",
+                params![id],
+            )?;
+            conn.execute("DELETE FROM vault_tags WHERE doc_id = ?1", params![id])?;
+            conn.execute("DELETE FROM vault_aliases WHERE doc_id = ?1", params![id])?;
+            id
+        }
+        None => {
+            let uuid = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO vault_documents
+                    (uuid, title, content, source_type, source_device_id, original_path,
+                     checksum, doc_type, char_count, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'local_file', ?4, ?5, ?6, 'statute_article_version',
+                         ?7, ?8, ?8)",
+                params![
+                    uuid,
+                    vslug,
+                    content,
+                    "local",
+                    doc.source_path,
+                    checksum,
+                    content.chars().count() as i64,
+                    now as i64,
+                ],
+            )?;
+            conn.last_insert_rowid()
+        }
+    };
+
+    let canonical_slug = super::slug::statute_slug(
+        &doc.law_name,
+        article.article_num,
+        article.article_sub,
+    );
+    let fm: &[(&str, Option<String>)] = &[
+        ("law_name", Some(doc.law_name.clone())),
+        ("article_key", Some(article.article_key.clone())),
+        ("article_num", Some(article.article_num.to_string())),
+        ("article_sub", article.article_sub.map(|s| s.to_string())),
+        ("article_title_kw", article.title_kw.clone()),
+        ("article_header", Some(article.header.clone())),
+        ("publish_date", Some(publish_date.to_string())),
+        ("version_of", Some(canonical_slug.clone())),
+        ("version_source", Some(category.as_str().to_string())),
+        ("ls_id", doc.ls_id.clone()),
+        ("ls_seq", doc.ls_seq.clone()),
+    ];
+    for (k, v) in fm {
+        if let Some(val) = v {
+            conn.execute(
+                "INSERT OR IGNORE INTO vault_frontmatter (doc_id, key, value)
+                 VALUES (?1, ?2, ?3)",
+                params![doc_id, k, val],
+            )?;
+        }
+    }
+
+    // Human-friendly alias — `근로기준법 제36조 (2020-05-26 공포)` —
+    // so `legal_graph_find` can resolve to the versioned node by name.
+    let pretty_date = if publish_date.len() == 8 {
+        format!(
+            "{}-{}-{}",
+            &publish_date[..4],
+            &publish_date[4..6],
+            &publish_date[6..8]
+        )
+    } else {
+        publish_date.to_string()
+    };
+    let alias = format!("{} {} ({} 공포)", doc.law_name, article.header, pretty_date);
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO vault_aliases (doc_id, alias) VALUES (?1, ?2)",
+        params![doc_id, alias],
+    );
+
+    // Tags.
+    insert_tag(conn, doc_id, "domain:legal", Some("domain"))?;
+    insert_tag(conn, doc_id, "kind:statute_version", Some("kind"))?;
+    insert_tag(conn, doc_id, &format!("law:{}", doc.law_name), Some("law"))?;
+    insert_tag(
+        conn,
+        doc_id,
+        &format!("year:{}", &publish_date[..publish_date.len().min(4)]),
+        Some("year"),
+    )?;
+
+    match existing {
+        Some(_) => Ok(ArticleOutcome::Updated(doc_id)),
+        None => Ok(ArticleOutcome::Inserted(doc_id)),
+    }
 }
 
 /// Prepend the structured `[pre:YYYYMMDD] ` marker when this citation
@@ -1154,5 +1366,161 @@ test
             )
             .unwrap();
         assert_eq!(csv, "20240328,20240405,20250410");
+    }
+
+    // ───── 버전 히스토리 (현행법령 / 연혁법령) ─────
+
+    /// A stripped-down statute markdown fixture keyed on caller-supplied
+    /// article text so we can simulate version drift across ingests.
+    fn statute_md_with_article(article_body: &str) -> String {
+        format!(
+            r#"# 근로기준법
+
+```json
+{{
+  "meta": {{"lsNm": "근로기준법", "ancYd": "20200526", "efYd": "20200526"}},
+  "title": "근로기준법",
+  "articles": [
+    {{"anchor": "J36:0", "number": "제36조(금품 청산)", "text": "{article_body}"}}
+  ],
+  "supplements": [
+    {{"title": "부      칙  <법률 제17326호, 2020. 5. 26.>", "body": "이 법은 공포한 날부터 시행한다."}}
+  ]
+}}
+```
+"#,
+            article_body = article_body.replace('\n', "\\n").replace('"', "\\\"")
+        )
+    }
+
+    #[test]
+    fn historical_ingest_writes_versioned_only_not_canonical() {
+        let conn = fresh_conn();
+        let md = statute_md_with_article("제36조(금품 청산) 2020년 당시 규정 - 지급 사유 14일 이내");
+        let doc = extract_statute(
+            &md,
+            r"D:\\국가법령정보api\\연혁법령\\20200526\\근로기준법.md",
+        )
+        .unwrap();
+        let counts = ingest_statute(&conn, &doc).unwrap();
+
+        // Historical category → 0 canonical writes, 1 versioned write.
+        assert_eq!(counts.statute_articles_inserted, 0);
+        assert_eq!(counts.statute_versions_inserted, 1);
+
+        let g = conn.lock();
+        // Canonical slug must NOT exist (pure-historical ingest).
+        let canonical_exists: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM vault_documents WHERE title='statute::근로기준법::36'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(canonical_exists, 0);
+        // Versioned slug must exist.
+        let vexists: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM vault_documents
+                    WHERE title='statute::근로기준법::36@20200526'
+                      AND doc_type='statute_article_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vexists, 1);
+    }
+
+    #[test]
+    fn current_ingest_writes_both_canonical_and_versioned() {
+        let conn = fresh_conn();
+        let md = statute_md_with_article("제36조(금품 청산) 2025년 현행 규정");
+        // Override the JSON's ancYd with a date from the 현행법령 path so
+        // versioned slug reflects the "published as of" date.
+        let md = md.replace("20200526", "20250131");
+        let doc = extract_statute(
+            &md,
+            r"D:\\국가법령정보api\\현행법령\\20250131\\근로기준법.md",
+        )
+        .unwrap();
+        let counts = ingest_statute(&conn, &doc).unwrap();
+
+        assert_eq!(counts.statute_articles_inserted, 1);
+        assert_eq!(counts.statute_versions_inserted, 1);
+
+        let g = conn.lock();
+        let canonical_exists: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM vault_documents WHERE title='statute::근로기준법::36'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let versioned_exists: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM vault_documents
+                    WHERE title='statute::근로기준법::36@20250131'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(canonical_exists, 1);
+        assert_eq!(versioned_exists, 1);
+    }
+
+    #[test]
+    fn historical_after_current_keeps_canonical_pointing_at_current() {
+        let conn = fresh_conn();
+
+        // Ingest the CURRENT version first.
+        let cur = statute_md_with_article("제36조(금품 청산) 현행 — 2024 개정 반영");
+        let cur = cur.replace("20200526", "20250131");
+        let cur_doc = extract_statute(
+            &cur,
+            r"D:\\국가법령정보api\\현행법령\\20250131\\근로기준법.md",
+        )
+        .unwrap();
+        ingest_statute(&conn, &cur_doc).unwrap();
+
+        // Then ingest a HISTORICAL version.
+        let old = statute_md_with_article("제36조(금품 청산) 옛 버전 — 2010");
+        let old = old.replace("20200526", "20101004");
+        let old_doc = extract_statute(
+            &old,
+            r"D:\\국가법령정보api\\연혁법령\\20101004\\근로기준법.md",
+        )
+        .unwrap();
+        ingest_statute(&conn, &old_doc).unwrap();
+
+        let g = conn.lock();
+        // Canonical content must still be the 2025 version — historical
+        // ingest must not overwrite it.
+        let canonical_content: String = g
+            .query_row(
+                "SELECT content FROM vault_documents WHERE title='statute::근로기준법::36'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(canonical_content.contains("현행 — 2024 개정 반영"));
+        assert!(!canonical_content.contains("옛 버전 — 2010"));
+
+        // Both versioned slugs exist with correct content.
+        let v2025: String = g
+            .query_row(
+                "SELECT content FROM vault_documents WHERE title='statute::근로기준법::36@20250131'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v2010: String = g
+            .query_row(
+                "SELECT content FROM vault_documents WHERE title='statute::근로기준법::36@20101004'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(v2025.contains("현행 — 2024 개정 반영"));
+        assert!(v2010.contains("옛 버전 — 2010"));
     }
 }

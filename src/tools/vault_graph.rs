@@ -448,6 +448,91 @@ impl Tool for LegalReadArticleTool {
     }
 }
 
+// ───────── Abbreviation inference (Korean legal subsequence rule) ─────────
+
+pub struct LegalInferLawAbbreviationTool;
+
+impl LegalInferLawAbbreviationTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for LegalInferLawAbbreviationTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for LegalInferLawAbbreviationTool {
+    fn name(&self) -> &str {
+        "legal_infer_law_abbreviation"
+    }
+
+    fn description(&self) -> &str {
+        "Korean-legal-abbreviation inference helper. Use when you see a short law form (e.g. `교특법`, `특가법`, `근퇴법`) and a direct lookup (`legal_graph_find`) returned NOTHING or you're unsure which canonical law the abbreviation refers to. \
+Applies three universal Korean abbreviation rules: \
+(1) abbreviations are never LONGER than the full name, \
+(2) abbreviation characters come FROM the full name IN ORDER, \
+(3) therefore every candidate canonical must contain the abbreviation as an ORDERED SUBSEQUENCE. \
+Returns the list of matching canonical law names from the curated table. When >1 result comes back (e.g. `특가법` surfaces both 특정범죄 가중처벌 and 특정경제범죄 가중처벌 sibling laws), disambiguate from the surrounding judgment's subject matter before calling `legal_graph_find` with the correct canonical."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "abbreviation": {
+                    "type": "string",
+                    "description": "The Korean-legal abbreviation you're trying to resolve (e.g. `특가법`, `근기법`, `성매법`). Whitespace is ignored."
+                }
+            },
+            "required": ["abbreviation"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolResult> {
+        let abbrev = arg_str(&args, "abbreviation")?;
+        let candidates =
+            crate::vault::legal::law_aliases::infer_candidates_by_subsequence(&abbrev);
+
+        let mut out = String::new();
+        if candidates.is_empty() {
+            let _ = writeln!(
+                out,
+                "No canonical law in the curated table matches `{abbrev}` by the \
+                 ordered-subsequence rule. Either (a) the abbreviation is longer \
+                 than every known canonical (violating rule 1), or (b) the canonical \
+                 isn't in the table yet. Consider calling `legal_graph_find` with the \
+                 FULL name directly if you know it, or widen your search via FTS."
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "{} candidate canonical(s) for `{abbrev}` by the ordered-subsequence rule:",
+                candidates.len()
+            );
+            for c in &candidates {
+                let _ = writeln!(out, "  - {c}");
+            }
+            if candidates.len() > 1 {
+                let _ = writeln!(
+                    out,
+                    "\nMultiple candidates — disambiguate from the judgment's subject matter \
+                     (what the case is actually about), then call `legal_graph_find` with the \
+                     chosen canonical."
+                );
+            }
+        }
+        Ok(ToolResult {
+            success: true,
+            output: out,
+            error: None,
+        })
+    }
+}
+
 // ───────── Applicable-version picker (2-tier 제1원칙) ─────────
 
 pub struct LegalApplicableVersionTool {

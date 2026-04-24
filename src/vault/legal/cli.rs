@@ -52,6 +52,24 @@ pub async fn ingest_path(config: &Config, root: PathBuf, dry_run: bool) -> Resul
         style("legal ingest:").bold().cyan(),
         root.display()
     );
+    // Auto-detect current/historical from the root path itself so the
+    // operator can confirm the policy before rows get written.
+    let root_str = root.to_string_lossy();
+    let detected = if root_str.contains("현행법령") {
+        Some("현행법령 (canonical + versioned writes)")
+    } else if root_str.contains("연혁법령") {
+        Some("연혁법령 (versioned-only writes; canonical preserved)")
+    } else {
+        None
+    };
+    if let Some(label) = detected {
+        println!("  {} {}", style("corpus:").dim(), label);
+    } else {
+        println!(
+            "  {} path contains neither 현행법령 nor 연혁법령 — canonical-only ingest",
+            style("note:").yellow()
+        );
+    }
     if dry_run {
         println!(
             "{} (dry-run — using in-memory db, nothing persisted)",
@@ -197,6 +215,13 @@ fn print_report(report: &IngestReport) {
         c.supplements_updated,
         c.supplements_skipped_unchanged,
         c.supplements_skipped_no_anc_no,
+    );
+    println!(
+        "  versions:      {} inserted, {} updated, {} unchanged, {} skipped (no 공포일)",
+        c.statute_versions_inserted,
+        c.statute_versions_updated,
+        c.statute_versions_skipped_unchanged,
+        c.statute_versions_skipped_no_date,
     );
     println!(
         "  case files:    {}   ({} inserted, {} updated, {} unchanged)",

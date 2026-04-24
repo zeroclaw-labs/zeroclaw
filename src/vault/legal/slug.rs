@@ -52,6 +52,51 @@ pub fn supplement_slug(law_name: &str, promulgation_no: &str) -> String {
     )
 }
 
+/// **Versioned** slug for a statute article — appends the 공포일
+/// (promulgation date, YYYYMMDD) so multiple historical versions of
+/// the same article can coexist in brain.db:
+///
+///   `statute::{법령명}::{N[-M]}@{YYYYMMDD}`
+///
+/// Normalisation: the date portion is stripped of `-`, `.`, and spaces
+/// so `2025-01-31`, `2025.01.31`, `20250131` all become `20250131`.
+/// Invalid (non 8-digit-after-normalisation) dates fall through with
+/// their normalised form preserved — the slug still pins the version,
+/// just without date arithmetic capability.
+///
+/// The canonical (unversioned) slug `statute::{법령명}::{N[-M]}` remains
+/// the citation-resolution target; versioned slugs are written
+/// additively so graph walks and citation lookups behave unchanged.
+pub fn versioned_statute_slug(
+    law_name: &str,
+    article_num: u32,
+    article_sub: Option<u32>,
+    publish_date: &str,
+) -> String {
+    let article_key = match article_sub {
+        Some(s) => format!("{article_num}-{s}"),
+        None => format!("{article_num}"),
+    };
+    let date = normalise_yyyymmdd(publish_date);
+    format!("statute::{}::{}@{}", law_name.trim(), article_key, date)
+}
+
+/// Normalise a date string to compact `YYYYMMDD`. Strips separators
+/// and surrounding whitespace. Returns the input trimmed if it can't
+/// be normalised (the slug is still deterministic, just not ISO-formed).
+fn normalise_yyyymmdd(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let compact: String = trimmed
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    if compact.len() == 8 {
+        compact
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Parse a Korean article reference like `제43조의2` or `제750조` into `(num, sub)`.
 /// Returns `None` for unparseable strings.
 pub fn parse_article(s: &str) -> Option<(u32, Option<u32>)> {

@@ -39,7 +39,9 @@ impl NodeKind {
     /// entry (`"supplement"` for 부칙, absent / `"article"` otherwise).
     pub fn from_doc_type(s: &str) -> Option<Self> {
         match s {
-            "statute_article" | "statute_supplement" => Some(Self::Statute),
+            "statute_article" | "statute_supplement" | "statute_article_version" => {
+                Some(Self::Statute)
+            }
             "case" => Some(Self::Case),
             _ => None,
         }
@@ -128,7 +130,8 @@ pub fn get_node(conn: &Connection, slug: &str) -> Result<Option<Node>> {
     let row = conn
         .query_row(
             "SELECT id, doc_type FROM vault_documents
-              WHERE title = ?1 AND doc_type IN ('statute_article','statute_supplement','case')",
+              WHERE title = ?1 AND doc_type IN \
+                ('statute_article','statute_supplement','statute_article_version','case')",
             params![slug],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
         )
@@ -297,7 +300,8 @@ pub fn read_article(conn: &Connection, slug: &str) -> Result<Option<ArticleConte
     let row: Option<(i64, String, String)> = conn
         .query_row(
             "SELECT id, doc_type, content FROM vault_documents
-              WHERE title = ?1 AND doc_type IN ('statute_article','statute_supplement','case')",
+              WHERE title = ?1 AND doc_type IN \
+                ('statute_article','statute_supplement','statute_article_version','case')",
             params![slug],
             |r| {
                 Ok((
@@ -676,6 +680,16 @@ pub struct ApplicableVersion {
     /// versions when the effective_date ties.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub promulgation_date: Option<String>,
+    /// Versioned article slug pointing at the exact snapshot of the
+    /// article body that was in force. Constructed as
+    /// `statute::{법}::{N}@{promulgation_date}`. Set when such a
+    /// versioned node exists in brain.db; agents should call
+    /// `legal_read_article` with this slug to retrieve the historical
+    /// body text. `None` means the picker settled on a version whose
+    /// body isn't archived — either because only current ingestion
+    /// ran or the specific version snapshot wasn't in the corpus.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub versioned_article_slug: Option<String>,
     /// A short human-readable explanation of the decision.
     pub explanation: String,
 }
@@ -722,6 +736,7 @@ pub fn pick_applicable_version(
             effective_date: None,
             promulgation_no: None,
             promulgation_date: None,
+            versioned_article_slug: None,
             explanation: format!("statute article not found: {statute_slug}"),
         });
     };
@@ -736,6 +751,7 @@ pub fn pick_applicable_version(
                 effective_date: None,
                 promulgation_no: None,
                 promulgation_date: None,
+                versioned_article_slug: None,
                 explanation: format!("no law_name on {statute_slug}"),
             });
         }
@@ -780,26 +796,56 @@ pub fn pick_applicable_version(
         None => supplements.into_iter().next(),
     };
 
+    // Extract article_num / article_sub from the statute slug so we can
+    // build a versioned-article slug pointing at the historical body.
+    // Slug form: `statute::{법}::{N}[-M]`; bail silently if malformed.
+    let (article_num, article_sub) = parse_article_nums_from_slug(statute_slug);
+
     match picked {
-        Some(s) => Ok(ApplicableVersion {
-            branch: branch.to_string(),
-            anchor_date: anchor_date_owned.clone(),
-            supplement_slug: Some(s.slug),
-            effective_date: s.effective_date,
-            promulgation_no: s.promulgation_no,
-            promulgation_date: s.promulgation_date,
-            explanation: match branch {
-                "revision_cutoff" => format!(
-                    "구법 citation: applied version whose effective_date ≤ {}",
-                    anchor_date_owned.as_deref().unwrap_or("?")
-                ),
-                "primary_verdict_date" => format!(
-                    "제1원칙: plain citation, applied version in force at verdict_date {}",
-                    anchor_date_owned.as_deref().unwrap_or("?")
-                ),
-                _ => "fallback: no verdict_date, used newest supplement".to_string(),
-            },
-        }),
+        Some(s) => {
+            // Compose the versioned article slug from the chosen
+            // supplement's promulgation_date + article numbers, then
+            // verify the versioned node actually exists before
+            // surfacing it — we don't fabricate slugs that can't be
+            // read.
+            let versioned_slug = match (article_num, s.promulgation_date.as_deref()) {
+                (Some(n), Some(pd)) if pd.len() == 8 => {
+                    let candidate =
+                        super::slug::versioned_statute_slug(&law_name, n, article_sub, pd);
+                    let exists: bool = conn
+                        .query_row(
+                            "SELECT 1 FROM vault_documents
+                              WHERE title = ?1 AND doc_type = 'statute_article_version'",
+                            params![candidate],
+                            |_| Ok(true),
+                        )
+                        .unwrap_or(false);
+                    if exists { Some(candidate) } else { None }
+                }
+                _ => None,
+            };
+
+            Ok(ApplicableVersion {
+                branch: branch.to_string(),
+                anchor_date: anchor_date_owned.clone(),
+                supplement_slug: Some(s.slug),
+                effective_date: s.effective_date,
+                promulgation_no: s.promulgation_no,
+                promulgation_date: s.promulgation_date,
+                versioned_article_slug: versioned_slug,
+                explanation: match branch {
+                    "revision_cutoff" => format!(
+                        "구법 citation: applied version whose effective_date ≤ {}",
+                        anchor_date_owned.as_deref().unwrap_or("?")
+                    ),
+                    "primary_verdict_date" => format!(
+                        "제1원칙: plain citation, applied version in force at verdict_date {}",
+                        anchor_date_owned.as_deref().unwrap_or("?")
+                    ),
+                    _ => "fallback: no verdict_date, used newest supplement".to_string(),
+                },
+            })
+        }
         None => Ok(ApplicableVersion {
             branch: "none".to_string(),
             anchor_date: anchor_date_owned,
@@ -807,11 +853,31 @@ pub fn pick_applicable_version(
             effective_date: None,
             promulgation_no: None,
             promulgation_date: None,
+            versioned_article_slug: None,
             explanation: format!(
                 "no supplement for law `{law_name}` matches the anchor date"
             ),
         }),
     }
+}
+
+fn parse_article_nums_from_slug(slug: &str) -> (Option<u32>, Option<u32>) {
+    let prefix = "statute::";
+    let rest = match slug.strip_prefix(prefix) {
+        Some(r) => r,
+        None => return (None, None),
+    };
+    let mut parts = rest.split("::");
+    let _law = parts.next();
+    let art_part = match parts.next() {
+        Some(a) => a,
+        None => return (None, None),
+    };
+    // `43-2` or `43`
+    let mut split = art_part.split('-');
+    let n: Option<u32> = split.next().and_then(|s| s.parse().ok());
+    let sub: Option<u32> = split.next().and_then(|s| s.parse().ok());
+    (n, sub)
 }
 
 /// Minimal shape returned by [`list_supplements_of_law`].

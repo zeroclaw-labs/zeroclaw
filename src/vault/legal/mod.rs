@@ -27,6 +27,7 @@ pub mod graph_query;
 pub mod ingest;
 pub mod law_aliases;
 pub mod slug;
+pub mod source_path;
 pub mod statute_extractor;
 pub mod vendor;
 
@@ -40,7 +41,7 @@ pub use graph_query::{
     MAX_NODES,
 };
 pub use ingest::{ingest_case, ingest_statute, IngestCounts, IngestReport};
-pub use slug::{case_slug, statute_slug};
+pub use slug::{case_slug, statute_slug, versioned_statute_slug};
 pub use statute_extractor::{
     extract_statute, looks_like_statute, StatuteArticle, StatuteDoc, Supplement,
 };

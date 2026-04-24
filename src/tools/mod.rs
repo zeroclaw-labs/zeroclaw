@@ -174,7 +174,8 @@ pub use traits::Tool;
 pub use traits::{ToolResult, ToolSpec};
 pub use vault_graph::{
     LegalApplicableVersionTool, LegalGraphFindTool, LegalGraphNeighborsTool,
-    LegalGraphShortestPathTool, LegalGraphSubgraphTool, LegalReadArticleTool,
+    LegalGraphShortestPathTool, LegalGraphSubgraphTool, LegalInferLawAbbreviationTool,
+    LegalReadArticleTool,
 };
 pub use wasm_module::WasmModuleTool;
 // Consumed from src/tools/registry.rs once the smart_search cascade is
@@ -418,6 +419,7 @@ pub fn all_tools_with_runtime(
         Arc::new(LegalApplicableVersionTool::new(Arc::new(
             workspace_dir.to_path_buf(),
         ))),
+        Arc::new(LegalInferLawAbbreviationTool::new()),
         Arc::new(document_fetch::DocumentFetchTool::new(Arc::new(
             workspace_dir.to_path_buf(),
         ))),

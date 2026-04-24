@@ -488,6 +488,41 @@ Adding a new row is a single line in `LAW_ALIAS_TABLE`. Unknown law
 names pass through unchanged — we never invent a slug from a name we
 don't recognise.
 
+### Inference rules for unlisted abbreviations
+
+The curated table covers the most-cited ~60 laws, but Korean
+practitioners coin short forms for thousands of other statutes too.
+When an agent encounters an abbreviation **not** in the table, it
+applies three universal rules that every Korean legal abbreviation
+obeys by construction:
+
+1. **Length rule.** An abbreviation is never longer than its full
+   name. Any candidate whose official name is shorter (in non-space
+   characters) than the abbreviation is impossible.
+2. **Character-origin rule.** Abbreviations are formed by picking
+   characters *from the full name, in the order they appear*. E.g.
+   `교특법` = 교(통사고처리)+특(례)+법, taken left-to-right from
+   `교통사고처리특례법`.
+3. **Ordered-subsequence test.** To resolve an unknown abbreviation,
+   enumerate every canonical whose name contains ALL of the
+   abbreviation's characters as an **ordered subsequence**. The
+   surviving list is the candidate set; pick among them using the
+   surrounding judgment's subject matter.
+
+Implementation:
+- `law_aliases::infer_candidates_by_subsequence(abbrev)` returns
+  every canonical in the table passing all three rules (whitespace
+  in canonicals is transparent — `특경법` still subsequences through
+  `특정경제범죄 가중처벌 등에 관한 법률` despite the spaces).
+- Agent tool **`legal_infer_law_abbreviation`** exposes the same
+  logic so the LLM / SLM can call it when a direct
+  `legal_graph_find` lookup comes up empty.
+
+Siblings deliberately share character sequences (`특가법` subsequences
+through both 특정범죄 and 특정경제범죄 가중처벌 canonicals) so
+multi-candidate results are expected and correct — disambiguation
+from context is part of the rule set, not a failure of it.
+
 ---
 
 ## What's NOT automatic yet (deferred)
@@ -557,6 +592,90 @@ Explicitly out of scope:
 Each is a separate follow-up PR.
 
 ---
+
+## Version history (현행법령 vs 연혁법령)
+
+The user's corpus is organised as:
+
+```
+<root>/현행법령/YYYYMMDD/<법령명>.md      ← currently in-force version
+<root>/연혁법령/YYYYMMDD/<법령명>.md      ← pre-amendment versions (going back to 1940s)
+```
+
+The ingester auto-detects the category from the path and applies a
+dual-slug write policy so history is preserved without polluting the
+citation graph:
+
+| Path contains | Canonical slug write | Versioned slug write |
+|---|---|---|
+| `현행법령` | yes — `statute::{법}::{N}` gets the latest body | yes — `statute::{법}::{N}@YYYYMMDD` also written |
+| `연혁법령` | **no** — canonical is never overwritten by history | yes — versioned slug only |
+| neither | yes (backward-compat) | no |
+
+**Why this split?** Citations in cases and cross-references always
+resolve to the canonical slug. A 연혁법령 ingest must not change
+what `case → cites → statute::근로기준법::36` points at — otherwise
+graph walks would suddenly jump to 1949's version whenever a
+historical corpus is added. The versioned slug
+(`statute::근로기준법::36@20101004`) is a separate storage location
+that `legal_read_article` can retrieve on demand.
+
+### Versioned-node write details
+
+- `doc_type = 'statute_article_version'` (distinct from
+  `'statute_article'` used by canonical nodes)
+- Content: article body prefixed with `# 근로기준법 제36조 (공포
+  YYYYMMDD)` for clear provenance when read back
+- Frontmatter: `law_name`, `article_num`, `article_sub`,
+  `publish_date`, `version_of` (= canonical slug pointer),
+  `version_source` (`"current"` / `"historical"`)
+- Alias: `근로기준법 제36조 (YYYY-MM-DD 공포)` so
+  `legal_graph_find` can resolve by human-friendly form
+- Tags: `domain:legal`, `kind:statute_version`, `law:…`, `year:YYYY`
+- **No outbound edges** — versioned nodes are read-only archives;
+  graph traversal stays on canonical slugs to keep it uncluttered
+
+### Picker integration
+
+When `legal_applicable_version(case_slug, statute_slug)` fires and
+lands on a historical version:
+
+```jsonc
+{
+  "branch": "revision_cutoff",
+  "anchor_date": "20211221",
+  "supplement_slug":        "statute::근로기준법::supplement::17326",
+  "effective_date":         "20200526",
+  "promulgation_date":      "20200526",
+  "versioned_article_slug": "statute::근로기준법::36@20200526",  // ← new
+  "explanation":            "구법 citation: applied version whose effective_date ≤ 20211221"
+}
+```
+
+The agent (or any caller) then feeds `versioned_article_slug` into
+`legal_read_article` to retrieve the historical body text verbatim.
+
+`versioned_article_slug` is surfaced **only when the corresponding
+node exists in brain.db** — we never fabricate a slug we can't read.
+So `None` means "this version exists conceptually but the snapshot
+wasn't in the ingested corpus".
+
+### Recommended workflow
+
+```powershell
+# Ingest current versions first (or not — order doesn't matter).
+zeroclaw vault legal ingest "D:\국가법령정보api(법령과 판례)\현행법령"
+
+# Then ingest the full historical archive.
+zeroclaw vault legal ingest "D:\국가법령정보api(법령과 판례)\연혁법령"
+
+# Verify.
+zeroclaw vault legal stats
+```
+
+On each run, the console reports the detected `corpus:` label
+(`현행법령` / `연혁법령`) before walking files so you can abort if
+it's wrong.
 
 ## Source files
 
