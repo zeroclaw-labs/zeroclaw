@@ -266,7 +266,8 @@ impl IrcChannel {
     }
 
     fn is_mentioned(&self, my_nick: &str, text: &str) -> bool {
-        text.to_ascii_lowercase().contains(&my_nick.to_ascii_lowercase())
+        text.to_ascii_lowercase()
+            .contains(&my_nick.to_ascii_lowercase())
     }
 
     /// Create a TLS connection to the IRC server.
@@ -558,10 +559,7 @@ impl Channel for IrcChannel {
                         continue;
                     }
 
-                    if self.mention_only
-                        && is_channel
-                        && self.is_mentioned(&current_nick, text)
-                    {
+                    if self.mention_only && is_channel && self.is_mentioned(&current_nick, text) {
                         continue;
                     }
 
