@@ -6,9 +6,10 @@ use std::path::Path;
 pub fn run() -> anyhow::Result<()> {
     let root = repo_root();
     require_tool("cargo", "https://rustup.rs")?;
-    require_tool("mdbook", "cargo install mdbook --locked")?;
-    require_tool("mdbook-xgettext", "cargo install mdbook-i18n-helpers --locked")?;
-    require_tool("mdbook-gettext", "cargo install mdbook-i18n-helpers --locked")?;
+    ensure_cargo_tool("mdbook", "mdbook")?;
+    ensure_cargo_tool("mdbook-xgettext", "mdbook-i18n-helpers")?;
+    ensure_cargo_tool("mdbook-gettext", "mdbook-i18n-helpers")?;
+    ensure_cargo_tool("mdbook-mermaid", "mdbook-mermaid")?;
 
     build_refs(&root)?;
     build_api(&root)?;

@@ -8,9 +8,10 @@ const PORT: u16 = 3000;
 pub fn run(locale: &str) -> anyhow::Result<()> {
     let root = repo_root();
     require_tool("cargo", "https://rustup.rs")?;
-    require_tool("mdbook", "cargo install mdbook --locked")?;
-    require_tool("mdbook-xgettext", "cargo install mdbook-i18n-helpers --locked")?;
-    require_tool("mdbook-gettext", "cargo install mdbook-i18n-helpers --locked")?;
+    ensure_cargo_tool("mdbook", "mdbook")?;
+    ensure_cargo_tool("mdbook-xgettext", "mdbook-i18n-helpers")?;
+    ensure_cargo_tool("mdbook-gettext", "mdbook-i18n-helpers")?;
+    ensure_cargo_tool("mdbook-mermaid", "mdbook-mermaid")?;
 
     let ref_dir = ref_dir(&root);
     if !ref_dir.join("cli.md").exists() || !ref_dir.join("config.md").exists() {
@@ -81,7 +82,9 @@ async fn serve_static(dir: std::path::PathBuf) -> anyhow::Result<()> {
     use axum::Router;
     use tower_http::services::ServeDir;
 
-    let app = Router::new().fallback_service(ServeDir::new(&dir));
+    let app = Router::new().fallback_service(
+        ServeDir::new(&dir).append_index_html_on_directories(true)
+    );
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{PORT}")).await?;
     axum::serve(listener, app).await?;
     Ok(())

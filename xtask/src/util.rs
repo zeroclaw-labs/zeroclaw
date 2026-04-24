@@ -51,19 +51,26 @@ pub fn locales() -> Vec<String> {
 }
 
 pub fn require_tool(cmd: &str, install_hint: &str) -> anyhow::Result<()> {
-    let found = std::env::var_os("PATH")
+    if tool_on_path(cmd) { return Ok(()); }
+    anyhow::bail!("'{}' not found on PATH\n  install: {}", cmd, install_hint);
+}
+
+/// Like `require_tool`, but if the binary is a cargo-installable crate that's missing,
+/// auto-install it via `cargo install --locked <crate>`. Idempotent — a no-op when present.
+pub fn ensure_cargo_tool(cmd: &str, crate_name: &str) -> anyhow::Result<()> {
+    if tool_on_path(cmd) { return Ok(()); }
+    println!("==> installing '{crate_name}' (missing '{cmd}')");
+    run_cmd(Command::new("cargo").args(["install", "--locked", crate_name]))
+}
+
+fn tool_on_path(cmd: &str) -> bool {
+    std::env::var_os("PATH")
         .map(|paths| {
             std::env::split_paths(&paths).any(|dir| {
-                let candidate = dir.join(cmd);
-                candidate.is_file()
-                    || dir.join(format!("{cmd}.exe")).is_file()
+                dir.join(cmd).is_file() || dir.join(format!("{cmd}.exe")).is_file()
             })
         })
-        .unwrap_or(false);
-    if !found {
-        anyhow::bail!("'{}' not found on PATH\n  install: {}", cmd, install_hint);
-    }
-    Ok(())
+        .unwrap_or(false)
 }
 
 pub fn run_cmd(cmd: &mut Command) -> anyhow::Result<()> {
