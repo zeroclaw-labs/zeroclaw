@@ -96,7 +96,11 @@ pub trait SessionBackend: Send + Sync {
     }
 
     /// Look up metadata for a single session by key.
-    /// Default impl loads all messages to derive count — override for O(1) lookup.
+    ///
+    /// The default impl loads all messages to derive the count and calls
+    /// `get_session_name` for the name. `created_at` and `last_activity` are
+    /// set to `Utc::now()` at call time — backends with stored timestamps
+    /// (e.g. SQLite) should override this method.
     fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
         let messages = self.load(session_key);
         if messages.is_empty() {
