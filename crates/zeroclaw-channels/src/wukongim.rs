@@ -254,7 +254,7 @@ impl WuKongIMChannel {
             "approval_id": approval_id,
             "timeout_secs": timeout_secs,
             "header": {
-                "title": "Approval Required"
+                "title": "需要审批"
             },
             "body": {
                 "elements": [
