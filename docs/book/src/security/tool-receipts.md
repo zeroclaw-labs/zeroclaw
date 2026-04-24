@@ -1,57 +1,55 @@
-# Tool Execution Receipts
+# Tool Receipts
 
-## Overview
+Tool receipts are cryptographic proofs that a tool actually ran. Every tool invocation — approved, blocked, or auto-approved — produces an HMAC-SHA256 digest over the call and its result. The digest is appended to the tool-result text and passed back to the model as part of the conversation.
 
-Tool receipts are cryptographic HMAC-SHA256 signatures that prove a tool actually executed. When enabled, every successful tool execution produces a receipt that the LLM cannot forge — because the signing key is ephemeral, per-session, and never exposed to the model.
+The practical outcome: the model cannot claim to have run a tool it didn't run, and it cannot fabricate a tool result. Both produce receipt mismatches the runtime detects.
 
-This addresses a class of LLM failure where the model claims to have used a tool (or denies having used one) without any independent verification. Receipts create ground truth about what actually ran.
+## The threat model
+
+An LLM is a string generator. By default, nothing prevents it from narrating a tool call it never made ("I ran `git log` and the latest commit is…"), or inventing a result for a tool call ("The weather API says 72°F" — when the call timed out). For an agent with autonomy, this is more than a correctness issue — it's a deniability issue.
+
+Tool receipts close that gap with the cheapest possible construct: a symmetric MAC with an ephemeral per-session key.
 
 Based on: Basu, A. (2026). "Tool Receipts, Not Zero-Knowledge Proofs: Practical Hallucination Detection for AI Agents." [arXiv:2603.10060](https://doi.org/10.48550/arXiv.2603.10060).
 
----
-
-## Status
-
-Receipts are controlled programmatically via the `ReceiptGenerator` API. The `[agent.tool_receipts]` config section is **not yet wired** — config-driven activation and system-prompt injection are tracked as a follow-up.
-
----
-
 ## How it works
 
-1. When the agent loop starts, an ephemeral 256-bit key is generated (never logged, never sent to the LLM).
-2. After each successful tool execution, the runtime computes:
+1. At agent-loop startup, a 256-bit key is generated. It's ephemeral — never written to disk, never sent to the model, never logged.
+2. After each tool invocation, the runtime computes:
    ```
-   receipt = HMAC-SHA256(key, tool_name | args | result | timestamp)
+   receipt = HMAC-SHA256(key, tool_name || args || result || timestamp)
    ```
-3. The receipt is appended to the tool result as `[receipt: zc-receipt-{timestamp}-{hash}]` before the result is returned to the LLM.
-4. *(Planned — not yet implemented)* The system prompt will instruct the LLM to preserve receipts verbatim when referencing tool results. This is tracked alongside config activation in the follow-up.
+3. The receipt is appended to the tool-result text as:
+   ```
+   [receipt: zc-receipt-<timestamp>-<base64url-digest>]
+   ```
+4. The tool result (with the receipt) is fed back to the model.
 
-### Receipt format
+The model sees every receipt in its conversation history. It can echo them in text it produces to the user. But it cannot produce a *new* valid receipt — the HMAC requires the session key, which the model doesn't have.
+
+### Receipt shape
 
 ```
 zc-receipt-1774608496-gzpEBuUIRYX1vd4fQl4oYkqhq4-GnoJDStmlYzvQiWA
-          ^timestamp  ^base64url-encoded HMAC-SHA256 digest
+          ^ epoch seconds     ^ base64url(HMAC-SHA256 digest)
 ```
 
-The `zc-receipt-` prefix distinguishes real receipts from fabricated ones. The LLM cannot compute a valid HMAC because it doesn't know the session key and cannot perform the math.
-
----
+The `zc-receipt-` prefix exists so the leak detector doesn't redact them (receipts are safe to surface; they contain no secret material).
 
 ## What receipts detect
 
 | Scenario | Without receipts | With receipts |
-|----------|-----------------|---------------|
-| LLM claims it ran a tool but didn't | Undetectable | No receipt exists — fabrication detected |
-| LLM fabricates a tool result | Undetectable | HMAC won't match — tampering detected |
-| LLM denies running tools it actually ran | Unverifiable | Receipts in log prove execution |
-| LLM fabricates a receipt string | Plausible-looking | HMAC verification fails — forgery detected |
+|---|---|---|
+| Model claims it ran a tool, didn't | Undetectable | No receipt — fabrication visible |
+| Model fabricates a result for a real call | Undetectable | HMAC mismatches on verification |
+| Model denies a call it did make | Unverifiable | Receipt in log proves it |
+| Model fabricates a plausible receipt string | Plausible | HMAC verification fails |
 
-### What receipts don't prevent
+### What receipts don't do
 
-- The LLM can still say anything in its text output — receipts don't suppress responses.
-- The LLM can answer questions without using tools at all. Receipts only verify tool calls that were made, not tool calls that should have been made.
-
----
+- **Don't constrain text output.** The model can still say things unrelated to any tool call.
+- **Don't force tool use.** Receipts are only generated when a tool is called; they don't help with "the model answered from prior knowledge when it should have looked something up".
+- **Don't travel across sessions.** Ephemeral keys mean a receipt from session A can't be verified in session B.
 
 ## Viewing receipts
 
@@ -61,14 +59,15 @@ The `zc-receipt-` prefix distinguishes real receipts from fabricated ones. The L
 RUST_LOG=zeroclaw::agent=debug zeroclaw daemon
 ```
 
-Look for:
+Produces:
+
 ```
-Tool receipt generated tool=shell receipt=zc-receipt-1774604899-fVRG...
+DEBUG Tool receipt generated tool=shell receipt=zc-receipt-1774604899-fVRG...
 ```
 
-### In user-visible messages
+### In user-visible replies
 
-When `show_in_response = true`, the bot's response includes:
+If `[agent.tool_receipts] show_in_response = true`, the reply includes a trailing block:
 
 ```
 Here's the weather in Istanbul: 16°C, sunny.
@@ -78,34 +77,46 @@ Tool receipts:
   weather: zc-receipt-1774608496-gzpEBuUIRYX1vd4fQl4oYkqhq4-GnoJDStmlYzvQiWA
 ```
 
-### Inline in LLM responses
+### In the LLM's own output
 
-*(Planned — not yet implemented)* The system prompt will instruct the LLM to echo receipts when referencing tool results. The leak detector is already configured to NOT redact `zc-receipt-` tokens in preparation for this.
+Because the model sees receipts in its context, it may echo them when describing tool results. The leak detector is configured to pass `zc-receipt-*` tokens through unmodified so this echoing works. If both the runtime and the model include a receipts block, the user sees two — strip one via channel-specific formatting rules.
 
-### LLM-echoed receipt blocks
+## Configuration
 
-The LLM may independently include a `Tool receipts:` block in its response text — it sees receipts in conversation history and can reproduce them. This is separate from the system-appended receipts block. The behavior can be controlled via system prompt instructions in `AGENTS.md` by telling the model whether or not to include tool receipts in its output. If both the LLM and the system append receipts, the user may see duplicate blocks.
-
----
+```toml
+[agent.tool_receipts]
+enabled = true
+show_in_response = false    # append trailing "Tool receipts:" block
+inject_system_prompt = true # instruct the model to echo receipts verbatim
+```
 
 ## Security properties
 
-- **Ephemeral keys**: A new key is generated for each agent session. Keys are never persisted, logged, or sent to the LLM.
-- **HMAC-SHA256**: Standard cryptographic MAC. The digest binds the tool name, arguments, result, and timestamp together — changing any input invalidates the receipt.
-- **No new dependencies**: Uses `hmac`, `sha2`, `ring`, and `base64` — all already in the dependency tree.
-- **No performance impact**: Receipt generation adds <1ms per tool call (HMAC computation is negligible).
+- **Ephemeral key per session.** Never persisted, never logged, never in the model's context. Compromising long-term storage gains nothing.
+- **Standard MAC primitives.** `hmac` + `sha2` from the Rust ecosystem.
+- **Negligible overhead.** <1 ms per tool call.
+- **No new external dependencies.**
 
----
+## What receipts are *not*
 
-## Current limitations
+- Not ZK proofs. The runtime can verify receipts because it holds the key. A third party cannot.
+- Not cross-signed with the conversation hash. Tampering with the prior conversation doesn't invalidate subsequent receipts (the receipt only covers the call it was computed for).
+- Not a replacement for approval gates. A receipt proves a call happened; it doesn't decide whether it should have.
 
-- **Config activation pending**: The `[agent.tool_receipts]` config section is not yet wired. Setting these keys currently has no effect. Receipts are controlled programmatically via the `ReceiptGenerator` API. Config-driven activation and system-prompt injection are tracked as a follow-up.
-- **Passive only**: Receipts are generated and logged but not validated against LLM responses. The system does not block responses with missing or invalid receipts.
-- **No persistent audit**: Receipts are in debug logs and conversation history but not stored in a queryable database.
-- **No cross-session verification**: Ephemeral keys mean receipts cannot be verified after the session ends.
+## Current state
 
----
+| Feature | Status |
+|---|---|
+| HMAC generation per call | Shipped |
+| Receipt appended to tool result | Shipped |
+| Debug log of receipts | Shipped |
+| `show_in_response` | Shipped |
+| System-prompt instruction to echo receipts | In flight |
+| Persistent audit database of receipts | Planned |
+| Cross-session receipt verification | Not planned (see ephemeral-key design) |
 
-## Related docs
+## See also
 
-- [Config reference](../reference/config.md) — generated config options
+- [Security → Overview](./overview.md)
+- [Autonomy levels](./autonomy.md) — the policy layer that decides whether a receipt-worthy call happens
+- [Reference → Config](../reference/config.md) — generated config reference
