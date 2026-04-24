@@ -2115,6 +2115,8 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     let stripped_json = strip_isolated_tool_json_artifacts(&stripped_xml, &known_tool_names);
     // Strip leading narration lines that announce tool usage
     let sanitized = strip_tool_narration(&stripped_json);
+    // Strip <think>...</think> reasoning blocks that leak from provider responses (#6040)
+    let sanitized = strip_think_tags_inline(&sanitized);
 
     // Scan for credential leaks before returning to caller
     match zeroclaw_runtime::security::LeakDetector::new().scan(&sanitized) {
@@ -11912,6 +11914,27 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn strip_think_tags_inline_handles_empty_string() {
         assert_eq!(strip_think_tags_inline(""), "");
+    }
+
+    #[test]
+    fn sanitize_channel_response_strips_think_tags() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let result = sanitize_channel_response("Hello <think>hidden reasoning</think>world", &tools);
+        assert_eq!(result, "Hello world");
+    }
+
+    #[test]
+    fn sanitize_channel_response_strips_unclosed_think_tag() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let result = sanitize_channel_response("visible<think>unclosed tail", &tools);
+        assert_eq!(result, "visible");
+    }
+
+    #[test]
+    fn sanitize_channel_response_passes_plain_text_without_think_tags() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let result = sanitize_channel_response("regular text without tags", &tools);
+        assert_eq!(result, "regular text without tags");
     }
 
     #[test]
