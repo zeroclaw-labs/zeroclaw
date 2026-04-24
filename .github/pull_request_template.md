@@ -55,13 +55,6 @@ Medium/high-risk PRs must fill:
 - `Co-authored-by` trailers added in commit messages for incorporated contributors? (`Yes/No`)
 - If `No`, why (inspiration-only, no direct code/design carry-over):
 
-## i18n Follow-Through (required only when docs or user-facing wording change)
-
-- Locale navigation parity updated in `README*`, `docs/README*`, and `docs/SUMMARY.md` for supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`)? (`Yes/No/N.A.`)
-- Localized runtime-contract docs updated where equivalents exist (minimum for `fr`/`vi`: `commands-reference`, `config-reference`, `troubleshooting`)? (`Yes/No/N.A.`)
-- Vietnamese canonical docs under `docs/i18n/vi/**` synced and compatibility shims under `docs/*.vi.md` validated? (`Yes/No/N.A.`)
-- If any `N.A.`, explain scope decision:
-
 ---
 
 **Labels** live in the GitHub label UI, not in the body. Set `risk:*`, `size:*`, and scope labels via the sidebar. Auto-label corrections: add `risk: manual` and the intended label.
