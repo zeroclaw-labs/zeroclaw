@@ -15,7 +15,7 @@ draft_update_interval_ms = 750     # bump if hitting Discord rate limits
 ```
 
 - **Bot intents needed:** Message Content Intent, Server Members Intent. Set in the Developer Portal.
-- **Streaming:** full — edits messages in place and splits long replies into multiple messages.
+- **[Streaming](../providers/streaming.md):** full — edits messages in place and splits long replies into multiple messages.
 - **Tool-call indicator:** typing indicator while tools run; visible code-block preview for shell and browser calls.
 
 ## Slack

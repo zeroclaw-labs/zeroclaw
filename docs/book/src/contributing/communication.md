@@ -2,46 +2,49 @@
 
 Where to ask questions, file bugs, propose features, and reach the team.
 
-## GitHub issues
+**If you just want to talk to us, Discord is the answer.** For anything that needs a durable record (bugs, feature requests, design discussion, RFCs), GitHub.
 
-The primary coordination surface.
+## Discord — best place to reach the team
 
-- **Bug reports** — use the bug template (`.github/ISSUE_TEMPLATE/bug_report.yml`). Include `zeroclaw --version`, OS, and the output of `zeroclaw doctor`.
-- **Feature requests** — use the feature template (`.github/ISSUE_TEMPLATE/feature_request.yml`). Focus on user value and constraints; implementation details are for RFCs or PR discussion.
-- **RFCs** — see [RFC process](./rfcs.md).
-- **Questions** — if it's more "how do I…" than "this is broken", prefer Discussions (below).
+Real-time chat. This is where the maintainers live day-to-day; the fastest path to a human response.
 
-Search before filing. Duplicates get consolidated; the search box is your friend.
-
-## GitHub Discussions
-
-For design chatter, usage questions, "does anyone else see this" posts, and conceptual conversations that aren't yet an issue. Less formal than an issue, won't get lost like a Discord message.
-
-[github.com/zeroclaw-labs/zeroclaw/discussions](https://github.com/zeroclaw-labs/zeroclaw/discussions)
-
-## Discord
-
-Real-time chat. Channels:
+Channels:
 
 - `#general` — the default room
-- `#help` — "I can't get X working" threads
+- `#help` — "I can't get X working" threads; the fastest way to unblock
 - `#dev` — in-flight development discussion
 - `#releases` — announcements, release notes, breaking-change pre-warnings
 
 [Invite link in the repo README.](https://github.com/zeroclaw-labs/zeroclaw)
 
-**Discord is ephemeral** — anything important should also land in an issue or discussion. Discord is great for "is anyone awake", "quick question", and social chatter; it is not a durable record.
+**Discord is ephemeral** — if the conversation leads to a bug or a feature idea, capture it as a GitHub issue afterwards so the record persists. Discord is for conversation; GitHub is for memory.
+
+## GitHub issues
+
+For bugs, feature requests, and anything that needs to be tracked.
+
+- **Bug reports** — use the bug template (`.github/ISSUE_TEMPLATE/bug_report.yml`). Include `zeroclaw --version`, OS, and the output of `zeroclaw doctor`.
+- **Feature requests** — use the feature template (`.github/ISSUE_TEMPLATE/feature_request.yml`). Focus on user value and constraints; implementation details are for RFCs or PR discussion.
+- **RFCs** — see [RFC process](./rfcs.md).
+
+Search before filing. Duplicates get consolidated; the search box is your friend.
+
+## GitHub Discussions
+
+For design chatter and conceptual conversations that aren't ready to be an issue. Works well for "does anyone else see this" posts and longer-form threads where Discord would scroll away.
+
+[github.com/zeroclaw-labs/zeroclaw/discussions](https://github.com/zeroclaw-labs/zeroclaw/discussions)
 
 ## Maintainer contacts
 
 Core maintainers and their focus areas:
 
-| Handle | Focus |
-|---|---|
-| [@singlerider](https://github.com/singlerider) | Runtime, providers, infra |
-| [@WareWolf-MoonWall](https://github.com/WareWolf-MoonWall) | Governance, docs, reviewer playbook |
-| [@theonlyhennygod](https://github.com/theonlyhennygod) | Channels, gateway |
-| [@JordanTheJet](https://github.com/JordanTheJet) | Hardware, edge deployments |
+| Handle | Role | Focus |
+|---|---|---|
+| [@JordanTheJet](https://github.com/JordanTheJet) | Project lead | Hardware, edge deployments |
+| [@theonlyhennygod](https://github.com/theonlyhennygod) | Original creator | Channels, gateway |
+| [@WareWolf-MoonWall](https://github.com/WareWolf-MoonWall) | Maintainer | Governance, docs, reviewer playbook |
+| [@singlerider](https://github.com/singlerider) | Maintainer | Runtime, providers, infra |
 
 `@`-mention sparingly — CC maintainers only when the issue genuinely needs their attention. Default to letting the team triage.
 
@@ -79,7 +82,7 @@ None offered. ZeroClaw is maintained by the community. If you're deploying at sc
 
 ## Feedback
 
-The fastest way to reach the team with open-ended feedback is a GitHub Discussion post tagged `feedback`. For "I tried to do X and it felt wrong" write-ups — the kind of input that surfaces UX issues the maintainers can't see from the code — that's where it goes.
+Open-ended feedback — "I tried to do X and it felt wrong", UX observations, direction thoughts — lands best as a thread in Discord `#general` or `#dev`. The team is more likely to see and discuss it there. If the thread turns into something concrete, move it to a GitHub Discussion or issue.
 
 ## Contributor recognition
 

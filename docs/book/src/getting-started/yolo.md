@@ -70,8 +70,8 @@ which expands to the above at startup. Watch the release notes.
 
 YOLO mode doesn't lobotomise the agent:
 
-- **Tool receipts** still get written. You can `tail -f` the receipts log and see exactly what ran.
-- **Audit logging** still works if enabled (`[security.audit] enabled = true`). Strongly recommended in YOLO.
+- **[Tool receipts](../security/tool-receipts.md)** still get written. You can `tail -f` the receipts log and see exactly what ran.
+- **[Audit logging](../ops/observability.md)** still works if enabled (`[security.audit] enabled = true`). Strongly recommended in YOLO.
 - **Conversation memory** still persists — there's still a record of what happened.
 
 You're not turning off the logs, you're turning off the approval gates and path enforcement.
