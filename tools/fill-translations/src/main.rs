@@ -90,6 +90,27 @@ fn decode_po_string(lines: &[String]) -> String {
     out
 }
 
+/// Detect a prompt-leak response and attempt to recover the real translation.
+///
+/// When a model leaks its instructions it translates them into the target language and
+/// appends the actual translation at the end (separated by a blank line). The leak is
+/// structural: the response is far longer than any plausible translation of `source`.
+/// Returns `Some(recovered)` when a leak is detected, `None` when the response looks clean.
+fn recover_from_leak(source: &str, response: &str) -> Option<String> {
+    let leak_threshold = source.len().saturating_mul(4).max(120);
+    if response.len() <= leak_threshold {
+        return None;
+    }
+    // The real translation is always the last non-empty paragraph.
+    let candidate = response.trim().rsplit("\n\n").find(|s| !s.trim().is_empty())?;
+    let candidate = candidate.trim().to_string();
+    // Sanity: recovered part must itself not look like another leak
+    if candidate.len() > leak_threshold {
+        return None;
+    }
+    Some(candidate)
+}
+
 /// Replace invalid JSON escape sequences (e.g. `\[`, `\(`) with their literal characters.
 fn sanitize_json_escapes(s: &str) -> String {
     let valid = ['\"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'];
@@ -281,6 +302,12 @@ async fn translate_batch(
             .ok_or_else(|| anyhow::anyhow!("no content in response: {resp}"))?
             .trim()
             .to_string();
+        let text = if let Some(recovered) = recover_from_leak(batch[0], &text) {
+            eprintln!("  warning: prompt leak detected, recovered translation from response tail");
+            recovered
+        } else {
+            text
+        };
         return Ok(vec![text]);
     }
 
@@ -358,6 +385,24 @@ async fn main() -> anyhow::Result<()> {
     if repaired > 0 {
         println!("==> Repairing {repaired} entries missing trailing \\n");
     }
+
+    // Repair entries where the model previously leaked its instructions instead of translating.
+    // Use the same length-ratio heuristic as the live detection: recover the real translation
+    // from the response tail when possible, otherwise clear to "" for re-translation.
+    let mut leak_cleared = 0;
+    let mut lines: Vec<String> = lines;
+    for entry in &entries {
+        if entry.msgstr.is_empty() { continue; }
+        if let Some(recovered) = recover_from_leak(&entry.msgid, &entry.msgstr) {
+            lines[entry.msgstr_line] = format!("msgstr \"{}\"", encode_po_string(&recovered));
+            leak_cleared += 1;
+        }
+    }
+    if leak_cleared > 0 {
+        println!("==> Repaired {leak_cleared} prompt-leaked entries");
+    }
+    // Re-parse with repaired lines
+    let entries = if leak_cleared > 0 { parse_po(&lines) } else { entries };
 
     // Entries with empty msgstr need AI translation.
     // Fuzzy entries already have a translation — accept it as-is, just drop the flag.
