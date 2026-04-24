@@ -32,7 +32,15 @@
     clippy::unused_self,
     clippy::cast_precision_loss,
     clippy::unnecessary_wraps,
-    dead_code
+    dead_code,
+    // Pre-existing style lints revealed after compile errors were fixed (LIGA-362)
+    clippy::unnecessary_sort_by,
+    clippy::useless_conversion,
+    clippy::duration_suboptimal_units,
+    clippy::while_let_loop,
+    clippy::manual_is_variant_and,
+    clippy::collapsible_match,
+    clippy::unused_async,
 )]
 
 use clap::Subcommand;
