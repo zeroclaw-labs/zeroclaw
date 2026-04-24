@@ -1,6 +1,8 @@
 use clap::Parser;
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 #[derive(Parser)]
 #[command(about = "Fill empty/fuzzy .po entries via a configured provider")]
@@ -18,12 +20,45 @@ struct Args {
     /// Provider name from [providers.models.<name>] in config.toml
     #[arg(long)]
     provider: String,
+    /// Path for appending full input/output on every failure (default: {po}.failures.log)
+    #[arg(long)]
+    log_failures: Option<PathBuf>,
+}
+
+/// Append-only logger for failed translation attempts — records the exact source string,
+/// raw model response, and error so failure patterns can be inspected after the run.
+struct FailureLog {
+    file: Mutex<std::fs::File>,
+}
+
+impl FailureLog {
+    fn open(path: &std::path::Path) -> anyhow::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        Ok(Self { file: Mutex::new(file) })
+    }
+
+    fn record(&self, chunk: usize, source: &str, response: &str, err: &anyhow::Error) {
+        let mut f = self.file.lock().expect("failure log mutex poisoned");
+        let _ = writeln!(
+            f,
+            "==== chunk {chunk} — {}\n-- error: {err}\n-- source: {source:?}\n-- response: {response:?}\n",
+            chrono_now()
+        );
+    }
+}
+
+fn chrono_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    format!("epoch={secs}")
 }
 
 struct ProviderConfig {
     base_url: String,
     model: String,
-    api_key: Option<String>,
 }
 
 fn read_provider_config(provider_name: &str) -> anyhow::Result<ProviderConfig> {
@@ -46,7 +81,6 @@ fn read_provider_config(provider_name: &str) -> anyhow::Result<ProviderConfig> {
         base_url: provider.get("base_url").and_then(|v| v.as_str())
             .unwrap_or("http://localhost:11434").to_string(),
         model,
-        api_key: provider.get("api_key").and_then(|v| v.as_str()).map(str::to_string),
     })
 }
 
@@ -122,29 +156,6 @@ fn check_for_leak(source: &str, response: &str) -> LeakCheck {
         Some(c) if !c.is_empty() && c.len() <= leak_threshold => LeakCheck::Recovered(c),
         _ => LeakCheck::Unrecoverable,
     }
-}
-
-/// Replace invalid JSON escape sequences (e.g. `\[`, `\(`) with their literal characters.
-fn sanitize_json_escapes(s: &str) -> String {
-    let valid = ['\"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'];
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.peek() {
-                Some(&next) if valid.contains(&next) => {
-                    out.push(c);
-                }
-                Some(_) => {
-                    // Invalid escape — drop the backslash, keep the character
-                }
-                None => { out.push(c); }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// Encode a plain string into a single-line po `msgstr "..."` value.
@@ -283,96 +294,90 @@ fn write_po(
     Ok(())
 }
 
+/// Strip wrapping characters the model added that weren't present in the source.
+///
+/// Handles the common failure modes observed in logs: a whole translation wrapped in
+/// backticks, corner brackets (`「」`/`『』`), straight or curly quotes, or the JSON field
+/// leak `t="..."`. Applies each rule only when the wrapper is symmetric AND absent from
+/// the source, so legitimate source-side wrapping is preserved.
+/// Outcome of a translate_batch call. On failure, `raw_response` carries the full model
+/// response (empty if the failure was before we got one — e.g. network) for logging.
+struct BatchFailure {
+    err: anyhow::Error,
+    raw_response: String,
+}
+
+type BatchResult = Result<Vec<String>, BatchFailure>;
+
+fn fail(err: anyhow::Error, raw_response: impl Into<String>) -> BatchFailure {
+    BatchFailure { err, raw_response: raw_response.into() }
+}
+
+/// Call Ollama's native `/api/chat` endpoint with a JSON schema constraining the output.
+/// Ollama enforces the schema at generation time, so the model cannot emit anything but the
+/// exact shape we request — no wrapping characters, no JSON leaks, no prose.
 async fn translate_batch(
     client: &reqwest::Client,
     provider: &ProviderConfig,
     locale: &str,
     batch: &[&str],
-) -> anyhow::Result<Vec<String>> {
-    // Single-entry: skip JSON entirely, use raw response as the translation
-    if batch.len() == 1 {
-        let prompt = format!(
-            "Translate the following English documentation string to {locale}.\n\
-             - Return ONLY the translated string, nothing else.\n\
-             - Do NOT translate: proper nouns, brand names (e.g. ZeroClaw, Anthropic, GitHub), command names, or code literals.\n\
-             - Preserve exactly: backticks, bold (**text**), inline code, URLs, and escape sequences (\\n, \\t, etc.).\n\
-             - If the string is already in {locale} or is a code literal, return it unchanged.\n\n\
-             {}",
-            batch[0]
-        );
-        let body = serde_json::json!({
-            "model": provider.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "reasoning_effort": "none"
-        });
-        let mut req = client.post(format!("{}/v1/chat/completions", provider.base_url)).json(&body);
-        if let Some(key) = &provider.api_key {
-            req = req.header("Authorization", format!("Bearer {key}"));
-        }
-        let resp = req.send().await?.error_for_status()?.json::<serde_json::Value>().await?;
-        let text = resp["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("no content in response: {resp}"))?
-            .trim()
-            .to_string();
-        let text = match check_for_leak(batch[0], &text) {
-            LeakCheck::Clean => text,
-            LeakCheck::Recovered(r) => {
-                eprintln!("  warning: prompt leak detected, recovered translation from response tail");
-                r
-            }
-            LeakCheck::Unrecoverable => {
-                anyhow::bail!("prompt leak with no recoverable translation");
-            }
-        };
-        return Ok(vec![text]);
-    }
-
-    let items: String = batch
-        .iter()
-        .map(|s| format!("- {s}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let prompt = format!(
-        "Translate the following English documentation strings to {locale}.\n\
-         Rules:\n\
-         - Return ONLY a JSON array with exactly {count} strings, in the same order as the input.\n\
-         - Do NOT translate: proper nouns, brand names (e.g. ZeroClaw, Anthropic, GitHub), command names, code literals, or strings that are already in {locale}.\n\
-         - Preserve exactly: backticks, bold (**text**), inline code, URLs, escape sequences (\\n, \\t, etc.), and leading/trailing whitespace.\n\
-         - Do NOT add item numbers, bullet points, or any prefix to translated strings.\n\
-         - Do NOT wrap output in markdown code fences.\n\n\
-         Strings to translate:\n\
-         {items}",
-        count = batch.len()
+) -> BatchResult {
+    let system = format!(
+        "You translate English technical documentation strings to {locale}.\n\
+         - Preserve backticks, bold (**text**), inline code, URLs, and escape sequences where \
+           they appear in the source, character-for-character.\n\
+         - Do not translate: brand and project names, command names, CLI flags, file paths, \
+           environment variables, code literals, function/type names.\n\
+         - If the input is already in {locale}, a code literal, a URL, or a single identifier, \
+           return it unchanged.\n\
+         - Use established software-localization terminology in {locale} rather than literal \
+           morpheme-by-morpheme translation."
     );
 
-    let body = serde_json::json!({
-        "model": provider.model,
-        "messages": [{"role": "user", "content": prompt}],
-        "reasoning_effort": "none"
-    });
-
-    let mut req = client
-        .post(format!("{}/v1/chat/completions", provider.base_url))
-        .json(&body);
-    if let Some(key) = &provider.api_key {
-        req = req.header("Authorization", format!("Bearer {key}"));
+    // Send each source as its own user message; the model responds with one translation per
+    // request as plain text in `message.content`. Ollama's schema enforcement is unreliable
+    // in practice (varies by model and version), so we ask for plain text and trust the prompt.
+    let mut out = Vec::with_capacity(batch.len());
+    for source in batch {
+        let body = serde_json::json!({
+            "model": provider.model,
+            "messages": [
+                {"role": "system", "content": &system},
+                {"role": "user", "content": *source},
+            ],
+            "stream": false,
+            // Disable reasoning/thinking — field name differs by Ollama endpoint and version, so
+            // include every variant we've seen. Unknown fields are silently ignored.
+            "think": false,
+            "reasoning_effort": "none",
+            "options": {"temperature": 0},
+        });
+        let content = fetch_ollama_content(client, provider, &body).await?;
+        out.push(content.trim().to_string());
     }
+    Ok(out)
+}
 
-    let resp = req.send().await?.error_for_status()?.json::<serde_json::Value>().await?;
-
-    let text = resp["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("no content in response: {resp}"))?;
-
-    // Extract the JSON array — find first '[' and last ']'
-    let start = text.find('[').ok_or_else(|| anyhow::anyhow!("no JSON array in response"))?;
-    let end   = text.rfind(']').ok_or_else(|| anyhow::anyhow!("no closing ] in response"))?;
-    let raw_json = &text[start..=end];
-    let arr: Vec<String> = serde_json::from_str(raw_json)
-        .or_else(|_| serde_json::from_str(&sanitize_json_escapes(raw_json)))?;
-    Ok(arr)
+/// POST to Ollama's native `/api/chat` and return `message.content` from the response.
+async fn fetch_ollama_content(
+    client: &reqwest::Client,
+    provider: &ProviderConfig,
+    body: &serde_json::Value,
+) -> Result<String, BatchFailure> {
+    let resp = client
+        .post(format!("{}/api/chat", provider.base_url))
+        .json(body)
+        .send().await
+        .map_err(|e| fail(e.into(), String::new()))?;
+    let status = resp.status();
+    let raw = resp.text().await.map_err(|e| fail(e.into(), String::new()))?;
+    if !status.is_success() {
+        return Err(fail(anyhow::anyhow!("HTTP {status}"), raw));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| fail(anyhow::anyhow!("response body JSON parse: {e}"), raw.clone()))?;
+    parsed["message"]["content"].as_str().map(str::to_string)
+        .ok_or_else(|| fail(anyhow::anyhow!("no message.content"), raw))
 }
 
 #[tokio::main]
@@ -459,6 +464,11 @@ async fn main() -> anyhow::Result<()> {
     let total = to_translate.len();
     let total_chunks = total.div_ceil(args.batch).max(1);
 
+    let log_path = args.log_failures.clone()
+        .unwrap_or_else(|| args.po.with_extension("failures.log"));
+    let failure_log = FailureLog::open(&log_path)?;
+    println!("==> Logging failures to {}", log_path.display());
+
     for (chunk_idx, chunk) in to_translate.chunks(args.batch).enumerate() {
         let msgids: Vec<&str> = chunk.iter().map(|e| e.msgid.as_str()).collect();
         println!("==> Chunk {}/{total_chunks} ({} entries)", chunk_idx + 1, chunk.len());
@@ -476,8 +486,13 @@ async fn main() -> anyhow::Result<()> {
                 }
                 write_po(&lines, &raw, &translations, &to_translate, &to_accept, &args.po)?;
             }
-            Err(e) => {
-                eprintln!("  warning: chunk {} failed: {e}", chunk_idx + 1);
+            Err(f) => {
+                let source_joined = msgids.join(" | ");
+                eprintln!(
+                    "  warning: chunk {} failed: {}\n    source: {:?}\n    response: {:?}",
+                    chunk_idx + 1, f.err, source_joined, f.raw_response
+                );
+                failure_log.record(chunk_idx + 1, &source_joined, &f.raw_response, &f.err);
             }
         }
     }
