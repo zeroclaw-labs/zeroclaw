@@ -575,13 +575,42 @@ pub fn ingest_case(conn: &Arc<Mutex<Connection>>, doc: &CaseDoc) -> Result<Inges
         .unwrap_or_else(|| doc.original_markdown.clone());
     let incident_dates = super::date_parse::find_all_dates(&body_for_dates);
     let incident_dates_capped: Vec<String> = incident_dates.iter().take(50).cloned().collect();
-    let incident_dates_csv = if incident_dates_capped.is_empty() {
-        None
-    } else {
-        Some(incident_dates_capped.join(","))
-    };
-    let incident_earliest = incident_dates_capped.first().cloned();
-    let incident_latest = incident_dates_capped.last().cloned();
+
+    // Fallback: Supreme / appellate judgments routinely omit explicit
+    // incident dates because the 1st-instance judgment already carried
+    // them. If no date literal was found, we infer the filing year from
+    // referenced case numbers — the first 4 digits of a Korean case
+    // number = 소장 접수 년도, which per 행위시법 원칙 aligns with the
+    // applicable statute's 시행일. We store `{year}0101` / `{year}1231`
+    // as sentinel earliest/latest so range queries still function, and
+    // surface `incident_date_source` = `filing_year_fallback` so
+    // consumers know the tolerance is ±1 year rather than exact.
+    let (incident_dates_csv, incident_earliest, incident_latest, incident_source) =
+        if !incident_dates_capped.is_empty() {
+            (
+                Some(incident_dates_capped.join(",")),
+                incident_dates_capped.first().cloned(),
+                incident_dates_capped.last().cloned(),
+                "body",
+            )
+        } else {
+            match super::date_parse::infer_filing_year_from_case_refs(
+                &body_for_dates,
+                &doc.case_number,
+            ) {
+                Some(year) => {
+                    let earliest = format!("{year}0101");
+                    let latest = format!("{year}1231");
+                    (
+                        Some(format!("{earliest},{latest}")),
+                        Some(earliest),
+                        Some(latest),
+                        "filing_year_fallback",
+                    )
+                }
+                None => (None, None, None, "none"),
+            }
+        };
 
     // Frontmatter.
     let frontmatter = [
@@ -596,6 +625,7 @@ pub fn ingest_case(conn: &Arc<Mutex<Connection>>, doc: &CaseDoc) -> Result<Inges
         ("verdict_kind", doc.verdict_kind.clone()),
         ("verdict_type", doc.verdict_type.clone()),
         ("incident_dates", incident_dates_csv),
+        ("incident_date_source", Some(incident_source.to_string())),
         ("incident_date_earliest", incident_earliest),
         ("incident_date_latest", incident_latest),
     ];

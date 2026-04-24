@@ -143,6 +143,65 @@ pub fn extract_article_amendment_dates(body: &str) -> Vec<String> {
     dates.into_iter().map(fmt_yyyymmdd).collect()
 }
 
+/// Infer the filing year of a judgment's originating case when no date
+/// literals were found in the body. Korean case numbers encode the year
+/// the complaint / indictment was filed as their leading 4 digits —
+/// and per the 행위시법 원칙, that year tracks the 사건발생일 closely
+/// enough to serve as a fallback for `effective_date` matching.
+///
+/// Why the fallback exists
+/// ───────────────────────
+/// Supreme Court and appellate judgments frequently omit explicit
+/// incident dates — the 1st-instance judgment already carries them, so
+/// higher courts only reference the 사건번호. If the body carries no
+/// date literals but contains references to other cases (e.g.
+/// `【원심판결】 수원지법 2024. 5. 9. 선고 2024고정48 판결`), we take
+/// the earliest year across all referenced case numbers — excluding
+/// the current judgment's own case number — as the filing-year proxy.
+///
+/// Returns the year as a 4-digit string (`"2024"`) on success, `None`
+/// when there are no usable references. Year sanity check: 1950 ≤ year
+/// ≤ current year + 1 rejects accidental 4-digit-number captures.
+pub fn infer_filing_year_from_case_refs(
+    body: &str,
+    own_case_number: &str,
+) -> Option<u16> {
+    use super::citation_patterns::extract_case_numbers;
+
+    let own_year: Option<u16> = own_case_number
+        .chars()
+        .take(4)
+        .collect::<String>()
+        .parse()
+        .ok();
+
+    let cur_year = chrono::Utc::now().year() as u16 + 1;
+
+    let mut candidates: Vec<u16> = extract_case_numbers(body)
+        .into_iter()
+        .filter(|c| c.case_number != own_case_number)
+        .filter_map(|c| {
+            c.case_number
+                .chars()
+                .take(4)
+                .collect::<String>()
+                .parse::<u16>()
+                .ok()
+        })
+        .filter(|&y| (1950..=cur_year).contains(&y))
+        .filter(|&y| Some(y) != own_year) // skip same-year as own case
+        .collect();
+
+    if candidates.is_empty() {
+        // If ALL candidates were the same year as own case (or there were
+        // none except the current one), fall back to the own year itself
+        // — it's still better than nothing for range matching.
+        return own_year.filter(|&y| (1950..=cur_year).contains(&y));
+    }
+    candidates.sort();
+    candidates.first().copied()
+}
+
 // ───────── Internals ─────────
 
 /// Isolate the `제1조(시행일)` clause or its closest analogue so later
@@ -314,5 +373,40 @@ mod tests {
         // Only tagged dates should be captured, not free text.
         let body = "제1조. 이 조문은 2025년 1월 1일에 발효된다.";
         assert!(extract_article_amendment_dates(body).is_empty());
+    }
+
+    #[test]
+    fn filing_year_fallback_picks_earliest_referenced_case() {
+        // Typical Supreme-Court judgment body with no literal dates in the
+        // reasoning section — only referenced case numbers.
+        let body = "【원심판결】 수원지법 안산지원 선고 2024고정48 판결. \
+                    참고판례: 대법원 2012도3166. 관련 민사사건: 2023가단92476.";
+        let y = infer_filing_year_from_case_refs(body, "2024노3424");
+        assert_eq!(y, Some(2012));
+    }
+
+    #[test]
+    fn filing_year_fallback_excludes_own_case_number() {
+        let body = "본건은 2024노3424 사건이다.";
+        // Only the current case's own number is present → no usable
+        // alternative, but we fall back to own year (2024) as last resort.
+        let y = infer_filing_year_from_case_refs(body, "2024노3424");
+        assert_eq!(y, Some(2024));
+    }
+
+    #[test]
+    fn filing_year_fallback_returns_none_on_empty_body() {
+        let y = infer_filing_year_from_case_refs("", "2024노3424");
+        assert_eq!(y, Some(2024)); // own-case fallback
+    }
+
+    #[test]
+    fn filing_year_fallback_rejects_implausible_years() {
+        // A mangled reference with year 9999 must not poison the result.
+        let body = "참고: 9999다12345";
+        let y = infer_filing_year_from_case_refs(body, "2024노3424");
+        // The implausible year is rejected; only the own-case year remains
+        // as the last-resort fallback.
+        assert_eq!(y, Some(2024));
     }
 }

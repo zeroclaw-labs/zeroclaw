@@ -344,6 +344,38 @@ The case-extractor deliberately scans `## 판례내용` first and falls
 back to the full markdown so it picks up dates in 판시사항 / 판결요지
 when the verdict body is short.
 
+#### Fallback: 1심 사건번호의 접수년도 (filing-year fallback)
+
+Supreme Court and many appellate judgments omit explicit incident
+dates in their reasoning section because the 1st-instance judgment
+already carried them. When the body contains no date literal at all,
+the ingester **infers the incident year** from referenced case
+numbers:
+
+- Every Korean case number's leading 4 digits = **소장 접수 년도**
+  (the year the complaint / indictment was filed). Per domain
+  convention this year tracks the 사건발생 year closely enough that
+  it can proxy the `effective_date` match.
+- `infer_filing_year_from_case_refs(body, own_case_number)`:
+  1. Extracts every case number in the body via `extract_case_numbers`
+  2. Excludes the judgment's own case number
+  3. Takes the **earliest** year among the remainder (lowest court /
+     original filing)
+  4. Sanity-checks the year against `1950 ≤ year ≤ current+1`
+  5. Falls back to the own-case year if no other references survive
+
+When this fallback fires, the ingester stores `{year}0101` as
+`incident_date_earliest` and `{year}1231` as `incident_date_latest`
+— sentinel values that keep range queries functional — plus an
+explicit provenance tag:
+
+- `incident_date_source = "body"` → dates came from date literals,
+  high confidence
+- `incident_date_source = "filing_year_fallback"` → single year
+  inferred from case references, ±1 year tolerance recommended
+- `incident_date_source = "none"` → no reliable signal; match by
+  `verdict_date` or widen the time window
+
 ### Applying the principle
 
 Given a resolved chain `case → cites → statute_article`:
