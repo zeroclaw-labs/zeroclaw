@@ -2,98 +2,16 @@
 
 ## 目录
 
-1. [Windows 11 MSYS2 环境下安装 Rust](#1-windows-11-msys2-环境下安装-rust)
-2. [根目录文件/文件夹解析](#2-根目录文件文件夹解析)
-3. [Rust 项目组织架构分析](#3-rust-项目组织架构分析)
-4. [测试框架与运行方式](#4-测试框架与运行方式)
-5. [快速开始](#5-快速开始)
+1. [根目录文件/文件夹解析](#1-根目录文件文件夹解析)
+2. [Rust 项目组织架构分析](#2-rust-项目组织架构分析)
+3. [测试框架与运行方式](#3-测试框架与运行方式)
+4. [快速开始](#4-快速开始)
 
 ---
 
-## 1. Windows 11 MSYS2 环境下安装 Rust
+## 1. 根目录文件/文件夹解析
 
-### 1.1 安装 MSYS2
-
-1. 从 [MSYS2 官网](https://www.msys2.org/) 下载安装程序
-2. 运行安装程序，选择安装路径（建议 `C:\msys64`）
-3. 安装完成后，从开始菜单打开 **"MSYS2 MINGW64"** 终端
-
-### 1.2 更新 MSYS2 包管理器
-
-```bash
-# 更新包数据库和核心包
-pacman -Syu
-
-# 如果提示关闭终端，关闭后重新打开 MSYS2 MINGW64 终端
-# 再次运行更新
-pacman -Su
-```
-
-### 1.3 安装 Rust 工具链
-
-ZeroClaw 项目推荐使用 **MSVC 工具链**（`x86_64-pc-windows-msvc`）进行编译。
-
-#### 方式一：使用 rustup（推荐）
-
-```bash
-# 安装 rustup
-pacman -S mingw-w64-x86_64-rust
-
-# 验证安装
-rustc --version
-cargo --version
-
-# 设置默认工具链为 MSVC（如果需要）
-rustup default stable-x86_64-pc-windows-msvc
-
-# 添加 MSVC 目标
-rustup target add x86_64-pc-windows-msvc
-```
-
-#### 方式二：使用官方 rustup-init.exe
-
-项目根目录提供了 `rustup-init.exe`，可以直接运行：
-
-```bash
-# 在 PowerShell 或 CMD 中运行
-.\rustup-init.exe
-```
-
-按照提示选择默认安装即可。
-
-### 1.4 安装 Visual Studio Build Tools（必需）
-
-ZeroClaw 使用 MSVC 链接器，需要安装 Visual Studio Build Tools：
-
-```powershell
-# 使用 winget 安装
-winget install Microsoft.VisualStudio.2022.BuildTools
-```
-
-安装过程中选择 **"Desktop development with C++"** 工作负载。
-
-### 1.5 验证环境
-
-```bash
-# 检查 Rust 版本
-rustc --version
-cargo --version
-
-# 检查已安装的目标
-rustup target list --installed
-```
-
-### 1.6 MSYS2 环境中的注意事项
-
-1. **终端选择**：使用 **MSYS2 MINGW64** 终端，而不是默认的 MSYS2 终端
-2. **路径问题**：MSYS2 会自动转换 Windows 路径，但建议使用绝对路径
-3. **环境变量**：确保 `PATH` 中包含 Rust 的 `~/.cargo/bin` 目录
-
----
-
-## 2. 根目录文件/文件夹解析
-
-### 2.1 核心目录结构
+### 1.1 核心目录结构
 
 ```
 zeroclaw/
@@ -222,7 +140,7 @@ zeroclaw/
 
 #### `src/` - 主应用源代码
 
-这是主二进制 `zeroclaw` 的源代码，详见 [3.3 节](#33-主应用-src)。
+这是主二进制 `zeroclaw` 的源代码，详见 [2.4 节](#24-主应用-src)。
 
 #### `tests/` - 测试目录
 
@@ -255,7 +173,7 @@ zeroclaw/
 | `package.json` | NPM 配置 |
 | `vite.config.ts` | Vite 构建配置 |
 
-### 2.3 根目录核心文件
+### 1.2 根目录核心文件
 
 | 文件 | 描述 |
 |------|------|
@@ -292,9 +210,9 @@ zeroclaw/
 
 ---
 
-## 3. Rust 项目组织架构分析
+## 2. Rust 项目组织架构分析
 
-### 3.1 工作空间概述
+### 2.1 工作空间概述
 
 ZeroClaw 是一个 **Rust Cargo 工作空间（Workspace）**，由根目录的 `Cargo.toml` 定义：
 
@@ -322,7 +240,7 @@ members = [
 ]
 ```
 
-### 3.2 项目总览
+### 2.2 项目总览
 
 | 类别 | 数量 | 说明 |
 |------|------|------|
@@ -334,7 +252,7 @@ members = [
 
 **总计：27 个 Rust 项目（含工作空间内外）**
 
-### 3.3 工作空间 Crate 详细说明
+### 2.3 工作空间 Crate 详细说明
 
 #### 核心层
 
@@ -377,7 +295,7 @@ members = [
 | `robot-kit` | Experimental | **机器人工具包** - 机器人控制库（配置、驱动、表情、监听、视觉、安全、感知、语音） |
 | `aardvark-sys` | Experimental | **Aardvark FFI** - Total Phase Aardvark I2C/SPI/GPIO 适配器的 Rust 绑定 |
 
-### 3.4 主应用（src/）
+### 2.4 主应用（src/）
 
 主应用 `zeroclaw` 二进制的源代码位于 `src/` 目录：
 
@@ -430,7 +348,7 @@ src/
 └── util.rs          # 工具函数
 ```
 
-### 3.5 固件项目
+### 2.5 固件项目
 
 | 项目 | 目标平台 | 描述 |
 |------|----------|------|
@@ -440,7 +358,7 @@ src/
 | `firmware/pico/` | Raspberry Pi Pico | 微控制器外设 |
 | `firmware/zeroclaw-fw-protocol/` | 通用 | 固件通信协议库 |
 
-### 3.6 依赖关系图（简化）
+### 2.6 依赖关系图（简化）
 
 ```
                     ┌─────────────────┐
@@ -499,9 +417,9 @@ src/
 
 ---
 
-## 4. 测试框架与运行方式
+## 3. 测试框架与运行方式
 
-### 4.1 五级测试分类
+### 3.1 五级测试分类
 
 ZeroClaw 使用五级测试分类体系：
 
@@ -513,7 +431,7 @@ ZeroClaw 使用五级测试分类体系：
 | **L4** | System（系统） | 完整请求→响应流程 | 仅外部 API Mock | `tests/system/` |
 | **L5** | Live（在线） | 完整真实服务 | 无 Mock（需 `#[ignore]`） | `tests/live/` |
 
-### 4.2 测试目录结构
+### 3.2 测试目录结构
 
 ```
 tests/
@@ -568,7 +486,7 @@ tests/
 └── test_system.rs       # 系统测试入口
 ```
 
-### 4.3 测试支持模块
+### 3.3 测试支持模块
 
 | 模块 | 内容 |
 |------|------|
@@ -579,7 +497,7 @@ tests/
 | `trace.rs` | `LlmTrace` 类型 + `LlmTrace::from_file()` 加载器 |
 | `assertions.rs` | `verify_expects()` 声明式断言 |
 
-### 4.4 运行测试命令
+### 3.4 运行测试命令
 
 #### 基础命令
 
@@ -642,7 +560,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-### 4.5 JSON Trace Fixtures
+### 3.5 JSON Trace Fixtures
 
 Trace fixtures 是存储为 JSON 文件的预制 LLM 响应脚本，用于声明式测试：
 
@@ -687,9 +605,9 @@ Trace fixtures 是存储为 JSON 文件的预制 LLM 响应脚本，用于声明
 
 ---
 
-## 5. 快速开始
+## 4. 快速开始
 
-### 5.1 环境准备
+### 4.1 环境准备
 
 #### Windows 11
 
@@ -724,7 +642,7 @@ rustc --version
 cargo --version
 ```
 
-### 5.2 克隆并构建
+### 4.2 克隆并构建
 
 ```bash
 # 克隆仓库
@@ -741,7 +659,7 @@ cargo build --release --features agent-runtime,channel-matrix,channel-lark
 cargo install --path . --force
 ```
 
-### 5.3 运行测试
+### 4.3 运行测试
 
 ```bash
 # 运行所有测试
@@ -751,7 +669,7 @@ cargo test
 ./dev/ci.sh all
 ```
 
-### 5.4 常用命令
+### 4.4 常用命令
 
 ```bash
 # 查看版本
