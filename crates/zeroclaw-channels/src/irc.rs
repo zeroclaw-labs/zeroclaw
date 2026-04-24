@@ -559,7 +559,7 @@ impl Channel for IrcChannel {
                         continue;
                     }
 
-                    if self.mention_only && is_channel && self.is_mentioned(&current_nick, text) {
+                    if self.mention_only && is_channel && !self.is_mentioned(&current_nick, text) {
                         continue;
                     }
 
@@ -1013,7 +1013,7 @@ mod tests {
         assert_eq!(parsed.nickserv_password.as_deref(), Some("secret"));
         assert!(parsed.sasl_password.is_none());
         assert_eq!(parsed.verify_tls, Some(true));
-        assert_eq!(parsed.mention_only, false);
+        assert!(!parsed.mention_only);
     }
 
     #[test]
@@ -1035,7 +1035,7 @@ nickname = "bot"
         assert!(parsed.nickserv_password.is_none());
         assert!(parsed.sasl_password.is_none());
         assert!(parsed.verify_tls.is_none());
-        assert_eq!(parsed.mention_only, false);
+        assert!(!parsed.mention_only);
     }
 
     #[test]
