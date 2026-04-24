@@ -94,6 +94,21 @@ impl IMessageChannel {
             warn!("Failed to save iMessage cursor: {e}");
         }
     }
+
+    /// Execute an AppleScript to send an iMessage. macOS only.
+    #[cfg(target_os = "macos")]
+    async fn run_applescript(script: String, recipient: &str) -> anyhow::Result<()> {
+        let result =
+            tokio::task::spawn_blocking(move || lightwave_macos::applescript::execute(&script))
+                .await??;
+        debug!("iMessage sent to {recipient}: {result}");
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    async fn run_applescript(_script: String, _recipient: &str) -> anyhow::Result<()> {
+        anyhow::bail!("iMessage send is only supported on macOS")
+    }
 }
 
 #[async_trait]
@@ -125,22 +140,7 @@ end tell"#,
             escaped = escaped,
         );
 
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = script;
-            anyhow::bail!("iMessage send is only supported on macOS");
-        }
-
-        // Run AppleScript in blocking thread to avoid blocking tokio
-        #[cfg(target_os = "macos")]
-        {
-            let result =
-                tokio::task::spawn_blocking(move || lightwave_macos::applescript::execute(&script))
-                    .await??;
-            debug!("iMessage sent to {recipient}: {result}");
-        }
-
-        Ok(())
+        Self::run_applescript(script, recipient).await
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
