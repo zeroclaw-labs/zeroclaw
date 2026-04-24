@@ -2,9 +2,17 @@ use crate::util::*;
 use std::path::Path;
 use std::process::Command;
 
-pub fn run(locale: Option<&str>, force: bool, provider: Option<&str>, batch: Option<usize>) -> anyhow::Result<()> {
+pub fn run(
+    locale: Option<&str>,
+    force: bool,
+    provider: Option<&str>,
+    batch: Option<usize>,
+) -> anyhow::Result<()> {
     let root = repo_root();
-    require_tool("mdbook-xgettext", "cargo install mdbook-i18n-helpers --locked")?;
+    require_tool(
+        "mdbook-xgettext",
+        "cargo install mdbook-i18n-helpers --locked",
+    )?;
     require_tool("msgmerge", "apt install gettext / brew install gettext")?;
     require_tool("msginit", "apt install gettext / brew install gettext")?;
     require_tool("msgfmt", "apt install gettext / brew install gettext")?;
@@ -18,10 +26,12 @@ pub fn run(locale: Option<&str>, force: bool, provider: Option<&str>, batch: Opt
 
     // Step 1: extract English msgids
     println!("==> Extracting English msgids → {}", pot.display());
-    run_cmd(Command::new("mdbook")
-        .args(["build", "-d", "po-extract"])
-        .env("MDBOOK_OUTPUT__XGETTEXT__POT_FILE", "messages.pot")
-        .current_dir(&book))?;
+    run_cmd(
+        Command::new("mdbook")
+            .args(["build", "-d", "po-extract"])
+            .env("MDBOOK_OUTPUT__XGETTEXT__POT_FILE", "messages.pot")
+            .current_dir(&book),
+    )?;
 
     let extracted = book.join("po-extract/xgettext/messages.pot");
     if extracted.exists() {
@@ -50,23 +60,29 @@ pub fn run(locale: Option<&str>, force: bool, provider: Option<&str>, batch: Opt
 
         if !po_file.exists() {
             println!("==> {locale}: bootstrapping new .po from template");
-            run_cmd(Command::new("msginit")
-                .args(["--no-translator", &format!("--locale={locale}"),
-                       "--input"])
-                .arg(&pot)
-                .arg("--output")
-                .arg(&po_file))?;
+            run_cmd(
+                Command::new("msginit")
+                    .args(["--no-translator", &format!("--locale={locale}"), "--input"])
+                    .arg(&pot)
+                    .arg("--output")
+                    .arg(&po_file),
+            )?;
         } else {
             println!("==> {locale}: msgmerge");
-            run_cmd(Command::new("msgmerge")
-                .args(["--update", "--backup=none", "--no-fuzzy-matching"])
-                .arg(&po_file)
-                .arg(&pot))?;
+            run_cmd(
+                Command::new("msgmerge")
+                    .args(["--update", "--backup=none", "--no-fuzzy-matching"])
+                    .arg(&po_file)
+                    .arg(&pot),
+            )?;
             // Strip obsolete (#~) entries that msgmerge leaves behind for removed source strings.
-            run_cmd(Command::new("msgattrib")
-                .arg("--no-obsolete")
-                .arg("--output-file").arg(&po_file)
-                .arg(&po_file))?;
+            run_cmd(
+                Command::new("msgattrib")
+                    .arg("--no-obsolete")
+                    .arg("--output-file")
+                    .arg(&po_file)
+                    .arg(&po_file),
+            )?;
         }
 
         if force {
@@ -74,7 +90,9 @@ pub fn run(locale: Option<&str>, force: bool, provider: Option<&str>, batch: Opt
                 println!("==> {locale}: --force: re-translating all entries");
                 fill(&root, &po_file, locale, true, p, batch)?;
             } else {
-                println!("==> {locale}: --force requested but no --provider specified — skipping AI step");
+                println!(
+                    "==> {locale}: --force requested but no --provider specified — skipping AI step"
+                );
             }
         } else {
             let delta = count_delta(&po_file)?;
@@ -83,7 +101,9 @@ pub fn run(locale: Option<&str>, force: bool, provider: Option<&str>, batch: Opt
                     println!("==> {locale}: AI-filling {delta} entries");
                     fill(&root, &po_file, locale, false, p, batch)?;
                 } else {
-                    println!("==> {locale}: {delta} entries need translation (use --provider <name> to auto-fill)");
+                    println!(
+                        "==> {locale}: {delta} entries need translation (use --provider <name> to auto-fill)"
+                    );
                 }
             } else {
                 println!("==> {locale}: up to date, skipping AI step");
@@ -93,9 +113,13 @@ pub fn run(locale: Option<&str>, force: bool, provider: Option<&str>, batch: Opt
 
     println!("\n==> Translation summary:");
     for locale in &targets {
-        if locale == "en" { continue; }
+        if locale == "en" {
+            continue;
+        }
         let po_file = po_dir.join(format!("{locale}.po"));
-        if !po_file.exists() { continue; }
+        if !po_file.exists() {
+            continue;
+        }
         print!("    {locale:<8} ");
         let out = Command::new("msgfmt")
             .args(["--statistics", "-o", "/dev/null"])
@@ -107,13 +131,22 @@ pub fn run(locale: Option<&str>, force: bool, provider: Option<&str>, batch: Opt
     Ok(())
 }
 
-fn fill(root: &Path, po_file: &Path, locale: &str, force: bool, provider: &str, batch: Option<usize>) -> anyhow::Result<()> {
+fn fill(
+    root: &Path,
+    po_file: &Path,
+    locale: &str,
+    force: bool,
+    provider: &str,
+    batch: Option<usize>,
+) -> anyhow::Result<()> {
     // Build and invoke the binary directly — `cargo run` wraps the child in a way that
     // breaks Ctrl-C propagation, leaving the translator orphaned in the terminal.
     let bin = root.join("target/release/fill-translations");
-    run_cmd(Command::new("cargo")
-        .args(["build", "--release", "-q", "--manifest-path"])
-        .arg(root.join("tools/fill-translations/Cargo.toml")))?;
+    run_cmd(
+        Command::new("cargo")
+            .args(["build", "--release", "-q", "--manifest-path"])
+            .arg(root.join("tools/fill-translations/Cargo.toml")),
+    )?;
     let mut cmd = Command::new(&bin);
     cmd.args(["--po"])
         .arg(po_file)

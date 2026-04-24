@@ -1,7 +1,7 @@
 use crate::cmd::mdbook::refs::{build_api, build_refs};
 use crate::util::*;
-use std::process::Command;
 use std::path::Path;
+use std::process::Command;
 
 pub fn run() -> anyhow::Result<()> {
     let root = repo_root();
@@ -15,20 +15,32 @@ pub fn run() -> anyhow::Result<()> {
     build_api(&root)?;
     build_locales(&root)?;
     assemble(&root)?;
-    println!("==> Done. Open: {}", book_dir(&root).join("book/index.html").display());
+    println!(
+        "==> Done. Open: {}",
+        book_dir(&root).join("book/index.html").display()
+    );
     Ok(())
 }
 
 pub fn build_locales(root: &std::path::Path) -> anyhow::Result<()> {
     let book = book_dir(root);
     let entries = locale_entries();
-    println!("==> Building mdBook for locales: {}", entries.iter().map(|e| e.code.as_str()).collect::<Vec<_>>().join(" "));
+    println!(
+        "==> Building mdBook for locales: {}",
+        entries
+            .iter()
+            .map(|e| e.code.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     inject_lang_switcher_locales(&book, &entries)?;
     for entry in &entries {
-        run_cmd(Command::new("mdbook")
-            .args(["build", "-d", &format!("book/{}", entry.code)])
-            .env("MDBOOK_BOOK__LANGUAGE", &entry.code)
-            .current_dir(&book))?;
+        run_cmd(
+            Command::new("mdbook")
+                .args(["build", "-d", &format!("book/{}", entry.code)])
+                .env("MDBOOK_BOOK__LANGUAGE", &entry.code)
+                .current_dir(&book),
+        )?;
     }
     Ok(())
 }
@@ -47,8 +59,12 @@ pub fn inject_lang_switcher_locales(book: &Path, entries: &[LocaleEntry]) -> any
     let new_block = format!("const LOCALES = [\n{locale_lines}\n  ];");
 
     // Replace the existing `const LOCALES = [...];` block
-    let start = src.find("const LOCALES = [").ok_or_else(|| anyhow::anyhow!("lang-switcher.js: LOCALES array not found"))?;
-    let end = src[start..].find("];").ok_or_else(|| anyhow::anyhow!("lang-switcher.js: LOCALES closing ]; not found"))?;
+    let start = src
+        .find("const LOCALES = [")
+        .ok_or_else(|| anyhow::anyhow!("lang-switcher.js: LOCALES array not found"))?;
+    let end = src[start..]
+        .find("];")
+        .ok_or_else(|| anyhow::anyhow!("lang-switcher.js: LOCALES closing ]; not found"))?;
     let updated = format!("{}{}{}", &src[..start], new_block, &src[start + end + 2..]);
     std::fs::write(&js_path, updated)?;
     Ok(())

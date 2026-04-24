@@ -34,7 +34,8 @@ pub fn locale_entries() -> Vec<LocaleEntry> {
     let raw = std::fs::read_to_string(&path)
         .unwrap_or_else(|_| panic!("locales.toml not found at {}", path.display()));
     let table: toml::Table = raw.parse().expect("locales.toml is invalid TOML");
-    table.get("locale")
+    table
+        .get("locale")
         .and_then(|v| v.as_array())
         .unwrap_or_else(|| panic!("locales.toml missing [[locale]] entries"))
         .iter()
@@ -51,14 +52,18 @@ pub fn locales() -> Vec<String> {
 }
 
 pub fn require_tool(cmd: &str, install_hint: &str) -> anyhow::Result<()> {
-    if tool_on_path(cmd) { return Ok(()); }
+    if tool_on_path(cmd) {
+        return Ok(());
+    }
     anyhow::bail!("'{}' not found on PATH\n  install: {}", cmd, install_hint);
 }
 
 /// Like `require_tool`, but if the binary is a cargo-installable crate that's missing,
 /// auto-install it via `cargo install --locked <crate>`. Idempotent — a no-op when present.
 pub fn ensure_cargo_tool(cmd: &str, crate_name: &str) -> anyhow::Result<()> {
-    if tool_on_path(cmd) { return Ok(()); }
+    if tool_on_path(cmd) {
+        return Ok(());
+    }
     println!("==> installing '{crate_name}' (missing '{cmd}')");
     run_cmd(Command::new("cargo").args(["install", "--locked", crate_name]))
 }
@@ -66,9 +71,8 @@ pub fn ensure_cargo_tool(cmd: &str, crate_name: &str) -> anyhow::Result<()> {
 fn tool_on_path(cmd: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| {
-                dir.join(cmd).is_file() || dir.join(format!("{cmd}.exe")).is_file()
-            })
+            std::env::split_paths(&paths)
+                .any(|dir| dir.join(cmd).is_file() || dir.join(format!("{cmd}.exe")).is_file())
         })
         .unwrap_or(false)
 }
@@ -118,25 +122,40 @@ pub struct ProviderConfig {
 
 /// Read a `[providers.models.<name>]` entry from ~/.zeroclaw/config.toml.
 pub fn read_provider_config(provider_name: &str) -> anyhow::Result<ProviderConfig> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| std::env::var("USERPROFILE").unwrap_or_default());
+    let home =
+        std::env::var("HOME").unwrap_or_else(|_| std::env::var("USERPROFILE").unwrap_or_default());
     let candidates = [
         format!("{home}/.zeroclaw/config.toml"),
         format!("{home}/.config/zeroclaw/config.toml"),
     ];
-    let raw = candidates.iter()
+    let raw = candidates
+        .iter()
         .find_map(|p| std::fs::read_to_string(p).ok())
         .ok_or_else(|| anyhow::anyhow!("config.toml not found (tried ~/.zeroclaw/config.toml)"))?;
 
     let table: toml::Table = raw.parse()?;
     let provider = table
-        .get("providers").and_then(|v| v.get("models")).and_then(|v| v.get(provider_name))
-        .ok_or_else(|| anyhow::anyhow!("[providers.models.{provider_name}] not found in config.toml"))?;
+        .get("providers")
+        .and_then(|v| v.get("models"))
+        .and_then(|v| v.get(provider_name))
+        .ok_or_else(|| {
+            anyhow::anyhow!("[providers.models.{provider_name}] not found in config.toml")
+        })?;
 
     Ok(ProviderConfig {
-        base_url: provider.get("base_url").and_then(|v| v.as_str())
-            .unwrap_or("http://localhost:11434").to_string(),
-        model: provider.get("model").and_then(|v| v.as_str()).map(str::to_string),
-        api_key: provider.get("api_key").and_then(|v| v.as_str()).map(str::to_string),
+        base_url: provider
+            .get("base_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("http://localhost:11434")
+            .to_string(),
+        model: provider
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        api_key: provider
+            .get("api_key")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     })
 }
 

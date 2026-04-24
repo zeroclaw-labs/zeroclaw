@@ -37,7 +37,9 @@ impl FailureLog {
             .create(true)
             .append(true)
             .open(path)?;
-        Ok(Self { file: Mutex::new(file) })
+        Ok(Self {
+            file: Mutex::new(file),
+        })
     }
 
     fn record(&self, chunk: usize, source: &str, response: &str, err: &anyhow::Error) {
@@ -52,7 +54,10 @@ impl FailureLog {
 
 fn chrono_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     format!("epoch={secs}")
 }
 
@@ -62,24 +67,33 @@ struct ProviderConfig {
 }
 
 fn read_provider_config(provider_name: &str) -> anyhow::Result<ProviderConfig> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| std::env::var("USERPROFILE").unwrap_or_default());
+    let home =
+        std::env::var("HOME").unwrap_or_else(|_| std::env::var("USERPROFILE").unwrap_or_default());
     let candidates = [
         format!("{home}/.zeroclaw/config.toml"),
         format!("{home}/.config/zeroclaw/config.toml"),
     ];
-    let raw = candidates.iter()
+    let raw = candidates
+        .iter()
         .find_map(|p| std::fs::read_to_string(p).ok())
         .ok_or_else(|| anyhow::anyhow!("config.toml not found (tried ~/.zeroclaw/config.toml)"))?;
     let table: toml::Table = raw.parse()?;
     let provider = table
-        .get("providers").and_then(|v| v.get("models")).and_then(|v| v.get(provider_name))
-        .ok_or_else(|| anyhow::anyhow!("[providers.models.{provider_name}] not found in config.toml"))?;
+        .get("providers")
+        .and_then(|v| v.get("models"))
+        .and_then(|v| v.get(provider_name))
+        .ok_or_else(|| {
+            anyhow::anyhow!("[providers.models.{provider_name}] not found in config.toml")
+        })?;
     let model = provider.get("model").and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("No model set for provider '{provider_name}' — add `model = \"...\"` to [providers.models.{provider_name}]"))?
         .to_string();
     Ok(ProviderConfig {
-        base_url: provider.get("base_url").and_then(|v| v.as_str())
-            .unwrap_or("http://localhost:11434").to_string(),
+        base_url: provider
+            .get("base_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("http://localhost:11434")
+            .to_string(),
         model,
     })
 }
@@ -112,7 +126,10 @@ fn decode_po_string(lines: &[String]) -> String {
                         Some('t') => out.push('\t'),
                         Some('\\') => out.push('\\'),
                         Some('"') => out.push('"'),
-                        Some(other) => { out.push('\\'); out.push(other); }
+                        Some(other) => {
+                            out.push('\\');
+                            out.push(other);
+                        }
                         None => out.push('\\'),
                     }
                 } else {
@@ -138,8 +155,7 @@ enum LeakCheck {
 /// is far longer than any plausible translation of `source`, or starts with a bullet list.
 fn check_for_leak(source: &str, response: &str) -> LeakCheck {
     let leak_threshold = source.len().saturating_mul(4).max(120);
-    let looks_like_bullets = response.trim_start().starts_with("- ")
-        && response.contains("\\n- ");
+    let looks_like_bullets = response.trim_start().starts_with("- ") && response.contains("\\n- ");
     let too_long = response.len() > leak_threshold;
     if !too_long && !looks_like_bullets {
         return LeakCheck::Clean;
@@ -151,7 +167,13 @@ fn check_for_leak(source: &str, response: &str) -> LeakCheck {
         .rsplit("\n\n")
         .find(|s| !s.trim().is_empty())
         .map(str::to_string)
-        .or_else(|| response.trim().rsplit(". ").next().map(|s| s.trim_end_matches('.').trim().to_string()));
+        .or_else(|| {
+            response
+                .trim()
+                .rsplit(". ")
+                .next()
+                .map(|s| s.trim_end_matches('.').trim().to_string())
+        });
     match candidate {
         Some(c) if !c.is_empty() && c.len() <= leak_threshold => LeakCheck::Recovered(c),
         _ => LeakCheck::Unrecoverable,
@@ -163,7 +185,7 @@ fn encode_po_string(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
         match c {
-            '"'  => out.push_str("\\\""),
+            '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
@@ -180,13 +202,20 @@ fn commit_entry(
     msgid_lines: &[String],
     msgstr_lines: &[String],
 ) {
-    let Some(ms_line) = msgstr_line_idx else { return };
+    let Some(ms_line) = msgstr_line_idx else {
+        return;
+    };
     let msgid = decode_po_string(msgid_lines);
     let msgstr = decode_po_string(msgstr_lines);
     if msgid.is_empty() {
         return; // header entry
     }
-    entries.push(Entry { msgstr_line: ms_line, fuzzy_line, msgid, msgstr });
+    entries.push(Entry {
+        msgstr_line: ms_line,
+        fuzzy_line,
+        msgid,
+        msgstr,
+    });
 }
 
 fn parse_po(lines: &[String]) -> Vec<Entry> {
@@ -202,7 +231,13 @@ fn parse_po(lines: &[String]) -> Vec<Entry> {
         let trimmed = line.trim_end();
 
         if trimmed.starts_with("#,") && trimmed.contains("fuzzy") {
-            commit_entry(&mut entries, fuzzy_line, msgstr_line_idx, &msgid_lines, &msgstr_lines);
+            commit_entry(
+                &mut entries,
+                fuzzy_line,
+                msgstr_line_idx,
+                &msgid_lines,
+                &msgstr_lines,
+            );
             fuzzy_line = Some(idx);
             in_msgid = false;
             in_msgstr = false;
@@ -214,7 +249,13 @@ fn parse_po(lines: &[String]) -> Vec<Entry> {
 
         if trimmed.starts_with("msgid ") {
             if msgstr_line_idx.is_some() {
-                commit_entry(&mut entries, fuzzy_line, msgstr_line_idx, &msgid_lines, &msgstr_lines);
+                commit_entry(
+                    &mut entries,
+                    fuzzy_line,
+                    msgstr_line_idx,
+                    &msgid_lines,
+                    &msgstr_lines,
+                );
                 fuzzy_line = None;
                 msgid_lines.clear();
                 msgstr_lines.clear();
@@ -237,8 +278,12 @@ fn parse_po(lines: &[String]) -> Vec<Entry> {
         }
 
         if trimmed.starts_with('"') {
-            if in_msgid  { msgid_lines.push(trimmed.to_string()); }
-            if in_msgstr { msgstr_lines.push(trimmed.to_string()); }
+            if in_msgid {
+                msgid_lines.push(trimmed.to_string());
+            }
+            if in_msgstr {
+                msgstr_lines.push(trimmed.to_string());
+            }
             continue;
         }
 
@@ -247,7 +292,13 @@ fn parse_po(lines: &[String]) -> Vec<Entry> {
             in_msgstr = false;
         }
     }
-    commit_entry(&mut entries, fuzzy_line, msgstr_line_idx, &msgid_lines, &msgstr_lines);
+    commit_entry(
+        &mut entries,
+        fuzzy_line,
+        msgstr_line_idx,
+        &msgid_lines,
+        &msgstr_lines,
+    );
     entries
 }
 
@@ -310,7 +361,10 @@ struct BatchFailure {
 type BatchResult = Result<Vec<String>, BatchFailure>;
 
 fn fail(err: anyhow::Error, raw_response: impl Into<String>) -> BatchFailure {
-    BatchFailure { err, raw_response: raw_response.into() }
+    BatchFailure {
+        err,
+        raw_response: raw_response.into(),
+    }
 }
 
 /// Call Ollama's native `/api/chat` endpoint with a JSON schema constraining the output.
@@ -367,16 +421,26 @@ async fn fetch_ollama_content(
     let resp = client
         .post(format!("{}/api/chat", provider.base_url))
         .json(body)
-        .send().await
+        .send()
+        .await
         .map_err(|e| fail(e.into(), String::new()))?;
     let status = resp.status();
-    let raw = resp.text().await.map_err(|e| fail(e.into(), String::new()))?;
+    let raw = resp
+        .text()
+        .await
+        .map_err(|e| fail(e.into(), String::new()))?;
     if !status.is_success() {
         return Err(fail(anyhow::anyhow!("HTTP {status}"), raw));
     }
-    let parsed: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| fail(anyhow::anyhow!("response body JSON parse: {e}"), raw.clone()))?;
-    parsed["message"]["content"].as_str().map(str::to_string)
+    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        fail(
+            anyhow::anyhow!("response body JSON parse: {e}"),
+            raw.clone(),
+        )
+    })?;
+    parsed["message"]["content"]
+        .as_str()
+        .map(str::to_string)
         .ok_or_else(|| fail(anyhow::anyhow!("no message.content"), raw))
 }
 
@@ -396,9 +460,7 @@ async fn main() -> anyhow::Result<()> {
     // interrupted runs. Pre-populate into translations so write_po fixes them inline.
     let mut repaired = 0;
     for entry in &entries {
-        if !entry.msgstr.is_empty()
-            && entry.msgid.ends_with('\n')
-            && !entry.msgstr.ends_with('\n')
+        if !entry.msgstr.is_empty() && entry.msgid.ends_with('\n') && !entry.msgstr.ends_with('\n')
         {
             translations.insert(entry.msgstr_line, format!("{}\n", entry.msgstr));
             repaired += 1;
@@ -415,7 +477,9 @@ async fn main() -> anyhow::Result<()> {
     let mut leak_blanked = 0;
     let mut lines: Vec<String> = lines;
     for entry in &entries {
-        if entry.msgstr.is_empty() { continue; }
+        if entry.msgstr.is_empty() {
+            continue;
+        }
         match check_for_leak(&entry.msgid, &entry.msgstr) {
             LeakCheck::Clean => {}
             LeakCheck::Recovered(r) => {
@@ -429,10 +493,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     if leak_recovered + leak_blanked > 0 {
-        println!("==> Leak repair: {leak_recovered} recovered, {leak_blanked} cleared for re-translation");
+        println!(
+            "==> Leak repair: {leak_recovered} recovered, {leak_blanked} cleared for re-translation"
+        );
     }
     // Re-parse with repaired lines
-    let entries = if leak_recovered + leak_blanked > 0 { parse_po(&lines) } else { entries };
+    let entries = if leak_recovered + leak_blanked > 0 {
+        parse_po(&lines)
+    } else {
+        entries
+    };
 
     // Entries with empty msgstr need AI translation.
     // Fuzzy entries already have a translation — accept it as-is, just drop the flag.
@@ -464,14 +534,20 @@ async fn main() -> anyhow::Result<()> {
     let total = to_translate.len();
     let total_chunks = total.div_ceil(args.batch).max(1);
 
-    let log_path = args.log_failures.clone()
+    let log_path = args
+        .log_failures
+        .clone()
         .unwrap_or_else(|| args.po.with_extension("failures.log"));
     let failure_log = FailureLog::open(&log_path)?;
     println!("==> Logging failures to {}", log_path.display());
 
     for (chunk_idx, chunk) in to_translate.chunks(args.batch).enumerate() {
         let msgids: Vec<&str> = chunk.iter().map(|e| e.msgid.as_str()).collect();
-        println!("==> Chunk {}/{total_chunks} ({} entries)", chunk_idx + 1, chunk.len());
+        println!(
+            "==> Chunk {}/{total_chunks} ({} entries)",
+            chunk_idx + 1,
+            chunk.len()
+        );
 
         match translate_batch(&client, &provider, &args.locale, &msgids).await {
             Ok(translated) => {
@@ -484,13 +560,23 @@ async fn main() -> anyhow::Result<()> {
                     };
                     translations.insert(entry.msgstr_line, text);
                 }
-                write_po(&lines, &raw, &translations, &to_translate, &to_accept, &args.po)?;
+                write_po(
+                    &lines,
+                    &raw,
+                    &translations,
+                    &to_translate,
+                    &to_accept,
+                    &args.po,
+                )?;
             }
             Err(f) => {
                 let source_joined = msgids.join(" | ");
                 eprintln!(
                     "  warning: chunk {} failed: {}\n    source: {:?}\n    response: {:?}",
-                    chunk_idx + 1, f.err, source_joined, f.raw_response
+                    chunk_idx + 1,
+                    f.err,
+                    source_joined,
+                    f.raw_response
                 );
                 failure_log.record(chunk_idx + 1, &source_joined, &f.raw_response, &f.err);
             }
@@ -498,7 +584,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Final write — handles to_accept fuzzy removals even when to_translate is empty
-    write_po(&lines, &raw, &translations, &to_translate, &to_accept, &args.po)?;
-    println!("==> Done: {}/{total} entries translated.", translations.len());
+    write_po(
+        &lines,
+        &raw,
+        &translations,
+        &to_translate,
+        &to_accept,
+        &args.po,
+    )?;
+    println!(
+        "==> Done: {}/{total} entries translated.",
+        translations.len()
+    );
     Ok(())
 }

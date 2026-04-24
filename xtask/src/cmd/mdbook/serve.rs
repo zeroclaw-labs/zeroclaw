@@ -1,7 +1,10 @@
 use crate::cmd::mdbook::refs::{build_api, build_refs};
 use crate::util::*;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 const PORT: u16 = 3000;
 
@@ -65,7 +68,9 @@ pub fn run(locale: &str) -> anyhow::Result<()> {
     println!("    Live-reload:    watching locale '{locale}'");
     println!("    Press Ctrl-C to stop.");
 
-    let _ = Command::new("xdg-open").arg(&url).spawn()
+    let _ = Command::new("xdg-open")
+        .arg(&url)
+        .spawn()
         .or_else(|_| Command::new("open").arg(&url).spawn());
 
     // Serve with axum + tower-http ServeDir — no Python required
@@ -82,9 +87,8 @@ async fn serve_static(dir: std::path::PathBuf) -> anyhow::Result<()> {
     use axum::Router;
     use tower_http::services::ServeDir;
 
-    let app = Router::new().fallback_service(
-        ServeDir::new(&dir).append_index_html_on_directories(true)
-    );
+    let app =
+        Router::new().fallback_service(ServeDir::new(&dir).append_index_html_on_directories(true));
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{PORT}")).await?;
     axum::serve(listener, app).await?;
     Ok(())

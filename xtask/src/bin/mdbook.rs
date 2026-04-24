@@ -1,5 +1,5 @@
-use xtask::cmd;
 use clap::{Parser, Subcommand};
+use xtask::cmd;
 
 #[derive(Parser)]
 #[command(name = "mdbook", about = "ZeroClaw documentation tooling")]
@@ -44,12 +44,20 @@ enum Cmd {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Serve { locale }       => cmd::mdbook::serve::run(&locale),
-        Cmd::Build                  => cmd::mdbook::build::run(),
-        Cmd::Refs                   => cmd::mdbook::refs::run(),
-        Cmd::Sync { locale, force, provider, batch } => cmd::mdbook::sync::run(locale.as_deref(), force, provider.as_deref(), batch),
-        Cmd::Stats                  => cmd::mdbook::stats::run(),
-        Cmd::Check                  => cmd::mdbook::check::run(),
-        Cmd::Locales                => { cmd::mdbook::build::print_locales(); Ok(()) },
+        Cmd::Serve { locale } => cmd::mdbook::serve::run(&locale),
+        Cmd::Build => cmd::mdbook::build::run(),
+        Cmd::Refs => cmd::mdbook::refs::run(),
+        Cmd::Sync {
+            locale,
+            force,
+            provider,
+            batch,
+        } => cmd::mdbook::sync::run(locale.as_deref(), force, provider.as_deref(), batch),
+        Cmd::Stats => cmd::mdbook::stats::run(),
+        Cmd::Check => cmd::mdbook::check::run(),
+        Cmd::Locales => {
+            cmd::mdbook::build::print_locales();
+            Ok(())
+        }
     }
 }
