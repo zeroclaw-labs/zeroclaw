@@ -2,6 +2,11 @@ name: Release Beta
 
 on:
   workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type 'release' to confirm beta release"
+        required: true
+        type: string
   push:
     tags:
       - "v*-beta*"
