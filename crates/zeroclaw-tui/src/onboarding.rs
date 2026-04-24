@@ -12,7 +12,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Paragraph},
 };
-use std::io::{self, IsTerminal};
+
+use std::io;
+#[cfg(unix)]
+use std::io::IsTerminal;
 
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::{
@@ -916,6 +919,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     encrypt_key: None,
                     verification_token: None,
                     allowed_users: vec![],
+                    mention_only: false,
                     receive_mode: LarkReceiveMode::default(),
                     port: None,
                     proxy_url: None,
