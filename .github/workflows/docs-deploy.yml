@@ -1,7 +1,8 @@
 name: Deploy mdBook docs to Pages
 
 # Builds the full multi-locale mdBook + rustdoc API reference and publishes
-# to GitHub Pages on push to master.
+# to a `gh-pages` branch. Configure Pages in repo Settings → Pages to serve
+# from the `gh-pages` branch root.
 #
 # All locales in locales.toml are built. Translations are produced locally
 # (see docs/book/src/maintainers/docs-and-translations.md) and committed to
@@ -22,12 +23,10 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write
 
 concurrency:
-  group: pages
+  group: gh-pages
   cancel-in-progress: false
 
 env:
@@ -36,9 +35,6 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-24.04-arm
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -80,12 +76,11 @@ jobs:
       - name: Build docs (refs + rustdoc + all locales)
         run: cargo mdbook build
 
-      - uses: actions/configure-pages@v5
-
-      - uses: actions/upload-pages-artifact@v3
+      - name: Deploy to gh-pages branch
+        uses: peaceiris/actions-gh-pages@v4
         with:
-          path: docs/book/book
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: docs/book/book
+          publish_branch: gh-pages
+          force_orphan: true
+          commit_message: "deploy: ${{ github.event.head_commit.message }}"
