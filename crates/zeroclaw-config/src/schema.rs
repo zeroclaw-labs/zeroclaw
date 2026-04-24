@@ -1554,6 +1554,11 @@ pub struct AgentConfig {
     #[serde(default)]
     pub context_compression: crate::scattered_types::ContextCompressionConfig,
 
+    /// Channel reply-intent precheck configuration (model override, timeout).
+    #[nested]
+    #[serde(default)]
+    pub precheck: crate::scattered_types::ChannelPrecheckConfig,
+
     /// Maximum characters for a single tool result before truncation.
     /// Head (2/3) and tail (1/3) are preserved with a truncation marker in the
     /// middle. Set to `0` to disable truncation. Default: `50000`.
@@ -1614,6 +1619,7 @@ impl Default for AgentConfig {
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
+            precheck: crate::scattered_types::ChannelPrecheckConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
         }

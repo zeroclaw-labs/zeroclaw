@@ -2924,15 +2924,59 @@ async fn process_channel_message(
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
-    let reply_intent = classify_channel_reply_intent(
-        active_provider.as_ref(),
-        history[0].content.as_str(),
-        &history,
-        route.model.as_str(),
-        runtime_defaults.temperature,
-    )
-    .await
-    .unwrap_or(AssistantChannelOutcome::Reply(String::new()));
+    let precheck_cfg = ctx.prompt_config.agent.precheck.clone();
+    let reply_intent = if precheck_cfg.enabled {
+        let precheck_model = precheck_cfg
+            .model
+            .as_deref()
+            .unwrap_or(route.model.as_str());
+        let precheck_start = Instant::now();
+        let precheck_timeout = Duration::from_secs(precheck_cfg.timeout_secs);
+        match tokio::time::timeout(
+            precheck_timeout,
+            classify_channel_reply_intent(
+                active_provider.as_ref(),
+                history[0].content.as_str(),
+                &history,
+                precheck_model,
+                runtime_defaults.temperature,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(outcome)) => {
+                #[allow(clippy::cast_possible_truncation)]
+                let elapsed_ms = precheck_start.elapsed().as_millis() as u64;
+                tracing::info!(
+                    elapsed_ms,
+                    model = precheck_model,
+                    "⏱ Reply-intent precheck completed"
+                );
+                outcome
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    model = precheck_model,
+                    "Reply-intent precheck failed, defaulting to REPLY"
+                );
+                AssistantChannelOutcome::Reply(String::new())
+            }
+            Err(_) => {
+                #[allow(clippy::cast_possible_truncation)]
+                let elapsed_ms = precheck_start.elapsed().as_millis() as u64;
+                tracing::warn!(
+                    elapsed_ms,
+                    timeout_secs = precheck_cfg.timeout_secs,
+                    model = precheck_model,
+                    "Reply-intent precheck timed out, defaulting to REPLY"
+                );
+                AssistantChannelOutcome::Reply(String::new())
+            }
+        }
+    } else {
+        AssistantChannelOutcome::Reply(String::new())
+    };
 
     if let AssistantChannelOutcome::NoReply { kind, reason } = reply_intent {
         let history_response = AssistantChannelOutcome::NoReply {
@@ -6743,6 +6787,55 @@ mod tests {
         }
     }
 
+    /// Provider that records every `model` value passed to `chat_with_system`
+    /// and short-circuits the agent loop with `NO_REPLY`. Lets a test assert
+    /// which model the precheck used vs the route model.
+    #[derive(Default)]
+    struct PrecheckModelCaptureProvider {
+        models: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for PrecheckModelCaptureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(model.to_string());
+            Ok("NO_REPLY: not addressed".to_string())
+        }
+    }
+
+    /// Provider that stalls the precheck call (detected by the classifier's
+    /// prompt prefix) so the orchestrator's `tokio::time::timeout` fires, while
+    /// returning instantly for any post-fail-open agent calls so the test does
+    /// not hang.
+    struct PrecheckSlowProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for PrecheckSlowProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            if message.starts_with("Decide whether the assistant should send any visible reply") {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok("REPLY".to_string())
+            } else {
+                Ok("ok".to_string())
+            }
+        }
+    }
+
     struct FormatErrorProvider;
 
     #[async_trait::async_trait]
@@ -9034,6 +9127,218 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let starts = channel_impl.start_typing_calls.load(Ordering::SeqCst);
         assert_eq!(starts, 0, "no-reply precheck should not show typing");
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_precheck_uses_configured_model_override() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(PrecheckModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agent.precheck.model = Some("precheck-fast".to_string());
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider,
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("main-route-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(config),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "precheck-model-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-precheck-model".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let models = provider_impl
+            .models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(
+            models.as_slice(),
+            &["precheck-fast".to_string()],
+            "precheck must use the configured model override; main loop must be skipped on NO_REPLY"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_precheck_timeout_fails_open_to_reply() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agent.precheck.timeout_secs = 1;
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(PrecheckSlowProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(config),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+        });
+
+        let started = Instant::now();
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "precheck-timeout-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-precheck-timeout".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+        let total = started.elapsed();
+
+        // Fail-open after precheck timeout means the main agent loop runs and
+        // delivers a reply. The slow precheck would otherwise hang for 60s.
+        let sent = channel_impl.sent_messages.lock().await.clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "fail-open after precheck timeout should send exactly one reply, got {sent:?}"
+        );
+        assert!(
+            sent[0].ends_with(":ok"),
+            "expected reply body 'ok' from main loop, got {:?}",
+            sent[0]
+        );
+        assert!(
+            total >= Duration::from_millis(900),
+            "process_channel_message returned in {total:?}; precheck timeout should have waited ~1s"
+        );
+        assert!(
+            total < Duration::from_secs(10),
+            "process_channel_message took {total:?}; should not have waited for the 60s slow precheck"
+        );
     }
 
     #[tokio::test]
