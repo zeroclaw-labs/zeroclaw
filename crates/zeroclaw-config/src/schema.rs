@@ -6560,6 +6560,9 @@ pub struct ChannelsConfig {
     #[cfg(feature = "voice-wake")]
     #[nested]
     pub voice_wake: Option<VoiceWakeConfig>,
+    /// Voice duplex configuration (full-duplex voice over WebSocket).
+    #[nested]
+    pub voice_duplex: Option<VoiceDuplexConfig>,
     /// MQTT channel configuration (SOP listener).
     #[nested]
     pub mqtt: Option<MqttConfig>,
@@ -6788,6 +6791,7 @@ impl Default for ChannelsConfig {
             voice_call: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
+            voice_duplex: None,
             mqtt: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
@@ -8608,6 +8612,19 @@ impl ChannelConfig for BlueskyConfig {
     fn desc() -> &'static str {
         "AT Protocol"
     }
+}
+
+/// Voice duplex configuration (`[channels.voice_duplex]`).
+///
+/// Enables full-duplex voice event handling over WebSocket.
+/// When disabled (default), voice events are rejected as unknown types.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct VoiceDuplexConfig {
+    /// Enable full-duplex voice event handling over WebSocket.
+    /// Default: false. When false, voice events are rejected as unknown types.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Voice wake word detection channel configuration.
@@ -11742,6 +11759,7 @@ auto_save = true
                 reddit: None,
                 bluesky: None,
                 voice_call: None,
+                voice_duplex: None,
                 #[cfg(feature = "voice-wake")]
                 voice_wake: None,
                 mqtt: None,
@@ -12878,6 +12896,7 @@ allowed_rooms = ["!ops:matrix.org"]
             reddit: None,
             bluesky: None,
             voice_call: None,
+            voice_duplex: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
@@ -13252,6 +13271,7 @@ bot_token = "xoxb-tok"
             reddit: None,
             bluesky: None,
             voice_call: None,
+            voice_duplex: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
