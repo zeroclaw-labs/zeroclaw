@@ -376,66 +376,69 @@ explicit provenance tag:
 - `incident_date_source = "none"` → no reliable signal; match by
   `verdict_date` or widen the time window
 
-### Applying the principle — three-tier signal priority
+### Applying the principle — 제1원칙 (primary rule)
 
-The ingester and graph query now surface three independent signals
-for picking the applicable statute version. They are listed in order
-of decreasing authority; a higher-tier signal's answer **overrides**
-lower-tier ones.
-
-**Tier 1 — `revision_cutoff` on the citation edge (최우선, 100% reliable)**
-
-When a judgment writes a citation as `구 {법}(YYYY. M. D. 법률 제N호로
-개정되기 전의 것) 제N조`, the date inside the parenthetical IS the
-revision boundary. The applicable law is unambiguously the version
-whose `effective_date ≤ cutoff - 1 day`. This is by Korean legal
-convention — every judgment that needs a pre-revision version MUST
-mark it this way in 적용법조 / 적용법령. No inference, no tolerance.
-
-Implementation:
-- `StatuteRef.revision_cutoff` (YYYYMMDD) populated by the citation
-  extractor via a window scan around each law anchor for the
-  `(… 개정되기 전의 것)` parenthetical.
-- Flows into `vault_links.context` prepended as `[pre:YYYYMMDD] {raw}`.
-- `Edge.revision_cutoff` surfaces in HTTP / snapshot / agent-tool
-  JSON, with the `[pre:…]` prefix stripped from the `evidence` field
-  for clean display.
-
-**Tier 2 — case `incident_date_earliest` (date-literal match)**
-
-No `구법` mark? Use the 행위시법 match:
+**제1원칙 (primary rule).** When a judgment's 적용법조 / 적용법령
+section names a law **without** the `구` prefix — i.e. plain
+`형법`, `민법`, `근로기준법`, `형사소송법` etc. — **the applicable
+version is the one in force at `verdict_date` (판결 선고 시점)**.
+This is the default; it covers the vast majority of citations.
 
 ```
-statute.effective_version :=
-    max(effective_date)
-    subject to effective_date ≤ case.incident_date_earliest
+plain law name in 적용법조
+   → applicable version := supplement whose
+         effective_date ≤ case.verdict_date
+         AND no later supplement precedes it
+   → 100% reliable (by Korean adjudication convention)
 ```
 
-This is standard range matching against `supplement.effective_date`.
+The judge has ALREADY decided whether to apply the current law
+(including any 형사 경한-개정 예외). Our job is just to honour that
+written decision. No incident-date-based inference, no range matching,
+no semantic comparison in the code path.
 
-**Tier 3 — `incident_date_source` fallback tolerance**
+**예외 — `구 {법}(…개정되기 전의 것)` citations.** The judge marked
+this specific citation as a pre-revision reference. Use Tier 1:
 
-- `"body"` → exact-day match (high confidence)
-- `"wonsim_offset"` → recommended tolerance ±6 months around the
-  stored `[YYYY0101, YYYY1231]` range, because the year is only
-  accurate to ±1 year of the 원심's filing year
-- `"own_case_year"` → same tolerance as wonsim_offset (1심 filing
-  usually 0-12 months after incident)
-- `"none"` → fall back to `verdict_date` or widen aggressively
+```
+citation prefixed with `구 {법}(YYYY. M. D. 법률 제N호로
+                                    개정되기 전의 것) 제N조`
+   → edge.revision_cutoff = YYYYMMDD  (populated by extractor)
+   → applicable version := supplement whose
+         effective_date ≤ cutoff − 1 day
+         AND no later supplement precedes it
+   → 100% reliable
+```
 
-### Not yet automated (current deferral)
+That's the entire applicable-law determination. Two branches, zero
+inference. `incident_date_*` fields are **not** inputs to this
+decision — they serve a different purpose (see next subsection).
 
-The three signals above are all **stored**. The ingester does not yet
-automatically:
+### Relationship to 형사 경한-개정 예외
 
-1. Pick the applicable version (would need version-aware statute
-   nodes like `statute::민법::839-2@20071221`).
-2. Compose Tier 1 overrides with Tier 2 ranges for mixed judgments.
+**Not a separate concern.** Per Korean adjudication convention, when
+the judgment decides that the newer (more lenient) law applies to a
+criminal matter, the 적용법조 section writes the plain current law
+name — which falls straight into Tier 2. When instead the pre-
+revision version applies (the case where no lenient-amendment kicked
+in), the 적용법조 section writes `구 {법}(…)` — Tier 1.
 
-A planned `legal_applicable_version(case_slug, statute_slug)` tool
-will run the three-tier decision. Today, agents should inspect
-`Edge.revision_cutoff` + case frontmatter dates and reason
-manually — all the data is there.
+The judge has already made the lenient-or-not judgment; we simply
+follow their formatting choice. No semantic comparison needed in the
+code.
+
+### Why incident_date_* fields still exist
+
+- `case.incident_date_earliest` / `incident_date_latest` /
+  `incident_date_source` let agents answer "when did the dispute
+  happen?" for timeline / narrative use cases.
+- They also support **non-applicable-law** temporal queries like
+  "show me all judgments whose incidents were in Q2 2024".
+- They are NOT inputs to the applicable-version picker.
+
+The `wonsim_offset` / `own_case_year` fallbacks discussed above remain
+useful when the body carries no date literal at all — but only for
+the "when" question, not the "which law version" question.
 
 ### The 형사사건 exception (유일한 예외)
 

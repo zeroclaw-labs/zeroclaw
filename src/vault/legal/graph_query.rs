@@ -645,6 +645,245 @@ fn fetch_edges_within(conn: &Connection, slugs: &[String]) -> Result<Vec<Edge>> 
     Ok(edges)
 }
 
+/// Applicable-version decision returned by [`pick_applicable_version`].
+/// Encodes the 제1원칙 / Tier 1 branch the decision took + the picked
+/// supplement slug + decision metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplicableVersion {
+    /// `"primary_verdict_date"` — plain citation, applied the law in
+    /// force at `verdict_date` (제1원칙).
+    /// `"revision_cutoff"` — citation was `구 {법}(... 개정되기 전의
+    /// 것)`, applied the version effective immediately BEFORE the
+    /// cutoff date.
+    /// `"fallback_latest"` — neither signal was usable (missing
+    /// verdict_date AND no cutoff); picked the newest ingested
+    /// supplement as a last resort.
+    /// `"none"` — no supplement nodes exist for this statute at all.
+    pub branch: String,
+    /// YYYYMMDD the decision was anchored to (verdict_date or cutoff).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_date: Option<String>,
+    /// The chosen supplement node's slug (if one was picked).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supplement_slug: Option<String>,
+    /// The chosen supplement's effective_date.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_date: Option<String>,
+    /// The chosen supplement's promulgation number (법률 제N호).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promulgation_no: Option<String>,
+    /// The promulgation date. Used by callers to distinguish adjacent
+    /// versions when the effective_date ties.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promulgation_date: Option<String>,
+    /// A short human-readable explanation of the decision.
+    pub explanation: String,
+}
+
+/// Given a `case` slug, the `statute_article` slug it cites, and the
+/// `revision_cutoff` for that specific edge (from `Edge.revision_cutoff`
+/// or extracted fresh), pick the applicable statute version using the
+/// 2-tier rule:
+///
+///   1. If `edge_cutoff` is `Some(YYYYMMDD)` → pick the supplement
+///      with the greatest `effective_date ≤ cutoff − 1 day`.
+///   2. Else → pick the supplement with the greatest
+///      `effective_date ≤ case.verdict_date`.
+///
+/// "Supplement with the greatest" is an index into `vault_documents`
+/// rows `doc_type='statute_supplement'` + `parent_law` frontmatter =
+/// this statute's law_name.
+///
+/// Returns `ApplicableVersion::branch = "none"` if the statute has no
+/// supplement nodes, or `"fallback_latest"` if both the cutoff and
+/// verdict_date are absent.
+pub fn pick_applicable_version(
+    conn: &Connection,
+    case_slug: &str,
+    statute_slug: &str,
+    edge_cutoff: Option<&str>,
+) -> Result<ApplicableVersion> {
+    // Work out which law this statute article belongs to — we look up
+    // the article's `law_name` frontmatter so we can list its
+    // supplements.
+    let article_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM vault_documents WHERE title = ?1
+               AND doc_type IN ('statute_article','statute_supplement')",
+            params![statute_slug],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok();
+    let Some(aid) = article_id else {
+        return Ok(ApplicableVersion {
+            branch: "none".to_string(),
+            anchor_date: None,
+            supplement_slug: None,
+            effective_date: None,
+            promulgation_no: None,
+            promulgation_date: None,
+            explanation: format!("statute article not found: {statute_slug}"),
+        });
+    };
+    let fm = load_frontmatter(conn, aid)?;
+    let law_name = match fm.get("law_name").or_else(|| fm.get("parent_law")) {
+        Some(n) => n.clone(),
+        None => {
+            return Ok(ApplicableVersion {
+                branch: "none".to_string(),
+                anchor_date: None,
+                supplement_slug: None,
+                effective_date: None,
+                promulgation_no: None,
+                promulgation_date: None,
+                explanation: format!("no law_name on {statute_slug}"),
+            });
+        }
+    };
+
+    // Fetch the case's verdict_date (Tier 2 anchor).
+    let verdict_date: Option<String> = conn
+        .query_row(
+            "SELECT vf.value FROM vault_frontmatter vf
+               JOIN vault_documents d ON d.id = vf.doc_id
+              WHERE d.title = ?1 AND vf.key = 'verdict_date'",
+            params![case_slug],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+
+    // Work out the anchor date + branch.
+    let (branch, anchor_date_owned) = match edge_cutoff {
+        Some(c) if c.len() == 8 => {
+            // Cutoff is exclusive — we want the last supplement effective
+            // BEFORE this date. Subtract one day.
+            let prev = previous_day_yyyymmdd(c).unwrap_or_else(|| c.to_string());
+            ("revision_cutoff", Some(prev))
+        }
+        _ => match verdict_date.as_ref() {
+            Some(vd) if vd.len() == 8 => ("primary_verdict_date", Some(vd.clone())),
+            _ => ("fallback_latest", None),
+        },
+    };
+
+    // Query supplements of this law, ordered newest-first by
+    // effective_date. For fallback_latest we just take the top row.
+    let supplements = list_supplements_of_law(conn, &law_name)?;
+
+    let picked = match &anchor_date_owned {
+        Some(anchor) => supplements
+            .iter()
+            .filter(|s| s.effective_date.as_deref().is_some_and(|d| d <= anchor.as_str()))
+            .max_by(|a, b| a.effective_date.cmp(&b.effective_date))
+            .cloned(),
+        None => supplements.into_iter().next(),
+    };
+
+    match picked {
+        Some(s) => Ok(ApplicableVersion {
+            branch: branch.to_string(),
+            anchor_date: anchor_date_owned.clone(),
+            supplement_slug: Some(s.slug),
+            effective_date: s.effective_date,
+            promulgation_no: s.promulgation_no,
+            promulgation_date: s.promulgation_date,
+            explanation: match branch {
+                "revision_cutoff" => format!(
+                    "구법 citation: applied version whose effective_date ≤ {}",
+                    anchor_date_owned.as_deref().unwrap_or("?")
+                ),
+                "primary_verdict_date" => format!(
+                    "제1원칙: plain citation, applied version in force at verdict_date {}",
+                    anchor_date_owned.as_deref().unwrap_or("?")
+                ),
+                _ => "fallback: no verdict_date, used newest supplement".to_string(),
+            },
+        }),
+        None => Ok(ApplicableVersion {
+            branch: "none".to_string(),
+            anchor_date: anchor_date_owned,
+            supplement_slug: None,
+            effective_date: None,
+            promulgation_no: None,
+            promulgation_date: None,
+            explanation: format!(
+                "no supplement for law `{law_name}` matches the anchor date"
+            ),
+        }),
+    }
+}
+
+/// Minimal shape returned by [`list_supplements_of_law`].
+#[derive(Debug, Clone)]
+struct SupplementRow {
+    slug: String,
+    effective_date: Option<String>,
+    promulgation_no: Option<String>,
+    promulgation_date: Option<String>,
+}
+
+fn list_supplements_of_law(conn: &Connection, law_name: &str) -> Result<Vec<SupplementRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.title,
+                MAX(CASE WHEN vf.key='effective_date'    THEN vf.value END) AS eff,
+                MAX(CASE WHEN vf.key='promulgation_no'   THEN vf.value END) AS pno,
+                MAX(CASE WHEN vf.key='promulgation_date' THEN vf.value END) AS pdate,
+                MAX(CASE WHEN vf.key='parent_law'        THEN vf.value END) AS parent
+           FROM vault_documents d
+           JOIN vault_frontmatter vf ON vf.doc_id = d.id
+          WHERE d.doc_type = 'statute_supplement'
+          GROUP BY d.id, d.title
+         HAVING parent = ?1
+          ORDER BY eff DESC NULLS LAST",
+    )?;
+    let rows = stmt.query_map(params![law_name], |r| {
+        Ok(SupplementRow {
+            slug: r.get(0)?,
+            effective_date: r.get::<_, Option<String>>(1)?,
+            promulgation_no: r.get::<_, Option<String>>(2)?,
+            promulgation_date: r.get::<_, Option<String>>(3)?,
+        })
+    })?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+fn previous_day_yyyymmdd(s: &str) -> Option<String> {
+    use chrono::NaiveDate;
+    if s.len() != 8 {
+        return None;
+    }
+    let y: i32 = s[..4].parse().ok()?;
+    let m: u32 = s[4..6].parse().ok()?;
+    let d: u32 = s[6..8].parse().ok()?;
+    let date = NaiveDate::from_ymd_opt(y, m, d)?;
+    let prev = date.pred_opt()?;
+    Some(format!(
+        "{:04}{:02}{:02}",
+        prev.year_naive(),
+        prev.month_naive(),
+        prev.day_naive()
+    ))
+}
+
+/// Helper to keep the `Datelike` trait method calls inline-friendly.
+trait NaiveDateExt {
+    fn year_naive(&self) -> i32;
+    fn month_naive(&self) -> u32;
+    fn day_naive(&self) -> u32;
+}
+impl NaiveDateExt for chrono::NaiveDate {
+    fn year_naive(&self) -> i32 {
+        <Self as chrono::Datelike>::year(self)
+    }
+    fn month_naive(&self) -> u32 {
+        <Self as chrono::Datelike>::month(self)
+    }
+    fn day_naive(&self) -> u32 {
+        <Self as chrono::Datelike>::day(self)
+    }
+}
+
 /// If `evidence` starts with `[pre:YYYYMMDD] `, split into
 /// `(Some(YYYYMMDD), remainder)`. Otherwise `(None, original)`.
 fn split_pre_marker(evidence: Option<String>) -> (Option<String>, Option<String>) {
@@ -951,5 +1190,122 @@ body
         let g = conn_a.lock();
         assert!(find_nodes(&g, "", 5).unwrap().is_empty());
         assert!(find_nodes(&g, "   ", 5).unwrap().is_empty());
+    }
+
+    /// Setup with multiple supplement nodes of the same law, so we can
+    /// test version-picking logic.
+    fn setup_with_multiple_supplements() -> Arc<Mutex<Connection>> {
+        let c = Connection::open_in_memory().unwrap();
+        init_schema(&c).unwrap();
+        let conn = Arc::new(Mutex::new(c));
+        let md = r#"# 근로기준법
+
+```json
+{
+  "meta": {"lsNm": "근로기준법", "ancYd": "20251001", "efYd": "20251001"},
+  "title": "근로기준법",
+  "articles": [
+    {"anchor": "J36:0", "number": "제36조(금품 청산)", "text": "제36조 14일 이내 지급."}
+  ],
+  "supplements": [
+    {"title": "부칙  <법률 제10339호, 2010. 6. 4.>", "body": "이 법은 공포 후 6개월이 경과한 날부터 시행한다."},
+    {"title": "부칙  <법률 제17326호, 2020. 5. 26.>", "body": "이 법은 공포한 날부터 시행한다."},
+    {"title": "부칙  <법률 제20520호, 2024. 10. 22.>", "body": "제1조(시행일) 이 법은 2025년 10월 1일부터 시행한다."}
+  ]
+}
+```
+"#;
+        let sdoc = extract_statute(md, "/x/20251001/근로기준법.md").unwrap();
+        ingest_statute(&conn, &sdoc).unwrap();
+
+        // Insert a fake case row with verdict_date = 2022-03-15.
+        {
+            let g = conn.lock();
+            g.execute(
+                "INSERT INTO vault_documents (uuid, title, content, source_type, source_device_id,
+                                               checksum, doc_type, char_count, created_at, updated_at)
+                 VALUES ('u1','case::2024노3424','body','local_file','local','c','case',5,1,1)",
+                [],
+            )
+            .unwrap();
+            let id: i64 = g
+                .query_row(
+                    "SELECT id FROM vault_documents WHERE title='case::2024노3424'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            g.execute(
+                "INSERT INTO vault_frontmatter (doc_id, key, value) VALUES (?1, 'verdict_date', '20220315')",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn picker_plain_citation_uses_verdict_date_제1원칙() {
+        let conn = setup_with_multiple_supplements();
+        let g = conn.lock();
+        let d = pick_applicable_version(&g, "case::2024노3424", "statute::근로기준법::36", None)
+            .unwrap();
+        assert_eq!(d.branch, "primary_verdict_date");
+        assert_eq!(d.anchor_date.as_deref(), Some("20220315"));
+        // Only the 2020-05-26 supplement has effective_date ≤ 2022-03-15.
+        // (2010-12-04 = 공포 + 6개월 is earlier; 2020-05-26 is later.)
+        assert_eq!(d.promulgation_no.as_deref(), Some("17326"));
+        assert_eq!(d.effective_date.as_deref(), Some("20200526"));
+    }
+
+    #[test]
+    fn picker_revision_cutoff_picks_version_before_cutoff_day() {
+        let conn = setup_with_multiple_supplements();
+        let g = conn.lock();
+        // Cutoff 2020-05-26 means "pre-revision" → effective on or before 2020-05-25.
+        let d = pick_applicable_version(
+            &g,
+            "case::2024노3424",
+            "statute::근로기준법::36",
+            Some("20200526"),
+        )
+        .unwrap();
+        assert_eq!(d.branch, "revision_cutoff");
+        assert_eq!(d.anchor_date.as_deref(), Some("20200525"));
+        // Only 2010-12-04 qualifies.
+        assert_eq!(d.promulgation_no.as_deref(), Some("10339"));
+    }
+
+    #[test]
+    fn picker_fallback_latest_when_verdict_date_missing() {
+        let conn = setup_with_multiple_supplements();
+        let g = conn.lock();
+        // Use a case without verdict_date.
+        {
+            let guard = &g;
+            guard
+                .execute(
+                    "INSERT INTO vault_documents (uuid, title, content, source_type, source_device_id,
+                                                   checksum, doc_type, char_count, created_at, updated_at)
+                     VALUES ('u2','case::noverdict','body','local_file','local','c2','case',5,1,1)",
+                    [],
+                )
+                .unwrap();
+        }
+        let d =
+            pick_applicable_version(&g, "case::noverdict", "statute::근로기준법::36", None).unwrap();
+        assert_eq!(d.branch, "fallback_latest");
+        // Newest supplement by effective_date is 2025-10-01 (법률 제20520호).
+        assert_eq!(d.promulgation_no.as_deref(), Some("20520"));
+    }
+
+    #[test]
+    fn picker_returns_none_for_missing_statute() {
+        let conn = setup_with_multiple_supplements();
+        let g = conn.lock();
+        let d = pick_applicable_version(&g, "case::2024노3424", "statute::없는법::1", None)
+            .unwrap();
+        assert_eq!(d.branch, "none");
+        assert!(d.supplement_slug.is_none());
     }
 }

@@ -14,7 +14,7 @@
 
 use super::traits::{Tool, ToolResult};
 use crate::vault::legal::graph_query::{
-    self, ArticleContent, Edge, FindHit, Node, NodeKind, Subgraph, MAX_NODES,
+    self, ApplicableVersion, ArticleContent, Edge, FindHit, Node, NodeKind, Subgraph, MAX_NODES,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -443,6 +443,93 @@ impl Tool for LegalReadArticleTool {
         Ok(ToolResult {
             success: true,
             output: out,
+            error: None,
+        })
+    }
+}
+
+// ───────── Applicable-version picker (2-tier 제1원칙) ─────────
+
+pub struct LegalApplicableVersionTool {
+    workspace_dir: Arc<PathBuf>,
+}
+
+impl LegalApplicableVersionTool {
+    pub fn new(workspace_dir: Arc<PathBuf>) -> Self {
+        Self { workspace_dir }
+    }
+}
+
+#[async_trait]
+impl Tool for LegalApplicableVersionTool {
+    fn name(&self) -> &str {
+        "legal_applicable_version"
+    }
+
+    fn description(&self) -> &str {
+        "Pick the applicable version of a Korean statute article for a given case, using the 2-tier 제1원칙: \
+(1) If the case's citation to this article had `구 {법}(... 개정되기 전의 것)` → apply the version effective immediately BEFORE the cutoff. \
+(2) Otherwise → apply the version in force at the case's verdict_date (판결 선고 시점). \
+Returns the chosen supplement slug, its effective_date / promulgation info, the anchor date used, and a short human explanation. `branch` = `primary_verdict_date` | `revision_cutoff` | `fallback_latest` | `none` tells you which rule fired."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "case_slug":    { "type": "string", "description": "e.g. `case::2024노3424`" },
+                "statute_slug": { "type": "string", "description": "e.g. `statute::근로기준법::36`" },
+                "edge_cutoff":  {
+                    "type": "string",
+                    "description": "Optional explicit revision cutoff (YYYYMMDD). If omitted, the tool looks up the citation edge in brain.db and uses its stored `revision_cutoff`. Pass explicitly when overriding or when the edge wasn't ingested."
+                }
+            },
+            "required": ["case_slug", "statute_slug"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolResult> {
+        let case_slug = arg_str(&args, "case_slug")?;
+        let statute_slug = arg_str(&args, "statute_slug")?;
+        let explicit_cutoff: Option<String> = args
+            .get("edge_cutoff")
+            .and_then(Value::as_str)
+            .filter(|s| s.len() == 8)
+            .map(str::to_string);
+        let workspace = self.workspace_dir.clone();
+
+        let decision = tokio::task::spawn_blocking(move || -> Result<ApplicableVersion> {
+            let conn = open_brain_db(&workspace)?;
+            // If the caller didn't supply an explicit cutoff, look the
+            // edge up in-database.
+            let cutoff: Option<String> = explicit_cutoff.or_else(|| {
+                conn.query_row(
+                    "SELECT vl.context FROM vault_links vl
+                       JOIN vault_documents src ON src.id = vl.source_doc_id
+                      WHERE src.title = ?1 AND vl.target_raw = ?2
+                      LIMIT 1",
+                    rusqlite::params![case_slug, statute_slug],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten()
+                .and_then(|ctx| {
+                    ctx.strip_prefix("[pre:").and_then(|rest| {
+                        rest.find("] ")
+                            .map(|end| rest[..end].to_string())
+                            .filter(|d| d.len() == 8 && d.chars().all(|c| c.is_ascii_digit()))
+                    })
+                })
+            });
+            graph_query::pick_applicable_version(&conn, &case_slug, &statute_slug, cutoff.as_deref())
+        })
+        .await
+        .context("applicable_version task join")??;
+
+        let payload = serde_json::to_string(&decision).context("serialising decision")?;
+        Ok(ToolResult {
+            success: true,
+            output: payload,
             error: None,
         })
     }
