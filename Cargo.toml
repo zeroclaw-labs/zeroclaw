@@ -164,6 +164,10 @@ panic = "abort"
 inherits = "release"
 codegen-units = 8
 
+[profile.ci]
+inherits = "dev"
+opt-level = 1
+
 [dev-dependencies]
 tempfile = "3.26"
 wiremock = "0.6"
