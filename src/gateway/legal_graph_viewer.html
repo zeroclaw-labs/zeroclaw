@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MoA Legal Graph</title>
+<script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+<script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+<script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+<style>
+  :root{--bg:#0f1115;--fg:#e7e9ee;--muted:#8b93a6;--pane:#181b22;--accent:#4ea1ff;--warn:#f5a524;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 -apple-system,"Segoe UI","Apple SD Gothic Neo",sans-serif;}
+  #app{display:grid;grid-template-rows:auto 1fr;height:100vh}
+  header{padding:10px 14px;background:var(--pane);border-bottom:1px solid #2a2f3a;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  header h1{margin:0;font-size:14px;color:var(--muted);font-weight:600;letter-spacing:.5px}
+  header input[type=text],header select,header input[type=number]{background:#0c0e13;color:var(--fg);border:1px solid #2a2f3a;border-radius:6px;padding:6px 8px;font-size:13px}
+  header input[type=text]{min-width:320px}
+  header button{background:var(--accent);color:#0a0c11;border:0;border-radius:6px;padding:6px 12px;font-weight:600;cursor:pointer}
+  header button.secondary{background:transparent;color:var(--fg);border:1px solid #2a2f3a}
+  header label{color:var(--muted);font-size:12px}
+  main{display:grid;grid-template-columns:1fr 340px;overflow:hidden}
+  #cy{background:#0c0e13}
+  #side{background:var(--pane);border-left:1px solid #2a2f3a;padding:12px;overflow:auto}
+  #side h2{margin:0 0 8px;font-size:13px;color:var(--muted);font-weight:600}
+  #side .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;font-size:12px;margin:6px 0 14px}
+  #side .kv dt{color:var(--muted)}
+  #side .kv dd{margin:0;word-break:break-all}
+  #side .edge{font-size:12px;padding:6px 8px;margin:4px 0;background:#0c0e13;border-radius:6px}
+  #stats{font-size:12px;color:var(--muted);padding:6px 0}
+  #err{background:#3a1c1c;color:#ffbaba;padding:8px 12px;border-radius:6px;margin:6px 14px;display:none}
+  .badge{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;margin-right:4px}
+  .badge.S{background:#3d5a8a;color:#fff}
+  .badge.C{background:#705236;color:#fff}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>MoA · LEGAL GRAPH</h1>
+    <input id="node" type="text" placeholder="statute::근로기준법::36 또는 case::2024노3424" />
+    <label>depth <input id="depth" type="number" min="1" max="3" value="1" style="width:52px"></label>
+    <label>kinds
+      <select id="kinds">
+        <option value="">all</option>
+        <option value="statute">statute only</option>
+        <option value="case">case only</option>
+      </select>
+    </label>
+    <button id="go">Load</button>
+    <button id="export" class="secondary" title="Export current view as graphify-compatible JSON">Export JSON</button>
+    <span id="stats"></span>
+  </header>
+  <div id="err"></div>
+  <main>
+    <div id="cy"></div>
+    <aside id="side">
+      <h2>Selected</h2>
+      <div id="detail"><em style="color:var(--muted)">Click a node to inspect. Double-click to expand neighbors.</em></div>
+    </aside>
+  </main>
+</div>
+<script>
+const $ = (s) => document.querySelector(s);
+const cy = cytoscape({
+  container: $('#cy'),
+  wheelSensitivity: 0.2,
+  style: [
+    { selector: 'node', style: {
+        'label': 'data(label)',
+        'background-color': '#2a2f3a',
+        'color': '#e7e9ee',
+        'font-size': 10,
+        'text-valign': 'center',
+        'text-halign': 'center',
+        'text-wrap': 'wrap',
+        'text-max-width': 120,
+        'width': 'label',
+        'height': 'label',
+        'padding': '8px',
+        'shape': 'round-rectangle',
+        'border-width': 1,
+        'border-color': '#3a4050',
+    }},
+    { selector: 'node[kind = "statute"]', style: { 'background-color': '#2a3a5a', 'border-color': '#4060a0' }},
+    { selector: 'node[kind = "case"]',    style: { 'background-color': '#4a3620', 'border-color': '#8a6030' }},
+    { selector: 'node:selected', style: { 'border-width': 3, 'border-color': '#4ea1ff' }},
+    { selector: 'edge', style: {
+        'width': 1.4,
+        'line-color': '#3a4050',
+        'target-arrow-color': '#3a4050',
+        'target-arrow-shape': 'triangle',
+        'curve-style': 'bezier',
+        'label': 'data(relation)',
+        'font-size': 8,
+        'color': '#8b93a6',
+        'text-rotation': 'autorotate',
+        'text-margin-y': -4,
+    }},
+    { selector: 'edge[resolved = false]', style: { 'line-style': 'dashed', 'line-color': '#553b1a' }},
+  ]
+});
+
+let lastSubgraph = { nodes: [], edges: [] };
+
+function showErr(msg) {
+  const el = $('#err');
+  if (msg) { el.textContent = msg; el.style.display = 'block'; }
+  else { el.style.display = 'none'; }
+}
+
+async function load(node, depth, kinds) {
+  showErr('');
+  const params = new URLSearchParams({ node, depth });
+  if (kinds) params.set('kinds', kinds);
+  const res = await fetch('/api/legal/graph/subgraph?' + params.toString());
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    showErr('HTTP ' + res.status + ' — ' + (body.error || 'unknown error'));
+    return;
+  }
+  const sg = await res.json();
+  lastSubgraph = sg;
+  render(sg);
+  $('#stats').textContent = `nodes ${sg.nodes.length} · edges ${sg.edges.length}${sg.truncated ? ' · TRUNCATED' : ''}`;
+}
+
+function render(sg) {
+  cy.elements().remove();
+  cy.add(sg.nodes.map(n => ({
+    data: { id: n.slug, label: shortLabel(n), kind: n.kind, raw: n }
+  })));
+  cy.add(sg.edges.map(e => ({
+    data: { id: `${e.source_slug}|${e.target_slug}|${e.relation}`, source: e.source_slug, target: e.target_slug, relation: e.relation, resolved: e.resolved, raw: e }
+  })).filter(e => cy.getElementById(e.data.source).length && cy.getElementById(e.data.target).length));
+  cy.layout({ name: 'dagre', rankDir: 'LR', nodeSep: 18, rankSep: 60 }).run();
+}
+
+function shortLabel(n) {
+  if (n.kind === 'statute') {
+    const law = n.law_name || '';
+    const ak = n.article_key || '';
+    const kw = n.article_title_kw ? `\n(${n.article_title_kw})` : '';
+    return law ? `${law} 제${ak.replace('-','조의')}조${kw}` : n.slug;
+  }
+  const name = n.case_name ? `\n${n.case_name}` : '';
+  return (n.case_number || n.slug) + name;
+}
+
+cy.on('tap', 'node', (evt) => {
+  const raw = evt.target.data('raw');
+  const kind = raw.kind === 'statute' ? 'S' : 'C';
+  const rows = [];
+  const add = (k, v) => v && rows.push(`<dt>${k}</dt><dd>${escapeHtml(v)}</dd>`);
+  add('slug', raw.slug);
+  add('label', raw.label);
+  if (raw.kind === 'statute') {
+    add('법령명', raw.law_name);
+    add('조항', raw.article_key);
+    add('소제목', raw.article_title_kw);
+  } else {
+    add('사건번호', raw.case_number);
+    add('사건명', raw.case_name);
+    add('법원', raw.court_name);
+    add('선고일', raw.verdict_date);
+  }
+  const id = evt.target.id();
+  const edgeBlocks = lastSubgraph.edges
+    .filter(e => e.source_slug === id || e.target_slug === id)
+    .slice(0, 20)
+    .map(e => `<div class="edge"><b>${e.relation}</b> · ${escapeHtml(e.source_slug)} → ${escapeHtml(e.target_slug)}${e.evidence ? '<br/><span style="color:var(--muted)">' + escapeHtml(e.evidence) + '</span>' : ''}</div>`)
+    .join('');
+  $('#detail').innerHTML = `
+    <div><span class="badge ${kind}">${raw.kind}</span><b>${escapeHtml(raw.label)}</b></div>
+    <dl class="kv">${rows.join('')}</dl>
+    <h2>Edges touching this node</h2>
+    ${edgeBlocks || '<em style="color:var(--muted)">(none in current view)</em>'}
+  `;
+});
+
+cy.on('dblclick', 'node', (evt) => {
+  const slug = evt.target.id();
+  $('#node').value = slug;
+  go();
+});
+
+function go() {
+  const node = $('#node').value.trim();
+  const depth = Math.max(1, Math.min(3, parseInt($('#depth').value) || 1));
+  const kinds = $('#kinds').value;
+  if (!node) { showErr('node slug required'); return; }
+  load(node, depth, kinds);
+}
+
+$('#go').addEventListener('click', go);
+$('#node').addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+$('#export').addEventListener('click', () => {
+  const blob = new Blob([JSON.stringify(lastSubgraph, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'legal-graph-subgraph.json';
+  a.click();
+});
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+
+// Bootstrap. Priority:
+//   1. If a <script id="__prebundled_subgraph__" type="application/json">
+//      tag is present (static HTML export from `vault legal export`),
+//      render it immediately — no network needed.
+//   2. Else if the URL has ?node=..., auto-load via the live API.
+//   3. Else show gateway stats.
+(() => {
+  const prebundled = document.getElementById('__prebundled_subgraph__');
+  if (prebundled) {
+    try {
+      const sg = JSON.parse(prebundled.textContent);
+      const meta = sg.__meta || {};
+      lastSubgraph = sg;
+      render(sg);
+      if (meta.root) $('#node').value = meta.root;
+      if (meta.depth) $('#depth').value = meta.depth;
+      $('#stats').textContent = `snapshot · nodes ${sg.nodes.length} · edges ${sg.edges.length}${meta.exported_at ? ' · ' + meta.exported_at : ''}`;
+      return;
+    } catch (e) {
+      showErr('malformed prebundled subgraph: ' + e.message);
+    }
+  }
+  const p = new URLSearchParams(location.search);
+  const node = p.get('node');
+  if (node) {
+    $('#node').value = node;
+    if (p.get('depth')) $('#depth').value = p.get('depth');
+    if (p.get('kinds')) $('#kinds').value = p.get('kinds');
+    go();
+  } else {
+    fetch('/api/legal/graph/stats').then(r => r.json()).then(s => {
+      $('#stats').textContent = `ready · ${s.statute_articles} statute · ${s.cases} case · ${s.edges} edges`;
+    }).catch(() => {});
+  }
+})();
+</script>
+</body>
+</html>

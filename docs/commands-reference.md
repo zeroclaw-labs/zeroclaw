@@ -29,6 +29,7 @@ Last verified: **February 28, 2026**.
 | `completions` | Generate shell completion scripts to stdout |
 | `hardware` | Discover and introspect USB hardware |
 | `peripheral` | Configure and flash peripherals |
+| `vault` | Second-brain (knowledge) store — currently the legal-domain graph |
 
 ## Command Groups
 
@@ -333,6 +334,48 @@ Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injec
 - `zeroclaw hardware info [--chip <chip_name>]`
 
 ### `peripheral`
+
+### `vault`
+
+Second-brain vault operations. Currently exposes a Korean legal-graph
+ingest/query pipeline over `vault_documents` + `vault_links` in
+`<workspace>/memory/brain.db`. Walks markdown folders, extracts
+statute/case citations with deterministic regex (no LLM in the write
+path), and upserts them as a queryable graph. See
+[reference/vault-legal-graph.md](reference/vault-legal-graph.md) for the
+full pipeline.
+
+- `zeroclaw vault legal ingest <path>`
+- `zeroclaw vault legal ingest <path> --dry-run`
+- `zeroclaw vault legal stats`
+- `zeroclaw vault legal export --root <slug> --depth <1-3> --out <file>`
+- `zeroclaw vault legal export --root <slug> --depth 2 --kinds statute,case --out graph.html`
+- `zeroclaw vault legal export --root <slug> --depth 2 --out subgraph.json --format json`
+
+Node slug conventions (canonical form used in `--root` and the agent tools):
+
+- Statute article: `statute::{법령명}::{N}[-M]` e.g. `statute::근로기준법::43-2`
+- Case: `case::{사건번호}` e.g. `case::2024노3424`
+
+The ingester also creates `vault_aliases` rows for common short forms
+(`근기법 제43조의2`, `민소법 제256조`, `民法 제750조` etc.), so agent
+and HTTP lookup endpoints can resolve human-readable citations.
+
+Gateway endpoints (when `zeroclaw gateway` is running):
+
+- `GET /api/legal/graph/subgraph?node=<slug>&depth=<N>&kinds=statute,case`
+- `GET /api/legal/graph/path?from=<slug>&to=<slug>&max_depth=<N>`
+- `GET /api/legal/graph/stats`
+- `GET /legal-graph/viewer` — embedded Cytoscape.js viewer
+- `GET /legal-graph/viewer?node=<slug>&depth=<N>` — deep-link
+
+Agent tools (registered in the default tool registry):
+
+- `legal_graph_find` — resolve `"민법 제839조의2"` → `statute::민법::839-2`
+- `legal_graph_neighbors` — n-hop subgraph around a node (both directions)
+- `legal_graph_shortest_path` — citation chain between two nodes
+- `legal_graph_subgraph` — graphify-compatible JSON dump
+- `legal_read_article` — fetch full 조문 body / 판결요지 / 참조조문 sections
 
 - `zeroclaw peripheral list`
 - `zeroclaw peripheral add <board> <path>`

@@ -41,6 +41,7 @@ Last refreshed: **February 28, 2026**.
 
 - [reference/README.md](reference/README.md)
 - [commands-reference.md](commands-reference.md)
+- [reference/vault-legal-graph.md](reference/vault-legal-graph.md)
 - [cron-scheduling.md](cron-scheduling.md)
 - [providers-reference.md](providers-reference.md)
 - [channels-reference.md](channels-reference.md)

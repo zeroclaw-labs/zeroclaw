@@ -151,6 +151,11 @@ sysinfo = { version = "0.34", default-features = false, features = ["system"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "nip59"] }
+# Character-encoding auto-detection for legal-markdown ingestion.
+# Older Korean legal corpora are frequently shipped as CP949 / EUC-KR;
+# `encoding_rs` (Mozilla, WHATWG-compliant) lets `vault legal ingest`
+# accept them without requiring the operator to pre-convert to UTF-8.
+encoding_rs = "0.8"
 regex = "1.10"
 hostname = "0.4.2"
 rustls = "0.23"

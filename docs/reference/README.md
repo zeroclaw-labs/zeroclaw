@@ -8,6 +8,7 @@ Structured reference index for commands, providers, channels, config, and integr
 - Provider IDs / aliases / env vars: [../providers-reference.md](../providers-reference.md)
 - Channel setup + allowlists: [../channels-reference.md](../channels-reference.md)
 - Config defaults and keys: [../config-reference.md](../config-reference.md)
+- Second-brain legal graph (Korean statute + case ingestion, agent tools, HTTP viewer, snapshot): [vault-legal-graph.md](vault-legal-graph.md)
 
 ## Provider & Integration Extensions
 

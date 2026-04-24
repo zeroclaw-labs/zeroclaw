@@ -405,6 +405,78 @@ pub enum MemoryCommands {
     },
 }
 
+/// Vault (second brain) subcommands.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VaultCommands {
+    /// Legal-domain operations (statute + precedent ingestion, graph stats).
+    Legal {
+        #[command(subcommand)]
+        legal_command: VaultLegalCommands,
+    },
+}
+
+/// `zeroclaw vault legal <subcommand>` — ingest Korean statute + precedent
+/// markdown into the second-brain graph (vault_documents + vault_links).
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VaultLegalCommands {
+    /// Walk a directory of .md files, classify each as statute or case, and upsert.
+    ///
+    /// Safe to re-run — checksum short-circuits unchanged files.
+    Ingest {
+        /// Path to a directory (recursively walked) or a single .md file.
+        path: std::path::PathBuf,
+        /// Parse + report without touching brain.db (in-memory DB).
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show legal-graph node/edge counts in brain.db.
+    Stats,
+    /// Populate `vault_embeddings` for every legal node that doesn't yet
+    /// have one. Uses the `memory.embedding_provider/model/dimensions`
+    /// config plus the resolved API key. Safe to re-run.
+    Embed {
+        /// Cap the number of docs embedded in a single run (default: all).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Batch size for the provider's `embed()` call (default 8, max 32).
+        #[arg(long, default_value = "8")]
+        batch: usize,
+    },
+    /// Export a subgraph rooted at a slug to a standalone HTML snapshot
+    /// (Cytoscape viewer with data embedded) or graphify-compatible JSON.
+    Export {
+        /// Root slug (e.g. `statute::근로기준법::36` or `case::2024노3424`).
+        #[arg(long)]
+        root: String,
+        /// Hop limit (1–3).
+        #[arg(long, default_value = "2")]
+        depth: u32,
+        /// Comma-separated kinds filter (`statute,case`). Omit for both.
+        #[arg(long)]
+        kinds: Option<String>,
+        /// Output file path.
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Output format. `html` = self-contained viewer (default); `json` =
+        /// raw `{nodes, edges, __meta}`, also graphify-compatible.
+        #[arg(long, default_value = "html")]
+        format: String,
+        /// Inline the Cytoscape + dagre JS from the local vendor cache so
+        /// the output HTML renders with no CDN calls. Requires a prior
+        /// `vault legal vendor-download`. Ignored for `--format json`.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Download Cytoscape.js + dagre + cytoscape-dagre into the workspace
+    /// vendor cache so `export --offline` and the gateway can serve them
+    /// without CDN calls. Safe to re-run.
+    VendorDownload {
+        /// Re-download even if the files already exist.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
 /// Integration subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum IntegrationCommands {

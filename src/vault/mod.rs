@@ -12,6 +12,7 @@ pub mod converter;
 pub mod health;
 pub mod hub;
 pub mod ingest;
+pub mod legal;
 pub mod llm_engine;
 pub mod normalize;
 pub mod schema;

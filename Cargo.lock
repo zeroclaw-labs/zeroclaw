@@ -10779,6 +10779,7 @@ dependencies = [
  "cron",
  "dialoguer",
  "directories",
+ "encoding_rs",
  "fantoccini",
  "fastembed",
  "futures-util",
