@@ -13042,6 +13042,8 @@ dependencies = [
  "aardvark-sys",
  "anyhow",
  "async-trait",
+ "console",
+ "dialoguer",
  "directories",
  "glob",
  "nusb",
