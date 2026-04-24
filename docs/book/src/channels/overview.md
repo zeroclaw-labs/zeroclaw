@@ -58,8 +58,9 @@ See [Voice & telephony](./voice.md).
 | Webhook | (always on with gateway) | Inbound HTTP → agent |
 | CLI | always on | Local stdin/stdout |
 | Gateway REST/WS | always on | HTTP + WebSocket |
+| ACP (Agent Client Protocol) | (always on with runtime) | JSON-RPC 2.0 over stdio — editor/IDE sessions |
 
-See [Webhooks](./webhook.md).
+See [Webhooks](./webhook.md) and [ACP](./acp.md).
 
 ## Configuration
 

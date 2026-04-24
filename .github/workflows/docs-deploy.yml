@@ -30,7 +30,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  MDBOOK_VERSION: v0.5.2
+  # Pinned to 0.5.0 to match the mdbook-mermaid 0.17.0 compile target —
+  # avoids "preprocessor was built against 0.5.0, called from 0.5.2" warning.
+  # Revisit when mdbook-mermaid ships against the latest mdbook minor.
+  MDBOOK_VERSION: v0.5.0
 
 jobs:
   deploy:

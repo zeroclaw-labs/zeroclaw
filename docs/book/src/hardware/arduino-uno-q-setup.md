@@ -175,7 +175,7 @@ Now when you message your Telegram bot *"Turn on the LED"* or *"Set pin 13 high"
 | 5 | `git clone https://github.com/zeroclaw-labs/zeroclaw.git && cd zeroclaw` |
 | 6 | `cargo build --release --features hardware` |
 | 7 | `zeroclaw onboard --api-key KEY --provider openrouter` |
-| 8 | Edit `~/.zeroclaw/config.toml` (add Telegram bot_token) |
+| 8 | `zeroclaw config set channels.telegram.bot-token <TOKEN>` |
 | 9 | `zeroclaw daemon --host 127.0.0.1 --port 42617` |
 | 10 | Message your Telegram bot — it responds |
 

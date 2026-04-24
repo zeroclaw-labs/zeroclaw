@@ -50,12 +50,12 @@
 - [Email](./channels/email.md)
 - [Voice & telephony](./channels/voice.md)
 - [Webhooks](./channels/webhook.md)
+- [ACP (Agent Client Protocol)](./channels/acp.md)
 
 # Tools
 
 - [Overview](./tools/overview.md)
 - [MCP (Model Context Protocol)](./tools/mcp.md)
-- [ACP (Agent Client Protocol)](./tools/acp.md)
 - [Browser automation](./tools/browser.md)
 
 # Security

@@ -24,7 +24,7 @@ Key behaviors:
 
 ### 2.1 Configuration
 
-Configure broker access under `[channels.mqtt]` in `config.toml` — see the [Config reference](../reference/config.md). The `use_tls` flag must match the scheme of `broker_url` (`mqtts://` ⇒ `true`, `mqtt://` ⇒ `false`).
+Configure broker access with `zeroclaw config set channels.mqtt.<field> <value>` — the keys land under `[channels.mqtt]` in the stored config. See the [Config reference](../reference/config.md) for all fields. The `use_tls` flag must match the scheme of `broker_url` (`mqtts://` ⇒ `true`, `mqtt://` ⇒ `false`).
 
 ### 2.2 Trigger Definition
 

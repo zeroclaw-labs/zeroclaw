@@ -15,7 +15,7 @@ ZeroClaw can read chip info from the Nucleo over USB **without flashing any firm
 
 The agent uses the `hardware_board_info` tool to return chip name, architecture, and memory map. With the `probe` feature, it reads live data via USB/SWD; otherwise it returns static datasheet info.
 
-**Config:** Add Nucleo to `config.toml` first under `[[peripherals.boards]]` (`board = "nucleo-f401re"`, `transport = "serial"`, your serial `path`). See the [Config reference](../reference/config.md) for all fields.
+**Config:** Run `zeroclaw onboard` (hardware step adds the board interactively), or use `zeroclaw config set peripherals.boards.0.board nucleo-f401re`, `transport serial`, and `path <your-serial-port>`. See the [Config reference](../reference/config.md) for all fields.
 
 **CLI alternative:**
 
@@ -114,7 +114,7 @@ Pin 13 = PA5 = User LED (LD2) on Nucleo-F401RE.
 | 1 | Connect Nucleo via USB |
 | 2 | `cargo install probe-rs-tools --locked` |
 | 3 | `zeroclaw peripheral flash-nucleo` |
-| 4 | Add Nucleo to config.toml (path = your serial port) |
+| 4 | `zeroclaw onboard` → hardware step (or `zeroclaw config set peripherals.boards.0.path <serial-port>`) |
 | 5 | `zeroclaw daemon` or `zeroclaw agent -m "Turn on LED"` |
 
 ---

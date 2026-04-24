@@ -229,7 +229,7 @@ Simple JSON over serial for boards without gRPC support:
 - [x] Retrieve-and-inject into LLM context on hardware-related queries
 - [x] Board-specific prompt augmentation
 
-**Usage:** Add `datasheet_dir = "docs/datasheets"` to `[peripherals]` in config.toml. Place `.md` or `.txt` files named by board (e.g. `nucleo-f401re.md`, `rpi-gpio.md`). Files in `_generic/` or named `generic.md` apply to all boards. Chunks are retrieved by keyword match and injected into the user message context.
+**Usage:** `zeroclaw config set peripherals.datasheet-dir docs/datasheets`. Place `.md` or `.txt` files named by board (e.g. `nucleo-f401re.md`, `rpi-gpio.md`). Files in `_generic/` or named `generic.md` apply to all boards. Chunks are retrieved by keyword match and injected into the user message context.
 
 ### Phase 5: Edge-Native — RPi ✅ (Done)
 

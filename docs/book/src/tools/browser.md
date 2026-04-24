@@ -27,7 +27,14 @@ agent-browser install              # macOS/Windows
 
 ### 2. Verify ZeroClaw Config
 
-The browser tool is enabled by default with `allowed_domains = ["*"]`. To restrict domains or disable it, edit the `[browser]` section of `~/.zeroclaw/config.toml`. See the [Config reference](../reference/config.md) for all fields and defaults.
+The browser tool is enabled by default with `allowed_domains = ["*"]`. Restrict domains or disable it via `zeroclaw config set`:
+
+```bash
+zeroclaw config set browser.allowed-domains '["example.com", "docs.example.com"]'
+zeroclaw config set browser.enabled false
+```
+
+See the [Config reference](../reference/config.md) for all browser fields and defaults.
 
 ### 3. Test
 

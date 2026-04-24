@@ -118,6 +118,6 @@ In `Full` (or YOLO) mode, tool calls execute without approval.
 
 ## See also
 
-- [Tools → Overview](./overview.md)
-- [MCP](./mcp.md) — the "tool provider" direction (clients providing tools to the agent), ACP is the inverse (clients driving the agent)
+- [Channels → Overview](./overview.md)
+- [Tools → MCP](../tools/mcp.md) — the "tool provider" direction (clients providing tools to the agent); ACP is the inverse (clients driving the agent)
 - [Security → Overview](../security/overview.md)
