@@ -18,6 +18,7 @@ ARG ZEROCLAW_CARGO_FEATURES="channel-lark,whatsapp-web"
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y \
+        busybox-static \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
@@ -69,6 +70,10 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     strip /app/zeroclaw
 RUN size=$(stat -c%s /app/zeroclaw) && \
     if [ "$size" -lt 1000000 ]; then echo "ERROR: binary too small (${size} bytes), likely dummy build artifact" && exit 1; fi
+
+# Distroless release keeps no shell/coreutils on PATH. Agent-orchestrator
+# execs a fixed minimal toolbox contract for file ops from this path.
+RUN install -D /bin/busybox /busybox/busybox
 
 # Prepare runtime directory structure and default config inline (no extra stage)
 RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
@@ -134,6 +139,7 @@ CMD ["daemon"]
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
+COPY --from=builder /busybox /busybox
 COPY --from=builder /zeroclaw-data /zeroclaw-data
 
 # Environment setup
