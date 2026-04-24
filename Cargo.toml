@@ -153,16 +153,6 @@ check-cfg = [
     'cfg(feature, values("channel-nostr", "createos", "memory-postgres", "rag-pdf"))',
 ]
 
-# Pre-existing style lints that were hidden by prior compilation failures.
-# These do not affect correctness; allow them until a dedicated cleanup pass.
-[lints.clippy]
-unnecessary_sort_by = "allow"
-useless_conversion = "allow"
-duration_suboptimal_units = "allow"
-while_let_loop = "allow"
-manual_is_variant_and = "allow"
-collapsible_match = "allow"
-
 [profile.release]
 opt-level = "z"
 lto = "fat"

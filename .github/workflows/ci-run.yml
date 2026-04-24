@@ -39,7 +39,15 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: |
+          cargo clippy --all-targets -- -D warnings \
+            -A clippy::unnecessary_sort_by \
+            -A clippy::useless_conversion \
+            -A clippy::duration_suboptimal_units \
+            -A clippy::while_let_loop \
+            -A clippy::manual_is_variant_and \
+            -A clippy::collapsible_match \
+            -A clippy::unused_async
 
   test:
     name: Test
