@@ -728,12 +728,15 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 /// Map tool name aliases from various LLM providers to ZeroClaw tool names.
 /// This handles variations like "fileread" -> "file_read", "bash" -> "shell", etc.
 fn map_tool_name_alias(tool_name: &str) -> &str {
-    // Strip Gemini-style namespace prefixes like `default_api.<name>` or `tools.<name>`.
-    // Why: OpenRouter-routed Gemini models emit function names as `default_api.foo`,
-    // which otherwise fails dispatch as "Unknown tool".
+    // Strip any dotted namespace prefix (keep only the final segment).
+    // Covers Gemini-emitted `default_api.<name>` and `tools.<name>`, plus
+    // MCP-server-name prefixes like `google_workspace.search_gmail_messages`
+    // that Gemini-via-OpenRouter also emits when the tool originates from
+    // an MCP server. The registry is indexed by bare tool name, so we
+    // normalize by taking the last segment.
     let tool_name = tool_name
-        .strip_prefix("default_api.")
-        .or_else(|| tool_name.strip_prefix("tools."))
+        .rsplit_once('.')
+        .map(|(_, suffix)| suffix)
         .unwrap_or(tool_name);
     match tool_name {
         // Shell variations (including GLM aliases that map to shell)
@@ -2855,6 +2858,30 @@ Let me check the result."#;
             map_tool_name_alias("totally_unknown_tool"),
             "totally_unknown_tool"
         );
+    }
+
+    #[test]
+    fn map_tool_name_alias_strips_dotted_namespaces() {
+        // Gemini-style static prefixes still work.
+        assert_eq!(map_tool_name_alias("default_api.file_read"), "file_read");
+        assert_eq!(map_tool_name_alias("tools.shell"), "shell");
+
+        // MCP-server-name prefixes (Gemini-via-OpenRouter also emits these
+        // when the tool originates from an MCP server; the registry is
+        // indexed by bare tool name, so we must strip them too).
+        assert_eq!(
+            map_tool_name_alias("google_workspace.search_gmail_messages"),
+            "search_gmail_messages"
+        );
+
+        // Only the final segment is kept even with multiple dots.
+        assert_eq!(map_tool_name_alias("a.b.c.final"), "final");
+
+        // Stripped segment still runs through the alias table.
+        assert_eq!(map_tool_name_alias("default_api.bash"), "shell");
+
+        // Names without any dot are unaffected.
+        assert_eq!(map_tool_name_alias("file_read"), "file_read");
     }
 
     #[test]
