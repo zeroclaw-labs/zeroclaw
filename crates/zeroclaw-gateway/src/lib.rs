@@ -22,6 +22,8 @@ pub mod session_queue;
 pub mod sse;
 pub mod static_files;
 pub mod tls;
+#[cfg(feature = "gateway-voice-duplex")]
+pub mod voice_duplex;
 pub mod ws;
 
 use anyhow::{Context, Result};

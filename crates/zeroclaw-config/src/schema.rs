@@ -6560,6 +6560,9 @@ pub struct ChannelsConfig {
     #[cfg(feature = "voice-wake")]
     #[nested]
     pub voice_wake: Option<VoiceWakeConfig>,
+    /// Voice duplex configuration (full-duplex voice over WebSocket).
+    #[nested]
+    pub voice_duplex: Option<VoiceDuplexConfig>,
     /// MQTT channel configuration (SOP listener).
     #[nested]
     pub mqtt: Option<MqttConfig>,
@@ -6788,6 +6791,7 @@ impl Default for ChannelsConfig {
             voice_call: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
+            voice_duplex: None,
             mqtt: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
@@ -8608,6 +8612,50 @@ impl ChannelConfig for BlueskyConfig {
     fn desc() -> &'static str {
         "AT Protocol"
     }
+}
+
+/// Voice duplex configuration (`[channels.voice_duplex]`).
+///
+/// Enables full-duplex voice event handling over WebSocket.
+/// When disabled (default), voice events are rejected as unknown types.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct VoiceDuplexConfig {
+    /// Enable full-duplex voice event handling over WebSocket.
+    /// Default: false. When false, voice events are rejected as unknown types.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// RMS energy threshold for the energy-based VAD.
+    /// Audio chunks with RMS energy above this value are considered speech.
+    /// Default: 0.01. Range: (0.0, 1.0].
+    #[serde(default = "default_vad_energy_threshold")]
+    pub vad_energy_threshold: f32,
+
+    /// Silence duration in milliseconds before the VAD declares speech has ended.
+    /// After this many milliseconds of continuous sub-threshold audio,
+    /// a `SpeechEnd` event is emitted.
+    /// Default: 500.
+    #[serde(default = "default_vad_silence_timeout_ms")]
+    pub vad_silence_timeout_ms: u32,
+}
+
+impl Default for VoiceDuplexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            vad_energy_threshold: default_vad_energy_threshold(),
+            vad_silence_timeout_ms: default_vad_silence_timeout_ms(),
+        }
+    }
+}
+
+fn default_vad_energy_threshold() -> f32 {
+    0.01
+}
+
+fn default_vad_silence_timeout_ms() -> u32 {
+    500
 }
 
 /// Voice wake word detection channel configuration.
@@ -11742,6 +11790,7 @@ auto_save = true
                 reddit: None,
                 bluesky: None,
                 voice_call: None,
+                voice_duplex: None,
                 #[cfg(feature = "voice-wake")]
                 voice_wake: None,
                 mqtt: None,
@@ -12878,6 +12927,7 @@ allowed_rooms = ["!ops:matrix.org"]
             reddit: None,
             bluesky: None,
             voice_call: None,
+            voice_duplex: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
@@ -13252,6 +13302,7 @@ bot_token = "xoxb-tok"
             reddit: None,
             bluesky: None,
             voice_call: None,
+            voice_duplex: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
