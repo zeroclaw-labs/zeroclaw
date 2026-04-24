@@ -1,32 +1,35 @@
 # Default owner for all files
-* @theonlyhennygod @JordanTheJet
+* @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+
+# Workspace crates (post-microkernel decomposition)
+/crates/** @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
 
 # Important functional modules
-/src/agent/** @theonlyhennygod @JordanTheJet
-/src/providers/** @theonlyhennygod @JordanTheJet
-/src/channels/** @theonlyhennygod @JordanTheJet
-/src/tools/** @theonlyhennygod @JordanTheJet
-/src/gateway/** @theonlyhennygod @JordanTheJet
-/src/runtime/** @theonlyhennygod @JordanTheJet
-/src/memory/** @theonlyhennygod @JordanTheJet
-/Cargo.toml @theonlyhennygod @JordanTheJet
-/Cargo.lock @theonlyhennygod @JordanTheJet
+/src/agent/** @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/src/providers/** @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/src/channels/** @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/src/tools/** @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/src/gateway/** @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/src/runtime/** @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/src/memory/** @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/Cargo.toml @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/Cargo.lock @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
 
 # Security / tests / CI-CD ownership
-/src/security/** @theonlyhennygod @JordanTheJet
-/tests/** @theonlyhennygod @JordanTheJet
-/.github/** @theonlyhennygod @JordanTheJet
-/.github/workflows/** @theonlyhennygod @JordanTheJet
-/.github/codeql/** @theonlyhennygod @JordanTheJet
-/.github/dependabot.yml @theonlyhennygod @JordanTheJet
-/SECURITY.md @theonlyhennygod @JordanTheJet
-/docs/actions-source-policy.md @theonlyhennygod @JordanTheJet
-/docs/ci-map.md @theonlyhennygod @JordanTheJet
+/src/security/** @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/tests/** @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/.github/** @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/.github/workflows/** @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/.github/codeql/** @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/.github/dependabot.yml @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/SECURITY.md @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/docs/actions-source-policy.md @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/docs/ci-map.md @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
 
 # Docs & governance
-/docs/** @theonlyhennygod @JordanTheJet
-/AGENTS.md @theonlyhennygod @JordanTheJet
-/CLAUDE.md @theonlyhennygod @JordanTheJet
-/CONTRIBUTING.md @theonlyhennygod @JordanTheJet
-/docs/pr-workflow.md @theonlyhennygod @JordanTheJet
-/docs/reviewer-playbook.md @theonlyhennygod @JordanTheJet
+/docs/** @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/AGENTS.md @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/CLAUDE.md @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/CONTRIBUTING.md @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/docs/pr-workflow.md @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
+/docs/reviewer-playbook.md @theonlyhennygod @JordanTheJet @singlerider @WareWolf-MoonWall
