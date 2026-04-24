@@ -11,7 +11,7 @@ preferred-dark-theme = "ayu"
 git-repository-url = "https://github.com/singlerider/zeroclaw"
 edit-url-template = "https://github.com/singlerider/zeroclaw/edit/master/docs/book/{path}"
 site-url = "/"
-additional-js = ["theme/lang-switcher.js"]
+additional-js = ["theme/lang-switcher.js", "mermaid.min.js", "mermaid-init.js"]
 additional-css = ["theme/custom.css"]
 
 [output.html.search]
@@ -21,3 +21,6 @@ use-boolean-and = true
 
 [preprocessor.gettext]
 after = ["links"]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
