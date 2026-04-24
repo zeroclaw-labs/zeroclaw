@@ -48,6 +48,7 @@ ignore = [
     { id = "RUSTSEC-2026-0094",  reason = "wasmtime Winch table.grow return value; extism 1.21 pins wasmtime 41.x; no extism release with fix" },
     { id = "RUSTSEC-2026-0095",  reason = "wasmtime Winch aarch64 sandbox escape (critical); extism 1.21 pins wasmtime 41.x; no extism release with fix" },
     { id = "RUSTSEC-2026-0096",  reason = "wasmtime Cranelift aarch64 sandbox escape (critical); extism 1.21 pins wasmtime 41.x; no extism release with fix" },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL parsing panic; v0.102.8 copy via rumqttc v0.25.1 has no fix in 0.102.x series, tracked for resolution when rumqttc upgrades past v0.25.x; v0.103.x copy fixed by cargo update to v0.103.13" },
 ]
 
 [licenses]
