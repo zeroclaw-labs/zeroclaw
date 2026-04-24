@@ -10,6 +10,12 @@ ARG TARGETARCH
 # Copy the pre-built binary for this platform (amd64 or arm64)
 COPY bin/${TARGETARCH}/zeroclaw /usr/local/bin/zeroclaw
 
+# Copy the web dashboard bundled alongside the binary in the release tarball.
+# The dashboard was decoupled from the binary in #5665 and is now served from
+# disk at `gateway.web_dist_dir`; without this COPY the distroless image has
+# no `/zeroclaw-data/web/dist` and `GET /` returns HTTP 503.
+COPY bin/${TARGETARCH}/web/dist /zeroclaw-data/web/dist
+
 # Runtime directory structure and default config
 COPY --chown=65534:65534 zeroclaw-data/ /zeroclaw-data/
 
