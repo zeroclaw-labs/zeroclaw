@@ -1135,6 +1135,7 @@ data: [DONE]
             api_path: None,
             provider_max_tokens: None,
             merge_system_into_user: false,
+            provider_extra: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");

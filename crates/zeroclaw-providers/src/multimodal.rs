@@ -52,6 +52,46 @@ pub enum MultimodalError {
     LocalReadFailed { input: String, reason: String },
 }
 
+/// Returns true for payloads that are plausibly loadable image references:
+/// absolute filesystem paths, `http(s)://` URLs, or base64 `data:` URIs.
+/// Placeholder-style payloads like `...`, `<path>`, or `example.png` fail
+/// this check and are left as literal text by [`parse_image_markers`], so
+/// illustrative markdown in a conversation does not trigger loader errors.
+fn is_loadable_image_reference(candidate: &str) -> bool {
+    candidate.starts_with('/')
+        || candidate.starts_with("http://")
+        || candidate.starts_with("https://")
+        || candidate.starts_with("data:")
+}
+
+/// Normalize a marker payload that may have been line-wrapped when pasted
+/// from a terminal (e.g. a log line where a long path was broken across
+/// rows with leading indentation). Interior newlines — and any whitespace
+/// immediately following them — are dropped; leading/trailing whitespace
+/// is trimmed. Legitimate paths may contain spaces but never newlines, so
+/// this only recovers corrupted markers and does not mangle real paths.
+fn collapse_wrapped_marker(raw: &str) -> String {
+    if !raw.contains('\n') && !raw.contains('\r') {
+        return raw.trim().to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut skip_ws = false;
+    for ch in raw.chars() {
+        if ch == '\n' || ch == '\r' {
+            skip_ws = true;
+            continue;
+        }
+        if skip_ws {
+            if ch.is_whitespace() {
+                continue;
+            }
+            skip_ws = false;
+        }
+        out.push(ch);
+    }
+    out.trim().to_string()
+}
+
 pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
     let mut refs = Vec::new();
     let mut cleaned = String::with_capacity(content.len());
@@ -69,12 +109,15 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
         };
 
         let end = marker_start + rel_end;
-        let candidate = content[marker_start..end].trim();
+        let candidate = collapse_wrapped_marker(&content[marker_start..end]);
 
-        if candidate.is_empty() {
+        if candidate.is_empty() || !is_loadable_image_reference(&candidate) {
+            // Preserve the original marker text (placeholders like
+            // `[IMAGE:...]` or `[IMAGE:<path>]` should survive as prose
+            // rather than triggering a loader error).
             cleaned.push_str(&content[start..=end]);
         } else {
-            refs.push(candidate.to_string());
+            refs.push(candidate);
         }
 
         cursor = end + 1;
@@ -506,6 +549,46 @@ mod tests {
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0], "/tmp/a.png");
         assert_eq!(refs[1], "https://example.com/b.jpg");
+    }
+
+    #[test]
+    fn parse_image_markers_collapses_line_wrapped_path() {
+        // Terminal-wrapped paste: a long path split across two rows with
+        // leading indentation should be recovered into the original path.
+        let input = "from the logs whether the agent emits\n  [IMAGE:/home/zeroclaw_user/.zeroclaw/workspace/signal_i\n  nbound/attachment.jpg] (which the\n  channel resolves)";
+        let (_, refs) = parse_image_markers(input);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            refs[0],
+            "/home/zeroclaw_user/.zeroclaw/workspace/signal_inbound/attachment.jpg"
+        );
+    }
+
+    #[test]
+    fn parse_image_markers_leaves_placeholder_markers_as_literal_text() {
+        // Illustrative markdown like `[IMAGE:...]` or `[IMAGE:<path>]`
+        // (e.g. in agent-authored prose the user quotes back) is not a
+        // loadable reference and must stay as literal text — otherwise the
+        // multimodal loader errors every turn the conversation replays.
+        let input = "example: `[IMAGE:...]` or `[IMAGE:<path>]` or `[IMAGE:example.png]`";
+        let (cleaned, refs) = parse_image_markers(input);
+        assert!(
+            refs.is_empty(),
+            "no placeholder should be treated as a loadable ref, got: {refs:?}"
+        );
+        assert!(cleaned.contains("[IMAGE:...]"));
+        assert!(cleaned.contains("[IMAGE:<path>]"));
+        assert!(cleaned.contains("[IMAGE:example.png]"));
+    }
+
+    #[test]
+    fn parse_image_markers_preserves_spaces_in_path() {
+        // Spaces within a single-line marker are legitimate (paths can
+        // contain spaces) and must survive unchanged.
+        let input = "look at [IMAGE:/tmp/my photos/beetle.png] please";
+        let (_, refs) = parse_image_markers(input);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0], "/tmp/my photos/beetle.png");
     }
 
     #[test]

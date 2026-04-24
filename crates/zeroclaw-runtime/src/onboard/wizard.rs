@@ -8379,6 +8379,7 @@ mod tests {
             encrypt_key: None,
             verification_token: None,
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: zeroclaw_config::schema::LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,

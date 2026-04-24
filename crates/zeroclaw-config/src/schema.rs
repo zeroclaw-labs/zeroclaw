@@ -555,6 +555,12 @@ pub struct ModelProviderConfig {
     /// Merge system messages into first user message.
     #[serde(default)]
     pub merge_system_into_user: bool,
+    /// Extra JSON parameters to include in API requests.
+    /// Merged at the top level of the request body, allowing provider-specific
+    /// features (routing, transforms, etc.) without code changes.
+    /// Example: `provider_extra = { provider = { only = ["Anthropic"] } }`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_extra: Option<serde_json::Value>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
@@ -1660,6 +1666,10 @@ pub struct SkillsConfig {
     /// Default: `false` (secure by default).
     #[serde(default)]
     pub allow_scripts: bool,
+    /// URL of the skills registry repository for bare-name installs.
+    /// Default: `https://github.com/zeroclaw-labs/zeroclaw-skills`
+    #[serde(default)]
+    pub registry_url: Option<String>,
     /// Controls how skills are injected into the system prompt.
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
@@ -6193,6 +6203,10 @@ pub struct CronJobDecl {
     /// Allowlist of tool names for agent jobs.
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
+    /// Whether to recall and inject memory context before this agent job runs.
+    /// Defaults to `true`; set to `false` for stateless digest jobs.
+    #[serde(default = "default_true")]
+    pub uses_memory: bool,
     /// Session target: `"isolated"` (default) or `"main"`.
     #[serde(default)]
     pub session_target: Option<String>,
@@ -7854,6 +7868,10 @@ pub struct FeishuConfig {
     /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, only respond to messages that @-mention the bot in groups.
+    /// Direct messages are always processed.
+    #[serde(default)]
+    pub mention_only: bool,
     /// Event receive mode: "websocket" (default) or "webhook"
     #[serde(default)]
     pub receive_mode: LarkReceiveMode,
@@ -9935,7 +9953,16 @@ impl Config {
         }
 
         if let Some(base_url) = base_url {
-            self.providers.fallback = Some(format!("custom:{base_url}"));
+            let canonical_key = format!("custom:{base_url}");
+            // Mirror the profile under the canonical key so runtime
+            // `fallback_provider()` lookups resolve — without this the rename
+            // would orphan the entry still keyed under the original profile name.
+            if !self.providers.models.contains_key(&canonical_key)
+                && let Some(entry) = self.providers.models.get(&profile_key).cloned()
+            {
+                self.providers.models.insert(canonical_key.clone(), entry);
+            }
+            self.providers.fallback = Some(canonical_key);
         }
     }
 
@@ -11235,6 +11262,10 @@ impl_enum_prop_kind!(
     AutonomyLevel,
 );
 
+impl HasPropKind for serde_json::Value {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12452,6 +12483,7 @@ default_temperature = 0.7
             encrypt_key: Some("feishu-encrypt".into()),
             verification_token: Some("feishu-verify".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
@@ -13968,6 +14000,17 @@ requires_openai_auth = true
                 .and_then(|e| e.base_url.as_deref()),
             Some("https://api.tonsof.blue/v1")
         );
+        // The entry is also mirrored under the canonical fallback key so
+        // runtime fallback_provider() lookups resolve.
+        assert_eq!(
+            config
+                .providers
+                .models
+                .get("custom:https://api.tonsof.blue/v1")
+                .and_then(|e| e.base_url.as_deref()),
+            Some("https://api.tonsof.blue/v1")
+        );
+        assert!(config.providers.fallback_provider().is_some());
     }
 
     #[test]
@@ -14429,6 +14472,7 @@ default_model = "legacy-model"
             encrypt_key: Some("feishu-encrypt".into()),
             verification_token: Some("feishu-verify".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
@@ -15401,6 +15445,7 @@ default_model = "persisted-profile"
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["user_123".into(), "user_456".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
@@ -15423,6 +15468,7 @@ default_model = "persisted-profile"
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
