@@ -102,6 +102,15 @@ impl Sandbox for DockerSandbox {
             "--network",
             "none",
         ]);
+
+        // Read-only workspace bind-mount. Same path inside and outside the
+        // container so workspace-relative paths resolve identically in both.
+        if let Some(workspace) = &self.workspace_dir {
+            let workspace_str = workspace.to_string_lossy();
+            docker_cmd.arg("-v");
+            docker_cmd.arg(format!("{workspace_str}:{workspace_str}:ro"));
+        }
+
         docker_cmd.arg(&self.image);
         docker_cmd.arg(&program);
         docker_cmd.args(&args);
@@ -261,5 +270,50 @@ mod tests {
     fn docker_without_workspace() {
         let sandbox = DockerSandbox::default();
         assert_eq!(sandbox.workspace_dir, None);
+    }
+
+    #[test]
+    fn docker_wrap_command_emits_bind_mount_when_workspace_configured() {
+        let ws = std::path::PathBuf::from("/workspace/skills");
+        let sandbox = DockerSandbox {
+            image: "alpine:latest".to_string(),
+            workspace_dir: Some(ws.clone()),
+        };
+        let mut cmd = Command::new("python3");
+        cmd.arg("script.py");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            args.contains(&"-v".to_string()),
+            "must include -v bind-mount flag when workspace is configured"
+        );
+        let ws_str = ws.to_string_lossy();
+        let expected = format!("{ws_str}:{ws_str}:ro");
+        assert!(
+            args.contains(&expected),
+            "bind-mount spec must match host-path:container-path:ro form; args={args:?}"
+        );
+    }
+
+    #[test]
+    fn docker_wrap_command_omits_bind_mount_when_no_workspace() {
+        let sandbox = DockerSandbox::default();
+        let mut cmd = Command::new("echo");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            !args.contains(&"-v".to_string()),
+            "must not emit -v when workspace_dir is None"
+        );
     }
 }
