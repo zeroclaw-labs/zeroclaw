@@ -1329,7 +1329,10 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
 }
 
 /// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
-async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Result<String> {
+async fn run_gateway_chat_simple(
+    state: &AppState,
+    message: &str,
+) -> anyhow::Result<zeroclaw_api::provider::ChatResponse> {
     let user_messages = vec![ChatMessage::user(message)];
 
     // Keep webhook/gateway prompts aligned with channel behavior by injecting
@@ -1359,7 +1362,14 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
 
     state
         .provider
-        .chat_with_history(&prepared.messages, &state.model, state.temperature)
+        .chat(
+            zeroclaw_api::provider::ChatRequest {
+                messages: &prepared.messages,
+                tools: None,
+            },
+            &state.model,
+            state.temperature,
+        )
         .await
 }
 
@@ -1513,8 +1523,15 @@ async fn handle_webhook(
     );
 
     match run_gateway_chat_simple(&state, message).await {
-        Ok(response) => {
+        Ok(chat_response) => {
             let duration = started_at.elapsed();
+            let input_tokens = chat_response.usage.as_ref().and_then(|u| u.input_tokens);
+            let output_tokens = chat_response.usage.as_ref().and_then(|u| u.output_tokens);
+            let tokens_used = input_tokens
+                .zip(output_tokens)
+                .map(|(i, o)| i + o)
+                .or(input_tokens)
+                .or(output_tokens);
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
                     provider: provider_label.clone(),
@@ -1522,8 +1539,8 @@ async fn handle_webhook(
                     duration,
                     success: true,
                     error_message: None,
-                    input_tokens: None,
-                    output_tokens: None,
+                    input_tokens,
+                    output_tokens,
                 },
             );
             state.observer.record_metric(
@@ -1534,11 +1551,12 @@ async fn handle_webhook(
                     provider: provider_label,
                     model: model_label,
                     duration,
-                    tokens_used: None,
+                    tokens_used,
                     cost_usd: None,
                 },
             );
 
+            let response = chat_response.text.unwrap_or_default();
             let body = serde_json::json!({"response": response, "model": state.model});
             (StatusCode::OK, Json(body))
         }

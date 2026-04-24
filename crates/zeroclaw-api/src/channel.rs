@@ -1,7 +1,30 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::media::MediaAttachment;
+
+// ── Channel approval types ──────────────────────────────────────
+
+/// Compact description of a tool call presented to the user for approval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelApprovalRequest {
+    pub tool_name: String,
+    pub arguments_summary: String,
+}
+
+/// The operator's response to a channel-presented approval prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelApprovalResponse {
+    /// Execute this one call.
+    Approve,
+    /// Deny this call.
+    Deny,
+    /// Execute and add tool to session-scoped allowlist.
+    #[serde(rename = "always")]
+    AlwaysApprove,
+}
 
 /// A message received from or sent to a channel
 #[derive(Debug, Clone)]
@@ -209,5 +232,19 @@ pub trait Channel: Send + Sync {
         _reason: Option<String>,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Request interactive tool-call approval from the channel operator.
+    ///
+    /// Returns `Ok(Some(response))` when the channel supports interactive
+    /// approval (e.g. Telegram inline keyboards). Returns `Ok(None)` when the
+    /// channel does not support approval prompts — the caller should fall back
+    /// to its default policy (typically auto-deny).
+    async fn request_approval(
+        &self,
+        _recipient: &str,
+        _request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        Ok(None)
     }
 }

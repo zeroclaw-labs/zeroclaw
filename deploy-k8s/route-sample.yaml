@@ -1,0 +1,18 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: zeroclaw
+  namespace: zeroclaw
+  labels:
+    app.kubernetes.io/name: zeroclaw
+    app.kubernetes.io/part-of: zeroclaw
+spec:
+  to:
+    kind: Service
+    name: zeroclaw
+    weight: 100
+  port:
+    targetPort: gateway
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

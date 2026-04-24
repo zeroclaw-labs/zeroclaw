@@ -103,6 +103,9 @@ pub fn make_prop_field(
     let display_value = if is_secret {
         match table.and_then(|t| t.get(serde_name)) {
             Some(toml::Value::String(s)) if !s.is_empty() => "****".to_string(),
+            Some(toml::Value::Array(arr)) if !arr.is_empty() => {
+                format!("[{}]", vec!["****"; arr.len()].join(", "))
+            }
             _ => "<unset>".to_string(),
         }
     } else {
@@ -192,12 +195,53 @@ fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Val
             })?))
         }
         PropKind::String | PropKind::Enum => Ok(toml::Value::String(value_str.to_string())),
+        PropKind::StringArray => {
+            let items = value_str
+                .split(',')
+                .map(|s| toml::Value::String(s.trim().to_string()))
+                .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                .collect();
+            Ok(toml::Value::Array(items))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_string_array_splits_on_comma() {
+        let result = parse_prop_value("alice, bob, charlie", PropKind::StringArray).unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0].as_str(), Some("alice"));
+        assert_eq!(arr[1].as_str(), Some("bob"));
+        assert_eq!(arr[2].as_str(), Some("charlie"));
+    }
+
+    #[test]
+    fn parse_string_array_empty_input_gives_empty_array() {
+        let result = parse_prop_value("", PropKind::StringArray).unwrap();
+        assert_eq!(result.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn parse_string_array_single_value() {
+        let result = parse_prop_value("alice", PropKind::StringArray).unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].as_str(), Some("alice"));
+    }
+
+    #[test]
+    fn parse_string_array_quote_in_value_is_literal() {
+        let result = parse_prop_value(r#"tok1, p@ss"word"#, PropKind::StringArray).unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0].as_str(), Some("tok1"));
+        assert_eq!(arr[1].as_str(), Some(r#"p@ss"word"#));
+    }
 
     #[test]
     fn reexported_config_default_is_constructible() {
@@ -219,6 +263,7 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: 120,
         };
 
         let discord = DiscordConfig {
@@ -256,6 +301,7 @@ mod tests {
             encrypt_key: None,
             verification_token: None,
             allowed_users: vec![],
+            mention_only: false,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,

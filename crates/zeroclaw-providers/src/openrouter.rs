@@ -1,9 +1,13 @@
+use crate::compatible::sse_bytes_to_events;
 use crate::multimodal;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
+    Provider, ProviderCapabilities, StreamError, StreamEvent, StreamOptions, StreamResult,
+    TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
+use futures_util::StreamExt as _;
+use futures_util::stream;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -13,6 +17,7 @@ pub struct OpenRouterProvider {
     credential: Option<String>,
     timeout_secs: u64,
     max_tokens: Option<u32>,
+    extra_body: Option<serde_json::Value>,
 }
 
 const DEFAULT_OPENROUTER_TIMEOUT_SECS: u64 = 120;
@@ -38,6 +43,22 @@ struct Message {
 enum MessageContent {
     Text(String),
     Parts(Vec<MessagePart>),
+}
+
+/// RAII guard that aborts a spawned tokio task when dropped.
+///
+/// Used by `stream_chat` to bind the SSE-forwarding task's lifetime to the
+/// returned stream. When a caller cancels the stream (timeout, user abort,
+/// client disconnect), the guard is dropped together with the stream state
+/// and the in-flight HTTP request is cancelled so it stops consuming
+/// bandwidth and connection-pool slots. `AbortHandle::abort` is a no-op
+/// after the task has finished naturally, so the happy path is unaffected.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -78,6 +99,8 @@ struct NativeChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -163,6 +186,7 @@ impl OpenRouterProvider {
                 .filter(|secs| *secs > 0)
                 .unwrap_or(DEFAULT_OPENROUTER_TIMEOUT_SECS),
             max_tokens: None,
+            extra_body: None,
         }
     }
 
@@ -175,6 +199,14 @@ impl OpenRouterProvider {
     /// Set the maximum output tokens for API requests.
     pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Set extra JSON parameters to merge into every API request body.
+    /// Keys in `extra` are inserted at the top level of the serialized request,
+    /// overriding any existing keys with the same name.
+    pub fn with_extra_body(mut self, extra: serde_json::Value) -> Self {
+        self.extra_body = Some(extra);
         self
     }
 
@@ -348,6 +380,24 @@ impl OpenRouterProvider {
         })
     }
 
+    /// Serialize `request` to JSON, merge `self.extra_body` keys at the top
+    /// level (extra_body wins on conflicts), and return the merged Value.
+    fn merge_extra_body<T: Serialize>(&self, request: &T) -> anyhow::Result<serde_json::Value> {
+        let Some(extra) = &self.extra_body else {
+            return Ok(serde_json::to_value(request)?);
+        };
+        let overrides = extra
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("provider_extra must be a JSON object, got: {extra}"))?;
+        let mut value = serde_json::to_value(request)?;
+        if let Some(base) = value.as_object_mut() {
+            for (k, v) in overrides {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+        Ok(value)
+    }
+
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "provider.openrouter",
@@ -412,13 +462,14 @@ impl Provider for OpenRouterProvider {
             max_tokens: self.max_tokens,
         };
 
+        let body = self.merge_extra_body(&request)?;
         let response = self
             .http_client()
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
-            .json(&request)
+            .json(&body)
             .send()
             .await?;
 
@@ -426,9 +477,12 @@ impl Provider for OpenRouterProvider {
             return Err(super::api_error("OpenRouter", response).await);
         }
 
-        let body = Self::read_response_body("OpenRouter", response).await?;
-        let chat_response =
-            Self::parse_response_body::<ApiChatResponse>("OpenRouter", &body, "chat-completions")?;
+        let resp_body = Self::read_response_body("OpenRouter", response).await?;
+        let chat_response = Self::parse_response_body::<ApiChatResponse>(
+            "OpenRouter",
+            &resp_body,
+            "chat-completions",
+        )?;
 
         chat_response
             .choices
@@ -462,13 +516,14 @@ impl Provider for OpenRouterProvider {
             max_tokens: self.max_tokens,
         };
 
+        let body = self.merge_extra_body(&request)?;
         let response = self
             .http_client()
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
-            .json(&request)
+            .json(&body)
             .send()
             .await?;
 
@@ -476,9 +531,12 @@ impl Provider for OpenRouterProvider {
             return Err(super::api_error("OpenRouter", response).await);
         }
 
-        let body = Self::read_response_body("OpenRouter", response).await?;
-        let chat_response =
-            Self::parse_response_body::<ApiChatResponse>("OpenRouter", &body, "chat-completions")?;
+        let resp_body = Self::read_response_body("OpenRouter", response).await?;
+        let chat_response = Self::parse_response_body::<ApiChatResponse>(
+            "OpenRouter",
+            &resp_body,
+            "chat-completions",
+        )?;
 
         chat_response
             .choices
@@ -508,15 +566,17 @@ impl Provider for OpenRouterProvider {
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
             max_tokens: self.max_tokens,
+            stream: None,
         };
 
+        let body = self.merge_extra_body(&native_request)?;
         let response = self
             .http_client()
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
-            .json(&native_request)
+            .json(&body)
             .send()
             .await?;
 
@@ -524,9 +584,12 @@ impl Provider for OpenRouterProvider {
             return Err(super::api_error("OpenRouter", response).await);
         }
 
-        let body = Self::read_response_body("OpenRouter", response).await?;
-        let native_response =
-            Self::parse_response_body::<NativeChatResponse>("OpenRouter", &body, "native chat")?;
+        let resp_body = Self::read_response_body("OpenRouter", response).await?;
+        let native_response = Self::parse_response_body::<NativeChatResponse>(
+            "OpenRouter",
+            &resp_body,
+            "native chat",
+        )?;
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
@@ -545,6 +608,113 @@ impl Provider for OpenRouterProvider {
 
     fn supports_native_tools(&self) -> bool {
         true
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn supports_streaming_tool_events(&self) -> bool {
+        true
+    }
+
+    fn stream_chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        if !options.enabled {
+            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+        }
+
+        let credential = match self.credential.as_ref() {
+            Some(c) => c.clone(),
+            None => {
+                return stream::once(async {
+                    Err(StreamError::Provider(
+                        "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.".to_string(),
+                    ))
+                })
+                .boxed();
+            }
+        };
+
+        let tools = Self::convert_tools(request.tools);
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            messages: Self::convert_messages(request.messages),
+            temperature,
+            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tools,
+            max_tokens: self.max_tokens,
+            stream: Some(true),
+        };
+
+        let payload = match serde_json::to_value(&native_request) {
+            Ok(v) => v,
+            Err(e) => {
+                return stream::once(async move { Err(StreamError::Json(e)) }).boxed();
+            }
+        };
+
+        let client = self.http_client();
+        let count_tokens = options.count_tokens;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
+
+        let handle = tokio::spawn(async move {
+            let response = match client
+                .post("https://openrouter.ai/api/v1/chat/completions")
+                .header("Authorization", format!("Bearer {credential}"))
+                .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
+                .header("X-Title", "ZeroClaw")
+                .header("Accept", "text/event-stream")
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let error = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| format!("HTTP error: {status}"));
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{status}: {error}"))))
+                    .await;
+                return;
+            }
+
+            let mut event_stream = sse_bytes_to_events(response, count_tokens);
+            while let Some(event) = event_stream.next().await {
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Bind the task's lifetime to the returned stream so dropping the
+        // stream cancels the in-flight HTTP request. Without this guard the
+        // spawned task keeps reading the response body to completion after
+        // the consumer is gone, holding a connection-pool slot and
+        // consuming OpenRouter quota for a request the caller no longer
+        // wants. `AbortHandle::abort` is a no-op if the task has already
+        // finished, so the happy path is unaffected. See #5822.
+        let guard = AbortOnDrop(handle.abort_handle());
+
+        stream::unfold((rx, guard), |(mut rx, guard)| async move {
+            rx.recv().await.map(|event| (event, (rx, guard)))
+        })
+        .boxed()
     }
 
     async fn chat_with_tools(
@@ -599,15 +769,17 @@ impl Provider for OpenRouterProvider {
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
             max_tokens: self.max_tokens,
+            stream: None,
         };
 
+        let body = self.merge_extra_body(&native_request)?;
         let response = self
             .http_client()
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
-            .json(&native_request)
+            .json(&body)
             .send()
             .await?;
 
@@ -615,9 +787,12 @@ impl Provider for OpenRouterProvider {
             return Err(super::api_error("OpenRouter", response).await);
         }
 
-        let body = Self::read_response_body("OpenRouter", response).await?;
-        let native_response =
-            Self::parse_response_body::<NativeChatResponse>("OpenRouter", &body, "native chat")?;
+        let resp_body = Self::read_response_body("OpenRouter", response).await?;
+        let native_response = Self::parse_response_body::<NativeChatResponse>(
+            "OpenRouter",
+            &resp_body,
+            "native chat",
+        )?;
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
@@ -656,6 +831,118 @@ mod tests {
         let caps = <OpenRouterProvider as Provider>::capabilities(&provider);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn supports_streaming_returns_true() {
+        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"), None);
+        assert!(provider.supports_streaming());
+    }
+
+    #[test]
+    fn supports_streaming_tool_events_returns_true() {
+        let provider = OpenRouterProvider::new(Some("openrouter-test-credential"), None);
+        assert!(provider.supports_streaming_tool_events());
+    }
+
+    #[tokio::test]
+    async fn stream_chat_without_key_returns_error_event() {
+        use crate::traits::{ChatMessage, ChatRequest};
+        use futures_util::StreamExt as _;
+
+        let provider = OpenRouterProvider::new(None, None);
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        }];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+
+        let mut stream = provider.stream_chat(
+            request,
+            "anthropic/claude-haiku-4-5",
+            0.0,
+            crate::traits::StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+
+        let first = stream
+            .next()
+            .await
+            .expect("stream should yield at least one event");
+        assert!(first.is_err(), "expected error without API key");
+        let err = first.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("API key not set"),
+            "error should mention API key: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_disabled_options_returns_final() {
+        use crate::traits::{ChatMessage, ChatRequest, StreamEvent};
+        use futures_util::StreamExt as _;
+
+        let provider = OpenRouterProvider::new(Some("key"), None);
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        }];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+
+        let mut stream = provider.stream_chat(
+            request,
+            "anthropic/claude-haiku-4-5",
+            0.0,
+            crate::traits::StreamOptions {
+                enabled: false,
+                count_tokens: false,
+            },
+        );
+
+        let first = stream
+            .next()
+            .await
+            .expect("stream should yield Final immediately");
+        assert!(matches!(first, Ok(StreamEvent::Final)));
+    }
+
+    #[test]
+    fn native_chat_request_serializes_stream_true() {
+        let req = NativeChatRequest {
+            model: "anthropic/claude-haiku-4-5".into(),
+            messages: vec![],
+            temperature: 0.0,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            stream: Some(true),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"stream\":true"));
+    }
+
+    #[test]
+    fn native_chat_request_omits_stream_when_none() {
+        let req = NativeChatRequest {
+            model: "anthropic/claude-haiku-4-5".into(),
+            messages: vec![],
+            temperature: 0.0,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            stream: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("stream"));
     }
 
     #[test]
@@ -1220,5 +1507,168 @@ mod tests {
         }];
 
         assert!(OpenRouterProvider::convert_tools(Some(&tools)).is_none());
+    }
+
+    #[test]
+    fn with_extra_body_sets_value() {
+        let extra = serde_json::json!({"provider": {"only": ["Anthropic"]}});
+        let provider = OpenRouterProvider::new(Some("key"), None).with_extra_body(extra.clone());
+        assert_eq!(provider.extra_body, Some(extra));
+    }
+
+    #[test]
+    fn extra_body_none_produces_unchanged_request() {
+        let provider = OpenRouterProvider::new(Some("key"), None);
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![],
+            temperature: 0.5,
+            max_tokens: None,
+        };
+
+        let base = serde_json::to_value(&request).unwrap();
+        let merged = provider.merge_extra_body(&request).unwrap();
+        assert_eq!(base, merged);
+    }
+
+    #[test]
+    fn extra_body_empty_object_produces_unchanged_request() {
+        let provider =
+            OpenRouterProvider::new(Some("key"), None).with_extra_body(serde_json::json!({}));
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![],
+            temperature: 0.5,
+            max_tokens: None,
+        };
+
+        let base = serde_json::to_value(&request).unwrap();
+        let merged = provider.merge_extra_body(&request).unwrap();
+        assert_eq!(base, merged);
+    }
+
+    #[test]
+    fn extra_body_adds_new_top_level_keys() {
+        let provider = OpenRouterProvider::new(Some("key"), None)
+            .with_extra_body(serde_json::json!({"provider": {"only": ["Anthropic"]}}));
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![],
+            temperature: 0.5,
+            max_tokens: None,
+        };
+
+        let merged = provider.merge_extra_body(&request).unwrap();
+        let obj = merged.as_object().unwrap();
+        assert_eq!(
+            obj.get("provider").unwrap(),
+            &serde_json::json!({"only": ["Anthropic"]})
+        );
+        assert_eq!(obj.get("model").unwrap(), "test-model");
+        assert_eq!(obj.get("temperature").unwrap(), 0.5);
+    }
+
+    #[test]
+    fn extra_body_overrides_existing_keys() {
+        let provider = OpenRouterProvider::new(Some("key"), None)
+            .with_extra_body(serde_json::json!({"temperature": 0.9}));
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![],
+            temperature: 0.5,
+            max_tokens: None,
+        };
+
+        let merged = provider.merge_extra_body(&request).unwrap();
+        let obj = merged.as_object().unwrap();
+        assert_eq!(obj.get("temperature").unwrap(), 0.9);
+    }
+
+    #[test]
+    fn extra_body_merges_at_top_level_not_nested() {
+        let provider = OpenRouterProvider::new(Some("key"), None)
+            .with_extra_body(serde_json::json!({"transforms": ["middle-out"]}));
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![],
+            temperature: 0.5,
+            max_tokens: None,
+        };
+
+        let merged = provider.merge_extra_body(&request).unwrap();
+        let obj = merged.as_object().unwrap();
+        assert_eq!(
+            obj.get("transforms").unwrap(),
+            &serde_json::json!(["middle-out"])
+        );
+        assert!(obj.get("extra_body").is_none());
+    }
+
+    #[test]
+    fn extra_body_with_nested_provider_routing() {
+        let provider = OpenRouterProvider::new(Some("key"), None).with_extra_body(
+            serde_json::json!({"provider": {"only": ["Anthropic"], "allow_fallbacks": false}}),
+        );
+        let request = NativeChatRequest {
+            model: "anthropic/claude-sonnet-4".into(),
+            messages: vec![],
+            temperature: 0.7,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            stream: None,
+        };
+
+        let merged = provider.merge_extra_body(&request).unwrap();
+        let obj = merged.as_object().unwrap();
+        let prov = obj.get("provider").unwrap();
+        assert_eq!(prov["only"], serde_json::json!(["Anthropic"]));
+        assert_eq!(prov["allow_fallbacks"], false);
+    }
+
+    /// Regression for #5822.
+    ///
+    /// `AbortOnDrop` must cancel the bound tokio task when it is dropped.
+    /// This guards the `stream_chat` invariant that a dropped stream stops
+    /// the in-flight SSE-forwarding task instead of letting it run to
+    /// completion.
+    #[tokio::test]
+    async fn abort_on_drop_cancels_long_running_task() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::{Duration, timeout};
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_clone = Arc::clone(&finished);
+
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            finished_clone.store(true, Ordering::SeqCst);
+        });
+        let raw_handle = handle.abort_handle();
+        let guard = AbortOnDrop(handle.abort_handle());
+
+        assert!(!raw_handle.is_finished());
+
+        drop(guard);
+
+        let cancelled = timeout(Duration::from_secs(2), async {
+            loop {
+                if raw_handle.is_finished() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            cancelled.is_ok(),
+            "task should be aborted within 2 s of AbortOnDrop being dropped"
+        );
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "cancelled task must not have run its completion side effect"
+        );
     }
 }
