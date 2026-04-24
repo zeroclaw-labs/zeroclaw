@@ -125,12 +125,21 @@ end tell"#,
             escaped = escaped,
         );
 
-        // Run AppleScript in blocking thread to avoid blocking tokio
-        let result =
-            tokio::task::spawn_blocking(move || lightwave_macos::applescript::execute(&script))
-                .await??;
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = script;
+            anyhow::bail!("iMessage send is only supported on macOS");
+        }
 
-        debug!("iMessage sent to {recipient}: {result}");
+        // Run AppleScript in blocking thread to avoid blocking tokio
+        #[cfg(target_os = "macos")]
+        {
+            let result =
+                tokio::task::spawn_blocking(move || lightwave_macos::applescript::execute(&script))
+                    .await??;
+            debug!("iMessage sent to {recipient}: {result}");
+        }
+
         Ok(())
     }
 
