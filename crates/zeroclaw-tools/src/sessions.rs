@@ -884,6 +884,8 @@ mod tests {
 
     /// Delegates everything except delete_session, which uses the trait
     /// default (returns Ok(false) without deleting anything).
+    /// Coupled to SessionBackend's default — if that default changes,
+    /// this wrapper's behavior changes too.
     struct NoOpDeleteBackend(Arc<dyn SessionBackend>);
 
     impl SessionBackend for NoOpDeleteBackend {
