@@ -13,7 +13,7 @@ repository = "https://github.com/lightwave-media/lightwave-sys"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "macos"]
 categories = ["command-line-utilities", "api-bindings"]
-rust-version = "1.87"
+rust-version = "1.93"
 
 [[bin]]
 name = "augusta"

@@ -37,28 +37,9 @@ jobs:
           echo "tag=${beta_tag}" >> "$GITHUB_OUTPUT"
           echo "Beta release: ${beta_tag}"
 
-  web:
-    name: Build Web Dashboard
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - name: Build web dashboard
-        run: cd web && npm ci && npm run build
-      - uses: actions/upload-artifact@v4
-        with:
-          name: web-dist
-          path: web/dist/
-          retention-days: 1
-
   build:
     name: Build ${{ matrix.target }}
-    needs: [version, web]
+    needs: [version]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -88,15 +69,13 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          toolchain: 1.92.0
+          toolchain: 1.95.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         if: runner.os != 'Windows'
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: web-dist
-          path: web/dist/
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
 
       - name: Install cross compiler
         if: matrix.cross_compiler
