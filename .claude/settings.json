@@ -1,0 +1,53 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/joelschaeffer/.bun/bin/bun /Users/joelschaeffer/dev/lightwave-media/.claude/hooks/session-start.ts",
+            "timeout": 5,
+            "statusMessage": "Loading Platform context..."
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/joelschaeffer/.bun/bin/bun /Users/joelschaeffer/dev/lightwave-media/.claude/hooks/pre-tool-use.ts",
+            "timeout": 10,
+            "statusMessage": "Validating file operation..."
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/joelschaeffer/.bun/bin/bun /Users/joelschaeffer/dev/lightwave-media/.claude/hooks/bash-guard.ts",
+            "timeout": 5,
+            "statusMessage": "Checking CLI enforcement..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/joelschaeffer/.bun/bin/bun /Users/joelschaeffer/dev/lightwave-media/.claude/hooks/stop.ts",
+            "timeout": 300,
+            "statusMessage": "Running pre-commit checks..."
+          }
+        ]
+      }
+    ]
+  },
+  "enabledMcpjsonServers": ["chrome-devtools"]
+}
