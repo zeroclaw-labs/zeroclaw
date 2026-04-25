@@ -1,5 +1,6 @@
 mod agent;
 mod agent_robustness;
+mod brain_compile_e2e;
 mod channel_routing;
 // hooks module is pub(crate) in Augusta — stub only
 // mod hooks;

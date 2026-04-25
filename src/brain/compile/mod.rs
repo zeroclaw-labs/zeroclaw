@@ -18,6 +18,10 @@ pub struct CompileOptions {
     pub force: bool,
     pub dry_run: bool,
     pub paperclip_host: String,
+    /// Override Paperclip instances root. Defaults to env var
+    /// `PAPERCLIP_INSTANCES_ROOT`, then `~/.paperclip/instances/default/`.
+    /// Set explicitly for tests and programmatic embedding.
+    pub instances_root: Option<PathBuf>,
 }
 
 pub struct CompileReport {
@@ -43,7 +47,10 @@ pub async fn run(opts: CompileOptions) -> Result<CompileReport> {
         errors: Vec::new(),
     };
 
-    let paperclip_root = paperclip_instances_root();
+    let paperclip_root = opts
+        .instances_root
+        .clone()
+        .unwrap_or_else(paperclip_instances_root);
 
     for company in companies {
         if company.status != "active" {

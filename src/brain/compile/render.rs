@@ -278,7 +278,6 @@ fn push_frontmatter(out: &mut String, brain: &BrainSnapshot) {
     out.push_str("---\n");
     out.push_str("generated_by: augusta brain compile\n");
     out.push_str(&format!("brain_sha: {}\n", &brain.brain_sha[..16]));
-    out.push_str(&format!("compiled_at: {}\n", brain.compiled_at));
     out.push_str("---\n\n");
 }
 
@@ -443,7 +442,6 @@ skills:
 "#,
             ),
             brain_sha: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into(),
-            compiled_at: "2026-01-01T00:00:00Z".into(),
         }
     }
 
@@ -465,7 +463,6 @@ skills:
         for md in [&bundle.agents_md, &bundle.soul_md, &bundle.tools_md] {
             assert!(md.starts_with("---\n"), "missing frontmatter: {md:.80}");
             assert!(md.contains("brain_sha: abcdef0123456789"));
-            assert!(md.contains("compiled_at: 2026-01-01T00:00:00Z"));
         }
     }
 

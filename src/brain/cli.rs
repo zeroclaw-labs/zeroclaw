@@ -36,6 +36,7 @@ pub async fn handle_command(command: crate::BrainCommands) -> Result<()> {
                 paperclip_host: paperclip_host
                     .or_else(|| std::env::var("LW_PAPERCLIP_HOST").ok())
                     .unwrap_or_else(|| "http://127.0.0.1:3100".to_string()),
+                instances_root: None,
             };
             let report = super::compile::run(opts).await?;
             println!(

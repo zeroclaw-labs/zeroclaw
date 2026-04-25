@@ -18,7 +18,6 @@ pub struct BrainSnapshot {
     pub skills_index: Value,
     /// SHA-256 of all loaded source bytes — used as a provenance stamp.
     pub brain_sha: String,
-    pub compiled_at: String,
 }
 
 pub fn load(brain_dir: &Path) -> Result<BrainSnapshot> {
@@ -48,7 +47,6 @@ pub fn load(brain_dir: &Path) -> Result<BrainSnapshot> {
     let skills_index = load("skills/__index.yaml", &mut hasher).unwrap_or(Value::Null);
 
     let brain_sha = format!("{:x}", hasher.finalize());
-    let compiled_at = chrono::Utc::now().to_rfc3339();
 
     Ok(BrainSnapshot {
         soul_mind,
@@ -60,7 +58,6 @@ pub fn load(brain_dir: &Path) -> Result<BrainSnapshot> {
         messaging_safety,
         skills_index,
         brain_sha,
-        compiled_at,
     })
 }
 
