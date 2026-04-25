@@ -31,12 +31,40 @@ pub struct ProvidersConfig {
 
 impl ProvidersConfig {
     pub fn fallback_provider(&self) -> Option<&ModelProviderConfig> {
-        self.fallback
-            .as_deref()
-            .and_then(|name| self.models.get(name))
+        self.fallback.as_deref().and_then(|name| {
+            // First try exact key match
+            if let Some(entry) = self.models.get(name) {
+                return Some(entry);
+            }
+            // For custom: URLs, search by base_url
+            if let Some(url) = name.strip_prefix("custom:") {
+                let normalized_url = url.trim_end_matches('/');
+                return self.models.values().find(|entry| {
+                    let entry_url = entry.base_url.as_deref().map(|u| u.trim_end_matches('/'));
+                    entry_url == Some(normalized_url)
+                });
+            }
+            None
+        })
     }
     pub fn fallback_provider_mut(&mut self) -> Option<&mut ModelProviderConfig> {
         let name = self.fallback.clone()?;
+        // For custom: URLs, find the matching key first
+        if let Some(url) = name.strip_prefix("custom:") {
+            let normalized_url = url.trim_end_matches('/');
+            let matching_key = self
+                .models
+                .iter()
+                .find(|(_, entry)| {
+                    entry.base_url.as_deref().map(|u| u.trim_end_matches('/'))
+                        == Some(normalized_url)
+                })
+                .map(|(k, _)| k.clone());
+            if let Some(key) = matching_key {
+                return self.models.get_mut(&key);
+            }
+        }
+        // Try exact key match
         self.models.get_mut(&name)
     }
 }

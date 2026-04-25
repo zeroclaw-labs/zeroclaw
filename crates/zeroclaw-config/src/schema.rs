@@ -561,6 +561,9 @@ pub struct ModelProviderConfig {
     /// Example: `provider_extra = { provider = { only = ["Anthropic"] } }`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_extra: Option<serde_json::Value>,
+    /// Path to a custom CA certificate file for TLS connections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_cert_path: Option<String>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
@@ -10632,6 +10635,32 @@ impl Config {
         if self.providers.fallback.is_none() {
             self.providers.fallback = Some(fallback.clone());
         }
+
+        // Check if entry already exists
+        if self.providers.models.contains_key(&fallback) {
+            return self.providers.models.get_mut(&fallback).unwrap();
+        }
+
+        // For custom: URLs, check if there's an existing entry with matching base_url
+        // and copy its tls_ca_cert_path
+        if let Some(url) = fallback.strip_prefix("custom:") {
+            let normalized_url = url.trim_end_matches('/');
+            let existing_cert = self.providers.models.values().find_map(|entry| {
+                entry
+                    .base_url
+                    .as_deref()
+                    .map(|u| u.trim_end_matches('/'))
+                    .filter(|u| u == &normalized_url)
+                    .and_then(|_| entry.tls_ca_cert_path.clone())
+            });
+
+            let entry = self.providers.models.entry(fallback).or_default();
+            if let Some(cert_path) = existing_cert {
+                entry.tls_ca_cert_path = Some(cert_path);
+            }
+            return entry;
+        }
+
         self.providers.models.entry(fallback).or_default()
     }
 
