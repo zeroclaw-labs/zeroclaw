@@ -651,10 +651,14 @@ Generate shell completion scripts for `zeroclaw`.
 
 The script is printed to stdout so it can be sourced directly:
 
-Examples:
+Examples (Unix shells):
   source <(zeroclaw completions bash)
   zeroclaw completions zsh > ~/.zfunc/_zeroclaw
-  zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish")]
+  zeroclaw completions fish > ~/.config/fish/completions/zeroclaw.fish
+
+Examples (Windows PowerShell):
+  zeroclaw completions powershell | Out-String | Invoke-Expression
+  zeroclaw completions powershell > $PROFILE.CurrentUserAllHosts")]
     Completions {
         /// Target shell
         #[arg(value_enum)]
@@ -1568,12 +1572,20 @@ async fn main() -> Result<()> {
 
         Commands::Daemon { port, host } => {
             if let Ok(exe) = std::env::current_exe() {
-                let exe_str = exe.to_string_lossy();
-                if exe_str.contains(".cargo/bin") || exe_str.contains("/home/") {
+                let under_home = directories::UserDirs::new()
+                    .map(|u| u.home_dir().to_path_buf())
+                    .is_some_and(|home| exe.starts_with(&home));
+                if under_home {
+                    let install_hint = if cfg!(windows) {
+                        "Consider installing to a system-wide location (e.g. C:\\Program Files\\ZeroClaw) for service use."
+                    } else if cfg!(target_os = "macos") {
+                        "Consider installing to /usr/local/bin or /opt/homebrew/bin for system-wide service."
+                    } else {
+                        "Consider installing to /usr/local/bin for system-wide service."
+                    };
                     tracing::warn!(
-                        "Daemon running from user home directory: {}. \
-                         Consider installing to /usr/local/bin for system-wide service.",
-                        exe_str
+                        "Daemon running from user home directory: {}. {install_hint}",
+                        exe.display(),
                     );
                 }
             }
@@ -1988,15 +2000,32 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // 3. ~/.cargo/bin/zeroclaw-desktop or ~/.local/bin/zeroclaw-desktop
+                // 3. Common cargo/local install locations under the user's home directory.
+                //    Uses directories::UserDirs so HOME (Unix) and USERPROFILE (Windows)
+                //    are both resolved correctly. On Windows the binary is .exe — try
+                //    both names since which::which (step 4) only catches PATH entries.
                 if found.is_none() {
-                    if let Some(home) = std::env::var_os("HOME") {
-                        let home = PathBuf::from(home);
-                        for dir in &[".cargo/bin", ".local/bin"] {
-                            let candidate = home.join(dir).join("zeroclaw-desktop");
-                            if candidate.is_file() {
-                                found = Some(candidate);
-                                break;
+                    if let Some(home) =
+                        directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())
+                    {
+                        let bin_names: &[&str] = if cfg!(windows) {
+                            &["zeroclaw-desktop.exe", "zeroclaw-desktop"]
+                        } else {
+                            &["zeroclaw-desktop"]
+                        };
+                        // .cargo/bin works the same on Windows; .local/bin is XDG (Unix only).
+                        let dirs: &[&str] = if cfg!(windows) {
+                            &[".cargo/bin"]
+                        } else {
+                            &[".cargo/bin", ".local/bin"]
+                        };
+                        'outer: for dir in dirs {
+                            for name in bin_names {
+                                let candidate = home.join(dir).join(name);
+                                if candidate.is_file() {
+                                    found = Some(candidate);
+                                    break 'outer;
+                                }
                             }
                         }
                     }
