@@ -716,6 +716,10 @@ pub struct ProviderRuntimeOptions {
     /// Extra JSON parameters merged into API request bodies at the top level.
     /// Propagated from `ModelProviderConfig::provider_extra`.
     pub provider_extra: Option<serde_json::Value>,
+    /// Full `[providers]` config, used to resolve `api_key`, `base_url`, and
+    /// provider-type overrides for fallback providers from `[providers.models.<name>]`.
+    /// When `None`, fallback credentials are resolved from env vars only.
+    pub fallback_providers_config: Option<zeroclaw_config::providers::ProvidersConfig>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -733,6 +737,7 @@ impl Default for ProviderRuntimeOptions {
             provider_max_tokens: None,
             merge_system_into_user: false,
             provider_extra: None,
+            fallback_providers_config: None,
         }
     }
 }
@@ -776,6 +781,7 @@ pub fn provider_runtime_options_from_config(
         provider_max_tokens: fallback.and_then(|e| e.max_tokens),
         merge_system_into_user,
         provider_extra: fallback.and_then(|e| e.provider_extra.clone()),
+        fallback_providers_config: Some(config.providers.clone()),
     }
 }
 
@@ -1810,12 +1816,23 @@ pub fn create_resilient_provider_with_options(
 
         let (provider_name, profile_override) = parse_provider_profile(fallback);
 
-        // Each fallback provider resolves its own credential via provider-
-        // specific env vars (e.g. DEEPSEEK_API_KEY for "deepseek") instead
-        // of inheriting the primary provider's key. Passing `None` lets
-        // `resolve_provider_credential` check the correct env var for the
-        // fallback provider name.
-        //
+        // Look up api_key, base_url, and provider-type from [providers.models.<name>]
+        // before falling back to env var resolution. This makes fallback providers
+        // config-aware the same way the primary provider is. If no profile entry
+        // exists, resolve_provider_credential falls through to provider-specific env
+        // vars (e.g. XAI_API_KEY for "xai") as before.
+        let model_profile = options
+            .fallback_providers_config
+            .as_ref()
+            .and_then(|pc| pc.models.get(provider_name));
+        let config_api_key = model_profile.and_then(|m| m.api_key.as_deref());
+        let config_api_url = model_profile.and_then(|m| m.base_url.as_deref());
+        // If the profile has a name override (e.g. name = "ollama" for a custom
+        // profile key), use it as the actual provider type for the factory.
+        let actual_provider_name = model_profile
+            .and_then(|m| m.name.as_deref())
+            .unwrap_or(provider_name);
+
         // When a profile override is present (e.g. "openai-codex:second"),
         // propagate it through `auth_profile_override` so the provider
         // picks up the correct OAuth credential set.
@@ -1828,7 +1845,18 @@ pub fn create_resilient_provider_with_options(
             None => options.clone(),
         };
 
-        match create_provider_with_options(provider_name, None, &fallback_options) {
+        let create_result = match actual_provider_name {
+            "openai-codex" | "openai_codex" | "codex" => {
+                create_provider_with_options(actual_provider_name, config_api_key, &fallback_options)
+            }
+            _ => create_provider_with_url_and_options(
+                actual_provider_name,
+                config_api_key,
+                config_api_url,
+                &fallback_options,
+            ),
+        };
+        match create_result {
             Ok(provider) => providers.push((fallback.clone(), provider)),
             Err(_error) => {
                 tracing::warn!(
