@@ -186,6 +186,47 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 "cost_usd": cost_usd,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             }),
+            zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
+                provider,
+                model,
+                duration,
+                success,
+                error_message,
+                input_tokens,
+                output_tokens,
+            } => serde_json::json!({
+                "type": "llm_response",
+                "provider": provider,
+                "model": model,
+                "duration_ms": duration.as_millis(),
+                "success": success,
+                "error_message": error_message,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }),
+            zeroclaw_runtime::observability::ObserverEvent::TurnComplete => {
+                serde_json::json!({
+                    "type": "turn_complete",
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                })
+            }
+            zeroclaw_runtime::observability::ObserverEvent::CacheHit {
+                cache_type,
+                tokens_saved,
+            } => serde_json::json!({
+                "type": "cache_hit",
+                "cache_type": cache_type,
+                "tokens_saved": tokens_saved,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }),
+            zeroclaw_runtime::observability::ObserverEvent::CacheMiss { cache_type } => {
+                serde_json::json!({
+                    "type": "cache_miss",
+                    "cache_type": cache_type,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                })
+            }
             _ => return, // Skip events we don't broadcast
         };
 
