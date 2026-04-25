@@ -6,6 +6,15 @@ default_provider = "ollama"
 default_model = "llama3.2"
 default_temperature = 0.7
 
+[channels_config]
+message_timeout_secs = 300
+reply_precheck = false
+max_concurrent_per_channel = 4
+
+[skills]
+open_skills_enabled = false
+whitelist = []
+
 [gateway]
 port = 42617
 host = "[::]"

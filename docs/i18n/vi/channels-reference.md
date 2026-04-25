@@ -146,8 +146,11 @@ interrupt_on_new_message = false  # tùy chọn: hủy yêu cầu đang xử lý
 
 Lưu ý về Telegram:
 
+- `stream_mode = "partial"` gửi tin nhắn nháp có thể chỉnh sửa, cập nhật từng token khi LLM streaming, sau đó hoàn tất với văn bản đầy đủ. Tiến trình gọi tool (ví dụ "🤔 Thinking...", "🔧 Running shell...") được hiển thị trong quá trình thực thi tool.
+- `draft_update_interval_ms` điều khiển giới hạn tần suất chỉnh sửa trong chế độ partial (mặc định: 1000ms).
 - `interrupt_on_new_message = true` giữ lại các lượt người dùng bị gián đoạn trong lịch sử hội thoại, sau đó khởi động lại việc tạo nội dung với tin nhắn mới nhất.
 - Phạm vi gián đoạn rất chặt chẽ: cùng người gửi trong cùng chat. Tin nhắn từ các chat khác nhau được xử lý độc lập.
+- **Chế độ giọng nói**: Khi người dùng gửi tin nhắn thoại với `[transcription]` được bật, agent sẽ chuyển đổi (STT), trả lời bằng văn bản và cũng gửi phản hồi giọng nói TTS (yêu cầu `[tts]` được bật). Chế độ giọng nói được kích hoạt theo chat khi nhận tin nhắn thoại và tắt khi người dùng gửi văn bản. Phản hồi ngắn hơn 40 ký tự không được tổng hợp.
 
 ### 4.2 Discord
 

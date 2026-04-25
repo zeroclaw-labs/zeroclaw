@@ -140,6 +140,8 @@ Lưu ý:
 |---|---|---|
 | `open_skills_enabled` | `false` | Cho phép tải/đồng bộ kho `open-skills` cộng đồng |
 | `open_skills_dir` | chưa đặt | Đường dẫn cục bộ cho `open-skills` (mặc định `$HOME/open-skills` khi bật) |
+| `prompt_injection_mode` | `full` | Độ chi tiết prompt skill: `full` (nội tuyến) hoặc `compact` (chỉ tên/mô tả) |
+| `whitelist` | `[]` | Danh sách trắng tên skill. Rỗng = tải tất cả (mặc định). Không rỗng = chỉ tải skill được chỉ định. Hữu ích để giảm kích thước system prompt trên model ngữ cảnh thấp. |
 
 Lưu ý:
 
@@ -353,6 +355,7 @@ Route hint giúp tên tích hợp ổn định khi model ID thay đổi.
 | `provider` | _bắt buộc_ | Provider đích (phải khớp tên provider đã biết) |
 | `model` | _bắt buộc_ | Model sử dụng với provider đó |
 | `api_key` | chưa đặt | API key tùy chỉnh cho provider của route này (tùy chọn) |
+| `context_window` | chưa đặt | Kích thước context window tùy chỉnh cho route này (token). Hữu ích để giới hạn context trên backend có VRAM hạn chế. |
 
 ### `[[embedding_routes]]`
 
@@ -430,6 +433,8 @@ Cấu hình kênh cấp cao nằm dưới `channels_config`.
 | Khóa | Mặc định | Mục đích |
 |---|---|---|
 | `message_timeout_secs` | `300` | Thời gian chờ cơ bản (giây) cho xử lý tin nhắn kênh; runtime tự điều chỉnh theo độ sâu tool-loop (lên đến 4x) |
+| `reply_precheck` | `false` | Chạy kiểm tra ý định trả lời LLM trước khi phản hồi trong cuộc trò chuyện nhóm. Khi `true`, agent thực hiện cuộc gọi phân loại nhẹ để quyết định có nên trả lời không. Tin nhắn trực tiếp luôn bỏ qua kiểm tra này. |
+| `max_concurrent_per_channel` | `4` | Số request LLM đồng thời tối đa cho mỗi kênh. Giá trị thấp hơn ngăn bão hòa backend có slot hạn chế (ví dụ llama.cpp `--parallel 3`). |
 
 Ví dụ:
 
