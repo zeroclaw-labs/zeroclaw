@@ -31,16 +31,20 @@ model = "qwen3.6:35b-a3b" # Current preferred model
 App strings live in `crates/zeroclaw-runtime/locales/`. English is the source of truth and is embedded at compile time. Non-English locales are loaded from `~/.zeroclaw/workspace/locales/` at runtime.
 
 ```bash
-cargo fluent stats                                      # coverage per locale
-cargo fluent check                                      # validate .ftl syntax
-cargo fluent fill --locale ja --provider ollama         # fill missing keys
-cargo fluent fill --locale ja --provider ollama --force # retranslate everything
-cargo fluent scan                                       # find stale or missing keys vs Rust source
+cargo fluent stats                                          # coverage per locale
+cargo fluent check                                          # validate .ftl syntax
+cargo fluent fill --locale ja --provider ollama             # fill missing keys (default batch 50)
+cargo fluent fill --locale ja --provider ollama --batch 1   # one-at-a-time (use when a file has long entries that truncate at batch 50, e.g. tools.ftl)
+cargo fluent fill --locale ja --provider ollama --force     # retranslate everything
+cargo fluent scan                                           # find stale or missing keys vs Rust source
 ```
+
+Each batch is written to disk before the next API call, so a mid-run failure only loses the in-flight batch. Re-running skips keys that already exist in the target `.ftl`, so resume is automatic — no `--force` needed.
 
 After filling, copy the updated `.ftl` file to your workspace and rebuild to pick up the changes:
 
 ```bash
+mkdir -p ~/.zeroclaw/workspace/locales/ja
 cp crates/zeroclaw-runtime/locales/ja/cli.ftl ~/.zeroclaw/workspace/locales/ja/cli.ftl
 ```
 

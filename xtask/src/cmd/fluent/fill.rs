@@ -1,7 +1,7 @@
 use crate::util::*;
 use std::path::{Path, PathBuf};
 
-const BATCH_SIZE: usize = 50;
+const DEFAULT_BATCH_SIZE: usize = 50;
 
 struct Backend {
     base_url: String,
@@ -20,7 +20,12 @@ fn resolve_backend(provider: &str) -> anyhow::Result<Backend> {
     })
 }
 
-pub fn run(locale: Option<&str>, force: bool, provider: Option<&str>) -> anyhow::Result<()> {
+pub fn run(
+    locale: Option<&str>,
+    force: bool,
+    provider: Option<&str>,
+    batch: Option<usize>,
+) -> anyhow::Result<()> {
     let root = repo_root();
     let locales_dir = fluent_locales_dir(&root);
     let en_dir = locales_dir.join("en");
@@ -40,6 +45,7 @@ pub fn run(locale: Option<&str>, force: bool, provider: Option<&str>) -> anyhow:
         )
     })?;
     let backend = resolve_backend(provider_name)?;
+    let batch_size = batch.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
 
     for target_locale in &targets {
         let target_dir = locales_dir.join(target_locale);
@@ -49,7 +55,14 @@ pub fn run(locale: Option<&str>, force: bool, provider: Option<&str>) -> anyhow:
             let filename = ftl_path.file_name().unwrap();
             let target_ftl = target_dir.join(filename);
 
-            fill_ftl_file(&ftl_path, &target_ftl, target_locale, force, &backend)?;
+            fill_ftl_file(
+                &ftl_path,
+                &target_ftl,
+                target_locale,
+                force,
+                &backend,
+                batch_size,
+            )?;
         }
     }
 
@@ -62,6 +75,7 @@ fn fill_ftl_file(
     locale: &str,
     force: bool,
     backend: &Backend,
+    batch_size: usize,
 ) -> anyhow::Result<()> {
     let en_entries = parse_ftl(&std::fs::read_to_string(en_path)?);
     let mut target_entries: Vec<(String, String)> = if target_path.exists() {
@@ -95,7 +109,7 @@ fn fill_ftl_file(
 
     let locale_name = locale_display_name(locale);
 
-    for chunk in to_translate.chunks(BATCH_SIZE) {
+    for chunk in to_translate.chunks(batch_size) {
         let translated = call_api(backend, locale_name, chunk)?;
 
         // Merge: update existing or append new

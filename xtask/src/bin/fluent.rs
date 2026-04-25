@@ -22,6 +22,9 @@ enum Cmd {
         /// Provider name from [providers.models.<name>] in config.toml (e.g. my-ollama)
         #[arg(long)]
         provider: Option<String>,
+        /// Entries per API call (default: 50). Lower if the model truncates large JSON responses.
+        #[arg(long)]
+        batch: Option<usize>,
     },
     /// Show translation coverage per locale
     Stats,
@@ -37,7 +40,8 @@ fn main() -> anyhow::Result<()> {
             locale,
             force,
             provider,
-        } => cmd::fluent::fill::run(locale.as_deref(), force, provider.as_deref()),
+            batch,
+        } => cmd::fluent::fill::run(locale.as_deref(), force, provider.as_deref(), batch),
         Cmd::Stats => cmd::fluent::stats::run(),
         Cmd::Check => cmd::fluent::check::run(),
     }
