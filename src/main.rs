@@ -911,6 +911,55 @@ enum VaultCommands {
         #[command(subcommand)]
         legal_command: VaultLegalCommands,
     },
+    /// Domain corpus lifecycle (install / swap / build / publish)
+    Domain {
+        #[command(subcommand)]
+        domain_command: VaultDomainCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum VaultDomainCommands {
+    /// Show install state, file size, vault_documents/links counts.
+    Info,
+    /// Migrate legal rows from brain.db into domain.db.
+    Extract {
+        /// Delete migrated rows from brain.db after successful copy.
+        #[arg(long)]
+        delete: bool,
+    },
+    /// Fetch a manifest, verify the bundle, install at workspace.
+    Install {
+        #[arg(long)]
+        from: String,
+    },
+    /// Re-fetch from `MOA_DOMAIN_MANIFEST_URL`.
+    Update,
+    /// Same as install, with explicit "live connections must reconnect" warning.
+    Swap {
+        #[arg(long)]
+        from: String,
+    },
+    /// Remove the installed domain.db.
+    Uninstall,
+    /// Bake a fresh domain.db from a corpus directory.
+    Build {
+        corpus_dir: std::path::PathBuf,
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Emit a manifest JSON for a baked bundle.
+    Publish {
+        bundle: std::path::PathBuf,
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1478,6 +1527,36 @@ async fn main() -> Result<()> {
                 VaultLegalCommands::VendorDownload { force } => {
                     vault::legal::cli::vendor_download(&config, force).await
                 }
+            },
+            VaultCommands::Domain { domain_command } => match domain_command {
+                VaultDomainCommands::Info => vault::domain_cli::info(&config),
+                VaultDomainCommands::Extract { delete } => {
+                    vault::domain_cli::extract(&config, delete)
+                }
+                VaultDomainCommands::Install { from } => {
+                    vault::domain_cli::install(&config, &from).await
+                }
+                VaultDomainCommands::Update => vault::domain_cli::update(&config).await,
+                VaultDomainCommands::Swap { from } => {
+                    vault::domain_cli::swap(&config, &from).await
+                }
+                VaultDomainCommands::Uninstall => vault::domain_cli::uninstall(&config),
+                VaultDomainCommands::Build { corpus_dir, out } => {
+                    vault::domain_cli::build(&corpus_dir, &out).await
+                }
+                VaultDomainCommands::Publish {
+                    bundle,
+                    url,
+                    name,
+                    version,
+                    out,
+                } => vault::domain_cli::publish(
+                    &bundle,
+                    &url,
+                    &name,
+                    &version,
+                    out.as_deref(),
+                ),
             },
         },
 

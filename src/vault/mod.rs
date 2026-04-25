@@ -10,6 +10,9 @@
 pub mod briefing;
 pub mod converter;
 pub mod domain;
+pub mod domain_cli;
+pub mod domain_manifest;
+pub mod domain_migrate;
 pub mod health;
 pub mod hub;
 pub mod ingest;

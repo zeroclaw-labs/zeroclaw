@@ -413,6 +413,80 @@ pub enum VaultCommands {
         #[command(subcommand)]
         legal_command: VaultLegalCommands,
     },
+    /// Domain corpus lifecycle — install / swap / build / publish the
+    /// swappable `domain.db` (Korean legal, future medical, etc.).
+    Domain {
+        #[command(subcommand)]
+        domain_command: VaultDomainCommands,
+    },
+}
+
+/// `zeroclaw vault domain <subcommand>` — manage the swappable
+/// domain corpus DB at `<workspace>/memory/domain.db`.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VaultDomainCommands {
+    /// Show install state, file size, vault_documents/links counts.
+    Info,
+    /// Migrate legal rows from `brain.db` into `domain.db` (one-time
+    /// fixup for v7 → v8 upgrades). Default mode copies and keeps
+    /// the source rows intact; pass `--delete` to remove them after
+    /// successful copy.
+    Extract {
+        /// Delete migrated rows from brain.db after successful copy.
+        #[arg(long)]
+        delete: bool,
+    },
+    /// Fetch a manifest, verify the bundle SHA-256, and atomic-rename
+    /// into `<workspace>/memory/domain.db`. `<from>` may be an
+    /// http(s) URL or a local manifest path.
+    Install {
+        /// Manifest URL or filesystem path.
+        #[arg(long)]
+        from: String,
+    },
+    /// Re-fetch from the manifest URL stored in
+    /// `MOA_DOMAIN_MANIFEST_URL`. For one-off URLs use `install --from`.
+    Update,
+    /// Same as `install`, but emits a louder warning that any open
+    /// connections holding `domain.db` ATTACHed must reconnect.
+    Swap {
+        #[arg(long)]
+        from: String,
+    },
+    /// Remove the installed `domain.db` from the workspace. No-op
+    /// when no file is present. Caller must ensure no live process
+    /// has it ATTACHed.
+    Uninstall,
+    /// Bake a fresh `domain.db` from a corpus directory of legal
+    /// markdown files (statute + precedent). Refuses to overwrite
+    /// `--out`.
+    Build {
+        /// Corpus root (recursively walked).
+        corpus_dir: std::path::PathBuf,
+        /// Output bundle path (e.g. `./build/korean-legal-2026.01.db`).
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Compute the bundle's SHA-256 + size and write a manifest JSON
+    /// next to it. Operators upload both files to their bucket.
+    Publish {
+        /// Path to the baked bundle.
+        bundle: std::path::PathBuf,
+        /// Bundle URL as it will appear in the published manifest
+        /// (must match where you uploaded the bundle file).
+        #[arg(long)]
+        url: String,
+        /// Corpus name (e.g. `korean-legal`).
+        #[arg(long)]
+        name: String,
+        /// Corpus version (e.g. `2026.01`).
+        #[arg(long)]
+        version: String,
+        /// Manifest output path. Defaults to
+        /// `<bundle>.manifest.json` next to the bundle.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
 }
 
 /// `zeroclaw vault legal <subcommand>` — ingest Korean statute + precedent
