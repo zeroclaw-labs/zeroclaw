@@ -10,10 +10,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Serve docs locally with live-reload
+    /// Serve docs locally with live-reload. Without --locale, builds all
+    /// locales from locales.toml; with --locale, builds and watches only that one.
     Serve {
-        #[arg(long, default_value = "en")]
-        locale: String,
+        #[arg(long)]
+        locale: Option<String>,
     },
     /// Static build of all locales into docs/book/book/
     Build,
@@ -44,7 +45,7 @@ enum Cmd {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Serve { locale } => cmd::mdbook::serve::run(&locale),
+        Cmd::Serve { locale } => cmd::mdbook::serve::run(locale.as_deref()),
         Cmd::Build => cmd::mdbook::build::run(),
         Cmd::Refs => cmd::mdbook::refs::run(),
         Cmd::Sync {

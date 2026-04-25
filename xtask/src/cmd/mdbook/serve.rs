@@ -1,5 +1,6 @@
 use crate::cmd::mdbook::refs::{build_api, build_refs};
 use crate::util::*;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
@@ -8,13 +9,27 @@ use std::sync::{
 
 const PORT: u16 = 3000;
 
-pub fn run(locale: &str) -> anyhow::Result<()> {
+pub fn run(locale: Option<&str>) -> anyhow::Result<()> {
     let root = repo_root();
     require_tool("cargo", "https://rustup.rs")?;
     ensure_cargo_tool("mdbook", "mdbook")?;
     ensure_cargo_tool("mdbook-xgettext", "mdbook-i18n-helpers")?;
     ensure_cargo_tool("mdbook-gettext", "mdbook-i18n-helpers")?;
     ensure_cargo_tool("mdbook-mermaid", "mdbook-mermaid")?;
+
+    let entries = locale_entries();
+    if let Some(code) = locale
+        && !entries.iter().any(|e| e.code == code)
+    {
+        anyhow::bail!(
+            "locale '{code}' not in locales.toml (known: {})",
+            entries
+                .iter()
+                .map(|e| e.code.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     let ref_dir = ref_dir(&root);
     if !ref_dir.join("cli.md").exists() || !ref_dir.join("config.md").exists() {
@@ -27,16 +42,33 @@ pub fn run(locale: &str) -> anyhow::Result<()> {
     let book = book_dir(&root);
     let out_dir = book.join("book");
 
-    // Build all locales into book/{locale}/ so the URL has a locale segment
-    // and the language switcher renders correctly — mirrors production layout.
-    println!("==> Building all locales for serve...");
-    crate::cmd::mdbook::build::build_locales(&root)?;
+    // Lang switcher always advertises every locale from locales.toml — switching
+    // to an unbuilt locale will 404 in single-locale mode, which is fine for
+    // local iteration.
+    crate::cmd::mdbook::build::inject_lang_switcher_locales(&book, &entries)?;
+
+    // Watched locale: the one passed in, or the first entry in locales.toml.
+    let watch_locale = locale
+        .map(str::to_string)
+        .or_else(|| entries.first().map(|e| e.code.clone()))
+        .ok_or_else(|| anyhow::anyhow!("locales.toml has no entries"))?;
+
+    match locale {
+        Some(code) => {
+            println!("==> Building locale '{code}' for serve...");
+            build_one_locale(&book, code)?;
+        }
+        None => {
+            println!("==> Building all locales for serve...");
+            crate::cmd::mdbook::build::build_locales(&root)?;
+        }
+    }
     crate::cmd::mdbook::build::assemble(&root)?;
 
-    // Watch the selected locale for live-reload (rebuilds book/{locale}/ on change)
+    // Watch the active locale for live-reload (rebuilds book/{locale}/ on change)
     let mut watch = Command::new("mdbook")
-        .args(["watch", "-d", &format!("book/{locale}")])
-        .env("MDBOOK_BOOK__LANGUAGE", locale)
+        .args(["watch", "-d", &format!("book/{watch_locale}")])
+        .env("MDBOOK_BOOK__LANGUAGE", &watch_locale)
         .current_dir(&book)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -60,12 +92,28 @@ pub fn run(locale: &str) -> anyhow::Result<()> {
     });
 
     let url = format!("http://localhost:{PORT}");
-    println!("==> Serving all locales at {url}");
-    for entry in locale_entries() {
-        println!("    {:<16} {url}/{}/", entry.label, entry.code);
+    match locale {
+        Some(code) => {
+            let label = entries
+                .iter()
+                .find(|e| e.code == code)
+                .map(|e| e.label.as_str())
+                .unwrap_or(code);
+            println!("==> Serving locale '{code}' at {url}");
+            println!("    {label:<16} {url}/{code}/");
+            println!(
+                "    (other locales in the language switcher will 404 — run without --locale to build them all)"
+            );
+        }
+        None => {
+            println!("==> Serving all locales at {url}");
+            for entry in &entries {
+                println!("    {:<16} {url}/{}/", entry.label, entry.code);
+            }
+        }
     }
     println!("    API reference:  {url}/api/index.html");
-    println!("    Live-reload:    watching locale '{locale}'");
+    println!("    Live-reload:    watching locale '{watch_locale}'");
     println!("    Press Ctrl-C to stop.");
 
     let _ = Command::new("xdg-open")
@@ -81,6 +129,15 @@ pub fn run(locale: &str) -> anyhow::Result<()> {
     let _ = watch.wait();
 
     result
+}
+
+fn build_one_locale(book: &Path, locale: &str) -> anyhow::Result<()> {
+    run_cmd(
+        Command::new("mdbook")
+            .args(["build", "-d", &format!("book/{locale}")])
+            .env("MDBOOK_BOOK__LANGUAGE", locale)
+            .current_dir(book),
+    )
 }
 
 async fn serve_static(dir: std::path::PathBuf) -> anyhow::Result<()> {
