@@ -759,7 +759,10 @@ mod tests {
             keyword: Some("cats".into()),
             limit: Some(10),
         });
-        assert!(cats.is_empty(), "stale content should not match after update");
+        assert!(
+            cats.is_empty(),
+            "stale content should not match after update"
+        );
 
         let dogs = backend.search(&SessionQuery {
             keyword: Some("dogs".into()),
