@@ -3206,9 +3206,34 @@ pub async fn process_message(
     }
 
     let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
-    let model_name = fallback_provider_pm
-        .and_then(|e| e.model.clone())
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+    let model_name = match fallback_provider_pm
+        .and_then(|e| e.model.as_deref())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        Some(m) => m.to_string(),
+        None => match config.providers.resolve_default_model() {
+            Some(m) => {
+                tracing::warn!(
+                    provider = provider_name,
+                    model = %m,
+                    "fallback provider has no `model` set; using first configured \
+                     providers.models entry as default. Set [providers.models.{provider_name}] \
+                     model = \"...\" to silence this warning.",
+                );
+                m
+            }
+            None => {
+                anyhow::bail!(
+                    "no model configured: providers.fallback = {:?} resolves with no model, \
+                     and no [[providers.models.*]] entry has a `model` field set. \
+                     Configure at least one [providers.models.<name>] model = \"...\" \
+                     or define a [[model_routes]] hint.",
+                    config.providers.fallback,
+                )
+            }
+        },
+    };
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_from_config(&config);
     let provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
