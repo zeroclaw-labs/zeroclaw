@@ -29,12 +29,6 @@ concurrency:
   group: gh-pages
   cancel-in-progress: false
 
-env:
-  # Pinned to 0.5.0 to match the mdbook-mermaid 0.17.0 compile target —
-  # avoids "preprocessor was built against 0.5.0, called from 0.5.2" warning.
-  # Revisit when mdbook-mermaid ships against the latest mdbook minor.
-  MDBOOK_VERSION: v0.5.0
-
 jobs:
   deploy:
     runs-on: ubuntu-24.04-arm
@@ -43,9 +37,17 @@ jobs:
         with:
           fetch-depth: 1
 
+      # MDBOOK_BIN_VERSION is scoped to this step only. Workflow-level
+      # `MDBOOK_*` env vars leak into `cargo mdbook build` below — mdbook 0.5.0
+      # rejects unknown `MDBOOK_*` env vars as invalid config keys (#2942).
       - name: Install mdBook (aarch64 musl, ~3 MB)
+        env:
+          # Pinned to match the mdbook-mermaid 0.17.0 compile target — avoids
+          # "preprocessor was built against 0.5.0, called from 0.5.2" warning.
+          # Revisit when mdbook-mermaid ships against the latest mdbook minor.
+          MDBOOK_BIN_VERSION: v0.5.0
         run: |
-          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/${MDBOOK_VERSION}/mdbook-${MDBOOK_VERSION}-aarch64-unknown-linux-musl.tar.gz" \
+          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/${MDBOOK_BIN_VERSION}/mdbook-${MDBOOK_BIN_VERSION}-aarch64-unknown-linux-musl.tar.gz" \
             | tar -xz -C /usr/local/bin
 
       - name: Install Rust stable toolchain
