@@ -2144,6 +2144,138 @@ mod tests {
         }
     }
 
+    /// Streaming mock that emits narration text + tool call on the first turn,
+    /// then a plain text response on the second. Used to verify the streaming
+    /// path has the same duplicate-narration guard as the blocking path.
+    struct NarrationStreamProvider {
+        call_count: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl Provider for NarrationStreamProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::stream::{self, StreamExt};
+            let mut count = self.call_count.lock();
+            *count += 1;
+            if *count == 1 {
+                stream::iter(vec![
+                    Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                        zeroclaw_providers::traits::StreamChunk {
+                            delta: "I will echo the message.".into(),
+                            is_final: false,
+                            reasoning: None,
+                            token_count: 0,
+                        },
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::ToolCall(
+                        zeroclaw_providers::ToolCall {
+                            id: "tc1".into(),
+                            name: "echo".into(),
+                            arguments: "{}".into(),
+                        },
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            } else {
+                stream::iter(vec![
+                    Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                        zeroclaw_providers::traits::StreamChunk {
+                            delta: "done".into(),
+                            is_final: false,
+                            reasoning: None,
+                            token_count: 0,
+                        },
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_narration_with_tool_calls_produces_no_consecutive_assistant_entries() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let provider = Box::new(NarrationStreamProvider {
+            call_count: Arc::new(Mutex::new(0)),
+        });
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent.turn_streamed("hi", event_tx).await.unwrap();
+
+        let history = agent.history();
+        for window in history.windows(2) {
+            let prev_is_assistant_chat = matches!(
+                &window[0],
+                ConversationMessage::Chat(m) if m.role == "assistant"
+            );
+            let next_is_tool_calls =
+                matches!(&window[1], ConversationMessage::AssistantToolCalls { .. });
+            assert!(
+                !(prev_is_assistant_chat && next_is_tool_calls),
+                "streaming path: history contains Chat(assistant) immediately before \
+                 AssistantToolCalls — duplicate narration push was not removed"
+            );
+        }
+    }
+
     // ── Skill tool registration & excluded_tools filtering ──────────
 
     /// A mock tool whose name is configurable (unlike `MockTool` which is
