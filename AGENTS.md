@@ -138,7 +138,7 @@ Dev-operational contracts — files consumed by AI coding skills and development
 | `docs/contributing/reviewer-playbook.md` | `github-issue-triage` — triage governance |
 | `docs/contributing/pr-workflow.md` | `github-issue-triage` — triage discipline |
 | `docs/contributing/pr-discipline.md` | `github-issue-triage`, PR template — privacy rules |
-| `docs/foundations/fnd-00*.md` | `github-pr-review-session` — RFC reference data; public transparency documents |
+| `docs/book/src/foundations/fnd-00*.md` | `github-pr-review-session` — RFC reference data; public transparency documents |
 
 ## Linked References
 
