@@ -146,6 +146,16 @@ fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Val
         }
         PropKind::String | PropKind::Enum => Ok(toml::Value::String(value_str.to_string())),
         PropKind::StringArray => {
+            let trimmed = value_str.trim();
+            // Accept JSON/TOML array syntax: ["a", "b", "c"]
+            if trimmed.starts_with('[')
+                && let Ok(arr) = serde_json::from_str::<Vec<String>>(trimmed)
+            {
+                return Ok(toml::Value::Array(
+                    arr.into_iter().map(toml::Value::String).collect(),
+                ));
+            }
+            // Fall back to comma-separated input.
             let items = value_str
                 .split(',')
                 .map(|s| toml::Value::String(s.trim().to_string()))

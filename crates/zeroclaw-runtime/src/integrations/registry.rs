@@ -938,6 +938,7 @@ mod tests {
             recovery_key: None,
             password: None,
             mention_only: false,
+            approval_timeout_secs: 300,
         });
         let entries = all_integrations();
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();

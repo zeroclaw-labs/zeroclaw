@@ -1004,6 +1004,7 @@ impl Agent {
         &mut self,
         user_message: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<String> {
         // ── Preamble (identical to turn) ───────────────────────────────
         if self.history.is_empty() {
@@ -1050,6 +1051,14 @@ impl Agent {
 
         // ── Turn loop ──────────────────────────────────────────────────
         for _ in 0..self.config.max_tool_iterations {
+            // Early exit if the caller cancelled this turn (e.g. user abort)
+            if cancel_token
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                return Err(crate::agent::loop_::ToolLoopCancelled.into());
+            }
+
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
 
             // Response cache check (same as turn)
@@ -1116,8 +1125,29 @@ impl Agent {
             let mut streamed_tool_calls: Vec<zeroclaw_providers::traits::ToolCall> = Vec::new();
             let mut got_stream = false;
             let mut pre_executed_call_ids: HashMap<String, VecDeque<String>> = HashMap::new();
+            let mut was_cancelled = false;
 
-            while let Some(item) = stream.next().await {
+            // Consume the stream, checking for cancellation between chunks.
+            // We use a manual loop with `tokio::select!` so that a cancel
+            // signal interrupts even while waiting for the next SSE event
+            // from the provider.
+            loop {
+                let next_item = stream.next();
+
+                let item = if let Some(ref token) = cancel_token {
+                    tokio::select! {
+                        biased;
+                        () = token.cancelled() => {
+                            was_cancelled = true;
+                            break;
+                        }
+                        item = next_item => item,
+                    }
+                } else {
+                    next_item.await
+                };
+
+                let Some(item) = item else { break };
                 match item {
                     Ok(event) => match event {
                         zeroclaw_providers::traits::StreamEvent::TextDelta(chunk) => {
@@ -1183,6 +1213,22 @@ impl Agent {
             // Drop the stream so we release the borrow on provider.
             drop(stream);
 
+            // If cancelled during streaming, return partial content with
+            // the interruption marker appended. The caller (ws.rs) will
+            // persist this truncated message and send an abort frame.
+            if was_cancelled {
+                let partial = if streamed_text.is_empty() {
+                    "[interrupted by user]".to_string()
+                } else {
+                    format!("{streamed_text}\n\n[interrupted by user]")
+                };
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::assistant(
+                        partial.clone(),
+                    )));
+                return Err(crate::agent::loop_::ToolLoopCancelled.into());
+            }
+
             // If streaming produced text, use it as the response and
             // check for tool calls via the dispatcher.
             let response = if got_stream {
@@ -1194,23 +1240,31 @@ impl Agent {
                     reasoning_content: None,
                 }
             } else {
-                // Fall back to non-streaming chat
-                match self
-                    .provider
-                    .chat(
-                        ChatRequest {
-                            messages: &messages,
-                            tools: if self.tool_dispatcher.should_send_tool_specs() {
-                                Some(&self.tool_specs)
-                            } else {
-                                None
-                            },
+                // Fall back to non-streaming chat, with cancellation guard
+                let chat_fut = self.provider.chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: if self.tool_dispatcher.should_send_tool_specs() {
+                            Some(&self.tool_specs)
+                        } else {
+                            None
                         },
-                        &effective_model,
-                        self.temperature,
-                    )
-                    .await
-                {
+                    },
+                    &effective_model,
+                    self.temperature,
+                );
+                let chat_result = if let Some(ref token) = cancel_token {
+                    tokio::select! {
+                        biased;
+                        () = token.cancelled() => {
+                            return Err(crate::agent::loop_::ToolLoopCancelled.into());
+                        }
+                        result = chat_fut => result,
+                    }
+                } else {
+                    chat_fut.await
+                };
+                match chat_result {
                     Ok(resp) => resp,
                     Err(err) => return Err(err),
                 }
@@ -1978,7 +2032,7 @@ mod tests {
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
         let response = agent
-            .turn_streamed("use the echo tool", event_tx)
+            .turn_streamed("use the echo tool", event_tx, None)
             .await
             .unwrap();
         assert_eq!(response, "stream-done");
