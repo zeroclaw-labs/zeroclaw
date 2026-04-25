@@ -40,6 +40,9 @@
     clippy::manual_is_variant_and,
     clippy::collapsible_match,
     clippy::unused_async,
+    clippy::format_push_string,
+    clippy::single_char_add_str,
+    clippy::match_same_arms,
 )]
 
 use clap::Subcommand;
@@ -51,8 +54,6 @@ pub(crate) mod auth;
 pub mod brain;
 pub mod channels;
 pub mod config;
-#[cfg(feature = "createos")]
-pub mod createos;
 pub mod daemon;
 pub mod fdx;
 pub mod gateway;
@@ -72,8 +73,6 @@ pub mod tui;
 pub(crate) mod util;
 
 pub use config::Config;
-#[cfg(feature = "createos")]
-pub use createos::cli::CreateOsCommands;
 
 /// Channel management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,6 +158,21 @@ pub enum BrainCommands {
     Stats,
     /// Verify content hashes against disk
     Validate,
+    /// Compile per-agent prompts (AGENTS.md/SOUL.md/TOOLS.md) from ~/.brain/ into Paperclip's instructions directory
+    Compile {
+        /// Compile only one agent by id (UUID); default = all agents in default company
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// Force overwrite even if hash matches existing files
+        #[arg(long)]
+        force: bool,
+        /// Don't write — just print what would change
+        #[arg(long)]
+        dry_run: bool,
+        /// Override Paperclip API base URL (default http://127.0.0.1:3100, or $LW_PAPERCLIP_HOST)
+        #[arg(long)]
+        paperclip_host: Option<String>,
+    },
 }
 
 /// Migration subcommands

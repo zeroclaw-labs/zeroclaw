@@ -5,6 +5,7 @@
 //! and content-hash validation.
 
 pub mod cli;
+pub mod compile;
 pub mod db;
 pub mod index;
 #[cfg(feature = "brain")]

@@ -22,6 +22,36 @@ pub async fn handle_command(command: crate::BrainCommands) -> Result<()> {
         } => handle_query(&brain, &text, session, budget, top_k, &format, categories).await,
         crate::BrainCommands::Stats => handle_stats(&brain),
         crate::BrainCommands::Validate => handle_validate(&brain),
+        crate::BrainCommands::Compile {
+            agent_id,
+            force,
+            dry_run,
+            paperclip_host,
+        } => {
+            let opts = super::compile::CompileOptions {
+                brain_dir: brain_dir.clone(),
+                agent_id,
+                force,
+                dry_run,
+                paperclip_host: paperclip_host
+                    .or_else(|| std::env::var("LW_PAPERCLIP_HOST").ok())
+                    .unwrap_or_else(|| "http://127.0.0.1:3100".to_string()),
+            };
+            let report = super::compile::run(opts).await?;
+            println!(
+                "{} compile {}: total={} written={} skipped_unchanged={} failed={}",
+                style(">>>").cyan().bold(),
+                if report.dry_run { "(dry-run)" } else { "" },
+                report.total_agents,
+                report.written,
+                report.skipped_unchanged,
+                report.failed,
+            );
+            for err in &report.errors {
+                eprintln!("  {}: {err}", style("warn").yellow());
+            }
+            Ok(())
+        }
     }
 }
 

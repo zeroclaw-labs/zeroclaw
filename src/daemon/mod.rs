@@ -43,10 +43,7 @@ pub mod exit_code {
 }
 
 /// Daemon entry point — runs the main event loop.
-pub async fn run_daemon(
-    config: DaemonConfig,
-    app_config: Option<&crate::config::Config>,
-) -> Result<()> {
+pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     // Install panic handler — ensures non-zero exit on panic so launchd restarts
     std::panic::set_hook(Box::new(|info| {
         eprintln!("Augusta daemon panicked: {info}");
@@ -68,14 +65,6 @@ pub async fn run_daemon(
     tracing::info!("Socket: {}", config.socket_path.display());
 
     crate::tui::event_bus::emit("daemon", "system", "agent_started", "Daemon started");
-
-    // Start createOS local-first sync if configured
-    #[cfg(feature = "createos")]
-    let createos_db = if let Some(cfg) = app_config {
-        start_createos_sync(cfg).await
-    } else {
-        None
-    };
 
     // Remove stale socket
     let _ = std::fs::remove_file(&config.socket_path);
@@ -131,13 +120,6 @@ pub async fn run_daemon(
 
     health_handle.abort();
 
-    // Disconnect createOS sync gracefully
-    #[cfg(feature = "createos")]
-    if let Some(ref db) = createos_db {
-        tracing::info!("Disconnecting createOS sync...");
-        db.disconnect().await;
-    }
-
     tracing::info!("Shutting down Augusta daemon");
     crate::tui::event_bus::emit("daemon", "system", "agent_stopped", "Daemon stopped");
 
@@ -147,58 +129,6 @@ pub async fn run_daemon(
     let _ = std::fs::remove_file(&config.heartbeat_path);
 
     Ok(())
-}
-
-/// Start createOS local-first database and connect to PowerSync for sync.
-///
-/// Returns the database handle if successfully started, or None if disabled/failed.
-#[cfg(feature = "createos")]
-async fn start_createos_sync(
-    config: &crate::config::Config,
-) -> Option<crate::createos::CreateOsDb> {
-    let cos = &config.createos;
-    if !cos.enabled {
-        tracing::debug!("createOS sync disabled");
-        return None;
-    }
-
-    if cos.api_base.is_empty() || cos.tenant.is_empty() {
-        tracing::warn!("createOS enabled but api_base or tenant not configured — skipping sync");
-        return None;
-    }
-
-    tracing::info!("Starting createOS local-first database...");
-
-    let db = match crate::createos::CreateOsDb::open(&config.workspace_dir) {
-        Ok(db) => db,
-        Err(e) => {
-            tracing::error!("Failed to open createOS database: {e}");
-            return None;
-        }
-    };
-
-    tracing::info!("createOS database: {}", db.db_path().display());
-
-    // Build connector config — device_id from HOSTNAME env or fallback
-    let device_id = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("HOST"))
-        .unwrap_or_else(|_| format!("augusta-{}", std::process::id()));
-
-    let connector_config = crate::createos::connector::ConnectorConfig {
-        api_base: cos.api_base.clone(),
-        tenant: cos.tenant.clone(),
-        device_id,
-        api_key: config.api_key.clone(),
-    };
-
-    if let Err(e) = db.connect(connector_config).await {
-        tracing::error!("Failed to connect createOS sync: {e}");
-        // Database still usable offline
-    } else {
-        tracing::info!("createOS sync connected (tenant: {})", cos.tenant);
-    }
-
-    Some(db)
 }
 
 /// Handle a single IPC client connection.
