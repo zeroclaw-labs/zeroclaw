@@ -195,9 +195,17 @@ Slack 监听行为：
 [channels_config.mattermost]
 url = \"https://mm.example.com\"
 bot_token = \"mattermost-token\"
-channel_id = \"channel-id\"          # 监听所需
+channel_id = \"channel-id\"          # 可选：单频道回退配置
+channel_ids = [\"channel-id\"]       # 可选：显式频道列表，优先于 channel_id
 allowed_users = [\"*\"]
 ```
+
+Mattermost 监听行为：
+
+- `channel_ids = ["chan-a", "chan-b"]`：仅监听列出的频道或私信。
+- `channel_id = "chan-a"`：仅监听这一个频道。
+- `channel_id = "*"` 或两者都为空：自动发现并监听所有可访问的频道和私信。
+- 两者同时设置时，`channel_ids` 优先。
 
 ### 4.5 Matrix
 

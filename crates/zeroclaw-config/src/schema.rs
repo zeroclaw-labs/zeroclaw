@@ -7114,10 +7114,21 @@ pub struct MattermostConfig {
     /// Mattermost server URL (e.g. `"https://mattermost.example.com"`).
     pub url: String,
     /// Mattermost bot access token.
+    /// Optional when `bot_id` + `bot_password` are provided; the channel will
+    /// obtain a session token via `POST /api/v4/users/login` at runtime.
     #[secret]
-    pub bot_token: String,
+    #[serde(default)]
+    pub bot_token: Option<String>,
     /// Optional channel ID to restrict the bot to a single channel.
+    /// When both `channel_id` and `channel_ids` are set, `channel_ids` takes precedence.
     pub channel_id: Option<String>,
+    /// Optional list of channel IDs to monitor simultaneously. Takes
+    /// precedence over `channel_id`. When empty, falls back to `channel_id`.
+    /// Use `["*"]`, or leave both `channel_id` and `channel_ids` empty, to
+    /// listen on **all** channels the bot has access to (including DMs) via
+    /// wildcard / auto-discovery mode.
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
     /// Allowed Mattermost user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
@@ -7137,6 +7148,20 @@ pub struct MattermostConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Listening mode: `"polling"` (default) or `"websocket"`.
+    /// WebSocket mode benefits from real-time event streaming with no polling latency.
+    /// Both modes accept either a static `bot_token` or login credentials
+    /// (`bot_id` + `bot_password`).
+    #[serde(default)]
+    pub listen_mode: Option<String>,
+    /// Bot ID (username or email) for login-based authentication.
+    /// Used with `bot_password` to obtain a session token via `POST /api/v4/users/login`.
+    #[serde(default)]
+    pub bot_id: Option<String>,
+    /// Bot password for login-based authentication.
+    #[secret]
+    #[serde(default)]
+    pub bot_password: Option<String>,
 }
 
 impl ChannelConfig for MattermostConfig {
@@ -13149,6 +13174,63 @@ bot_token = "xoxb-tok"
         let json = r#"{"url":"https://mm.example.com","bot_token":"tok"}"#;
         let parsed: MattermostConfig = serde_json::from_str(json).unwrap();
         assert!(!parsed.interrupt_on_new_message);
+    }
+
+    #[test]
+    async fn mattermost_config_toml_backward_compat() {
+        let toml_str = r#"
+url = "https://mm.example.com"
+bot_token = "tok"
+channel_id = "channel-a"
+"#;
+        let parsed: MattermostConfig = toml::from_str(toml_str).unwrap();
+        assert!(parsed.channel_ids.is_empty());
+        assert!(parsed.allowed_users.is_empty());
+        assert_eq!(parsed.thread_replies, None);
+        assert_eq!(parsed.mention_only, None);
+        assert!(!parsed.interrupt_on_new_message);
+        assert_eq!(parsed.channel_id.as_deref(), Some("channel-a"));
+        assert_eq!(parsed.bot_token.as_deref(), Some("tok"));
+    }
+
+    #[test]
+    async fn mattermost_config_toml_accepts_channel_ids() {
+        let toml_str = r#"
+url = "https://mm.example.com"
+bot_token = "tok"
+channel_ids = ["chan-a", "dm-b"]
+"#;
+        let parsed: MattermostConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.channel_ids, vec!["chan-a", "dm-b"]);
+        assert!(parsed.channel_id.is_none());
+    }
+
+    #[test]
+    async fn mattermost_config_toml_accepts_both_channel_selectors() {
+        let toml_str = r#"
+url = "https://mm.example.com"
+bot_token = "tok"
+channel_id = "fallback-chan"
+channel_ids = ["chan-a", "chan-b"]
+"#;
+        let parsed: MattermostConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.channel_id.as_deref(), Some("fallback-chan"));
+        assert_eq!(parsed.channel_ids, vec!["chan-a", "chan-b"]);
+    }
+
+    #[test]
+    async fn mattermost_config_toml_accepts_login_auth() {
+        let toml_str = r#"
+url = "https://mm.example.com"
+bot_id = "bot-user"
+bot_password = "secret"
+listen_mode = "websocket"
+"#;
+        let parsed: MattermostConfig = toml::from_str(toml_str).unwrap();
+        assert!(parsed.bot_token.is_none());
+        assert_eq!(parsed.bot_id.as_deref(), Some("bot-user"));
+        assert_eq!(parsed.bot_password.as_deref(), Some("secret"));
+        assert_eq!(parsed.listen_mode.as_deref(), Some("websocket"));
     }
 
     #[test]

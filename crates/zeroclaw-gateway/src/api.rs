@@ -1018,7 +1018,8 @@ fn mask_sensitive_fields(
         mask_optional_secret(&mut slack.app_token);
     }
     if let Some(mattermost) = masked.channels.mattermost.as_mut() {
-        mask_required_secret(&mut mattermost.bot_token);
+        mask_optional_secret(&mut mattermost.bot_token);
+        mask_optional_secret(&mut mattermost.bot_password);
     }
     if let Some(webhook) = masked.channels.webhook.as_mut() {
         mask_optional_secret(&mut webhook.secret);
@@ -1157,7 +1158,8 @@ fn restore_masked_sensitive_fields(
         incoming.channels.mattermost.as_mut(),
         current.channels.mattermost.as_ref(),
     ) {
-        restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
+        restore_optional_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
+        restore_optional_secret(&mut incoming_ch.bot_password, &current_ch.bot_password);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels.webhook.as_mut(),
