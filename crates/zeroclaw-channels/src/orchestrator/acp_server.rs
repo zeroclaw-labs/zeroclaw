@@ -10,10 +10,11 @@
 //!
 //! | Method            | Description                              |
 //! |-------------------|------------------------------------------|
-//! | `initialize`      | Handshake — returns server capabilities  |
+//! | `initialize`      | Handshake — returns server capabilities (incl. defaultModel) |
 //! | `session/new`     | Create an isolated agent session          |
-//! | `session/prompt`  | Send a prompt, stream back events         |
+//! | `session/prompt`  | Send a prompt, stream back `session/update` events |
 //! | `session/stop`    | Gracefully terminate a session            |
+//! | `session/update`  | Streaming events and bidirectional events |
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 use zeroclaw_config::schema::Config;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
@@ -127,7 +128,7 @@ impl AcpServer {
     /// Run the ACP server, reading JSON-RPC requests from stdin and writing
     /// responses/notifications to stdout.
     pub async fn run(&self) -> Result<()> {
-        info!(
+        debug!(
             "ACP server starting (max_sessions={}, timeout={}s)",
             self.acp_config.max_sessions, self.acp_config.session_timeout_secs
         );
@@ -148,7 +149,7 @@ impl AcpServer {
                 sessions.retain(|id, session| {
                     let expired = session.last_active.elapsed() > timeout;
                     if expired {
-                        info!("Session {id} expired after inactivity");
+                        debug!("Session {id} expired after inactivity");
                     }
                     !expired
                 });
@@ -163,7 +164,7 @@ impl AcpServer {
             line.clear();
             let bytes_read = reader.read_line(&mut line).await?;
             if bytes_read == 0 {
-                info!("ACP server: stdin closed, shutting down");
+                debug!("ACP server: stdin closed, shutting down");
                 break;
             }
 
@@ -203,6 +204,7 @@ impl AcpServer {
             "session/new" => self.handle_session_new(&request.params).await,
             "session/prompt" => self.handle_session_prompt(&request.params, &id).await,
             "session/stop" => self.handle_session_stop(&request.params).await,
+            "session/event" | "session/update" => self.handle_session_event(&request.params).await,
             _ => Err(RpcError {
                 code: METHOD_NOT_FOUND,
                 message: format!("Method not found: {}", request.method),
@@ -222,6 +224,13 @@ impl AcpServer {
     // ── Method handlers ──────────────────────────────────────────
 
     fn handle_initialize(&self, _params: &Value) -> RpcResult {
+        let default_model = self
+            .config
+            .providers
+            .fallback_provider()
+            .and_then(|e| e.model.clone())
+            .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string());
+
         Ok(serde_json::json!({
             "protocolVersion": "1.0",
             "serverInfo": {
@@ -232,12 +241,15 @@ impl AcpServer {
                 "streaming": true,
                 "maxSessions": self.acp_config.max_sessions,
                 "sessionTimeoutSecs": self.acp_config.session_timeout_secs,
+                "defaultModel": default_model,
             },
             "methods": [
                 "initialize",
                 "session/new",
                 "session/prompt",
                 "session/stop",
+                "session/update",
+                "session/event",  // legacy
             ],
         }))
     }
@@ -286,7 +298,7 @@ impl AcpServer {
             },
         );
 
-        info!("Created session {session_id} (workspace: {workspace_dir})");
+        debug!("Created session {session_id} (workspace: {workspace_dir})");
 
         Ok(serde_json::json!({
             "sessionId": session_id,
@@ -306,15 +318,7 @@ impl AcpServer {
             })?
             .to_string();
 
-        let prompt = params
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| RpcError {
-                code: INVALID_PARAMS,
-                message: "Missing required parameter: prompt".to_string(),
-                data: None,
-            })?
-            .to_string();
+        let prompt = Self::parse_prompt(params)?;
 
         // Remove the session from the map so we can take mutable ownership of
         // the Agent for the duration of the turn. It will be reinserted after.
@@ -336,49 +340,69 @@ impl AcpServer {
         // the whole Session and returns it alongside the result so we can
         // put the session back into the map afterwards.
         let turn_handle = tokio::spawn(async move {
-            let result = session.agent.turn_streamed(&prompt, event_tx).await;
+            let result = session.agent.turn_streamed(&prompt, event_tx, None).await;
             (session, result)
         });
 
-        // Forward events as they arrive
+        // Forward events as they arrive. Use standard ACP `session/update`
+        // notifications with `sessionUpdate` + structured `content` so that
+        // clients like agentic.nvim route them to MessageWriter.
         while let Some(event) = event_rx.recv().await {
             let notification = match &event {
                 TurnEvent::Chunk { delta } => JsonRpcNotification {
                     jsonrpc: "2.0",
-                    method: "session/event",
+                    method: "session/update",
                     params: serde_json::json!({
                         "sessionId": session_id,
-                        "type": "chunk",
-                        "content": delta,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {
+                                "type": "text",
+                                "text": delta
+                            }
+                        }
                     }),
                 },
                 TurnEvent::ToolCall { name, args } => JsonRpcNotification {
                     jsonrpc: "2.0",
-                    method: "session/event",
+                    method: "session/update",
                     params: serde_json::json!({
                         "sessionId": session_id,
-                        "type": "tool_call",
-                        "name": name,
-                        "args": args,
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": name,  // simplistic; full impl would generate UUID
+                            "name": name,
+                            "kind": "other",
+                            "argument": args,
+                            "status": "pending"
+                        }
                     }),
                 },
                 TurnEvent::ToolResult { name, output } => JsonRpcNotification {
                     jsonrpc: "2.0",
-                    method: "session/event",
+                    method: "session/update",
                     params: serde_json::json!({
                         "sessionId": session_id,
-                        "type": "tool_result",
-                        "name": name,
-                        "output": output,
+                        "update": {
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": name,
+                            "status": "completed",
+                            "body": output
+                        }
                     }),
                 },
                 TurnEvent::Thinking { delta } => JsonRpcNotification {
                     jsonrpc: "2.0",
-                    method: "session/event",
+                    method: "session/update",
                     params: serde_json::json!({
                         "sessionId": session_id,
-                        "type": "thinking",
-                        "content": delta,
+                        "update": {
+                            "sessionUpdate": "agent_thought_chunk",
+                            "content": {
+                                "type": "text",
+                                "text": delta
+                            }
+                        }
                     }),
                 },
             };
@@ -407,8 +431,41 @@ impl AcpServer {
 
         Ok(serde_json::json!({
             "sessionId": session_id,
-            "content": result,
+            "stopReason": "end_turn",
+            "content": result,  // full assembled response for clients that expect it
         }))
+    }
+
+    fn parse_prompt(params: &Value) -> std::result::Result<String, RpcError> {
+        match params.get("prompt") {
+            Some(Value::String(s)) => Ok(s.clone()),
+            Some(Value::Array(arr)) => {
+                let mut joined = String::new();
+                for part in arr {
+                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                        if !joined.is_empty() {
+                            joined.push_str("\n\n");
+                        }
+                        joined.push_str(text);
+                    }
+                }
+                if joined.is_empty() {
+                    return Err(RpcError {
+                        code: INVALID_PARAMS,
+                        message: "Parameter 'prompt' array must contain at least one text part"
+                            .to_string(),
+                        data: None,
+                    });
+                }
+                Ok(joined)
+            }
+            _ => Err(RpcError {
+                code: INVALID_PARAMS,
+                message: "Missing required parameter: prompt (must be string or array of parts)"
+                    .to_string(),
+                data: None,
+            }),
+        }
     }
 
     async fn handle_session_stop(&self, params: &Value) -> RpcResult {
@@ -424,10 +481,54 @@ impl AcpServer {
 
         let mut sessions = self.sessions.lock().await;
         if sessions.remove(session_id).is_some() {
-            info!("Stopped session {session_id}");
+            debug!("Stopped session {session_id}");
             Ok(serde_json::json!({
                 "sessionId": session_id,
                 "stopped": true,
+            }))
+        } else {
+            Err(RpcError {
+                code: SESSION_NOT_FOUND,
+                message: format!("Session not found: {session_id}"),
+                data: None,
+            })
+        }
+    }
+
+    /// Handle incoming `session/update` (or legacy `session/event`) notifications.
+    ///
+    /// This processes bidirectional events for an active session (e.g. tool results,
+    /// status updates, or client-side events). Currently updates session activity
+    /// to prevent premature reaping; future extensions can route specific event
+    /// types into the Agent.
+    async fn handle_session_event(&self, params: &Value) -> RpcResult {
+        let session_id = params
+            .get("sessionId")
+            .or_else(|| params.get("session_id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RpcError {
+                code: INVALID_PARAMS,
+                message: "Missing required parameter: sessionId".to_string(),
+                data: None,
+            })?
+            .to_string();
+
+        let event_type = params
+            .get("type")
+            .or_else(|| params.get("update").and_then(|u| u.get("sessionUpdate")))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        debug!("Received session update (type={event_type}) for session {session_id}");
+
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&session_id) {
+            session.last_active = Instant::now();
+            Ok(serde_json::json!({
+                "sessionId": session_id,
+                "type": event_type,
+                "status": "processed"
             }))
         } else {
             Err(RpcError {
@@ -494,6 +595,7 @@ impl AcpServer {
 
 // ── Error helper ─────────────────────────────────────────────────
 
+#[derive(Debug)]
 struct RpcError {
     code: i32,
     message: String,
@@ -540,9 +642,9 @@ mod tests {
 
     #[test]
     fn json_rpc_request_parse_notification() {
-        let json = r#"{"jsonrpc":"2.0","method":"session/event","params":{}}"#;
+        let json = r#"{"jsonrpc":"2.0","method":"session/update","params":{}}"#;
         let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.method, "session/event");
+        assert_eq!(req.method, "session/update");
         assert!(req.id.is_none());
     }
 
@@ -585,11 +687,55 @@ mod tests {
     fn json_rpc_notification_serialize() {
         let notif = JsonRpcNotification {
             jsonrpc: "2.0",
-            method: "session/event",
-            params: serde_json::json!({"type": "chunk", "content": "hello"}),
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": "test-sid",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "hello" }
+                }
+            }),
         };
         let json = serde_json::to_string(&notif).unwrap();
-        assert!(json.contains(r#""method":"session/event""#));
-        assert!(json.contains(r#""content":"hello""#));
+        assert!(json.contains(r#""method":"session/update""#));
+        assert!(json.contains(r#""sessionUpdate":"agent_message_chunk""#));
+        assert!(json.contains(r#""text":"hello""#));
+    }
+
+    #[test]
+    fn test_prompt_parsing() {
+        // String prompt
+        let string_params = serde_json::json!({"prompt": "hello world"});
+        let result = AcpServer::parse_prompt(&string_params).unwrap();
+        assert_eq!(result, "hello world");
+
+        // Array prompt (valid)
+        let array_params = serde_json::json!({
+            "prompt": [
+                {"type": "text", "text": "part 1"},
+                {"type": "text", "text": "part 2"}
+            ]
+        });
+        let result = AcpServer::parse_prompt(&array_params).unwrap();
+        assert_eq!(result, "part 1\n\npart 2");
+
+        // Array prompt (empty or no text)
+        let empty_array_params = serde_json::json!({"prompt": []});
+        let result = AcpServer::parse_prompt(&empty_array_params);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, INVALID_PARAMS);
+
+        let no_text_params = serde_json::json!({
+            "prompt": [
+                {"type": "image", "data": "..."}
+            ]
+        });
+        let result = AcpServer::parse_prompt(&no_text_params);
+        assert!(result.is_err());
+
+        // Missing prompt
+        let missing_params = serde_json::json!({});
+        let result = AcpServer::parse_prompt(&missing_params);
+        assert!(result.is_err());
     }
 }

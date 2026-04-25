@@ -555,6 +555,12 @@ pub struct ModelProviderConfig {
     /// Merge system messages into first user message.
     #[serde(default)]
     pub merge_system_into_user: bool,
+    /// Extra JSON parameters to include in API requests.
+    /// Merged at the top level of the request body, allowing provider-specific
+    /// features (routing, transforms, etc.) without code changes.
+    /// Example: `provider_extra = { provider = { only = ["Anthropic"] } }`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_extra: Option<serde_json::Value>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
@@ -1660,6 +1666,10 @@ pub struct SkillsConfig {
     /// Default: `false` (secure by default).
     #[serde(default)]
     pub allow_scripts: bool,
+    /// URL of the skills registry repository for bare-name installs.
+    /// Default: `https://github.com/zeroclaw-labs/zeroclaw-skills`
+    #[serde(default)]
+    pub registry_url: Option<String>,
     /// Controls how skills are injected into the system prompt.
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
@@ -5064,6 +5074,30 @@ impl Default for StorageProviderConfig {
 /// and memory snapshot/hydration.
 /// Configuration for Qdrant vector database backend (`[memory.qdrant]`).
 /// Used when `[memory].backend = "qdrant"`.
+/// PostgreSQL memory backend configuration (`[memory.postgres]` section).
+/// Used when `[memory].backend = "postgres"`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "memory.postgres"]
+pub struct PostgresMemoryConfig {
+    /// Enable pgvector extension for hybrid vector+keyword recall.
+    #[serde(default)]
+    pub vector_enabled: bool,
+
+    /// Vector dimensions for pgvector embeddings (default: 1536).
+    #[serde(default = "default_pgvector_dimensions")]
+    pub vector_dimensions: usize,
+}
+
+impl Default for PostgresMemoryConfig {
+    fn default() -> Self {
+        Self {
+            vector_enabled: false,
+            vector_dimensions: default_pgvector_dimensions(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "memory.qdrant"]
@@ -5115,8 +5149,9 @@ pub enum SearchMode {
 #[prefix = "memory"]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
-    /// "sqlite" | "lucid" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
+    /// "sqlite" | "lucid" | "postgres" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
     ///
+    /// `postgres` uses `[storage.provider.config].db_url`; requires `--features memory-postgres` build.
     /// `qdrant` uses `[memory.qdrant]` config or `QDRANT_URL` env var.
     pub backend: String,
     /// Auto-save user-stated conversation input to memory (assistant output is excluded)
@@ -5238,6 +5273,13 @@ pub struct MemoryConfig {
     #[serde(default)]
     #[nested]
     pub qdrant: QdrantConfig,
+
+    // ── PostgreSQL backend options ─────────────────────────────
+    /// Configuration for PostgreSQL memory backend (`[memory.postgres]`).
+    /// Only used when `backend = "postgres"`.
+    #[serde(default)]
+    #[nested]
+    pub postgres: PostgresMemoryConfig,
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
@@ -5276,6 +5318,10 @@ fn default_conflict_threshold() -> f64 {
 }
 fn default_audit_retention_days() -> u32 {
     30
+}
+
+fn default_pgvector_dimensions() -> usize {
+    1536
 }
 
 fn default_embedding_provider() -> String {
@@ -5361,6 +5407,7 @@ impl Default for MemoryConfig {
             policy: MemoryPolicyConfig::default(),
             sqlite_open_timeout_secs: None,
             qdrant: QdrantConfig::default(),
+            postgres: PostgresMemoryConfig::default(),
         }
     }
 }
@@ -5383,6 +5430,15 @@ pub struct ObservabilityConfig {
     #[serde(default)]
     pub otel_service_name: Option<String>,
 
+    /// Optional HTTP headers sent with every OTLP export request (e.g. authorization).
+    /// Specified as key-value pairs in TOML:
+    /// ```toml
+    /// [observability.otel_headers]
+    /// Authorization = "Bearer sk-..."
+    /// ```
+    #[serde(default)]
+    pub otel_headers: Option<std::collections::HashMap<String, String>>,
+
     /// Runtime trace storage mode: "none" | "rolling" | "full".
     /// Controls whether model replies and tool-call diagnostics are persisted.
     #[serde(default = "default_runtime_trace_mode")]
@@ -5403,6 +5459,7 @@ impl Default for ObservabilityConfig {
             backend: "none".into(),
             otel_endpoint: None,
             otel_service_name: None,
+            otel_headers: None,
             runtime_trace_mode: default_runtime_trace_mode(),
             runtime_trace_path: default_runtime_trace_path(),
             runtime_trace_max_entries: default_runtime_trace_max_entries(),
@@ -6183,6 +6240,10 @@ pub struct CronJobDecl {
     /// Allowlist of tool names for agent jobs.
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
+    /// Whether to recall and inject memory context before this agent job runs.
+    /// Defaults to `true`; set to `false` for stateless digest jobs.
+    #[serde(default = "default_true")]
+    pub uses_memory: bool,
     /// Session target: `"isolated"` (default) or `"main"`.
     #[serde(default)]
     pub session_target: Option<String>,
@@ -6536,6 +6597,9 @@ pub struct ChannelsConfig {
     #[cfg(feature = "voice-wake")]
     #[nested]
     pub voice_wake: Option<VoiceWakeConfig>,
+    /// Voice duplex configuration (full-duplex voice over WebSocket).
+    #[nested]
+    pub voice_duplex: Option<VoiceDuplexConfig>,
     /// MQTT channel configuration (SOP listener).
     #[nested]
     pub mqtt: Option<MqttConfig>,
@@ -6764,6 +6828,7 @@ impl Default for ChannelsConfig {
             voice_call: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
+            voice_duplex: None,
             mqtt: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
@@ -6797,6 +6862,14 @@ fn default_draft_update_interval_ms() -> u64 {
 
 fn default_multi_message_delay_ms() -> u64 {
     800
+}
+
+fn default_telegram_approval_timeout_secs() -> u64 {
+    120
+}
+
+fn default_channel_approval_timeout_secs() -> u64 {
+    300
 }
 
 fn default_matrix_draft_update_interval_ms() -> u64 {
@@ -6839,6 +6912,10 @@ pub struct TelegramConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// How long (seconds) to wait for the operator to tap an inline-keyboard
+    /// button on a tool approval prompt before auto-denying. Default: 120.
+    #[serde(default = "default_telegram_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -6900,6 +6977,9 @@ pub struct DiscordConfig {
     /// and retry if no progress is made within this duration. 0 = disabled.
     #[serde(default)]
     pub stall_timeout_secs: u64,
+    /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -7005,6 +7085,9 @@ pub struct SlackConfig {
     /// Leave unset to disable reaction-based cancellation.
     #[serde(default)]
     pub cancel_reaction: Option<String>,
+    /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
 }
 
 fn default_slack_draft_update_interval_ms() -> u64 {
@@ -7177,6 +7260,9 @@ pub struct MatrixConfig {
     #[secret]
     #[serde(default)]
     pub password: Option<String>,
+    /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -7218,6 +7304,9 @@ pub struct SignalConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
 }
 
 impl ChannelConfig for SignalConfig {
@@ -7343,6 +7432,9 @@ pub struct WhatsAppConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
 }
 
 impl ChannelConfig for WhatsAppConfig {
@@ -7832,6 +7924,10 @@ pub struct FeishuConfig {
     /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, only respond to messages that @-mention the bot in groups.
+    /// Direct messages are always processed.
+    #[serde(default)]
+    pub mention_only: bool,
     /// Event receive mode: "websocket" (default) or "webhook"
     #[serde(default)]
     pub receive_mode: LarkReceiveMode,
@@ -8572,6 +8668,19 @@ impl ChannelConfig for BlueskyConfig {
     fn desc() -> &'static str {
         "AT Protocol"
     }
+}
+
+/// Voice duplex configuration (`[channels.voice_duplex]`).
+///
+/// Enables full-duplex voice event handling over WebSocket.
+/// When disabled (default), voice events are rejected as unknown types.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct VoiceDuplexConfig {
+    /// Enable full-duplex voice event handling over WebSocket.
+    /// Default: false. When false, voice events are rejected as unknown types.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// Voice wake word detection channel configuration.
@@ -9869,7 +9978,16 @@ impl Config {
         }
 
         if let Some(base_url) = base_url {
-            self.providers.fallback = Some(format!("custom:{base_url}"));
+            let canonical_key = format!("custom:{base_url}");
+            // Mirror the profile under the canonical key so runtime
+            // `fallback_provider()` lookups resolve — without this the rename
+            // would orphan the entry still keyed under the original profile name.
+            if !self.providers.models.contains_key(&canonical_key)
+                && let Some(entry) = self.providers.models.get(&profile_key).cloned()
+            {
+                self.providers.models.insert(canonical_key.clone(), entry);
+            }
+            self.providers.fallback = Some(canonical_key);
         }
     }
 
@@ -11169,6 +11287,10 @@ impl_enum_prop_kind!(
     AutonomyLevel,
 );
 
+impl HasPropKind for serde_json::Value {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11569,6 +11691,39 @@ auto_save = true
     }
 
     #[test]
+    async fn memory_config_pgvector_defaults() {
+        let memory = MemoryConfig::default();
+        assert!(!memory.postgres.vector_enabled);
+        assert_eq!(memory.postgres.vector_dimensions, 1536);
+    }
+
+    #[test]
+    async fn memory_config_pgvector_roundtrip() {
+        let toml = r#"
+            backend = "postgres"
+            [postgres]
+            vector_enabled = true
+            vector_dimensions = 768
+        "#;
+        let parsed: MemoryConfig = toml::from_str(toml).unwrap();
+        assert!(parsed.postgres.vector_enabled);
+        assert_eq!(parsed.postgres.vector_dimensions, 768);
+
+        let serialized = toml::to_string(&parsed).unwrap();
+        let reparsed: MemoryConfig = toml::from_str(&serialized).unwrap();
+        assert!(reparsed.postgres.vector_enabled);
+        assert_eq!(reparsed.postgres.vector_dimensions, 768);
+    }
+
+    #[test]
+    async fn memory_config_pgvector_defaults_when_omitted() {
+        let toml = r#"backend = "postgres""#;
+        let parsed: MemoryConfig = toml::from_str(toml).unwrap();
+        assert!(!parsed.postgres.vector_enabled);
+        assert_eq!(parsed.postgres.vector_dimensions, 1536);
+    }
+
+    #[test]
     async fn channels_default() {
         let c = ChannelsConfig::default();
         assert!(c.cli);
@@ -11662,6 +11817,7 @@ auto_save = true
                     mention_only: false,
                     ack_reactions: None,
                     proxy_url: None,
+                    approval_timeout_secs: default_telegram_approval_timeout_secs(),
                 }),
                 discord: None,
                 discord_history: None,
@@ -11692,6 +11848,7 @@ auto_save = true
                 reddit: None,
                 bluesky: None,
                 voice_call: None,
+                voice_duplex: None,
                 #[cfg(feature = "voice-wake")]
                 voice_wake: None,
                 mqtt: None,
@@ -12384,6 +12541,7 @@ default_temperature = 0.7
             encrypt_key: Some("feishu-encrypt".into()),
             verification_token: Some("feishu-verify".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
@@ -12551,6 +12709,7 @@ default_temperature = 0.7
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: 120,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -12585,6 +12744,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            approval_timeout_secs: 300,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -12607,6 +12767,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            approval_timeout_secs: 300,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -12666,6 +12827,7 @@ default_temperature = 0.7
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -12697,6 +12859,7 @@ default_temperature = 0.7
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -12733,6 +12896,7 @@ allowed_rooms = ["!ops:matrix.org"]
             ignore_attachments: true,
             ignore_stories: false,
             proxy_url: None,
+            approval_timeout_secs: 300,
         };
         let json = serde_json::to_string(&sc).unwrap();
         let parsed: SignalConfig = serde_json::from_str(&json).unwrap();
@@ -12755,6 +12919,7 @@ allowed_rooms = ["!ops:matrix.org"]
             ignore_attachments: false,
             ignore_stories: true,
             proxy_url: None,
+            approval_timeout_secs: 300,
         };
         let toml_str = toml::to_string(&sc).unwrap();
         let parsed: SignalConfig = toml::from_str(&toml_str).unwrap();
@@ -12803,6 +12968,7 @@ allowed_rooms = ["!ops:matrix.org"]
                 recovery_key: None,
                 mention_only: false,
                 password: None,
+                approval_timeout_secs: 300,
             }),
             signal: None,
             whatsapp: None,
@@ -12826,6 +12992,7 @@ allowed_rooms = ["!ops:matrix.org"]
             reddit: None,
             bluesky: None,
             voice_call: None,
+            voice_duplex: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
@@ -13029,6 +13196,7 @@ bot_token = "xoxb-tok"
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
             proxy_url: None,
+            approval_timeout_secs: 300,
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -13058,6 +13226,7 @@ bot_token = "xoxb-tok"
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
             proxy_url: None,
+            approval_timeout_secs: 300,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -13092,6 +13261,7 @@ bot_token = "xoxb-tok"
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
             proxy_url: None,
+            approval_timeout_secs: 300,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -13118,6 +13288,7 @@ bot_token = "xoxb-tok"
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
             proxy_url: None,
+            approval_timeout_secs: 300,
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -13143,6 +13314,7 @@ bot_token = "xoxb-tok"
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
             proxy_url: None,
+            approval_timeout_secs: 300,
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -13179,6 +13351,7 @@ bot_token = "xoxb-tok"
                 dm_mention_patterns: vec![],
                 group_mention_patterns: vec![],
                 proxy_url: None,
+                approval_timeout_secs: 300,
             }),
             linq: None,
             wati: None,
@@ -13200,6 +13373,7 @@ bot_token = "xoxb-tok"
             reddit: None,
             bluesky: None,
             voice_call: None,
+            voice_duplex: None,
             #[cfg(feature = "voice-wake")]
             voice_wake: None,
             mqtt: None,
@@ -13897,6 +14071,17 @@ requires_openai_auth = true
                 .and_then(|e| e.base_url.as_deref()),
             Some("https://api.tonsof.blue/v1")
         );
+        // The entry is also mirrored under the canonical fallback key so
+        // runtime fallback_provider() lookups resolve.
+        assert_eq!(
+            config
+                .providers
+                .models
+                .get("custom:https://api.tonsof.blue/v1")
+                .and_then(|e| e.base_url.as_deref()),
+            Some("https://api.tonsof.blue/v1")
+        );
+        assert!(config.providers.fallback_provider().is_some());
     }
 
     #[test]
@@ -14358,6 +14543,7 @@ default_model = "legacy-model"
             encrypt_key: Some("feishu-encrypt".into()),
             verification_token: Some("feishu-verify".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
@@ -15330,6 +15516,7 @@ default_model = "persisted-profile"
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["user_123".into(), "user_456".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
@@ -15352,6 +15539,7 @@ default_model = "persisted-profile"
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
@@ -15731,6 +15919,7 @@ require_otp_to_resume = true
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            approval_timeout_secs: default_telegram_approval_timeout_secs(),
         });
 
         // Save (triggers encryption)
@@ -16633,6 +16822,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
         let fields = mx.secret_fields();
         assert_eq!(fields.len(), 3);
@@ -16662,6 +16852,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
         let fields = mx.secret_fields();
         assert!(!fields[0].is_set);
@@ -16684,6 +16875,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
         mx.set_secret("channels.matrix.access-token", "new-token".into())
             .unwrap();
@@ -16707,6 +16899,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
         assert!(
             mx.set_secret("channels.matrix.nonexistent", "val".into())
@@ -16747,6 +16940,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         });
 
         let fields = config.secret_fields();
@@ -16773,6 +16967,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         });
 
         config
@@ -16799,6 +16994,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             recovery_key: None,
             password: None,
+            approval_timeout_secs: 300,
         });
         config
             .set_secret("channels.matrix.access-token", "sk-test".into())
@@ -16839,6 +17035,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
 
         // Encrypt
@@ -16871,6 +17068,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -16901,6 +17099,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -16926,6 +17125,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             mention_only: false,
             password: None,
+            approval_timeout_secs: 300,
         }
     }
 
@@ -17346,5 +17546,63 @@ allowed_users = ["@u:m"]
             config.channels.matrix.as_ref().unwrap().enabled,
             "backfill should activate channel even when config has comments"
         );
+    }
+
+    #[test]
+    async fn channel_approval_timeout_secs_defaults_to_300() {
+        // Omitting approval_timeout_secs from each config should deserialize to 300
+        let discord: DiscordConfig =
+            serde_json::from_str(r#"{"bot_token":"tok","enabled":true}"#).unwrap();
+        assert_eq!(discord.approval_timeout_secs, 300);
+
+        let slack: SlackConfig =
+            serde_json::from_str(r#"{"bot_token":"tok","enabled":true}"#).unwrap();
+        assert_eq!(slack.approval_timeout_secs, 300);
+
+        let signal: SignalConfig = serde_json::from_str(
+            r#"{"http_url":"http://localhost","account":"+1","enabled":true}"#,
+        )
+        .unwrap();
+        assert_eq!(signal.approval_timeout_secs, 300);
+
+        let matrix: MatrixConfig = serde_json::from_str(
+            r#"{"homeserver":"https://matrix.org","access_token":"tok","enabled":true,"allowed_users":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(matrix.approval_timeout_secs, 300);
+
+        let whatsapp: WhatsAppConfig = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert_eq!(whatsapp.approval_timeout_secs, 300);
+    }
+
+    #[test]
+    async fn channel_approval_timeout_secs_explicit_override() {
+        let discord: DiscordConfig = serde_json::from_str(
+            r#"{"bot_token":"tok","enabled":true,"approval_timeout_secs":60}"#,
+        )
+        .unwrap();
+        assert_eq!(discord.approval_timeout_secs, 60);
+
+        let slack: SlackConfig = serde_json::from_str(
+            r#"{"bot_token":"tok","enabled":true,"approval_timeout_secs":120}"#,
+        )
+        .unwrap();
+        assert_eq!(slack.approval_timeout_secs, 120);
+
+        let signal: SignalConfig = serde_json::from_str(
+            r#"{"http_url":"http://localhost","account":"+1","enabled":true,"approval_timeout_secs":90}"#,
+        )
+        .unwrap();
+        assert_eq!(signal.approval_timeout_secs, 90);
+
+        let matrix: MatrixConfig = serde_json::from_str(
+            r#"{"homeserver":"https://matrix.org","access_token":"tok","enabled":true,"allowed_users":[],"approval_timeout_secs":45}"#,
+        )
+        .unwrap();
+        assert_eq!(matrix.approval_timeout_secs, 45);
+
+        let whatsapp: WhatsAppConfig =
+            serde_json::from_str(r#"{"enabled":true,"approval_timeout_secs":180}"#).unwrap();
+        assert_eq!(whatsapp.approval_timeout_secs, 180);
     }
 }

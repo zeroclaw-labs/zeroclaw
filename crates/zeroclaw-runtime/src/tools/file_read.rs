@@ -340,7 +340,16 @@ mod tests {
     #[tokio::test]
     async fn file_read_blocks_absolute_path() {
         let tool = FileReadTool::new(test_security(std::env::temp_dir()));
-        let result = tool.execute(json!({"path": "/etc/passwd"})).await.unwrap();
+
+        #[cfg(unix)]
+        let target = "/etc/passwd";
+        #[cfg(windows)]
+        let target = {
+            let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+            std::path::PathBuf::from(sysroot).join(r"System32\drivers\etc\hosts")
+        };
+
+        let result = tool.execute(json!({"path": target})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
     }
@@ -640,7 +649,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/test_document.pdf");
+            .join("../../tests/fixtures/test_document.pdf");
         tokio::fs::copy(&fixture, dir.join("report.pdf"))
             .await
             .expect("copy PDF fixture");
@@ -789,7 +798,7 @@ mod tests {
         tokio::fs::create_dir_all(&workspace).await.unwrap();
 
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/test_document.pdf");
+            .join("../../tests/fixtures/test_document.pdf");
         tokio::fs::copy(&fixture, workspace.join("report.pdf"))
             .await
             .expect("copy PDF fixture");
@@ -982,7 +991,7 @@ mod tests {
         tokio::fs::create_dir_all(&workspace).await.unwrap();
 
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/test_document.pdf");
+            .join("../../tests/fixtures/test_document.pdf");
         tokio::fs::copy(&fixture, workspace.join("report.pdf"))
             .await
             .expect("copy PDF fixture");

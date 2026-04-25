@@ -1,4 +1,20 @@
 //! Memory subsystem: backends, embeddings, consolidation, retrieval.
+//!
+//! ## Reserved Key Prefixes
+//!
+//! The following key prefixes are reserved for the auto-save system. Any memory
+//! stored under these keys will be **excluded from context assembly** by all
+//! three context-building paths (`build_context`, `DefaultMemoryLoader`, and
+//! `should_skip_memory_context_entry`). Do not use these prefixes for semantic
+//! memories that should surface in agent context.
+//!
+//! | Prefix | Purpose | Detection function |
+//! |---|---|---|
+//! | `assistant_resp` / `assistant_resp_*` | Model-authored assistant summaries (untrusted context) | [`is_assistant_autosave_key`] |
+//! | `user_msg` / `user_msg_*` | Raw per-turn user messages (consolidation queue) | [`is_user_autosave_key`] |
+//!
+//! Channel-scoped variants (e.g. `telegram_user_msg_*`, `discord_*`) are
+//! **not** filtered — they use different prefixes and are handled separately.
 
 pub mod audit;
 pub mod backend;
@@ -10,11 +26,15 @@ pub mod embeddings;
 pub mod hygiene;
 pub mod importance;
 pub mod knowledge_graph;
+#[cfg(feature = "memory-postgres")]
+pub mod knowledge_graph_pg;
 pub mod lucid;
 pub mod markdown;
 pub mod namespaced;
 pub mod none;
 pub mod policy;
+#[cfg(feature = "memory-postgres")]
+pub mod postgres;
 pub mod qdrant;
 pub mod response_cache;
 pub mod retrieval;
@@ -36,6 +56,9 @@ pub use namespaced::NamespacedMemory;
 pub use none::NoneMemory;
 #[allow(unused_imports)]
 pub use policy::PolicyEnforcer;
+#[cfg(feature = "memory-postgres")]
+#[allow(unused_imports)]
+pub use postgres::PostgresMemory;
 pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
 #[allow(unused_imports)]
@@ -49,6 +72,38 @@ use anyhow::Context;
 use std::path::Path;
 use std::sync::Arc;
 use zeroclaw_config::schema::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
+
+#[cfg(feature = "memory-postgres")]
+fn build_postgres_memory(
+    memory_config: &MemoryConfig,
+    storage_provider: &StorageProviderConfig,
+) -> anyhow::Result<Box<dyn Memory>> {
+    use postgres::PostgresMemory;
+    let db_url = storage_provider
+        .db_url
+        .as_deref()
+        .context("memory backend 'postgres' requires [storage.provider.config].db_url")?;
+    let memory = PostgresMemory::new(
+        db_url,
+        &storage_provider.schema,
+        &storage_provider.table,
+        storage_provider.connect_timeout_secs,
+        Some(memory_config.postgres.vector_enabled),
+        Some(memory_config.postgres.vector_dimensions),
+    )?;
+    Ok(Box::new(memory))
+}
+
+#[cfg(not(feature = "memory-postgres"))]
+fn build_postgres_memory(
+    _memory_config: &MemoryConfig,
+    _storage_provider: &StorageProviderConfig,
+) -> anyhow::Result<Box<dyn Memory>> {
+    anyhow::bail!(
+        "memory backend 'postgres' requested but this build was compiled without \
+         `memory-postgres`; rebuild with `--features memory-postgres`"
+    )
+}
 
 fn create_memory_with_builders<F>(
     backend_name: &str,
@@ -64,6 +119,17 @@ where
         MemoryBackendKind::Lucid => {
             let local = sqlite_builder()?;
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
+        }
+        MemoryBackendKind::Postgres => {
+            // Postgres requires a real MemoryConfig + StorageProviderConfig, which this
+            // builder-only entry point does not receive. All supported call paths go
+            // through `create_memory_with_storage_and_routes`, which handles postgres via
+            // an early return. Fail loudly if a caller ever reaches this arm, rather than
+            // pretending to work with default configs that can never connect.
+            anyhow::bail!(
+                "postgres backend requires storage config; \
+                 call create_memory_with_storage_and_routes instead of create_memory_with_builders"
+            )
         }
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
@@ -97,6 +163,15 @@ pub fn effective_memory_backend_name(
 pub fn is_assistant_autosave_key(key: &str) -> bool {
     let normalized = key.trim().to_ascii_lowercase();
     normalized == "assistant_resp" || normalized.starts_with("assistant_resp_")
+}
+
+/// Auto-save key used for raw user messages captured per-turn.
+/// Re-injecting these into build_context causes exponential bloat: each recalled
+/// entry contains prior generations' context verbatim, growing unboundedly.
+/// Consolidated knowledge is already promoted to Core/Daily entries.
+pub fn is_user_autosave_key(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase();
+    normalized == "user_msg" || normalized.starts_with("user_msg_")
 }
 
 /// Filter known synthetic autosave noise patterns that should not be
@@ -353,6 +428,12 @@ pub fn create_memory_with_storage_and_routes(
         )));
     }
 
+    if matches!(backend_kind, MemoryBackendKind::Postgres) {
+        let fallback = StorageProviderConfig::default();
+        let provider = storage_provider.unwrap_or(&fallback);
+        return build_postgres_memory(config, provider);
+    }
+
     create_memory_with_builders(
         &backend_name,
         workspace_dir,
@@ -432,6 +513,15 @@ mod tests {
     }
 
     #[test]
+    fn user_autosave_key_detection_matches_per_turn_patterns() {
+        assert!(is_user_autosave_key("user_msg"));
+        assert!(is_user_autosave_key("user_msg_1234"));
+        assert!(is_user_autosave_key("USER_MSG_abcd"));
+        assert!(!is_user_autosave_key("user_message"));
+        assert!(!is_user_autosave_key("assistant_resp_1234"));
+    }
+
+    #[test]
     fn autosave_content_filter_drops_cron_and_distilled_noise() {
         assert!(should_skip_autosave_content("[cron:auto] patrol check"));
         assert!(should_skip_autosave_content(
@@ -482,6 +572,23 @@ mod tests {
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
         assert_eq!(mem.name(), "none");
+    }
+
+    #[cfg(not(feature = "memory-postgres"))]
+    #[test]
+    fn factory_postgres_without_feature_gives_clear_error() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "postgres".into(),
+            ..MemoryConfig::default()
+        };
+        let error = create_memory(&cfg, tmp.path(), None)
+            .err()
+            .expect("backend=postgres without memory-postgres feature should fail");
+        assert!(
+            error.to_string().contains("memory-postgres"),
+            "error should mention the feature flag: {error}"
+        );
     }
 
     #[test]

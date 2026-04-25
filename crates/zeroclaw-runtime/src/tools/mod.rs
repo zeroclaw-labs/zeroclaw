@@ -98,7 +98,9 @@ pub use zeroclaw_tools::pushover::PushoverTool;
 pub use zeroclaw_tools::reaction::ReactionTool;
 pub use zeroclaw_tools::report_template_tool::ReportTemplateTool;
 pub use zeroclaw_tools::screenshot::ScreenshotTool;
-pub use zeroclaw_tools::sessions::{SessionsHistoryTool, SessionsListTool, SessionsSendTool};
+pub use zeroclaw_tools::sessions::{
+    SessionDeleteTool, SessionResetTool, SessionsHistoryTool, SessionsListTool, SessionsSendTool,
+};
 pub use zeroclaw_tools::swarm::SwarmTool;
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
@@ -331,7 +333,8 @@ pub fn all_tools_with_runtime(
     Option<ChannelMapHandle>,
 ) {
     let has_shell_access = runtime.has_shell_access();
-    let sandbox = create_sandbox(&root_config.security);
+    let runtime_kind = root_config.runtime.kind.as_str();
+    let sandbox = create_sandbox(&root_config.security, runtime_kind);
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
@@ -680,6 +683,13 @@ pub fn all_tools_with_runtime(
             security.clone(),
         )));
         tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+        // NOTE: SessionResetTool and SessionDeleteTool are available via
+        // zeroclaw_tools::sessions but NOT registered by default. They are
+        // destructive operations (clear/delete conversation history) and
+        // should only be enabled by callers that explicitly need them
+        // (e.g., orchestration dashboards). To enable:
+        //   tool_arcs.push(Arc::new(SessionResetTool::new(backend.clone(), security.clone())));
+        //   tool_arcs.push(Arc::new(SessionDeleteTool::new(backend, security.clone())));
     }
 
     // LinkedIn integration (config-gated)
@@ -924,24 +934,14 @@ pub fn all_tools_with_runtime(
                 plugin_path.parent().unwrap_or(&plugin_path),
             ) {
                 Ok(host) => {
-                    let tool_manifests = host.tool_plugins();
-                    let count = tool_manifests.len();
-                    for manifest in tool_manifests {
-                        tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::new(
+                    let details = host.tool_plugin_details();
+                    let count = details.len();
+                    for (manifest, wasm_path) in details {
+                        tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
+                            wasm_path.to_path_buf(),
+                            manifest.permissions.clone(),
                             manifest.name.clone(),
                             manifest.description.clone().unwrap_or_default(),
-                            manifest.name.clone(),
-                            "call".to_string(),
-                            serde_json::json!({
-                                "type": "object",
-                                "properties": {
-                                    "input": {
-                                        "type": "string",
-                                        "description": "Input for the plugin"
-                                    }
-                                },
-                                "required": ["input"]
-                            }),
                         )));
                     }
                     tracing::info!("Loaded {count} WASM plugin tools");

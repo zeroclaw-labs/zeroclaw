@@ -59,6 +59,198 @@ pub struct WizardCallbacks {
     pub whatsapp_web_available: bool,
 }
 
+// ── Container detection for Docker/Kubernetes environments ───────
+
+/// Detected container runtime type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerRuntime {
+    /// Not running in a container
+    None,
+    /// Docker
+    Docker,
+    /// Podman
+    Podman,
+    /// containerd (no reliable host alias)
+    Containerd,
+    /// Kubernetes (no reliable host alias)
+    Kubernetes,
+    /// Unknown container runtime (no reliable host alias)
+    Unknown,
+}
+
+/// Input signals for container runtime detection (used for deterministic testing).
+#[derive(Default)]
+struct ContainerRuntimeInputs {
+    kubernetes_service_host_set: bool,
+    cgroup_contents: Option<String>,
+    containerenv_exists: bool,
+    dockerenv_exists: bool,
+    container_env_var: Option<String>,
+}
+
+/// Pure helper to detect container runtime from explicit inputs (for testability).
+fn detect_container_runtime_from_inputs(inputs: &ContainerRuntimeInputs) -> ContainerRuntime {
+    // Check for Kubernetes first (most specific)
+    if inputs.kubernetes_service_host_set {
+        return ContainerRuntime::Kubernetes;
+    }
+
+    // Check cgroup for container runtime signatures
+    if let Some(cgroup) = &inputs.cgroup_contents {
+        let cgroup_lower = cgroup.to_lowercase();
+        if cgroup_lower.contains("kubepods") {
+            return ContainerRuntime::Kubernetes;
+        }
+        if cgroup_lower.contains("podman") {
+            return ContainerRuntime::Podman;
+        }
+        if cgroup_lower.contains("containerd") {
+            return ContainerRuntime::Containerd;
+        }
+        if cgroup_lower.contains("docker") {
+            return ContainerRuntime::Docker;
+        }
+    }
+
+    // Check for Podman-specific marker
+    if inputs.containerenv_exists {
+        return ContainerRuntime::Podman;
+    }
+
+    // Check for Docker marker file
+    if inputs.dockerenv_exists {
+        return ContainerRuntime::Docker;
+    }
+
+    // Check for generic container env var
+    if let Some(val) = &inputs.container_env_var {
+        let val_lower = val.to_lowercase();
+        if val_lower.contains("podman") {
+            return ContainerRuntime::Podman;
+        }
+        if val_lower.contains("docker") {
+            return ContainerRuntime::Docker;
+        }
+        // Unknown container runtime - require explicit URL input
+        return ContainerRuntime::Unknown;
+    }
+
+    ContainerRuntime::None
+}
+
+/// Detects which container runtime (if any) the process is running inside.
+fn detect_container_runtime() -> ContainerRuntime {
+    let inputs = ContainerRuntimeInputs {
+        kubernetes_service_host_set: std::env::var("KUBERNETES_SERVICE_HOST").is_ok(),
+        cgroup_contents: std::fs::read_to_string("/proc/1/cgroup").ok(),
+        containerenv_exists: Path::new("/run/.containerenv").exists(),
+        dockerenv_exists: Path::new("/.dockerenv").exists(),
+        container_env_var: std::env::var("container").ok(),
+    };
+    detect_container_runtime_from_inputs(&inputs)
+}
+
+/// Returns the appropriate hostname for accessing services on the host machine.
+/// Returns `None` for runtimes without a reliable host alias (user must configure manually).
+fn default_local_host() -> Option<&'static str> {
+    match detect_container_runtime() {
+        ContainerRuntime::None => Some("localhost"),
+        ContainerRuntime::Docker => Some("host.docker.internal"),
+        ContainerRuntime::Podman => Some("host.containers.internal"),
+        ContainerRuntime::Containerd | ContainerRuntime::Kubernetes | ContainerRuntime::Unknown => {
+            None
+        }
+    }
+}
+
+/// Builds a default URL for a local service, using container-aware hostname.
+/// Returns `None` for Kubernetes where no reliable host alias exists.
+fn default_local_url(port: u16, path: &str) -> Option<String> {
+    default_local_host().map(|host| format!("http://{}:{}{}", host, port, path))
+}
+
+/// Configuration for prompting a local provider endpoint URL.
+struct LocalProviderPromptConfig<'a> {
+    /// Display name for the provider (e.g., "llama.cpp", "vLLM")
+    display_name: &'a str,
+    /// Default port for the service
+    port: u16,
+    /// Default path suffix (e.g., "/v1")
+    path: &'a str,
+    /// Environment variable name for the API key (e.g., "LLAMACPP_API_KEY")
+    api_key_env_var: &'a str,
+}
+
+/// Prompts for a local provider endpoint URL with container-aware defaults,
+/// validates the URL, and optionally prompts for an API key.
+/// Returns (normalized_url, api_key).
+fn prompt_local_provider_endpoint(config: &LocalProviderPromptConfig) -> Result<(String, String)> {
+    // For Kubernetes/containerd/unknown, don't provide a misleading localhost default
+    let raw_url: String = if let Some(default_url) = default_local_url(config.port, config.path) {
+        Input::new()
+            .with_prompt(format!("  {} server endpoint URL", config.display_name))
+            .default(default_url)
+            .interact_text()?
+    } else {
+        print_bullet(&format!(
+            "Running in a container without a known host alias. {} may not resolve to the host.",
+            style("localhost").yellow()
+        ));
+        Input::new()
+            .with_prompt(format!(
+                "  {} server endpoint URL (e.g., http://<service-name>:{}{})",
+                config.display_name, config.port, config.path
+            ))
+            .interact_text()?
+    };
+
+    let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
+    if normalized_url.is_empty() {
+        anyhow::bail!("{} endpoint URL cannot be empty.", config.display_name);
+    }
+
+    // Validate URL format
+    let parsed = reqwest::Url::parse(&normalized_url).with_context(|| {
+        format!(
+            "{} endpoint URL must be a valid URL (e.g., http://service:{}{})",
+            config.display_name, config.port, config.path
+        )
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!(
+            "{} endpoint URL must use http:// or https://",
+            config.display_name
+        );
+    }
+
+    print_bullet(&format!(
+        "Using {} server endpoint: {}",
+        config.display_name,
+        style(&normalized_url).cyan()
+    ));
+    print_bullet(&format!(
+        "No API key needed unless your {} server requires authentication.",
+        config.display_name
+    ));
+
+    let key: String = Input::new()
+        .with_prompt(format!(
+            "  API key for {} server (or Enter to skip)",
+            config.display_name
+        ))
+        .allow_empty(true)
+        .interact_text()?;
+
+    if key.trim().is_empty() {
+        print_bullet(&format!(
+            "No API key provided. Set {} later only if your server requires authentication.",
+            style(config.api_key_env_var).yellow()
+        ));
+    }
+
+    Ok((normalized_url, key))
+}
+
 // ── Project context collected during wizard ──────────────────────
 
 /// User-provided personalization baked into workspace MD files.
@@ -94,7 +286,7 @@ const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 
 fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
-    channels.channels_except_webhook().iter().any(|(_, ok)| *ok)
+    channels.channels().iter().any(|(_, ok)| *ok)
 }
 
 // ── Main wizard entry point ──────────────────────────────────────
@@ -501,6 +693,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         policy: zeroclaw_config::schema::MemoryPolicyConfig::default(),
         sqlite_open_timeout_secs: None,
         qdrant: zeroclaw_config::schema::QdrantConfig::default(),
+        postgres: zeroclaw_config::schema::PostgresMemoryConfig::default(),
     }
 }
 
@@ -922,6 +1115,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
         "avian" => "deepseek/deepseek-v3.2".into(),
+        "copilot" => "gpt-4o".into(),
         _ => "anthropic/claude-sonnet-4.6".into(),
     }
 }
@@ -1000,6 +1194,17 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "GPT-5.2 Codex (agentic coding)".to_string(),
             ),
             ("o4-mini".to_string(), "o4-mini (fallback)".to_string()),
+        ],
+        "copilot" => vec![
+            ("gpt-4o".to_string(), "GPT-4o".to_string()),
+            ("gpt-4.1".to_string(), "GPT-4.1".to_string()),
+            ("gpt-5-mini".to_string(), "GPT-5 mini".to_string()),
+            (
+                "claude-sonnet-4.6".to_string(),
+                "Claude Sonnet 4.6".to_string(),
+            ),
+            ("gpt-5.3-codex".to_string(), "GPT-5.3 Codex".to_string()),
+            ("claude-opus-4.6".to_string(), "Claude Opus 4.6".to_string()),
         ],
         "venice" => vec![
             (
@@ -1624,14 +1829,33 @@ async fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
     Ok(parse_gemini_model_ids(&payload))
 }
 
-async fn fetch_ollama_models() -> Result<Vec<String>> {
+async fn fetch_ollama_models(endpoint_override: Option<&str>) -> Result<Vec<String>> {
     let client = build_model_fetch_client()?;
+    let endpoint = match endpoint_override {
+        Some(base) => {
+            let normalized = normalize_ollama_endpoint_url(base);
+            if normalized.is_empty() {
+                default_local_url(11434, "/api/tags").ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Ollama endpoint URL is required (no safe default for this container runtime)"
+                    )
+                })?
+            } else {
+                format!("{normalized}/api/tags")
+            }
+        }
+        None => default_local_url(11434, "/api/tags").ok_or_else(|| {
+            anyhow::anyhow!(
+                "Ollama endpoint URL is required (no safe default for this container runtime)"
+            )
+        })?,
+    };
     let payload: Value = client
-        .get("http://localhost:11434/api/tags")
+        .get(&endpoint)
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .context("model fetch failed: GET http://localhost:11434/api/tags")?
+        .with_context(|| format!("model fetch failed: GET {endpoint}"))?
         .json()
         .await
         .context("failed to parse Ollama model list response")?;
@@ -1652,10 +1876,59 @@ fn normalize_ollama_endpoint_url(raw_url: &str) -> String {
 }
 
 fn ollama_endpoint_is_local(endpoint_url: &str) -> bool {
-    reqwest::Url::parse(endpoint_url)
-        .ok()
-        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-        .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0"))
+    let Ok(url) = reqwest::Url::parse(endpoint_url) else {
+        return false;
+    };
+
+    let Some(host) = url.host_str().map(|h| h.to_ascii_lowercase()) else {
+        return false;
+    };
+
+    // Strip brackets from IPv6 addresses for comparison
+    let host_clean = host.trim_start_matches('[').trim_end_matches(']');
+
+    // Explicit loopback and container host aliases - always local regardless of scheme
+    if matches!(
+        host_clean,
+        "localhost"
+            | "127.0.0.1"
+            | "::1"
+            | "0.0.0.0"
+            | "host.docker.internal"
+            | "host.containers.internal"
+    ) {
+        return true;
+    }
+
+    // For K8s service names, only treat as local if using HTTP (not HTTPS).
+    // Remote cloud endpoints typically use HTTPS, so this avoids misclassifying
+    // a user's explicit "remote Ollama" choice as local.
+    if url.scheme() != "http" {
+        return false;
+    }
+
+    // Kubernetes/internal service names (HTTP only):
+    // e.g., "ollama", "ollama.default.svc", "ollama.default.svc.cluster.local"
+    //
+    // Any dotless hostname over HTTP is treated as a local K8s/internal
+    // service name. This classification only affects model-list filtering
+    // (the `:cloud` suffix visibility) and is not used as a security
+    // boundary. HTTPS with bare hostnames is deliberately excluded above
+    // to preserve remote-Ollama semantics.
+    if !host_clean.contains('.') {
+        return true; // Simple service name like "ollama"
+    }
+
+    // Common internal/cluster suffixes (HTTP only)
+    if host_clean.ends_with(".svc")
+        || host_clean.ends_with(".svc.cluster.local")
+        || host_clean.ends_with(".local")
+        || host_clean.ends_with(".internal")
+    {
+        return true;
+    }
+
+    false
 }
 
 fn ollama_uses_remote_endpoint(provider_api_url: Option<&str>) -> bool {
@@ -1768,7 +2041,8 @@ async fn fetch_live_models_for_provider(
                 ]
             } else {
                 // Local endpoints should not surface cloud-only suffixes.
-                fetch_ollama_models()
+                // Pass the configured endpoint URL (may be container-aware like host.docker.internal)
+                fetch_ollama_models(provider_api_url)
                     .await?
                     .into_iter()
                     .filter(|model_id| !model_id.ends_with(":cloud"))
@@ -2401,7 +2675,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
         "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
-        "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
+        "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere, GitHub Copilot)",
         "🏠 Local / private (Ollama, llama.cpp server, vLLM — no API key needed)",
         "🔧 Custom — bring your own OpenAI-compatible API",
     ];
@@ -2485,6 +2759,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             ("opencode", "OpenCode Zen — code-focused AI"),
             ("opencode-go", "OpenCode Go — Subsidized code-focused AI"),
             ("cohere", "Cohere — Command R+ & embeddings"),
+            ("copilot", "GitHub Copilot"),
         ],
         4 => local_provider_choices(),
         _ => vec![], // Custom — handled below
@@ -2595,132 +2870,78 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
             key
         } else {
-            print_bullet("Using local Ollama at http://localhost:11434 (no API key needed).");
-            String::new()
+            // Local Ollama: compute container-aware URL and persist it
+            // For runtimes without a known host alias (e.g., Kubernetes), require explicit input
+            if let Some(ollama_url) = default_local_url(11434, "") {
+                provider_api_url = Some(ollama_url.clone());
+                print_bullet(&format!(
+                    "Using local Ollama at {} (no API key needed).",
+                    style(&ollama_url).cyan()
+                ));
+                String::new()
+            } else {
+                print_bullet(&format!(
+                    "Running in a container without a known host alias. {} may not resolve to the host.",
+                    style("localhost").yellow()
+                ));
+                let raw_url: String = Input::new()
+                    .with_prompt("  Ollama endpoint URL (e.g., http://<service-name>:11434)")
+                    .interact_text()?;
+
+                let normalized_url = normalize_ollama_endpoint_url(&raw_url);
+                if normalized_url.is_empty() {
+                    anyhow::bail!("Ollama endpoint URL cannot be empty.");
+                }
+                // Validate URL format
+                let parsed = reqwest::Url::parse(&normalized_url).context(
+                    "Ollama endpoint URL must be a valid URL (e.g., http://service:11434)",
+                )?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("Ollama endpoint URL must use http:// or https://");
+                }
+                provider_api_url = Some(normalized_url.clone());
+                print_bullet(&format!(
+                    "Using Ollama at {} (no API key needed).",
+                    style(&normalized_url).cyan()
+                ));
+                String::new()
+            }
         }
     } else if matches!(provider_name, "llamacpp" | "llama.cpp") {
-        let raw_url: String = Input::new()
-            .with_prompt("  llama.cpp server endpoint URL")
-            .default("http://localhost:8080/v1")
-            .interact_text()?;
-
-        let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
-        if normalized_url.is_empty() {
-            anyhow::bail!("llama.cpp endpoint URL cannot be empty.");
-        }
-        provider_api_url = Some(normalized_url.clone());
-
-        print_bullet(&format!(
-            "Using llama.cpp server endpoint: {}",
-            style(&normalized_url).cyan()
-        ));
-        print_bullet("No API key needed unless your llama.cpp server is started with --api-key.");
-
-        let key: String = Input::new()
-            .with_prompt("  API key for llama.cpp server (or Enter to skip)")
-            .allow_empty(true)
-            .interact_text()?;
-
-        if key.trim().is_empty() {
-            print_bullet(&format!(
-                "No API key provided. Set {} later only if your server requires authentication.",
-                style("LLAMACPP_API_KEY").yellow()
-            ));
-        }
-
+        let (url, key) = prompt_local_provider_endpoint(&LocalProviderPromptConfig {
+            display_name: "llama.cpp",
+            port: 8080,
+            path: "/v1",
+            api_key_env_var: "LLAMACPP_API_KEY",
+        })?;
+        provider_api_url = Some(url);
         key
     } else if provider_name == "sglang" {
-        let raw_url: String = Input::new()
-            .with_prompt("  SGLang server endpoint URL")
-            .default("http://localhost:30000/v1")
-            .interact_text()?;
-
-        let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
-        if normalized_url.is_empty() {
-            anyhow::bail!("SGLang endpoint URL cannot be empty.");
-        }
-        provider_api_url = Some(normalized_url.clone());
-
-        print_bullet(&format!(
-            "Using SGLang server endpoint: {}",
-            style(&normalized_url).cyan()
-        ));
-        print_bullet("No API key needed unless your SGLang server requires authentication.");
-
-        let key: String = Input::new()
-            .with_prompt("  API key for SGLang server (or Enter to skip)")
-            .allow_empty(true)
-            .interact_text()?;
-
-        if key.trim().is_empty() {
-            print_bullet(&format!(
-                "No API key provided. Set {} later only if your server requires authentication.",
-                style("SGLANG_API_KEY").yellow()
-            ));
-        }
-
+        let (url, key) = prompt_local_provider_endpoint(&LocalProviderPromptConfig {
+            display_name: "SGLang",
+            port: 30000,
+            path: "/v1",
+            api_key_env_var: "SGLANG_API_KEY",
+        })?;
+        provider_api_url = Some(url);
         key
     } else if provider_name == "vllm" {
-        let raw_url: String = Input::new()
-            .with_prompt("  vLLM server endpoint URL")
-            .default("http://localhost:8000/v1")
-            .interact_text()?;
-
-        let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
-        if normalized_url.is_empty() {
-            anyhow::bail!("vLLM endpoint URL cannot be empty.");
-        }
-        provider_api_url = Some(normalized_url.clone());
-
-        print_bullet(&format!(
-            "Using vLLM server endpoint: {}",
-            style(&normalized_url).cyan()
-        ));
-        print_bullet("No API key needed unless your vLLM server requires authentication.");
-
-        let key: String = Input::new()
-            .with_prompt("  API key for vLLM server (or Enter to skip)")
-            .allow_empty(true)
-            .interact_text()?;
-
-        if key.trim().is_empty() {
-            print_bullet(&format!(
-                "No API key provided. Set {} later only if your server requires authentication.",
-                style("VLLM_API_KEY").yellow()
-            ));
-        }
-
+        let (url, key) = prompt_local_provider_endpoint(&LocalProviderPromptConfig {
+            display_name: "vLLM",
+            port: 8000,
+            path: "/v1",
+            api_key_env_var: "VLLM_API_KEY",
+        })?;
+        provider_api_url = Some(url);
         key
     } else if provider_name == "osaurus" {
-        let raw_url: String = Input::new()
-            .with_prompt("  Osaurus server endpoint URL")
-            .default("http://localhost:1337/v1")
-            .interact_text()?;
-
-        let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
-        if normalized_url.is_empty() {
-            anyhow::bail!("Osaurus endpoint URL cannot be empty.");
-        }
-        provider_api_url = Some(normalized_url.clone());
-
-        print_bullet(&format!(
-            "Using Osaurus server endpoint: {}",
-            style(&normalized_url).cyan()
-        ));
-        print_bullet("No API key needed unless your Osaurus server requires authentication.");
-
-        let key: String = Input::new()
-            .with_prompt("  API key for Osaurus server (or Enter to skip)")
-            .allow_empty(true)
-            .interact_text()?;
-
-        if key.trim().is_empty() {
-            print_bullet(&format!(
-                "No API key provided. Set {} later only if your server requires authentication.",
-                style("OSAURUS_API_KEY").yellow()
-            ));
-        }
-
+        let (url, key) = prompt_local_provider_endpoint(&LocalProviderPromptConfig {
+            display_name: "Osaurus",
+            port: 1337,
+            path: "/v1",
+            api_key_env_var: "OSAURUS_API_KEY",
+        })?;
+        provider_api_url = Some(url);
         key
     } else if canonical_provider_name(provider_name) == "gemini" {
         // Special handling for Gemini: check for CLI auth first
@@ -2839,6 +3060,25 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 key
             }
         }
+    } else if canonical_provider_name(provider_name) == "copilot" {
+        // GitHub Copilot uses OAuth device flow — no API key needed during setup.
+        // Check if a GITHUB_TOKEN is already available in the environment.
+        if std::env::var("GITHUB_TOKEN").is_ok() {
+            print_bullet(&format!(
+                "{} GITHUB_TOKEN environment variable detected!",
+                style("✓").green().bold()
+            ));
+            print_bullet("ZeroClaw will use it for GitHub Copilot authentication.");
+        } else {
+            print_bullet("GitHub Copilot uses OAuth device-flow authentication.");
+            print_bullet("No API key is needed — you'll be prompted to authorize on first run.");
+            print_bullet(&format!(
+                "Or set {} to use a pre-existing GitHub personal access token.",
+                style("GITHUB_TOKEN").yellow()
+            ));
+        }
+        println!();
+        String::new()
     } else {
         let key_url = if is_moonshot_alias(provider_name)
             || canonical_provider_name(provider_name) == "kimi-code"
@@ -3178,6 +3418,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => "NVIDIA_API_KEY",
         "astrai" => "ASTRAI_API_KEY",
         "avian" => "AVIAN_API_KEY",
+        "copilot" => "GITHUB_TOKEN",
         _ => "API_KEY",
     }
 }
@@ -3757,6 +3998,9 @@ fn setup_channels(
                     mention_only: existing_tg.map(|t| t.mention_only).unwrap_or(false),
                     ack_reactions: existing_tg.and_then(|t| t.ack_reactions),
                     proxy_url: existing_tg.and_then(|t| t.proxy_url.clone()),
+                    approval_timeout_secs: existing_tg
+                        .map(|t| t.approval_timeout_secs)
+                        .unwrap_or(120),
                 });
             }
             ChannelMenuChoice::Discord => {
@@ -3898,6 +4142,9 @@ fn setup_channels(
                         .map(|d| d.multi_message_delay_ms)
                         .unwrap_or(800),
                     stall_timeout_secs: existing_dc.map(|d| d.stall_timeout_secs).unwrap_or(0),
+                    approval_timeout_secs: existing_dc
+                        .map(|d| d.approval_timeout_secs)
+                        .unwrap_or(300),
                 });
             }
             ChannelMenuChoice::Slack => {
@@ -4079,6 +4326,9 @@ fn setup_channels(
                         .map(|s| s.draft_update_interval_ms)
                         .unwrap_or(1200),
                     cancel_reaction: existing_sl.and_then(|s| s.cancel_reaction.clone()),
+                    approval_timeout_secs: existing_sl
+                        .map(|s| s.approval_timeout_secs)
+                        .unwrap_or(300),
                 });
             }
             ChannelMenuChoice::IMessage => {
@@ -4311,6 +4561,9 @@ fn setup_channels(
                     mention_only: existing_mx.map(|m| m.mention_only).unwrap_or(false),
                     recovery_key,
                     password: existing_mx.and_then(|m| m.password.clone()),
+                    approval_timeout_secs: existing_mx
+                        .map(|m| m.approval_timeout_secs)
+                        .unwrap_or(300),
                 });
             }
             ChannelMenuChoice::Signal => {
@@ -4407,6 +4660,11 @@ fn setup_channels(
                     ignore_attachments,
                     ignore_stories,
                     proxy_url: config.signal.as_ref().and_then(|s| s.proxy_url.clone()),
+                    approval_timeout_secs: config
+                        .signal
+                        .as_ref()
+                        .map(|s| s.approval_timeout_secs)
+                        .unwrap_or(300),
                 });
 
                 println!("  {} Signal configured", style("✅").green().bold());
@@ -4518,6 +4776,9 @@ fn setup_channels(
                             .map(|w| w.group_mention_patterns.clone())
                             .unwrap_or_default(),
                         proxy_url: existing_wa.and_then(|w| w.proxy_url.clone()),
+                        approval_timeout_secs: existing_wa
+                            .map(|w| w.approval_timeout_secs)
+                            .unwrap_or(300),
                     });
 
                     println!(
@@ -4635,6 +4896,9 @@ fn setup_channels(
                         .map(|w| w.group_mention_patterns.clone())
                         .unwrap_or_default(),
                     proxy_url: existing_wa.and_then(|w| w.proxy_url.clone()),
+                    approval_timeout_secs: existing_wa
+                        .map(|w| w.approval_timeout_secs)
+                        .unwrap_or(300),
                 });
             }
             ChannelMenuChoice::Linq => {
@@ -6171,6 +6435,12 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::Mutex;
 
+    /// Builds a default URL, falling back to localhost if no container alias is available.
+    fn default_local_url_or_localhost(port: u16, path: &str) -> String {
+        let host = default_local_host().unwrap_or("localhost");
+        format!("http://{}:{}{}", host, port, path)
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -7066,6 +7336,8 @@ mod tests {
         );
         assert_eq!(default_model_for_provider("openai"), "gpt-5.2");
         assert_eq!(default_model_for_provider("openai-codex"), "gpt-5-codex");
+        assert_eq!(default_model_for_provider("copilot"), "gpt-4o");
+        assert_eq!(default_model_for_provider("github-copilot"), "gpt-4o");
         assert_eq!(
             default_model_for_provider("anthropic"),
             "claude-sonnet-4-5-20250929"
@@ -7134,6 +7406,8 @@ mod tests {
         assert_eq!(canonical_provider_name("aws-bedrock"), "bedrock");
         assert_eq!(canonical_provider_name("build.nvidia.com"), "nvidia");
         assert_eq!(canonical_provider_name("llama.cpp"), "llamacpp");
+        assert_eq!(canonical_provider_name("github-copilot"), "copilot");
+        assert_eq!(canonical_provider_name("copilot"), "copilot");
     }
 
     #[test]
@@ -7170,6 +7444,21 @@ mod tests {
 
         assert!(ids.contains(&"gpt-5-codex".to_string()));
         assert!(ids.contains(&"gpt-5.2-codex".to_string()));
+    }
+
+    #[test]
+    fn curated_models_for_copilot_include_expected_models() {
+        let ids: Vec<String> = curated_models_for_provider("copilot")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"gpt-4o".to_string()));
+        assert!(ids.contains(&"gpt-4.1".to_string()));
+        assert!(ids.contains(&"gpt-5-mini".to_string()));
+        assert!(ids.contains(&"claude-sonnet-4.6".to_string()));
+        assert!(ids.contains(&"gpt-5.3-codex".to_string()));
+        assert!(ids.contains(&"claude-opus-4.6".to_string()));
     }
 
     #[test]
@@ -7471,6 +7760,20 @@ mod tests {
     }
 
     #[test]
+    fn normalize_ollama_endpoint_url_prevents_double_api_path() {
+        // Verifies that URLs ending with /api are normalized to prevent
+        // /api/api/tags when appending /api/tags for model fetching
+        let base_with_api = "http://localhost:11434/api";
+        let normalized = normalize_ollama_endpoint_url(base_with_api);
+        assert_eq!(normalized, "http://localhost:11434");
+
+        // Constructing the tags URL should now be correct
+        let tags_url = format!("{normalized}/api/tags");
+        assert_eq!(tags_url, "http://localhost:11434/api/tags");
+        assert!(!tags_url.contains("/api/api/"));
+    }
+
+    #[test]
     fn ollama_uses_remote_endpoint_distinguishes_local_and_remote_urls() {
         assert!(!ollama_uses_remote_endpoint(None));
         assert!(!ollama_uses_remote_endpoint(Some("http://localhost:11434")));
@@ -7479,6 +7782,255 @@ mod tests {
         )));
         assert!(ollama_uses_remote_endpoint(Some("https://ollama.com")));
         assert!(ollama_uses_remote_endpoint(Some("https://ollama.com/api")));
+    }
+
+    #[test]
+    fn ollama_endpoint_is_local_recognizes_docker_internal_host() {
+        // Standard localhost variants
+        assert!(ollama_endpoint_is_local("http://localhost:11434"));
+        assert!(ollama_endpoint_is_local("http://127.0.0.1:11434"));
+        assert!(ollama_endpoint_is_local("http://0.0.0.0:11434"));
+        assert!(ollama_endpoint_is_local("http://[::1]:11434"));
+
+        // Docker internal hostname (container-to-host communication)
+        assert!(ollama_endpoint_is_local(
+            "http://host.docker.internal:11434"
+        ));
+        assert!(ollama_endpoint_is_local(
+            "http://HOST.DOCKER.INTERNAL:11434"
+        ));
+
+        // Remote endpoints should not be considered local
+        assert!(!ollama_endpoint_is_local("https://ollama.example.com"));
+        assert!(!ollama_endpoint_is_local("http://192.168.1.100:11434"));
+    }
+
+    #[test]
+    fn ollama_uses_remote_endpoint_treats_docker_internal_as_local() {
+        assert!(!ollama_uses_remote_endpoint(Some(
+            "http://host.docker.internal:11434"
+        )));
+        assert!(!ollama_uses_remote_endpoint(Some(
+            "http://host.docker.internal:11434/api"
+        )));
+    }
+
+    #[test]
+    fn default_local_url_builds_correct_format() {
+        // This test verifies the URL format without depending on container detection
+        // default_local_url returns Option<String>, use unwrap since not in K8s during tests
+        if let Some(url) = default_local_url(11434, "/api/tags") {
+            assert!(url.starts_with("http://"));
+            assert!(url.contains(":11434"));
+            assert!(url.ends_with("/api/tags"));
+        }
+        // Also test the fallback version
+        let url = default_local_url_or_localhost(11434, "/api/tags");
+        assert!(url.starts_with("http://"));
+        assert!(url.contains(":11434"));
+        assert!(url.ends_with("/api/tags"));
+    }
+
+    #[test]
+    fn default_local_url_handles_empty_path() {
+        let url = default_local_url_or_localhost(8080, "");
+        assert!(url.ends_with(":8080"));
+    }
+
+    #[test]
+    fn ollama_endpoint_is_local_recognizes_podman_host() {
+        // Podman uses host.containers.internal
+        assert!(ollama_endpoint_is_local(
+            "http://host.containers.internal:11434"
+        ));
+        assert!(ollama_endpoint_is_local(
+            "http://HOST.CONTAINERS.INTERNAL:11434"
+        ));
+    }
+
+    #[test]
+    fn ollama_endpoint_is_local_recognizes_k8s_service_names() {
+        // Simple service name (no dots) - HTTP only
+        assert!(ollama_endpoint_is_local("http://ollama:11434"));
+        // Kubernetes DNS names - HTTP only
+        assert!(ollama_endpoint_is_local("http://ollama.default.svc:11434"));
+        assert!(ollama_endpoint_is_local(
+            "http://ollama.default.svc.cluster.local:11434"
+        ));
+        // .local and .internal suffixes - HTTP only
+        assert!(ollama_endpoint_is_local("http://ollama.local:11434"));
+        assert!(ollama_endpoint_is_local("http://myservice.internal:11434"));
+        // Real remote endpoints should still be detected as remote
+        assert!(!ollama_endpoint_is_local(
+            "https://ollama.example.com:11434"
+        ));
+        assert!(!ollama_endpoint_is_local("https://api.ollama.ai"));
+        // HTTPS with internal-looking names should be treated as remote
+        // (preserves user's explicit "remote Ollama" choice)
+        assert!(!ollama_endpoint_is_local("https://ollama:11434"));
+        assert!(!ollama_endpoint_is_local("https://ollama.internal:11434"));
+        assert!(!ollama_endpoint_is_local("https://proxy.local:11434"));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_unknown_container_env() {
+        // Unknown container env var value should return Unknown, not Docker
+        let inputs = ContainerRuntimeInputs {
+            container_env_var: Some("lxc".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Unknown
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_kubernetes_env() {
+        let inputs = ContainerRuntimeInputs {
+            kubernetes_service_host_set: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Kubernetes
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_kubernetes_cgroup() {
+        let inputs = ContainerRuntimeInputs {
+            cgroup_contents: Some("12:cpuset:/kubepods/burstable/pod123".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Kubernetes
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_docker_cgroup() {
+        let inputs = ContainerRuntimeInputs {
+            cgroup_contents: Some("12:cpuset:/docker/abc123".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Docker
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_containerd_cgroup() {
+        let inputs = ContainerRuntimeInputs {
+            cgroup_contents: Some("0::/system.slice/containerd.service".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Containerd
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_podman_cgroup() {
+        let inputs = ContainerRuntimeInputs {
+            cgroup_contents: Some("0::/user.slice/user-1000.slice/podman-abc123".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Podman
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_dockerenv_file() {
+        let inputs = ContainerRuntimeInputs {
+            dockerenv_exists: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Docker
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_podman_containerenv() {
+        let inputs = ContainerRuntimeInputs {
+            containerenv_exists: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Podman
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_docker_env_var() {
+        // container env var containing "docker" should return Docker
+        let inputs = ContainerRuntimeInputs {
+            container_env_var: Some("docker".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Docker
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_detects_podman_env_var() {
+        let inputs = ContainerRuntimeInputs {
+            container_env_var: Some("podman".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Podman
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_returns_none_when_no_signals() {
+        let inputs = ContainerRuntimeInputs::default();
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::None
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_kubernetes_takes_priority() {
+        // Kubernetes env var should take precedence over Docker/Podman markers
+        let inputs = ContainerRuntimeInputs {
+            kubernetes_service_host_set: true,
+            dockerenv_exists: true,
+            containerenv_exists: true,
+            cgroup_contents: Some("docker".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Kubernetes
+        ));
+    }
+
+    #[test]
+    fn detect_container_runtime_from_inputs_cgroup_kubepods_takes_priority_over_docker() {
+        // kubepods in cgroup should be detected as Kubernetes, not Docker
+        let inputs = ContainerRuntimeInputs {
+            cgroup_contents: Some("0::/kubepods/burstable/pod123/docker-abc".to_string()),
+            dockerenv_exists: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            detect_container_runtime_from_inputs(&inputs),
+            ContainerRuntime::Kubernetes
+        ));
     }
 
     #[test]
@@ -7660,6 +8212,8 @@ mod tests {
         assert_eq!(provider_env_var("anthropic"), "ANTHROPIC_API_KEY");
         assert_eq!(provider_env_var("openai-codex"), "OPENAI_API_KEY");
         assert_eq!(provider_env_var("openai"), "OPENAI_API_KEY");
+        assert_eq!(provider_env_var("copilot"), "GITHUB_TOKEN");
+        assert_eq!(provider_env_var("github-copilot"), "GITHUB_TOKEN"); // alias
         assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
         assert_eq!(provider_env_var("llamacpp"), "LLAMACPP_API_KEY");
         assert_eq!(provider_env_var("llama.cpp"), "LLAMACPP_API_KEY");
@@ -7799,6 +8353,7 @@ mod tests {
             ignore_attachments: false,
             ignore_stories: true,
             proxy_url: None,
+            approval_timeout_secs: 300,
         });
         assert!(has_launchable_channels(&channels));
 
@@ -7846,10 +8401,28 @@ mod tests {
             encrypt_key: None,
             verification_token: None,
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: zeroclaw_config::schema::LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
         });
+        assert!(has_launchable_channels(&channels));
+    }
+
+    #[test]
+    fn webhook_only_config_is_launchable() {
+        let channels = ChannelsConfig {
+            webhook: Some(zeroclaw_config::schema::WebhookConfig {
+                enabled: true,
+                port: 8080,
+                listen_path: None,
+                send_url: None,
+                send_method: None,
+                auth_header: None,
+                secret: None,
+            }),
+            ..Default::default()
+        };
         assert!(has_launchable_channels(&channels));
     }
 
@@ -7871,6 +8444,7 @@ mod tests {
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
                 stall_timeout_secs: 0,
+                approval_timeout_secs: 300,
             }),
             matrix: Some(MatrixConfig {
                 enabled: true,
@@ -7887,6 +8461,7 @@ mod tests {
                 recovery_key: None,
                 mention_only: false,
                 password: None,
+                approval_timeout_secs: 300,
             }),
             ..Default::default()
         };
@@ -7923,6 +8498,7 @@ mod tests {
                 recovery_key: Some("recovery-secret".into()),
                 mention_only: false,
                 password: None,
+                approval_timeout_secs: 300,
             }),
             ..Default::default()
         };

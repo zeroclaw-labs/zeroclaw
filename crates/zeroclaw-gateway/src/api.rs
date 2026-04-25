@@ -1528,6 +1528,48 @@ pub async fn handle_api_session_state(
     }
 }
 
+// ── Session abort endpoint ────────────────────────────────────────
+
+/// POST /api/sessions/{id}/abort — cancel an in-flight agent response.
+///
+/// Looks up the cancellation token for the given session. If a turn is
+/// currently running the token is cancelled, which causes the agent's
+/// streaming loop and tool-call loop to exit early. The WebSocket handler
+/// is responsible for cleaning up partial state and sending the abort
+/// frame to the client.
+///
+/// Returns 200 with `{"status": "aborted"}` if a running turn was found,
+/// or `{"status": "no_active_response"}` if the session was idle (no
+/// token present). Both are success — abort is idempotent.
+pub async fn handle_api_session_abort(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let session_key = format!("gw_{id}");
+
+    // Look up and cancel the token. Hold the lock only long enough to
+    // clone the token — cancellation itself does not need the lock.
+    let token = state
+        .cancel_tokens
+        .lock()
+        .expect("cancel_tokens lock poisoned")
+        .get(&session_key)
+        .cloned();
+
+    if let Some(token) = token {
+        token.cancel();
+        tracing::info!(session_key, "session abort requested");
+        Json(serde_json::json!({ "status": "aborted" })).into_response()
+    } else {
+        Json(serde_json::json!({ "status": "no_active_response" })).into_response()
+    }
+}
+
 // ── Claude Code hook endpoint ────────────────────────────────────
 
 /// POST /hooks/claude-code — receives HTTP hook events from Claude Code
@@ -1675,6 +1717,7 @@ mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -1723,6 +1766,7 @@ mod tests {
             encrypt_key: Some("feishu-encrypt".to_string()),
             verification_token: Some("feishu-verify".to_string()),
             allowed_users: vec!["*".to_string()],
+            mention_only: false,
             receive_mode: zeroclaw_config::schema::LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
@@ -1739,6 +1783,7 @@ mod tests {
             password: "email-password-secret".to_string(),
             from_address: "agent@example.com".to_string(),
             idle_timeout_secs: 1740,
+            poll_interval_secs: 60,
             allowed_senders: vec!["*".to_string()],
             default_subject: "ZeroClaw Message".to_string(),
             max_attachment_bytes: 25 * 1024 * 1024,
@@ -1876,6 +1921,7 @@ mod tests {
             encrypt_key: Some("feishu-encrypt-real".to_string()),
             verification_token: Some("feishu-verify-real".to_string()),
             allowed_users: vec!["*".to_string()],
+            mention_only: false,
             receive_mode: zeroclaw_config::schema::LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
@@ -1892,6 +1938,7 @@ mod tests {
             password: "email-password-real".to_string(),
             from_address: "agent@example.com".to_string(),
             idle_timeout_secs: 1740,
+            poll_interval_secs: 60,
             allowed_senders: vec!["*".to_string()],
             default_subject: "ZeroClaw Message".to_string(),
             max_attachment_bytes: 25 * 1024 * 1024,
