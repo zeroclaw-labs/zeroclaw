@@ -298,6 +298,7 @@ channel-voice-call = ["zeroclaw-channels/channel-voice-call"]
 channel-feishu = ["channel-lark"]
 whatsapp-web = ["zeroclaw-channels/whatsapp-web"]
 voice-wake = ["zeroclaw-channels/voice-wake"]
+memory-postgres = ["zeroclaw-memory/memory-postgres"]
 
 # Backends and platform flags — each forwards to ONE crate
 observability-prometheus = [
@@ -312,7 +313,7 @@ sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
 browser-native = ["zeroclaw-tools/browser-native"]
 plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-runtime/plugins-wasm"]
 probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
-rag-pdf = ["zeroclaw-tools/rag-pdf"]
+rag-pdf = ["zeroclaw-tools/rag-pdf", "zeroclaw-runtime/rag-pdf"]
 webauthn = ["zeroclaw-runtime/webauthn"]
 
 # Backward-compatible aliases
@@ -328,7 +329,7 @@ ci-all = [
     "hardware", "peripheral-rpi",
     "sandbox-landlock", "sandbox-bubblewrap",
     "browser-native", "plugins-wasm", "probe", "rag-pdf",
-    "webauthn",
+    "webauthn", "memory-postgres",
 ]
 
 [profile.dev]

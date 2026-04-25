@@ -1308,12 +1308,13 @@ fn create_provider_with_url_and_options(
             )))
         }
         name if minimax_base_url(name).is_some() => Ok(compat(
-            OpenAiCompatibleProvider::new_merge_system_into_user(
+            OpenAiCompatibleProvider::new(
                 "MiniMax",
                 minimax_base_url(name).expect("checked in guard"),
                 key,
                 AuthStyle::Bearer,
-            ),
+            )
+            .with_merge_system_into_user(),
         )),
         "azure_openai" | "azure-openai" | "azure" => {
             let resource = std::env::var("AZURE_OPENAI_RESOURCE")
@@ -2843,13 +2844,13 @@ mod tests {
     }
 
     #[test]
-    fn factory_minimax_disables_native_tool_calling() {
+    fn factory_minimax_supports_native_tool_calling() {
         let minimax = create_provider("minimax", Some("key")).expect("provider should resolve");
-        assert!(!minimax.supports_native_tools());
+        assert!(minimax.supports_native_tools());
 
         let minimax_cn =
             create_provider("minimax-cn", Some("key")).expect("provider should resolve");
-        assert!(!minimax_cn.supports_native_tools());
+        assert!(minimax_cn.supports_native_tools());
     }
 
     #[test]

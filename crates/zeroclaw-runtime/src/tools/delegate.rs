@@ -1164,7 +1164,7 @@ impl DelegateTool {
                 None,
                 &self.multimodal_config,
                 agent_config.max_iterations,
-                None,
+                Some(self.cancellation_token.child_token()),
                 None,
                 None,
                 &[],

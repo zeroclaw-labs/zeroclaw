@@ -43,6 +43,10 @@ export interface CronJob {
   enabled: boolean;
   delivery: unknown;
   delete_after_run: boolean;
+  session_target: string | null;
+  model: string | null;
+  allowed_tools: string[] | null;
+  source: string | null;
   created_at: string;
   next_run: string;
   last_run: string | null;

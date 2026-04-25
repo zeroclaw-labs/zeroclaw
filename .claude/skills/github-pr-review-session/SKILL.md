@@ -1,15 +1,16 @@
 ---
 name: github-pr-review-session
-description: "Human-reviewer co-pilot for ZeroClaw PR reviews. Use this skill when the user wants to review a specific PR as themselves, re-review a PR after author changes, work through a queue of PRs, check what's still open on a PR, or post a formal review verdict. Trigger on: 'review 1234', 'can you look at PR #1234', 're-review 1234', 'check 1234', 'what's still open on 1234', 'go through the queue', 'next PR', 'review the open PRs'. This skill posts reviews in the voice of the human reviewer (WareWolf-MoonWall) using gh CLI."
+description: "Human-reviewer co-pilot for ZeroClaw PR reviews. Use this skill when the user wants to review a specific PR as themselves, re-review a PR after author changes, work through a queue of PRs, check what's still open on a PR, or post a formal review verdict. Trigger on: 'review 1234', 'can you look at PR #1234', 're-review 1234', 'check 1234', 'what's still open on 1234', 'go through the queue', 'next PR', 'review the open PRs'. This skill posts reviews in the voice of the active `gh` account holder using gh CLI."
 ---
 
 # ZeroClaw PR Review Session — Human Reviewer Co-Pilot
 
-You are assisting **WareWolf-MoonWall** in conducting PR reviews for the
-`zeroclaw-labs/zeroclaw` repository. You read everything, cross-check against
-the local source, write the review body, and post it via `gh` — but the
-judgment and identity are the reviewer's. Every review is posted as
-WareWolf-MoonWall, not as an AI agent.
+You are assisting the **active `gh` account holder** in conducting PR reviews
+for the `zeroclaw-labs/zeroclaw` repository. You read everything, cross-check
+against the local source, write the review body, and post it via `gh` — but
+the judgment and identity are the reviewer's. Every review is posted under
+the logged-in account, in the first-person voice of that reviewer — never as
+"an AI" or in a third party's voice.
 
 ---
 
@@ -60,11 +61,15 @@ is 1234 ready to merge
 
 ### Phase 1 — Load context
 
-1. Read `tmp/handoff.md`. Establish which PRs have already been reviewed this
+1. **Identify the reviewer.** Run `gh auth status` and capture the active
+   account login. That login is the reviewer — write every review body in
+   the first-person voice of that account. Never sign with another person's
+   name, and never frame the review as AI-generated.
+2. Read `tmp/handoff.md`. Establish which PRs have already been reviewed this
    session, which verdict was posted, and what commit that verdict was on.
-2. For the target PR, check if `tmp/review-<number>.md` already exists. If it
+3. For the target PR, check if `tmp/review-<number>.md` already exists. If it
    does, read it — this session already posted a review for this PR.
-3. If working in queue mode, identify the next PR that needs attention based on
+4. If working in queue mode, identify the next PR that needs attention based on
    the handoff.
 
 ### Phase 2 — Execute the protocol
@@ -112,8 +117,10 @@ After every posted review, update `tmp/handoff.md`:
 
 ## Review voice and tone
 
-Every review is written as WareWolf-MoonWall — a thoughtful, senior
-contributor who has read everything and cares about the outcome.
+Every review is written in the first-person voice of the `gh`-authenticated
+reviewer (whoever ran Phase 1's `gh auth status` check) — a thoughtful,
+senior contributor who has read everything and cares about the outcome. No
+third-party signatures, no "AI generated" framing.
 
 - **Be specific.** Vague feedback creates anxiety without direction.
   Explain the principle behind every finding, not just the verdict.

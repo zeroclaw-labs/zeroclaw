@@ -369,4 +369,33 @@ mod tests {
         assert!(deleted);
         assert!(backend.load("trait_delete").is_empty());
     }
+
+    // ── get_session_metadata (trait default) tests ──────────────────
+
+    #[test]
+    fn get_session_metadata_returns_none_for_missing() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        assert!(backend.get_session_metadata("nonexistent").is_none());
+    }
+
+    #[test]
+    fn get_session_metadata_returns_correct_count() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        backend
+            .append("test_session", &ChatMessage::user("hello"))
+            .unwrap();
+        backend
+            .append("test_session", &ChatMessage::assistant("hi"))
+            .unwrap();
+
+        let meta = backend.get_session_metadata("test_session").unwrap();
+        assert_eq!(meta.key, "test_session");
+        assert_eq!(meta.message_count, 2);
+        assert!(meta.name.is_none());
+    }
 }

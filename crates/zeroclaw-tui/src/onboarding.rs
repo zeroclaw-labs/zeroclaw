@@ -12,7 +12,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Paragraph},
 };
-use std::io::{self, IsTerminal};
+
+use std::io;
+#[cfg(unix)]
+use std::io::IsTerminal;
 
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::{
@@ -774,6 +777,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     draft_update_interval_ms: 1000,
                     multi_message_delay_ms: 800,
                     stall_timeout_secs: 0,
+                    approval_timeout_secs: 300,
                 });
             }
         }
@@ -793,6 +797,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     stream_drafts: false,
                     draft_update_interval_ms: 1200,
                     cancel_reaction: None,
+                    approval_timeout_secs: 300,
                 });
             }
         }
@@ -816,6 +821,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     dm_mention_patterns: vec![],
                     group_mention_patterns: vec![],
                     proxy_url: None,
+                    approval_timeout_secs: 300,
                 });
             }
         }
@@ -830,6 +836,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     ignore_attachments: false,
                     ignore_stories: true,
                     proxy_url: None,
+                    approval_timeout_secs: 300,
                 });
             }
         }
@@ -876,6 +883,9 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     mention_only: existing_mx.map(|m| m.mention_only).unwrap_or(false),
                     recovery_key: existing_mx.and_then(|m| m.recovery_key.clone()),
                     password: existing_mx.and_then(|m| m.password.clone()),
+                    approval_timeout_secs: existing_mx
+                        .map(|m| m.approval_timeout_secs)
+                        .unwrap_or(300),
                 });
             }
         }
