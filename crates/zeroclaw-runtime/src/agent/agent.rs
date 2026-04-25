@@ -2206,7 +2206,7 @@ mod tests {
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
         let _ = agent
-            .turn_streamed("use pre-executed tools", event_tx)
+            .turn_streamed("use pre-executed tools", event_tx, None)
             .await
             .unwrap();
 
