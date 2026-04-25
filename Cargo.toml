@@ -101,9 +101,10 @@ fastembed = { version = "4", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
 
-# PowerSync (local-first sync for createOS)
-powersync = { version = "0.0.4", features = ["tokio"] }
-http-client = { version = "6.5.3", default-features = false }
+# PowerSync (local-first sync for createOS) — optional, requires stable Rust
+# pinned to 0.0.3 which locks powersync_core =0.4.9 (pre-debug_closure_helpers nightly dep)
+powersync = { version = "0.0.3", features = ["tokio"], optional = true }
+http-client = { version = "6.5.3", default-features = false, optional = true }
 
 # Interactive CLI prompts
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
@@ -141,7 +142,7 @@ lightwave-macos = { path = "crates/lightwave-macos" }
 
 [features]
 default = ["createos"]
-createos = []
+createos = ["dep:powersync", "dep:http-client"]
 brain = ["dep:fastembed"]
 browser-native = ["dep:fantoccini"]
 gateway = ["dep:axum"]
