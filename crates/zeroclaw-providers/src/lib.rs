@@ -1846,9 +1846,11 @@ pub fn create_resilient_provider_with_options(
         };
 
         let create_result = match actual_provider_name {
-            "openai-codex" | "openai_codex" | "codex" => {
-                create_provider_with_options(actual_provider_name, config_api_key, &fallback_options)
-            }
+            "openai-codex" | "openai_codex" | "codex" => create_provider_with_options(
+                actual_provider_name,
+                config_api_key,
+                &fallback_options,
+            ),
             _ => create_provider_with_url_and_options(
                 actual_provider_name,
                 config_api_key,
