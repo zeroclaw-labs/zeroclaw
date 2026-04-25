@@ -8281,10 +8281,15 @@ mod tests {
 
     #[test]
     fn backend_key_from_choice_maps_supported_backends() {
+        // Order must mirror SELECTABLE_MEMORY_BACKENDS in
+        // crates/zeroclaw-memory/src/backend.rs. When new backends are added
+        // there, both the wizard prompt order and this test update together.
         assert_eq!(backend_key_from_choice(0), "sqlite");
         assert_eq!(backend_key_from_choice(1), "lucid");
-        assert_eq!(backend_key_from_choice(2), "markdown");
-        assert_eq!(backend_key_from_choice(3), "none");
+        assert_eq!(backend_key_from_choice(2), "postgres");
+        assert_eq!(backend_key_from_choice(3), "markdown");
+        assert_eq!(backend_key_from_choice(4), "none");
+        // Out-of-range choices fall back to the default backend (sqlite).
         assert_eq!(backend_key_from_choice(999), "sqlite");
     }
 

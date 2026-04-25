@@ -11699,8 +11699,12 @@ auto_save = true
 
     #[test]
     async fn memory_config_pgvector_roundtrip() {
+        // `auto_save` is required on MemoryConfig and unrelated to the pgvector
+        // fields these tests exercise. Including it keeps the fixture parseable
+        // without coupling the test to schema-default behavior on auto_save.
         let toml = r#"
             backend = "postgres"
+            auto_save = true
             [postgres]
             vector_enabled = true
             vector_dimensions = 768
@@ -11717,7 +11721,10 @@ auto_save = true
 
     #[test]
     async fn memory_config_pgvector_defaults_when_omitted() {
-        let toml = r#"backend = "postgres""#;
+        let toml = r#"
+            backend = "postgres"
+            auto_save = true
+        "#;
         let parsed: MemoryConfig = toml::from_str(toml).unwrap();
         assert!(!parsed.postgres.vector_enabled);
         assert_eq!(parsed.postgres.vector_dimensions, 1536);
