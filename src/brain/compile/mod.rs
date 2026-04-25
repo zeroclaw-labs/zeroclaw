@@ -67,9 +67,18 @@ pub async fn run(opts: CompileOptions) -> Result<CompileReport> {
                 .join("instructions");
 
             match writer::write_bundle(&agent_dir, &bundle, opts.force, opts.dry_run) {
-                Ok(writer::WriteOutcome::Wrote) => report.written += 1,
-                Ok(writer::WriteOutcome::Unchanged) => report.skipped_unchanged += 1,
-                Ok(writer::WriteOutcome::WouldWrite) => report.written += 1,
+                Ok(writer::WriteOutcome::Wrote) => {
+                    tracing::info!(agent = %agent.name, dir = %agent_dir.display(), "wrote");
+                    report.written += 1;
+                }
+                Ok(writer::WriteOutcome::Unchanged) => {
+                    tracing::debug!(agent = %agent.name, "unchanged");
+                    report.skipped_unchanged += 1;
+                }
+                Ok(writer::WriteOutcome::WouldWrite) => {
+                    tracing::info!(agent = %agent.name, dir = %agent_dir.display(), "would write (dry-run)");
+                    report.written += 1;
+                }
                 Err(err) => {
                     report.failed += 1;
                     report

@@ -6,6 +6,9 @@ pub fn is_accessibility_trusted() -> bool {
     extern "C" {
         fn AXIsProcessTrusted() -> u8;
     }
+    // SAFETY: AXIsProcessTrusted is a thread-safe Apple API that takes no
+    // arguments and returns a Boolean (u8). No preconditions; sound on any
+    // macOS process. Linked via the ApplicationServices framework.
     unsafe { AXIsProcessTrusted() != 0 }
 }
 
@@ -20,6 +23,9 @@ pub fn has_screen_capture_access() -> bool {
     extern "C" {
         fn CGPreflightScreenCaptureAccess() -> u8;
     }
+    // SAFETY: CGPreflightScreenCaptureAccess is a thread-safe CoreGraphics API
+    // that takes no arguments and returns a Boolean (u8). Read-only check;
+    // does not show a system dialog.
     unsafe { CGPreflightScreenCaptureAccess() != 0 }
 }
 
@@ -34,6 +40,9 @@ pub fn request_screen_capture_access() -> bool {
     extern "C" {
         fn CGRequestScreenCaptureAccess() -> u8;
     }
+    // SAFETY: CGRequestScreenCaptureAccess is a thread-safe CoreGraphics API
+    // that takes no arguments and returns a Boolean (u8). Triggers the system
+    // permission dialog on first call; sound to invoke from any thread.
     unsafe { CGRequestScreenCaptureAccess() != 0 }
 }
 

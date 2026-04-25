@@ -2484,12 +2484,10 @@ mod tests {
     }
 
     #[cfg(feature = "browser-native")]
-    #[test]
-    fn reset_session_is_idempotent_without_client() {
-        tokio_test::block_on(async {
-            let mut state = native_backend::NativeBrowserState::default();
-            state.reset_session().await;
-            state.reset_session().await;
-        });
+    #[tokio::test]
+    async fn reset_session_is_idempotent_without_client() {
+        let mut state = native_backend::NativeBrowserState::default();
+        state.reset_session().await;
+        state.reset_session().await;
     }
 }

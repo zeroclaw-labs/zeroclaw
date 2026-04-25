@@ -19,7 +19,7 @@ pub fn render_agent(brain: &BrainSnapshot, agent: &Agent) -> AgentBundle {
     let role_match = find_swarm_role(&brain.swarm, agent);
     AgentBundle {
         agents_md: render_agents_md(brain, agent, role_match.as_ref()),
-        soul_md: render_soul_md(brain, agent),
+        soul_md: render_soul_md(brain, &agent.name),
         tools_md: render_tools_md(brain, agent, role_match.as_ref()),
     }
 }
@@ -141,10 +141,10 @@ fn render_agents_md(brain: &BrainSnapshot, agent: &Agent, role: Option<&RoleMatc
     out
 }
 
-fn render_soul_md(brain: &BrainSnapshot, agent: &Agent) -> String {
+fn render_soul_md(brain: &BrainSnapshot, agent_name: &str) -> String {
     let mut out = String::new();
     push_frontmatter(&mut out, brain);
-    out.push_str(&format!("# Soul — {}\n\n", agent.name));
+    out.push_str(&format!("# Soul — {}\n\n", agent_name));
 
     out.push_str("## Mind\n\n");
     if let Some(thesis) = brain.soul_mind.get("thesis").and_then(|v| v.as_str()) {
@@ -223,7 +223,6 @@ fn render_soul_md(brain: &BrainSnapshot, agent: &Agent) -> String {
         out.push_str("\n\n");
     }
 
-    let _ = agent;
     out
 }
 
@@ -272,7 +271,6 @@ fn render_tools_md(brain: &BrainSnapshot, agent: &Agent, role: Option<&RoleMatch
         out.push_str("\n");
     }
 
-    let _ = agent;
     out
 }
 
@@ -357,5 +355,208 @@ fn tier_label(tier: u64) -> &'static str {
         2 => "Reactive",
         3 => "Background",
         _ => "?",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn yaml(s: &str) -> Value {
+        serde_yaml::from_str(s).unwrap()
+    }
+
+    fn fixture_brain() -> BrainSnapshot {
+        BrainSnapshot {
+            soul_mind: yaml(
+                r#"
+thesis: Amplify perspective. Never generate one.
+how_we_think:
+  - Embrace reality.
+  - Cultivate skepticism.
+decision_framework:
+  questions:
+    - order: 1
+      question: What do you want?
+      description: Clarify the goal.
+    - order: 2
+      question: What is true?
+      description: Assess reality.
+  validation: How do you know that is true?
+"#,
+            ),
+            soul_voice: yaml(
+                r#"
+communication:
+  - Lead with the headline.
+  - Numbers, not adjectives.
+words_reveal_decisions:
+  avoid:
+    - pattern: "Should I?"
+      fix: State what you'd do and why.
+    - pattern: "I think"
+      fix: State what IS with evidence.
+"#,
+            ),
+            soul_judgment: yaml(
+                r#"
+default_bias: act_first
+bias_rule: When in doubt, act.
+modes:
+  act_first:
+    description: Default mode.
+    pattern: Show the work.
+  ask_first:
+    description: Strategic.
+    pattern: Clarify before acting.
+"#,
+            ),
+            soul_aesthetic: yaml("seeing_philosophy: Patience is practice.\n"),
+            swarm: yaml(
+                r#"
+agents:
+  v_legal:
+    role: Legal counsel
+    domain: contracts compliance
+    tier: 2
+    observes:
+      - new contracts
+    produces:
+      - contract reviews
+    escalates_when:
+      - novel legal exposure
+    self_heal: Re-read the contract.
+    channels:
+      - slack
+      - email
+"#,
+            ),
+            agile_framework: Value::Null,
+            messaging_safety: Value::Null,
+            skills_index: yaml(
+                r#"
+skills:
+  - id: gmail-draft
+    type: action
+    runtime: paperclip
+    trigger: User asks to send email.
+"#,
+            ),
+            brain_sha: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into(),
+            compiled_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn agent_legal() -> Agent {
+        Agent {
+            id: "agent-1".into(),
+            company_id: "co-1".into(),
+            name: "Legal".into(),
+            title: Some("Legal counsel".into()),
+            capabilities: Some("Reviews contracts and flags compliance risk.".into()),
+            reports_to: Some("agent-gm".into()),
+        }
+    }
+
+    #[test]
+    fn render_agent_produces_three_files_with_frontmatter() {
+        let brain = fixture_brain();
+        let bundle = render_agent(&brain, &agent_legal());
+        for md in [&bundle.agents_md, &bundle.soul_md, &bundle.tools_md] {
+            assert!(md.starts_with("---\n"), "missing frontmatter: {md:.80}");
+            assert!(md.contains("brain_sha: abcdef0123456789"));
+            assert!(md.contains("compiled_at: 2026-01-01T00:00:00Z"));
+        }
+    }
+
+    #[test]
+    fn agents_md_contains_role_domain_tier_and_reports_to() {
+        let bundle = render_agent(&fixture_brain(), &agent_legal());
+        let md = &bundle.agents_md;
+        assert!(md.contains("# Legal"));
+        assert!(md.contains("**Title:** Legal counsel"));
+        assert!(md.contains("Reviews contracts and flags compliance risk."));
+        assert!(md.contains("## Domain"));
+        assert!(md.contains("contracts compliance"));
+        assert!(md.contains("**Tier:** 2 (Reactive)"));
+        assert!(md.contains("- new contracts"));
+        assert!(md.contains("- contract reviews"));
+        assert!(md.contains("- novel legal exposure"));
+        assert!(md.contains("Re-read the contract."));
+        assert!(md.contains("Agent `agent-gm`"));
+    }
+
+    #[test]
+    fn agents_md_includes_judgment_modes_and_decision_framework() {
+        let bundle = render_agent(&fixture_brain(), &agent_legal());
+        let md = &bundle.agents_md;
+        assert!(md.contains("## Judgment modes"));
+        assert!(md.contains("**act_first**"));
+        assert!(md.contains("**ask_first**"));
+        assert!(md.contains("## Decision framework"));
+        assert!(md.contains("1. **What do you want?**"));
+        assert!(md.contains("_Validation:_ How do you know that is true?"));
+    }
+
+    #[test]
+    fn soul_md_contains_mind_voice_judgment_aesthetic() {
+        let bundle = render_agent(&fixture_brain(), &agent_legal());
+        let md = &bundle.soul_md;
+        assert!(md.contains("# Soul — Legal"));
+        assert!(md.contains("## Mind"));
+        assert!(md.contains("Amplify perspective."));
+        assert!(md.contains("- Embrace reality."));
+        assert!(md.contains("## Voice"));
+        assert!(md.contains("- Lead with the headline."));
+        assert!(md.contains("**Words to swap.**"));
+        assert!(md.contains("| Should I? | State what you'd do and why. |"));
+        assert!(md.contains("## Judgment"));
+        assert!(md.contains("**Default bias:** `act_first`"));
+        assert!(md.contains("When in doubt, act."));
+        assert!(md.contains("## Aesthetic"));
+        assert!(md.contains("Patience is practice."));
+    }
+
+    #[test]
+    fn tools_md_contains_channels_plugin_tools_and_skills() {
+        let bundle = render_agent(&fixture_brain(), &agent_legal());
+        let md = &bundle.tools_md;
+        assert!(md.contains("# Tools — Legal"));
+        assert!(md.contains("## Channels"));
+        assert!(md.contains("slack, email"));
+        assert!(md.contains("## Plugin tools"));
+        assert!(md.contains("`brain.query`"));
+        assert!(md.contains("`pool.claim`"));
+        assert!(md.contains("## Skills"));
+        assert!(md.contains("`gmail-draft`"));
+    }
+
+    #[test]
+    fn no_raw_yaml_fences_in_output() {
+        let bundle = render_agent(&fixture_brain(), &agent_legal());
+        for md in [&bundle.agents_md, &bundle.soul_md, &bundle.tools_md] {
+            assert!(!md.contains("```yaml"), "raw yaml fence leaked: {md:.200}");
+            assert!(!md.contains("```yml"), "raw yml fence leaked");
+        }
+    }
+
+    #[test]
+    fn agent_with_no_swarm_match_still_renders_basic_sections() {
+        let brain = fixture_brain();
+        let agent = Agent {
+            id: "agent-x".into(),
+            company_id: "co-1".into(),
+            name: "WildcardAgent".into(),
+            title: None,
+            capabilities: None,
+            reports_to: None,
+        };
+        let bundle = render_agent(&brain, &agent);
+        assert!(bundle.agents_md.contains("# WildcardAgent"));
+        // No domain/tier sections expected when no role match.
+        assert!(!bundle.agents_md.contains("## Domain"));
+        assert!(!bundle.agents_md.contains("**Tier:**"));
+        // Soul still renders.
+        assert!(bundle.soul_md.contains("# Soul — WildcardAgent"));
     }
 }

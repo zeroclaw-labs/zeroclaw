@@ -285,6 +285,8 @@ pub fn install_launchd() -> Result<()> {
 
     // Bootstrap the agent (modern launchctl)
     let plist_str = plist_dest.to_str().unwrap_or_default();
+    // SAFETY: getuid() is async-signal-safe and always returns successfully
+    // with the calling process's real UID. No preconditions or invariants.
     let domain_target = format!("gui/{}", unsafe { libc::getuid() });
     let status = std::process::Command::new("launchctl")
         .args(["bootstrap", &domain_target, plist_str])
@@ -324,6 +326,7 @@ fn install_watchdog() -> Result<()> {
     std::fs::copy(&source, &dest)?;
 
     let dest_str = dest.to_str().unwrap_or_default();
+    // SAFETY: getuid() always succeeds and returns the calling process's real UID.
     let domain_target = format!("gui/{}", unsafe { libc::getuid() });
     let status = std::process::Command::new("launchctl")
         .args(["bootstrap", &domain_target, dest_str])
@@ -361,6 +364,7 @@ pub fn uninstall_launchd() -> Result<()> {
 /// Bootout a launchd service using modern launchctl, falling back to legacy unload.
 fn launchctl_bootout(plist_path: &std::path::Path) -> Result<()> {
     let plist_str = plist_path.to_str().unwrap_or_default();
+    // SAFETY: getuid() always succeeds and returns the calling process's real UID.
     let domain_target = format!("gui/{}", unsafe { libc::getuid() });
     let status = std::process::Command::new("launchctl")
         .args(["bootout", &domain_target, plist_str])
@@ -387,6 +391,9 @@ pub fn daemon_stop() -> Result<String> {
     let pid: i32 = pid_str.trim().parse()?;
 
     // Check if process is alive before sending signal
+    // SAFETY: kill(pid, 0) is the canonical existence probe — sends no signal,
+    // performs only permission/existence checks. Sound for any pid value;
+    // returns -1 with errno set (ESRCH/EPERM) on failure rather than UB.
     let alive = unsafe { libc::kill(pid, 0) == 0 };
     if !alive {
         let _ = std::fs::remove_file(&config.pid_file);
@@ -394,6 +401,8 @@ pub fn daemon_stop() -> Result<String> {
     }
 
     // Send SIGTERM for graceful shutdown
+    // SAFETY: kill(pid, SIGTERM) is sound for any pid; the kernel rejects
+    // invalid targets with -1/errno rather than UB. We check the return below.
     let result = unsafe { libc::kill(pid, libc::SIGTERM) };
     if result != 0 {
         anyhow::bail!(
@@ -428,6 +437,8 @@ pub fn daemon_status() -> Result<String> {
     let pid: u32 = pid_str.trim().parse()?;
 
     // Check if process is alive
+    // SAFETY: kill(pid, 0) is the existence probe — no signal sent, no UB
+    // possible for any pid value. Returns -1/errno on failure.
     let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
 
     if alive {

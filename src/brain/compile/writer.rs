@@ -75,3 +75,83 @@ fn write_atomic(target: &Path, content: &str) -> Result<()> {
         .with_context(|| format!("rename {} -> {}", tmp.display(), target.display()))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn bundle(tag: &str) -> AgentBundle {
+        AgentBundle {
+            agents_md: format!("agents-{tag}"),
+            soul_md: format!("soul-{tag}"),
+            tools_md: format!("tools-{tag}"),
+        }
+    }
+
+    #[test]
+    fn first_write_creates_files_and_reports_wrote() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("instructions");
+        let outcome = write_bundle(&dir, &bundle("v1"), false, false).unwrap();
+        assert!(matches!(outcome, WriteOutcome::Wrote));
+        assert_eq!(
+            fs::read_to_string(dir.join("AGENTS.md")).unwrap(),
+            "agents-v1"
+        );
+        assert_eq!(fs::read_to_string(dir.join("SOUL.md")).unwrap(), "soul-v1");
+        assert_eq!(
+            fs::read_to_string(dir.join("TOOLS.md")).unwrap(),
+            "tools-v1"
+        );
+    }
+
+    #[test]
+    fn second_write_with_identical_content_reports_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("instructions");
+        write_bundle(&dir, &bundle("v1"), false, false).unwrap();
+        let outcome = write_bundle(&dir, &bundle("v1"), false, false).unwrap();
+        assert!(matches!(outcome, WriteOutcome::Unchanged));
+    }
+
+    #[test]
+    fn dry_run_with_no_existing_files_reports_would_write_and_creates_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("instructions");
+        let outcome = write_bundle(&dir, &bundle("v1"), false, true).unwrap();
+        assert!(matches!(outcome, WriteOutcome::WouldWrite));
+        assert!(!dir.exists(), "dry-run must not create the target dir");
+    }
+
+    #[test]
+    fn dry_run_with_unchanged_content_reports_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("instructions");
+        write_bundle(&dir, &bundle("v1"), false, false).unwrap();
+        let outcome = write_bundle(&dir, &bundle("v1"), false, true).unwrap();
+        assert!(matches!(outcome, WriteOutcome::Unchanged));
+    }
+
+    #[test]
+    fn force_rewrites_even_when_content_is_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("instructions");
+        write_bundle(&dir, &bundle("v1"), false, false).unwrap();
+        let outcome = write_bundle(&dir, &bundle("v1"), true, false).unwrap();
+        assert!(matches!(outcome, WriteOutcome::Wrote));
+    }
+
+    #[test]
+    fn changed_content_overwrites() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("instructions");
+        write_bundle(&dir, &bundle("v1"), false, false).unwrap();
+        let outcome = write_bundle(&dir, &bundle("v2"), false, false).unwrap();
+        assert!(matches!(outcome, WriteOutcome::Wrote));
+        assert_eq!(
+            fs::read_to_string(dir.join("AGENTS.md")).unwrap(),
+            "agents-v2"
+        );
+    }
+}
