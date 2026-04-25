@@ -10,7 +10,7 @@
 //!
 //! | Method            | Description                              |
 //! |-------------------|------------------------------------------|
-//! | `initialize`      | Handshake — returns server capabilities (incl. defaultModel or null) |
+//! | `initialize`      | Handshake — returns server capabilities (incl. defaultModel when configured) |
 //! | `session/new`     | Create an isolated agent session          |
 //! | `session/prompt`  | Send a prompt, stream back `session/update` events |
 //! | `session/stop`    | Gracefully terminate a session            |
