@@ -5451,6 +5451,11 @@ pub struct ObservabilityConfig {
     /// Maximum entries retained when runtime_trace_mode = "rolling".
     #[serde(default = "default_runtime_trace_max_entries")]
     pub runtime_trace_max_entries: usize,
+
+    /// File rotation policy for runtime trace output.
+    #[serde(default)]
+    #[nested]
+    pub runtime_trace_rotation: FileRotationConfig,
 }
 
 impl Default for ObservabilityConfig {
@@ -5463,6 +5468,7 @@ impl Default for ObservabilityConfig {
             runtime_trace_mode: default_runtime_trace_mode(),
             runtime_trace_path: default_runtime_trace_path(),
             runtime_trace_max_entries: default_runtime_trace_max_entries(),
+            runtime_trace_rotation: FileRotationConfig::default(),
         }
     }
 }
@@ -5477,6 +5483,49 @@ fn default_runtime_trace_path() -> String {
 
 fn default_runtime_trace_max_entries() -> usize {
     200
+}
+
+/// File rotation policy for runtime trace (and future) log output.
+///
+/// Rotated files are named `<stem>.YYYY-MM-DD.<seq>.<ext>`.
+/// Rotation is triggered by both file size and natural day boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "observability.runtime_trace_rotation"]
+pub struct FileRotationConfig {
+    /// Maximum size of a single file in MB before rotation is triggered.
+    #[serde(default = "default_rotation_max_file_size_mb")]
+    pub max_file_size_mb: u64,
+
+    /// Maximum age in days for rotated files. Older files are deleted.
+    #[serde(default = "default_rotation_max_age_days")]
+    pub max_age_days: u64,
+
+    /// Maximum number of rotated files to keep. Oldest are deleted first.
+    #[serde(default = "default_rotation_max_rotated_files")]
+    pub max_rotated_files: usize,
+}
+
+impl Default for FileRotationConfig {
+    fn default() -> Self {
+        Self {
+            max_file_size_mb: default_rotation_max_file_size_mb(),
+            max_age_days: default_rotation_max_age_days(),
+            max_rotated_files: default_rotation_max_rotated_files(),
+        }
+    }
+}
+
+fn default_rotation_max_file_size_mb() -> u64 {
+    100
+}
+
+fn default_rotation_max_age_days() -> u64 {
+    30
+}
+
+fn default_rotation_max_rotated_files() -> usize {
+    100
 }
 
 // ── Hooks ────────────────────────────────────────────────────────

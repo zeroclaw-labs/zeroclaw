@@ -1,0 +1,20 @@
+[package]
+name = "zeroclaw-file-rotation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Enterprise-grade file rotation: size + date based, with retention policies."
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tokio = { version = "1.50", default-features = false, features = ["sync", "time", "fs", "io-util", "rt"] }
+tracing = { version = "0.1", default-features = false }
+
+[dev-dependencies]
+filetime = "0.2"
+libc = "0.2"
+tempfile = "3.26"
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }

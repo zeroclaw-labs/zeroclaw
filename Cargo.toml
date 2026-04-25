@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-file-rotation", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri"]
 resolver = "2"
 
 [workspace.package]
@@ -13,6 +13,7 @@ rust-version = "1.87"
 zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.7.3" }
 zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.7.3" }
 zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.7.3", default-features = false }
+zeroclaw-file-rotation = { path = "crates/zeroclaw-file-rotation", version = "0.7.3" }
 zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.7.3" }
 zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.7.3" }
 zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.7.3", default-features = false }

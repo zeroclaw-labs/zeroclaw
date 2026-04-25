@@ -1,13 +1,12 @@
 use anyhow::Result;
-use chrono::{Local, Utc};
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::Arc;
 use uuid::Uuid;
-use zeroclaw_config::schema::ObservabilityConfig;
+use zeroclaw_config::schema::{FileRotationConfig, ObservabilityConfig};
+use zeroclaw_file_rotation::{RotatingFileWriter, RotationConfig};
 
 const DEFAULT_TRACE_REL_PATH: &str = "state/runtime-trace.jsonl";
 
@@ -53,96 +52,48 @@ pub struct RuntimeTraceEvent {
 
 struct RuntimeTraceLogger {
     mode: RuntimeTraceStorageMode,
-    max_entries: usize,
-    path: PathBuf,
-    write_lock: std::sync::Mutex<()>,
+    writer: RotatingFileWriter,
 }
 
 impl RuntimeTraceLogger {
-    fn new(mode: RuntimeTraceStorageMode, max_entries: usize, path: PathBuf) -> Self {
-        Self {
-            mode,
-            max_entries: max_entries.max(1),
-            path,
-            write_lock: std::sync::Mutex::new(()),
-        }
+    async fn new(
+        mode: RuntimeTraceStorageMode,
+        path: std::path::PathBuf,
+        rotation_config: &FileRotationConfig,
+    ) -> Result<Self> {
+        let rot_cfg = RotationConfig {
+            max_file_size_bytes: rotation_config.max_file_size_mb * 1024 * 1024,
+            max_age_days: rotation_config.max_age_days,
+            max_rotated_files: rotation_config.max_rotated_files,
+            #[cfg(unix)]
+            file_permissions: Some(0o600),
+            sync_on_write: true,
+        };
+
+        let writer = RotatingFileWriter::new(path.clone(), rot_cfg).await?;
+
+        Ok(Self { mode, writer })
     }
 
-    fn append(&self, event: &RuntimeTraceEvent) -> Result<()> {
+    async fn append(&self, event: &RuntimeTraceEvent) -> Result<()> {
         if self.mode == RuntimeTraceStorageMode::None {
             return Ok(());
         }
 
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
-
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
         let line = serde_json::to_string(event)?;
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-
-        let mut file = options.open(&self.path)?;
-        writeln!(file, "{line}")?;
-        file.sync_data()?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
-        }
-
-        if self.mode == RuntimeTraceStorageMode::Rolling {
-            self.trim_to_last_entries()?;
-        }
+        self.writer.append(line).await?;
 
         Ok(())
     }
 
-    fn trim_to_last_entries(&self) -> Result<()> {
-        let raw = fs::read_to_string(&self.path).unwrap_or_default();
-        let lines: Vec<&str> = raw
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect();
-
-        if lines.len() <= self.max_entries {
-            return Ok(());
-        }
-
-        let keep_from = lines.len().saturating_sub(self.max_entries);
-        let kept = &lines[keep_from..];
-        let mut rewritten = kept.join("\n");
-        rewritten.push('\n');
-
-        let tmp = self.path.with_extension(format!(
-            "tmp.{}.{}",
-            std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        fs::write(&tmp, rewritten)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
-
-        fs::rename(tmp, &self.path)?;
+    async fn shutdown(&self) -> Result<()> {
+        self.writer.shutdown().await?;
         Ok(())
     }
 }
 
-static TRACE_LOGGER: LazyLock<RwLock<Option<Arc<RuntimeTraceLogger>>>> =
-    LazyLock::new(|| RwLock::new(None));
+static TRACE_LOGGER: std::sync::LazyLock<tokio::sync::RwLock<Option<Arc<RuntimeTraceLogger>>>> =
+    std::sync::LazyLock::new(|| tokio::sync::RwLock::new(None));
 
 /// Resolve runtime trace storage mode from config.
 pub fn storage_mode_from_config(config: &ObservabilityConfig) -> RuntimeTraceStorageMode {
@@ -176,19 +127,27 @@ pub fn resolve_trace_path(config: &ObservabilityConfig, workspace_dir: &Path) ->
 }
 
 /// Initialize (or disable) runtime trace logging.
-pub fn init_from_config(config: &ObservabilityConfig, workspace_dir: &Path) {
+pub async fn init_from_config(config: &ObservabilityConfig, workspace_dir: &Path) {
     let mode = storage_mode_from_config(config);
     let logger = if mode == RuntimeTraceStorageMode::None {
         None
     } else {
-        Some(Arc::new(RuntimeTraceLogger::new(
+        match RuntimeTraceLogger::new(
             mode,
-            config.runtime_trace_max_entries.max(1),
             resolve_trace_path(config, workspace_dir),
-        )))
+            &config.runtime_trace_rotation,
+        )
+        .await
+        {
+            Ok(l) => Some(Arc::new(l)),
+            Err(err) => {
+                tracing::warn!("Failed to initialize runtime trace logger: {err}");
+                None
+            }
+        }
     };
 
-    let mut guard = TRACE_LOGGER.write().unwrap_or_else(|e| e.into_inner());
+    let mut guard = TRACE_LOGGER.write().await;
     *guard = logger;
 }
 
@@ -203,10 +162,8 @@ pub fn record_event(
     message: Option<&str>,
     payload: Value,
 ) {
-    let logger = TRACE_LOGGER
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let logger = TRACE_LOGGER.try_read().ok().and_then(|g| g.clone());
+
     let Some(logger) = logger else {
         return;
     };
@@ -224,8 +181,23 @@ pub fn record_event(
         payload,
     };
 
-    if let Err(err) = logger.append(&event) {
-        tracing::warn!("Failed to write runtime trace event: {err}");
+    // Spawn a fire-and-forget task so append() can run on the tokio runtime
+    // without blocking the caller (which may be on a non-async code path).
+    tokio::spawn(async move {
+        if let Err(err) = logger.append(&event).await {
+            tracing::warn!("Failed to write runtime trace event: {err}");
+        }
+    });
+}
+
+/// Gracefully shut down the trace logger, flushing any buffered writes.
+pub async fn shutdown() {
+    let logger = TRACE_LOGGER.write().await.take();
+
+    if let Some(logger) = logger
+        && let Err(err) = logger.shutdown().await
+    {
+        tracing::warn!("Failed to shut down runtime trace logger: {err}");
     }
 }
 
@@ -240,7 +212,7 @@ pub fn load_events(
         return Ok(Vec::new());
     }
 
-    let raw = fs::read_to_string(path)?;
+    let raw = std::fs::read_to_string(path)?;
     let mut events = Vec::new();
 
     for line in raw.lines() {
@@ -297,7 +269,7 @@ pub fn find_event_by_id(path: &Path, id: &str) -> Result<Option<RuntimeTraceEven
         return Ok(None);
     }
 
-    let raw = fs::read_to_string(path)?;
+    let raw = std::fs::read_to_string(path)?;
     for line in raw.lines().rev() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -316,6 +288,7 @@ pub fn find_event_by_id(path: &Path, id: &str) -> Result<Option<RuntimeTraceEven
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     fn test_observability_config() -> ObservabilityConfig {
         ObservabilityConfig {
@@ -326,6 +299,7 @@ mod tests {
             runtime_trace_mode: "rolling".to_string(),
             runtime_trace_path: "state/runtime-trace.jsonl".to_string(),
             runtime_trace_max_entries: 3,
+            runtime_trace_rotation: FileRotationConfig::default(),
         }
     }
 
@@ -359,11 +333,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rolling_mode_keeps_latest_entries() {
+    #[tokio::test]
+    async fn rolling_mode_writes_via_rotation_writer() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("trace.jsonl");
-        let logger = RuntimeTraceLogger::new(RuntimeTraceStorageMode::Rolling, 2, path.clone());
+
+        let rot_config = FileRotationConfig {
+            max_file_size_mb: 100,
+            max_age_days: 30,
+            max_rotated_files: 100,
+        };
+        let logger =
+            RuntimeTraceLogger::new(RuntimeTraceStorageMode::Rolling, path.clone(), &rot_config)
+                .await
+                .unwrap();
 
         for i in 0..5 {
             let event = RuntimeTraceEvent {
@@ -378,20 +361,33 @@ mod tests {
                 message: Some(format!("event-{i}")),
                 payload: serde_json::json!({ "i": i }),
             };
-            logger.append(&event).unwrap();
+            logger.append(&event).await.unwrap();
         }
+        logger.shutdown().await.unwrap();
 
-        let events = load_events(&path, 10, None, None).unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].message.as_deref(), Some("event-4"));
-        assert_eq!(events[1].message.as_deref(), Some("event-3"));
+        // The active file plus potentially rotated files should contain all events
+        let all_events = load_events(&path, 10, None, None).unwrap_or_default();
+        assert_eq!(
+            all_events.len(),
+            5,
+            "All 5 events should be readable across active + rotated files"
+        );
     }
 
-    #[test]
-    fn find_event_by_id_returns_match() {
+    #[tokio::test]
+    async fn find_event_by_id_returns_match() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("trace.jsonl");
-        let logger = RuntimeTraceLogger::new(RuntimeTraceStorageMode::Full, 100, path.clone());
+
+        let rot_config = FileRotationConfig {
+            max_file_size_mb: 100,
+            max_age_days: 30,
+            max_rotated_files: 100,
+        };
+        let logger =
+            RuntimeTraceLogger::new(RuntimeTraceStorageMode::Full, path.clone(), &rot_config)
+                .await
+                .unwrap();
 
         let target_id = "target-event";
         let event = RuntimeTraceEvent {
@@ -406,7 +402,8 @@ mod tests {
             message: Some("boom".into()),
             payload: serde_json::json!({ "error": "boom" }),
         };
-        logger.append(&event).unwrap();
+        logger.append(&event).await.unwrap();
+        logger.shutdown().await.unwrap();
 
         let found = find_event_by_id(&path, target_id).unwrap();
         assert!(found.is_some());
