@@ -440,6 +440,19 @@ async fn process_chat_message(
         let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
     }
 
+    // ── Cancellation token lifecycle ─────────────────────────────
+    // Create a token before the turn starts so the abort endpoint
+    // can cancel it. Remove it after the turn completes regardless
+    // of outcome (normal, error, or cancelled).
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    {
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .insert(session_key.to_string(), cancel_token.clone());
+    }
+
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
 
@@ -449,14 +462,49 @@ async fn process_chat_message(
     // instead — `turn_streamed` writes to the channel and we drain it
     // from the other branch.
     let content_owned = content.to_string();
-    let turn_fut = async { agent.turn_streamed(&content_owned, event_tx).await };
+    let turn_fut = async {
+        agent
+            .turn_streamed(&content_owned, event_tx, Some(cancel_token.clone()))
+            .await
+    };
 
     // Drive both futures concurrently: the agent turn produces events
-    // and we relay them over WebSocket.
+    // and we relay them over WebSocket. Track streamed chunks so we
+    // can reconstruct partial content on cancellation.
+    //
+    // WHY incremental persistence: If the process crashes during streaming,
+    // the assistant's response is lost — only the user message survives.
+    // We append a placeholder assistant message on the first chunk, then
+    // update_last periodically (every 500ms) so partial content survives.
+    // The final response overwrites this via update_last on completion.
+    let mut accumulated_text = String::new();
+    let mut partial_saved = false;
+    let mut last_partial_save = std::time::Instant::now();
+    let partial_save_interval = std::time::Duration::from_millis(500);
+
     let forward_fut = async {
         while let Some(event) = event_rx.recv().await {
             let ws_msg = match event {
-                TurnEvent::Chunk { delta } => {
+                TurnEvent::Chunk { ref delta } => {
+                    accumulated_text.push_str(delta);
+
+                    // Incremental persistence: save partial content so it
+                    // survives a crash. First chunk appends, subsequent
+                    // chunks update in-place.
+                    if last_partial_save.elapsed() >= partial_save_interval {
+                        if let Some(ref backend) = state.session_backend {
+                            let partial =
+                                zeroclaw_providers::ChatMessage::assistant(&accumulated_text);
+                            if partial_saved {
+                                let _ = backend.update_last(session_key, &partial);
+                            } else {
+                                let _ = backend.append(session_key, &partial);
+                                partial_saved = true;
+                            }
+                        }
+                        last_partial_save = std::time::Instant::now();
+                    }
+
                     serde_json::json!({ "type": "chunk", "content": delta })
                 }
                 TurnEvent::Thinking { delta } => {
@@ -475,12 +523,70 @@ async fn process_chat_message(
 
     let (result, ()) = tokio::join!(turn_fut, forward_fut);
 
+    // ── Remove cancel token (turn finished) ──────────────────────
+    {
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .remove(session_key);
+    }
+
+    // Check if this turn was cancelled. `turn_streamed` propagates
+    // `ToolLoopCancelled` through anyhow, so we detect it here.
+    let was_cancelled = match &result {
+        Err(e) => zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(e),
+        Ok(_) => false,
+    };
+
+    if was_cancelled {
+        // Store partial content with interruption marker so the
+        // conversation stays coherent for subsequent turns.
+        let truncated = if accumulated_text.is_empty() {
+            "[interrupted by user]".to_string()
+        } else {
+            format!("{accumulated_text}\n\n[interrupted by user]")
+        };
+
+        if let Some(ref backend) = state.session_backend {
+            let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
+            if partial_saved {
+                let _ = backend.update_last(session_key, &assistant_msg);
+            } else {
+                let _ = backend.append(session_key, &assistant_msg);
+            }
+        }
+
+        // Inform the client the turn was aborted
+        let aborted = serde_json::json!({ "type": "aborted" });
+        let _ = sender.send(Message::Text(aborted.to_string().into())).await;
+
+        // Set session state to idle
+        if let Some(ref backend) = state.session_backend {
+            let _ = backend.set_session_state(session_key, "idle", None);
+        }
+
+        // Broadcast agent_end event
+        let _ = state.event_tx.send(serde_json::json!({
+            "type": "agent_end",
+            "provider": provider_label,
+            "model": state.model,
+        }));
+
+        return;
+    }
+
     match result {
         Ok(response) => {
-            // Persist assistant response
+            // Persist final assistant response. If we saved partial content
+            // during streaming, update it in-place; otherwise append fresh.
             if let Some(ref backend) = state.session_backend {
                 let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&response);
-                let _ = backend.append(session_key, &assistant_msg);
+                if partial_saved {
+                    let _ = backend.update_last(session_key, &assistant_msg);
+                } else {
+                    let _ = backend.append(session_key, &assistant_msg);
+                }
             }
 
             // Fire-and-forget memory consolidation so facts from WS sessions

@@ -98,7 +98,9 @@ pub use zeroclaw_tools::pushover::PushoverTool;
 pub use zeroclaw_tools::reaction::ReactionTool;
 pub use zeroclaw_tools::report_template_tool::ReportTemplateTool;
 pub use zeroclaw_tools::screenshot::ScreenshotTool;
-pub use zeroclaw_tools::sessions::{SessionsHistoryTool, SessionsListTool, SessionsSendTool};
+pub use zeroclaw_tools::sessions::{
+    SessionDeleteTool, SessionResetTool, SessionsHistoryTool, SessionsListTool, SessionsSendTool,
+};
 pub use zeroclaw_tools::swarm::SwarmTool;
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
@@ -681,6 +683,13 @@ pub fn all_tools_with_runtime(
             security.clone(),
         )));
         tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+        // NOTE: SessionResetTool and SessionDeleteTool are available via
+        // zeroclaw_tools::sessions but NOT registered by default. They are
+        // destructive operations (clear/delete conversation history) and
+        // should only be enabled by callers that explicitly need them
+        // (e.g., orchestration dashboards). To enable:
+        //   tool_arcs.push(Arc::new(SessionResetTool::new(backend.clone(), security.clone())));
+        //   tool_arcs.push(Arc::new(SessionDeleteTool::new(backend, security.clone())));
     }
 
     // LinkedIn integration (config-gated)
