@@ -96,6 +96,7 @@ const INTERNAL_ERROR: i32 = -32603;
 // Custom error codes
 const SESSION_NOT_FOUND: i32 = -32000;
 const SESSION_LIMIT_REACHED: i32 = -32001;
+const ACP_PROTOCOL_VERSION: u64 = 1;
 
 // ── Session state ────────────────────────────────────────────────
 
@@ -232,25 +233,33 @@ impl AcpServer {
             .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string());
 
         Ok(serde_json::json!({
-            "protocolVersion": "1.0",
-            "serverInfo": {
+            "protocolVersion": ACP_PROTOCOL_VERSION,
+            "agentCapabilities": {
+                "loadSession": false,
+                "promptCapabilities": {
+                    "image": false,
+                    "audio": false,
+                    "embeddedContext": false,
+                },
+                "mcpCapabilities": {
+                    "http": false,
+                    "sse": false,
+                },
+                "sessionCapabilities": {},
+            },
+            "agentInfo": {
                 "name": "zeroclaw-acp",
+                "title": "ZeroClaw ACP",
                 "version": env!("CARGO_PKG_VERSION"),
             },
-            "capabilities": {
-                "streaming": true,
-                "maxSessions": self.acp_config.max_sessions,
-                "sessionTimeoutSecs": self.acp_config.session_timeout_secs,
-                "defaultModel": default_model,
-            },
-            "methods": [
-                "initialize",
-                "session/new",
-                "session/prompt",
-                "session/stop",
-                "session/update",
-                "session/event",  // legacy
-            ],
+            "authMethods": [],
+            "_meta": {
+                "zeroclaw": {
+                    "defaultModel": default_model,
+                    "maxSessions": self.acp_config.max_sessions,
+                    "sessionTimeoutSecs": self.acp_config.session_timeout_secs,
+                }
+            }
         }))
     }
 
@@ -714,6 +723,38 @@ mod tests {
         assert!(parsed.get("result").is_some());
         assert!(parsed.get("error").is_none());
         assert_eq!(parsed["id"], 1);
+    }
+
+    #[test]
+    fn initialize_response_uses_acp_v1_shape() {
+        let server = AcpServer::new(Config::default(), AcpServerConfig::default());
+        let result = server
+            .handle_initialize(&serde_json::json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {},
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0.0"
+                }
+            }))
+            .unwrap();
+
+        assert_eq!(result["protocolVersion"], 1);
+        assert_eq!(result["agentInfo"]["name"], "zeroclaw-acp");
+        assert_eq!(result["agentInfo"]["title"], "ZeroClaw ACP");
+        assert_eq!(result["agentInfo"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(result["authMethods"], serde_json::json!([]));
+        assert_eq!(result["agentCapabilities"]["loadSession"], false);
+        assert_eq!(
+            result["agentCapabilities"]["promptCapabilities"]["image"],
+            false
+        );
+        assert_eq!(
+            result["agentCapabilities"]["mcpCapabilities"]["http"],
+            false
+        );
+        assert!(result.get("serverInfo").is_none());
+        assert!(result.get("capabilities").is_none());
     }
 
     #[test]
