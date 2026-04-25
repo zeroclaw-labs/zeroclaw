@@ -2,10 +2,14 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+};
 
 const GROUP_TARGET_PREFIX: &str = "group:";
 
@@ -30,6 +34,8 @@ pub struct SignalChannel {
     ignore_stories: bool,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    approval_timeout_secs: u64,
 }
 
 // ── signal-cli SSE event JSON shapes ────────────────────────────
@@ -90,12 +96,19 @@ impl SignalChannel {
             ignore_attachments,
             ignore_stories,
             proxy_url: None,
+            pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+            approval_timeout_secs: 300,
         }
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
+        self
+    }
+
+    pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
+        self.approval_timeout_secs = secs;
         self
     }
 
@@ -385,9 +398,20 @@ impl Channel for SignalChannel {
                                 Ok(sse) => {
                                     if let Some(ref envelope) = sse.envelope
                                         && let Some(msg) = self.process_envelope(envelope)
-                                        && tx.send(msg).await.is_err()
                                     {
-                                        return Ok(());
+                                        if let Some((token, response)) =
+                                            crate::util::parse_approval_reply(&msg.content)
+                                        {
+                                            let mut map = self.pending_approvals.lock().await;
+                                            if let Some(sender) = map.remove(&token) {
+                                                let _ = sender.send(response);
+                                                current_data.clear();
+                                                continue;
+                                            }
+                                        }
+                                        if tx.send(msg).await.is_err() {
+                                            return Ok(());
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -412,6 +436,15 @@ impl Channel for SignalChannel {
                         if let Some(ref envelope) = sse.envelope
                             && let Some(msg) = self.process_envelope(envelope)
                         {
+                            if let Some((token, response)) =
+                                crate::util::parse_approval_reply(&msg.content)
+                            {
+                                let mut map = self.pending_approvals.lock().await;
+                                if let Some(sender) = map.remove(&token) {
+                                    let _ = sender.send(response);
+                                    continue;
+                                }
+                            }
                             let _ = tx.send(msg).await;
                         }
                     }
@@ -459,6 +492,39 @@ impl Channel for SignalChannel {
         // signal-cli doesn't have a stop-typing RPC; typing indicators
         // auto-expire after ~15s on the client side.
         Ok(())
+    }
+
+    async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        let token = crate::util::new_approval_token();
+        let text = format!(
+            "APPROVAL REQUIRED [{}]\nTool: {}\nArgs: {}\n\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
+            token, request.tool_name, request.arguments_summary, token, token, token,
+        );
+
+        let (tx, rx) = oneshot::channel();
+        self.pending_approvals
+            .lock()
+            .await
+            .insert(token.clone(), tx);
+
+        if let Err(err) = self.send(&SendMessage::new(text, recipient)).await {
+            self.pending_approvals.lock().await.remove(&token);
+            return Err(err);
+        }
+
+        let response =
+            match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
+                Ok(Ok(resp)) => resp,
+                _ => {
+                    self.pending_approvals.lock().await.remove(&token);
+                    ChannelApprovalResponse::Deny
+                }
+            };
+        Ok(Some(response))
     }
 }
 
@@ -920,5 +986,34 @@ mod tests {
         assert!(env.data_message.is_none());
         assert!(env.story_message.is_none());
         assert!(env.timestamp.is_none());
+    }
+
+    #[test]
+    fn pending_approvals_map_is_initially_empty() {
+        let ch = make_channel();
+        let map = ch.pending_approvals.try_lock().unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn approval_timeout_defaults_to_300_and_is_overridable() {
+        let ch = make_channel();
+        assert_eq!(ch.approval_timeout_secs, 300);
+        let ch = ch.with_approval_timeout_secs(60);
+        assert_eq!(ch.approval_timeout_secs, 60);
+    }
+
+    #[tokio::test]
+    async fn pending_approval_oneshot_delivers_response() {
+        let ch = make_channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert("abc123".to_string(), tx);
+        // simulate listen() routing
+        let sender = ch.pending_approvals.lock().await.remove("abc123").unwrap();
+        sender.send(ChannelApprovalResponse::Approve).unwrap();
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
     }
 }

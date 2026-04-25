@@ -23,18 +23,19 @@ pub use schema::{
     NodesConfig, NotionConfig, ObservabilityConfig, OpenAiSttConfig, OpenAiTtsConfig,
     OpenCodeCliConfig, OpenVpnTunnelConfig, OtpConfig, OtpMethod, PacingConfig,
     PeripheralBoardConfig, PeripheralsConfig, PipelineConfig, PiperTtsConfig, PluginsConfig,
-    ProjectIntelConfig, ProxyConfig, ProxyScope, QdrantConfig, QueryClassificationConfig,
-    ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
-    SchedulerConfig, SearchMode, SecretsConfig, SecurityConfig, SecurityOpsConfig, ShellToolConfig,
-    SkillCreationConfig, SkillImprovementConfig, SkillsConfig, SkillsPromptInjectionMode,
-    SlackConfig, SopConfig, StorageConfig, StorageProviderConfig, StorageProviderSection,
-    StreamMode, SwarmConfig, SwarmStrategy, TelegramConfig, TextBrowserConfig, ToolFilterGroup,
-    ToolFilterGroupMode, TranscriptionConfig, TtsConfig, TunnelConfig, VerifiableIntentConfig,
-    WebFetchConfig, WebSearchConfig, WebhookConfig, WhatsAppChatPolicy, WhatsAppWebMode,
-    WorkspaceConfig, apply_channel_proxy_to_builder, apply_runtime_proxy_to_builder,
-    build_channel_proxy_client, build_channel_proxy_client_with_timeouts,
-    build_runtime_proxy_client, build_runtime_proxy_client_with_timeouts, runtime_proxy_config,
-    set_runtime_proxy_config, ws_connect_with_proxy,
+    PostgresMemoryConfig, ProjectIntelConfig, ProxyConfig, ProxyScope, QdrantConfig,
+    QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig,
+    SandboxBackend, SandboxConfig, SchedulerConfig, SearchMode, SecretsConfig, SecurityConfig,
+    SecurityOpsConfig, ShellToolConfig, SkillCreationConfig, SkillImprovementConfig, SkillsConfig,
+    SkillsPromptInjectionMode, SlackConfig, SopConfig, StorageConfig, StorageProviderConfig,
+    StorageProviderSection, StreamMode, SwarmConfig, SwarmStrategy, TelegramConfig,
+    TextBrowserConfig, ToolFilterGroup, ToolFilterGroupMode, TranscriptionConfig, TtsConfig,
+    TunnelConfig, VerifiableIntentConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
+    WhatsAppChatPolicy, WhatsAppWebMode, WorkspaceConfig, apply_channel_proxy_to_builder,
+    apply_runtime_proxy_to_builder, build_channel_proxy_client,
+    build_channel_proxy_client_with_timeouts, build_runtime_proxy_client,
+    build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
+    ws_connect_with_proxy,
 };
 
 pub use schema::ModelProviderConfig;
@@ -196,6 +197,16 @@ fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Val
         }
         PropKind::String | PropKind::Enum => Ok(toml::Value::String(value_str.to_string())),
         PropKind::StringArray => {
+            let trimmed = value_str.trim();
+            // Accept JSON/TOML array syntax: ["a", "b", "c"]
+            if trimmed.starts_with('[')
+                && let Ok(arr) = serde_json::from_str::<Vec<String>>(trimmed)
+            {
+                return Ok(toml::Value::Array(
+                    arr.into_iter().map(toml::Value::String).collect(),
+                ));
+            }
+            // Fall back to comma-separated input.
             let items = value_str
                 .split(',')
                 .map(|s| toml::Value::String(s.trim().to_string()))
@@ -279,6 +290,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            approval_timeout_secs: 300,
         };
 
         let lark = LarkConfig {
