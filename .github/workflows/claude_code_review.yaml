@@ -45,45 +45,52 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-          DJANGO_SERVICE_TOKEN: ${{ secrets.DJANGO_SERVICE_TOKEN }}
+          PAPERCLIP_API_URL: ${{ secrets.PAPERCLIP_API_URL }}
+          PAPERCLIP_API_KEY: ${{ secrets.PAPERCLIP_API_KEY }}
+          PAPERCLIP_COMPANY_ID: ${{ secrets.PAPERCLIP_COMPANY_ID }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           REPO_NAME: ${{ github.repository }}
+          BRANCH_NAME: ${{ github.head_ref }}
         run: |
-          if [ -z "$DJANGO_SERVICE_TOKEN" ]; then
-            echo "DJANGO_SERVICE_TOKEN not set, skipping Paperclip sync"
+          if [ -z "$PAPERCLIP_API_KEY" ]; then
+            echo "PAPERCLIP_API_KEY not set, skipping Paperclip sync"
+            exit 0
+          fi
+
+          # Extract issue identifier from branch name or PR title (e.g. LIGA-554)
+          ISSUE_REF=$(echo "${BRANCH_NAME} ${PR_TITLE}" | grep -oiE '[A-Z]+-[0-9]+' | head -1 | tr '[:lower:]' '[:upper:]')
+          if [ -z "$ISSUE_REF" ]; then
+            echo "No issue identifier found in branch/title, skipping"
             exit 0
           fi
 
           REVIEW=$(gh api "repos/${REPO_NAME}/issues/${PR_NUMBER}/comments" \
             --jq '[.[] | select(.user.login == "claude[bot]")] | last | .body // empty')
-
           if [ -z "$REVIEW" ]; then
             echo "No review comment found, skipping"
             exit 0
           fi
 
-          PAYLOAD=$(jq -n \
-            --arg title "Code Review: ${PR_TITLE} (#${PR_NUMBER})" \
-            --arg repo "$REPO_NAME" \
-            --arg pr_num "$PR_NUMBER" \
-            --arg pr_url "$PR_URL" \
-            --arg author "$PR_AUTHOR" \
-            --arg review "$REVIEW" \
-            '{
-              title: $title,
-              description: ("**Repo:** " + $repo + "\n**PR:** #" + $pr_num + "\n**Author:** " + $author + "\n**URL:** " + $pr_url + "\n\n---\n\n" + $review),
-              status: "approved",
-              priority: "p4_low",
-              task_type: "chore",
-              task_category: "software_dev"
-            }')
+          # Find Paperclip issue UUID by identifier
+          PAPERCLIP_ISSUE_ID=$(curl -sf \
+            "${PAPERCLIP_API_URL}/api/companies/${PAPERCLIP_COMPANY_ID}/issues?q=${ISSUE_REF}" \
+            -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" \
+            | jq -r --arg ref "$ISSUE_REF" '.items[]? | select(.identifier == $ref) | .id' | head -1)
 
-          curl -sf -X POST "https://api.lightwave-media.ltd/v1/createOS/tasks/" \
-            -H "X-Service-Token: ${DJANGO_SERVICE_TOKEN}" \
+          if [ -z "$PAPERCLIP_ISSUE_ID" ]; then
+            echo "Issue ${ISSUE_REF} not found in Paperclip, skipping"
+            exit 0
+          fi
+
+          BODY=$(printf "## Claude Code Review: %s PR #%s\n\n**Author:** %s\n**PR:** [%s](%s)\n\n---\n\n%s" \
+            "${REPO_NAME}" "${PR_NUMBER}" "${PR_AUTHOR}" "${PR_TITLE}" "${PR_URL}" "${REVIEW}")
+
+          curl -sf -X POST "${PAPERCLIP_API_URL}/api/issues/${PAPERCLIP_ISSUE_ID}/comments" \
+            -H "Authorization: Bearer ${PAPERCLIP_API_KEY}" \
             -H "Content-Type: application/json" \
-            -d "$PAYLOAD" \
-            && echo "Review synced to Paperclip" \
-            || echo "Paperclip sync failed (non-blocking)"
+            -d "$(jq -n --arg body "$BODY" '{body: $body}')" \
+            && echo "Review posted to Paperclip issue ${ISSUE_REF}" \
+            || echo "Paperclip post failed (non-blocking)"
