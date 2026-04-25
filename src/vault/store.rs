@@ -49,6 +49,48 @@ impl VaultStore {
         })
     }
 
+    /// Recommended production factory: build the store AND auto-ATTACH
+    /// `<workspace>/memory/domain.db` if it exists. Equivalent to
+    /// calling `with_shared_connection` and then `attach_domain` on
+    /// the conventional path. Safe when the file is absent — silently
+    /// falls back to single-DB (brain.db only) mode.
+    pub fn open_for_workspace(
+        conn: Arc<Mutex<Connection>>,
+        workspace_dir: &std::path::Path,
+    ) -> Result<Self> {
+        let store = Self::with_shared_connection(conn)?;
+        let _ = store.attach_domain(&super::domain::domain_db_path(workspace_dir))?;
+        Ok(store)
+    }
+
+    /// ATTACH an external domain DB at `path` as schema `domain` on
+    /// this store's shared connection. Initialises the vault schema on
+    /// the target first so a freshly-installed file is immediately
+    /// query-able.
+    ///
+    /// - `Ok(true)`  — file existed and is now attached (or was already)
+    /// - `Ok(false)` — file does not exist (no-op)
+    /// - `Err(_)`    — file exists but ATTACH or schema-init failed
+    pub fn attach_domain(&self, path: &std::path::Path) -> Result<bool> {
+        if path.exists() {
+            super::domain::ensure_schema(path)?;
+        }
+        let conn = self.conn.lock();
+        super::domain::attach(&conn, path)
+    }
+
+    /// DETACH the domain DB. No-op when not attached.
+    pub fn detach_domain(&self) -> Result<()> {
+        let conn = self.conn.lock();
+        super::domain::detach(&conn)
+    }
+
+    /// `true` when the `domain` schema is currently attached.
+    pub fn has_domain(&self) -> bool {
+        let conn = self.conn.lock();
+        super::domain::is_attached(&conn).unwrap_or(false)
+    }
+
     /// Swap in a different AI engine (e.g. LLM-backed in production).
     pub fn with_ai_engine(mut self, engine: Arc<dyn AIEngine>) -> Self {
         self.ai = engine;
@@ -595,6 +637,51 @@ fn fts_escape(q: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_for_workspace_without_domain_runs_single_db() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let store = VaultStore::open_for_workspace(conn, tmp.path()).unwrap();
+        assert!(!store.has_domain(), "no domain.db → has_domain == false");
+    }
+
+    #[test]
+    fn open_for_workspace_auto_attaches_existing_domain_db() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Pre-create domain.db so open_for_workspace finds it.
+        super::super::domain::ensure_schema(&super::super::domain::domain_db_path(tmp.path()))
+            .unwrap();
+
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let store = VaultStore::open_for_workspace(conn, tmp.path()).unwrap();
+        assert!(store.has_domain(), "existing domain.db → auto-attached");
+    }
+
+    #[test]
+    fn attach_then_detach_round_trip_via_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = super::super::domain::domain_db_path(tmp.path());
+
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let store = VaultStore::with_shared_connection(conn).unwrap();
+        assert!(!store.has_domain());
+
+        // Attach to non-existent path — Ok(false), no panic.
+        let attached = store.attach_domain(&path).unwrap();
+        assert!(!attached);
+        assert!(!store.has_domain());
+
+        // Now create the file + attach.
+        super::super::domain::ensure_schema(&path).unwrap();
+        let attached = store.attach_domain(&path).unwrap();
+        assert!(attached);
+        assert!(store.has_domain());
+
+        // Detach round-trip.
+        store.detach_domain().unwrap();
+        assert!(!store.has_domain());
+    }
 
     // Async kept for signature symmetry with other vault test helpers
     // (vault/health.rs, vault/hub.rs, vault/briefing.rs) — avoids churn at

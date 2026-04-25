@@ -7,8 +7,11 @@
 
 use super::{
     case_extractor::{extract_case, looks_like_case},
-    graph_query::{self, NodeKind, Subgraph},
-    ingest::{ingest_case, ingest_statute, resolve_pending_links, IngestCounts, IngestReport},
+    graph_query::{self, NodeKind},
+    ingest::{
+        ingest_case_to, ingest_statute_to, resolve_pending_links_in, IngestCounts, IngestReport,
+        IngestTarget,
+    },
     statute_extractor::{extract_statute, looks_like_statute},
 };
 use crate::config::Config;
@@ -20,30 +23,50 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Walk a directory (or a single file), classify each markdown as statute
-/// or case, and upsert into brain.db's vault tables. See the module docs
-/// for write-layout semantics.
+/// or case, and upsert into the **domain** vault corpus. See the module
+/// docs for write-layout semantics.
+///
+/// Domain routing (v8): `vault legal ingest` writes to
+/// `<workspace>/memory/domain.db`, NOT brain.db. The user's brain.db
+/// stays free of bulky law/case rows; cross-schema reads (per
+/// `graph_query`) UNION both DBs at query time. The domain.db file is
+/// auto-created with the vault schema if absent.
 pub async fn ingest_path(config: &Config, root: PathBuf, dry_run: bool) -> Result<()> {
     if !root.exists() {
         anyhow::bail!("legal ingest: path does not exist: {}", root.display());
     }
 
-    // Open (or create) brain.db at the conventional location.
-    let db_path = config.workspace_dir.join("memory").join("brain.db");
-    if let Some(parent) = db_path.parent() {
+    // Open brain.db AND ATTACH domain.db. Writes go to domain, but
+    // brain.db is the connection's primary so the FK/transaction
+    // semantics match production runtime.
+    let brain_path = config.workspace_dir.join("memory").join("brain.db");
+    let domain_path = crate::vault::domain::domain_db_path(&config.workspace_dir);
+    if let Some(parent) = brain_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!("creating memory dir {}", parent.display())
         })?;
     }
 
     let conn: Arc<Mutex<Connection>> = if dry_run {
-        // Dry run: in-memory DB so we parse + would-insert but don't touch disk.
+        // Dry run: in-memory main + in-memory file-backed domain so we
+        // parse + would-insert but don't touch the user's brain.db.
         let c = Connection::open_in_memory()?;
         crate::vault::schema::init_schema(&c)?;
+        // For dry-run, ATTACH a temp file we throw away on exit.
+        let tmp = tempfile::TempDir::new()?;
+        let dry_domain = tmp.path().join("domain.db");
+        crate::vault::domain::ensure_schema(&dry_domain)?;
+        crate::vault::domain::attach(&c, &dry_domain)?;
+        // tempdir kept alive via leak — process exits when the CLI returns.
+        std::mem::forget(tmp);
         Arc::new(Mutex::new(c))
     } else {
-        let c = Connection::open(&db_path)
-            .with_context(|| format!("opening brain.db at {}", db_path.display()))?;
+        let c = Connection::open(&brain_path)
+            .with_context(|| format!("opening brain.db at {}", brain_path.display()))?;
         crate::vault::schema::init_schema(&c)?;
+        // Ensure domain.db exists with the vault schema then ATTACH.
+        crate::vault::domain::ensure_schema(&domain_path)?;
+        crate::vault::domain::attach(&c, &domain_path)?;
         Arc::new(Mutex::new(c))
     };
 
@@ -90,7 +113,8 @@ pub async fn ingest_path(config: &Config, root: PathBuf, dry_run: bool) -> Resul
     }
 
     // Resolve pending edges (targets ingested later in this batch).
-    let resolved_after = resolve_pending_links(&conn)?;
+    // Intra-domain only — cross-schema resolution is read-time.
+    let resolved_after = resolve_pending_links_in(&conn, IngestTarget::Domain)?;
     report.counts.edges_resolved_after_pass += resolved_after;
 
     print_report(&report);
@@ -127,12 +151,19 @@ async fn ingest_one(
     let source_path = path.to_string_lossy().to_string();
 
     // Route: case first (cheaper signal — explicit `## 사건번호`), fallback statute.
+    // All legal CLI ingests target the domain schema (v8).
     if looks_like_case(&body) {
         let doc = extract_case(&body, &source_path)?;
-        merge(&mut report.counts, ingest_case(conn, &doc)?);
+        merge(
+            &mut report.counts,
+            ingest_case_to(conn, &doc, IngestTarget::Domain)?,
+        );
     } else if looks_like_statute(&body) {
         let doc = extract_statute(&body, &source_path)?;
-        merge(&mut report.counts, ingest_statute(conn, &doc)?);
+        merge(
+            &mut report.counts,
+            ingest_statute_to(conn, &doc, IngestTarget::Domain)?,
+        );
     } else {
         anyhow::bail!("file matches neither case nor statute heuristics");
     }

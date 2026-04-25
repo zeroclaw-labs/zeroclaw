@@ -40,7 +40,10 @@ pub use graph_query::{
     shortest_path, ApplicableVersion, ArticleContent, Edge, FindHit, Node, NodeKind, Subgraph,
     MAX_NODES,
 };
-pub use ingest::{ingest_case, ingest_statute, IngestCounts, IngestReport};
+pub use ingest::{
+    ingest_case, ingest_case_to, ingest_statute, ingest_statute_to, resolve_pending_links_in,
+    IngestCounts, IngestReport, IngestTarget,
+};
 pub use slug::{case_slug, statute_slug, versioned_statute_slug};
 pub use statute_extractor::{
     extract_statute, looks_like_statute, StatuteArticle, StatuteDoc, Supplement,

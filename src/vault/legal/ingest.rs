@@ -20,6 +20,17 @@
 //! whenever the target is already present. After ingest we also call
 //! [`resolve_pending_links`] to pick up targets added earlier in the same
 //! batch.
+//!
+//! Target schema (Step A3)
+//! ───────────────────────
+//! The ingester accepts an [`IngestTarget`] selecting which attached
+//! schema receives the writes — `Main` (the default; brain.db) or
+//! `Domain` (the swappable domain.db ATTACHed as schema `domain`). All
+//! table names are fully qualified with the chosen schema prefix so a
+//! single Connection with both DBs attached can route each ingest call
+//! independently. Edge target lookups stay intra-schema; cross-schema
+//! resolution is deferred to read-time UNION queries (per Step A4) so
+//! domain swaps don't corrupt cached `target_doc_id` values.
 
 use super::case_extractor::CaseDoc;
 use super::citation_patterns::extract_statute_citations;
@@ -30,6 +41,29 @@ use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+
+/// Which attached schema receives ingest writes.
+///
+/// `Main` is the user's `brain.db` (always present). `Domain` is the
+/// swappable corpus DB ATTACHed as schema `domain` (typically the
+/// shipped legal corpus). Legal CLI ingests default to `Domain` so the
+/// user's brain.db stays free of the bulky law/case rows; user-paste
+/// ingestion still goes to `Main`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestTarget {
+    Main,
+    Domain,
+}
+
+impl IngestTarget {
+    /// SQL schema-name prefix (`"main"` or `"domain"`).
+    pub fn schema(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Domain => "domain",
+        }
+    }
+}
 
 /// Running totals reported back to the CLI.
 #[derive(Debug, Default, Clone)]
@@ -70,11 +104,23 @@ pub struct IngestReport {
 
 // ───────── Statute ingestion ─────────
 
+/// Backward-compat shim. Ingests into `main` (brain.db). New callers
+/// should use [`ingest_statute_to`] and choose `IngestTarget::Domain`
+/// for swappable corpora.
 pub fn ingest_statute(conn: &Arc<Mutex<Connection>>, doc: &StatuteDoc) -> Result<IngestCounts> {
+    ingest_statute_to(conn, doc, IngestTarget::Main)
+}
+
+pub fn ingest_statute_to(
+    conn: &Arc<Mutex<Connection>>,
+    doc: &StatuteDoc,
+    target: IngestTarget,
+) -> Result<IngestCounts> {
     let mut counts = IngestCounts {
         statute_files: 1,
         ..Default::default()
     };
+    let schema = target.schema();
 
     // Source-path meta drives the canonical-vs-versioned write policy.
     // `Current`  → write canonical + versioned (current is both latest AND a dated revision).
@@ -106,14 +152,16 @@ pub fn ingest_statute(conn: &Arc<Mutex<Connection>>, doc: &StatuteDoc) -> Result
     for article in &doc.articles {
         // 1. Canonical slug — citation-resolution target + graph node.
         if write_canonical {
-            match upsert_statute_article(&tx, doc, article)? {
+            match upsert_statute_article(&tx, schema, doc, article)? {
                 ArticleOutcome::Inserted(doc_id) => {
                     counts.statute_articles_inserted += 1;
-                    counts.edges_written += write_statute_edges(&tx, doc, article, doc_id)?;
+                    counts.edges_written +=
+                        write_statute_edges(&tx, schema, doc, article, doc_id)?;
                 }
                 ArticleOutcome::Updated(doc_id) => {
                     counts.statute_articles_updated += 1;
-                    counts.edges_written += write_statute_edges(&tx, doc, article, doc_id)?;
+                    counts.edges_written +=
+                        write_statute_edges(&tx, schema, doc, article, doc_id)?;
                 }
                 ArticleOutcome::SkippedUnchanged => {
                     counts.statute_articles_skipped_unchanged += 1;
@@ -132,7 +180,15 @@ pub fn ingest_statute(conn: &Arc<Mutex<Connection>>, doc: &StatuteDoc) -> Result
                     article.article_sub,
                     pd,
                 );
-                match upsert_versioned_article(&tx, doc, article, &vslug, pd, path_meta.category)? {
+                match upsert_versioned_article(
+                    &tx,
+                    schema,
+                    doc,
+                    article,
+                    &vslug,
+                    pd,
+                    path_meta.category,
+                )? {
                     ArticleOutcome::Inserted(_) => counts.statute_versions_inserted += 1,
                     ArticleOutcome::Updated(_) => counts.statute_versions_updated += 1,
                     ArticleOutcome::SkippedUnchanged => {
@@ -155,14 +211,14 @@ pub fn ingest_statute(conn: &Arc<Mutex<Connection>>, doc: &StatuteDoc) -> Result
     // Supplements without a parseable promulgation number are skipped
     // (they'd collide on slug) and recorded in the counts for visibility.
     for sup in &doc.supplements {
-        match upsert_supplement(&tx, doc, sup)? {
+        match upsert_supplement(&tx, schema, doc, sup)? {
             SupplementOutcome::Inserted(doc_id) => {
                 counts.supplements_inserted += 1;
-                counts.edges_written += write_supplement_edges(&tx, doc, sup, doc_id)?;
+                counts.edges_written += write_supplement_edges(&tx, schema, doc, sup, doc_id)?;
             }
             SupplementOutcome::Updated(doc_id) => {
                 counts.supplements_updated += 1;
-                counts.edges_written += write_supplement_edges(&tx, doc, sup, doc_id)?;
+                counts.edges_written += write_supplement_edges(&tx, schema, doc, sup, doc_id)?;
             }
             SupplementOutcome::SkippedUnchanged => {
                 counts.supplements_skipped_unchanged += 1;
@@ -194,6 +250,7 @@ enum SupplementOutcome {
 
 fn upsert_statute_article(
     conn: &Connection,
+    schema: &str,
     doc: &StatuteDoc,
     article: &StatuteArticle,
 ) -> Result<ArticleOutcome> {
@@ -210,7 +267,9 @@ fn upsert_statute_article(
     // Check by canonical slug.
     let existing: Option<(i64, String)> = conn
         .query_row(
-            "SELECT id, checksum FROM vault_documents WHERE title = ?1",
+            &format!(
+                "SELECT id, checksum FROM {schema}.vault_documents WHERE title = ?1"
+            ),
             params![article.slug],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
         )
@@ -222,10 +281,13 @@ fn upsert_statute_article(
         }
         Some((id, _)) => {
             conn.execute(
-                "UPDATE vault_documents
-                   SET content = ?1, checksum = ?2, char_count = ?3, updated_at = ?4,
-                       original_path = ?5, doc_type = 'statute_article', source_type = 'local_file'
-                 WHERE id = ?6",
+                &format!(
+                    "UPDATE {schema}.vault_documents
+                       SET content = ?1, checksum = ?2, char_count = ?3, updated_at = ?4,
+                           original_path = ?5, doc_type = 'statute_article',
+                           source_type = 'local_file'
+                     WHERE id = ?6"
+                ),
                 params![
                     content,
                     checksum,
@@ -238,26 +300,34 @@ fn upsert_statute_article(
             .context("updating existing statute article row")?;
             // Replace links + auxiliary rows cleanly.
             conn.execute(
-                "DELETE FROM vault_links WHERE source_doc_id = ?1",
+                &format!("DELETE FROM {schema}.vault_links WHERE source_doc_id = ?1"),
                 params![id],
             )?;
             conn.execute(
-                "DELETE FROM vault_frontmatter WHERE doc_id = ?1",
+                &format!("DELETE FROM {schema}.vault_frontmatter WHERE doc_id = ?1"),
                 params![id],
             )?;
-            conn.execute("DELETE FROM vault_tags WHERE doc_id = ?1", params![id])?;
+            conn.execute(
+                &format!("DELETE FROM {schema}.vault_tags WHERE doc_id = ?1"),
+                params![id],
+            )?;
             // Aliases are globally UNIQUE; leaving stale ones risks blocking
             // valid aliases on a renamed law — wipe them too.
-            conn.execute("DELETE FROM vault_aliases WHERE doc_id = ?1", params![id])?;
+            conn.execute(
+                &format!("DELETE FROM {schema}.vault_aliases WHERE doc_id = ?1"),
+                params![id],
+            )?;
             id
         }
         None => {
             let uuid = uuid::Uuid::new_v4().to_string();
             conn.execute(
-                "INSERT INTO vault_documents
-                    (uuid, title, content, source_type, source_device_id, original_path,
-                     checksum, doc_type, char_count, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'local_file', ?4, ?5, ?6, 'statute_article', ?7, ?8, ?8)",
+                &format!(
+                    "INSERT INTO {schema}.vault_documents
+                        (uuid, title, content, source_type, source_device_id, original_path,
+                         checksum, doc_type, char_count, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'local_file', ?4, ?5, ?6, 'statute_article', ?7, ?8, ?8)"
+                ),
                 params![
                     uuid,
                     article.slug,
@@ -309,8 +379,10 @@ fn upsert_statute_article(
     for (k, v) in frontmatter {
         if let Some(val) = v {
             conn.execute(
-                "INSERT OR IGNORE INTO vault_frontmatter (doc_id, key, value)
-                 VALUES (?1, ?2, ?3)",
+                &format!(
+                    "INSERT OR IGNORE INTO {schema}.vault_frontmatter (doc_id, key, value)
+                     VALUES (?1, ?2, ?3)"
+                ),
                 params![doc_id, k, val],
             )?;
         }
@@ -320,17 +392,25 @@ fn upsert_statute_article(
     let aliases = statute_aliases(&doc.law_name, article.article_num, article.article_sub);
     for alias in aliases {
         let _ = conn.execute(
-            "INSERT OR IGNORE INTO vault_aliases (doc_id, alias) VALUES (?1, ?2)",
+            &format!(
+                "INSERT OR IGNORE INTO {schema}.vault_aliases (doc_id, alias) VALUES (?1, ?2)"
+            ),
             params![doc_id, alias],
         );
     }
 
     // Tags — domain/kind/law/keyword.
-    insert_tag(conn, doc_id, "domain:legal", Some("domain"))?;
-    insert_tag(conn, doc_id, "kind:statute", Some("kind"))?;
-    insert_tag(conn, doc_id, &format!("law:{}", doc.law_name), Some("law"))?;
+    insert_tag(conn, schema, doc_id, "domain:legal", Some("domain"))?;
+    insert_tag(conn, schema, doc_id, "kind:statute", Some("kind"))?;
+    insert_tag(
+        conn,
+        schema,
+        doc_id,
+        &format!("law:{}", doc.law_name),
+        Some("law"),
+    )?;
     if let Some(kw) = article.title_kw.as_deref() {
-        insert_tag(conn, doc_id, kw, Some("title_kw"))?;
+        insert_tag(conn, schema, doc_id, kw, Some("title_kw"))?;
     }
 
     match existing {
@@ -341,6 +421,7 @@ fn upsert_statute_article(
 
 fn write_statute_edges(
     conn: &Connection,
+    schema: &str,
     doc: &StatuteDoc,
     article: &StatuteArticle,
     source_doc_id: i64,
@@ -360,6 +441,7 @@ fn write_statute_edges(
         let evidence = evidence_with_cutoff(&cite.raw, cite.revision_cutoff.as_deref());
         insert_edge(
             conn,
+            schema,
             source_doc_id,
             &target_slug,
             relation,
@@ -381,6 +463,7 @@ fn write_statute_edges(
 /// through canonical slugs.
 fn upsert_versioned_article(
     conn: &Connection,
+    schema: &str,
     doc: &StatuteDoc,
     article: &StatuteArticle,
     vslug: &str,
@@ -396,7 +479,9 @@ fn upsert_versioned_article(
 
     let existing: Option<(i64, String)> = conn
         .query_row(
-            "SELECT id, checksum FROM vault_documents WHERE title = ?1",
+            &format!(
+                "SELECT id, checksum FROM {schema}.vault_documents WHERE title = ?1"
+            ),
             params![vslug],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
         )
@@ -408,11 +493,13 @@ fn upsert_versioned_article(
         }
         Some((id, _)) => {
             conn.execute(
-                "UPDATE vault_documents
-                   SET content = ?1, checksum = ?2, char_count = ?3, updated_at = ?4,
-                       original_path = ?5, doc_type = 'statute_article_version',
-                       source_type = 'local_file'
-                 WHERE id = ?6",
+                &format!(
+                    "UPDATE {schema}.vault_documents
+                       SET content = ?1, checksum = ?2, char_count = ?3, updated_at = ?4,
+                           original_path = ?5, doc_type = 'statute_article_version',
+                           source_type = 'local_file'
+                     WHERE id = ?6"
+                ),
                 params![
                     content,
                     checksum,
@@ -423,21 +510,29 @@ fn upsert_versioned_article(
                 ],
             )?;
             conn.execute(
-                "DELETE FROM vault_frontmatter WHERE doc_id = ?1",
+                &format!("DELETE FROM {schema}.vault_frontmatter WHERE doc_id = ?1"),
                 params![id],
             )?;
-            conn.execute("DELETE FROM vault_tags WHERE doc_id = ?1", params![id])?;
-            conn.execute("DELETE FROM vault_aliases WHERE doc_id = ?1", params![id])?;
+            conn.execute(
+                &format!("DELETE FROM {schema}.vault_tags WHERE doc_id = ?1"),
+                params![id],
+            )?;
+            conn.execute(
+                &format!("DELETE FROM {schema}.vault_aliases WHERE doc_id = ?1"),
+                params![id],
+            )?;
             id
         }
         None => {
             let uuid = uuid::Uuid::new_v4().to_string();
             conn.execute(
-                "INSERT INTO vault_documents
-                    (uuid, title, content, source_type, source_device_id, original_path,
-                     checksum, doc_type, char_count, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'local_file', ?4, ?5, ?6, 'statute_article_version',
-                         ?7, ?8, ?8)",
+                &format!(
+                    "INSERT INTO {schema}.vault_documents
+                        (uuid, title, content, source_type, source_device_id, original_path,
+                         checksum, doc_type, char_count, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'local_file', ?4, ?5, ?6, 'statute_article_version',
+                             ?7, ?8, ?8)"
+                ),
                 params![
                     uuid,
                     vslug,
@@ -474,8 +569,10 @@ fn upsert_versioned_article(
     for (k, v) in fm {
         if let Some(val) = v {
             conn.execute(
-                "INSERT OR IGNORE INTO vault_frontmatter (doc_id, key, value)
-                 VALUES (?1, ?2, ?3)",
+                &format!(
+                    "INSERT OR IGNORE INTO {schema}.vault_frontmatter (doc_id, key, value)
+                     VALUES (?1, ?2, ?3)"
+                ),
                 params![doc_id, k, val],
             )?;
         }
@@ -495,16 +592,25 @@ fn upsert_versioned_article(
     };
     let alias = format!("{} {} ({} 공포)", doc.law_name, article.header, pretty_date);
     let _ = conn.execute(
-        "INSERT OR IGNORE INTO vault_aliases (doc_id, alias) VALUES (?1, ?2)",
+        &format!(
+            "INSERT OR IGNORE INTO {schema}.vault_aliases (doc_id, alias) VALUES (?1, ?2)"
+        ),
         params![doc_id, alias],
     );
 
     // Tags.
-    insert_tag(conn, doc_id, "domain:legal", Some("domain"))?;
-    insert_tag(conn, doc_id, "kind:statute_version", Some("kind"))?;
-    insert_tag(conn, doc_id, &format!("law:{}", doc.law_name), Some("law"))?;
+    insert_tag(conn, schema, doc_id, "domain:legal", Some("domain"))?;
+    insert_tag(conn, schema, doc_id, "kind:statute_version", Some("kind"))?;
     insert_tag(
         conn,
+        schema,
+        doc_id,
+        &format!("law:{}", doc.law_name),
+        Some("law"),
+    )?;
+    insert_tag(
+        conn,
+        schema,
         doc_id,
         &format!("year:{}", &publish_date[..publish_date.len().min(4)]),
         Some("year"),
@@ -532,6 +638,7 @@ fn evidence_with_cutoff(raw: &str, cutoff: Option<&str>) -> String {
 
 fn upsert_supplement(
     conn: &Connection,
+    schema: &str,
     doc: &StatuteDoc,
     sup: &Supplement,
 ) -> Result<SupplementOutcome> {
@@ -545,7 +652,9 @@ fn upsert_supplement(
 
     let existing: Option<(i64, String)> = conn
         .query_row(
-            "SELECT id, checksum FROM vault_documents WHERE title = ?1",
+            &format!(
+                "SELECT id, checksum FROM {schema}.vault_documents WHERE title = ?1"
+            ),
             params![slug],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
         )
@@ -557,11 +666,13 @@ fn upsert_supplement(
         }
         Some((id, _)) => {
             conn.execute(
-                "UPDATE vault_documents
-                   SET content = ?1, checksum = ?2, char_count = ?3, updated_at = ?4,
-                       original_path = ?5, doc_type = 'statute_supplement',
-                       source_type = 'local_file'
-                 WHERE id = ?6",
+                &format!(
+                    "UPDATE {schema}.vault_documents
+                       SET content = ?1, checksum = ?2, char_count = ?3, updated_at = ?4,
+                           original_path = ?5, doc_type = 'statute_supplement',
+                           source_type = 'local_file'
+                     WHERE id = ?6"
+                ),
                 params![
                     content,
                     checksum,
@@ -572,24 +683,32 @@ fn upsert_supplement(
                 ],
             )?;
             conn.execute(
-                "DELETE FROM vault_links WHERE source_doc_id = ?1",
+                &format!("DELETE FROM {schema}.vault_links WHERE source_doc_id = ?1"),
                 params![id],
             )?;
             conn.execute(
-                "DELETE FROM vault_frontmatter WHERE doc_id = ?1",
+                &format!("DELETE FROM {schema}.vault_frontmatter WHERE doc_id = ?1"),
                 params![id],
             )?;
-            conn.execute("DELETE FROM vault_tags WHERE doc_id = ?1", params![id])?;
-            conn.execute("DELETE FROM vault_aliases WHERE doc_id = ?1", params![id])?;
+            conn.execute(
+                &format!("DELETE FROM {schema}.vault_tags WHERE doc_id = ?1"),
+                params![id],
+            )?;
+            conn.execute(
+                &format!("DELETE FROM {schema}.vault_aliases WHERE doc_id = ?1"),
+                params![id],
+            )?;
             id
         }
         None => {
             let uuid = uuid::Uuid::new_v4().to_string();
             conn.execute(
-                "INSERT INTO vault_documents
-                    (uuid, title, content, source_type, source_device_id, original_path,
-                     checksum, doc_type, char_count, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'local_file', ?4, ?5, ?6, 'statute_supplement', ?7, ?8, ?8)",
+                &format!(
+                    "INSERT INTO {schema}.vault_documents
+                        (uuid, title, content, source_type, source_device_id, original_path,
+                         checksum, doc_type, char_count, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'local_file', ?4, ?5, ?6, 'statute_supplement', ?7, ?8, ?8)"
+                ),
                 params![
                     uuid,
                     slug,
@@ -628,8 +747,10 @@ fn upsert_supplement(
     for (k, v) in fm {
         if let Some(val) = v {
             conn.execute(
-                "INSERT OR IGNORE INTO vault_frontmatter (doc_id, key, value)
-                 VALUES (?1, ?2, ?3)",
+                &format!(
+                    "INSERT OR IGNORE INTO {schema}.vault_frontmatter (doc_id, key, value)
+                     VALUES (?1, ?2, ?3)"
+                ),
                 params![doc_id, k, val],
             )?;
         }
@@ -651,18 +772,32 @@ fn upsert_supplement(
     };
     for alias in alias_forms {
         let _ = conn.execute(
-            "INSERT OR IGNORE INTO vault_aliases (doc_id, alias) VALUES (?1, ?2)",
+            &format!(
+                "INSERT OR IGNORE INTO {schema}.vault_aliases (doc_id, alias) VALUES (?1, ?2)"
+            ),
             params![doc_id, alias],
         );
     }
 
     // Tags.
-    insert_tag(conn, doc_id, "domain:legal", Some("domain"))?;
-    insert_tag(conn, doc_id, "kind:supplement", Some("kind"))?;
-    insert_tag(conn, doc_id, &format!("law:{}", doc.law_name), Some("law"))?;
+    insert_tag(conn, schema, doc_id, "domain:legal", Some("domain"))?;
+    insert_tag(conn, schema, doc_id, "kind:supplement", Some("kind"))?;
+    insert_tag(
+        conn,
+        schema,
+        doc_id,
+        &format!("law:{}", doc.law_name),
+        Some("law"),
+    )?;
     if let Some(d) = sup.promulgation_date.as_deref() {
         if d.len() >= 4 {
-            insert_tag(conn, doc_id, &format!("year:{}", &d[..4]), Some("year"))?;
+            insert_tag(
+                conn,
+                schema,
+                doc_id,
+                &format!("year:{}", &d[..4]),
+                Some("year"),
+            )?;
         }
     }
 
@@ -673,6 +808,7 @@ fn upsert_supplement(
     let parent_article1 = super::slug::statute_slug(&doc.law_name, 1, None);
     insert_edge(
         conn,
+        schema,
         doc_id,
         &parent_article1,
         "amends",
@@ -687,6 +823,7 @@ fn upsert_supplement(
 
 fn write_supplement_edges(
     conn: &Connection,
+    schema: &str,
     doc: &StatuteDoc,
     sup: &Supplement,
     source_doc_id: i64,
@@ -704,7 +841,7 @@ fn write_supplement_edges(
         } else {
             "cross-law"
         };
-        insert_edge(conn, source_doc_id, &target, relation, Some(&cite.raw))?;
+        insert_edge(conn, schema, source_doc_id, &target, relation, Some(&cite.raw))?;
         written += 1;
     }
     Ok(written)
@@ -712,11 +849,22 @@ fn write_supplement_edges(
 
 // ───────── Case ingestion ─────────
 
+/// Backward-compat shim. Ingests into `main` (brain.db). Use
+/// [`ingest_case_to`] with `IngestTarget::Domain` for domain corpora.
 pub fn ingest_case(conn: &Arc<Mutex<Connection>>, doc: &CaseDoc) -> Result<IngestCounts> {
+    ingest_case_to(conn, doc, IngestTarget::Main)
+}
+
+pub fn ingest_case_to(
+    conn: &Arc<Mutex<Connection>>,
+    doc: &CaseDoc,
+    target: IngestTarget,
+) -> Result<IngestCounts> {
     let mut counts = IngestCounts {
         case_files: 1,
         ..Default::default()
     };
+    let schema = target.schema();
     let mut guard = conn.lock();
     let tx = guard
         .transaction()
@@ -726,7 +874,9 @@ pub fn ingest_case(conn: &Arc<Mutex<Connection>>, doc: &CaseDoc) -> Result<Inges
     let now = unix_epoch();
     let existing: Option<(i64, String)> = tx
         .query_row(
-            "SELECT id, checksum FROM vault_documents WHERE title = ?1",
+            &format!(
+                "SELECT id, checksum FROM {schema}.vault_documents WHERE title = ?1"
+            ),
             params![doc.slug],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
         )
@@ -740,10 +890,12 @@ pub fn ingest_case(conn: &Arc<Mutex<Connection>>, doc: &CaseDoc) -> Result<Inges
         }
         Some((id, _)) => {
             tx.execute(
-                "UPDATE vault_documents
-                   SET content = ?1, checksum = ?2, char_count = ?3, updated_at = ?4,
-                       original_path = ?5, doc_type = 'case', source_type = 'local_file'
-                 WHERE id = ?6",
+                &format!(
+                    "UPDATE {schema}.vault_documents
+                       SET content = ?1, checksum = ?2, char_count = ?3, updated_at = ?4,
+                           original_path = ?5, doc_type = 'case', source_type = 'local_file'
+                     WHERE id = ?6"
+                ),
                 params![
                     doc.original_markdown,
                     checksum,
@@ -754,25 +906,33 @@ pub fn ingest_case(conn: &Arc<Mutex<Connection>>, doc: &CaseDoc) -> Result<Inges
                 ],
             )?;
             tx.execute(
-                "DELETE FROM vault_links WHERE source_doc_id = ?1",
+                &format!("DELETE FROM {schema}.vault_links WHERE source_doc_id = ?1"),
                 params![id],
             )?;
             tx.execute(
-                "DELETE FROM vault_frontmatter WHERE doc_id = ?1",
+                &format!("DELETE FROM {schema}.vault_frontmatter WHERE doc_id = ?1"),
                 params![id],
             )?;
-            tx.execute("DELETE FROM vault_tags WHERE doc_id = ?1", params![id])?;
-            tx.execute("DELETE FROM vault_aliases WHERE doc_id = ?1", params![id])?;
+            tx.execute(
+                &format!("DELETE FROM {schema}.vault_tags WHERE doc_id = ?1"),
+                params![id],
+            )?;
+            tx.execute(
+                &format!("DELETE FROM {schema}.vault_aliases WHERE doc_id = ?1"),
+                params![id],
+            )?;
             counts.cases_updated += 1;
             id
         }
         None => {
             let uuid = uuid::Uuid::new_v4().to_string();
             tx.execute(
-                "INSERT INTO vault_documents
-                    (uuid, title, content, source_type, source_device_id, original_path,
-                     checksum, doc_type, char_count, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'local_file', ?4, ?5, ?6, 'case', ?7, ?8, ?8)",
+                &format!(
+                    "INSERT INTO {schema}.vault_documents
+                        (uuid, title, content, source_type, source_device_id, original_path,
+                         checksum, doc_type, char_count, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'local_file', ?4, ?5, ?6, 'case', ?7, ?8, ?8)"
+                ),
                 params![
                     uuid,
                     doc.slug,
@@ -878,8 +1038,10 @@ pub fn ingest_case(conn: &Arc<Mutex<Connection>>, doc: &CaseDoc) -> Result<Inges
     for (k, v) in frontmatter {
         if let Some(val) = v {
             tx.execute(
-                "INSERT OR IGNORE INTO vault_frontmatter (doc_id, key, value)
-                 VALUES (?1, ?2, ?3)",
+                &format!(
+                    "INSERT OR IGNORE INTO {schema}.vault_frontmatter (doc_id, key, value)
+                     VALUES (?1, ?2, ?3)"
+                ),
                 params![doc_id, k, val],
             )?;
         }
@@ -887,28 +1049,44 @@ pub fn ingest_case(conn: &Arc<Mutex<Connection>>, doc: &CaseDoc) -> Result<Inges
 
     // Aliases — full case number + court-qualified form.
     let _ = tx.execute(
-        "INSERT OR IGNORE INTO vault_aliases (doc_id, alias) VALUES (?1, ?2)",
+        &format!(
+            "INSERT OR IGNORE INTO {schema}.vault_aliases (doc_id, alias) VALUES (?1, ?2)"
+        ),
         params![doc_id, doc.case_number],
     );
     if let Some(court) = doc.court_name.as_deref() {
         let _ = tx.execute(
-            "INSERT OR IGNORE INTO vault_aliases (doc_id, alias) VALUES (?1, ?2)",
+            &format!(
+                "INSERT OR IGNORE INTO {schema}.vault_aliases (doc_id, alias) VALUES (?1, ?2)"
+            ),
             params![doc_id, format!("{court} {}", doc.case_number)],
         );
     }
 
     // Tags.
-    insert_tag(&tx, doc_id, "domain:legal", Some("domain"))?;
-    insert_tag(&tx, doc_id, "kind:case", Some("kind"))?;
+    insert_tag(&tx, schema, doc_id, "domain:legal", Some("domain"))?;
+    insert_tag(&tx, schema, doc_id, "kind:case", Some("kind"))?;
     if let Some(c) = doc.court_name.as_deref() {
-        insert_tag(&tx, doc_id, &format!("court:{c}"), Some("court"))?;
+        insert_tag(&tx, schema, doc_id, &format!("court:{c}"), Some("court"))?;
     }
     if let Some(c) = doc.case_type_name.as_deref() {
-        insert_tag(&tx, doc_id, &format!("type:{c}"), Some("case_type"))?;
+        insert_tag(
+            &tx,
+            schema,
+            doc_id,
+            &format!("type:{c}"),
+            Some("case_type"),
+        )?;
     }
     if let Some(d) = doc.verdict_date.as_deref() {
         if d.len() >= 4 {
-            insert_tag(&tx, doc_id, &format!("year:{}", &d[..4]), Some("year"))?;
+            insert_tag(
+                &tx,
+                schema,
+                doc_id,
+                &format!("year:{}", &d[..4]),
+                Some("year"),
+            )?;
         }
     }
 
@@ -919,7 +1097,7 @@ pub fn ingest_case(conn: &Arc<Mutex<Connection>>, doc: &CaseDoc) -> Result<Inges
     for cite in &doc.statute_citations {
         let target = super::slug::statute_slug(&cite.law_name, cite.article, cite.article_sub);
         let evidence = evidence_with_cutoff(&cite.raw, cite.revision_cutoff.as_deref());
-        insert_edge(&tx, doc_id, &target, "cites", Some(&evidence))?;
+        insert_edge(&tx, schema, doc_id, &target, "cites", Some(&evidence))?;
         edges += 1;
     }
     // Edges: case → case.
@@ -928,7 +1106,7 @@ pub fn ingest_case(conn: &Arc<Mutex<Connection>>, doc: &CaseDoc) -> Result<Inges
         if target == doc.slug {
             continue;
         }
-        insert_edge(&tx, doc_id, &target, "ref-case", Some(&cref.raw))?;
+        insert_edge(&tx, schema, doc_id, &target, "ref-case", Some(&cref.raw))?;
         edges += 1;
     }
     counts.edges_written += edges;
@@ -939,8 +1117,16 @@ pub fn ingest_case(conn: &Arc<Mutex<Connection>>, doc: &CaseDoc) -> Result<Inges
 
 // ───────── Shared helpers ─────────
 
+/// Insert a `vault_links` row in `{schema}`. The `target_doc_id` is
+/// resolved against the SAME schema only — cross-schema resolution is
+/// deferred to read-time UNION queries (see `vault::legal::graph_query`)
+/// per the slug-only resolution policy. This keeps writes idempotent
+/// across domain.db swaps: replacing `domain.db` with a new corpus
+/// can't leave dangling integer FKs in `main.vault_links` because we
+/// never store one in the first place.
 fn insert_edge(
     conn: &Connection,
+    schema: &str,
     source_doc_id: i64,
     target_slug: &str,
     relation: &str,
@@ -948,16 +1134,20 @@ fn insert_edge(
 ) -> Result<()> {
     let target_doc_id: Option<i64> = conn
         .query_row(
-            "SELECT id FROM vault_documents WHERE title = ?1",
+            &format!(
+                "SELECT id FROM {schema}.vault_documents WHERE title = ?1"
+            ),
             params![target_slug],
             |r| r.get::<_, i64>(0),
         )
         .ok();
     conn.execute(
-        "INSERT INTO vault_links
-            (source_doc_id, target_raw, target_doc_id, display_text,
-             link_type, context, is_resolved)
-         VALUES (?1, ?2, ?3, ?4, 'wikilink', ?5, ?6)",
+        &format!(
+            "INSERT INTO {schema}.vault_links
+                (source_doc_id, target_raw, target_doc_id, display_text,
+                 link_type, context, is_resolved)
+             VALUES (?1, ?2, ?3, ?4, 'wikilink', ?5, ?6)"
+        ),
         params![
             source_doc_id,
             target_slug,
@@ -972,12 +1162,16 @@ fn insert_edge(
 
 fn insert_tag(
     conn: &Connection,
+    schema: &str,
     doc_id: i64,
     tag_name: &str,
     tag_type: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO vault_tags (doc_id, tag_name, tag_type) VALUES (?1, ?2, ?3)",
+        &format!(
+            "INSERT OR IGNORE INTO {schema}.vault_tags (doc_id, tag_name, tag_type)
+             VALUES (?1, ?2, ?3)"
+        ),
         params![doc_id, tag_name, tag_type],
     )?;
     Ok(())
@@ -997,15 +1191,30 @@ fn unix_epoch() -> u64 {
 /// Scan unresolved links and attempt to resolve them by matching `target_raw`
 /// against `vault_documents.title`. Returns the number of links newly resolved.
 ///
-/// Call after each batch so edges pointing to nodes ingested later in the
-/// same batch still wire up.
+/// Backward-compat shim. Operates on `main` (brain.db). Use
+/// [`resolve_pending_links_in`] for domain.db.
 pub fn resolve_pending_links(conn: &Arc<Mutex<Connection>>) -> Result<usize> {
+    resolve_pending_links_in(conn, IngestTarget::Main)
+}
+
+/// As [`resolve_pending_links`] but for an explicit schema. ONLY
+/// resolves intra-schema (link's own schema → same schema's
+/// vault_documents). Cross-schema resolution is the read path's
+/// responsibility (per slug-only policy).
+///
+/// Call after each batch so edges pointing to nodes ingested later in
+/// the same batch still wire up.
+pub fn resolve_pending_links_in(
+    conn: &Arc<Mutex<Connection>>,
+    target: IngestTarget,
+) -> Result<usize> {
+    let schema = target.schema();
     let guard = conn.lock();
-    let mut stmt = guard.prepare(
+    let mut stmt = guard.prepare(&format!(
         "SELECT vl.id, vl.target_raw
-           FROM vault_links vl
-          WHERE vl.is_resolved = 0",
-    )?;
+           FROM {schema}.vault_links vl
+          WHERE vl.is_resolved = 0"
+    ))?;
     let rows: Vec<(i64, String)> = stmt
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
         .filter_map(Result::ok)
@@ -1015,14 +1224,20 @@ pub fn resolve_pending_links(conn: &Arc<Mutex<Connection>>) -> Result<usize> {
     for (link_id, target_raw) in rows {
         let target_id: Option<i64> = guard
             .query_row(
-                "SELECT id FROM vault_documents WHERE title = ?1",
+                &format!(
+                    "SELECT id FROM {schema}.vault_documents WHERE title = ?1"
+                ),
                 params![target_raw],
                 |r| r.get::<_, i64>(0),
             )
             .ok();
         if let Some(tid) = target_id {
             guard.execute(
-                "UPDATE vault_links SET target_doc_id = ?1, is_resolved = 1 WHERE id = ?2",
+                &format!(
+                    "UPDATE {schema}.vault_links
+                        SET target_doc_id = ?1, is_resolved = 1
+                      WHERE id = ?2"
+                ),
                 params![tid, link_id],
             )?;
             resolved += 1;

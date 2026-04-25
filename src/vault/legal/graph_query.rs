@@ -14,11 +14,71 @@
 //! All queries respect a hard **node cap** (`MAX_NODES`, 500) so agents
 //! can't accidentally blow the response token budget with a depth-10
 //! walk that hits every statute.
+//!
+//! Cross-DB resolution (Step A4)
+//! ─────────────────────────────
+//! Reads transparently UNION across `main` (brain.db) and `domain`
+//! (domain.db, when ATTACHed). On slug conflicts the **domain** row
+//! wins — domain-shipped corpora take precedence over user-pasted
+//! content sharing the same slug. ID-based subqueries (frontmatter,
+//! tags, aliases) are scoped to the schema where the row was found,
+//! since SQLite IDs are per-schema. Edges follow slugs only — never
+//! cached integer FKs across schemas — so swapping `domain.db` cannot
+//! leave dangling references in `main.vault_links`.
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+
+/// Resolution priority: domain rows shadow main rows on slug conflict.
+/// Order is fixed (`domain`, `main`); `main` is always present, `domain`
+/// only when ATTACHed. The schema name is the fully-qualified SQL
+/// prefix (e.g. `domain.vault_documents`).
+const SCHEMAS_BY_PRIORITY: [&str; 2] = ["domain", "main"];
+
+fn domain_attached(conn: &Connection) -> bool {
+    super::super::domain::is_attached(conn).unwrap_or(false)
+}
+
+/// Schemas to read from this query, ordered by priority (domain first
+/// when attached, then main). Domain-priority means earlier entries
+/// shadow later ones when slugs collide.
+fn active_schemas(conn: &Connection) -> &'static [&'static str] {
+    if domain_attached(conn) {
+        &SCHEMAS_BY_PRIORITY
+    } else {
+        &SCHEMAS_BY_PRIORITY[1..]
+    }
+}
+
+/// Look up a slug across all active schemas, returning the highest-priority
+/// hit. Returns `(schema, id, doc_type)` so subsequent ID-based queries
+/// can stay scoped to the schema where the row lives.
+fn lookup_slug_in_legal(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Option<(&'static str, i64, String)>> {
+    for schema in active_schemas(conn) {
+        let row: Option<(i64, String)> = conn
+            .query_row(
+                &format!(
+                    "SELECT id, doc_type FROM {schema}.vault_documents
+                       WHERE title = ?1
+                         AND doc_type IN
+                            ('statute_article','statute_supplement',
+                             'statute_article_version','case')"
+                ),
+                params![slug],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok();
+        if let Some((id, doc_type)) = row {
+            return Ok(Some((schema, id, doc_type)));
+        }
+    }
+    Ok(None)
+}
 
 /// Hard cap on nodes returned from any single traversal call.
 pub const MAX_NODES: usize = 500;
@@ -125,22 +185,14 @@ pub struct Subgraph {
 }
 
 /// Load a single node by slug. Returns `None` if the slug isn't present or
-/// its `doc_type` isn't in the legal set.
+/// its `doc_type` isn't in the legal set. Domain-priority: when the same
+/// slug exists in both `main` and `domain`, the `domain` row wins.
 pub fn get_node(conn: &Connection, slug: &str) -> Result<Option<Node>> {
-    let row = conn
-        .query_row(
-            "SELECT id, doc_type FROM vault_documents
-              WHERE title = ?1 AND doc_type IN \
-                ('statute_article','statute_supplement','statute_article_version','case')",
-            params![slug],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-        )
-        .ok();
-    let Some((id, doc_type)) = row else {
+    let Some((schema, id, doc_type)) = lookup_slug_in_legal(conn, slug)? else {
         return Ok(None);
     };
     let kind = NodeKind::from_doc_type(&doc_type).unwrap();
-    Ok(Some(hydrate_node(conn, id, slug, kind)?))
+    Ok(Some(hydrate_node(conn, schema, id, slug, kind)?))
 }
 
 /// Fetch `depth`-hop neighbors of `root_slug` as a subgraph. Traverses both
@@ -297,26 +349,20 @@ pub struct ArticleContent {
 }
 
 pub fn read_article(conn: &Connection, slug: &str) -> Result<Option<ArticleContent>> {
-    let row: Option<(i64, String, String)> = conn
-        .query_row(
-            "SELECT id, doc_type, content FROM vault_documents
-              WHERE title = ?1 AND doc_type IN \
-                ('statute_article','statute_supplement','statute_article_version','case')",
-            params![slug],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .ok();
-    let Some((id, doc_type, content)) = row else {
+    let Some((schema, id, doc_type)) = lookup_slug_in_legal(conn, slug)? else {
         return Ok(None);
     };
+    let content: String = conn
+        .query_row(
+            &format!(
+                "SELECT content FROM {schema}.vault_documents WHERE id = ?1"
+            ),
+            params![id],
+            |r| r.get::<_, String>(0),
+        )
+        .with_context(|| format!("loading content for {slug}"))?;
     let kind = NodeKind::from_doc_type(&doc_type).unwrap();
-    let metadata = load_frontmatter(conn, id)?;
+    let metadata = load_frontmatter(conn, schema, id)?;
     let label = build_label(slug, kind, &metadata);
     let sections = match kind {
         NodeKind::Case => parse_case_sections(&content),
@@ -378,16 +424,28 @@ pub fn find_nodes(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Fi
     }
 
     // 2. Exact alias — same 100% confidence; short-circuit.
-    let alias_hit: Option<String> = conn
-        .query_row(
-            "SELECT d.title FROM vault_aliases va
-               JOIN vault_documents d ON d.id = va.doc_id
-              WHERE va.alias = ?1
-                AND d.doc_type IN ('statute_article','statute_supplement','case')",
-            params![q],
-            |r| r.get::<_, String>(0),
-        )
-        .ok();
+    //    Domain-priority: search domain first, then main, so a domain
+    //    alias shadowing a main alias resolves to the domain row.
+    let mut alias_hit: Option<String> = None;
+    for schema in active_schemas(conn) {
+        let hit: Option<String> = conn
+            .query_row(
+                &format!(
+                    "SELECT d.title FROM {schema}.vault_aliases va
+                       JOIN {schema}.vault_documents d ON d.id = va.doc_id
+                      WHERE va.alias = ?1
+                        AND d.doc_type IN
+                            ('statute_article','statute_supplement','case')"
+                ),
+                params![q],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+        if hit.is_some() {
+            alias_hit = hit;
+            break;
+        }
+    }
     if let Some(slug) = alias_hit {
         if let Some(n) = get_node(conn, &slug)? {
             push_hit(&mut out, &mut seen, &n, "exact-alias");
@@ -426,15 +484,28 @@ pub fn find_nodes(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Fi
     // 5. FTS5 fallback. Trigram tokenizer requires ≥3-char substrings; the
     //    vault_docs_fts view is over title+content so hits for e.g.
     //    `재산분할` will surface 제839조의2.
+    //
+    //    SQLite limitation: the FTS5 `MATCH` operator's LHS must be the
+    //    unqualified FTS5 table name — schema-qualified (`main.vault_docs_fts MATCH …`)
+    //    and aliased forms are rejected as "no such column". This means
+    //    we can only run FTS against `main.vault_docs_fts` from this
+    //    connection. For the domain schema we still get cross-schema
+    //    coverage via the slug/alias paths (steps 2–4), which `legal_graph_find`
+    //    callers rely on; substring/concept search across the bulk
+    //    domain corpus is intentionally out of scope for this entry
+    //    point and is served by the dedicated legal tools that open
+    //    domain.db on a separate connection when needed.
     if out.len() < limit && q.chars().count() >= 3 {
-        let remaining = limit - out.len();
         let fts_query = fts_escape(q);
         if !fts_query.is_empty() {
+            let remaining = limit - out.len();
             let mut stmt = conn.prepare(
                 "SELECT d.title
-                   FROM vault_docs_fts f JOIN vault_documents d ON d.id = f.rowid
+                   FROM vault_docs_fts f
+                   JOIN vault_documents d ON d.id = f.rowid
                   WHERE vault_docs_fts MATCH ?1
-                    AND d.doc_type IN ('statute_article','statute_supplement','case')
+                    AND d.doc_type IN
+                        ('statute_article','statute_supplement','case')
                   ORDER BY bm25(vault_docs_fts)
                   LIMIT ?2",
             )?;
@@ -530,48 +601,74 @@ fn pass_kinds(filter: &[NodeKind], kind: NodeKind) -> bool {
 /// All 1-hop neighbor slugs of `slug` — following OUTBOUND edges
 /// (vault_links.source_doc_id = slug's id) and INBOUND edges (target_raw = slug
 /// for unresolved links, or target_doc_id = slug's id for resolved ones).
+///
+/// Cross-schema: enumerates outbound + inbound edges from BOTH `main`
+/// and `domain` (when attached). Inbound edges from a different schema
+/// can only match by `target_raw == slug`, since cross-schema
+/// `target_doc_id` is never written (per slug-only resolution policy).
 fn fetch_direct_neighbors(conn: &Connection, slug: &str) -> Result<Vec<String>> {
-    let id: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM vault_documents WHERE title = ?1",
-            params![slug],
-            |r| r.get::<_, i64>(0),
-        )
-        .ok();
-    let Some(id) = id else {
-        return Ok(vec![]);
-    };
     let mut out: Vec<String> = Vec::new();
 
-    // Outbound: legal_node → whatever. Target slug is the target_raw
-    // (always set, even for unresolved links).
-    {
-        let mut stmt = conn.prepare(
-            "SELECT target_raw FROM vault_links WHERE source_doc_id = ?1",
-        )?;
-        let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
-        for r in rows {
-            out.push(r?);
+    for schema in active_schemas(conn) {
+        // Per-schema id lookup. The same slug may resolve in multiple
+        // schemas; we walk each schema's local edges independently.
+        let id: Option<i64> = conn
+            .query_row(
+                &format!(
+                    "SELECT id FROM {schema}.vault_documents WHERE title = ?1"
+                ),
+                params![slug],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok();
+
+        if let Some(id) = id {
+            // Outbound: legal_node → whatever. target_raw always set.
+            {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT target_raw FROM {schema}.vault_links WHERE source_doc_id = ?1"
+                ))?;
+                let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
+                for r in rows {
+                    out.push(r?);
+                }
+            }
+            // Inbound (intra-schema): use target_doc_id when resolved,
+            // target_raw otherwise.
+            {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT d.title
+                       FROM {schema}.vault_links vl
+                       JOIN {schema}.vault_documents d ON d.id = vl.source_doc_id
+                      WHERE (vl.target_doc_id = ?1 AND vl.is_resolved = 1)
+                         OR (vl.target_raw = ?2 AND vl.is_resolved = 0)"
+                ))?;
+                let rows = stmt.query_map(params![id, slug], |r| r.get::<_, String>(0))?;
+                for r in rows {
+                    out.push(r?);
+                }
+            }
+        }
+
+        // Inbound (cross-schema-safe): unresolved links whose
+        // `target_raw == slug`, regardless of whether the slug resolves
+        // in this schema. Catches `main.vault_links → domain.slug`.
+        {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT d.title
+                   FROM {schema}.vault_links vl
+                   JOIN {schema}.vault_documents d ON d.id = vl.source_doc_id
+                  WHERE vl.target_raw = ?1 AND vl.is_resolved = 0"
+            ))?;
+            let rows = stmt.query_map(params![slug], |r| r.get::<_, String>(0))?;
+            for r in rows {
+                out.push(r?);
+            }
         }
     }
 
-    // Inbound: whatever → legal_node. Prefer target_doc_id match; for
-    // unresolved links where target_raw == slug, those are caught too.
-    {
-        let mut stmt = conn.prepare(
-            "SELECT d.title
-               FROM vault_links vl
-               JOIN vault_documents d ON d.id = vl.source_doc_id
-              WHERE (vl.target_doc_id = ?1 AND vl.is_resolved = 1)
-                 OR (vl.target_raw = ?2 AND vl.is_resolved = 0)",
-        )?;
-        let rows = stmt.query_map(params![id, slug], |r| r.get::<_, String>(0))?;
-        for r in rows {
-            out.push(r?);
-        }
-    }
-
-    // Restrict to legal nodes only (other vault docs may share brain.db).
+    // Restrict to legal nodes only (other vault docs may share brain.db),
+    // checking each schema and keeping any slug that surfaces in either.
     if out.is_empty() {
         return Ok(out);
     }
@@ -579,16 +676,21 @@ fn fetch_direct_neighbors(conn: &Connection, slug: &str) -> Result<Vec<String>> 
         .take(out.len())
         .collect::<Vec<_>>()
         .join(",");
-    let q = format!(
-        "SELECT title FROM vault_documents
-           WHERE title IN ({placeholders})
-             AND doc_type IN ('statute_article','statute_supplement','case')"
-    );
-    let mut stmt = conn.prepare(&q)?;
-    let params_dyn: Vec<&dyn rusqlite::ToSql> =
-        out.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-    let rows = stmt.query_map(params_dyn.as_slice(), |r| r.get::<_, String>(0))?;
-    let keep: HashSet<String> = rows.filter_map(Result::ok).collect();
+    let mut keep: HashSet<String> = HashSet::new();
+    for schema in active_schemas(conn) {
+        let q = format!(
+            "SELECT title FROM {schema}.vault_documents
+               WHERE title IN ({placeholders})
+                 AND doc_type IN ('statute_article','statute_supplement','case')"
+        );
+        let mut stmt = conn.prepare(&q)?;
+        let params_dyn: Vec<&dyn rusqlite::ToSql> =
+            out.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params_dyn.as_slice(), |r| r.get::<_, String>(0))?;
+        for r in rows.filter_map(Result::ok) {
+            keep.insert(r);
+        }
+    }
     out.retain(|s| keep.contains(s));
     out.sort();
     out.dedup();
@@ -596,6 +698,12 @@ fn fetch_direct_neighbors(conn: &Connection, slug: &str) -> Result<Vec<String>> 
 }
 
 /// All edges whose both endpoints are in `slugs`.
+///
+/// Cross-schema: collects edges from BOTH `main` and `domain` (when
+/// attached). Edges are matched purely by slug (`src.title` +
+/// `vl.target_raw`) so cross-schema references resolve naturally —
+/// `main.vault_links` whose `target_raw` names a `domain.vault_documents`
+/// slug are kept iff that slug is in the input set.
 fn fetch_edges_within(conn: &Connection, slugs: &[String]) -> Result<Vec<Edge>> {
     if slugs.is_empty() {
         return Ok(vec![]);
@@ -604,36 +712,51 @@ fn fetch_edges_within(conn: &Connection, slugs: &[String]) -> Result<Vec<Edge>> 
         .take(slugs.len())
         .collect::<Vec<_>>()
         .join(",");
-    let q = format!(
-        "SELECT src.title, vl.target_raw, vl.display_text, vl.context, vl.is_resolved
-           FROM vault_links vl
-           JOIN vault_documents src ON src.id = vl.source_doc_id
-          WHERE src.title IN ({ph}) AND vl.target_raw IN ({ph})
-            AND src.doc_type IN ('statute_article','statute_supplement','case')",
-        ph = placeholders
-    );
-    let mut stmt = conn.prepare(&q)?;
-    let params_dyn: Vec<&dyn rusqlite::ToSql> = slugs
-        .iter()
-        .chain(slugs.iter())
-        .map(|s| s as &dyn rusqlite::ToSql)
-        .collect();
-    let rows = stmt.query_map(params_dyn.as_slice(), |r| {
-        let evidence: Option<String> = r.get(3)?;
-        // `[pre:YYYYMMDD] …` prefix carries the 구법 applicable-law
-        // signal. Strip it from `evidence` (cleaner display) and
-        // surface as a structured field.
-        let (revision_cutoff, evidence) = split_pre_marker(evidence);
-        Ok(Edge {
-            source_slug: r.get(0)?,
-            target_slug: r.get(1)?,
-            relation: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-            evidence,
-            resolved: r.get::<_, i64>(4)? != 0,
-            revision_cutoff,
-        })
-    })?;
-    let mut edges: Vec<Edge> = rows.filter_map(Result::ok).collect();
+
+    let mut edges: Vec<Edge> = Vec::new();
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
+    for schema in active_schemas(conn) {
+        let q = format!(
+            "SELECT src.title, vl.target_raw, vl.display_text, vl.context, vl.is_resolved
+               FROM {schema}.vault_links vl
+               JOIN {schema}.vault_documents src ON src.id = vl.source_doc_id
+              WHERE src.title IN ({ph})
+                AND vl.target_raw IN ({ph})
+                AND src.doc_type IN ('statute_article','statute_supplement','case')",
+            ph = placeholders
+        );
+        let mut stmt = conn.prepare(&q)?;
+        let params_dyn: Vec<&dyn rusqlite::ToSql> = slugs
+            .iter()
+            .chain(slugs.iter())
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = stmt.query_map(params_dyn.as_slice(), |r| {
+            let evidence: Option<String> = r.get(3)?;
+            // `[pre:YYYYMMDD] …` prefix carries the 구법 applicable-law
+            // signal. Strip it from `evidence` (cleaner display) and
+            // surface as a structured field.
+            let (revision_cutoff, evidence) = split_pre_marker(evidence);
+            Ok(Edge {
+                source_slug: r.get(0)?,
+                target_slug: r.get(1)?,
+                relation: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                evidence,
+                resolved: r.get::<_, i64>(4)? != 0,
+                revision_cutoff,
+            })
+        })?;
+        for e in rows.filter_map(Result::ok) {
+            let key = (
+                e.source_slug.clone(),
+                e.target_slug.clone(),
+                e.relation.clone(),
+            );
+            if seen.insert(key) {
+                edges.push(e);
+            }
+        }
+    }
     edges.sort_by(|a, b| {
         (
             a.source_slug.as_str(),
@@ -719,16 +842,22 @@ pub fn pick_applicable_version(
 ) -> Result<ApplicableVersion> {
     // Work out which law this statute article belongs to — we look up
     // the article's `law_name` frontmatter so we can list its
-    // supplements.
-    let article_id: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM vault_documents WHERE title = ?1
-               AND doc_type IN ('statute_article','statute_supplement')",
-            params![statute_slug],
-            |r| r.get::<_, i64>(0),
-        )
-        .ok();
-    let Some(aid) = article_id else {
+    // supplements. Domain-priority: try domain first, then main.
+    let article_lookup: Option<(&'static str, i64)> = active_schemas(conn)
+        .iter()
+        .find_map(|schema| {
+            conn.query_row(
+                &format!(
+                    "SELECT id FROM {schema}.vault_documents WHERE title = ?1
+                       AND doc_type IN ('statute_article','statute_supplement')"
+                ),
+                params![statute_slug],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok()
+            .map(|id| (*schema, id))
+        });
+    let Some((article_schema, aid)) = article_lookup else {
         return Ok(ApplicableVersion {
             branch: "none".to_string(),
             anchor_date: None,
@@ -740,7 +869,7 @@ pub fn pick_applicable_version(
             explanation: format!("statute article not found: {statute_slug}"),
         });
     };
-    let fm = load_frontmatter(conn, aid)?;
+    let fm = load_frontmatter(conn, article_schema, aid)?;
     let law_name = match fm.get("law_name").or_else(|| fm.get("parent_law")) {
         Some(n) => n.clone(),
         None => {
@@ -757,17 +886,28 @@ pub fn pick_applicable_version(
         }
     };
 
-    // Fetch the case's verdict_date (Tier 2 anchor).
-    let verdict_date: Option<String> = conn
-        .query_row(
-            "SELECT vf.value FROM vault_frontmatter vf
-               JOIN vault_documents d ON d.id = vf.doc_id
-              WHERE d.title = ?1 AND vf.key = 'verdict_date'",
-            params![case_slug],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten();
+    // Fetch the case's verdict_date (Tier 2 anchor). Search across
+    // schemas — cases may live in main (user-pasted) or domain (shipped
+    // corpus). First non-empty hit wins.
+    let mut verdict_date: Option<String> = None;
+    for schema in active_schemas(conn) {
+        let v: Option<String> = conn
+            .query_row(
+                &format!(
+                    "SELECT vf.value FROM {schema}.vault_frontmatter vf
+                       JOIN {schema}.vault_documents d ON d.id = vf.doc_id
+                      WHERE d.title = ?1 AND vf.key = 'verdict_date'"
+                ),
+                params![case_slug],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        if v.is_some() {
+            verdict_date = v;
+            break;
+        }
+    }
 
     // Work out the anchor date + branch.
     let (branch, anchor_date_owned) = match edge_cutoff {
@@ -812,14 +952,21 @@ pub fn pick_applicable_version(
                 (Some(n), Some(pd)) if pd.len() == 8 => {
                     let candidate =
                         super::slug::versioned_statute_slug(&law_name, n, article_sub, pd);
-                    let exists: bool = conn
-                        .query_row(
-                            "SELECT 1 FROM vault_documents
-                              WHERE title = ?1 AND doc_type = 'statute_article_version'",
+                    // Check both schemas — versioned snapshots may live
+                    // in either the user's brain.db or the shipped
+                    // domain corpus.
+                    let exists = active_schemas(conn).iter().any(|schema| {
+                        conn.query_row(
+                            &format!(
+                                "SELECT 1 FROM {schema}.vault_documents
+                                  WHERE title = ?1
+                                    AND doc_type = 'statute_article_version'"
+                            ),
                             params![candidate],
                             |_| Ok(true),
                         )
-                        .unwrap_or(false);
+                        .unwrap_or(false)
+                    });
                     if exists { Some(candidate) } else { None }
                 }
                 _ => None,
@@ -890,28 +1037,44 @@ struct SupplementRow {
 }
 
 fn list_supplements_of_law(conn: &Connection, law_name: &str) -> Result<Vec<SupplementRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT d.title,
-                MAX(CASE WHEN vf.key='effective_date'    THEN vf.value END) AS eff,
-                MAX(CASE WHEN vf.key='promulgation_no'   THEN vf.value END) AS pno,
-                MAX(CASE WHEN vf.key='promulgation_date' THEN vf.value END) AS pdate,
-                MAX(CASE WHEN vf.key='parent_law'        THEN vf.value END) AS parent
-           FROM vault_documents d
-           JOIN vault_frontmatter vf ON vf.doc_id = d.id
-          WHERE d.doc_type = 'statute_supplement'
-          GROUP BY d.id, d.title
-         HAVING parent = ?1
-          ORDER BY eff DESC NULLS LAST",
-    )?;
-    let rows = stmt.query_map(params![law_name], |r| {
-        Ok(SupplementRow {
-            slug: r.get(0)?,
-            effective_date: r.get::<_, Option<String>>(1)?,
-            promulgation_no: r.get::<_, Option<String>>(2)?,
-            promulgation_date: r.get::<_, Option<String>>(3)?,
-        })
-    })?;
-    Ok(rows.filter_map(Result::ok).collect())
+    // Collect from each active schema then merge. Domain-priority on
+    // slug conflicts: when the same supplement slug surfaces in both
+    // schemas, the domain copy wins (we iterate domain first).
+    let mut by_slug: HashMap<String, SupplementRow> = HashMap::new();
+    for schema in active_schemas(conn) {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT d.title,
+                    MAX(CASE WHEN vf.key='effective_date'    THEN vf.value END) AS eff,
+                    MAX(CASE WHEN vf.key='promulgation_no'   THEN vf.value END) AS pno,
+                    MAX(CASE WHEN vf.key='promulgation_date' THEN vf.value END) AS pdate,
+                    MAX(CASE WHEN vf.key='parent_law'        THEN vf.value END) AS parent
+               FROM {schema}.vault_documents d
+               JOIN {schema}.vault_frontmatter vf ON vf.doc_id = d.id
+              WHERE d.doc_type = 'statute_supplement'
+              GROUP BY d.id, d.title
+             HAVING parent = ?1"
+        ))?;
+        let rows = stmt.query_map(params![law_name], |r| {
+            Ok(SupplementRow {
+                slug: r.get(0)?,
+                effective_date: r.get::<_, Option<String>>(1)?,
+                promulgation_no: r.get::<_, Option<String>>(2)?,
+                promulgation_date: r.get::<_, Option<String>>(3)?,
+            })
+        })?;
+        for sup in rows.filter_map(Result::ok) {
+            by_slug.entry(sup.slug.clone()).or_insert(sup);
+        }
+    }
+    let mut out: Vec<SupplementRow> = by_slug.into_values().collect();
+    // Sort effective_date DESC, NULLs last.
+    out.sort_by(|a, b| match (&a.effective_date, &b.effective_date) {
+        (Some(x), Some(y)) => y.cmp(x),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.slug.cmp(&b.slug),
+    });
+    Ok(out)
 }
 
 fn previous_day_yyyymmdd(s: &str) -> Option<String> {
@@ -967,8 +1130,14 @@ fn split_pre_marker(evidence: Option<String>) -> (Option<String>, Option<String>
     (None, Some(s))
 }
 
-fn hydrate_node(conn: &Connection, id: i64, slug: &str, kind: NodeKind) -> Result<Node> {
-    let fm = load_frontmatter(conn, id)?;
+fn hydrate_node(
+    conn: &Connection,
+    schema: &str,
+    id: i64,
+    slug: &str,
+    kind: NodeKind,
+) -> Result<Node> {
+    let fm = load_frontmatter(conn, schema, id)?;
     let label = build_label(slug, kind, &fm);
     Ok(Node {
         id,
@@ -990,10 +1159,14 @@ fn hydrate_node(conn: &Connection, id: i64, slug: &str, kind: NodeKind) -> Resul
     })
 }
 
-fn load_frontmatter(conn: &Connection, doc_id: i64) -> Result<HashMap<String, String>> {
-    let mut stmt = conn.prepare(
-        "SELECT key, value FROM vault_frontmatter WHERE doc_id = ?1",
-    )?;
+fn load_frontmatter(
+    conn: &Connection,
+    schema: &str,
+    doc_id: i64,
+) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT key, value FROM {schema}.vault_frontmatter WHERE doc_id = ?1"
+    ))?;
     let rows = stmt.query_map(params![doc_id], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default()))
     })?;
@@ -1373,5 +1546,169 @@ body
             .unwrap();
         assert_eq!(d.branch, "none");
         assert!(d.supplement_slug.is_none());
+    }
+
+    // ───── Cross-schema (domain.db ATTACH) tests — Step A4 ─────
+
+    /// Build a Connection with both `main` (in-memory) and `domain`
+    /// (file-backed via tempfile, ATTACHed) schemas + identical vault
+    /// tables. Returns (conn, tempdir-keepalive).
+    fn fresh_attached_conn() -> (Arc<Mutex<Connection>>, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let domain_path = tmp.path().join("domain.db");
+        // Init schema on the domain file first so ATTACH sees a complete
+        // table set.
+        crate::vault::domain::ensure_schema(&domain_path).unwrap();
+
+        let main = Connection::open_in_memory().unwrap();
+        init_schema(&main).unwrap();
+        crate::vault::domain::attach(&main, &domain_path).unwrap();
+        assert!(crate::vault::domain::is_attached(&main).unwrap());
+        (Arc::new(Mutex::new(main)), tmp)
+    }
+
+    #[test]
+    fn cross_schema_get_node_finds_domain_only_slug() {
+        let (conn, _tmp) = fresh_attached_conn();
+        // Ingest the statute INTO domain only.
+        let sdoc = crate::vault::legal::extract_statute(
+            STATUTE_MD,
+            "/x/20251001/근로기준법.md",
+        )
+        .unwrap();
+        crate::vault::legal::ingest_statute_to(
+            &conn,
+            &sdoc,
+            crate::vault::legal::IngestTarget::Domain,
+        )
+        .unwrap();
+
+        let g = conn.lock();
+        // Slug exists in domain, NOT in main — get_node must still find it.
+        let main_count: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM main.vault_documents WHERE title='statute::근로기준법::36'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(main_count, 0, "must not have written to main");
+        let domain_count: i64 = g
+            .query_row(
+                "SELECT COUNT(*) FROM domain.vault_documents WHERE title='statute::근로기준법::36'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(domain_count, 1, "must have written to domain");
+
+        let n = get_node(&g, "statute::근로기준법::36").unwrap().unwrap();
+        assert_eq!(n.slug, "statute::근로기준법::36");
+        assert_eq!(n.law_name.as_deref(), Some("근로기준법"));
+    }
+
+    #[test]
+    fn cross_schema_neighbors_resolves_main_link_to_domain_node() {
+        let (conn, _tmp) = fresh_attached_conn();
+        // Ingest statute into DOMAIN.
+        let sdoc = crate::vault::legal::extract_statute(
+            STATUTE_MD,
+            "/x/20251001/근로기준법.md",
+        )
+        .unwrap();
+        crate::vault::legal::ingest_statute_to(
+            &conn,
+            &sdoc,
+            crate::vault::legal::IngestTarget::Domain,
+        )
+        .unwrap();
+
+        // Ingest case into MAIN — its `cites` edges target domain slugs.
+        let cdoc = crate::vault::legal::extract_case(
+            CASE_MD,
+            "/x/20250530/2024노3424_400102_형사_606941.md",
+        )
+        .unwrap();
+        crate::vault::legal::ingest_case_to(
+            &conn,
+            &cdoc,
+            crate::vault::legal::IngestTarget::Main,
+        )
+        .unwrap();
+
+        let g = conn.lock();
+        // The case's edges have target_doc_id NULL (cross-schema → unresolved
+        // by the writer) but target_raw set, so neighbors traversal resolves.
+        let sg = neighbors(&g, "case::2024노3424", 1, &[]).unwrap();
+        let slugs: HashSet<&str> = sg.nodes.iter().map(|n| n.slug.as_str()).collect();
+        assert!(
+            slugs.contains("statute::근로기준법::36"),
+            "expected domain statute among neighbors of main case; got {slugs:?}"
+        );
+        assert!(
+            slugs.contains("statute::근로기준법::109"),
+            "expected domain statute 109 among neighbors of main case; got {slugs:?}"
+        );
+    }
+
+    #[test]
+    fn cross_schema_domain_priority_when_slug_collides() {
+        let (conn, _tmp) = fresh_attached_conn();
+        // Insert the SAME slug into main AND domain with different
+        // content so we can tell them apart.
+        {
+            let g = conn.lock();
+            // main copy.
+            g.execute(
+                "INSERT INTO main.vault_documents
+                    (uuid, title, content, source_type, source_device_id, checksum,
+                     doc_type, char_count, created_at, updated_at)
+                 VALUES ('u-main','statute::근로기준법::36','MAIN BODY','local_file','local',
+                         'cm','statute_article',9,1,1)",
+                [],
+            )
+            .unwrap();
+            // domain copy.
+            g.execute(
+                "INSERT INTO domain.vault_documents
+                    (uuid, title, content, source_type, source_device_id, checksum,
+                     doc_type, char_count, created_at, updated_at)
+                 VALUES ('u-dom','statute::근로기준법::36','DOMAIN BODY','local_file','local',
+                         'cd','statute_article',11,1,1)",
+                [],
+            )
+            .unwrap();
+        }
+        let g = conn.lock();
+        let a = read_article(&g, "statute::근로기준법::36").unwrap().unwrap();
+        // Domain wins on slug conflict.
+        assert!(
+            a.content.contains("DOMAIN BODY"),
+            "expected domain content, got: {}",
+            a.content
+        );
+    }
+
+    #[test]
+    fn cross_schema_find_nodes_resolves_domain_alias() {
+        let (conn, _tmp) = fresh_attached_conn();
+        let sdoc = crate::vault::legal::extract_statute(
+            STATUTE_MD,
+            "/x/20251001/근로기준법.md",
+        )
+        .unwrap();
+        crate::vault::legal::ingest_statute_to(
+            &conn,
+            &sdoc,
+            crate::vault::legal::IngestTarget::Domain,
+        )
+        .unwrap();
+        let g = conn.lock();
+        // Alias `근로기준법 제36조` was inserted into domain only.
+        let hits = find_nodes(&g, "근로기준법 제36조", 5).unwrap();
+        assert!(
+            hits.iter().any(|h| h.slug == "statute::근로기준법::36"),
+            "got: {hits:?}"
+        );
     }
 }
