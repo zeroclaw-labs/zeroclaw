@@ -446,6 +446,8 @@ zeroclaw skills audit https://github.com/user/my-skill.git
 zeroclaw skills remove my-skill
 ```
 
+Browse [community-contributed skills](docs/community-skills.md) compatible with `zeroclaw skills install`.
+
 ## CLI commands
 
 ```bash
