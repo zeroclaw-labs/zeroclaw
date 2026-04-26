@@ -164,10 +164,7 @@ fn search_http_json_registry(
     };
 
     if !resp.status().is_success() {
-        tracing::warn!(
-            "{registry_name} search returned HTTP {}",
-            resp.status()
-        );
+        tracing::warn!("{registry_name} search returned HTTP {}", resp.status());
         return Ok(vec![]);
     }
 
@@ -238,22 +235,50 @@ impl ClawhubRegistry {
             "https" | "http" => {}
             _ => return None,
         }
-        if !parsed
-            .host_str()
-            .is_some_and(Self::is_clawhub_host)
-        {
+        if !parsed.host_str().is_some_and(Self::is_clawhub_host) {
             return None;
         }
         Some(parsed)
     }
 
+    /// Bare `owner/slug` (no scheme, exactly one `/`, no leading dot/tilde,
+    /// safe characters only) is treated as a ClawHub shorthand so users can
+    /// run `zeroclaw skills install pskoett/self-improving-agent` without
+    /// typing the full URL or `clawhub:` prefix.
+    fn is_bare_owner_slug(source: &str) -> bool {
+        if source.contains("://") || source.contains(':') {
+            return false;
+        }
+        if source.starts_with('.') || source.starts_with('~') || source.starts_with('/') {
+            return false;
+        }
+        if source.contains('\\') || source.contains("..") {
+            return false;
+        }
+        let parts: Vec<&str> = source.split('/').collect();
+        if parts.len() != 2 {
+            return false;
+        }
+        let segment_ok = |s: &&str| {
+            !s.is_empty()
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+                && !s.starts_with('.')
+        };
+        parts.iter().all(segment_ok)
+    }
+
     fn download_url(source: &str) -> Result<String> {
         if let Some(slug) = source.strip_prefix("clawhub:") {
             let slug = slug.trim().trim_end_matches('/');
-            if slug.is_empty() || slug.contains('/') {
+            if slug.is_empty() {
                 anyhow::bail!("invalid clawhub source '{source}': expected 'clawhub:<slug>'");
             }
             return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={slug}"));
+        }
+
+        if Self::is_bare_owner_slug(source) {
+            return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={source}"));
         }
 
         if let Some(parsed) = Self::parse_url(source) {
@@ -274,15 +299,27 @@ impl ClawhubRegistry {
 
     fn skill_dir_name(source: &str) -> Result<String> {
         let raw = if let Some(slug) = source.strip_prefix("clawhub:") {
-            slug.trim().trim_end_matches('/').rsplit('/').next().unwrap_or(slug)
+            slug.trim()
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or(slug)
+        } else if Self::is_bare_owner_slug(source) {
+            source.rsplit('/').next().unwrap_or(source)
         } else if let Some(parsed) = Self::parse_url(source) {
             let segs: Vec<_> = parsed.path_segments().into_iter().flatten().collect();
-            return Ok(normalize_skill_name(segs.last().copied().unwrap_or("skill")));
+            return Ok(normalize_skill_name(
+                segs.last().copied().unwrap_or("skill"),
+            ));
         } else {
             "skill"
         };
         let name = normalize_skill_name(raw);
-        Ok(if name.is_empty() { "skill".into() } else { name })
+        Ok(if name.is_empty() {
+            "skill".into()
+        } else {
+            name
+        })
     }
 }
 
@@ -292,7 +329,9 @@ impl SkillRegistry for ClawhubRegistry {
     }
 
     fn matches_source(&self, source: &str) -> bool {
-        source.starts_with("clawhub:") || Self::parse_url(source).is_some()
+        source.starts_with("clawhub:")
+            || Self::parse_url(source).is_some()
+            || Self::is_bare_owner_slug(source)
     }
 
     fn search(&self, query: &str) -> Result<Vec<SkillSearchResult>> {
@@ -332,10 +371,7 @@ impl AgentSkillsIoRegistry {
             "https" | "http" => {}
             _ => return None,
         }
-        if !parsed
-            .host_str()
-            .is_some_and(Self::is_agentskills_host)
-        {
+        if !parsed.host_str().is_some_and(Self::is_agentskills_host) {
             return None;
         }
         Some(parsed)
@@ -345,7 +381,9 @@ impl AgentSkillsIoRegistry {
         if let Some(slug) = source.strip_prefix("agentskills:") {
             let slug = slug.trim().trim_end_matches('/');
             if slug.is_empty() {
-                anyhow::bail!("invalid agentskills source '{source}': expected 'agentskills:<slug>'");
+                anyhow::bail!(
+                    "invalid agentskills source '{source}': expected 'agentskills:<slug>'"
+                );
             }
             return Ok(format!("{AGENTSKILLS_DOWNLOAD_API}?slug={slug}"));
         }
@@ -371,7 +409,11 @@ impl AgentSkillsIoRegistry {
         if let Some(slug) = source.strip_prefix("agentskills:") {
             let base = slug.trim().trim_end_matches('/');
             let name = normalize_skill_name(base);
-            return if name.is_empty() { "skill".into() } else { name };
+            return if name.is_empty() {
+                "skill".into()
+            } else {
+                name
+            };
         }
         if let Some(parsed) = Self::parse_url(source) {
             let segs: Vec<_> = parsed.path_segments().into_iter().flatten().collect();
@@ -402,7 +444,13 @@ impl SkillRegistry for AgentSkillsIoRegistry {
     ) -> Result<(PathBuf, usize)> {
         let url = Self::download_url(source)?;
         let dir_name = Self::skill_dir_name(source);
-        install_http_zip_skill(&url, &dir_name, skills_path, allow_scripts, "agentskills.io")
+        install_http_zip_skill(
+            &url,
+            &dir_name,
+            skills_path,
+            allow_scripts,
+            "agentskills.io",
+        )
     }
 }
 
@@ -417,8 +465,7 @@ pub struct SkillsShRegistry;
 
 impl SkillsShRegistry {
     fn is_skillssh_host(host: &str) -> bool {
-        host.eq_ignore_ascii_case(SKILLSSH_DOMAIN)
-            || host.eq_ignore_ascii_case(SKILLSSH_WWW_DOMAIN)
+        host.eq_ignore_ascii_case(SKILLSSH_DOMAIN) || host.eq_ignore_ascii_case(SKILLSSH_WWW_DOMAIN)
     }
 
     fn parse_url(source: &str) -> Option<reqwest::Url> {
@@ -427,10 +474,7 @@ impl SkillsShRegistry {
             "https" | "http" => {}
             _ => return None,
         }
-        if !parsed
-            .host_str()
-            .is_some_and(Self::is_skillssh_host)
-        {
+        if !parsed.host_str().is_some_and(Self::is_skillssh_host) {
             return None;
         }
         Some(parsed)
@@ -466,7 +510,11 @@ impl SkillsShRegistry {
         if let Some(slug) = source.strip_prefix("skillssh:") {
             let base = slug.trim().trim_end_matches('/');
             let name = normalize_skill_name(base);
-            return if name.is_empty() { "skill".into() } else { name };
+            return if name.is_empty() {
+                "skill".into()
+            } else {
+                name
+            };
         }
         if let Some(parsed) = Self::parse_url(source) {
             let segs: Vec<_> = parsed.path_segments().into_iter().flatten().collect();
@@ -627,7 +675,16 @@ impl RegistryDispatcher {
     ) -> Option<Result<(PathBuf, usize)>> {
         for reg in &self.registries {
             if reg.matches_source(source) {
-                return Some(reg.install(source, skills_path, allow_scripts));
+                // HTTP-based registries use reqwest::blocking, which spins up
+                // its own tokio runtime. Dropping that nested runtime panics
+                // when this function is called from inside an existing async
+                // context (e.g. the CLI's #[tokio::main]). block_in_place
+                // detaches the current worker thread so nested-runtime drop
+                // is allowed. is_in_async_runtime gates this so tests and
+                // sync callers aren't forced through the wrapper.
+                return Some(call_blocking(|| {
+                    reg.install(source, skills_path, allow_scripts)
+                }));
             }
         }
         None
@@ -636,7 +693,9 @@ impl RegistryDispatcher {
     pub fn search(&self, query: &str) -> Vec<SkillSearchResult> {
         let mut results = Vec::new();
         for reg in &self.registries {
-            match reg.search(query) {
+            // Same async-runtime concern as `install` — see comment there.
+            let outcome = call_blocking(|| reg.search(query));
+            match outcome {
                 Ok(mut r) => results.append(&mut r),
                 Err(e) => {
                     tracing::warn!("search failed for {}: {e}", reg.name());
@@ -644,6 +703,20 @@ impl RegistryDispatcher {
             }
         }
         results
+    }
+}
+
+/// Run blocking I/O work, isolated from any enclosing tokio runtime.
+///
+/// Inside a multi-thread tokio runtime we use `block_in_place` so that the
+/// dropped `reqwest::blocking` runtime doesn't trip the "cannot drop a
+/// runtime in async context" panic. Outside a runtime (sync callers, unit
+/// tests) we just run the closure directly.
+fn call_blocking<R>(f: impl FnOnce() -> R) -> R {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
     }
 }
 
@@ -660,14 +733,12 @@ impl SkillRegistry for CustomHttpRegistry {
     }
 
     fn matches_source(&self, source: &str) -> bool {
-        if let Ok(parsed) = reqwest::Url::parse(source) {
-            if let Some(host) = parsed.host_str() {
-                if let Ok(base) = reqwest::Url::parse(&self.base_url) {
-                    if let Some(base_host) = base.host_str() {
-                        return host.eq_ignore_ascii_case(base_host);
-                    }
-                }
-            }
+        if let Ok(parsed) = reqwest::Url::parse(source)
+            && let Some(host) = parsed.host_str()
+            && let Ok(base) = reqwest::Url::parse(&self.base_url)
+            && let Some(base_host) = base.host_str()
+        {
+            return host.eq_ignore_ascii_case(base_host);
         }
         false
     }
@@ -689,8 +760,7 @@ impl SkillRegistry for CustomHttpRegistry {
             .path_segments()
             .into_iter()
             .flatten()
-            .filter(|s| !s.is_empty())
-            .last()
+            .rfind(|s| !s.is_empty())
             .unwrap_or("skill");
         let dir_name = normalize_skill_name(slug);
         let download_url = format!(
@@ -729,6 +799,40 @@ mod tests {
         assert!(r.matches_source("https://clawhub.ai/user/skill"));
         assert!(!r.matches_source("agentskills:foo"));
         assert!(!r.matches_source("https://agentskills.io/foo"));
+    }
+
+    #[test]
+    fn clawhub_accepts_owner_slug_with_slash_in_prefix_form() {
+        // Real ClawHub slugs are owner/name, e.g. `pskoett/self-improving-agent`.
+        // The previous parser hardcoded `slug.contains('/')` as invalid.
+        let url = ClawhubRegistry::download_url("clawhub:pskoett/self-improving-agent").unwrap();
+        assert_eq!(
+            url,
+            "https://clawhub.ai/api/v1/download?slug=pskoett/self-improving-agent"
+        );
+    }
+
+    #[test]
+    fn clawhub_accepts_bare_owner_slug() {
+        let r = ClawhubRegistry;
+        assert!(r.matches_source("pskoett/self-improving-agent"));
+        let url = ClawhubRegistry::download_url("pskoett/self-improving-agent").unwrap();
+        assert_eq!(
+            url,
+            "https://clawhub.ai/api/v1/download?slug=pskoett/self-improving-agent"
+        );
+        let dir = ClawhubRegistry::skill_dir_name("pskoett/self-improving-agent").unwrap();
+        assert_eq!(dir, "self_improving_agent");
+    }
+
+    #[test]
+    fn clawhub_rejects_three_segment_paths() {
+        // path/to/something is a local path, not a ClawHub shorthand.
+        let r = ClawhubRegistry;
+        assert!(!r.matches_source("path/to/something"));
+        assert!(!r.matches_source("./local/path"));
+        assert!(!r.matches_source("../other/skill"));
+        assert!(!r.matches_source("/abs/path"));
     }
 
     #[test]
