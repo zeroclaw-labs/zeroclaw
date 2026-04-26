@@ -175,6 +175,50 @@ impl Tool for AskUserTool {
             }
         };
 
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+
+        // Prefer the channel's native structured-choice flow when choices are
+        // present (e.g. ACP `session/request_permission`, Telegram inline
+        // keyboard). Channels that don't implement it return `Ok(None)` and
+        // we fall through to the generic send + listen path.
+        if let Some(ref choices_vec) = choices
+            && !choices_vec.is_empty()
+        {
+            match channel.request_choice(&question, choices_vec, timeout).await {
+                Ok(Some(answer)) => {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: answer,
+                        error: None,
+                    });
+                }
+                Ok(None) => { /* fall through to send+listen */ }
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Failed to ask question on channel '{channel_name}': {e}"
+                        )),
+                    });
+                }
+            }
+        } else if !channel.supports_free_form_ask() {
+            // Free-form ask_user has no first-class ACP method yet. The ACP
+            // elicitation RFD is the future fix — until it lands, agents
+            // talking to ACP clients must supply `choices` so we can route
+            // through `session/request_permission`.
+            // RFD: https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Channel '{channel_name}' requires `choices` for ask_user \
+                     (free-form questions await ACP elicitation RFD)"
+                )),
+            });
+        }
+
         // Format and send the question
         let text = format_question(&question, choices.as_deref());
         let msg = SendMessage::new(&text, "");
@@ -190,7 +234,6 @@ impl Tool for AskUserTool {
 
         // Listen for user response with timeout
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(1);
-        let timeout = std::time::Duration::from_secs(timeout_secs);
 
         // Spawn a listener task on the channel
         let listen_channel = Arc::clone(&channel);

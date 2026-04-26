@@ -20,14 +20,17 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 use zeroclaw_config::schema::Config;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
+
+use crate::acp_channel::AcpChannel;
 
 // ── Configuration ────────────────────────────────────────────────
 
@@ -78,12 +81,12 @@ struct JsonRpcNotification {
     params: Value,
 }
 
-#[derive(Debug, Serialize)]
-struct JsonRpcError {
-    code: i32,
-    message: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonRpcError {
+    pub code: i32,
+    pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<Value>,
+    pub data: Option<Value>,
 }
 
 // Standard JSON-RPC error codes
@@ -97,6 +100,145 @@ const INTERNAL_ERROR: i32 = -32603;
 const SESSION_NOT_FOUND: i32 = -32000;
 const SESSION_LIMIT_REACHED: i32 = -32001;
 const ACP_PROTOCOL_VERSION: u64 = 1;
+
+// ── Outbound JSON-RPC plumbing ───────────────────────────────────
+
+/// A pending outbound JSON-RPC call, awaiting a response from the client.
+type PendingResponder = oneshot::Sender<std::result::Result<Value, JsonRpcError>>;
+
+/// Writer + outbound-call tracker shared between the server loop and
+/// per-session bridges (e.g. [`AcpChannel`]).
+///
+/// All stdout writes go through `writer_tx` so concurrent notifications and
+/// outbound requests can't interleave bytes. Outbound requests get string ids
+/// (`zc-out-<n>`) that are disjoint from any client-issued id space.
+pub struct RpcOutbound {
+    writer_tx: mpsc::Sender<String>,
+    pending: std::sync::Mutex<HashMap<String, PendingResponder>>,
+    next_id: AtomicU64,
+}
+
+impl RpcOutbound {
+    fn new(writer_tx: mpsc::Sender<String>) -> Self {
+        Self {
+            writer_tx,
+            pending: std::sync::Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+        }
+    }
+
+    /// Send a JSON-RPC notification (no `id`, no response expected).
+    pub async fn notify(&self, method: &str, params: Value) {
+        let n = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        if let Ok(s) = serde_json::to_string(&n)
+            && self.writer_tx.send(s).await.is_err()
+        {
+            warn!("ACP writer task closed; dropping outbound notification");
+        }
+    }
+
+    /// Send a JSON-RPC request and await the response.
+    pub async fn request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> std::result::Result<Value, JsonRpcError> {
+        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = format!("zc-out-{n}");
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.insert(id.clone(), tx);
+        }
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": id,
+        });
+        let body = match serde_json::to_string(&req) {
+            Ok(s) => s,
+            Err(e) => {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id);
+                return Err(JsonRpcError {
+                    code: INTERNAL_ERROR,
+                    message: format!("Failed to encode request: {e}"),
+                    data: None,
+                });
+            }
+        };
+        if self.writer_tx.send(body).await.is_err() {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+            return Err(JsonRpcError {
+                code: INTERNAL_ERROR,
+                message: "ACP writer task closed".to_string(),
+                data: None,
+            });
+        }
+        rx.await.unwrap_or_else(|_| {
+            Err(JsonRpcError {
+                code: INTERNAL_ERROR,
+                message: "Outbound RPC dropped".to_string(),
+                data: None,
+            })
+        })
+    }
+
+    /// Route an inbound JSON-RPC response (matched by `id`) to the
+    /// corresponding pending caller.
+    pub(crate) fn dispatch_response(
+        &self,
+        id_str: &str,
+        result: Option<Value>,
+        error: Option<JsonRpcError>,
+    ) {
+        let responder = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id_str);
+        if let Some(tx) = responder {
+            let payload = if let Some(err) = error {
+                Err(err)
+            } else {
+                Ok(result.unwrap_or(Value::Null))
+            };
+            let _ = tx.send(payload);
+        } else {
+            debug!("No pending outbound RPC matched response id={id_str}");
+        }
+    }
+}
+
+#[cfg(test)]
+impl RpcOutbound {
+    /// Test-only: build an `RpcOutbound` whose writer channel is provided by
+    /// the test (so outbound frames can be inspected without touching stdout).
+    pub fn for_testing(writer_tx: mpsc::Sender<String>) -> Self {
+        Self::new(writer_tx)
+    }
+
+    /// Test-only wrapper around `dispatch_response` so cross-module tests
+    /// (e.g. in `acp_channel`) can simulate inbound JSON-RPC responses.
+    pub fn dispatch_response_for_test(
+        &self,
+        id_str: &str,
+        result: Option<Value>,
+        error: Option<JsonRpcError>,
+    ) {
+        self.dispatch_response(id_str, result, error);
+    }
+}
 
 // ── Session state ────────────────────────────────────────────────
 
@@ -118,24 +260,42 @@ pub struct AcpServer {
     config: Config,
     acp_config: AcpServerConfig,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
+    rpc: Arc<RpcOutbound>,
+    /// Receiver for the writer task. Pulled out (replaced with `None`) the
+    /// first time `run()` starts the writer loop.
+    writer_rx: std::sync::Mutex<Option<mpsc::Receiver<String>>>,
 }
 
 impl AcpServer {
     pub fn new(config: Config, acp_config: AcpServerConfig) -> Self {
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
         Self {
             config,
             acp_config,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            rpc: Arc::new(RpcOutbound::new(writer_tx)),
+            writer_rx: std::sync::Mutex::new(Some(writer_rx)),
         }
     }
 
     /// Run the ACP server, reading JSON-RPC requests from stdin and writing
     /// responses/notifications to stdout.
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(self: Arc<Self>) -> Result<()> {
         debug!(
             "ACP server starting (max_sessions={}, timeout={}s)",
             self.acp_config.max_sessions, self.acp_config.session_timeout_secs
         );
+
+        // Pull the writer-rx out of self so we can move it into the writer
+        // task. Subsequent `run()` calls would have nothing to drive — but
+        // `run()` is normally invoked once per process.
+        let writer_rx = self
+            .writer_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("ACP server writer already started"))?;
+        tokio::spawn(writer_task(writer_rx));
 
         let stdin = tokio::io::stdin();
         let mut reader = BufReader::new(stdin);
@@ -177,6 +337,23 @@ impl AcpServer {
                 continue;
             }
 
+            // First, peek at whether this is a response (has `result` or
+            // `error`) to a request *we* sent. Inbound requests/notifications
+            // fall through to the JsonRpcRequest path.
+            if let Ok(value) = serde_json::from_str::<Value>(trimmed)
+                && value.is_object()
+                && (value.get("result").is_some() || value.get("error").is_some())
+                && let Some(id) = value.get("id")
+            {
+                let id_str = id.as_str().map(String::from).unwrap_or_else(|| id.to_string());
+                let result = value.get("result").cloned();
+                let error: Option<JsonRpcError> = value
+                    .get("error")
+                    .and_then(|e| serde_json::from_value(e.clone()).ok());
+                self.rpc.dispatch_response(&id_str, result, error);
+                continue;
+            }
+
             match serde_json::from_str::<JsonRpcRequest>(trimmed) {
                 Ok(request) => {
                     if request.jsonrpc != "2.0" {
@@ -186,7 +363,14 @@ impl AcpServer {
                         }
                         continue;
                     }
-                    self.handle_request(request).await;
+                    // Spawn so a long-running session/prompt doesn't block the
+                    // read loop — outbound RPC responses (e.g. for
+                    // session/request_permission) need to be processable
+                    // while a prompt turn is in flight.
+                    let server = Arc::clone(&self);
+                    tokio::spawn(async move {
+                        server.handle_request(request).await;
+                    });
                 }
                 Err(e) => {
                     warn!("Failed to parse JSON-RPC request: {e}");
@@ -324,6 +508,19 @@ impl AcpServer {
             message: format!("Failed to create agent: {e}"),
             data: None,
         })?;
+
+        // Wire an ACP back-channel so tools like `ask_user`,
+        // `escalate_to_human`, and `reaction` can talk to the IDE/CLI client
+        // for this session. Registered as `"acp"`; resolved by name when the
+        // agent picks a channel.
+        let acp_channel = Arc::new(AcpChannel::new(
+            "acp",
+            session_id.clone(),
+            Arc::clone(&self.rpc),
+        ));
+        agent
+            .channel_handles()
+            .register_channel("acp", acp_channel);
 
         let now = Instant::now();
         sessions.insert(
@@ -477,7 +674,10 @@ impl AcpServer {
             })?;
 
         let mut sessions = self.sessions.lock().await;
-        if sessions.remove(session_id).is_some() {
+        if let Some(session) = sessions.remove(session_id) {
+            // Drop the ACP back-channel from each tool's channel map so the
+            // session's RpcOutbound clone isn't kept alive by stale entries.
+            session.agent.channel_handles().unregister_channel("acp");
             debug!("Stopped session {session_id}");
             Ok(serde_json::json!({
                 "sessionId": session_id,
@@ -569,23 +769,33 @@ impl AcpServer {
     async fn write_json<T: Serialize>(&self, value: &T) {
         match serde_json::to_string(value) {
             Ok(json) => {
-                let mut stdout = tokio::io::stdout();
-                // Write as a single line followed by newline
-                if let Err(e) = stdout.write_all(json.as_bytes()).await {
-                    error!("Failed to write to stdout: {e}");
-                    return;
-                }
-                if let Err(e) = stdout.write_all(b"\n").await {
-                    error!("Failed to write newline to stdout: {e}");
-                    return;
-                }
-                if let Err(e) = stdout.flush().await {
-                    error!("Failed to flush stdout: {e}");
+                if self.rpc.writer_tx.send(json).await.is_err() {
+                    error!("ACP writer task closed; dropping outbound message");
                 }
             }
             Err(e) => {
                 error!("Failed to serialize JSON-RPC message: {e}");
             }
+        }
+    }
+}
+
+/// Single writer task that owns stdout. All outbound JSON-RPC messages flow
+/// through here, so concurrent notifications and outbound requests don't
+/// interleave bytes.
+async fn writer_task(mut rx: mpsc::Receiver<String>) {
+    let mut stdout = tokio::io::stdout();
+    while let Some(line) = rx.recv().await {
+        if let Err(e) = stdout.write_all(line.as_bytes()).await {
+            error!("Failed to write to stdout: {e}");
+            continue;
+        }
+        if let Err(e) = stdout.write_all(b"\n").await {
+            error!("Failed to write newline to stdout: {e}");
+            continue;
+        }
+        if let Err(e) = stdout.flush().await {
+            error!("Failed to flush stdout: {e}");
         }
     }
 }

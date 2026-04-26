@@ -59,6 +59,51 @@ pub struct Agent {
     /// Hook runner for tool-call auditing and lifecycle side effects.
     /// See issue #5462.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    /// Late-bound channel maps for the four channel-driven tools
+    /// (`ask_user`, `reaction`, `escalate_to_human`, `poll`). Held so that
+    /// per-session callers (e.g. the ACP server) can register a back-channel
+    /// after agent construction. Production paths populate via
+    /// `start_channels`; this is the alternate path for environments that
+    /// build an Agent directly without `start_channels`.
+    channel_handles: AgentChannelHandles,
+}
+
+/// Bundle of late-bound channel-map handles owned by an Agent. Cloning is
+/// cheap (Arc clones); the underlying maps are shared with the live tools.
+#[derive(Clone, Default)]
+pub struct AgentChannelHandles {
+    pub ask_user: Option<tools::ChannelMapHandle>,
+    pub reaction: Option<tools::ChannelMapHandle>,
+    pub escalate: Option<tools::ChannelMapHandle>,
+    pub poll: Option<tools::ChannelMapHandle>,
+}
+
+impl AgentChannelHandles {
+    /// Register a channel into every populated handle so all four
+    /// channel-driven tools can resolve it by name.
+    pub fn register_channel(
+        &self,
+        name: impl Into<String>,
+        channel: Arc<dyn zeroclaw_api::channel::Channel>,
+    ) {
+        let name = name.into();
+        for handle in [&self.ask_user, &self.reaction, &self.escalate, &self.poll]
+            .into_iter()
+            .flatten()
+        {
+            handle.write().insert(name.clone(), Arc::clone(&channel));
+        }
+    }
+
+    /// Remove a channel from every populated handle (used on session/stop).
+    pub fn unregister_channel(&self, name: &str) {
+        for handle in [&self.ask_user, &self.reaction, &self.escalate, &self.poll]
+            .into_iter()
+            .flatten()
+        {
+            handle.write().remove(name);
+        }
+    }
 }
 
 pub struct AgentBuilder {
@@ -322,6 +367,7 @@ impl AgentBuilder {
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
             hook_runner: self.hook_runner,
+            channel_handles: AgentChannelHandles::default(),
         })
     }
 }
@@ -329,6 +375,15 @@ impl AgentBuilder {
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
+    }
+
+    /// Late-bound channel-map handles for the four channel-driven tools.
+    /// Populated by `from_config_with_session_cwd`; empty when an Agent is
+    /// constructed via the builder directly. Callers (e.g. the ACP server)
+    /// use `channel_handles().register_channel(...)` to wire a back-channel
+    /// into all four tool maps in one shot.
+    pub fn channel_handles(&self) -> &AgentChannelHandles {
+        &self.channel_handles
     }
 
     pub fn history(&self) -> &[ConversationMessage] {
@@ -413,10 +468,10 @@ impl Agent {
         let (
             mut tools,
             delegate_handle,
-            _reaction_handle,
-            _channel_map_handle,
-            _ask_user_handle,
-            _escalate_handle,
+            reaction_handle,
+            poll_handle,
+            ask_user_handle,
+            escalate_handle,
         ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -557,7 +612,7 @@ impl Agent {
         let skills = crate::skills::load_skills_with_config(&config.workspace_dir, config);
         tools::register_skill_tools(&mut tools, &skills, security.clone());
 
-        Agent::builder()
+        let mut agent = Agent::builder()
             .provider(provider)
             .tools(tools)
             .memory(memory)
@@ -601,7 +656,16 @@ impl Agent {
             } else {
                 None
             })
-            .build()
+            .build()?;
+
+        agent.channel_handles = AgentChannelHandles {
+            ask_user: ask_user_handle,
+            reaction: reaction_handle,
+            escalate: escalate_handle,
+            poll: Some(poll_handle),
+        };
+
+        Ok(agent)
     }
 
     fn trim_history(&mut self) {

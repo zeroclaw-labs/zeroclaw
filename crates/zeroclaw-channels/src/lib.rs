@@ -4,6 +4,7 @@ pub mod orchestrator;
 pub mod util;
 
 // Always-compiled channels and utilities (no feature gate)
+pub mod acp_channel;
 pub mod cli;
 pub mod link_enricher;
 pub mod transcription;
