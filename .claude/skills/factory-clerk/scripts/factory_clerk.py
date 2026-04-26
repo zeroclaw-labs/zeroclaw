@@ -87,7 +87,7 @@ class Candidate:
     @property
     def marker(self) -> str:
         related = self.related if self.related is not None else "none"
-        return f"<!-- factory-janitor:{self.action or self.kind}:{self.target_type}:{self.target}:{related} -->"
+        return f"<!-- factory-clerk:{self.action or self.kind}:{self.target_type}:{self.target}:{related} -->"
 
 
 class Gh:
@@ -733,7 +733,7 @@ def rg_literal(symbol: str, max_matches: int) -> tuple[str, ...]:
         return ()
     matches: list[str] = []
     for line in result.stdout.splitlines():
-        if "/.claude/skills/factory-janitor/" in line:
+        if "/.claude/skills/factory-clerk/" in line:
             continue
         if line.startswith("./.git/") or line.startswith("./artifacts/"):
             continue
@@ -957,7 +957,7 @@ def candidate_to_dict(candidate: Candidate) -> dict[str, Any]:
 def write_audit(repo: str, mode: str, candidates: list[Candidate], results: list[dict[str, Any]], output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = output_dir / f"factory-janitor-{stamp}.json"
+    path = output_dir / f"factory-clerk-{stamp}.json"
     payload = {
         "repo": repo,
         "mode": mode,
@@ -973,7 +973,7 @@ def write_markdown_summary(candidates: list[Candidate], results: list[dict[str, 
     path.parent.mkdir(parents=True, exist_ok=True)
     counts = Counter(candidate.decision for candidate in candidates)
     lines = [
-        "# Factory Janitor Summary",
+        "# Factory Clerk Summary",
         "",
         f"- Candidates: {len(candidates)}",
         f"- AUTO_CLOSE: {counts['AUTO_CLOSE']}",
@@ -997,7 +997,7 @@ def write_markdown_summary(candidates: list[Candidate], results: list[dict[str, 
 def print_summary(candidates: list[Candidate], results: list[dict[str, Any]]) -> None:
     counts = Counter(candidate.decision for candidate in candidates)
     kind_counts = Counter(candidate.kind for candidate in candidates)
-    print("Factory Janitor summary")
+    print("Factory Clerk summary")
     print("=======================")
     print(f"Candidates: {len(candidates)}")
     for decision in ("AUTO_CLOSE", "AUTO_COMMENT", "QUEUE_FOR_REVIEW", "NO_ACTION"):
@@ -1059,7 +1059,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--include-marked",
         action="store_true",
-        help="Include candidates already marked by a previous factory-janitor comment",
+        help="Include candidates already marked by a previous factory-clerk comment",
     )
     parser.add_argument(
         "--max-mutations",
@@ -1075,7 +1075,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--audit-dir",
-        default="artifacts/factory-janitor",
+        default="artifacts/factory-clerk",
         help="Directory for JSON audit output",
     )
     parser.add_argument(

@@ -1,11 +1,11 @@
 ---
-name: factory-janitor
-description: "Conservative autonomous factory cleanup for ZeroClaw. Use this skill when the user wants to reduce duplicate issues/PRs, close issues already fixed by merged PRs, close PRs superseded by merged work, link open PRs to issues, run a software-factory cleanup sweep, or run the Factory Janitor automation. Trigger on: 'factory janitor', 'reduce duplicates', 'close implemented issues', 'close superseded PRs', 'link PRs to issues', 'software factory cleanup', or 'janitor sweep'."
+name: factory-clerk
+description: "Conservative autonomous factory records cleanup for ZeroClaw. Use this skill when the user wants to reduce duplicate issues/PRs, close issues already fixed by merged PRs, close PRs superseded by merged work, link open PRs to issues, run a software-factory cleanup sweep, or run the Factory Clerk automation. Trigger on: 'factory clerk', 'reduce duplicates', 'close implemented issues', 'close superseded PRs', 'link PRs to issues', 'software factory cleanup', or 'clerk sweep'."
 ---
 
-# Factory Janitor
+# Factory Clerk
 
-Autonomous factory cleanup for low-ambiguity lifecycle actions. This skill complements `github-issue-triage`: issue triage decides what an issue is; Factory Janitor finds cleanup actions that can be safely repeated across the issue and PR backlog.
+Autonomous factory records cleanup for low-ambiguity lifecycle actions. This skill complements `github-issue-triage`: issue triage decides what an issue is; Factory Clerk finds cleanup actions that can be safely repeated across the issue and PR backlog.
 
 ## Authority
 
@@ -23,7 +23,7 @@ Never close security, RFC, tracking, blocked, or maintainer-decision issues. Nev
 Use the deterministic runner first:
 
 ```bash
-python3 .claude/skills/factory-janitor/scripts/factory_janitor.py \
+python3 .claude/skills/factory-clerk/scripts/factory_clerk.py \
   --repo zeroclaw-labs/zeroclaw \
   --mode preview
 ```
@@ -31,41 +31,41 @@ python3 .claude/skills/factory-janitor/scripts/factory_janitor.py \
 Modes:
 
 ```bash
-python3 .claude/skills/factory-janitor/scripts/factory_janitor.py --mode preview
-python3 .claude/skills/factory-janitor/scripts/factory_janitor.py --mode comment-only
-python3 .claude/skills/factory-janitor/scripts/factory_janitor.py --mode apply-safe
+python3 .claude/skills/factory-clerk/scripts/factory_clerk.py --mode preview
+python3 .claude/skills/factory-clerk/scripts/factory_clerk.py --mode comment-only
+python3 .claude/skills/factory-clerk/scripts/factory_clerk.py --mode apply-safe
 ```
 
 Useful scoped runs:
 
 ```bash
-python3 .claude/skills/factory-janitor/scripts/factory_janitor.py \
+python3 .claude/skills/factory-clerk/scripts/factory_clerk.py \
   --checks fixed-by-merged-pr,explicit-duplicates
 
-python3 .claude/skills/factory-janitor/scripts/factory_janitor.py \
+python3 .claude/skills/factory-clerk/scripts/factory_clerk.py \
   --checks open-pr-links,superseded-prs \
   --mode comment-only
 
-python3 .claude/skills/factory-janitor/scripts/factory_janitor.py \
+python3 .claude/skills/factory-clerk/scripts/factory_clerk.py \
   --checks implemented-on-master-preview \
   --mode preview
 ```
 
-The runner writes a JSON audit log to `artifacts/factory-janitor/` unless `--no-audit-file` is passed.
+The runner writes a JSON audit log to `artifacts/factory-clerk/` unless `--no-audit-file` is passed.
 
 Useful safety controls:
 
 ```bash
-python3 .claude/skills/factory-janitor/scripts/factory_janitor.py \
+python3 .claude/skills/factory-clerk/scripts/factory_clerk.py \
   --mode apply-safe \
   --max-mutations 10 \
-  --summary-file artifacts/factory-janitor/summary.md
+  --summary-file artifacts/factory-clerk/summary.md
 ```
 
 - Hidden comment markers prevent repeat comments on later runs.
 - `--max-mutations` caps comments/closures in one non-preview run.
 - `--label <name>` can tag mutated issues/PRs when the label already exists.
-- `--include-marked` shows candidates already handled by earlier Factory Janitor comments.
+- `--include-marked` shows candidates already handled by earlier Factory Clerk comments.
 - `implemented-on-master-preview` searches the checked-out codebase for concrete symbols mentioned by open issues and queues review candidates only.
 
 ## Workflow

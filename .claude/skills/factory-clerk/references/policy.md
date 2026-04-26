@@ -1,4 +1,4 @@
-# Factory Janitor Policy
+# Factory Clerk Policy
 
 ## Decision Classes
 
@@ -70,7 +70,7 @@ Allowed when:
 
 - An open PR explicitly mentions an open issue with `closes`, `fixes`, or `resolves`.
 - The issue thread does not already mention that PR.
-- A prior Factory Janitor marker for the same action is not already present, unless `--include-marked` is used.
+- A prior Factory Clerk marker for the same action is not already present, unless `--include-marked` is used.
 
 Comment only; never close until the PR merges.
 
@@ -117,6 +117,6 @@ This check is evidence gathering only:
 
 ## Repeat-Run Safety
 
-Factory Janitor comments include hidden HTML markers. Scheduled runs must skip candidates that already have the same marker. Use `--include-marked` only for audits/debugging.
+Factory Clerk comments include hidden HTML markers. Scheduled runs must skip candidates that already have the same marker. Use `--include-marked` only for audits/debugging.
 
 Non-preview runs must keep a mutation cap (`--max-mutations`) so a bad query or GitHub API shape cannot create a large comment/closure burst.

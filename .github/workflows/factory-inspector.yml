@@ -1,8 +1,8 @@
-name: Factory Janitor
+name: Factory Inspector
 
 on:
   schedule:
-    - cron: "30 10 * * *"
+    - cron: "45 10 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -13,18 +13,17 @@ on:
         options:
           - preview
           - comment-only
-          - apply-safe
       checks:
         description: "Comma-separated checks"
         required: true
-        default: "fixed-by-merged-pr,explicit-duplicates,superseded-prs,open-pr-links,implemented-on-master-preview,similarity-preview"
+        default: "pr-intake,issue-intake"
       max_mutations:
-        description: "Maximum comments/closures in non-preview modes"
+        description: "Maximum PR comments in comment-only mode"
         required: true
         default: "25"
 
 concurrency:
-  group: factory-janitor
+  group: factory-inspector
   cancel-in-progress: false
 
 permissions:
@@ -33,33 +32,33 @@ permissions:
   pull-requests: write
 
 jobs:
-  janitor:
-    name: Factory Janitor
+  inspector:
+    name: Factory Inspector
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Run factory janitor
+      - name: Run factory inspector
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MODE: ${{ github.event_name == 'schedule' && 'preview' || inputs.mode }}
-          CHECKS: ${{ github.event_name == 'schedule' && 'fixed-by-merged-pr,explicit-duplicates,superseded-prs,open-pr-links,implemented-on-master-preview,similarity-preview' || inputs.checks }}
+          CHECKS: ${{ github.event_name == 'schedule' && 'pr-intake,issue-intake' || inputs.checks }}
           MAX_MUTATIONS: ${{ github.event_name == 'schedule' && '25' || inputs.max_mutations }}
         run: |
-          python3 .claude/skills/factory-janitor/scripts/factory_janitor.py \
+          python3 .claude/skills/factory-inspector/scripts/factory_inspector.py \
             --repo "$GITHUB_REPOSITORY" \
             --mode "$MODE" \
             --checks "$CHECKS" \
             --max-mutations "$MAX_MUTATIONS" \
-            --summary-file artifacts/factory-janitor/summary.md
+            --summary-file artifacts/factory-inspector/summary.md
 
       - name: Add job summary
-        run: cat artifacts/factory-janitor/summary.md >> "$GITHUB_STEP_SUMMARY"
+        run: cat artifacts/factory-inspector/summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload audit log
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: factory-janitor-audit
-          path: artifacts/factory-janitor/*.json
+          name: factory-inspector-audit
+          path: artifacts/factory-inspector/*.json
           if-no-files-found: error

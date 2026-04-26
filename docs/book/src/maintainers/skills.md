@@ -14,7 +14,8 @@ Each skill lives in its own directory with a `SKILL.md` file. Claude Code loads 
 | `github-pr` | Opening or updating a PR with a fully-populated template body |
 | `squash-merge` | Landing an approved PR into `master` with preserved commit history and the purple **Merged** badge |
 | `changelog-generation` | Preparing `CHANGELOG-next.md` for a release — summarises merges since the last tag |
-| `factory-janitor` | Conservative autonomous cleanup for exact duplicates, issues fixed by merged PRs, superseded PRs, and PR-to-issue links |
+| `factory-clerk` | Conservative autonomous records cleanup for exact duplicates, issues fixed by merged PRs, superseded PRs, and PR-to-issue links |
+| `factory-inspector` | Intake quality checks for PR templates, validation evidence, linked issues, risk labels, and thin issue reports |
 | `skill-creator` | Creating, editing, or benchmarking the skills themselves |
 | `zeroclaw` | Operating the running ZeroClaw instance (CLI + gateway API) |
 
@@ -62,19 +63,19 @@ Labels and the stale policy are defined in [Reviewer playbook → Issue triage](
 
 PRs with merge conflicts receive `needs-author-action` only — no review, no diff comment — per `feedback_conflicts_label_only`.
 
-## Factory janitor workflow
+## Factory clerk workflow
 
-The `factory-janitor` skill is the software-factory cleanup layer for low-ambiguity lifecycle work. It is intentionally narrower than issue triage: it finds exact cleanup candidates and either previews, comments, or applies safe closures.
+The `factory-clerk` skill is the software-factory records cleanup layer for low-ambiguity lifecycle work. It is intentionally narrower than issue triage: it finds exact cleanup candidates and either previews, comments, or applies safe closures.
 
 Run locally:
 
 ```bash
-python3 .claude/skills/factory-janitor/scripts/factory_janitor.py --mode preview
-python3 .claude/skills/factory-janitor/scripts/factory_janitor.py --mode comment-only
-python3 .claude/skills/factory-janitor/scripts/factory_janitor.py --mode apply-safe
+python3 .claude/skills/factory-clerk/scripts/factory_clerk.py --mode preview
+python3 .claude/skills/factory-clerk/scripts/factory_clerk.py --mode comment-only
+python3 .claude/skills/factory-clerk/scripts/factory_clerk.py --mode apply-safe
 ```
 
-Run from Actions with **Factory Janitor**. The scheduled run is preview-only and uploads a JSON audit artifact plus a Markdown job summary. Manual dispatch can run `comment-only` or `apply-safe` with a mutation cap.
+Run from Actions with **Factory Clerk**. The scheduled run is preview-only and uploads a JSON audit artifact plus a Markdown job summary. Manual dispatch can run `comment-only` or `apply-safe` with a mutation cap.
 
 Autonomous closure is limited to:
 
@@ -84,7 +85,22 @@ Autonomous closure is limited to:
 
 Similarity-only matches, partial coverage, competing config surfaces, and anything with protected labels are preview-only and must go through normal maintainer review.
 
-Repeated runs are safe by default: comments include hidden Factory Janitor markers, and later runs skip candidates with matching markers unless `--include-marked` is passed.
+Repeated runs are safe by default: comments include hidden Factory Clerk markers, and later runs skip candidates with matching markers unless `--include-marked` is passed.
+
+## Factory inspector workflow
+
+The `factory-inspector` skill is the intake quality gate. It checks whether PRs and issues are reviewable before maintainers spend deeper review time.
+
+Run locally:
+
+```bash
+python3 .claude/skills/factory-inspector/scripts/factory_inspector.py --mode preview
+python3 .claude/skills/factory-inspector/scripts/factory_inspector.py --mode comment-only --checks pr-intake
+```
+
+Run from Actions with **Factory Inspector**. The scheduled run is preview-only and uploads a JSON audit artifact plus a Markdown job summary. Manual dispatch can run `comment-only`, which posts a single checklist comment on PRs with deterministic intake failures.
+
+The first version comments only on PR intake issues. Issue intake findings remain preview-only so maintainers can tune the signal before automating contributor-facing issue comments.
 
 ## Squash-merge strategy
 
