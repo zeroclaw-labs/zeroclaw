@@ -36,6 +36,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.slack",
     "channel.telegram",
     "channel.wati",
+    "channel.wechat",
     "channel.whatsapp",
     "tool.browser",
     "tool.composio",

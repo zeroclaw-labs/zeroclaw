@@ -4164,6 +4164,10 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .with_workspace_dir(config.workspace_dir.clone()),
             ))
         }
+        #[cfg(not(feature = "channel-wechat"))]
+        "wechat" => {
+            anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
+        }
         "nextcloud_talk" | "nextcloud-talk" => {
             let nc = config
                 .channels
@@ -4934,6 +4938,15 @@ fn collect_configured_channels(
             });
         } else {
             tracing::info!("WeChat channel configured but disabled (enabled = false)");
+        }
+    }
+
+    #[cfg(not(feature = "channel-wechat"))]
+    if let Some(ref wechat) = config.channels.wechat {
+        if wechat.enabled {
+            tracing::warn!(
+                "WeChat channel is configured but this build was compiled without `channel-wechat`; skipping WeChat {context}."
+            );
         }
     }
 
@@ -5804,6 +5817,23 @@ pub async fn deliver_announcement(
                 sg.ignore_attachments,
                 sg.ignore_stories,
             );
+            zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
+                .await?;
+        }
+        #[cfg(feature = "channel-wechat")]
+        "wechat" => {
+            let wc = config
+                .channels
+                .wechat
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("wechat channel not configured"))?;
+            let ch = WeChatChannel::new(
+                wc.allowed_users.clone(),
+                wc.api_base_url.clone(),
+                wc.cdn_base_url.clone(),
+                wc.state_dir.as_ref().map(std::path::PathBuf::from),
+            )
+            .with_workspace_dir(config.workspace_dir.clone());
             zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
                 .await?;
         }

@@ -69,7 +69,9 @@ wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = f
 qrcode = { version = "0.14", optional = true }
 shellexpand = "3.1"
 
-# WeChat iLink (optional)
+# WeChat iLink (optional) — AES-128-ECB and MD5 are mandated by the iLink
+# Bot media encryption protocol. The CDN requires ECB-mode ciphertext and
+# MD5 file checksums in upload requests. Not our choice of primitives.
 aes = { version = "0.8", optional = true }
 ecb = { version = "0.1", optional = true }
 md5 = { version = "0.8", optional = true }

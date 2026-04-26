@@ -728,20 +728,38 @@ impl WeChatChannel {
         let target = target.trim();
         let target = target.strip_prefix("file://").unwrap_or(target);
 
-        if let Some(rel) = target.strip_prefix("/workspace/")
-            && let Some(workspace_dir) = &self.workspace_dir
+        let resolved = if let Some(rel) = target.strip_prefix("/workspace/") {
+            if let Some(workspace_dir) = &self.workspace_dir {
+                workspace_dir.join(rel)
+            } else {
+                PathBuf::from(target)
+            }
+        } else {
+            let path = PathBuf::from(target);
+            if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(path)
+            }
+        };
+
+        // Prevent path traversal outside workspace when workspace_dir is set
+        if let Some(workspace_dir) = &self.workspace_dir
+            && let (Ok(canonical), Ok(allowed)) =
+                (resolved.canonicalize(), workspace_dir.canonicalize())
+            && !canonical.starts_with(&allowed)
         {
-            return workspace_dir.join(rel);
+            tracing::warn!(
+                "WeChat: attachment path {} escapes workspace {}, blocking",
+                canonical.display(),
+                allowed.display()
+            );
+            return workspace_dir.join("blocked_attachment");
         }
 
-        let path = PathBuf::from(target);
-        if path.is_absolute() {
-            return path;
-        }
-
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
+        resolved
     }
 
     fn remote_file_name(
@@ -795,6 +813,15 @@ impl WeChatChannel {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("WeChat attachment download failed ({status}): {body}");
+        }
+
+        if let Some(len) = resp.content_length()
+            && len > WECHAT_MEDIA_MAX_BYTES
+        {
+            anyhow::bail!(
+                "WeChat attachment Content-Length ({len} bytes) exceeds {} MB limit",
+                WECHAT_MEDIA_MAX_BYTES / (1024 * 1024)
+            );
         }
 
         let content_type = resp
