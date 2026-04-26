@@ -355,70 +355,10 @@ impl AcpServer {
 
         // Forward events as they arrive. Use standard ACP `session/update`
         // notifications: `tool_call` for initial (pending + title/kind for UI/icons),
-        // `tool_call_update` for completion (status + rawOutput). This enables
-        // proper pending→completed flow without duplicating large tool output in
-        // multiple fields on the wire.
+        // `tool_call_update` for completion (status + rawOutput/content). This enables
+        // proper pending→completed flow in ACP clients.
         while let Some(event) = event_rx.recv().await {
-            let notification = match &event {
-                TurnEvent::Chunk { delta } => JsonRpcNotification {
-                    jsonrpc: "2.0",
-                    method: "session/update",
-                    params: serde_json::json!({
-                        "sessionId": session_id,
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": {
-                                "type": "text",
-                                "text": delta
-                            }
-                        }
-                    }),
-                },
-                TurnEvent::ToolCall { id, name, args } => JsonRpcNotification {
-                    jsonrpc: "2.0",
-                    method: "session/update",
-                    params: serde_json::json!({
-                        "sessionId": session_id,
-                        "update": {
-                            "sessionUpdate": "tool_call",
-                            "toolCallId": id,
-                            "title": name,
-                            "kind": map_tool_kind(name),
-                            "rawInput": args,
-                            "status": "pending"
-                        }
-                    }),
-                },
-                TurnEvent::ToolResult { id, name, output } => JsonRpcNotification {
-                    jsonrpc: "2.0",
-                    method: "session/update",
-                    params: serde_json::json!({
-                        "sessionId": session_id,
-                        "update": {
-                            "sessionUpdate": "tool_call_update",
-                            "toolCallId": id,
-                            "title": name,
-                            "kind": map_tool_kind(name),
-                            "status": "completed",
-                            "rawOutput": output
-                        }
-                    }),
-                },
-                TurnEvent::Thinking { delta } => JsonRpcNotification {
-                    jsonrpc: "2.0",
-                    method: "session/update",
-                    params: serde_json::json!({
-                        "sessionId": session_id,
-                        "update": {
-                            "sessionUpdate": "agent_thought_chunk",
-                            "content": {
-                                "type": "text",
-                                "text": delta
-                            }
-                        }
-                    }),
-                },
-            };
+            let notification = notification_for_turn_event(&session_id, &event);
             self.write_notification(&notification).await;
         }
 
@@ -654,6 +594,78 @@ fn map_tool_kind(name: &str) -> &'static str {
     }
 }
 
+fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> JsonRpcNotification {
+    match event {
+        TurnEvent::Chunk { delta } => JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": delta
+                    }
+                }
+            }),
+        },
+        TurnEvent::ToolCall { id, name, args } => JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": id,
+                    "name": name,
+                    "title": name,
+                    "kind": map_tool_kind(name),
+                    "rawInput": args,
+                    "status": "pending"
+                }
+            }),
+        },
+        TurnEvent::ToolResult { id, name, output } => JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": id,
+                    "name": name,
+                    "title": name,
+                    "kind": map_tool_kind(name),
+                    "status": "completed",
+                    "rawOutput": output,
+                    "content": [{
+                        "type": "content",
+                        "content": {
+                            "type": "text",
+                            "text": output
+                        }
+                    }]
+                }
+            }),
+        },
+        TurnEvent::Thinking { delta } => JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": delta
+                    }
+                }
+            }),
+        },
+    }
+}
+
 // ── Error helper ─────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -843,6 +855,7 @@ mod tests {
                 "update": {
                     "sessionUpdate": "tool_call",
                     "toolCallId": "tc-12345",
+                    "name": "shell",
                     "title": "shell",
                     "kind": "execute",
                     "rawInput": {"command": "ls -la"},
@@ -853,6 +866,7 @@ mod tests {
         let json1 = serde_json::to_string(&tool_call_notif).unwrap();
         assert!(json1.contains("\"sessionUpdate\":\"tool_call\""));
         assert!(json1.contains("\"toolCallId\":\"tc-12345\""));
+        assert!(json1.contains("\"name\":\"shell\""));
         assert!(json1.contains("\"title\":\"shell\""));
         assert!(json1.contains("\"kind\":\"execute\""));
         assert!(json1.contains("\"status\":\"pending\""));
@@ -867,19 +881,29 @@ mod tests {
                 "update": {
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": "tc-12345",
+                    "name": "shell",
                     "title": "shell",
                     "kind": "execute",
                     "status": "completed",
-                    "rawOutput": "file1.txt\nfile2.txt"
+                    "rawOutput": "file1.txt\nfile2.txt",
+                    "content": [{
+                        "type": "content",
+                        "content": {
+                            "type": "text",
+                            "text": "file1.txt\nfile2.txt"
+                        }
+                    }]
                 }
             }),
         };
         let json2 = serde_json::to_string(&tool_update_notif).unwrap();
         assert!(json2.contains("\"sessionUpdate\":\"tool_call_update\""));
         assert!(json2.contains("\"toolCallId\":\"tc-12345\""));
+        assert!(json2.contains("\"name\":\"shell\""));
         assert!(json2.contains("\"status\":\"completed\""));
         assert!(json2.contains("\"rawOutput\""));
-        assert!(!json2.contains("\"content\""));
+        assert!(json2.contains("\"content\""));
+        assert!(json2.contains("\"type\":\"content\""));
         assert!(json2.contains("file1.txt"));
         // Verify matching toolCallId across events
         assert!(json1.contains("tc-12345") && json2.contains("tc-12345"));
@@ -894,5 +918,55 @@ mod tests {
         assert_eq!(map_tool_kind("file_write"), "edit");
         assert_eq!(map_tool_kind("web_fetch"), "fetch");
         assert_eq!(map_tool_kind("unknown_tool"), "other");
+    }
+
+    #[test]
+    fn turn_tool_events_include_client_visible_tool_fields() {
+        let call = notification_for_turn_event(
+            "test-sid",
+            &TurnEvent::ToolCall {
+                id: "tc-12345".to_string(),
+                name: "shell".to_string(),
+                args: serde_json::json!({"command": "ls -la"}),
+            },
+        );
+        let call_value = serde_json::to_value(call).unwrap();
+        assert_eq!(call_value["method"], "session/update");
+        assert_eq!(call_value["params"]["update"]["sessionUpdate"], "tool_call");
+        assert_eq!(call_value["params"]["update"]["toolCallId"], "tc-12345");
+        assert_eq!(call_value["params"]["update"]["name"], "shell");
+        assert_eq!(call_value["params"]["update"]["title"], "shell");
+        assert_eq!(call_value["params"]["update"]["kind"], "execute");
+        assert_eq!(
+            call_value["params"]["update"]["rawInput"],
+            serde_json::json!({"command": "ls -la"})
+        );
+
+        let result = notification_for_turn_event(
+            "test-sid",
+            &TurnEvent::ToolResult {
+                id: "tc-12345".to_string(),
+                name: "shell".to_string(),
+                output: "file1.txt\nfile2.txt".to_string(),
+            },
+        );
+        let result_value = serde_json::to_value(result).unwrap();
+        assert_eq!(
+            result_value["params"]["update"]["sessionUpdate"],
+            "tool_call_update"
+        );
+        assert_eq!(result_value["params"]["update"]["toolCallId"], "tc-12345");
+        assert_eq!(result_value["params"]["update"]["name"], "shell");
+        assert_eq!(result_value["params"]["update"]["title"], "shell");
+        assert_eq!(result_value["params"]["update"]["kind"], "execute");
+        assert_eq!(result_value["params"]["update"]["status"], "completed");
+        assert_eq!(
+            result_value["params"]["update"]["rawOutput"],
+            "file1.txt\nfile2.txt"
+        );
+        assert_eq!(
+            result_value["params"]["update"]["content"][0]["content"]["text"],
+            "file1.txt\nfile2.txt"
+        );
     }
 }
