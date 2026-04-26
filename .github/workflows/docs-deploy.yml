@@ -88,4 +88,5 @@ jobs:
           publish_dir: docs/book/book
           publish_branch: gh-pages
           force_orphan: true
+          cname: docs.zeroclawlabs.ai
           commit_message: "deploy: ${{ github.event.head_commit.message }}"
