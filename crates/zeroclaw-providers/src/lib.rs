@@ -717,6 +717,19 @@ pub struct ProviderRuntimeOptions {
     /// Extra JSON parameters merged into API request bodies at the top level.
     /// Propagated from `ModelProviderConfig::provider_extra`.
     pub provider_extra: Option<serde_json::Value>,
+    /// Override for the Ollama `num_ctx` request option. Only consumed by
+    /// the `ollama` factory arm. `None` falls back to the framework
+    /// default constant.
+    pub ollama_num_ctx: Option<u32>,
+    /// Override for the Ollama `num_predict` request option. Only consumed
+    /// by the `ollama` factory arm. `None` falls back to the framework
+    /// default constant.
+    pub ollama_num_predict: Option<i32>,
+    /// Override for the default temperature stored in the Ollama provider's
+    /// tuning struct. Only consumed by the `ollama` factory arm. `None`
+    /// falls back to the framework default constant. The per-call
+    /// temperature passed through `Provider::chat_with_system` still wins.
+    pub ollama_temperature_override: Option<f64>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -734,6 +747,9 @@ impl Default for ProviderRuntimeOptions {
             provider_max_tokens: None,
             merge_system_into_user: false,
             provider_extra: None,
+            ollama_num_ctx: None,
+            ollama_num_predict: None,
+            ollama_temperature_override: None,
         }
     }
 }
@@ -777,6 +793,9 @@ pub fn provider_runtime_options_from_config(
         provider_max_tokens: fallback.and_then(|e| e.max_tokens),
         merge_system_into_user,
         provider_extra: fallback.and_then(|e| e.provider_extra.clone()),
+        ollama_num_ctx: fallback.and_then(|e| e.ollama_num_ctx),
+        ollama_num_predict: fallback.and_then(|e| e.ollama_num_predict),
+        ollama_temperature_override: fallback.and_then(|e| e.ollama_temperature_override),
     }
 }
 
@@ -1213,11 +1232,16 @@ fn create_provider_with_url_and_options(
 
             let api_url = env_url.as_deref().or(api_url);
 
-            Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
-                api_url,
-                key,
-                options.reasoning_enabled,
-            )))
+            let tuning = ollama::OllamaTuning::from_runtime_overrides(
+                options.ollama_num_ctx,
+                options.ollama_num_predict,
+                options.ollama_temperature_override,
+            );
+
+            Ok(Box::new(
+                ollama::OllamaProvider::new_with_reasoning(api_url, key, options.reasoning_enabled)
+                    .with_tuning(tuning),
+            ))
         }
         "gemini" | "google" | "google-gemini" => {
             let state_dir = options.zeroclaw_dir.clone().unwrap_or_else(|| {
@@ -3799,5 +3823,52 @@ mod tests {
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_PROVIDER_URL") };
+    }
+
+    #[test]
+    fn ollama_runtime_overrides_populate_tuning_struct() {
+        // Mirror the factory's tuning derivation: the same expression used
+        // inside `create_provider_with_url_and_options`'s "ollama" arm.
+        // Asserting on the resulting struct gives us downcast-free coverage
+        // that the three runtime-option fields actually reach the provider.
+        let options = ProviderRuntimeOptions {
+            ollama_num_ctx: Some(16384),
+            ollama_num_predict: Some(4096),
+            ollama_temperature_override: Some(0.5),
+            ..ProviderRuntimeOptions::default()
+        };
+
+        let tuning = ollama::OllamaTuning::from_runtime_overrides(
+            options.ollama_num_ctx,
+            options.ollama_num_predict,
+            options.ollama_temperature_override,
+        );
+        assert_eq!(tuning.num_ctx, 16384);
+        assert_eq!(tuning.num_predict, 4096);
+        assert_eq!(tuning.temperature_override, Some(0.5));
+
+        let provider = ollama::OllamaProvider::new(None, None).with_tuning(tuning);
+        assert_eq!(provider.tuning(), tuning);
+
+        // The factory itself must succeed with the same options.
+        let factory_provider = create_provider_with_url_and_options("ollama", None, None, &options);
+        assert!(factory_provider.is_ok());
+    }
+
+    #[test]
+    fn ollama_runtime_overrides_default_to_none_temperature_override() {
+        // Default options must produce a tuning that leaves
+        // `temperature_override = None` so per-call temperature wins —
+        // the backward-compat guarantee for operators who never set the
+        // override in config.toml.
+        let options = ProviderRuntimeOptions::default();
+        let tuning = ollama::OllamaTuning::from_runtime_overrides(
+            options.ollama_num_ctx,
+            options.ollama_num_predict,
+            options.ollama_temperature_override,
+        );
+        assert!(tuning.temperature_override.is_none());
+        assert_eq!(tuning.num_ctx, ollama::OLLAMA_DEFAULT_NUM_CTX);
+        assert_eq!(tuning.num_predict, ollama::OLLAMA_DEFAULT_NUM_PREDICT);
     }
 }
