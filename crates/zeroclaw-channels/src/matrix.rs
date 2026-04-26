@@ -498,13 +498,15 @@ mod client {
     /// - corruption recovery (with password)
     ///
     /// Corruption signals (per matrix-sdk encryption.md and SDK source —
-    /// `manager.rs:237` for `SigningKeyChanged`, `mod.rs:683` for OTK
-    /// duplicates): the SDK rejects a device key update when the store and
-    /// server disagree, and offers no public API to selectively forget a
-    /// device record. The official remediation is "Clear storage to create
-    /// a new device". We do that automatically when password + user_id are
-    /// configured; otherwise we surface a clear error so the operator can
-    /// either provide a password or wipe state manually.
+    /// `IdentityManager::update_or_create_device` rejects updates with
+    /// `SigningKeyChanged`, and `Encryption::send_outgoing_request` records
+    /// the durable `OneTimeKeyAlreadyUploaded` state-store flag): the SDK
+    /// rejects a device key update when the store and server disagree, and
+    /// offers no public API to selectively forget a device record. The
+    /// official remediation is "Clear storage to create a new device". We
+    /// do that automatically when password + user_id are configured;
+    /// otherwise we surface a clear error so the operator can either
+    /// provide a password or wipe state manually.
     ///
     /// Wrong-recovery-key failures are *not* a corruption signal — they're
     /// an operator-config issue. We log them clearly and continue with
@@ -658,10 +660,12 @@ mod client {
 
             // Durable corruption signal: when the matrix-sdk encounters a
             // duplicate-OTK upload (the server says it already has the
-            // one-time-keys we're trying to upload), it persists this flag
-            // (encryption/mod.rs:715-720). Per the SDK comment at line 691,
-            // this means "we forgot about some of our one-time keys. This
-            // will lead to UTDs." It survives restarts. The only way out is
+            // one-time-keys we're trying to upload),
+            // `Encryption::send_outgoing_request` records the
+            // `StateStoreDataKey::OneTimeKeyAlreadyUploaded` flag in the
+            // state store. Per the SDK's own comment, this means "we
+            // forgot about some of our one-time keys. This will lead to
+            // UTDs." The flag survives restarts. The only remediation is
             // to wipe and re-login.
             let otk_corruption_flagged = client
                 .state_store()
@@ -2502,14 +2506,25 @@ impl Channel for MatrixChannel {
             "APPROVAL REQUIRED [{token}]\nTool: {}\nArgs: {}\n\nReply `{token} approve` / `{token} deny` / `{token} always`.",
             request.tool_name, request.arguments_summary
         );
-        let send_msg = SendMessage::new(prompt, recipient);
-        self.send(&send_msg).await?;
 
+        // Register the waiter BEFORE sending the prompt so a fast operator
+        // reply landing on the inbound event handler between send and
+        // register isn't silently dropped (the inbound parser would find
+        // no matching token in `pending_approvals` and treat the reply as
+        // a normal message). If the send itself fails, clean up the
+        // registration before propagating the error.
         let (tx, rx) = oneshot::channel();
         self.pending_approvals
             .lock()
             .await
             .insert(token.clone(), tx);
+
+        let send_msg = SendMessage::new(prompt, recipient);
+        if let Err(e) = self.send(&send_msg).await {
+            self.pending_approvals.lock().await.remove(&token);
+            return Err(e);
+        }
+
         let timeout = Duration::from_secs(self.config.approval_timeout_secs.max(1));
         let result = tokio::time::timeout(timeout, rx).await;
         if result.is_err() {

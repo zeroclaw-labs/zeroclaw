@@ -104,6 +104,11 @@ use zeroclaw_runtime::util::truncate_with_ellipsis;
 /// Live channel registry populated by `start_channels()`. Used by `deliver_announcement()` to
 /// reuse authenticated channel instances (critical for Matrix E2EE — avoids re-running session
 /// restore on every cron delivery).
+///
+/// Set once at startup; valid for the process lifetime. Daemon restart is required to pick up
+/// channel-config changes — there's no in-flight refresh path. Callers must tolerate the
+/// `OnceLock::get()` returning `None` during the brief window before `start_channels` populates
+/// it; `deliver_announcement` falls back to per-call channel reconstruction in that case.
 static CRON_CHANNEL_REGISTRY: OnceLock<Arc<HashMap<String, Arc<dyn Channel>>>> = OnceLock::new();
 
 /// Observer wrapper that forwards tool-call events to a channel sender

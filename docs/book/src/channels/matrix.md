@@ -351,11 +351,12 @@ RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemo
 
 ## 7. Auto-recovery from corrupted local state
 
-The matrix-rust-sdk default SQLite store is single-device and assumes the local view stays in sync with the homeserver. Three failure modes break that assumption irrecoverably; ZeroClaw detects each at startup and (when `password` + `user-id` are both configured) auto-wipes `~/.zeroclaw/state/matrix/` and re-authenticates so a fresh device is created server-side.
+The matrix-rust-sdk default SQLite store is single-device and assumes the local view stays in sync with the homeserver. Two failure modes break that assumption irrecoverably; ZeroClaw detects each at startup and (when `password` + `user-id` are both configured) auto-wipes `~/.zeroclaw/state/matrix/` and re-authenticates so a fresh device is created server-side.
 
-- **Configured `device-id` differs from saved.** Switching device-ids while keeping the existing store produces `Duplicate one-time keys` and `SigningKeyChanged` errors that don't self-heal — the SDK has no public API to selectively forget device records. The auto-wipe registers a new device cleanly.
-- **Orphan crypto state.** A `store/` directory exists but `session.json` doesn't (manual cleanup, interrupted prior install, etc.). Logging in fresh on top of orphaned crypto state reproduces the same OTK / signing-key conflicts.
+- **Orphan crypto state.** A `store/` directory exists but `session.json` doesn't (manual cleanup, interrupted prior install, etc.). Logging in fresh on top of orphaned crypto state reproduces `Duplicate one-time keys` / `SigningKeyChanged` conflicts that don't self-heal.
 - **`StateStoreDataKey::OneTimeKeyAlreadyUploaded` flag set.** The SDK persists this key into the state store the first time it sees a duplicate-OTK upload (per the SDK's own comment: "we forgot about some of our one-time keys. This will lead to UTDs."). It survives restarts; the only fix is wipe and re-register.
+
+**`device-id` drift is detected but tolerated, not wiped.** If `channels.matrix.device-id` differs from the device id stored in `session.json`, the channel logs a warning and honors the saved id (which is the value the homeserver actually assigned at login). Wiping on drift would create a recovery loop because auto-recovery itself generates a new id, leaving config and session permanently out of sync.
 
 When **`recover()` itself fails** (typically `MAC check for the secret storage key failed`), the channel logs the homeserver's default secret-storage key id, whether the key event has passphrase info, the whitespace-stripped input length, and the full error chain — these point at *which* layer rejected the recovery key without leaking the value. Recovery failures are **non-fatal** (they don't trigger auto-wipe); the bot continues, the new device just won't be cross-signed.
 
