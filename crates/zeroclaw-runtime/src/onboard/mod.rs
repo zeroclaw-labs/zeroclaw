@@ -154,6 +154,14 @@ fn find_default<'a>(defaults: &'a [FieldDefault], path: &str) -> Option<&'a str>
         .map(|d| d.display.as_str())
 }
 
+/// True when `input` parses as the same `Vec<String>` form `config.toml`
+/// emits. Lets the StringArray prompt accept the bracketed display form
+/// bidirectionally.
+fn parses_as_string_array(input: &str) -> bool {
+    toml::from_str::<std::collections::HashMap<String, Vec<String>>>(&format!("v = {input}"))
+        .is_ok()
+}
+
 /// Prompt for a single config field identified by its dotted name. Returns
 /// `Nav::Back` when the user pressed Esc at the prompt; `Nav::Done` on any
 /// other outcome (including "kept current value"). `default` is the
@@ -187,6 +195,16 @@ async fn prompt_field(
     // the section supplied one and the field is unset, "Current: X"
     // when the config carries a user-set value (non-bool only).
     let mut help = field.description.to_string();
+    // List-of-strings fields take comma-separated input. Without this
+    // hint users guess and end up entering things like `["alice"]` as
+    // raw text — the parser then treats that as one big string element
+    // and the saved config is garbage.
+    if field.kind == PropKind::StringArray {
+        if !help.is_empty() {
+            help.push('\n');
+        }
+        help.push_str("Format: alice,bob or [\"alice\", \"bob\"]. Empty = clear list.");
+    }
     if !is_set
         && let Some(d) = default
         && !d.is_empty()
@@ -229,7 +247,7 @@ async fn prompt_field(
                 Answer::Value(_) => {}
             }
         }
-        PropKind::String | PropKind::Integer | PropKind::Float | PropKind::StringArray => {
+        PropKind::String | PropKind::Integer | PropKind::Float => {
             // Prefill priority: config current value > section default > empty.
             // When the user accepts the prefilled default (no edit), we
             // still write it through set_prop so the config records the
@@ -244,6 +262,34 @@ async fn prompt_field(
                 Answer::Value(new) => {
                     if (is_set || !new.is_empty()) && new != current {
                         persist(cfg, name, &new).await?;
+                    }
+                }
+            }
+        }
+        PropKind::StringArray => {
+            let prefill = if is_set {
+                Some(current.as_str())
+            } else {
+                default
+            };
+            // Accepts comma-separated input or the bracketed form from
+            // config.toml. Reject malformed brackets — otherwise the
+            // parser silently coerces them into a single-element list
+            // of garbage.
+            loop {
+                match ui.string(prompt, prefill).await? {
+                    Answer::Back => return Ok(Nav::Back),
+                    Answer::Value(new) => {
+                        let trimmed = new.trim();
+                        if trimmed.starts_with('[') && !parses_as_string_array(trimmed) {
+                            ui.note("Invalid array. Use alice,bob or [\"alice\", \"bob\"].");
+                            continue;
+                        }
+                        if (is_set || !new.is_empty()) && new != current {
+                            persist(cfg, name, &new).await?;
+                        }
+                        ui.note("");
+                        break;
                     }
                 }
             }
@@ -476,7 +522,7 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
             Some(forced) => forced.clone(),
             None => {
                 let current_idx = entries.iter().position(|p| p.name == current_fallback);
-                let options: Vec<SelectItem> = entries
+                let mut options: Vec<SelectItem> = entries
                     .iter()
                     .map(|p| {
                         let configured = cfg.providers.models.contains_key(p.name);
@@ -492,20 +538,41 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
                         }
                     })
                     .collect();
-                match ui.select("Provider", &options, current_idx).await? {
+                // "Done" lets the user exit providers without picking one —
+                // matches the channels picker's escape hatch. Highlight it
+                // by default when no fallback is set yet (first-time setup).
+                let done_idx = options.len();
+                options.push(SelectItem::new("Done"));
+                let initial = current_idx.or(Some(done_idx));
+                let idx = match ui.select("Provider", &options, initial).await? {
                     Answer::Back => return Ok(Nav::Back),
-                    Answer::Value(idx) => entries[idx].name.to_string(),
+                    Answer::Value(idx) => idx,
+                };
+                if idx == done_idx {
+                    break;
                 }
+                entries[idx].name.to_string()
             }
         };
 
-        if picked != current_fallback {
-            persist(cfg, "providers.fallback", &picked).await?;
-        }
-
-        // Seed the HashMap entry so prop_fields enumerates its fields.
+        // Seed the HashMap entry in memory so `prop_fields` can enumerate
+        // its fields for the prompts below. Not persisted here — the first
+        // `persist()` for a real value (api_key, model, …) carries it to
+        // disk. If the user backs out before any value is set, the back
+        // paths drop the entry so it never reaches the file.
+        let is_new_entry = !cfg.providers.models.contains_key(&picked);
         cfg.providers.models.entry(picked.clone()).or_default();
-        cfg.save().await?;
+
+        // For fresh entries, pre-populate the provider's trait-level defaults
+        // into the in-memory entry. Skipped when reconfiguring so existing
+        // user overrides aren't clobbered. Lives in memory until the first
+        // `persist()` carries the entry — defaults included — to disk.
+        if is_new_entry {
+            let prefix = format!("providers.models.{picked}");
+            for trait_default in provider_trait_defaults(&picked, &prefix) {
+                cfg.set_prop(&trait_default.path, &trait_default.display)?;
+            }
+        }
 
         let display_name = entries
             .iter()
@@ -537,6 +604,7 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
                     if flags.provider.is_some() {
                         return Ok(Nav::Back);
                     }
+                    cfg.providers.models.remove(&picked);
                     continue;
                 }
                 Nav::Done => {}
@@ -551,6 +619,7 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
                     if flags.provider.is_some() {
                         return Ok(Nav::Back);
                     }
+                    cfg.providers.models.remove(&picked);
                     continue;
                 }
                 Nav::Done => {}
@@ -600,42 +669,7 @@ async fn offer_advanced_settings(
         Answer::Value(true) => {}
     }
 
-    // Build the defaults override map from the concrete Provider's trait
-    // methods. A provider handle constructed with `api_key = None` can
-    // still answer the `default_*` questions — they're family-level
-    // constants, not runtime values. If construction fails (unknown /
-    // local-only provider), fall through with an empty override map and
-    // let each field's own display_value carry the prompt.
-    let defaults: Vec<FieldDefault> = match zeroclaw_providers::create_provider(provider, None) {
-        Ok(handle) => {
-            let mut v = vec![
-                FieldDefault {
-                    path: format!("{prefix}.temperature"),
-                    display: handle.default_temperature().to_string(),
-                },
-                FieldDefault {
-                    path: format!("{prefix}.max-tokens"),
-                    display: handle.default_max_tokens().to_string(),
-                },
-                FieldDefault {
-                    path: format!("{prefix}.timeout-secs"),
-                    display: handle.default_timeout_secs().to_string(),
-                },
-                FieldDefault {
-                    path: format!("{prefix}.wire-api"),
-                    display: handle.default_wire_api().to_string(),
-                },
-            ];
-            if let Some(url) = handle.default_base_url() {
-                v.push(FieldDefault {
-                    path: format!("{prefix}.base-url"),
-                    display: url.to_string(),
-                });
-            }
-            v
-        }
-        Err(_) => Vec::new(),
-    };
+    let defaults = provider_trait_defaults(provider, prefix);
 
     // Skipped: `model` (already via prompt_model), `api-key` (explicit auth
     // phase), and fields that only apply to a different provider family
@@ -643,6 +677,44 @@ async fn offer_advanced_settings(
     let mut excludes: Vec<&str> = vec!["model", "api-key"];
     excludes.extend(provider_family_excludes(provider));
     prompt_fields_under(cfg, ui, prefix, &excludes, &defaults).await
+}
+
+/// Build the `FieldDefault` list for a provider from its trait methods.
+/// Single source of truth: used to pre-populate fresh entries during
+/// onboarding AND to surface defaults in the advanced-settings walk.
+/// A provider handle constructed with `api_key = None` can still answer
+/// the `default_*` questions — they're family-level constants, not
+/// runtime values. If construction fails (unknown / local-only provider),
+/// returns an empty vec and callers fall back to per-field display values.
+fn provider_trait_defaults(provider: &str, prefix: &str) -> Vec<FieldDefault> {
+    let Ok(handle) = zeroclaw_providers::create_provider(provider, None) else {
+        return Vec::new();
+    };
+    let mut v = vec![
+        FieldDefault {
+            path: format!("{prefix}.temperature"),
+            display: handle.default_temperature().to_string(),
+        },
+        FieldDefault {
+            path: format!("{prefix}.max-tokens"),
+            display: handle.default_max_tokens().to_string(),
+        },
+        FieldDefault {
+            path: format!("{prefix}.timeout-secs"),
+            display: handle.default_timeout_secs().to_string(),
+        },
+        FieldDefault {
+            path: format!("{prefix}.wire-api"),
+            display: handle.default_wire_api().to_string(),
+        },
+    ];
+    if let Some(url) = handle.default_base_url() {
+        v.push(FieldDefault {
+            path: format!("{prefix}.base-url"),
+            display: url.to_string(),
+        });
+    }
+    v
 }
 
 /// Exclude fields that don't apply to the selected provider family.

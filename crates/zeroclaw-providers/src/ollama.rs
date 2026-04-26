@@ -7,8 +7,10 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Zero temperature = greedy sampling. Local dev defaults to reproducible outputs.
-const TEMPERATURE_DEFAULT: f64 = 0.0;
+/// Matches Ollama's upstream Modelfile default
+/// (<https://docs.ollama.com/modelfile>): "Increasing the temperature will
+/// make the model answer more creatively. (Default: 0.8)".
+const TEMPERATURE_DEFAULT: f64 = 0.8;
 /// Local inference is CPU/GPU-bound; give it more headroom than cloud calls.
 const TIMEOUT_SECS_DEFAULT: u64 = 600;
 /// Ollama's standard localhost endpoint. Overrideable via
