@@ -57,6 +57,9 @@ tmp/
 # Coverage artifacts
 lcov.info
 
+# Automation audit artifacts
+artifacts/
+
 # IDE's stuff
 .idea
 

@@ -120,6 +120,7 @@ Branch/commit/PR rules:
 AI coding assistant skills live in `.claude/skills/`. Use the right one for the job:
 
 - `.claude/skills/github-pr-review-session/SKILL.md` — PR review co-pilot; assists **you** as the human reviewer. Posts reviews as WareWolf-MoonWall using the RFC feedback taxonomy (🔴/🟡/✅/🔵/🟢). Trigger: `review 1234`, `re-review 1234`, `go through the queue`.
+- `.claude/skills/factory-janitor/SKILL.md` — conservative software-factory cleanup for exact duplicates, issues fixed by merged PRs, superseded PRs, and PR-to-issue links. Trigger: `factory janitor`, `reduce duplicates`, `close implemented issues`, `close superseded PRs`.
 - `.claude/skills/changelog-generation/SKILL.md` — generates `CHANGELOG-next.md` between stable tags, resolves contributors via GraphQL, feeds the release workflow. Trigger: `generate changelog`, `release notes for v0.7.x`.
 
 ## Localization
@@ -138,6 +139,7 @@ Dev-operational contracts — files consumed by AI coding skills and development
 | `docs/book/src/maintainers/reviewer-playbook.md` | `github-issue-triage` — triage governance |
 | `docs/book/src/maintainers/pr-workflow.md` | `github-issue-triage` — triage discipline |
 | `docs/book/src/contributing/privacy.md` | `github-issue-triage`, PR template — privacy rules |
+| `.claude/skills/factory-janitor/references/policy.md` | `factory-janitor` — autonomous cleanup authority bounds |
 | `docs/book/src/foundations/fnd-00*.md` | `github-pr-review-session` — RFC reference data; public transparency documents |
 
 ## Linked References

@@ -15,3 +15,7 @@ Repository convention:
 Workflow behavior documentation in this directory:
 
 - `.github/workflows/master-branch-flow.md`
+
+Notable maintenance workflows:
+
+- `factory-janitor.yml` - preview-only scheduled factory cleanup audit; manual dispatch can run comment-only or safe apply modes for exact duplicate/fixed/superseded cleanup.

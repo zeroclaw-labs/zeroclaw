@@ -14,6 +14,7 @@ Each skill lives in its own directory with a `SKILL.md` file. Claude Code loads 
 | `github-pr` | Opening or updating a PR with a fully-populated template body |
 | `squash-merge` | Landing an approved PR into `master` with preserved commit history and the purple **Merged** badge |
 | `changelog-generation` | Preparing `CHANGELOG-next.md` for a release — summarises merges since the last tag |
+| `factory-janitor` | Conservative autonomous cleanup for exact duplicates, issues fixed by merged PRs, superseded PRs, and PR-to-issue links |
 | `skill-creator` | Creating, editing, or benchmarking the skills themselves |
 | `zeroclaw` | Operating the running ZeroClaw instance (CLI + gateway API) |
 
@@ -60,6 +61,30 @@ The `github-issue-triage` skill runs autonomous backlog sweeps within defined au
 Labels and the stale policy are defined in [Reviewer playbook → Issue triage](./reviewer-playbook.md#issue-triage). The skill escalates ambiguity to the user before acting.
 
 PRs with merge conflicts receive `needs-author-action` only — no review, no diff comment — per `feedback_conflicts_label_only`.
+
+## Factory janitor workflow
+
+The `factory-janitor` skill is the software-factory cleanup layer for low-ambiguity lifecycle work. It is intentionally narrower than issue triage: it finds exact cleanup candidates and either previews, comments, or applies safe closures.
+
+Run locally:
+
+```bash
+python3 .claude/skills/factory-janitor/scripts/factory_janitor.py --mode preview
+python3 .claude/skills/factory-janitor/scripts/factory_janitor.py --mode comment-only
+python3 .claude/skills/factory-janitor/scripts/factory_janitor.py --mode apply-safe
+```
+
+Run from Actions with **Factory Janitor**. The scheduled run is preview-only and uploads a JSON audit artifact plus a Markdown job summary. Manual dispatch can run `comment-only` or `apply-safe` with a mutation cap.
+
+Autonomous closure is limited to:
+
+- open issues explicitly fixed by merged PRs with closing keywords;
+- issues explicitly marked duplicate by a maintainer comment;
+- open PRs explicitly superseded by a merged PR.
+
+Similarity-only matches, partial coverage, competing config surfaces, and anything with protected labels are preview-only and must go through normal maintainer review.
+
+Repeated runs are safe by default: comments include hidden Factory Janitor markers, and later runs skip candidates with matching markers unless `--include-marked` is passed.
 
 ## Squash-merge strategy
 
