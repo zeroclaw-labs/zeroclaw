@@ -198,6 +198,24 @@ export function deleteCronJob(id: string): Promise<void> {
     method: 'DELETE',
   });
 }
+
+export interface CronTriggerResult {
+  status: string;
+  job_id: string;
+  success: boolean;
+  output: string;
+  duration_ms: number;
+  started_at: string;
+  finished_at: string;
+}
+
+/** Manually trigger a cron job and wait for the result. */
+export function triggerCronJob(id: string): Promise<CronTriggerResult> {
+  return apiFetch<CronTriggerResult>(`/api/cron/${encodeURIComponent(id)}/run`, {
+    method: 'POST',
+  });
+}
+
 export function patchCronJob(
   id: string,
   patch: { name?: string; schedule?: string; command?: string; prompt?: string },

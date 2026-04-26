@@ -982,6 +982,7 @@ pub async fn run_gateway(
             delete(api::handle_api_cron_delete).patch(api::handle_api_cron_patch),
         )
         .route("/api/cron/{id}/runs", get(api::handle_api_cron_runs))
+        .route("/api/cron/{id}/run", post(api::handle_api_cron_run))
         .route("/api/integrations", get(api::handle_api_integrations))
         .route(
             "/api/integrations/settings",

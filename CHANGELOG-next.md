@@ -128,6 +128,9 @@
 
 - Voice mode added to the dashboard.
 - Plugins management page added.
+- "Run now" action added to each cron job in the dashboard, with a matching
+  `POST /api/cron/{id}/run` endpoint that executes the job, persists the run, and
+  broadcasts the result over SSE (#5501).
 - Theme mode switch fixed — light/dark selection now applies correctly on load (#5724).
 - Visual preview swatches added to the theme mode selector (#5767).
 - Dashboard is now decoupled from the main binary — built separately and embedded at

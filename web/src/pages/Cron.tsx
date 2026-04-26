@@ -11,6 +11,7 @@ import {
   ChevronRight,
   RefreshCw,
   Pencil,
+  Play,
 } from 'lucide-react';
 import type { CronJob, CronRun } from '@/types/api';
 import {
@@ -21,6 +22,7 @@ import {
   getCronSettings,
   patchCronSettings,
   patchCronJob,
+  triggerCronJob,
 } from '@/lib/api';
 import type { CronSettings } from '@/lib/api';
 import { t } from '@/lib/i18n';
@@ -149,6 +151,7 @@ export default function Cron() {
   const [error, setError] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
+  const [triggering, setTriggering] = useState<string | null>(null);
   const [settings, setSettings] = useState<CronSettings | null>(null);
   const [togglingCatchUp, setTogglingCatchUp] = useState(false);
 
@@ -316,6 +319,31 @@ export default function Cron() {
       setError(err instanceof Error ? err.message : t('cron.delete_error'));
     } finally {
       setConfirmDelete(null);
+    }
+  };
+
+  const handleTrigger = async (id: string) => {
+    setTriggering(id);
+    setError(null);
+    try {
+      const result = await triggerCronJob(id);
+      // Refresh job list so last_run / last_status reflect the manual run.
+      try {
+        const refreshed = await getCronJobs();
+        setJobs(refreshed);
+      } catch {
+        // If list refresh fails, leave the existing rows; the user can reload.
+      }
+      // Auto-expand the run history so the user can see the result they just triggered.
+      setExpandedJob(id);
+      if (!result.success) {
+        const detail = result.output?.trim();
+        setError(detail ? `${t('cron.trigger_error')}: ${detail}` : t('cron.trigger_error'));
+      }
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : t('cron.trigger_error'));
+    } finally {
+      setTriggering(null);
     }
   };
 
@@ -665,6 +693,18 @@ export default function Cron() {
                     </td>
                     <td className="text-right">
                       <div className="flex items-center justify-end gap-2">
+                        <button
+                          onClick={() => handleTrigger(job.id)}
+                          className="btn-icon"
+                          title={t('cron.trigger')}
+                          disabled={triggering === job.id}
+                        >
+                          {triggering === job.id ? (
+                            <RefreshCw className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Play className="h-4 w-4" />
+                          )}
+                        </button>
                         <button
                           onClick={() => openEditModal(job)}
                           className="btn-icon"

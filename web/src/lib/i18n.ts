@@ -575,6 +575,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Main',
     'cron.allowed_tools_optional': 'Allowed Tools (optional)',
     'cron.allowed_tools_placeholder': 'e.g. shell, file_read, memory_store',
+    'cron.trigger': 'Run now',
+    'cron.trigger_error': 'Failed to trigger job',
 
     // Integrations
     'integrations.title': 'Integrations',
