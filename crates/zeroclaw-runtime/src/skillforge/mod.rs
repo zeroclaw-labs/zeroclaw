@@ -14,7 +14,7 @@ use tracing::{info, warn};
 
 use self::evaluate::{EvalResult, Evaluator, Recommendation};
 use self::integrate::Integrator;
-use self::scout::{GitHubScout, Scout, ScoutResult, ScoutSource};
+use self::scout::{GitHubScout, HttpJsonScout, Scout, ScoutResult, ScoutSource};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -44,7 +44,12 @@ fn default_auto_integrate() -> bool {
     true
 }
 fn default_sources() -> Vec<String> {
-    vec!["github".into(), "clawhub".into()]
+    vec![
+        "github".into(),
+        "clawhub".into(),
+        "agentskills".into(),
+        "skillssh".into(),
+    ]
 }
 fn default_scan_interval() -> u64 {
     24
@@ -151,10 +156,58 @@ impl SkillForge {
                         }
                     }
                 }
-                ScoutSource::ClawHub | ScoutSource::HuggingFace => {
+                ScoutSource::ClawHub => {
+                    let scout = HttpJsonScout::new(
+                        "https://clawhub.ai/api/v1/search".into(),
+                        ScoutSource::ClawHub,
+                        "ClawhHub",
+                    );
+                    match scout.discover().await {
+                        Ok(mut found) => {
+                            info!(count = found.len(), "ClawhHub scout returned candidates");
+                            candidates.append(&mut found);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "ClawhHub scout failed, continuing with other sources");
+                        }
+                    }
+                }
+                ScoutSource::AgentSkillsIo => {
+                    let scout = HttpJsonScout::new(
+                        "https://agentskills.io/api/v1/search".into(),
+                        ScoutSource::AgentSkillsIo,
+                        "agentskills.io",
+                    );
+                    match scout.discover().await {
+                        Ok(mut found) => {
+                            info!(count = found.len(), "agentskills.io scout returned candidates");
+                            candidates.append(&mut found);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "agentskills.io scout failed, continuing with other sources");
+                        }
+                    }
+                }
+                ScoutSource::SkillsSh => {
+                    let scout = HttpJsonScout::new(
+                        "https://skills.sh/api/v1/search".into(),
+                        ScoutSource::SkillsSh,
+                        "skills.sh",
+                    );
+                    match scout.discover().await {
+                        Ok(mut found) => {
+                            info!(count = found.len(), "skills.sh scout returned candidates");
+                            candidates.append(&mut found);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "skills.sh scout failed, continuing with other sources");
+                        }
+                    }
+                }
+                ScoutSource::HuggingFace => {
                     info!(
                         source = src.as_str(),
-                        "Source not yet implemented — skipping"
+                        "HuggingFace source not yet implemented — skipping"
                     );
                 }
             }
@@ -250,6 +303,6 @@ mod tests {
         assert!(cfg.auto_integrate);
         assert_eq!(cfg.scan_interval_hours, 24);
         assert!((cfg.min_score - 0.7).abs() < f64::EPSILON);
-        assert_eq!(cfg.sources, vec!["github", "clawhub"]);
+        assert_eq!(cfg.sources, vec!["github", "clawhub", "agentskills", "skillssh"]);
     }
 }

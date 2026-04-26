@@ -1,3 +1,4 @@
+pub mod registry;
 pub mod skill_http;
 pub mod skill_tool;
 use anyhow::{Context, Result};
@@ -1223,7 +1224,7 @@ fn detect_newly_installed_directory(
     }
 }
 
-fn enforce_skill_security_audit(
+pub(crate) fn enforce_skill_security_audit(
     skill_path: &Path,
     allow_scripts: bool,
 ) -> Result<audit::SkillAuditReport> {

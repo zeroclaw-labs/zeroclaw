@@ -1694,6 +1694,26 @@ fn parse_skills_prompt_injection_mode(raw: &str) -> Option<SkillsPromptInjection
     }
 }
 
+/// An external skill registry that ZeroClaw can pull from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct ExternalRegistry {
+    /// Human-readable name for this registry.
+    pub name: String,
+    /// Base URL of the registry API.
+    pub url: String,
+    /// Registry protocol: `"zip-api"` (HTTP JSON + ZIP download) or `"git"`.
+    #[serde(default = "default_registry_kind")]
+    pub kind: String,
+    /// Whether this registry is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_registry_kind() -> String {
+    "zip-api".into()
+}
+
 /// Skills loading configuration (`[skills]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -1715,6 +1735,9 @@ pub struct SkillsConfig {
     /// Default: `https://github.com/zeroclaw-labs/zeroclaw-skills`
     #[serde(default)]
     pub registry_url: Option<String>,
+    /// Additional external skill registries for install and search.
+    #[serde(default)]
+    pub extra_registries: Vec<ExternalRegistry>,
     /// Controls how skills are injected into the system prompt.
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
