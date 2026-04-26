@@ -301,6 +301,14 @@ pub enum SkillCommands {
         #[arg(long)]
         verbose: bool,
     },
+    /// Search all skill registries for skills matching a query
+    Search {
+        /// Search query
+        query: String,
+        /// Maximum results per registry
+        #[arg(long, default_value = "10")]
+        limit: usize,
+    },
 }
 
 /// Migration subcommands
