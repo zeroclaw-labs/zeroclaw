@@ -20,3 +20,5 @@ Notable maintenance workflows:
 
 - `factory-clerk.yml` - preview-only scheduled factory records cleanup audit; manual dispatch can run comment-only or safe apply modes for exact duplicate/fixed/superseded cleanup.
 - `factory-inspector.yml` - preview-only scheduled intake quality audit; manual dispatch can comment on deterministic PR intake failures.
+- `factory-testbench.yml` - read-only scheduled factory snapshot/replay audit with safety invariants.
+- `factory-foreman.yml` - preview-only scheduled factory orchestration; manual dispatch can coordinate guarded comment/apply modes.

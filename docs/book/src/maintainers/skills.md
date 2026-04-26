@@ -16,6 +16,8 @@ Each skill lives in its own directory with a `SKILL.md` file. Claude Code loads 
 | `changelog-generation` | Preparing `CHANGELOG-next.md` for a release — summarises merges since the last tag |
 | `factory-clerk` | Conservative autonomous records cleanup for exact duplicates, issues fixed by merged PRs, superseded PRs, and PR-to-issue links |
 | `factory-inspector` | Intake quality checks for PR templates, validation evidence, linked issues, risk labels, and thin issue reports |
+| `factory-testbench` | Offline replay and safety invariants for factory automation decisions |
+| `factory-foreman` | Preview-first orchestration across Testbench, Clerk, and Inspector |
 | `skill-creator` | Creating, editing, or benchmarking the skills themselves |
 | `zeroclaw` | Operating the running ZeroClaw instance (CLI + gateway API) |
 
@@ -101,6 +103,43 @@ python3 .claude/skills/factory-inspector/scripts/factory_inspector.py --mode com
 Run from Actions with **Factory Inspector**. The scheduled run is preview-only and uploads a JSON audit artifact plus a Markdown job summary. Manual dispatch can run `comment-only`, which posts a single checklist comment on PRs with deterministic intake failures.
 
 The first version comments only on PR intake issues. Issue intake findings remain preview-only so maintainers can tune the signal before automating contributor-facing issue comments.
+
+## Factory testbench workflow
+
+The `factory-testbench` skill is the factory safety harness. It snapshots GitHub issue/PR state, replays Clerk and Inspector decisions offline, and fails when core safety invariants are violated.
+
+Run local fixture tests:
+
+```bash
+python3 .claude/skills/factory-testbench/scripts/factory_testbench.py fixture-test
+```
+
+Snapshot and replay live GitHub state:
+
+```bash
+python3 .claude/skills/factory-testbench/scripts/factory_testbench.py roundtrip --repo zeroclaw-labs/zeroclaw
+```
+
+Run from Actions with **Factory Testbench**. The workflow is read-only and uploads snapshot/replay artifacts. Optional `--clone-dir` creates or updates a local bare mirror clone for deeper replay experiments, but sandbox GitHub mutation is intentionally not part of this first version.
+
+## Factory foreman workflow
+
+The `factory-foreman` skill coordinates factory roles. It always runs Testbench first, then Clerk, then Inspector.
+
+Run preview locally:
+
+```bash
+python3 .claude/skills/factory-foreman/scripts/factory_foreman.py --mode preview
+```
+
+Manual non-preview runs:
+
+```bash
+python3 .claude/skills/factory-foreman/scripts/factory_foreman.py --mode comment-only --max-mutations 10
+python3 .claude/skills/factory-foreman/scripts/factory_foreman.py --mode apply-safe --allow-apply-safe --max-mutations 10
+```
+
+Run from Actions with **Factory Foreman**. Scheduled runs are preview-only. `apply-safe` requires the explicit `allow_apply_safe=true` workflow input and still runs Testbench before any Clerk/Inspector action.
 
 ## Squash-merge strategy
 
