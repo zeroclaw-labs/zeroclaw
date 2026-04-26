@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,16 @@ FOREMAN_PATH = ROOT / ".claude/skills/factory-foreman/scripts/factory_foreman.py
 REF_RE = re.compile(r"(?<![\w/.-])#(?P<number>\d+)\b")
 CLOSING_REF_RE = re.compile(
     r"(?i)\b(?P<keyword>close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(?P<number>\d+)\b"
+)
+GH_MUTATION_DELAY = float(os.environ.get("FACTORY_SANDBOX_GH_DELAY", "1.5"))
+GH_RETRYABLE_ERRORS = (
+    "was submitted too quickly",
+    "secondary rate limit",
+    "abuse detection",
+    "api rate limit exceeded",
+    "http 502",
+    "http 503",
+    "http 504",
 )
 
 
@@ -55,33 +66,69 @@ def run_gh_json(args: list[str]) -> Any:
 
 def run_gh_text(args: list[str], input_text: str | None = None) -> str:
     cmd = ["gh", *args]
+    last_detail = ""
+    for attempt in range(1, 7):
+        try:
+            result = subprocess.run(
+                cmd,
+                input=input_text,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            throttle_gh_mutation(args)
+            return result.stdout
+        except FileNotFoundError:
+            raise SystemExit("gh CLI is required but was not found in PATH")
+        except subprocess.CalledProcessError as exc:
+            detail = exc.stderr.strip() or exc.stdout.strip()
+            last_detail = detail
+            if not is_retryable_gh_error(detail) or attempt == 6:
+                raise RuntimeError(f"{' '.join(cmd)} failed: {detail}") from exc
+            time.sleep(min(60.0, 2.0 * attempt * attempt))
+    raise RuntimeError(f"{' '.join(cmd)} failed: {last_detail}")
+
+
+def is_retryable_gh_error(detail: str) -> bool:
+    lowered = detail.lower()
+    return any(token in lowered for token in GH_RETRYABLE_ERRORS)
+
+
+def throttle_gh_mutation(args: list[str]) -> None:
+    if GH_MUTATION_DELAY <= 0 or len(args) < 2:
+        return
+    mutating = {
+        ("repo", "create"),
+        ("label", "create"),
+        ("issue", "create"),
+        ("issue", "comment"),
+        ("issue", "edit"),
+        ("issue", "close"),
+        ("pr", "create"),
+        ("pr", "comment"),
+        ("pr", "edit"),
+        ("pr", "close"),
+        ("pr", "merge"),
+    }
+    if (args[0], args[1]) in mutating:
+        time.sleep(GH_MUTATION_DELAY)
+
+
+def run_cmd(args: list[str], cwd: Path | None = None, input_text: str | None = None) -> str:
     try:
         result = subprocess.run(
-            cmd,
+            args,
+            cwd=cwd,
             input=input_text,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=True,
         )
-    except FileNotFoundError:
-        raise SystemExit("gh CLI is required but was not found in PATH")
     except subprocess.CalledProcessError as exc:
-        detail = exc.stderr.strip() or exc.stdout.strip()
-        raise RuntimeError(f"{' '.join(cmd)} failed: {detail}") from exc
-    return result.stdout
-
-
-def run_cmd(args: list[str], cwd: Path | None = None, input_text: str | None = None) -> str:
-    result = subprocess.run(
-        args,
-        cwd=cwd,
-        input=input_text,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=True,
-    )
+        detail = (exc.stderr or exc.stdout or "").strip()
+        raise RuntimeError(f"{' '.join(args)} failed: {detail}") from exc
     return result.stdout.strip() or result.stderr.strip()
 
 
@@ -111,9 +158,13 @@ def git_success(args: list[str], cwd: Path | None = None) -> bool:
     return result.returncode == 0
 
 
+def github_ssh_url(repo: str) -> str:
+    return f"git@github.com:{repo}.git"
+
+
 def clone_mirror(repo: str, clone_dir: Path) -> str:
     clone_dir.parent.mkdir(parents=True, exist_ok=True)
-    url = f"https://github.com/{repo}.git"
+    url = github_ssh_url(repo)
     if clone_dir.exists():
         result = subprocess.run(
             ["git", "-C", str(clone_dir), "remote", "update", "--prune"],
@@ -179,17 +230,29 @@ def write_json(payload: dict[str, Any], output_dir: Path, prefix: str) -> Path:
     return path
 
 
-def snapshot(repo: str, limit: int, output_dir: Path, clone_dir: Path | None) -> Path:
+def parse_csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def snapshot(
+    repo: str,
+    limit: int,
+    output_dir: Path,
+    clone_dir: Path | None,
+    issue_state: str = "all",
+    pr_states: list[str] | None = None,
+) -> Path:
     clone_result = None
     if clone_dir is not None:
         clone_result = clone_mirror(repo, clone_dir)
 
-    issues = dedupe_by_number(list_issues(repo, "all", limit))
-    prs = dedupe_by_number(
-        list_prs(repo, "open", limit)
-        + list_prs(repo, "closed", limit)
-        + list_prs(repo, "merged", limit)
-    )
+    states = pr_states or ["open", "closed", "merged"]
+    issues = dedupe_by_number(list_issues(repo, issue_state, limit))
+    prs = dedupe_by_number([
+        pr
+        for state in states
+        for pr in list_prs(repo, state, limit)
+    ])
     payload = {
         "schema": "factory-testbench-snapshot-v1",
         "repo": repo,
@@ -197,6 +260,8 @@ def snapshot(repo: str, limit: int, output_dir: Path, clone_dir: Path | None) ->
         "source_head": run_git(["rev-parse", "HEAD"], ROOT),
         "clone_dir": str(clone_dir) if clone_dir else None,
         "clone_result": clone_result,
+        "issue_state": issue_state,
+        "pr_states": states,
         "issues": issues,
         "prs": prs,
     }
@@ -208,6 +273,20 @@ def parse_created_number(url: str) -> int:
     if not match:
         raise RuntimeError(f"Could not parse GitHub number from: {url}")
     return int(match.group("number"))
+
+
+def run_gh_create_number(args: list[str], input_text: str | None = None) -> int:
+    last_output = ""
+    for attempt in range(1, 9):
+        output = run_gh_text(args, input_text=input_text)
+        last_output = output
+        try:
+            return parse_created_number(output)
+        except RuntimeError:
+            if output.strip():
+                raise
+            time.sleep(min(300.0, 15.0 * attempt * attempt))
+    raise RuntimeError(f"Could not parse GitHub number from create output: {last_output}")
 
 
 def repo_exists(repo: str) -> bool:
@@ -248,7 +327,7 @@ def push_mirror_to_target(source_repo: str, target_repo: str, work_dir: Path, dr
         "git",
         "push",
         "--prune",
-        f"https://github.com/{target_repo}.git",
+        github_ssh_url(target_repo),
         "+refs/heads/*:refs/heads/*",
         "+refs/tags/*:refs/tags/*",
     ], mirror_dir)
@@ -371,7 +450,7 @@ def ensure_work_clone(target_repo: str, work_dir: Path) -> Path:
     if clone_dir.exists():
         run_cmd(["git", "fetch", "origin", "--prune"], clone_dir)
         return clone_dir
-    run_cmd(["git", "clone", f"https://github.com/{target_repo}.git", str(clone_dir)])
+    run_cmd(["git", "clone", github_ssh_url(target_repo), str(clone_dir)])
     run_cmd(["git", "config", "user.name", "Factory Sandbox"], clone_dir)
     run_cmd(["git", "config", "user.email", "factory-sandbox@example.invalid"], clone_dir)
     return clone_dir
@@ -439,8 +518,7 @@ def create_sandbox_issues(
             "-",
         ]
         args.extend(label_args(issue.get("labels", [])))
-        url = run_gh_text(args, input_text=body)
-        issue_map[original] = parse_created_number(url)
+        issue_map[original] = run_gh_create_number(args, input_text=body)
     return issue_map
 
 
@@ -478,8 +556,7 @@ def create_sandbox_prs(
         if pr.get("isDraft"):
             args.append("--draft")
         args.extend(label_args(pr.get("labels", [])))
-        url = run_gh_text(args, input_text=placeholder)
-        pr_map[original] = parse_created_number(url)
+        pr_map[original] = run_gh_create_number(args, input_text=placeholder)
     return pr_map
 
 
@@ -926,6 +1003,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     snapshot_parser.add_argument("--limit", type=int, default=1000)
     snapshot_parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     snapshot_parser.add_argument("--clone-dir")
+    snapshot_parser.add_argument("--issue-state", choices=("open", "closed", "all"), default="all")
+    snapshot_parser.add_argument("--pr-states", default="open,closed,merged")
 
     replay_parser = sub.add_parser("replay")
     replay_parser.add_argument("--snapshot", required=True)
@@ -940,6 +1019,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     roundtrip_parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", DEFAULT_REPO))
     roundtrip_parser.add_argument("--limit", type=int, default=1000)
     roundtrip_parser.add_argument("--clone-dir")
+    roundtrip_parser.add_argument("--issue-state", choices=("open", "closed", "all"), default="all")
+    roundtrip_parser.add_argument("--pr-states", default="open,closed,merged")
     common_replay_args(roundtrip_parser)
 
     sandbox_parser = sub.add_parser("sandbox")
@@ -948,6 +1029,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     sandbox_parser.add_argument("--target-repo", required=True)
     sandbox_parser.add_argument("--limit", type=int, default=1000)
     sandbox_parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    sandbox_parser.add_argument("--issue-state", choices=("open", "closed", "all"), default="all")
+    sandbox_parser.add_argument("--pr-states", default="open,closed,merged")
     sandbox_parser.add_argument("--work-dir")
     sandbox_parser.add_argument("--reuse-existing", action="store_true")
     sandbox_parser.add_argument("--dry-run", action="store_true")
@@ -964,7 +1047,14 @@ def main(argv: list[str]) -> int:
     output_dir = Path(getattr(args, "output_dir", DEFAULT_OUTPUT_DIR))
 
     if args.command == "snapshot":
-        path = snapshot(args.repo, args.limit, output_dir, Path(args.clone_dir) if args.clone_dir else None)
+        path = snapshot(
+            args.repo,
+            args.limit,
+            output_dir,
+            Path(args.clone_dir) if args.clone_dir else None,
+            args.issue_state,
+            parse_csv(args.pr_states),
+        )
         print(f"Snapshot file: {path}")
         return 0
 
@@ -972,7 +1062,14 @@ def main(argv: list[str]) -> int:
         if args.snapshot:
             data = json.loads(Path(args.snapshot).read_text(encoding="utf-8"))
         else:
-            snapshot_path = snapshot(args.repo, args.limit, output_dir, None)
+            snapshot_path = snapshot(
+                args.repo,
+                args.limit,
+                output_dir,
+                None,
+                args.issue_state,
+                parse_csv(args.pr_states),
+            )
             data = json.loads(snapshot_path.read_text(encoding="utf-8"))
         payload = sandbox(data, args)
         print("Factory Sandbox summary")
@@ -991,7 +1088,14 @@ def main(argv: list[str]) -> int:
         return 0
 
     if args.command == "roundtrip":
-        snapshot_path = snapshot(args.repo, args.limit, output_dir, Path(args.clone_dir) if args.clone_dir else None)
+        snapshot_path = snapshot(
+            args.repo,
+            args.limit,
+            output_dir,
+            Path(args.clone_dir) if args.clone_dir else None,
+            args.issue_state,
+            parse_csv(args.pr_states),
+        )
         data = json.loads(snapshot_path.read_text(encoding="utf-8"))
         payload = replay(data, args)
     elif args.command == "replay":
