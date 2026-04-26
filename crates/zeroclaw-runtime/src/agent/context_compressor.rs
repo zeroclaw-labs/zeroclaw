@@ -486,7 +486,11 @@ fn build_transcript(messages: &[ChatMessage], max_chars: usize) -> String {
     let mut transcript = String::new();
     for msg in messages {
         let role = msg.role.to_uppercase();
-        let _ = writeln!(transcript, "{role}: {}", msg.content.trim());
+        // Strip media markers — the summarizer auxiliary call does not need
+        // image content, and forwarding `[IMAGE:/local/path]` would reach
+        // the provider as a malformed `image_url.url` and trigger 400 errors.
+        let safe_content = zeroclaw_providers::multimodal::strip_media_markers(msg.content.trim());
+        let _ = writeln!(transcript, "{role}: {safe_content}");
     }
 
     if transcript.len() > max_chars {
@@ -724,6 +728,29 @@ mod tests {
         let t = build_transcript(&messages, 10_000);
         assert!(t.contains("USER: hello"));
         assert!(t.contains("ASSISTANT: hi there"));
+    }
+
+    #[test]
+    fn test_build_transcript_strips_media_markers() {
+        // Regression: image markers in history must be stripped so that
+        // local file paths do not reach the summarizer auxiliary call and
+        // fail with `unsupported image url: /local/path` 400 errors.
+        let messages = vec![
+            msg(
+                "user",
+                "Look at [IMAGE:/zeroclaw-data/workspace/telegram_files/photo_1.jpg]",
+            ),
+            msg("assistant", "Cute cat!"),
+        ];
+        let t = build_transcript(&messages, 10_000);
+        assert!(
+            !t.contains("[IMAGE:"),
+            "transcript should not contain raw IMAGE marker: {t}"
+        );
+        assert!(
+            t.contains("[media attachment]"),
+            "transcript should contain placeholder: {t}"
+        );
     }
 
     #[test]

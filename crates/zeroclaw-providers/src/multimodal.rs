@@ -142,6 +142,25 @@ pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
     count_image_markers(messages) > 0
 }
 
+/// Replace media markers (`[IMAGE:...]`, `[DOCUMENT:...]`, `[FILE:...]`,
+/// `[VIDEO:...]`, `[VOICE:...]`, `[AUDIO:...]`) with `[media attachment]`.
+///
+/// Use before passing user-facing text to auxiliary `chat_with_system` calls
+/// (intent classification, summarization, delegation) so that local file
+/// paths from inbound channels do not leak to the upstream provider — the
+/// upstream API would otherwise receive a filesystem path as `image_url.url`
+/// and reject the request.
+///
+/// Auxiliary calls do not need to *see* the media content; they only route
+/// or summarize, so the placeholder is sufficient. The main agent loop
+/// continues to call `prepare_messages_for_provider` for full normalization.
+pub fn strip_media_markers(text: &str) -> String {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\[(?:IMAGE|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]").unwrap()
+    });
+    RE.replace_all(text, "[media attachment]").into_owned()
+}
+
 pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     if image_ref.starts_with("data:") {
         let comma_idx = image_ref.find(',')?;
@@ -539,6 +558,41 @@ fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_media_markers_replaces_image_local_path() {
+        let input = "Look at [IMAGE:/zeroclaw-data/workspace/telegram_files/photo_1.jpg]";
+        assert_eq!(strip_media_markers(input), "Look at [media attachment]");
+    }
+
+    #[test]
+    fn strip_media_markers_replaces_image_data_uri() {
+        let input = "Inline [IMAGE:data:image/png;base64,abcd]";
+        assert_eq!(strip_media_markers(input), "Inline [media attachment]");
+    }
+
+    #[test]
+    fn strip_media_markers_replaces_all_supported_kinds() {
+        let input = "[IMAGE:/a.jpg] [DOCUMENT:/b.pdf] [FILE:/c.zip] [VIDEO:/d.mp4] [VOICE:/e.ogg] [AUDIO:/f.wav]";
+        let expected = "[media attachment] [media attachment] [media attachment] [media attachment] [media attachment] [media attachment]";
+        assert_eq!(strip_media_markers(input), expected);
+    }
+
+    #[test]
+    fn strip_media_markers_leaves_plain_text_untouched() {
+        let input = "No markers here, just text with [brackets] and (parens).";
+        assert_eq!(strip_media_markers(input), input);
+    }
+
+    #[test]
+    fn strip_media_markers_preserves_unrelated_brackets() {
+        // Markers that don't match the media kinds are left alone.
+        let input = "Use [TODO:foo] and [NOTE:bar] but replace [IMAGE:/x.jpg]";
+        assert_eq!(
+            strip_media_markers(input),
+            "Use [TODO:foo] and [NOTE:bar] but replace [media attachment]"
+        );
+    }
 
     #[test]
     fn parse_image_markers_extracts_multiple_markers() {
