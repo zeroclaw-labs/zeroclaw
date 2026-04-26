@@ -8,7 +8,7 @@ Every workflow lives in `.github/workflows/`. The sections below group them by t
 
 Fires on every PR targeting `master`. Composite job with multiple matrix legs:
 
-- **lint** — `cargo fmt --check`, `cargo clippy -D warnings`, `cargo check --features ci-all`, strict delta lint on changed lines
+- **lint** — `cargo fmt --check`, `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`
 - **build** — matrix: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`
 - **check** — all features + no-default-features
 - **check-32bit** — `i686-unknown-linux-gnu` with no default features
