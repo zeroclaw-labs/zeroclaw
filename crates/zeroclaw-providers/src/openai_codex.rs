@@ -1147,6 +1147,7 @@ data: [DONE]
             provider_max_tokens: None,
             merge_system_into_user: false,
             provider_extra: None,
+            providers_models: std::collections::HashMap::new(),
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");

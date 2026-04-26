@@ -717,6 +717,11 @@ pub struct ProviderRuntimeOptions {
     /// Extra JSON parameters merged into API request bodies at the top level.
     /// Propagated from `ModelProviderConfig::provider_extra`.
     pub provider_extra: Option<serde_json::Value>,
+    /// All named provider profiles from `[providers.X]` config blocks, keyed by
+    /// provider name. Used by the fallback chain to resolve each fallback's
+    /// `api_key` and `base_url` from config before falling back to env vars.
+    pub providers_models:
+        std::collections::HashMap<String, zeroclaw_config::schema::ModelProviderConfig>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -734,6 +739,7 @@ impl Default for ProviderRuntimeOptions {
             provider_max_tokens: None,
             merge_system_into_user: false,
             provider_extra: None,
+            providers_models: std::collections::HashMap::new(),
         }
     }
 }
@@ -777,6 +783,7 @@ pub fn provider_runtime_options_from_config(
         provider_max_tokens: fallback.and_then(|e| e.max_tokens),
         merge_system_into_user,
         provider_extra: fallback.and_then(|e| e.provider_extra.clone()),
+        providers_models: config.providers.models.clone(),
     }
 }
 
@@ -1787,6 +1794,10 @@ pub fn create_resilient_provider(
 }
 
 /// Create provider chain with retry/fallback behavior and auth runtime options.
+///
+/// Fallback provider credentials and base URLs are resolved from
+/// `options.providers_models` (populated by `provider_runtime_options_from_config`)
+/// before falling back to environment variables.
 pub fn create_resilient_provider_with_options(
     primary_name: &str,
     api_key: Option<&str>,
@@ -1804,6 +1815,8 @@ pub fn create_resilient_provider_with_options(
     };
     providers.push((primary_name.to_string(), primary_provider));
 
+    let mut provider_model_overrides = std::collections::HashMap::new();
+
     for fallback in &reliability.fallback_providers {
         if fallback == primary_name || providers.iter().any(|(name, _)| name == fallback) {
             continue;
@@ -1811,15 +1824,18 @@ pub fn create_resilient_provider_with_options(
 
         let (provider_name, profile_override) = parse_provider_profile(fallback);
 
-        // Each fallback provider resolves its own credential via provider-
-        // specific env vars (e.g. DEEPSEEK_API_KEY for "deepseek") instead
-        // of inheriting the primary provider's key. Passing `None` lets
-        // `resolve_provider_credential` check the correct env var for the
-        // fallback provider name.
-        //
-        // When a profile override is present (e.g. "openai-codex:second"),
-        // propagate it through `auth_profile_override` so the provider
-        // picks up the correct OAuth credential set.
+        // Resolve credentials for this fallback from the [providers.X] config block first,
+        // then let `resolve_provider_credential` fall through to provider-specific env vars.
+        // When a profile override is present (e.g. "openai-codex:second"), propagate it
+        // through `auth_profile_override` so the provider picks up the correct OAuth set.
+        let fallback_cfg = options.providers_models.get(provider_name);
+        let fallback_api_key = fallback_cfg.and_then(|c| c.api_key.as_deref());
+        let fallback_base_url = fallback_cfg.and_then(|c| c.base_url.as_deref());
+
+        if let Some(model) = fallback_cfg.and_then(|c| c.model.as_deref()) {
+            provider_model_overrides.insert(fallback.clone(), model.to_string());
+        }
+
         let fallback_options = match profile_override {
             Some(profile) => {
                 let mut opts = options.clone();
@@ -1829,7 +1845,12 @@ pub fn create_resilient_provider_with_options(
             None => options.clone(),
         };
 
-        match create_provider_with_options(provider_name, None, &fallback_options) {
+        match create_provider_with_url_and_options(
+            provider_name,
+            fallback_api_key,
+            fallback_base_url,
+            &fallback_options,
+        ) {
             Ok(provider) => providers.push((fallback.clone(), provider)),
             Err(_error) => {
                 tracing::warn!(
@@ -1846,7 +1867,8 @@ pub fn create_resilient_provider_with_options(
         reliability.provider_backoff_ms,
     )
     .with_api_keys(reliability.api_keys.clone())
-    .with_model_fallbacks(reliability.model_fallbacks.clone());
+    .with_model_fallbacks(reliability.model_fallbacks.clone())
+    .with_provider_model_overrides(provider_model_overrides);
 
     Ok(Box::new(reliable))
 }
@@ -1874,6 +1896,9 @@ pub fn create_routed_provider(
 }
 
 /// Create a routed provider using explicit runtime options.
+///
+/// Fallback credentials and base URLs for each sub-provider are resolved from
+/// `options.providers_models` (populated by `provider_runtime_options_from_config`).
 pub fn create_routed_provider_with_options(
     primary_name: &str,
     api_key: Option<&str>,
@@ -3376,6 +3401,113 @@ mod tests {
         assert!(provider.is_ok());
     }
 
+    /// Fallback providers use api_key from ProviderRuntimeOptions.providers_models (populated
+    /// by provider_runtime_options_from_config) rather than relying solely on env vars.
+    /// Regression test for issue #5803 where [providers.X] config blocks were silently
+    /// ignored for fallback providers.
+    #[test]
+    fn resilient_fallback_reads_api_key_from_providers_models() {
+        let reliability = zeroclaw_config::schema::ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 100,
+            fallback_providers: vec!["openai".into()],
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        };
+
+        let mut providers_models = std::collections::HashMap::new();
+        providers_models.insert(
+            "openai".to_string(),
+            zeroclaw_config::schema::ModelProviderConfig {
+                api_key: Some("sk-config-provided-key".to_string()),
+                ..Default::default()
+            },
+        );
+        let options = ProviderRuntimeOptions {
+            providers_models,
+            ..Default::default()
+        };
+
+        let provider = create_resilient_provider_with_options(
+            "anthropic",
+            Some("sk-ant-test"),
+            None,
+            &reliability,
+            &options,
+        );
+        assert!(provider.is_ok());
+    }
+
+    /// Fallback provider uses base_url from ProviderRuntimeOptions.providers_models so
+    /// custom endpoints are respected for fallback providers (issue #5803).
+    #[test]
+    fn resilient_fallback_reads_base_url_from_providers_models() {
+        let reliability = zeroclaw_config::schema::ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 100,
+            fallback_providers: vec!["openai".into()],
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        };
+
+        let mut providers_models = std::collections::HashMap::new();
+        providers_models.insert(
+            "openai".to_string(),
+            zeroclaw_config::schema::ModelProviderConfig {
+                api_key: Some("xai-config-key".to_string()),
+                base_url: Some("https://api.x.ai/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        let options = ProviderRuntimeOptions {
+            providers_models,
+            ..Default::default()
+        };
+
+        let provider = create_resilient_provider_with_options(
+            "anthropic",
+            Some("sk-ant-test"),
+            None,
+            &reliability,
+            &options,
+        );
+        assert!(provider.is_ok());
+    }
+
+    /// When providers_models is empty (ProviderRuntimeOptions::default()), fallbacks
+    /// still resolve via env vars — backward compat with callers that have no config map.
+    #[test]
+    fn resilient_fallback_empty_providers_models_falls_back_to_env() {
+        let reliability = zeroclaw_config::schema::ReliabilityConfig {
+            provider_retries: 1,
+            provider_backoff_ms: 100,
+            fallback_providers: vec!["ollama".into(), "lmstudio".into()],
+            api_keys: Vec::new(),
+            model_fallbacks: std::collections::HashMap::new(),
+            channel_initial_backoff_secs: 2,
+            channel_max_backoff_secs: 60,
+            scheduler_poll_secs: 15,
+            scheduler_retries: 2,
+        };
+
+        let provider = create_resilient_provider_with_options(
+            "anthropic",
+            Some("sk-ant-test"),
+            None,
+            &reliability,
+            &ProviderRuntimeOptions::default(),
+        );
+        assert!(provider.is_ok());
+    }
+
     /// Osaurus works as a fallback provider alongside other named providers.
     #[test]
     fn resilient_fallback_includes_osaurus() {
@@ -3803,5 +3935,33 @@ mod tests {
 
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZEROCLAW_PROVIDER_URL") };
+    }
+
+    /// `provider_runtime_options_from_config` must copy all three per-provider
+    /// fields (api_key, base_url, model) from `config.providers.models` into
+    /// `options.providers_models` so the fallback chain can use them without
+    /// consulting env vars.  Regression test for issue #5803.
+    #[test]
+    fn provider_runtime_options_from_config_populates_providers_models() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.insert(
+            "xai".to_string(),
+            zeroclaw_config::schema::ModelProviderConfig {
+                api_key: Some("xai-test-key".to_string()),
+                base_url: Some("https://api.x.ai/v1".to_string()),
+                model: Some("grok-3".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let options = provider_runtime_options_from_config(&config);
+
+        let entry = options
+            .providers_models
+            .get("xai")
+            .expect("[providers.xai] must be present in options.providers_models");
+        assert_eq!(entry.api_key.as_deref(), Some("xai-test-key"));
+        assert_eq!(entry.base_url.as_deref(), Some("https://api.x.ai/v1"));
+        assert_eq!(entry.model.as_deref(), Some("grok-3"));
     }
 }

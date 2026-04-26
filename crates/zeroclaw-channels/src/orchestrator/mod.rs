@@ -899,7 +899,9 @@ fn decrypt_optional_secret_for_runtime_reload(
     Ok(())
 }
 
-async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRuntimeDefaults> {
+async fn load_runtime_defaults_from_config_file(
+    path: &Path,
+) -> Result<(ChannelRuntimeDefaults, zeroclaw_providers::ProviderRuntimeOptions)> {
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -942,7 +944,8 @@ async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRu
     }
 
     parsed.apply_env_overrides();
-    Ok(runtime_defaults_from_config(&parsed))
+    let options = zeroclaw_providers::provider_runtime_options_from_config(&parsed);
+    Ok((runtime_defaults_from_config(&parsed), options))
 }
 
 async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Result<()> {
@@ -965,13 +968,14 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         }
     }
 
-    let next_defaults = load_runtime_defaults_from_config_file(&config_path).await?;
+    let (next_defaults, fresh_provider_options) =
+        load_runtime_defaults_from_config_file(&config_path).await?;
     let next_default_provider = zeroclaw_providers::create_resilient_provider_with_options(
         &next_defaults.default_provider,
         next_defaults.api_key.as_deref(),
         next_defaults.api_url.as_deref(),
         &next_defaults.reliability,
-        &ctx.provider_runtime_options,
+        &fresh_provider_options,
     )?;
     let next_default_provider: Arc<dyn Provider> = Arc::from(next_default_provider);
 
