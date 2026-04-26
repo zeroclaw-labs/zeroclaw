@@ -7,7 +7,7 @@
 //! so that user-facing keys remain stable.
 //!
 //! The subsystem supports resilient multi-provider configurations through the
-//! [`ReliableProvider`](reliable::ReliableProvider) wrapper, which handles fallback
+//! [`ReliableProvider`] wrapper, which handles fallback
 //! chains and automatic retry. Model routing across providers is available via
 //! [`create_routed_provider`].
 //!
@@ -27,6 +27,7 @@ pub mod gemini;
 pub mod gemini_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod kilocli;
+pub mod models_dev;
 pub mod multimodal;
 pub mod ollama;
 pub mod openai;

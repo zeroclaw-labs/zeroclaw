@@ -57,6 +57,8 @@ pub struct WhatsAppChannel {
     dm_mention_patterns: Vec<Regex>,
     /// Compiled mention patterns for group-chat mention gating.
     group_mention_patterns: Vec<Regex>,
+    /// Seconds to wait for an operator reply to a `request_approval` prompt
+    /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
 }
 

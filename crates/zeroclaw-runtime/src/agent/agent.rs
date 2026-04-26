@@ -4,7 +4,6 @@ use crate::agent::dispatcher::{
 use crate::agent::eval::AutoClassifyExt;
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
-use crate::i18n::ToolDescriptions;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::SecurityPolicy;
@@ -47,7 +46,6 @@ pub struct Agent {
     #[allow(dead_code)] // WIP: stored for future runtime tool filtering
     allowed_tools: Option<Vec<String>>,
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
-    tool_descriptions: Option<ToolDescriptions>,
     /// Pre-rendered security policy summary injected into the system prompt
     /// so the LLM knows the concrete constraints before making tool calls.
     security_summary: Option<String>,
@@ -84,7 +82,6 @@ pub struct AgentBuilder {
     route_model_by_hint: Option<HashMap<String, String>>,
     allowed_tools: Option<Vec<String>>,
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
-    tool_descriptions: Option<ToolDescriptions>,
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
@@ -121,7 +118,6 @@ impl AgentBuilder {
             route_model_by_hint: None,
             allowed_tools: None,
             response_cache: None,
-            tool_descriptions: None,
             security_summary: None,
             autonomy_level: None,
             activated_tools: None,
@@ -246,11 +242,6 @@ impl AgentBuilder {
         self
     }
 
-    pub fn tool_descriptions(mut self, tool_descriptions: Option<ToolDescriptions>) -> Self {
-        self.tool_descriptions = tool_descriptions;
-        self
-    }
-
     pub fn security_summary(mut self, summary: Option<String>) -> Self {
         self.security_summary = summary;
         self
@@ -324,7 +315,6 @@ impl AgentBuilder {
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
             allowed_tools: allowed,
             response_cache: self.response_cache,
-            tool_descriptions: self.tool_descriptions,
             security_summary: self.security_summary,
             autonomy_level: self
                 .autonomy_level
@@ -650,7 +640,6 @@ impl Agent {
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
-            tool_descriptions: self.tool_descriptions.as_ref(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
         };
@@ -929,7 +918,7 @@ impl Agent {
                         },
                     },
                     &effective_model,
-                    self.temperature,
+                    Some(self.temperature),
                 )
                 .await
             {
@@ -1117,7 +1106,7 @@ impl Agent {
                     },
                 },
                 &effective_model,
-                self.temperature,
+                Some(self.temperature),
                 stream_opts,
             );
 
@@ -1251,7 +1240,7 @@ impl Agent {
                         },
                     },
                     &effective_model,
-                    self.temperature,
+                    Some(self.temperature),
                 );
                 let chat_result = if let Some(ref token) = cancel_token {
                     tokio::select! {
@@ -1473,7 +1462,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<String> {
             Ok("ok".into())
         }
@@ -1482,7 +1471,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<zeroclaw_providers::ChatResponse> {
             let mut guard = self.responses.lock();
             if guard.is_empty() {
@@ -1509,7 +1498,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<String> {
             Ok("ok".into())
         }
@@ -1518,7 +1507,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<zeroclaw_providers::ChatResponse> {
             self.seen_models.lock().push(model.to_string());
             let mut guard = self.responses.lock();
@@ -1918,7 +1907,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<String> {
             Ok("ok".into())
         }
@@ -1927,7 +1916,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<zeroclaw_providers::ChatResponse> {
             self.tools_received.lock().push(request.tools.is_some());
             let mut count = self.call_count.lock();
@@ -1961,7 +1950,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             _options: zeroclaw_providers::traits::StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,

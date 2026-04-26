@@ -1379,7 +1379,7 @@ async fn run_gateway_chat_simple(
                 tools: None,
             },
             &state.model,
-            state.temperature,
+            Some(state.temperature),
         )
         .await
 }
@@ -2804,7 +2804,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("ok".into())

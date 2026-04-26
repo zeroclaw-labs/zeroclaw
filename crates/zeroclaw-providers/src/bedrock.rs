@@ -22,7 +22,6 @@ const ENDPOINT_PREFIX: &str = "bedrock-runtime";
 /// SigV4 signing service name (AWS uses "bedrock", not "bedrock-runtime").
 const SIGNING_SERVICE: &str = "bedrock";
 const DEFAULT_REGION: &str = "us-east-1";
-const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 // ── Authentication ──────────────────────────────────────────────
 
@@ -478,12 +477,12 @@ impl BedrockProvider {
         if let Some(token) = env_optional("BEDROCK_API_KEY") {
             return Self {
                 auth: Some(BedrockAuth::BearerToken(token)),
-                max_tokens: DEFAULT_MAX_TOKENS,
+                max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
             };
         }
         Self {
             auth: AwsCredentials::from_env().ok().map(BedrockAuth::SigV4),
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
         }
     }
 
@@ -492,13 +491,13 @@ impl BedrockProvider {
         if let Some(token) = env_optional("BEDROCK_API_KEY") {
             return Self {
                 auth: Some(BedrockAuth::BearerToken(token)),
-                max_tokens: DEFAULT_MAX_TOKENS,
+                max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
             };
         }
         let auth = AwsCredentials::resolve().await.ok().map(BedrockAuth::SigV4);
         Self {
             auth,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
         }
     }
 
@@ -506,7 +505,7 @@ impl BedrockProvider {
     pub fn with_bearer_token(token: &str) -> Self {
         Self {
             auth: Some(BedrockAuth::BearerToken(token.to_string())),
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
         }
     }
 
@@ -1106,8 +1105,9 @@ impl Provider for BedrockProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let auth = self.resolve_auth().await?;
 
         let system = system_prompt.map(|text| {
@@ -1149,8 +1149,9 @@ impl Provider for BedrockProvider {
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let auth = self.resolve_auth().await?;
 
         let (system_blocks, mut converse_messages) = Self::convert_messages(request.messages);
@@ -1376,11 +1377,11 @@ mod tests {
             let _env_lock = env_lock();
             BedrockProvider {
                 auth: None,
-                max_tokens: DEFAULT_MAX_TOKENS,
+                max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
             }
         };
         let result = provider
-            .chat_with_system(None, "hello", "anthropic.claude-sonnet-4-6", 0.7)
+            .chat_with_system(None, "hello", "anthropic.claude-sonnet-4-6", Some(0.7))
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1716,7 +1717,7 @@ mod tests {
     async fn warmup_without_credentials_is_noop() {
         let provider = BedrockProvider {
             auth: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
         };
         let result = provider.warmup().await;
         assert!(result.is_ok());
@@ -1726,7 +1727,7 @@ mod tests {
     fn capabilities_reports_native_tool_calling() {
         let provider = BedrockProvider {
             auth: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
         };
         let caps = provider.capabilities();
         assert!(caps.native_tool_calling);

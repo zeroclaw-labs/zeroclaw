@@ -395,7 +395,7 @@ impl KnowledgeGraph {
 
     /// Extract a subgraph starting from `root_id` up to `depth` hops.
     ///
-    /// `depth` must be between 1 and [`Self::MAX_SUBGRAPH_DEPTH`] (100).
+    /// `depth` must be between 1 and `MAX_SUBGRAPH_DEPTH` (100).
     /// Uses a recursive CTE for efficient single-query bidirectional traversal.
     pub fn get_subgraph(
         &self,

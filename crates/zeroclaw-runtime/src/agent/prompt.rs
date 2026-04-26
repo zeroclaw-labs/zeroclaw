@@ -1,5 +1,4 @@
 use crate::agent::personality;
-use crate::i18n::ToolDescriptions;
 use crate::identity;
 use crate::security::AutonomyLevel;
 use crate::skills::Skill;
@@ -18,9 +17,6 @@ pub struct PromptContext<'a> {
     pub skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     pub identity_config: Option<&'a IdentityConfig>,
     pub dispatcher_instructions: &'a str,
-    /// Locale-aware tool descriptions. When present, tool descriptions in
-    /// prompts are resolved from the locale file instead of hardcoded values.
-    pub tool_descriptions: Option<&'a ToolDescriptions>,
     /// Pre-rendered security policy summary for inclusion in the Safety
     /// prompt section.  When present, the LLM sees the concrete constraints
     /// (allowed commands, forbidden paths, autonomy level) so it can plan
@@ -146,10 +142,8 @@ impl PromptSection for ToolsSection {
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         let mut out = String::from("## Tools\n\n");
         for tool in ctx.tools {
-            let desc = ctx
-                .tool_descriptions
-                .and_then(|td: &ToolDescriptions| td.get(tool.name()))
-                .unwrap_or_else(|| tool.description());
+            let i18n_description = crate::i18n::get_tool_description(tool.name());
+            let desc = i18n_description.unwrap_or_else(|| tool.description());
             let _ = writeln!(
                 out,
                 "- **{}**: {}\n  Parameters: `{}`",
@@ -355,7 +349,7 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: Some(&identity_config),
             dispatcher_instructions: "",
-            tool_descriptions: None,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -386,7 +380,7 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
-            tool_descriptions: None,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -424,7 +418,7 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -466,7 +460,7 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -494,7 +488,7 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
-            tool_descriptions: None,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -535,7 +529,7 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -569,7 +563,7 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+
             security_summary: Some(summary.clone()),
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -604,7 +598,7 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
@@ -631,7 +625,7 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Full,
         };
@@ -666,7 +660,7 @@ mod tests {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
         };
