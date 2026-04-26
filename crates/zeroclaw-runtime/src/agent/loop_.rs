@@ -550,7 +550,7 @@ async fn consume_provider_streaming_response(
             tools: request_tools,
         },
         model,
-        temperature,
+        Some(temperature),
         zeroclaw_providers::traits::StreamOptions::new(true),
     );
     let mut outcome = StreamedChatOutcome::default();
@@ -1142,7 +1142,7 @@ pub async fn run_tool_call_loop(
                                 tools: request_tools,
                             },
                             active_model,
-                            temperature,
+                            Some(temperature),
                         );
                         if let Some(token) = cancellation_token.as_ref() {
                             tokio::select! {
@@ -1164,7 +1164,7 @@ pub async fn run_tool_call_loop(
                     tools: request_tools,
                 },
                 active_model,
-                temperature,
+                Some(temperature),
             );
 
             match pacing.step_timeout_secs {
@@ -2001,7 +2001,10 @@ pub async fn run_tool_call_loop(
         messages: history,
         tools: None, // No tools — force a text response
     };
-    match provider.chat(summary_request, model, temperature).await {
+    match provider
+        .chat(summary_request, model, Some(temperature))
+        .await
+    {
         Ok(resp) => {
             let text = resp.text.unwrap_or_default();
             if text.is_empty() {
@@ -3905,7 +3908,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("ok".to_string())
@@ -3931,7 +3934,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("ok".to_string())
@@ -3941,7 +3944,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let marker_count =
@@ -4002,7 +4005,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!("chat_with_system should not be used in scripted provider tests");
         }
@@ -4011,7 +4014,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             let mut responses = self
                 .responses
@@ -4048,7 +4051,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!(
                 "chat_with_system should not be used in streaming scripted provider tests"
@@ -4059,7 +4062,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("chat should not be called when streaming succeeds")
@@ -4073,7 +4076,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             options: StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
@@ -4136,7 +4139,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!(
                 "chat_with_system should not be used in streaming native tool event provider tests"
@@ -4147,7 +4150,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("chat should not be called when native streaming events succeed")
@@ -4165,7 +4168,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             options: StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
@@ -4225,7 +4228,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!("chat_with_system should not be used in route-aware stream tests");
         }
@@ -4234,7 +4237,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("chat should not be called when routed streaming succeeds")
@@ -4248,7 +4251,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             options: StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,

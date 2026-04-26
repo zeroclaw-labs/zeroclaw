@@ -18,6 +18,9 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
 
+/// Telnyx Inference Engine public endpoint.
+const BASE_URL: &str = "https://api.telnyx.com/v2/ai";
+
 /// Telnyx AI inference provider.
 ///
 /// Uses the OpenAI-compatible chat completions API at `/v2/ai/chat/completions`.
@@ -41,9 +44,6 @@ pub struct TelnyxProvider {
 }
 
 impl TelnyxProvider {
-    /// Telnyx AI API base URL
-    const BASE_URL: &'static str = "https://api.telnyx.com/v2/ai";
-
     /// Create a new Telnyx AI provider.
     ///
     /// The API key can be provided directly or will be resolved from:
@@ -77,7 +77,7 @@ impl TelnyxProvider {
 
         let response = self
             .client
-            .get(format!("{}/models", Self::BASE_URL))
+            .get(format!("{}/models", BASE_URL))
             .header("Authorization", format!("Bearer {}", api_key))
             .send()
             .await?;
@@ -93,7 +93,7 @@ impl TelnyxProvider {
 
     /// Build the chat completions URL
     fn chat_url(&self) -> String {
-        format!("{}/chat/completions", Self::BASE_URL)
+        format!("{}/chat/completions", BASE_URL)
     }
 }
 
@@ -167,13 +167,19 @@ struct ResponseMessage {
 
 #[async_trait]
 impl Provider for TelnyxProvider {
+    // ── Provider-family defaults ──
+    fn default_base_url(&self) -> Option<&str> {
+        Some(BASE_URL)
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let api_key = self.api_key.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Telnyx API key not set. Set TELNYX_API_KEY environment variable or run `zeroclaw onboard`."
@@ -230,8 +236,9 @@ impl Provider for TelnyxProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let api_key = self.api_key.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Telnyx API key not set. Set TELNYX_API_KEY environment variable or run `zeroclaw onboard`."
@@ -280,11 +287,7 @@ impl Provider for TelnyxProvider {
 
     async fn warmup(&self) -> anyhow::Result<()> {
         // Pre-warm the connection pool
-        let _ = self
-            .client
-            .get(format!("{}/models", Self::BASE_URL))
-            .send()
-            .await;
+        let _ = self.client.get(format!("{}/models", BASE_URL)).send().await;
         Ok(())
     }
 }

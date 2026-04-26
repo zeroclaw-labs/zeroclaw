@@ -740,7 +740,7 @@ mod tests {
                 _system_prompt: Option<&str>,
                 _message: &str,
                 _model: &str,
-                _temperature: f64,
+                _temperature: Option<f64>,
             ) -> anyhow::Result<String> {
                 Ok("fallback".into())
             }
@@ -749,7 +749,7 @@ mod tests {
                 &self,
                 request: ChatRequest<'_>,
                 _model: &str,
-                _temperature: f64,
+                _temperature: Option<f64>,
             ) -> anyhow::Result<ChatResponse> {
                 self.requests
                     .lock()

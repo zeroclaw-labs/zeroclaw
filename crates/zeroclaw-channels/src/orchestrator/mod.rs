@@ -2056,7 +2056,7 @@ async fn classify_channel_reply_intent(
     }
 
     let response = provider
-        .chat_with_system(Some(system_prompt), &convo, model, temperature)
+        .chat_with_system(Some(system_prompt), &convo, model, Some(temperature))
         .await?;
     let trimmed = response.trim();
     if trimmed.is_empty() {
@@ -4861,15 +4861,19 @@ fn collect_configured_channels(
     }
 
     if let Some(ref mc) = config.channels.mochat {
-        channels.push(ConfiguredChannel {
-            display_name: "Mochat",
-            channel: Arc::new(MochatChannel::new(
-                mc.api_url.clone(),
-                mc.api_token.clone(),
-                mc.allowed_users.clone(),
-                mc.poll_interval_secs,
-            )),
-        });
+        if mc.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "Mochat",
+                channel: Arc::new(MochatChannel::new(
+                    mc.api_url.clone(),
+                    mc.api_token.clone(),
+                    mc.allowed_users.clone(),
+                    mc.poll_interval_secs,
+                )),
+            });
+        } else {
+            tracing::info!("Mochat channel configured but disabled (enabled = false)");
+        }
     }
 
     if let Some(ref wc) = config.channels.wecom {
@@ -6484,7 +6488,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("ok".to_string())
         }
@@ -6501,7 +6505,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("NO_REPLY: not addressed to agent".to_string())
         }
@@ -6516,7 +6520,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("ok".to_string())
         }
@@ -6525,7 +6529,7 @@ mod tests {
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             if messages
                 .iter()
@@ -6690,7 +6694,7 @@ mod tests {
             _system_prompt: Option<&str>,
             message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             tokio::time::sleep(self.delay).await;
             Ok(format!("echo: {message}"))
@@ -6720,7 +6724,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(tool_call_payload())
         }
@@ -6729,7 +6733,7 @@ mod tests {
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let has_tool_results = messages
                 .iter()
@@ -6751,7 +6755,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(tool_call_payload_with_alias_tag())
         }
@@ -6760,7 +6764,7 @@ mod tests {
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let has_tool_results = messages
                 .iter()
@@ -6782,7 +6786,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("fallback".to_string())
         }
@@ -6791,7 +6795,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(r#"{"name":"mock_price","parameters":{"symbol":"BTC"}}
 {"result":{"symbol":"BTC","price_usd":65000}}
@@ -6820,7 +6824,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(tool_call_payload())
         }
@@ -6829,7 +6833,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let completed_iterations = Self::completed_tool_iterations(messages);
             if completed_iterations >= self.required_tool_iterations {
@@ -6854,7 +6858,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("fallback".to_string())
         }
@@ -6863,7 +6867,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let snapshot = messages
                 .iter()
@@ -6887,7 +6891,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("fallback".to_string())
         }
@@ -6896,7 +6900,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let snapshot = messages
                 .iter()
@@ -6927,7 +6931,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("fallback".to_string())
         }
@@ -6936,7 +6940,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &self,
             _messages: &[ChatMessage],
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             self.models

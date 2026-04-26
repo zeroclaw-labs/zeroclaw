@@ -13283,6 +13283,7 @@ name = "zeroclaw-config"
 version = "0.7.3"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chacha20poly1305",
  "chrono",
  "directories",
@@ -13677,6 +13678,7 @@ name = "zeroclaw-tui"
 version = "0.7.3"
 dependencies = [
  "anyhow",
+ "async-trait",
  "crossterm",
  "libc",
  "ratatui",

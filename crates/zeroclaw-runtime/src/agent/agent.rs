@@ -918,7 +918,7 @@ impl Agent {
                         },
                     },
                     &effective_model,
-                    self.temperature,
+                    Some(self.temperature),
                 )
                 .await
             {
@@ -1106,7 +1106,7 @@ impl Agent {
                     },
                 },
                 &effective_model,
-                self.temperature,
+                Some(self.temperature),
                 stream_opts,
             );
 
@@ -1240,7 +1240,7 @@ impl Agent {
                         },
                     },
                     &effective_model,
-                    self.temperature,
+                    Some(self.temperature),
                 );
                 let chat_result = if let Some(ref token) = cancel_token {
                     tokio::select! {
@@ -1462,7 +1462,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<String> {
             Ok("ok".into())
         }
@@ -1471,7 +1471,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<zeroclaw_providers::ChatResponse> {
             let mut guard = self.responses.lock();
             if guard.is_empty() {
@@ -1498,7 +1498,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<String> {
             Ok("ok".into())
         }
@@ -1507,7 +1507,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<zeroclaw_providers::ChatResponse> {
             self.seen_models.lock().push(model.to_string());
             let mut guard = self.responses.lock();
@@ -1907,7 +1907,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<String> {
             Ok("ok".into())
         }
@@ -1916,7 +1916,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<zeroclaw_providers::ChatResponse> {
             self.tools_received.lock().push(request.tools.is_some());
             let mut count = self.call_count.lock();
@@ -1950,7 +1950,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             _options: zeroclaw_providers::traits::StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,

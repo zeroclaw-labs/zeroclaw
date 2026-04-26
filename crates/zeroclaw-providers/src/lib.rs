@@ -27,6 +27,7 @@ pub mod gemini;
 pub mod gemini_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod kilocli;
+pub mod models_dev;
 pub mod multimodal;
 pub mod ollama;
 pub mod openai;

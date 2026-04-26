@@ -16,6 +16,11 @@ use zeroclaw_config::schema::{DelegateAgentConfig, DelegateToolConfig};
 use zeroclaw_memory::{Memory, NamespacedMemory};
 use zeroclaw_providers::{self, ChatMessage, Provider};
 
+/// Fallback temperature for sub-agent tool loops when the delegate config
+/// leaves it unset; matches the longstanding agentic default that balances
+/// coherence with enough variety to explore tool options.
+const DELEGATE_AGENTIC_DEFAULT_TEMPERATURE: f64 = 0.7;
+
 /// Serializable result of a background delegate task.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackgroundDelegateResult {
@@ -467,8 +472,6 @@ impl DelegateTool {
             format!("[Context]\n{context}\n\n[Task]\n{prompt}")
         };
 
-        let temperature = agent_config.temperature.unwrap_or(0.7);
-
         // Agentic mode: run full tool-call loop with allowlisted tools.
         if agent_config.agentic {
             return self
@@ -477,7 +480,9 @@ impl DelegateTool {
                     agent_config,
                     &*provider,
                     &full_prompt,
-                    temperature,
+                    agent_config
+                        .temperature
+                        .unwrap_or(DELEGATE_AGENTIC_DEFAULT_TEMPERATURE),
                 )
                 .await;
         }
@@ -497,7 +502,7 @@ impl DelegateTool {
                 system_prompt_ref,
                 &full_prompt,
                 &agent_config.model,
-                temperature,
+                agent_config.temperature,
             ),
         )
         .await;
@@ -1362,7 +1367,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("unused".to_string())
         }
@@ -1371,7 +1376,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             let has_tool_message = request.messages.iter().any(|m| m.role == "tool");
             if has_tool_message {
@@ -1405,7 +1410,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("unused".to_string())
         }
@@ -1414,7 +1419,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
                 text: None,
@@ -1438,7 +1443,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("unused".to_string())
         }
@@ -1447,7 +1452,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Err(anyhow!("provider boom"))
         }
@@ -1953,7 +1958,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("unused".to_string())
         }
@@ -1962,7 +1967,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             let has_tool_message = request.messages.iter().any(|m| m.role == "tool");
             if has_tool_message {

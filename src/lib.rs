@@ -77,8 +77,6 @@ pub mod nodes;
 #[cfg(feature = "agent-runtime")]
 pub mod observability;
 #[cfg(feature = "agent-runtime")]
-pub(crate) mod onboard;
-#[cfg(feature = "agent-runtime")]
 pub mod peripherals;
 #[cfg(feature = "agent-runtime")]
 pub mod platform;
@@ -99,8 +97,6 @@ pub mod sop;
 pub mod tools;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod trust;
-#[cfg(feature = "tui-onboarding")]
-pub mod tui;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod tunnel;
 #[cfg(feature = "agent-runtime")]

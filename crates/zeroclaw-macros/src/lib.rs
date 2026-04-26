@@ -287,6 +287,72 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     if <#value_ty>::prop_is_secret(name) { return true; }
                 });
 
+                // Path routing through HashMap<String, T>: the one parser
+                // lives in `crate::config::route_hashmap_path` so get/set
+                // don't duplicate it. Paths look like
+                // `<my_prefix>.<field>.<key>.<inner_suffix>`; on a hit the
+                // dispatch is forwarded to the value type's own get_prop /
+                // set_prop via its `configurable_prefix()`.
+                let field_name_lit = snake_to_kebab(&field_ident.to_string());
+                nested_get_prop.push(quote! {
+                    if let Some((hm_key, inner_name)) = crate::config::route_hashmap_path(
+                        name,
+                        Self::configurable_prefix(),
+                        #field_name_lit,
+                        <#value_ty>::configurable_prefix(),
+                    ) && let Some(inner) = self.#field_ident.get(hm_key)
+                        && let Ok(val) = inner.get_prop(&inner_name)
+                    {
+                        return Ok(val);
+                    }
+                });
+                nested_set_prop.push(quote! {
+                    if let Some((hm_key, inner_name)) = crate::config::route_hashmap_path(
+                        name,
+                        Self::configurable_prefix(),
+                        #field_name_lit,
+                        <#value_ty>::configurable_prefix(),
+                    ) && let Some(inner) = self.#field_ident.get_mut(hm_key)
+                        && let Ok(()) = inner.set_prop(&inner_name, value_str)
+                    {
+                        return Ok(());
+                    }
+                });
+
+                // Enumerate every HashMap entry and inject its runtime key
+                // into the child's static field paths: a child field named
+                // `<inner_prefix>.api-key` becomes
+                // `<my_prefix>.<field>.<hm_key>.api-key`. Without this, prop_fields()
+                // never surfaces e.g. `providers.models.anthropic.api-key`,
+                // so onboard has no way to prompt for it.
+                nested_prop_fields.push(quote! {
+                    {
+                        let inner_prefix = <#value_ty>::configurable_prefix();
+                        let outer_prefix = if Self::configurable_prefix().is_empty() {
+                            #field_name_lit.to_string()
+                        } else {
+                            format!("{}.{}", Self::configurable_prefix(), #field_name_lit)
+                        };
+                        for (hm_key, inner) in &self.#field_ident {
+                            let base = format!("{outer_prefix}.{hm_key}");
+                            for mut field in inner.prop_fields() {
+                                let leaf = field
+                                    .name
+                                    .strip_prefix(inner_prefix)
+                                    .and_then(|s| s.strip_prefix('.'))
+                                    .unwrap_or(field.name.as_str())
+                                    .to_string();
+                                field.name = if leaf.is_empty() {
+                                    base.clone()
+                                } else {
+                                    format!("{base}.{leaf}")
+                                };
+                                fields.push(field);
+                            }
+                        }
+                    }
+                });
+
                 continue;
             } else if is_option {
                 nested_collect.push(quote! {
@@ -443,6 +509,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let category_lit = &category;
         let type_str = field.ty.to_token_stream().to_string().replace(' ', "");
         let type_hint_lit = &type_str;
+        let description = extract_doc(&field.attrs);
+        let description_lit = description.as_str();
 
         // PropKind resolved at compile time via HasPropKind trait.
         // All field types must implement HasPropKind — scalars in traits.rs,
@@ -488,6 +556,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 #kind_token,
                 #is_secret,
                 #enum_variants_expr,
+                #description_lit,
             )
         });
     }
@@ -636,6 +705,32 @@ fn has_attr(field: &syn::Field, name: &str) -> bool {
 
 fn snake_to_kebab(s: &str) -> String {
     s.replace('_', "-")
+}
+
+/// Flatten a field's `///` doc comment into a single space-separated line.
+/// Empty string when the field has no doc comment.
+fn extract_doc(attrs: &[syn::Attribute]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for attr in attrs {
+        if !attr.path().is_ident("doc") {
+            continue;
+        }
+        let Meta::NameValue(nv) = &attr.meta else {
+            continue;
+        };
+        let syn::Expr::Lit(expr_lit) = &nv.value else {
+            continue;
+        };
+        let Lit::Str(lit_str) = &expr_lit.lit else {
+            continue;
+        };
+        let line = lit_str.value();
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+    parts.join(" ")
 }
 
 fn is_option_type(ty: &syn::Type) -> bool {

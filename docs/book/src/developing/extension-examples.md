@@ -200,7 +200,7 @@ impl Channel for TelegramChannel {
 
 Providers are LLM backend adapters. Each provider connects ZeroClaw to a different model API.
 
-**Required method**: `chat_with_system(system_prompt: Option<&str>, message: &str, model: &str, temperature: f64) -> Result<String>`.
+**Required method**: `chat_with_system(system_prompt: Option<&str>, message: &str, model: &str, temperature: Option<f64>) -> Result<String>`.
 Everything else has default implementations:
 `simple_chat()` and `chat_with_history()` delegate to `chat_with_system()`;
 `capabilities()` returns no native tool calling by default;
@@ -236,8 +236,9 @@ impl Provider for OllamaProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let url = format!("{}/api/generate", self.base_url);
 
         let mut body = serde_json::json!({

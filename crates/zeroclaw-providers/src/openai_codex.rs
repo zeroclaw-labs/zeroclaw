@@ -15,6 +15,8 @@ const CODEX_RESPONSES_URL_ENV: &str = "ZEROCLAW_CODEX_RESPONSES_URL";
 const CODEX_BASE_URL_ENV: &str = "ZEROCLAW_CODEX_BASE_URL";
 const DEFAULT_CODEX_INSTRUCTIONS: &str =
     "You are ZeroClaw, a concise and helpful coding assistant.";
+/// OpenAI Codex speaks the "responses" wire protocol, not chat_completions.
+const WIRE_API: &str = "responses";
 
 pub struct OpenAiCodexProvider {
     auth: AuthService,
@@ -719,6 +721,15 @@ impl OpenAiCodexProvider {
 
 #[async_trait]
 impl Provider for OpenAiCodexProvider {
+    // ── Provider-family defaults ──
+    fn default_wire_api(&self) -> &str {
+        WIRE_API
+    }
+
+    fn default_base_url(&self) -> Option<&str> {
+        Some(DEFAULT_CODEX_RESPONSES_URL)
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: false,
@@ -732,7 +743,7 @@ impl Provider for OpenAiCodexProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         // Build temporary messages array
         let mut messages = Vec::new();
@@ -754,7 +765,7 @@ impl Provider for OpenAiCodexProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         // Normalize image markers: convert file paths to data URIs
         let config = zeroclaw_config::schema::MultimodalConfig::default();
