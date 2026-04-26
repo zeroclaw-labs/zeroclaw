@@ -337,7 +337,11 @@ impl Scout for HttpJsonScout {
         };
 
         let items = self.parse_items(&body);
-        debug!(count = items.len(), source = self.source_label, "Parsed items");
+        debug!(
+            count = items.len(),
+            source = self.source_label,
+            "Parsed items"
+        );
         Ok(items)
     }
 }

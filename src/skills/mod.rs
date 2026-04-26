@@ -111,13 +111,14 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             let dispatcher =
                 registry::RegistryDispatcher::from_config(&config.skills, workspace_dir);
 
-            let (installed_dir, files_scanned) =
-                if let Some(result) = dispatcher.install(&source, &skills_path, config.skills.allow_scripts) {
-                    result.with_context(|| format!("failed to install skill: {source}"))?
-                } else {
-                    install_local_skill_source(&source, &skills_path, config.skills.allow_scripts)
-                        .with_context(|| format!("failed to install local skill source: {source}"))?
-                };
+            let (installed_dir, files_scanned) = if let Some(result) =
+                dispatcher.install(&source, &skills_path, config.skills.allow_scripts)
+            {
+                result.with_context(|| format!("failed to install skill: {source}"))?
+            } else {
+                install_local_skill_source(&source, &skills_path, config.skills.allow_scripts)
+                    .with_context(|| format!("failed to install local skill source: {source}"))?
+            };
             println!(
                 "  {} Skill installed and audited: {} ({} files scanned)",
                 console::style("✓").green().bold(),
@@ -172,10 +173,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                 println!("    zeroclaw skills install skillssh:<slug>");
             } else {
                 let capped = results.len().min(limit);
-                println!(
-                    "Found {} skill(s) matching '{query}':",
-                    capped
-                );
+                println!("Found {} skill(s) matching '{query}':", capped);
                 println!();
                 for result in results.iter().take(limit) {
                     println!(
@@ -185,10 +183,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                         result.description
                     );
                     if !result.source_url.is_empty() {
-                        println!(
-                            "    Install: zeroclaw skills install {}",
-                            result.source_url
-                        );
+                        println!("    Install: zeroclaw skills install {}", result.source_url);
                     }
                 }
             }
