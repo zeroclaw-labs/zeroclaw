@@ -87,6 +87,9 @@ Branch/commit/PR rules:
 
 ## Linked References
 
+- `../videoclaw-ops/docs/SKILL-ROLLOUT-AND-GITOPS-LESSONS.md` — when shipping
+  **skills baked into `zeroclaw-skills` image** or coordinating with
+  **agent-orchestrator / K8s** (two-step delivery, registry tags, Argo paths)
 - `@docs/contributing/change-playbooks.md` — adding providers, channels, tools, peripherals; security/gateway changes; architecture boundaries
 - `@docs/contributing/pr-discipline.md` — privacy rules, superseded-PR attribution/templates, handoff template
 - `@docs/contributing/docs-contract.md` — docs system contract, i18n rules, locale parity
