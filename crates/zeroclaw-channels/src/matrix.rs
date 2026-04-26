@@ -417,7 +417,122 @@ mod client {
         state_dir.join("store")
     }
 
+    /// Build the SDK client, handling all three of:
+    /// - normal restore from a consistent session.json + store/
+    /// - first-run fresh login
+    /// - corruption recovery (with password)
+    ///
+    /// Corruption signals (per matrix-sdk encryption.md and SDK source —
+    /// `manager.rs:237` for `SigningKeyChanged`, `mod.rs:683` for OTK
+    /// duplicates): the SDK rejects a device key update when the store and
+    /// server disagree, and offers no public API to selectively forget a
+    /// device record. The official remediation is "Clear storage to create
+    /// a new device". We do that automatically when password + user_id are
+    /// configured; otherwise we surface a clear error so the operator can
+    /// either provide a password or wipe state manually.
+    ///
+    /// Wrong-recovery-key failures are *not* a corruption signal — they're
+    /// an operator-config issue. We log them clearly and continue with
+    /// `bootstrap_cross_signing_if_needed`, which sets up fresh cross-signing
+    /// when no identity could be imported.
     pub(super) async fn build(config: &MatrixConfig, state_dir: &Path) -> Result<Client> {
+        build_attempt(config, state_dir, 0).await
+    }
+
+    fn wipe_state(state_dir: &Path) -> Result<()> {
+        let session = session::path(state_dir);
+        if session.exists()
+            && let Err(e) = std::fs::remove_file(&session)
+        {
+            return Err(anyhow!(
+                "matrix: failed to remove {} during corruption recovery: {e}. Fix permissions or wipe the directory manually.",
+                session.display()
+            ));
+        }
+        let store = store_dir(state_dir);
+        if store.exists()
+            && let Err(e) = std::fs::remove_dir_all(&store)
+        {
+            return Err(anyhow!(
+                "matrix: failed to remove {} during corruption recovery: {e}. Fix permissions or wipe the directory manually.",
+                store.display()
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn store_has_orphan_data(state_dir: &Path) -> bool {
+        let store = store_dir(state_dir);
+        let Ok(mut entries) = std::fs::read_dir(&store) else {
+            return false;
+        };
+        entries.any(|e| e.is_ok())
+    }
+
+    pub(super) fn can_password_relogin(config: &MatrixConfig) -> bool {
+        let has_password = config
+            .password
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let has_user_id = config
+            .user_id
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        has_password && has_user_id
+    }
+
+    async fn build_attempt(
+        config: &MatrixConfig,
+        state_dir: &Path,
+        recovery_attempts: u32,
+    ) -> Result<Client> {
+        // Hard recursion bound: at most one auto-wipe + relogin cycle per call.
+        if recovery_attempts > 1 {
+            bail!(
+                "matrix: corruption recovery looped — aborting to avoid an infinite restart cycle. \
+                 Wipe ~/.zeroclaw/state/matrix/ manually and restart."
+            );
+        }
+
+        let saved = session::load(state_dir)?;
+
+        // The saved device_id is canonical — it's what the server actually
+        // assigned at login. config.device_id is only a hint for first-ever
+        // login. If they drift (e.g. after auto-recovery generates a fresh
+        // device, or the operator edits config), warn but honor the saved
+        // value. Wiping on drift would create a recovery loop.
+        if let (Some(blob), Some(want)) = (
+            saved.as_ref(),
+            config.device_id.as_deref().filter(|s| !s.is_empty()),
+        ) && want != blob.device_id
+        {
+            warn!(
+                "matrix: configured channels.matrix.device-id ({want}) differs from the saved session ({}). \
+                 Honoring the saved device_id (canonical, assigned by the homeserver). \
+                 Update channels.matrix.device-id to match (or clear it) to silence this warning, \
+                 or wipe {} entirely to register a different device.",
+                blob.device_id,
+                state_dir.display(),
+            );
+        }
+
+        // Detect orphan crypto state — store data without a session blob.
+        // This typically happens after a manual `rm session.json` or when a
+        // prior install crashed mid-write. Restoring is impossible; logging
+        // in fresh on top of the orphan store reproduces the same
+        // SigningKeyChanged / Duplicate-OTK loop the user just hit.
+        if saved.is_none() && store_has_orphan_data(state_dir) {
+            return recover_or_bail(
+                config,
+                state_dir,
+                recovery_attempts,
+                "found crypto store data without a saved session.json — orphan state from a prior install or interrupted run.",
+            )
+            .await;
+        }
+
         let store = store_dir(state_dir);
         std::fs::create_dir_all(&store)
             .with_context(|| format!("create matrix store dir {}", store.display()))?;
@@ -429,106 +544,150 @@ mod client {
             .await
             .context("build matrix client")?;
 
-        let logged_in = match session::load(state_dir)? {
-            Some(blob) => {
-                let session = MatrixSession {
-                    meta: SessionMeta {
-                        user_id: blob.user_id.parse().context("parse stored user_id")?,
-                        device_id: blob.device_id.into(),
-                    },
-                    tokens: SessionTokens {
-                        access_token: blob.access_token,
-                        refresh_token: blob.refresh_token,
-                    },
-                };
-                client
-                    .matrix_auth()
-                    .restore_session(session, matrix_sdk::store::RoomLoadSettings::default())
-                    .await
-                    .context("restore matrix session from session.json")?;
-                info!("matrix: restored session from session.json");
-                true
+        // Step 1: restore an existing session, or fresh-login.
+        let mut fresh_login = false;
+        if let Some(blob) = saved {
+            let saved_device_id = blob.device_id.clone();
+            let session = MatrixSession {
+                meta: SessionMeta {
+                    user_id: blob.user_id.parse().context("parse stored user_id")?,
+                    device_id: blob.device_id.into(),
+                },
+                tokens: SessionTokens {
+                    access_token: blob.access_token,
+                    refresh_token: blob.refresh_token,
+                },
+            };
+            match client
+                .matrix_auth()
+                .restore_session(session, matrix_sdk::store::RoomLoadSettings::default())
+                .await
+            {
+                Ok(()) => info!("matrix: restored session from session.json"),
+                Err(e) => {
+                    // restore_session failed despite a matching device_id —
+                    // the access token is probably revoked, or the saved
+                    // session disagrees with the local crypto store.
+                    drop(client);
+                    return recover_or_bail(
+                        config,
+                        state_dir,
+                        recovery_attempts,
+                        &format!(
+                            "restore_session failed for device_id {saved_device_id}: {e}. \
+                             The access token is likely revoked or the local crypto store is inconsistent."
+                        ),
+                    )
+                    .await;
+                }
             }
-            None => false,
-        };
 
-        let mut bootstrap_attempted = false;
-        if !logged_in {
+            // Durable corruption signal: when the matrix-sdk encounters a
+            // duplicate-OTK upload (the server says it already has the
+            // one-time-keys we're trying to upload), it persists this flag
+            // (encryption/mod.rs:715-720). Per the SDK comment at line 691,
+            // this means "we forgot about some of our one-time keys. This
+            // will lead to UTDs." It survives restarts. The only way out is
+            // to wipe and re-login.
+            let otk_corruption_flagged = client
+                .state_store()
+                .get_kv_data(matrix_sdk::store::StateStoreDataKey::OneTimeKeyAlreadyUploaded)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+            if otk_corruption_flagged {
+                drop(client);
+                return recover_or_bail(
+                    config,
+                    state_dir,
+                    recovery_attempts,
+                    "matrix-sdk has flagged the local crypto store as out-of-sync with server-side one-time keys (StateStoreDataKey::OneTimeKeyAlreadyUploaded). The local store has lost track of OTKs that the server still records — fresh sends would fail to decrypt. The SDK has no in-place fix for this state.",
+                )
+                .await;
+            }
+        } else {
             login_fresh(&client, config).await?;
-            bootstrap_attempted = true;
-            if let Some(blob) = session_blob_from(&client) {
-                session::save(state_dir, &blob)?;
+            fresh_login = true;
+            if let Some(blob) = session_blob_from(&client)
+                && let Err(e) = session::save(state_dir, &blob)
+            {
+                warn!("matrix: failed to persist session.json: {e}");
             }
         }
 
+        // Step 2: import existing cross-signing + room keys from the
+        // homeserver's encrypted backup. Failure here (wrong recovery_key,
+        // missing backup, secret-storage rotated) is non-fatal — bootstrap
+        // below fills in fresh cross-signing instead. The operator should
+        // see the warning and either fix the recovery key or accept fresh
+        // bootstrap as the new baseline.
         if let Some(key) = config.recovery_key.as_deref()
             && !key.is_empty()
         {
             run_recovery(&client, key).await;
         }
 
-        if bootstrap_attempted
-            && let (Some(pw), Some(rk)) = (&config.password, &config.recovery_key)
-            && !pw.is_empty()
-            && !rk.is_empty()
+        // Step 3: ensure cross-signing is set up. Idempotent — a no-op when
+        // recover() imported an existing identity, fresh bootstrap otherwise.
+        if fresh_login
+            && let Some(pw) = config.password.as_deref().filter(|s| !s.is_empty())
             && let Some(user_id) = client.user_id()
         {
-            bootstrap_cross_signing(&client, user_id.as_str().to_string(), pw.clone()).await;
+            ensure_cross_signing(&client, user_id.as_str().to_string(), pw.to_string()).await;
         }
 
         Ok(client)
     }
 
-    async fn login_fresh(client: &Client, config: &MatrixConfig) -> Result<()> {
-        if !config.access_token.is_empty() {
-            let user_id = config
-                .user_id
-                .clone()
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    anyhow!("matrix.user_id is required when using access_token-based login")
-                })?
-                .parse()
-                .context("parse matrix.user_id")?;
-            let device_id = config
-                .device_id
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| format!("ZEROCLAW_{}", uuid::Uuid::new_v4().simple()));
-            let session = MatrixSession {
-                meta: SessionMeta {
-                    user_id,
-                    device_id: device_id.into(),
-                },
-                tokens: SessionTokens {
-                    access_token: config.access_token.clone(),
-                    refresh_token: None,
-                },
-            };
-            client
-                .matrix_auth()
-                .restore_session(session, matrix_sdk::store::RoomLoadSettings::default())
-                .await
-                .context("attach matrix session via access_token")?;
-            info!("matrix: logged in via access_token");
-            return Ok(());
+    /// Either auto-wipe + retry (when password + user_id are configured) or
+    /// bail with operator-actionable instructions.
+    async fn recover_or_bail(
+        config: &MatrixConfig,
+        state_dir: &Path,
+        recovery_attempts: u32,
+        reason: &str,
+    ) -> Result<Client> {
+        if can_password_relogin(config) {
+            warn!(
+                "matrix: {reason} Auto-recovering: wiping {} and re-authenticating with password.",
+                state_dir.display()
+            );
+            wipe_state(state_dir)?;
+            return Box::pin(build_attempt(config, state_dir, recovery_attempts + 1)).await;
         }
+        bail!(
+            "matrix: {reason}\n\
+             Cannot auto-recover because channels.matrix.password and channels.matrix.user-id are not both set.\n\
+             Either:\n  \
+             • configure channels.matrix.password (and user-id) so the next start can re-authenticate, or\n  \
+             • wipe the state directory manually:  rm -rf {}",
+            state_dir.display(),
+        );
+    }
 
+    async fn login_fresh(client: &Client, config: &MatrixConfig) -> Result<()> {
+        // Prefer password when set: it creates a server-side device matching
+        // `config.device_id`, so subsequent crypto operations don't fight with
+        // a token bound to a different device.
+        if let Some(pw) = config.password.as_deref().filter(|s| !s.is_empty()) {
+            return password_login(client, config, pw).await;
+        }
+        if !config.access_token.is_empty() {
+            return access_token_login(client, config).await;
+        }
+        bail!("matrix login requires either access_token or user_id+password")
+    }
+
+    async fn password_login(client: &Client, config: &MatrixConfig, password: &str) -> Result<()> {
         let user_id = config
             .user_id
             .clone()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow!("matrix.user_id is required for password login"))?;
-        let password = config
-            .password
-            .clone()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                anyhow!("matrix login requires either access_token or user_id+password")
-            })?;
         let mut login = client
             .matrix_auth()
-            .login_username(&user_id, &password)
+            .login_username(&user_id, password)
             .initial_device_display_name("ZeroClaw");
         if let Some(d) = config.device_id.as_deref()
             && !d.is_empty()
@@ -537,6 +696,40 @@ mod client {
         }
         login.send().await.context("password login failed")?;
         info!("matrix: logged in via password");
+        Ok(())
+    }
+
+    async fn access_token_login(client: &Client, config: &MatrixConfig) -> Result<()> {
+        let user_id = config
+            .user_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow!("matrix.user_id is required when using access_token-based login")
+            })?
+            .parse()
+            .context("parse matrix.user_id")?;
+        let device_id = config
+            .device_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("ZEROCLAW_{}", uuid::Uuid::new_v4().simple()));
+        let session = MatrixSession {
+            meta: SessionMeta {
+                user_id,
+                device_id: device_id.into(),
+            },
+            tokens: SessionTokens {
+                access_token: config.access_token.clone(),
+                refresh_token: None,
+            },
+        };
+        client
+            .matrix_auth()
+            .restore_session(session, matrix_sdk::store::RoomLoadSettings::default())
+            .await
+            .context("attach matrix session via access_token")?;
+        info!("matrix: logged in via access_token");
         Ok(())
     }
 
@@ -550,6 +743,10 @@ mod client {
         })
     }
 
+    /// Try to import cross-signing keys + room keys from the homeserver's
+    /// encrypted backup, decrypted by `key`. Logs success or failure; failure
+    /// is non-fatal (caller will fall through to `ensure_cross_signing`,
+    /// which bootstraps fresh keys if no identity was imported).
     async fn run_recovery(client: &Client, key: &str) {
         let recovery = client.encryption().recovery();
         if matches!(
@@ -560,24 +757,33 @@ mod client {
             return;
         }
         match recovery.recover(key).await {
-            Ok(()) => info!("matrix: E2EE recovery completed"),
-            Err(e) => warn!("matrix: E2EE recovery failed: {e}"),
+            Ok(()) => {
+                info!("matrix: E2EE recovery completed (cross-signing + room keys imported)")
+            }
+            Err(e) => warn!(
+                "matrix: E2EE recovery failed: {e} — ensure channels.matrix.recovery-key matches the homeserver's secret-storage key. Continuing with fresh bootstrap."
+            ),
         }
     }
 
-    async fn bootstrap_cross_signing(client: &Client, user_id: String, password: String) {
+    /// Ensure cross-signing is set up for this device. After a successful
+    /// `recover()`, the user identity already exists and this is a no-op.
+    /// On a brand-new account with no server-side backup, this bootstraps
+    /// fresh cross-signing keys (UIA-protected by `password`).
+    ///
+    /// We deliberately do *not* call `recovery().enable()` here: it would
+    /// generate a new secret-storage key and invalidate the user's
+    /// configured `recovery_key`.
+    async fn ensure_cross_signing(client: &Client, user_id: String, password: String) {
         let identifier = UserIdentifier::UserIdOrLocalpart(user_id);
         let auth_data = AuthData::Password(Password::new(identifier, password));
         match client
             .encryption()
-            .bootstrap_cross_signing(Some(auth_data))
+            .bootstrap_cross_signing_if_needed(Some(auth_data))
             .await
         {
-            Ok(()) => info!("matrix: cross-signing bootstrap completed"),
-            Err(e) => warn!("matrix: cross-signing bootstrap failed: {e}"),
-        }
-        if let Err(e) = client.encryption().recovery().enable().await {
-            warn!("matrix: recovery enable after cross-signing bootstrap failed: {e}");
+            Ok(()) => info!("matrix: cross-signing verified or bootstrapped"),
+            Err(e) => warn!("matrix: cross-signing setup failed: {e}"),
         }
     }
 
@@ -839,7 +1045,18 @@ mod inbound {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            thread_ts: thread_id.as_ref().map(|t| t.to_string()),
+            // Reply anchor: use the existing thread root when present,
+            // otherwise (when reply_in_thread is on) anchor a brand-new thread
+            // on this very event so the bot's reply opens a thread.
+            thread_ts: thread_id.as_ref().map(|t| t.to_string()).or_else(|| {
+                if ctx.config.reply_in_thread {
+                    Some(ev.event_id.to_string())
+                } else {
+                    None
+                }
+            }),
+            // Interruption scope is for cancellation grouping — only set when
+            // the inbound is genuinely *inside* a reply thread.
             interruption_scope_id: thread_id.as_ref().map(|t| t.to_string()),
             attachments,
         };
@@ -1922,6 +2139,74 @@ mod tests {
             let p = dir.path().join("session.json");
             std::fs::write(p, "{not valid json").unwrap();
             assert!(load(dir.path()).is_err());
+        }
+    }
+
+    mod auth_gating {
+        //! Pure-logic tests for the auth-flow gating helpers — keeps
+        //! corruption-recovery decisions verifiable without touching the SDK.
+
+        use super::super::client::{can_password_relogin, store_has_orphan_data};
+        use tempfile::TempDir;
+        use zeroclaw_config::schema::MatrixConfig;
+
+        fn cfg(password: Option<&str>, user_id: Option<&str>) -> MatrixConfig {
+            MatrixConfig {
+                enabled: true,
+                homeserver: "https://m.org".into(),
+                access_token: String::new(),
+                user_id: user_id.map(String::from),
+                device_id: None,
+                allowed_users: vec![],
+                allowed_rooms: vec![],
+                interrupt_on_new_message: false,
+                stream_mode: Default::default(),
+                draft_update_interval_ms: 1500,
+                multi_message_delay_ms: 800,
+                mention_only: false,
+                recovery_key: None,
+                password: password.map(String::from),
+                approval_timeout_secs: 300,
+                reply_in_thread: true,
+                ack_reactions: true,
+            }
+        }
+
+        #[test]
+        fn relogin_requires_both_password_and_user_id() {
+            assert!(can_password_relogin(&cfg(Some("pw"), Some("@bot:m"))));
+            assert!(!can_password_relogin(&cfg(None, Some("@bot:m"))));
+            assert!(!can_password_relogin(&cfg(Some("pw"), None)));
+            assert!(!can_password_relogin(&cfg(None, None)));
+        }
+
+        #[test]
+        fn relogin_rejects_empty_strings() {
+            assert!(!can_password_relogin(&cfg(Some(""), Some("@bot:m"))));
+            assert!(!can_password_relogin(&cfg(Some("pw"), Some(""))));
+        }
+
+        #[test]
+        fn orphan_detection_no_state_dir() {
+            let dir = TempDir::new().unwrap();
+            // store/ does not exist
+            assert!(!store_has_orphan_data(dir.path()));
+        }
+
+        #[test]
+        fn orphan_detection_empty_store() {
+            let dir = TempDir::new().unwrap();
+            std::fs::create_dir_all(dir.path().join("store")).unwrap();
+            assert!(!store_has_orphan_data(dir.path()));
+        }
+
+        #[test]
+        fn orphan_detection_populated_store() {
+            let dir = TempDir::new().unwrap();
+            let store = dir.path().join("store");
+            std::fs::create_dir_all(&store).unwrap();
+            std::fs::write(store.join("matrix-sdk-crypto.sqlite3"), b"x").unwrap();
+            assert!(store_has_orphan_data(dir.path()));
         }
     }
 
