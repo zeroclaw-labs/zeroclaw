@@ -53,8 +53,7 @@ class Candidate:
 
     @property
     def marker(self) -> str:
-        codes = ",".join(sorted(finding.code for finding in self.findings)) or "none"
-        return f"<!-- factory-inspector:{self.kind}:{self.target_type}:{self.target}:{codes} -->"
+        return f"<!-- factory-inspector:{self.kind}:{self.target_type}:{self.target} -->"
 
 
 class Gh:
@@ -197,7 +196,17 @@ def validation_incomplete(sections: dict[str, str]) -> bool:
     section = sections.get("Validation Evidence (required)", "")
     if section_is_placeholder(section):
         return True
-    command_tokens = ("cargo ", "python3 ", "actionlint", "bash ", "markdown", "mdbook", "npm ")
+    command_tokens = (
+        "./dev/ci.sh",
+        "scripts/ci/",
+        "cargo ",
+        "python3 ",
+        "actionlint",
+        "bash ",
+        "markdown",
+        "mdbook",
+        "npm ",
+    )
     return not any(token in section for token in command_tokens)
 
 
@@ -205,7 +214,8 @@ def security_incomplete(sections: dict[str, str]) -> bool:
     section = sections.get("Security & Privacy Impact (required)", "")
     if section_is_placeholder(section):
         return True
-    return "(`Yes/No`)" in section or section.count("Yes") + section.count("No") < 3
+    yes_no_answers = len(re.findall(r"(?i)\b(?:yes|no)\b", section))
+    return "(`Yes/No`)" in section or yes_no_answers < 3
 
 
 def rollback_incomplete(sections: dict[str, str]) -> bool:

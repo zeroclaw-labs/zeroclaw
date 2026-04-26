@@ -34,6 +34,7 @@ DEFAULT_CHECKS = (
 ISSUE_PROTECTED_LABELS = {
     "security",
     "risk: high",
+    "risk: manual",
     "type:rfc",
     "type:tracking",
     "status:blocked",
@@ -42,9 +43,11 @@ ISSUE_PROTECTED_LABELS = {
     "no-stale",
     "priority:critical",
 }
+PROTECTED_LABEL_PREFIXES = ("security:",)
 
 PR_PROTECTED_LABELS = {
     "risk: high",
+    "risk: manual",
     "status:blocked",
     "status:needs-maintainer-decision",
     "r:needs-maintainer-decision",
@@ -58,7 +61,7 @@ DUPLICATE_RE = re.compile(
     r"(?i)\b(?:duplicate of|duplicates|same as)\s+#(?P<number>\d+)\b"
 )
 SUPERSEDED_RE = re.compile(
-    r"(?i)\b(?:superseded by|replaced by|covered by)\s+#(?P<number>\d+)\b"
+    r"(?i)\b(?:superseded by|replaced by)\s+#(?P<number>\d+)\b"
 )
 BOT_LOGINS = {"github-actions", "dependabot", "dependabot[bot]"}
 MAINTAINER_ASSOCIATIONS = {"COLLABORATOR", "MEMBER", "OWNER"}
@@ -153,7 +156,7 @@ class Gh:
             "--limit",
             str(limit),
             "--json",
-            "number,title,body,labels,comments,mergedAt,state,url,isDraft,files",
+            "number,title,body,labels,comments,mergedAt,state,url,isDraft,files,baseRefName",
         )
 
     def pr_view(self, number: int) -> dict[str, Any]:
@@ -164,7 +167,7 @@ class Gh:
             "--repo",
             self.repo,
             "--json",
-            "number,title,body,labels,comments,mergedAt,state,url,isDraft,files",
+            "number,title,body,labels,comments,mergedAt,state,url,isDraft,files,baseRefName",
         )
 
     def issue_comment(self, number: int, body: str) -> str:
@@ -251,7 +254,14 @@ def label_names(item: dict[str, Any]) -> set[str]:
 
 
 def has_protected_labels(item: dict[str, Any], protected: set[str]) -> bool:
-    return bool(label_names(item) & protected)
+    labels = label_names(item)
+    if labels & protected:
+        return True
+    return any(
+        label.startswith(prefix)
+        for label in labels
+        for prefix in PROTECTED_LABEL_PREFIXES
+    )
 
 
 def text_of(item: dict[str, Any]) -> str:
@@ -329,6 +339,20 @@ def fixed_by_merged_pr_candidates(
         for issue_number in sorted(closing_refs(text_of(pr))):
             issue = open_issues.get(issue_number)
             if not issue:
+                continue
+            if pr.get("baseRefName") != "master":
+                candidates.append(
+                    Candidate(
+                        kind="fixed-by-merged-pr",
+                        decision="QUEUE_FOR_REVIEW",
+                        target_type="issue",
+                        target=issue_number,
+                        related=pr["number"],
+                        summary="Merged PR has closing keyword, but it did not target `master`.",
+                        evidence=[f"PR #{pr['number']} base branch is `{pr.get('baseRefName')}`."],
+                        url=issue.get("url"),
+                    )
+                )
                 continue
             if has_protected_labels(issue, ISSUE_PROTECTED_LABELS):
                 candidates.append(
@@ -512,10 +536,14 @@ def open_pr_link_candidates(
 ) -> list[Candidate]:
     candidates: list[Candidate] = []
     for pr in open_prs:
+        if has_protected_labels(pr, PR_PROTECTED_LABELS):
+            continue
         refs = closing_refs(text_of(pr))
         for issue_number in sorted(refs):
             issue = open_issues.get(issue_number)
             if not issue:
+                continue
+            if has_protected_labels(issue, ISSUE_PROTECTED_LABELS):
                 continue
             if issue_thread_mentions_pr(issue, pr["number"]):
                 continue

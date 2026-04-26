@@ -25,7 +25,7 @@ It must not:
 - approve, request changes, close, merge, edit branches, or edit PR bodies;
 - comment on semantic code correctness;
 - comment on issue intake automatically in the first version;
-- duplicate an earlier Factory Inspector comment with the same hidden marker.
+- duplicate an earlier Factory Inspector comment for the same PR intake check.
 
 ## High-Risk Paths
 

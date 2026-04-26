@@ -70,6 +70,7 @@ Allowed when:
 
 - An open PR explicitly mentions an open issue with `closes`, `fixes`, or `resolves`.
 - The issue thread does not already mention that PR.
+- Neither the issue nor the PR has protected labels.
 - A prior Factory Clerk marker for the same action is not already present, unless `--include-marked` is used.
 
 Comment only; never close until the PR merges.
@@ -83,7 +84,9 @@ Do not mutate from the script. Partial coverage requires an agent/human-written 
 Never close issues with any of these labels:
 
 - `security`
+- `security:*`
 - `risk: high`
+- `risk: manual`
 - `type:rfc`
 - `type:tracking`
 - `status:blocked`
@@ -94,7 +97,9 @@ Never close issues with any of these labels:
 
 Never close PRs with any of these labels:
 
+- `security:*`
 - `risk: high`
+- `risk: manual`
 - `status:blocked`
 - `status:needs-maintainer-decision`
 - `r:needs-maintainer-decision`
