@@ -46,6 +46,7 @@ ISSUE_PROTECTED_LABELS = {
 PROTECTED_LABEL_PREFIXES = ("security:",)
 
 PR_PROTECTED_LABELS = {
+    "security",
     "risk: high",
     "risk: manual",
     "status:blocked",
@@ -253,8 +254,12 @@ def label_names(item: dict[str, Any]) -> set[str]:
     return {label["name"] for label in item.get("labels", [])}
 
 
+def normalized_label_names(item: dict[str, Any]) -> set[str]:
+    return {name.strip().lower() for name in label_names(item)}
+
+
 def has_protected_labels(item: dict[str, Any], protected: set[str]) -> bool:
-    labels = label_names(item)
+    labels = normalized_label_names(item)
     if labels & protected:
         return True
     return any(

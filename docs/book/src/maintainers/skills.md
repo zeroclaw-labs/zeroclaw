@@ -86,6 +86,7 @@ Autonomous closure is limited to:
 - open PRs explicitly superseded by a merged PR.
 
 Similarity-only matches, partial coverage, competing config surfaces, and anything with protected labels are preview-only and must go through normal maintainer review.
+Protected label matching is case-insensitive; exact `security` and `security:*` labels are protected.
 
 Repeated runs are safe by default: comments include hidden Factory Clerk markers, and later runs skip candidates with matching markers unless `--include-marked` is passed.
 

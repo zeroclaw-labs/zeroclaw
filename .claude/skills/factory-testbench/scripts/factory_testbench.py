@@ -679,7 +679,7 @@ def labels_for(data: dict[str, Any], target_type: str, number: int) -> set[str]:
     collection = data.get("issues" if target_type == "issue" else "prs", [])
     for item in collection:
         if int(item["number"]) == number:
-            return {label["name"] for label in item.get("labels", [])}
+            return {label["name"].strip().lower() for label in item.get("labels", [])}
     return set()
 
 
@@ -761,6 +761,7 @@ def built_in_fixture() -> dict[str, Any]:
             {"number": 2, "title": "Duplicate", "body": "Same bug.", "labels": [], "comments": [maintainer], "state": "OPEN"},
             {"number": 3, "title": "Protected", "body": "Fixes from PR.", "labels": [{"name": "risk: high"}], "comments": [], "state": "OPEN"},
             {"number": 4, "title": "Fixed", "body": "Bug.", "labels": [], "comments": [], "state": "OPEN"},
+            {"number": 5, "title": "Protected mixed case", "body": "Fixes from PR.", "labels": [{"name": "Risk: High"}], "comments": [], "state": "OPEN"},
         ],
         "prs": [
             {
@@ -798,6 +799,42 @@ def built_in_fixture() -> dict[str, Any]:
                 "isDraft": False,
                 "files": [],
                 "baseRefName": "release/0.1",
+            },
+            {
+                "number": 13,
+                "title": "fix: protected mixed case",
+                "body": "Fixes #5",
+                "labels": [],
+                "comments": [],
+                "mergedAt": "2026-01-02T00:00:00Z",
+                "state": "MERGED",
+                "isDraft": False,
+                "files": [],
+                "baseRefName": "master",
+            },
+            {
+                "number": 20,
+                "title": "feat: security-sensitive branch",
+                "body": "Superseded by #21",
+                "labels": [{"name": "Security"}],
+                "comments": [],
+                "mergedAt": None,
+                "state": "OPEN",
+                "isDraft": False,
+                "files": [],
+                "baseRefName": "master",
+            },
+            {
+                "number": 21,
+                "title": "feat: replacement branch",
+                "body": "",
+                "labels": [],
+                "comments": [],
+                "mergedAt": "2026-01-02T00:00:00Z",
+                "state": "MERGED",
+                "isDraft": False,
+                "files": [],
+                "baseRefName": "master",
             },
         ],
     }

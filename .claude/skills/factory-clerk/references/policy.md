@@ -97,12 +97,15 @@ Never close issues with any of these labels:
 
 Never close PRs with any of these labels:
 
+- `security`
 - `security:*`
 - `risk: high`
 - `risk: manual`
 - `status:blocked`
 - `status:needs-maintainer-decision`
 - `r:needs-maintainer-decision`
+
+Protected label matching is case-insensitive.
 
 ## Similarity Candidates
 

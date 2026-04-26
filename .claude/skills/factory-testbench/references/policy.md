@@ -44,6 +44,8 @@ Replay must fail on:
 - any Inspector issue mutation candidate;
 - duplicate markers within one replay result.
 
+Protected label checks are case-insensitive in replay, matching the Clerk runtime behavior.
+
 ## Sandbox Scope
 
 Sandbox replay is allowed to:

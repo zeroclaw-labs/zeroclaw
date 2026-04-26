@@ -127,6 +127,10 @@ def label_names(item: dict[str, Any]) -> set[str]:
     return {label["name"] for label in item.get("labels", [])}
 
 
+def normalized_label_names(item: dict[str, Any]) -> set[str]:
+    return {name.strip().lower() for name in label_names(item)}
+
+
 def comments_text(item: dict[str, Any]) -> str:
     return "\n".join(comment.get("body") or "" for comment in item.get("comments", []))
 
@@ -247,7 +251,7 @@ def rollback_incomplete(sections: dict[str, str]) -> bool:
 def inspect_pr(pr: dict[str, Any]) -> Candidate | None:
     body = pr.get("body") or ""
     sections = section_map(body)
-    labels = label_names(pr)
+    labels = normalized_label_names(pr)
     findings: list[Finding] = []
 
     for required in REQUIRED_TEMPLATE_SECTIONS:
@@ -290,7 +294,7 @@ def inspect_pr(pr: dict[str, Any]) -> Candidate | None:
 
 
 def inspect_issue(issue: dict[str, Any]) -> Candidate | None:
-    labels = label_names(issue)
+    labels = normalized_label_names(issue)
     body = issue.get("body") or ""
     title = issue.get("title") or ""
     findings: list[Finding] = []
