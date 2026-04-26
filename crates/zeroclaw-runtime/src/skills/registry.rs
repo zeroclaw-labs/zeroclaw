@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
+use flate2::read::GzDecoder;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tar::Archive;
 use zip::ZipArchive;
 
 // ─── Shared types ────────────────────────────────────────────────────────────
@@ -146,6 +148,134 @@ pub fn install_http_zip_skill(
             Err(err)
         }
     }
+}
+
+/// Install a skill from a GitHub repo by downloading the repo tarball and
+/// extracting a single subdirectory (the skill). Tries common layouts:
+/// `skills/<skill>/`, `<skill>/`, then falls back to a recursive scan.
+pub fn install_github_subdir_skill(
+    owner: &str,
+    repo: &str,
+    skill: &str,
+    skills_path: &Path,
+    allow_scripts: bool,
+    registry_name: &str,
+) -> Result<(PathBuf, usize)> {
+    let dir_name = normalize_skill_name(skill);
+    let installed_dir = skills_path.join(&dir_name);
+    if installed_dir.exists() {
+        anyhow::bail!(
+            "Destination skill already exists: {}",
+            installed_dir.display()
+        );
+    }
+
+    // GitHub's codeload tarball URL — no auth required for public repos
+    let tarball_url = format!("https://codeload.github.com/{owner}/{repo}/tar.gz/HEAD");
+    let client = http_client()?;
+    let resp = client
+        .get(&tarball_url)
+        .send()
+        .with_context(|| format!("failed to fetch tarball from {tarball_url}"))?;
+
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        anyhow::bail!("{registry_name} (GitHub) rate limit reached (HTTP 429)");
+    }
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "{registry_name} download failed (HTTP {}): {tarball_url}",
+            resp.status()
+        );
+    }
+
+    let bytes = resp.bytes()?.to_vec();
+    if bytes.len() as u64 > MAX_ZIP_BYTES {
+        anyhow::bail!(
+            "{registry_name} tarball rejected: too large ({} bytes > {MAX_ZIP_BYTES})",
+            bytes.len()
+        );
+    }
+
+    // Decompress + extract in-memory; then locate the skill subdirectory and
+    // copy only that subdirectory into the destination.
+    let tmp = tempfile::tempdir().context("failed to create temp dir")?;
+    let gz = GzDecoder::new(Cursor::new(bytes));
+    let mut archive = Archive::new(gz);
+    archive.set_preserve_permissions(false);
+    archive
+        .unpack(tmp.path())
+        .with_context(|| format!("failed to extract {registry_name} tarball"))?;
+
+    // GitHub tarballs unpack to a single top-level dir like `<repo>-<sha>/`
+    let top_dir = std::fs::read_dir(tmp.path())?
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().is_dir())
+        .ok_or_else(|| anyhow::anyhow!("empty tarball from {registry_name}"))?
+        .path();
+
+    let candidates = [top_dir.join("skills").join(skill), top_dir.join(skill)];
+
+    let skill_src: PathBuf = candidates
+        .iter()
+        .find(|p| p.is_dir() && has_skill_manifest(p))
+        .cloned()
+        .or_else(|| candidates.iter().find(|p| p.is_dir()).cloned())
+        .or_else(|| walk_for_skill_dir(&top_dir, skill))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "skill '{skill}' not found in {owner}/{repo} (tried skills/{skill} and {skill})"
+            )
+        })?;
+
+    std::fs::create_dir_all(&installed_dir)?;
+    if let Err(err) = super::copy_dir_recursive_secure(&skill_src, &installed_dir) {
+        let _ = std::fs::remove_dir_all(&installed_dir);
+        return Err(err);
+    }
+
+    let has_manifest = installed_dir.join("SKILL.md").exists()
+        || installed_dir.join("SKILL.toml").exists()
+        || installed_dir.join("manifest.toml").exists();
+    if !has_manifest {
+        std::fs::write(
+            installed_dir.join("SKILL.toml"),
+            format!(
+                "[skill]\nname = \"{dir_name}\"\ndescription = \"{registry_name} skill from {owner}/{repo}\"\nversion = \"0.1.0\"\n"
+            ),
+        )?;
+    }
+
+    match super::enforce_skill_security_audit(&installed_dir, allow_scripts) {
+        Ok(report) => Ok((installed_dir, report.files_scanned)),
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&installed_dir);
+            Err(err)
+        }
+    }
+}
+
+fn has_skill_manifest(p: &Path) -> bool {
+    p.join("SKILL.md").exists() || p.join("SKILL.toml").exists() || p.join("manifest.toml").exists()
+}
+
+fn walk_for_skill_dir(root: &Path, skill: &str) -> Option<PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            if p.file_name().is_some_and(|n| n == skill) && has_skill_manifest(&p) {
+                return Some(p);
+            }
+            stack.push(p);
+        }
+    }
+    None
 }
 
 fn search_http_json_registry(
@@ -351,18 +481,19 @@ impl SkillRegistry for ClawhubRegistry {
 }
 
 // ─── agentskills.io registry ─────────────────────────────────────────────────
-
-const AGENTSKILLS_DOMAIN: &str = "agentskills.io";
-const AGENTSKILLS_WWW_DOMAIN: &str = "www.agentskills.io";
-const AGENTSKILLS_DOWNLOAD_API: &str = "https://agentskills.io/api/v1/download";
-const AGENTSKILLS_SEARCH_API: &str = "https://agentskills.io/api/v1/search";
+//
+// agentskills.io is the **specification** site (Mintlify docs only — no skill
+// download API). Skills following the agentskills format are indexed by
+// skills.sh and hosted on GitHub. This registry accepts
+// `agentskills:<owner>/<repo>/<skill>` as an alias for the same skillssh:
+// triplet so users who think of the spec name can still install.
 
 pub struct AgentSkillsIoRegistry;
 
 impl AgentSkillsIoRegistry {
     fn is_agentskills_host(host: &str) -> bool {
-        host.eq_ignore_ascii_case(AGENTSKILLS_DOMAIN)
-            || host.eq_ignore_ascii_case(AGENTSKILLS_WWW_DOMAIN)
+        host.eq_ignore_ascii_case("agentskills.io")
+            || host.eq_ignore_ascii_case("www.agentskills.io")
     }
 
     fn parse_url(source: &str) -> Option<reqwest::Url> {
@@ -376,51 +507,6 @@ impl AgentSkillsIoRegistry {
         }
         Some(parsed)
     }
-
-    fn download_url(source: &str) -> Result<String> {
-        if let Some(slug) = source.strip_prefix("agentskills:") {
-            let slug = slug.trim().trim_end_matches('/');
-            if slug.is_empty() {
-                anyhow::bail!(
-                    "invalid agentskills source '{source}': expected 'agentskills:<slug>'"
-                );
-            }
-            return Ok(format!("{AGENTSKILLS_DOWNLOAD_API}?slug={slug}"));
-        }
-
-        if let Some(parsed) = Self::parse_url(source) {
-            let path = parsed
-                .path_segments()
-                .into_iter()
-                .flatten()
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-                .join("/");
-            if path.is_empty() {
-                anyhow::bail!("could not extract slug from agentskills.io URL: {source}");
-            }
-            return Ok(format!("{AGENTSKILLS_DOWNLOAD_API}?slug={path}"));
-        }
-
-        anyhow::bail!("unrecognised agentskills.io source format: {source}")
-    }
-
-    fn skill_dir_name(source: &str) -> String {
-        if let Some(slug) = source.strip_prefix("agentskills:") {
-            let base = slug.trim().trim_end_matches('/');
-            let name = normalize_skill_name(base);
-            return if name.is_empty() {
-                "skill".into()
-            } else {
-                name
-            };
-        }
-        if let Some(parsed) = Self::parse_url(source) {
-            let segs: Vec<_> = parsed.path_segments().into_iter().flatten().collect();
-            return normalize_skill_name(segs.last().copied().unwrap_or("skill"));
-        }
-        "skill".into()
-    }
 }
 
 impl SkillRegistry for AgentSkillsIoRegistry {
@@ -432,8 +518,9 @@ impl SkillRegistry for AgentSkillsIoRegistry {
         source.starts_with("agentskills:") || Self::parse_url(source).is_some()
     }
 
+    /// agentskills.io is a docs site; route searches through skills.sh.
     fn search(&self, query: &str) -> Result<Vec<SkillSearchResult>> {
-        search_http_json_registry(AGENTSKILLS_SEARCH_API, query, "agentskills.io")
+        SkillsShRegistry.search(query)
     }
 
     fn install(
@@ -442,26 +529,44 @@ impl SkillRegistry for AgentSkillsIoRegistry {
         skills_path: &Path,
         allow_scripts: bool,
     ) -> Result<(PathBuf, usize)> {
-        let url = Self::download_url(source)?;
-        let dir_name = Self::skill_dir_name(source);
-        install_http_zip_skill(
-            &url,
-            &dir_name,
-            skills_path,
-            allow_scripts,
-            "agentskills.io",
-        )
+        // Translate the source into a skillssh: triplet and delegate.
+        let translated = if let Some(rest) = source.strip_prefix("agentskills:") {
+            format!("skillssh:{}", rest.trim().trim_matches('/'))
+        } else if let Some(parsed) = Self::parse_url(source) {
+            let path = parsed
+                .path_segments()
+                .into_iter()
+                .flatten()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("/");
+            format!("skillssh:{path}")
+        } else {
+            anyhow::bail!("unrecognised agentskills.io source format: {source}")
+        };
+        SkillsShRegistry.install(&translated, skills_path, allow_scripts)
     }
 }
 
 // ─── skills.sh registry ─────────────────────────────────────────────────────
+//
+// skills.sh is the de-facto agent-skills registry. Skills are indexed via its
+// JSON API and the actual content is hosted on GitHub. Identity for a skill is
+// the triplet `<owner>/<repo>/<skill>` — install resolves to the GitHub repo
+// `<owner>/<repo>` and extracts `skills/<skill>/` (or `<skill>/` at the root).
 
 const SKILLSSH_DOMAIN: &str = "skills.sh";
 const SKILLSSH_WWW_DOMAIN: &str = "www.skills.sh";
-const SKILLSSH_DOWNLOAD_API: &str = "https://skills.sh/api/v1/download";
-const SKILLSSH_SEARCH_API: &str = "https://skills.sh/api/v1/search";
+const SKILLSSH_SEARCH_API: &str = "https://skills.sh/api/search";
 
 pub struct SkillsShRegistry;
+
+#[derive(Debug, Clone)]
+struct SkillsShTriplet {
+    owner: String,
+    repo: String,
+    skill: String,
+}
 
 impl SkillsShRegistry {
     fn is_skillssh_host(host: &str) -> bool {
@@ -480,47 +585,60 @@ impl SkillsShRegistry {
         Some(parsed)
     }
 
-    fn download_url(source: &str) -> Result<String> {
-        if let Some(slug) = source.strip_prefix("skillssh:") {
-            let slug = slug.trim().trim_end_matches('/');
-            if slug.is_empty() {
-                anyhow::bail!("invalid skills.sh source '{source}': expected 'skillssh:<slug>'");
-            }
-            return Ok(format!("{SKILLSSH_DOWNLOAD_API}?slug={slug}"));
-        }
-
-        if let Some(parsed) = Self::parse_url(source) {
-            let path = parsed
+    /// Parse `<owner>/<repo>/<skill>` from a skillssh: prefix or skills.sh URL.
+    fn parse_triplet(source: &str) -> Result<SkillsShTriplet> {
+        let raw = if let Some(s) = source.strip_prefix("skillssh:") {
+            s.trim().trim_matches('/').to_string()
+        } else if let Some(parsed) = Self::parse_url(source) {
+            parsed
                 .path_segments()
                 .into_iter()
                 .flatten()
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
-                .join("/");
-            if path.is_empty() {
-                anyhow::bail!("could not extract slug from skills.sh URL: {source}");
-            }
-            return Ok(format!("{SKILLSSH_DOWNLOAD_API}?slug={path}"));
+                .join("/")
+        } else {
+            anyhow::bail!("unrecognised skills.sh source format: {source}")
+        };
+
+        let parts: Vec<&str> = raw.split('/').collect();
+        if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+            anyhow::bail!(
+                "invalid skills.sh source '{source}': expected '<owner>/<repo>/<skill>' (e.g. anthropics/skills/webapp-testing)"
+            );
         }
 
-        anyhow::bail!("unrecognised skills.sh source format: {source}")
+        Ok(SkillsShTriplet {
+            owner: parts[0].into(),
+            repo: parts[1].into(),
+            skill: parts[2].into(),
+        })
     }
 
-    fn skill_dir_name(source: &str) -> String {
-        if let Some(slug) = source.strip_prefix("skillssh:") {
-            let base = slug.trim().trim_end_matches('/');
-            let name = normalize_skill_name(base);
-            return if name.is_empty() {
-                "skill".into()
-            } else {
-                name
-            };
-        }
-        if let Some(parsed) = Self::parse_url(source) {
-            let segs: Vec<_> = parsed.path_segments().into_iter().flatten().collect();
-            return normalize_skill_name(segs.last().copied().unwrap_or("skill"));
-        }
-        "skill".into()
+    /// Parse skills.sh JSON search response into SkillSearchResult entries.
+    fn parse_search_response(body: &serde_json::Value) -> Vec<SkillSearchResult> {
+        let Some(items) = body.get("skills").and_then(|v| v.as_array()) else {
+            return vec![];
+        };
+        items
+            .iter()
+            .filter_map(|item| {
+                let name = item.get("name").and_then(|v| v.as_str())?.to_string();
+                let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let installs = item.get("installs").and_then(|v| v.as_u64()).unwrap_or(0);
+                Some(SkillSearchResult {
+                    name,
+                    description: if installs > 0 {
+                        format!("{installs} installs")
+                    } else {
+                        String::new()
+                    },
+                    registry: "skills.sh".into(),
+                    source_url: format!("skillssh:{id}"),
+                    version: None,
+                })
+            })
+            .collect()
     }
 }
 
@@ -534,7 +652,21 @@ impl SkillRegistry for SkillsShRegistry {
     }
 
     fn search(&self, query: &str) -> Result<Vec<SkillSearchResult>> {
-        search_http_json_registry(SKILLSSH_SEARCH_API, query, "skills.sh")
+        let client = http_client()?;
+        let url = format!("{SKILLSSH_SEARCH_API}?q={}", urlencoding::encode(query));
+        let resp = match client.get(&url).send() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("skills.sh search failed: {e}");
+                return Ok(vec![]);
+            }
+        };
+        if !resp.status().is_success() {
+            tracing::warn!("skills.sh search returned HTTP {}", resp.status());
+            return Ok(vec![]);
+        }
+        let body: serde_json::Value = resp.json().context("invalid JSON from skills.sh")?;
+        Ok(Self::parse_search_response(&body))
     }
 
     fn install(
@@ -543,9 +675,64 @@ impl SkillRegistry for SkillsShRegistry {
         skills_path: &Path,
         allow_scripts: bool,
     ) -> Result<(PathBuf, usize)> {
-        let url = Self::download_url(source)?;
-        let dir_name = Self::skill_dir_name(source);
-        install_http_zip_skill(&url, &dir_name, skills_path, allow_scripts, "skills.sh")
+        let t = Self::parse_triplet(source)?;
+        install_github_subdir_skill(
+            &t.owner,
+            &t.repo,
+            &t.skill,
+            skills_path,
+            allow_scripts,
+            "skills.sh",
+        )
+    }
+}
+
+// ─── GitHub direct-install registry ─────────────────────────────────────────
+//
+// `github:<owner>/<repo>/<skill>` — direct install from any GitHub repo
+// following the agent-skills convention (skills/<skill>/SKILL.md or
+// <skill>/SKILL.md at the repo root).
+
+pub struct GitHubSkillRegistry;
+
+impl SkillRegistry for GitHubSkillRegistry {
+    fn name(&self) -> &str {
+        "github"
+    }
+
+    fn matches_source(&self, source: &str) -> bool {
+        source.starts_with("github:")
+    }
+
+    fn search(&self, _query: &str) -> Result<Vec<SkillSearchResult>> {
+        Ok(vec![])
+    }
+
+    fn install(
+        &self,
+        source: &str,
+        skills_path: &Path,
+        allow_scripts: bool,
+    ) -> Result<(PathBuf, usize)> {
+        let raw = source
+            .strip_prefix("github:")
+            .unwrap_or("")
+            .trim()
+            .trim_matches('/');
+        let parts: Vec<&str> = raw.split('/').collect();
+        if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+            anyhow::bail!(
+                "invalid github source '{source}': expected 'github:<owner>/<repo>/<skill>'"
+            );
+        }
+        install_github_subdir_skill(
+            parts[0],
+            parts[1],
+            parts[2],
+            skills_path,
+            allow_scripts,
+            "github",
+        )
     }
 }
 
@@ -562,6 +749,7 @@ impl SkillRegistry for GitRegistry {
         if ClawhubRegistry.matches_source(source)
             || AgentSkillsIoRegistry.matches_source(source)
             || SkillsShRegistry.matches_source(source)
+            || GitHubSkillRegistry.matches_source(source)
         {
             return false;
         }
@@ -647,6 +835,7 @@ impl RegistryDispatcher {
             Box::new(ClawhubRegistry),
             Box::new(AgentSkillsIoRegistry),
             Box::new(SkillsShRegistry),
+            Box::new(GitHubSkillRegistry),
             Box::new(GitRegistry),
             Box::new(ZeroClawSkillsRegistry {
                 workspace_dir: workspace_dir.to_path_buf(),

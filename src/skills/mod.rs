@@ -108,10 +108,18 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             let skills_path = skills_dir(workspace_dir);
             std::fs::create_dir_all(&skills_path)?;
 
+            // Local paths win over registry dispatch. Prevents the bare
+            // `<owner>/<repo>` ClawHub shorthand from silently shadowing a
+            // user's relative directory of the same shape.
+            let local_dir_exists = std::path::Path::new(&source).is_dir();
+
             let dispatcher =
                 registry::RegistryDispatcher::from_config(&config.skills, workspace_dir);
 
-            let (installed_dir, files_scanned) = if let Some(result) =
+            let (installed_dir, files_scanned) = if local_dir_exists {
+                install_local_skill_source(&source, &skills_path, config.skills.allow_scripts)
+                    .with_context(|| format!("failed to install local skill source: {source}"))?
+            } else if let Some(result) =
                 dispatcher.install(&source, &skills_path, config.skills.allow_scripts)
             {
                 result.with_context(|| format!("failed to install skill: {source}"))?

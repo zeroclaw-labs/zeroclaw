@@ -1248,7 +1248,7 @@ fn remove_git_metadata(skill_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_dir_recursive_secure(src: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn copy_dir_recursive_secure(src: &Path, dest: &Path) -> Result<()> {
     let src_meta = std::fs::symlink_metadata(src)
         .with_context(|| format!("failed to read metadata for {}", src.display()))?;
     if src_meta.file_type().is_symlink() {
