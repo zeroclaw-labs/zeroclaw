@@ -5160,6 +5160,19 @@ pub async fn start_channels(config: Config) -> Result<()> {
         None,
     );
 
+    // Wire peripheral tools (gpio_read/gpio_write etc.) — same factory the
+    // agent loop uses. Without this, channel-driven sessions (Telegram, etc.)
+    // can't actuate hardware even when [peripherals] is configured.
+    let peripheral_tools =
+        zeroclaw_runtime::agent::loop_::load_peripheral_tools(config.peripherals.clone()).await;
+    if !peripheral_tools.is_empty() {
+        tracing::info!(
+            count = peripheral_tools.len(),
+            "Peripheral tools added (channels orchestrator)"
+        );
+        built_tools.extend(peripheral_tools);
+    }
+
     // Wire MCP tools into the registry before freezing — non-fatal.
     // When `deferred_loading` is enabled, MCP tools are NOT added eagerly.
     // Instead, a `tool_search` built-in is registered for on-demand loading.

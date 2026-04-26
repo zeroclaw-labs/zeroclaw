@@ -10,6 +10,14 @@ target
 docs
 examples
 tests
+# Web frontend — demo doesn't need it; production Dockerfile builds it separately.
+# Skipping cuts ~150 MB of node_modules from the build context.
+web
+node_modules
+
+# Hackathon demo: keep the esp32_sim example so the demo container can build it
+!crates/zeroclaw-hardware/examples
+!crates/zeroclaw-hardware/examples/**
 
 # Markdown files (README, CHANGELOG, etc.)
 *.md

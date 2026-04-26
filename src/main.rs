@@ -1440,6 +1440,16 @@ async fn main() -> Result<()> {
                 Box::new(zeroclaw_channels::cli::CliChannel::new())
             }));
 
+            // Wire peripheral tools (gpio_read/gpio_write from configured boards).
+            // Mirrors the Daemon handler — without this, `zeroclaw agent` never
+            // sees the peripheral, and tool dispatch fails with "Unknown tool".
+            #[cfg(feature = "hardware")]
+            zeroclaw_runtime::agent::loop_::register_peripheral_tools_fn(Box::new(|config| {
+                Box::pin(async move {
+                    zeroclaw_hardware::peripherals::create_peripheral_tools(&config).await
+                })
+            }));
+
             Box::pin(agent::run(
                 config,
                 message,

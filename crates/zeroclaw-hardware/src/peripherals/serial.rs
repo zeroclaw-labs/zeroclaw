@@ -24,6 +24,10 @@ const ALLOWED_PATH_PREFIXES: &[&str] = &[
     "/dev/tty.usbserial",
     "/dev/cu.usbserial", // Arduino Uno (FTDI), clones
     "COM",               // Windows
+    // Opt-in via `dev-sim` cargo feature: enables hardware-free simulation
+    // by allowing paths created by the `esp32_sim` example (socat / pty pair).
+    #[cfg(feature = "dev-sim")]
+    "/tmp/zc-sim-",
 ];
 
 fn is_path_allowed(path: &str) -> bool {
@@ -72,7 +76,7 @@ pub struct SerialTransport {
 const SERIAL_TIMEOUT_SECS: u64 = 5;
 
 impl SerialTransport {
-    async fn request(&self, cmd: &str, args: Value) -> anyhow::Result<ToolResult> {
+    pub(crate) async fn request(&self, cmd: &str, args: Value) -> anyhow::Result<ToolResult> {
         let mut port = self.port.lock().await;
         let resp = tokio::time::timeout(
             std::time::Duration::from_secs(SERIAL_TIMEOUT_SECS),
@@ -120,9 +124,14 @@ impl SerialPeripheral {
             .ok_or_else(|| anyhow::anyhow!("Serial peripheral requires path"))?;
 
         if !is_path_allowed(path) {
+            #[cfg(feature = "dev-sim")]
+            let hint = ", /tmp/zc-sim-*";
+            #[cfg(not(feature = "dev-sim"))]
+            let hint = "";
             anyhow::bail!(
-                "Serial path not allowed: {}. Allowed: /dev/ttyACM*, /dev/ttyUSB*, /dev/tty.usbmodem*, /dev/cu.usbmodem*",
-                path
+                "Serial path not allowed: {}. Allowed: /dev/ttyACM*, /dev/ttyUSB*, /dev/tty.usbmodem*, /dev/cu.usbmodem*{}",
+                path,
+                hint
             );
         }
 
@@ -200,7 +209,8 @@ impl Tool for GpioReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read the value (0 or 1) of a GPIO pin on a connected peripheral (e.g. STM32 Nucleo)"
+        "Read a GPIO pin value (0 or 1). PIN MAP: pin 5 = motion_sensor (input). \
+         Pins 2/12/13/14 are outputs, not readable here."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -239,7 +249,14 @@ impl Tool for GpioWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Set a GPIO pin high (1) or low (0) on a connected peripheral (e.g. turn on/off LED)"
+        "Set a GPIO pin high (1) or low (0) on the smart-room ESP32. \
+         PIN MAP for this specific board — pick from this list, do NOT invent or use training priors: \
+         pin 12 → reading_lamp (output), \
+         pin 13 → overhead_light (output), \
+         pin 14 → heater (output), \
+         pin 2  → fan ONLY (output) — pin 2 is NOT the lamp; do not pick pin 2 when the user asks for a lamp/light, \
+         pin 5  → motion_sensor (INPUT — use gpio_read instead). \
+         Match the user's device name to a pin from this list."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -248,11 +265,11 @@ impl Tool for GpioWriteTool {
             "properties": {
                 "pin": {
                     "type": "integer",
-                    "description": "GPIO pin number"
+                    "description": "GPIO pin number. Smart-room map: 12=reading_lamp, 13=overhead_light, 14=heater, 2=fan (NOT lamp). Pin 5 is motion_sensor input — use gpio_read for that."
                 },
                 "value": {
                     "type": "integer",
-                    "description": "0 for low, 1 for high"
+                    "description": "0 for low/off, 1 for high/on"
                 }
             },
             "required": ["pin", "value"]

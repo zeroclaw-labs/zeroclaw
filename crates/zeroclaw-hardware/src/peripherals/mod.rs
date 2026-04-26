@@ -17,6 +17,8 @@ pub mod capabilities_tool;
 #[cfg(feature = "hardware")]
 pub mod nucleo_flash;
 #[cfg(feature = "hardware")]
+pub mod smartroom;
+#[cfg(feature = "hardware")]
 pub mod uno_q_bridge;
 #[cfg(feature = "hardware")]
 pub mod uno_q_setup;
@@ -94,7 +96,8 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
                 if p.connect().await.is_err() {
                     tracing::warn!("Peripheral {} connect warning (continuing)", p.name());
                 }
-                serial_transports.push((board.board.clone(), p.transport()));
+                let transport = p.transport();
+                serial_transports.push((board.board.clone(), transport.clone()));
                 tools.extend(p.tools());
                 if board.board == "arduino-uno"
                     && let Some(ref path) = board.path
@@ -103,6 +106,17 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
                         path.clone(),
                     )));
                     tracing::info!("Arduino upload tool added (port: {})", path);
+                }
+                // Smart-room demo: high-level device-name tools that hide pin
+                // numbers from the LLM. Triggered by board=esp32 (the demo sim).
+                if board.board == "esp32" || board.board == "esp32-sim" {
+                    tools.push(Box::new(smartroom::SetDeviceTool {
+                        transport: transport.clone(),
+                    }));
+                    tools.push(Box::new(smartroom::ReadDeviceTool {
+                        transport: transport.clone(),
+                    }));
+                    tracing::info!("Smart-room device tools added (set_device, read_device)");
                 }
                 tracing::info!(board = %board.board, "Serial peripheral connected");
             }

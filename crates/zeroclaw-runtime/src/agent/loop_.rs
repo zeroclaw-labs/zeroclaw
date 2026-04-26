@@ -29,6 +29,19 @@ static PERIPHERAL_TOOLS_FN: std::sync::OnceLock<PeripheralToolsFn> = std::sync::
 pub fn register_peripheral_tools_fn(f: PeripheralToolsFn) {
     let _ = PERIPHERAL_TOOLS_FN.set(f);
 }
+
+/// Public helper for crates outside the runtime (channels orchestrator, etc.)
+/// to load peripheral tools through the registered factory. Returns an empty
+/// vec when no factory is registered (e.g. when `hardware` feature is off).
+pub async fn load_peripheral_tools(
+    config: zeroclaw_config::schema::PeripheralsConfig,
+) -> Vec<Box<dyn Tool>> {
+    if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
+        f(config).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
 use crate::cost::types::BudgetCheck;
 use crate::observability::{self, Observer, ObserverEvent, runtime_trace};
 use crate::platform;
