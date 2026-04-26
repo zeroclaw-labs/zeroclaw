@@ -2,8 +2,9 @@
 //!
 //! This module provides the multi-channel messaging infrastructure that connects
 //! ZeroClaw to external platforms. Each channel implements the [`Channel`] trait
-//! defined in [`traits`], which provides a uniform interface for sending messages,
-//! listening for incoming messages, health checking, and typing indicators.
+//! defined in the `traits` submodule, which provides a uniform interface for
+//! sending messages, listening for incoming messages, health checking, and typing
+//! indicators.
 //!
 //! Channels are instantiated by [`start_channels`] based on the runtime configuration.
 //! The subsystem manages per-sender conversation history, concurrent message processing
@@ -5238,16 +5239,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     let tools_registry = Arc::new(built_tools);
 
-    // ── Load locale-aware tool descriptions ────────────────────────
+    // ── Initialize locale-aware tool descriptions ──────────────────
     let i18n_locale = config
         .locale
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(zeroclaw_runtime::i18n::detect_locale);
-    let i18n_search_dirs = zeroclaw_runtime::i18n::default_search_dirs(&workspace);
-    let i18n_descs =
-        zeroclaw_runtime::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+    zeroclaw_runtime::i18n::init(&i18n_locale);
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -5343,10 +5342,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         config.agent.max_system_prompt_chars,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(
-            tools_registry.as_ref(),
-            Some(&i18n_descs),
-        ));
+        system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
     }
 
     // Append deferred MCP tool names so the LLM knows what is available
@@ -8953,7 +8949,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "build_system_prompt should not emit protocol block directly"
         );
 
-        prompt.push_str(&build_tool_instructions(&[], None));
+        prompt.push_str(&build_tool_instructions(&[]));
 
         assert_eq!(
             prompt.matches("## Tool Use Protocol").count(),

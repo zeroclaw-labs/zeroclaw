@@ -7,7 +7,7 @@
 //! so that user-facing keys remain stable.
 //!
 //! The subsystem supports resilient multi-provider configurations through the
-//! [`ReliableProvider`](reliable::ReliableProvider) wrapper, which handles fallback
+//! [`ReliableProvider`] wrapper, which handles fallback
 //! chains and automatic retry. Model routing across providers is available via
 //! [`create_routed_provider`].
 //!

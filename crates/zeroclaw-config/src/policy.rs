@@ -76,7 +76,7 @@ impl Clone for ActionTracker {
 ///
 /// Each unique sender key (Telegram thread ID, Discord channel, etc.) gets
 /// its own independent [`ActionTracker`] bucket. When no sender is in scope
-/// (cron jobs, CLI), the [`GLOBAL_KEY`] bucket is used.
+/// (cron jobs, CLI), the `GLOBAL_KEY` bucket is used.
 ///
 /// Note: sender buckets accumulate for the daemon lifetime with no eviction.
 /// This is acceptable for bounded sets of chat IDs; in high-cardinality deployments,

@@ -46,18 +46,61 @@ fn has_serde_skip(field: &syn::Field) -> bool {
 ///
 /// # Generated methods
 ///
-/// ## Secret methods (unchanged)
+/// ## Secret methods
 /// - `secret_fields(&self) -> Vec<SecretFieldInfo>`
 /// - `set_secret(&mut self, name: &str, value: String) -> Result<()>`
 /// - `encrypt_secrets(&mut self, store: &SecretStore) -> Result<()>`
 /// - `decrypt_secrets(&mut self, store: &SecretStore) -> Result<()>`
 ///
-/// ## Property methods (new)
+/// ## Property methods
 /// - `prop_fields(&self) -> Vec<PropFieldInfo>` — enumerate all fields
 /// - `get_prop(&self, name: &str) -> Result<String>` — get current value as string
 /// - `set_prop(&mut self, name: &str, value_str: &str) -> Result<()>` — parse string and set
 /// - `prop_is_secret(name: &str) -> bool` — static check
 /// - `init_defaults(&mut self, prefix: Option<&str>) -> Vec<&'static str>` — instantiate None nested sections
+///
+/// # Adding a new config struct
+///
+/// 1. Derive `Configurable` and `Default`, set `#[prefix]`, add `enabled` if the
+///    section is opt-in:
+///
+/// ```ignore
+/// use zeroclaw_macros::Configurable;
+///
+/// #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+/// #[prefix = "channels.your-channel"]
+/// pub struct YourChannelConfig {
+///     #[serde(default)]
+///     pub enabled: bool,
+///     #[secret]
+///     pub bot_token: String,
+///     #[secret]
+///     pub webhook_secret: Option<String>,
+///     pub room_id: String,
+/// }
+/// ```
+///
+/// 2. If the struct nests inside a parent (e.g. `ChannelsConfig`), add `#[nested]`
+///    on the parent's field so the tree traversal finds it.
+///
+/// 3. Field names convert from `snake_case` to `kebab-case` for CLI use.
+///    `bot_token` on a struct with `#[prefix = "channels.your-channel"]`
+///    becomes `channels.your-channel.bot-token`.
+///
+/// ## Enum fields
+///
+/// Enum types used as fields must implement `HasPropKind`. Add the type to the
+/// `impl_enum_prop_kind!` block in `crates/zeroclaw-config/src/schema.rs`, or
+/// implement `HasPropKind` at the enum's definition site:
+///
+/// ```ignore
+/// impl crate::config::HasPropKind for YourEnum {
+///     const PROP_KIND: crate::config::PropKind = crate::config::PropKind::Enum;
+/// }
+/// ```
+///
+/// Live examples: see `ChannelsConfig`, `ProvidersConfig`, and `MemoryConfig`
+/// in `crates/zeroclaw-config/src/schema.rs`.
 #[proc_macro_derive(Configurable, attributes(secret, nested, prefix, serde))]
 pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);

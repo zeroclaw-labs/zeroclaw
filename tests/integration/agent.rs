@@ -5,7 +5,7 @@
 //! external service dependencies. They complement the unit tests in
 //! `src/agent/tests.rs` by running at the integration test boundary.
 //!
-//! Ref: https://github.com/zeroclaw-labs/zeroclaw/issues/618 (item 6)
+//! Ref: <https://github.com/zeroclaw-labs/zeroclaw/issues/618> (item 6)
 
 use crate::support::helpers::{
     StaticMemoryLoader, build_agent, build_agent_xml, build_recording_agent, text_response,

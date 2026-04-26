@@ -1054,7 +1054,7 @@ impl DelegateTool {
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
-            tool_descriptions: None,
+
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
         };

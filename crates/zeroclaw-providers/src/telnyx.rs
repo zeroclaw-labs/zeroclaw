@@ -1,7 +1,7 @@
 //! Telnyx AI inference provider.
 //!
 //! Telnyx provides AI inference through an OpenAI-compatible API at
-//! https://api.telnyx.com/v2/ai with access to 53+ models including
+//! <https://api.telnyx.com/v2/ai> with access to 53+ models including
 //! GPT-4o, Claude, Llama, Mistral, and more.
 //!
 //! # Configuration

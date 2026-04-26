@@ -36,7 +36,7 @@
 )]
 
 use anyhow::{Context, Result, bail};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use dialoguer::{Password, Select};
 use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write};
@@ -49,12 +49,30 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     config::schema::validate_temperature(t)
 }
 
-fn print_no_command_help() -> Result<()> {
-    println!("No command provided.");
-    println!("Try `zeroclaw onboard` to initialize your workspace.");
+fn print_no_command_help(cmd: clap::Command) -> Result<()> {
+    #[cfg(feature = "agent-runtime")]
+    {
+        println!(
+            "{}",
+            crate::i18n::get_cli_string("cli-no-command-provided")
+                .as_deref()
+                .unwrap_or("No command provided.")
+        );
+        println!(
+            "{}",
+            crate::i18n::get_cli_string("cli-try-onboard")
+                .as_deref()
+                .unwrap_or("Try `zeroclaw onboard` to initialize your workspace.")
+        );
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        println!("No command provided.");
+        println!("Try `zeroclaw onboard` to initialize your workspace.");
+    }
     println!();
 
-    let mut cmd = Cli::command();
+    let mut cmd = cmd;
     cmd.print_help()?;
     println!();
 
@@ -129,6 +147,8 @@ mod platform;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
 mod providers;
+#[cfg(feature = "schema-export")]
+mod schema_markdown;
 #[cfg(feature = "agent-runtime")]
 mod security;
 #[cfg(feature = "agent-runtime")]
@@ -412,8 +432,8 @@ Examples:
   zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
   zeroclaw cron add-every 60000 'Ping heartbeat'
   zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
-  zeroclaw cron pause <task-id>
-  zeroclaw cron update <task-id> --expression '0 8 * * *' --tz Europe/London")]
+  zeroclaw cron pause TASK_ID
+  zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London")]
     Cron {
         #[command(subcommand)]
         cron_command: CronCommands,
@@ -526,7 +546,7 @@ Examples:
   zeroclaw memory stats
   zeroclaw memory list
   zeroclaw memory list --category core --limit 10
-  zeroclaw memory get <key>
+  zeroclaw memory get KEY
   zeroclaw memory clear --category conversation --yes")]
     Memory {
         #[command(subcommand)]
@@ -623,6 +643,14 @@ Examples:
         #[arg(value_enum)]
         shell: CompletionShell,
     },
+
+    /// Print the full CLI reference as Markdown (used by the docs pipeline).
+    #[command(hide = true)]
+    MarkdownHelp,
+
+    /// Print the config JSON Schema (used by the docs pipeline).
+    #[command(hide = true)]
+    MarkdownSchema,
 
     /// Launch or install the companion desktop app
     #[command(long_about = "\
@@ -929,6 +957,42 @@ enum MemoryCommands {
     },
 }
 
+fn apply_i18n_to_command(cmd: clap::Command) -> clap::Command {
+    #[cfg(feature = "agent-runtime")]
+    {
+        apply_cmd_translations(cmd, "cli")
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    cmd
+}
+
+#[cfg(feature = "agent-runtime")]
+fn apply_cmd_translations(cmd: clap::Command, prefix: &str) -> clap::Command {
+    let sub_names: Vec<String> = cmd
+        .get_subcommands()
+        .map(|s| s.get_name().to_string())
+        .collect();
+
+    let about_key = format!("{prefix}-about");
+    let cmd = match crate::i18n::get_cli_string(&about_key) {
+        Some(about) => cmd.about(about),
+        None => cmd,
+    };
+
+    let long_about_key = format!("{prefix}-long-about");
+    let cmd = match crate::i18n::get_cli_string(&long_about_key) {
+        Some(long_about) => cmd.long_about(long_about),
+        None => cmd,
+    };
+
+    let mut cmd = cmd;
+    for name in &sub_names {
+        let child_prefix = format!("{prefix}-{name}");
+        cmd = cmd.mut_subcommand(name, |sub| apply_cmd_translations(sub, &child_prefix));
+    }
+    cmd
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
@@ -940,11 +1004,16 @@ async fn main() -> Result<()> {
         eprintln!("Warning: Failed to install default crypto provider: {e:?}");
     }
 
+    #[cfg(feature = "agent-runtime")]
+    crate::i18n::init(&crate::i18n::detect_locale());
+
+    let cmd = apply_i18n_to_command(Cli::command());
+
     if std::env::args_os().len() <= 1 {
-        return print_no_command_help();
+        return print_no_command_help(cmd);
     }
 
-    let cli = Cli::parse();
+    let cli = Cli::from_arg_matches(&cmd.get_matches()).map_err(|e| e.exit())?;
 
     if let Some(config_dir) = &cli.config_dir {
         if config_dir.trim().is_empty() {
@@ -960,6 +1029,25 @@ async fn main() -> Result<()> {
         let mut stdout = std::io::stdout().lock();
         write_shell_completion(*shell, &mut stdout)?;
         return Ok(());
+    }
+
+    // Docs-pipeline subcommands: stdout-only, no config load, no logging init.
+    match &cli.command {
+        Commands::MarkdownHelp => {
+            clap_markdown::print_help_markdown::<Cli>();
+            return Ok(());
+        }
+        Commands::MarkdownSchema => {
+            #[cfg(feature = "schema-export")]
+            {
+                let schema = schemars::schema_for!(config::Config);
+                print!("{}", schema_markdown::generate(&schema.to_value()));
+                return Ok(());
+            }
+            #[cfg(not(feature = "schema-export"))]
+            anyhow::bail!("zeroclaw was built without the 'schema-export' feature");
+        }
+        _ => {}
     }
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO.
@@ -1205,7 +1293,9 @@ async fn main() -> Result<()> {
                 }
                 return Ok(());
             }
-            Commands::Completions { shell } => unreachable!(),
+            Commands::Completions { .. } | Commands::MarkdownHelp | Commands::MarkdownSchema => {
+                unreachable!()
+            }
             _ => {
                 anyhow::bail!(
                     "This command requires the full runtime. Rebuild with default features:\n  cargo build --release"
@@ -1216,7 +1306,10 @@ async fn main() -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     match cli.command {
-        Commands::Onboard { .. } | Commands::Completions { .. } => unreachable!(),
+        Commands::Onboard { .. }
+        | Commands::Completions { .. }
+        | Commands::MarkdownHelp
+        | Commands::MarkdownSchema => unreachable!(),
 
         Commands::Agent {
             message,
