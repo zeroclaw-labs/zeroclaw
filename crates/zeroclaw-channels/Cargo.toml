@@ -69,13 +69,18 @@ wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = f
 qrcode = { version = "0.14", optional = true }
 shellexpand = "3.1"
 
+# WeChat iLink (optional)
+aes = { version = "0.8", optional = true }
+ecb = { version = "0.1", optional = true }
+md5 = { version = "0.8", optional = true }
+
 [features]
 default = [
     "channel-discord", "channel-slack", "channel-signal", "channel-mattermost",
     "channel-irc", "channel-imessage", "channel-dingtalk", "channel-qq",
     "channel-bluesky", "channel-twitter", "channel-reddit", "channel-notion",
     "channel-linq", "channel-wati", "channel-nextcloud", "channel-mochat",
-    "channel-wecom", "channel-clawdtalk", "channel-webhook",
+    "channel-wechat", "channel-wecom", "channel-clawdtalk", "channel-webhook",
     "channel-whatsapp-cloud", "channel-voice-call",
 ]
 # Channels with optional deps
@@ -102,6 +107,7 @@ channel-linq = []
 channel-wati = []
 channel-nextcloud = []
 channel-mochat = []
+channel-wechat = ["dep:aes", "dep:ecb", "dep:md5", "dep:mime_guess", "dep:qrcode"]
 channel-wecom = []
 channel-clawdtalk = []
 channel-webhook = []

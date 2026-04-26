@@ -57,6 +57,8 @@ pub use crate::voice_call::VoiceCallChannel;
 pub use crate::voice_wake::VoiceWakeChannel;
 pub use crate::wati::WatiChannel;
 pub use crate::webhook::WebhookChannel;
+#[cfg(feature = "channel-wechat")]
+pub use crate::wechat::WeChatChannel;
 pub use crate::wecom::WeComChannel;
 pub use crate::whatsapp::WhatsAppChannel;
 pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
@@ -607,6 +609,14 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
                [VIDEO:<path-or-url>], [VOICE:<path-or-url>]\n\
              - Voice supports .wav, .mp3, .silk formats only. Other audio formats use [DOCUMENT:]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
+        "wechat" => Some(
+            "When responding on WeChat:\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
+               [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - Use absolute local paths when sending generated files whenever possible.\n",
         ),
         _ => None,
     }
@@ -4137,6 +4147,23 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 wc.allowed_users.clone(),
             )))
         }
+        #[cfg(feature = "channel-wechat")]
+        "wechat" => {
+            let wc = config
+                .channels
+                .wechat
+                .as_ref()
+                .context("WeChat channel is not configured")?;
+            Ok(Arc::new(
+                WeChatChannel::new(
+                    wc.allowed_users.clone(),
+                    wc.api_base_url.clone(),
+                    wc.cdn_base_url.clone(),
+                    wc.state_dir.as_ref().map(std::path::PathBuf::from),
+                )
+                .with_workspace_dir(config.workspace_dir.clone()),
+            ))
+        }
         "nextcloud_talk" | "nextcloud-talk" => {
             let nc = config
                 .channels
@@ -4887,6 +4914,26 @@ fn collect_configured_channels(
             });
         } else {
             tracing::info!("WeCom channel configured but disabled (enabled = false)");
+        }
+    }
+
+    #[cfg(feature = "channel-wechat")]
+    if let Some(ref wechat) = config.channels.wechat {
+        if wechat.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "WeChat",
+                channel: Arc::new(
+                    WeChatChannel::new(
+                        wechat.allowed_users.clone(),
+                        wechat.api_base_url.clone(),
+                        wechat.cdn_base_url.clone(),
+                        wechat.state_dir.as_ref().map(std::path::PathBuf::from),
+                    )
+                    .with_workspace_dir(config.workspace_dir.clone()),
+                ),
+            });
+        } else {
+            tracing::info!("WeChat channel configured but disabled (enabled = false)");
         }
     }
 

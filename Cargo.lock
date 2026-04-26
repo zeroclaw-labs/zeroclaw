@@ -13215,6 +13215,7 @@ dependencies = [
 name = "zeroclaw-channels"
 version = "0.7.3"
 dependencies = [
+ "aes",
  "anyhow",
  "async-imap",
  "async-trait",
@@ -13223,6 +13224,7 @@ dependencies = [
  "chrono",
  "cpal",
  "directories",
+ "ecb",
  "futures-util",
  "hex",
  "hmac 0.12.1",
@@ -13231,6 +13233,7 @@ dependencies = [
  "lru",
  "mail-parser",
  "matrix-sdk",
+ "md5",
  "mime_guess",
  "nanohtml2text",
  "nostr-sdk",

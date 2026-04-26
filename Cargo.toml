@@ -257,7 +257,7 @@ agent-runtime = [
     "channel-dingtalk", "channel-qq", "channel-bluesky",
     "channel-twitter", "channel-reddit", "channel-notion",
     "channel-linq", "channel-wati", "channel-nextcloud",
-    "channel-mochat", "channel-wecom", "channel-clawdtalk",
+    "channel-mochat", "channel-wechat", "channel-wecom", "channel-clawdtalk",
     "channel-webhook", "channel-acp-server", "channel-whatsapp-cloud",
     "channel-voice-call",
 ]
@@ -289,6 +289,7 @@ channel-linq = ["zeroclaw-channels/channel-linq"]
 channel-wati = ["zeroclaw-channels/channel-wati"]
 channel-nextcloud = ["zeroclaw-channels/channel-nextcloud"]
 channel-mochat = ["zeroclaw-channels/channel-mochat"]
+channel-wechat = ["zeroclaw-channels/channel-wechat"]
 channel-wecom = ["zeroclaw-channels/channel-wecom"]
 channel-clawdtalk = ["zeroclaw-channels/channel-clawdtalk"]
 channel-webhook = ["zeroclaw-channels/channel-webhook"]
