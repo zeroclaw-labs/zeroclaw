@@ -873,29 +873,35 @@ mod client {
         }
     }
 
+    /// Be lenient with `<anything>||<room-id-or-alias>` recipients (some
+    /// operators write cron `delivery.to` that way). Extracts the last
+    /// segment that looks like a Matrix room id (`!…`) or alias (`#…`).
+    /// Returns `(chosen, was_normalized)` so the caller can log a warning
+    /// when normalization actually triggered.
+    pub(super) fn normalize_recipient(id_or_alias: &str) -> (&str, bool) {
+        if !id_or_alias.contains("||") {
+            return (id_or_alias, false);
+        }
+        let chosen = id_or_alias
+            .split("||")
+            .map(str::trim)
+            .filter(|s| s.starts_with('!') || s.starts_with('#'))
+            .last()
+            .unwrap_or(id_or_alias);
+        (chosen, true)
+    }
+
     pub(super) async fn resolve_room(
         client: &Client,
         cache: &Arc<RwLock<HashMap<String, OwnedRoomId>>>,
         id_or_alias: &str,
     ) -> Result<OwnedRoomId> {
-        // Be lenient with `<anything>||<room-id-or-alias>` recipients (some
-        // operators write cron `delivery.to` that way). Extract the last
-        // segment that parses as a Matrix room id (`!…`) or alias (`#…`).
-        let id_or_alias = if id_or_alias.contains("||") {
-            let segments: Vec<&str> = id_or_alias.split("||").map(|s| s.trim()).collect();
-            let chosen = segments
-                .iter()
-                .rev()
-                .find(|s| s.starts_with('!') || s.starts_with('#'))
-                .copied()
-                .unwrap_or(id_or_alias);
+        let (id_or_alias, normalized) = normalize_recipient(id_or_alias);
+        if normalized {
             warn!(
-                "matrix: recipient {id_or_alias:?} contains `||`; using {chosen:?} as the room target. Update channels.matrix or cron `delivery.to` to a plain room id/alias to silence this warning."
+                "matrix: recipient contains `||`; using {id_or_alias:?} as the room target. Update channels.matrix or cron `delivery.to` to a plain room id/alias to silence this warning."
             );
-            chosen
-        } else {
-            id_or_alias
-        };
+        }
         if id_or_alias.starts_with('!') {
             return id_or_alias
                 .parse::<matrix_sdk::ruma::OwnedRoomId>()
@@ -1111,9 +1117,16 @@ mod inbound {
         };
 
         if let Some(info) = media_kind {
-            content =
-                attach_media(&room, &info, ctx.workspace_dir.as_deref(), &body, content, &raw, ctx.transcription.as_deref())
-                    .await;
+            content = attach_media(
+                &room,
+                &info,
+                ctx.workspace_dir.as_deref(),
+                &body,
+                content,
+                &raw,
+                ctx.transcription.as_deref(),
+            )
+            .await;
         } else if let Some(reply_target) = extract_in_reply_to(&raw) {
             // The current event has no media of its own but is a reply (often
             // mention-only text replying to a previously-ignored media event).
@@ -1134,9 +1147,7 @@ mod inbound {
                         .await;
                     }
                 }
-                Err(e) => debug!(
-                    "matrix: could not fetch in_reply_to parent {reply_target}: {e}"
-                ),
+                Err(e) => debug!("matrix: could not fetch in_reply_to parent {reply_target}: {e}"),
             }
         }
         let attachments: Vec<MediaAttachment> = Vec::new();
@@ -1268,20 +1279,14 @@ mod inbound {
         match save_media_to_workspace(room, info, workspace_dir).await {
             Ok(Some(path)) => {
                 let marker = format_media_marker(info, &path);
-                let placeholder = matches!(
-                    body_hint,
-                    "[image]" | "[file]" | "[audio]" | "[video]"
-                );
+                let placeholder = matches!(body_hint, "[image]" | "[file]" | "[audio]" | "[video]");
                 content = if body_hint.is_empty() {
                     if content.is_empty() {
                         marker
                     } else {
                         format!("{content}\n\n{marker}")
                     }
-                } else if placeholder
-                    || body_hint == info.file_name
-                    || content == body_hint
-                {
+                } else if placeholder || body_hint == info.file_name || content == body_hint {
                     marker
                 } else {
                     format!("{content}\n\n{marker}")
@@ -1310,7 +1315,7 @@ mod inbound {
     /// Walk a fetched timeline event's raw JSON looking for a media-typed
     /// `m.room.message` payload. Returns `None` if the event is not a
     /// recognized media message.
-    fn parent_media_info(
+    pub(super) fn parent_media_info(
         raw: matrix_sdk::ruma::serde::Raw<matrix_sdk::ruma::events::AnySyncTimelineEvent>,
     ) -> Option<MediaInfo> {
         let json: JsonValue = serde_json::from_str(raw.json().get()).ok()?;
@@ -1319,9 +1324,7 @@ mod inbound {
         let kind = match msgtype {
             "m.image" => MediaCategory::Image,
             "m.video" => MediaCategory::Video,
-            "m.audio" if content.get("org.matrix.msc3245.voice").is_some() => {
-                MediaCategory::Voice
-            }
+            "m.audio" if content.get("org.matrix.msc3245.voice").is_some() => MediaCategory::Voice,
             "m.audio" => MediaCategory::Audio,
             "m.file" => MediaCategory::File,
             _ => return None,
@@ -1342,9 +1345,9 @@ mod inbound {
                 serde_json::from_value(file.clone()).ok()?;
             matrix_sdk::ruma::events::room::MediaSource::Encrypted(Box::new(encrypted))
         } else if let Some(url) = content.get("url").and_then(|u| u.as_str()) {
-            matrix_sdk::ruma::events::room::MediaSource::Plain(
-                matrix_sdk::ruma::OwnedMxcUri::from(url),
-            )
+            matrix_sdk::ruma::events::room::MediaSource::Plain(matrix_sdk::ruma::OwnedMxcUri::from(
+                url,
+            ))
         } else {
             return None;
         };
@@ -2736,48 +2739,6 @@ mod tests {
         }
     }
 
-    mod cross_signing {
-        //! Cross-signing bootstrap is gated on (password.is_some()
-        //! && recovery_key.is_some() && fresh_login). This test asserts the
-        //! gating predicate, not the SDK call itself.
-
-        fn should_bootstrap(
-            password: Option<&str>,
-            recovery_key: Option<&str>,
-            fresh_login: bool,
-        ) -> bool {
-            fresh_login
-                && matches!(password, Some(p) if !p.is_empty())
-                && matches!(recovery_key, Some(r) if !r.is_empty())
-        }
-
-        #[test]
-        fn both_set_fresh_login() {
-            assert!(should_bootstrap(Some("pw"), Some("EsTk"), true));
-        }
-
-        #[test]
-        fn password_only() {
-            assert!(!should_bootstrap(Some("pw"), None, true));
-        }
-
-        #[test]
-        fn recovery_only() {
-            assert!(!should_bootstrap(None, Some("EsTk"), true));
-        }
-
-        #[test]
-        fn restored_session_skips_bootstrap() {
-            assert!(!should_bootstrap(Some("pw"), Some("EsTk"), false));
-        }
-
-        #[test]
-        fn empty_strings_dont_count() {
-            assert!(!should_bootstrap(Some(""), Some("EsTk"), true));
-            assert!(!should_bootstrap(Some("pw"), Some(""), true));
-        }
-    }
-
     mod voice {
         use super::super::inbound::is_voice_message;
         use matrix_sdk::event_handler::RawEvent;
@@ -2877,6 +2838,274 @@ mod tests {
                 "content": { "msgtype": "m.text", "body": "hi" }
             }));
             assert!(extract_mentions_user_ids(&r).is_none());
+        }
+    }
+
+    mod multi_streaming {
+        //! `next_paragraph_break` is the heart of MultiMessage streaming —
+        //! getting the code-fence detection wrong means agent code blocks
+        //! get split mid-block. These cover the corner cases.
+
+        use super::super::streaming::next_paragraph_break;
+
+        #[test]
+        fn no_break_returns_none() {
+            assert_eq!(next_paragraph_break("hello world"), None);
+        }
+
+        #[test]
+        fn single_break_at_offset() {
+            assert_eq!(next_paragraph_break("first\n\nsecond"), Some(5));
+        }
+
+        #[test]
+        fn first_break_when_multiple_present() {
+            // Caller is expected to consume +2 past the break, so reporting
+            // the *first* break is the correct contract — the loop emits one
+            // paragraph per iteration.
+            assert_eq!(next_paragraph_break("a\n\nb\n\nc"), Some(1));
+        }
+
+        #[test]
+        fn break_inside_code_fence_ignored() {
+            // The `\n\n` after "let x = 1;" is inside ```rust ... ``` and
+            // must not be treated as a paragraph boundary.
+            let text = "before\n\n```rust\nlet x = 1;\n\nlet y = 2;\n```\n\nafter";
+            let break_at = next_paragraph_break(text).expect("first break");
+            // First real break is the one between "before" and the fence.
+            assert_eq!(&text[..break_at], "before");
+        }
+
+        #[test]
+        fn break_after_closed_fence_detected() {
+            // Once the fence closes, subsequent `\n\n` should be detected.
+            let text = "```\ncode\n```\n\nafter";
+            assert_eq!(next_paragraph_break(text), Some(12));
+        }
+
+        #[test]
+        fn fence_must_be_at_line_start() {
+            // ``` mid-line is not a fence open — paragraph break still applies.
+            let text = "inline ``` not a fence\n\nafter";
+            assert!(next_paragraph_break(text).is_some());
+        }
+
+        #[test]
+        fn unicode_safe() {
+            // Byte offset must be on a char boundary so the caller's
+            // `text[..break_at]` slice doesn't panic.
+            let text = "héllo\n\nwörld";
+            let break_at = next_paragraph_break(text).expect("break");
+            assert!(text.is_char_boundary(break_at));
+            assert_eq!(&text[..break_at], "héllo");
+        }
+    }
+
+    mod in_reply_to {
+        //! Coverage for the mention-only "@bot can you see this image?"
+        //! flow: the inbound text event has no media of its own but its
+        //! `m.relates_to.m.in_reply_to.event_id` points at an earlier
+        //! media-only event the bot ignored.
+
+        use super::super::inbound::{extract_in_reply_to, parent_media_info};
+        use matrix_sdk::event_handler::RawEvent;
+        use matrix_sdk::ruma::events::AnySyncTimelineEvent;
+        use matrix_sdk::ruma::serde::Raw;
+
+        fn raw(json: serde_json::Value) -> RawEvent {
+            let r: Raw<serde_json::Value> = Raw::new(&json).expect("raw");
+            RawEvent(r.into_json())
+        }
+
+        fn parent_raw(json: serde_json::Value) -> Raw<AnySyncTimelineEvent> {
+            Raw::new(&json).expect("parent raw").cast_unchecked()
+        }
+
+        #[test]
+        fn in_reply_to_extracted_from_plain_reply() {
+            let r = raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "@bot can you see this?",
+                    "m.relates_to": {
+                        "m.in_reply_to": { "event_id": "$parent:server" }
+                    }
+                }
+            }));
+            let id = extract_in_reply_to(&r).expect("some");
+            assert_eq!(id.as_str(), "$parent:server");
+        }
+
+        #[test]
+        fn in_reply_to_extracted_from_threaded_reply() {
+            // Modern threaded replies nest m.in_reply_to *inside* the
+            // m.thread relation — extract_in_reply_to should handle both.
+            let r = raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "...",
+                    "m.relates_to": {
+                        "rel_type": "m.thread",
+                        "event_id": "$root:server",
+                        "m.in_reply_to": { "event_id": "$parent:server" }
+                    }
+                }
+            }));
+            let id = extract_in_reply_to(&r).expect("some");
+            assert_eq!(id.as_str(), "$parent:server");
+        }
+
+        #[test]
+        fn no_relation_returns_none() {
+            let r = raw(serde_json::json!({
+                "content": { "msgtype": "m.text", "body": "hi" }
+            }));
+            assert!(extract_in_reply_to(&r).is_none());
+        }
+
+        #[test]
+        fn parent_image_plain_url() {
+            let p = parent_raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.image",
+                    "body": "cat.jpg",
+                    "url": "mxc://example.org/abc",
+                    "info": { "mimetype": "image/jpeg" }
+                }
+            }));
+            let info = parent_media_info(p).expect("media info");
+            assert!(matches!(
+                info.kind,
+                super::super::inbound::MediaCategory::Image
+            ));
+            assert_eq!(info.file_name, "cat.jpg");
+            assert_eq!(info.mime.as_deref(), Some("image/jpeg"));
+        }
+
+        #[test]
+        fn parent_voice_distinguished_from_audio() {
+            let p = parent_raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "voice.ogg",
+                    "url": "mxc://example.org/v",
+                    "org.matrix.msc3245.voice": {}
+                }
+            }));
+            let info = parent_media_info(p).expect("media info");
+            assert!(matches!(
+                info.kind,
+                super::super::inbound::MediaCategory::Voice
+            ));
+        }
+
+        #[test]
+        fn parent_audio_without_voice_flag_is_audio() {
+            let p = parent_raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "song.mp3",
+                    "url": "mxc://example.org/m"
+                }
+            }));
+            let info = parent_media_info(p).expect("media info");
+            assert!(matches!(
+                info.kind,
+                super::super::inbound::MediaCategory::Audio
+            ));
+        }
+
+        #[test]
+        fn parent_encrypted_file_decoded() {
+            // The `file` key (instead of `url`) signals encrypted media —
+            // parent_media_info must decode it as MediaSource::Encrypted.
+            let p = parent_raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.image",
+                    "body": "secret.jpg",
+                    "info": { "mimetype": "image/jpeg" },
+                    "file": {
+                        "url": "mxc://example.org/enc",
+                        "v": "v2",
+                        "key": {
+                            "kty": "oct",
+                            "alg": "A256CTR",
+                            "ext": true,
+                            "k": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                            "key_ops": ["encrypt", "decrypt"]
+                        },
+                        "iv": "AAAAAAAAAAAAAAAAAAAAAA",
+                        "hashes": { "sha256": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8" }
+                    }
+                }
+            }));
+            let info = parent_media_info(p).expect("media info");
+            assert!(matches!(
+                info.kind,
+                super::super::inbound::MediaCategory::Image
+            ));
+            assert!(matches!(
+                info.source,
+                matrix_sdk::ruma::events::room::MediaSource::Encrypted(_)
+            ));
+        }
+
+        #[test]
+        fn parent_text_event_returns_none() {
+            let p = parent_raw(serde_json::json!({
+                "content": { "msgtype": "m.text", "body": "hi" }
+            }));
+            assert!(parent_media_info(p).is_none());
+        }
+    }
+
+    mod cron_recipient {
+        //! Cron operators sometimes write `delivery.to` as `<sender>||<room>`.
+        //! `client::normalize_recipient` extracts the last `!`/`#`-prefixed
+        //! segment and signals whether it changed anything.
+
+        use super::super::client::normalize_recipient;
+
+        #[test]
+        fn plain_room_id_unchanged() {
+            let (out, normalized) = normalize_recipient("!abc:server");
+            assert_eq!(out, "!abc:server");
+            assert!(!normalized);
+        }
+
+        #[test]
+        fn plain_alias_unchanged() {
+            let (out, normalized) = normalize_recipient("#room:server");
+            assert_eq!(out, "#room:server");
+            assert!(!normalized);
+        }
+
+        #[test]
+        fn sender_pipe_room_extracts_room() {
+            let (out, normalized) = normalize_recipient("@bot:server||!abc:server");
+            assert_eq!(out, "!abc:server");
+            assert!(normalized);
+        }
+
+        #[test]
+        fn whitespace_around_pipes_trimmed() {
+            let (out, _) = normalize_recipient("@bot:server || !abc:server ");
+            assert_eq!(out, "!abc:server");
+        }
+
+        #[test]
+        fn no_room_segment_falls_through_to_input() {
+            // If nothing in the split looks like a room, return the original
+            // so resolve_room's downstream parser produces a clear error.
+            let (out, normalized) = normalize_recipient("alice||bob");
+            assert_eq!(out, "alice||bob");
+            assert!(normalized);
+        }
+
+        #[test]
+        fn last_room_segment_wins() {
+            let (out, _) = normalize_recipient("!old:s||!new:s");
+            assert_eq!(out, "!new:s");
         }
     }
 }
