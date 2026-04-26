@@ -1301,6 +1301,7 @@ mod outbound {
     };
     use serde_json::json;
     use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
+    use tracing::warn;
 
     use super::{client, context as ctx_mod, markers};
     use zeroclaw_api::{channel::SendMessage, media::MediaAttachment};
@@ -1319,20 +1320,37 @@ mod outbound {
         let room =
             resolve_joined_room(outbox.client, outbox.alias_cache, &message.recipient).await?;
 
-        let (text, ms) = markers::parse(&message.content);
+        let (mut text, ms) = markers::parse(&message.content);
 
+        // Outbound attachments. SendMessage.attachments comes from the runtime's
+        // structured attachment list; missing/empty data is fatal there because
+        // the bytes were already in memory. Marker-driven uploads are best-
+        // effort: if a marker target can't be read or uploaded, log it and fall
+        // back to a textual note so the operator sees what the agent intended
+        // rather than a silently-dropped reply.
         for att in &message.attachments {
             upload_attachment(&room, att, AttachmentKind::Auto).await?;
         }
 
+        let mut failed_markers: Vec<String> = Vec::new();
         for marker in &ms {
-            let bytes = fetch_marker_bytes(&marker.target).await?;
             let kind = match marker.kind {
                 markers::MarkerKind::Image => AttachmentKind::Image,
                 markers::MarkerKind::Audio => AttachmentKind::Audio,
                 markers::MarkerKind::Video => AttachmentKind::Video,
                 markers::MarkerKind::File => AttachmentKind::File,
                 markers::MarkerKind::Voice => AttachmentKind::Voice,
+            };
+            let bytes = match fetch_marker_bytes(&marker.target).await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(
+                        "matrix: skipping outbound marker for {}: {e}",
+                        marker.target
+                    );
+                    failed_markers.push(marker.target.clone());
+                    continue;
+                }
             };
             let file_name = derive_file_name(&marker.target);
             let mime = mime_for(&file_name, &kind);
@@ -1341,7 +1359,30 @@ mod outbound {
                 data: bytes,
                 mime_type: Some(mime),
             };
-            upload_attachment(&room, &att, kind).await?;
+            if let Err(e) = upload_attachment(&room, &att, kind).await {
+                warn!(
+                    "matrix: skipping outbound marker for {} (upload failed): {e}",
+                    marker.target
+                );
+                failed_markers.push(marker.target.clone());
+            }
+        }
+
+        if !failed_markers.is_empty() {
+            let note = if failed_markers.len() == 1 {
+                format!(
+                    "(note: I couldn't deliver the file at {}.)",
+                    failed_markers[0]
+                )
+            } else {
+                let joined = failed_markers.join(", ");
+                format!("(note: I couldn't deliver these files: {joined}.)")
+            };
+            text = if text.trim().is_empty() {
+                note
+            } else {
+                format!("{text}\n\n{note}")
+            };
         }
 
         if text.trim().is_empty() {
