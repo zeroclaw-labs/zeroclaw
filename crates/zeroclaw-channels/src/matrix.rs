@@ -3573,11 +3573,12 @@ mod tests {
         use zeroclaw_config::schema::TranscriptionConfig;
 
         fn enabled_cfg() -> TranscriptionConfig {
-            // Construct via Default + flip the `enabled` flag so this stays
-            // robust to future field additions on TranscriptionConfig.
-            let mut cfg = TranscriptionConfig::default();
-            cfg.enabled = true;
-            cfg
+            // Construct via Default + struct update so we stay robust to
+            // future field additions on TranscriptionConfig.
+            TranscriptionConfig {
+                enabled: true,
+                ..TranscriptionConfig::default()
+            }
         }
 
         fn disabled_cfg() -> TranscriptionConfig {
