@@ -550,11 +550,7 @@ impl OnboardUi for RatatuiUi {
                 KeyEvent {
                     code: KeyCode::Down,
                     ..
-                } => {
-                    if cursor + 1 < matches.len() {
-                        cursor += 1;
-                    }
-                }
+                } if cursor + 1 < matches.len() => cursor += 1,
                 KeyEvent {
                     code: KeyCode::Backspace,
                     ..
