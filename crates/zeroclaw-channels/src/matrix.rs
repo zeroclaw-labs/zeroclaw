@@ -1503,6 +1503,7 @@ mod outbound {
     use std::{collections::HashMap, sync::Arc};
 
     use anyhow::{Context as _, Result, anyhow, bail};
+    use futures_util::StreamExt;
     use matrix_sdk::{
         Client, Room, RoomState,
         attachment::AttachmentConfig,
@@ -1523,6 +1524,9 @@ mod outbound {
         },
     };
     use serde_json::json;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+    use std::time::Duration;
     use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
     use tracing::warn;
 
@@ -1537,6 +1541,128 @@ mod outbound {
         pub threads_seen: &'a Arc<TokioRwLock<std::collections::HashSet<OwnedEventId>>>,
         pub reaction_log: &'a Arc<TokioMutex<HashMap<ReactionKey, OwnedEventId>>>,
         pub reply_in_thread: bool,
+        /// Workspace root that bounds local marker targets. Outbound marker
+        /// `[file:...]`/`[image:...]` paths must live inside this directory
+        /// after canonicalisation; any path that escapes is refused. None
+        /// means the channel was constructed without `with_workspace_dir`,
+        /// in which case all local markers are refused.
+        pub workspace_dir: Option<&'a Path>,
+    }
+
+    /// 8 MiB cap on the body of an HTTP marker fetch. Matches WebFetchTool's
+    /// streaming-cap pattern in `crates/zeroclaw-tools/src/web_fetch.rs`.
+    const MAX_MARKER_BYTES: usize = 8 * 1024 * 1024;
+    /// 30-second connect+request timeout for HTTP marker fetches. Bounds the
+    /// agent-driven fetch path so a hung target cannot stall the channel.
+    const MARKER_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Resolved marker fetch target after sandboxing. `Local` paths are
+    /// canonicalised and proven to live within the configured `workspace_dir`.
+    /// `Http` URLs have an explicit `http`/`https` scheme.
+    #[derive(Debug)]
+    pub(super) enum MarkerTarget {
+        Local(PathBuf),
+        Http(reqwest::Url),
+    }
+
+    /// Validate an outbound marker target against the trust boundary policy:
+    ///
+    /// * `http`/`https` URLs are accepted (their fetch is then bounded by
+    ///   `MAX_MARKER_BYTES` and `MARKER_HTTP_TIMEOUT` in `fetch_http`).
+    /// * Schemes other than `http`/`https` (`file:`, `data:`, anything with
+    ///   `://`) are refused outright.
+    /// * Local paths are canonicalised and must live inside `workspace_dir`.
+    ///   `..` traversal that escapes the workspace, or absolute paths outside
+    ///   it, are refused.
+    /// * Local paths require `workspace_dir` to be configured. Without it,
+    ///   the channel cannot make a safe path decision.
+    ///
+    /// Pure(ish) helper: does FS canonicalisation but no network I/O.
+    /// Unit-tested directly without a live SDK or HTTP server.
+    pub(super) fn validate_marker_target(
+        target: &str,
+        workspace_dir: Option<&Path>,
+    ) -> Result<MarkerTarget> {
+        if target.starts_with("http://") || target.starts_with("https://") {
+            let url = reqwest::Url::parse(target)
+                .with_context(|| format!("parse marker URL {target}"))?;
+            return Ok(MarkerTarget::Http(url));
+        }
+        // Anything else with a scheme that isn't a Windows drive letter is
+        // refused. `://` covers most URL forms; `data:` and `file:` get
+        // explicit checks because they don't use `//`.
+        if target.contains("://") {
+            let scheme = target.split("://").next().unwrap_or("?");
+            bail!(
+                "matrix: marker target uses disallowed scheme {scheme:?}; only http/https and workspace-relative paths are accepted"
+            );
+        }
+        if target.starts_with("data:") || target.starts_with("file:") {
+            bail!(
+                "matrix: marker target uses disallowed scheme; only http/https and workspace-relative paths are accepted"
+            );
+        }
+
+        let workspace = workspace_dir.ok_or_else(|| {
+            anyhow!(
+                "matrix: marker target {target} is a local path but the channel was started without a workspace_dir, refusing for safety"
+            )
+        })?;
+        let workspace_canon = std::fs::canonicalize(workspace)
+            .with_context(|| format!("canonicalize workspace {}", workspace.display()))?;
+
+        let target_path = Path::new(target);
+        let absolute = if target_path.is_absolute() {
+            target_path.to_path_buf()
+        } else {
+            workspace_canon.join(target_path)
+        };
+        let target_canon = std::fs::canonicalize(&absolute)
+            .with_context(|| format!("canonicalize marker target {target}"))?;
+
+        if !target_canon.starts_with(&workspace_canon) {
+            bail!(
+                "matrix: marker target {target} resolves to {} which is outside workspace_dir {}; refusing",
+                target_canon.display(),
+                workspace_canon.display(),
+            );
+        }
+        Ok(MarkerTarget::Local(target_canon))
+    }
+
+    fn marker_http_client() -> &'static reqwest::Client {
+        static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+        CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(MARKER_HTTP_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .user_agent("zeroclaw-matrix/1.0")
+                .build()
+                .expect("default reqwest client config never fails to build")
+        })
+    }
+
+    async fn fetch_http(url: reqwest::Url) -> Result<Vec<u8>> {
+        let client = marker_http_client();
+        let resp = client
+            .get(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("fetch marker URL {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            bail!("matrix: marker URL {url} returned HTTP status {status}");
+        }
+        let mut stream = resp.bytes_stream();
+        let mut buf = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.with_context(|| format!("stream chunk from {url}"))?;
+            if buf.len().saturating_add(chunk.len()) > MAX_MARKER_BYTES {
+                bail!("matrix: marker URL {url} exceeded {MAX_MARKER_BYTES}-byte cap; refusing");
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
     }
 
     pub(super) async fn send(outbox: &Outbox<'_>, message: &SendMessage) -> Result<OwnedEventId> {
@@ -1577,7 +1703,7 @@ mod outbound {
                 markers::MarkerKind::File => AttachmentKind::File,
                 markers::MarkerKind::Voice => AttachmentKind::Voice,
             };
-            let bytes = match fetch_marker_bytes(&marker.target).await {
+            let bytes = match fetch_marker_bytes(&marker.target, outbox.workspace_dir).await {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(
@@ -1859,19 +1985,25 @@ mod outbound {
         }
     }
 
-    async fn fetch_marker_bytes(target: &str) -> Result<Vec<u8>> {
-        if target.starts_with("http://") || target.starts_with("https://") {
-            let resp = reqwest::get(target)
+    /// Sandboxed outbound-marker fetcher. Resolves a marker target string via
+    /// `validate_marker_target` (see that function's docs for the trust
+    /// boundary policy), then performs a bounded fetch:
+    ///
+    /// * Local paths use async I/O via `tokio::fs::read` so the executor
+    ///   isn't blocked on disk reads.
+    /// * HTTP/HTTPS URLs go through a static `reqwest::Client` with a 30s
+    ///   timeout and a 5-redirect cap, with the response body streamed into
+    ///   an 8 MiB buffer that aborts on overflow.
+    pub(super) async fn fetch_marker_bytes(
+        target: &str,
+        workspace_dir: Option<&Path>,
+    ) -> Result<Vec<u8>> {
+        match validate_marker_target(target, workspace_dir)? {
+            MarkerTarget::Local(path) => tokio::fs::read(&path)
                 .await
-                .with_context(|| format!("fetch marker target {target}"))?;
-            let bytes = resp
-                .bytes()
-                .await
-                .with_context(|| format!("read marker bytes from {target}"))?;
-            return Ok(bytes.to_vec());
+                .with_context(|| format!("read marker file {}", path.display())),
+            MarkerTarget::Http(url) => fetch_http(url).await,
         }
-        let bytes = std::fs::read(target).with_context(|| format!("read marker file {target}"))?;
-        Ok(bytes)
     }
 }
 
@@ -1951,6 +2083,7 @@ impl MatrixChannel {
             threads_seen: &self.threads_seen,
             reaction_log: &self.reaction_log,
             reply_in_thread: self.config.reply_in_thread,
+            workspace_dir: self.workspace_dir.as_deref().map(|p| p.as_path()),
         }
     }
 
@@ -3106,6 +3239,159 @@ mod tests {
         fn last_room_segment_wins() {
             let (out, _) = normalize_recipient("!old:s||!new:s");
             assert_eq!(out, "!new:s");
+        }
+    }
+
+    mod outbound_sandbox {
+        //! Trust-boundary tests for `outbound::validate_marker_target`. The
+        //! marker target string comes from agent text and is therefore
+        //! untrusted; the sandbox must keep local reads inside `workspace_dir`
+        //! and refuse non-http(s) schemes outright.
+
+        use super::super::outbound::{MarkerTarget, validate_marker_target};
+        use tempfile::TempDir;
+
+        #[test]
+        fn accepts_workspace_path() {
+            let workspace = TempDir::new().unwrap();
+            let inside = workspace.path().join("photo.jpg");
+            std::fs::write(&inside, b"x").unwrap();
+            let result = validate_marker_target(inside.to_str().unwrap(), Some(workspace.path()));
+            match result.expect("validate") {
+                MarkerTarget::Local(p) => {
+                    assert!(p.starts_with(std::fs::canonicalize(workspace.path()).unwrap()));
+                }
+                _ => panic!("expected Local"),
+            }
+        }
+
+        #[test]
+        fn accepts_relative_workspace_path() {
+            let workspace = TempDir::new().unwrap();
+            let inside = workspace.path().join("photo.jpg");
+            std::fs::write(&inside, b"x").unwrap();
+            // Relative-to-workspace target — no `./` prefix; mimics the form
+            // an agent emits when it knows the workspace as cwd.
+            let result = validate_marker_target("photo.jpg", Some(workspace.path()));
+            match result.expect("validate") {
+                MarkerTarget::Local(_) => {}
+                _ => panic!("expected Local"),
+            }
+        }
+
+        #[test]
+        fn rejects_absolute_outside_workspace() {
+            let workspace = TempDir::new().unwrap();
+            // `/etc/hostname` exists on every Linux host; we don't actually
+            // read it, just canonicalise.
+            let result = validate_marker_target("/etc/hostname", Some(workspace.path()));
+            assert!(result.is_err(), "expected Err for /etc target");
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("outside workspace_dir"),
+                "expected 'outside workspace_dir' in error, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn rejects_dotdot_traversal() {
+            let workspace = TempDir::new().unwrap();
+            // Build a file outside the workspace, then try to reach it via
+            // `<workspace>/../<sibling-name>/file`.
+            let parent = workspace.path().parent().unwrap();
+            let outside_dir = parent.join("zeroclaw-test-outside");
+            let _ = std::fs::create_dir(&outside_dir);
+            let outside_file = outside_dir.join("secret");
+            std::fs::write(&outside_file, b"x").unwrap();
+            let traversal = format!(
+                "../{}/secret",
+                outside_dir.file_name().unwrap().to_str().unwrap()
+            );
+            let result = validate_marker_target(&traversal, Some(workspace.path()));
+            let _ = std::fs::remove_file(&outside_file);
+            let _ = std::fs::remove_dir(&outside_dir);
+            assert!(
+                result.is_err(),
+                "expected Err for `..` traversal escaping workspace"
+            );
+        }
+
+        #[test]
+        fn rejects_file_scheme() {
+            let workspace = TempDir::new().unwrap();
+            let result = validate_marker_target("file:///etc/hostname", Some(workspace.path()));
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("disallowed scheme"),
+                "expected scheme rejection, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn rejects_data_scheme() {
+            let workspace = TempDir::new().unwrap();
+            let result =
+                validate_marker_target("data:text/plain;base64,aGk=", Some(workspace.path()));
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("disallowed scheme"),
+                "expected scheme rejection, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn rejects_unknown_scheme() {
+            let workspace = TempDir::new().unwrap();
+            let result = validate_marker_target("ftp://example.com/x", Some(workspace.path()));
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("disallowed scheme"),
+                "expected scheme rejection, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn accepts_http_url() {
+            let workspace = TempDir::new().unwrap();
+            let result =
+                validate_marker_target("http://example.com/photo.jpg", Some(workspace.path()));
+            match result.expect("validate") {
+                MarkerTarget::Http(u) => assert_eq!(u.scheme(), "http"),
+                _ => panic!("expected Http"),
+            }
+        }
+
+        #[test]
+        fn accepts_https_url() {
+            let workspace = TempDir::new().unwrap();
+            let result =
+                validate_marker_target("https://example.com/photo.jpg", Some(workspace.path()));
+            match result.expect("validate") {
+                MarkerTarget::Http(u) => assert_eq!(u.scheme(), "https"),
+                _ => panic!("expected Http"),
+            }
+        }
+
+        #[test]
+        fn local_path_without_workspace_is_refused() {
+            // Operator forgot to wire `with_workspace_dir`. Local marker
+            // cannot be safely resolved — refuse rather than fall back to
+            // process cwd (which would be the daemon working dir, not the
+            // workspace).
+            let result = validate_marker_target("photo.jpg", None);
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("without a workspace_dir"),
+                "expected workspace_dir-not-configured error, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn http_url_works_without_workspace() {
+            // HTTP URLs don't depend on a workspace — they should succeed
+            // even when workspace_dir is None.
+            let result = validate_marker_target("https://example.com/x.jpg", None);
+            assert!(matches!(result, Ok(MarkerTarget::Http(_))));
         }
     }
 }
