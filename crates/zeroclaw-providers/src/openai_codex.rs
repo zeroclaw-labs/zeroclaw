@@ -1147,6 +1147,9 @@ data: [DONE]
             zeroclaw_dir: None,
             think: None,
             chat_template_kwargs: None,
+            ollama_num_ctx: None,
+            ollama_num_predict: None,
+            ollama_temperature_override: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
