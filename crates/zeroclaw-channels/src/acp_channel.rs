@@ -37,7 +37,11 @@ pub struct AcpChannel {
 impl AcpChannel {
     /// Build an ACP channel bound to a specific ACP session id and the
     /// server's outbound JSON-RPC plumbing.
-    pub fn new(name: impl Into<String>, session_id: impl Into<String>, rpc: Arc<RpcOutbound>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        session_id: impl Into<String>,
+        rpc: Arc<RpcOutbound>,
+    ) -> Self {
         Self {
             name: name.into(),
             session_id: session_id.into(),

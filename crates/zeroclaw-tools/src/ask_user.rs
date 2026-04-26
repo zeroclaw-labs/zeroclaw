@@ -184,7 +184,10 @@ impl Tool for AskUserTool {
         if let Some(ref choices_vec) = choices
             && !choices_vec.is_empty()
         {
-            match channel.request_choice(&question, choices_vec, timeout).await {
+            match channel
+                .request_choice(&question, choices_vec, timeout)
+                .await
+            {
                 Ok(Some(answer)) => {
                     return Ok(ToolResult {
                         success: true,

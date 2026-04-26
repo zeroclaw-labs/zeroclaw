@@ -1466,9 +1466,8 @@ async fn main() -> Result<()> {
             if let Some(timeout) = session_timeout {
                 acp_config.session_timeout_secs = timeout;
             }
-            let server = std::sync::Arc::new(channels::acp_server::AcpServer::new(
-                config, acp_config,
-            ));
+            let server =
+                std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config));
             server.run().await
         }
 
