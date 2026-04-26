@@ -89,6 +89,28 @@ impl Channel for AcpChannel {
         false
     }
 
+    async fn add_reaction(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+        _emoji: &str,
+    ) -> anyhow::Result<()> {
+        // ACP renders agent output as message chunks — there's no per-message
+        // reaction primitive in the protocol, so silently no-oping (the trait
+        // default) would falsely report success to the agent. Surface as Err
+        // so the `reaction` tool's caller sees the truth.
+        anyhow::bail!("AcpChannel does not support reactions")
+    }
+
+    async fn remove_reaction(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+        _emoji: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("AcpChannel does not support reactions")
+    }
+
     async fn request_choice(
         &self,
         question: &str,
@@ -215,6 +237,22 @@ mod tests {
         assert_eq!(v["params"]["update"]["content"]["text"], "hello");
         // Notifications must not have an id.
         assert!(v.get("id").is_none());
+    }
+
+    #[tokio::test]
+    async fn add_reaction_returns_error() {
+        let (rpc, _rx) = make_rpc();
+        let ch = AcpChannel::new("acp", "sess-1", rpc);
+        let res = ch.add_reaction("chan", "msg", "👍").await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_returns_error() {
+        let (rpc, _rx) = make_rpc();
+        let ch = AcpChannel::new("acp", "sess-1", rpc);
+        let res = ch.remove_reaction("chan", "msg", "👍").await;
+        assert!(res.is_err());
     }
 
     #[tokio::test]

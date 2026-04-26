@@ -282,6 +282,24 @@ impl Tool for EscalateToHumanTool {
             (name.clone(), ch.clone())
         };
 
+        // Channels without free-form `listen` support (e.g. ACP today, until
+        // the elicitation RFD lands) can't deliver the human's reply. Fail
+        // fast so the agent can route the escalation differently or proceed
+        // without blocking — the alternative is silently timing out for
+        // `timeout_secs` seconds.
+        // RFD: https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx
+        if wait_for_response && !channel.supports_free_form_ask() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Channel '{channel_name}' cannot receive a free-form reply, \
+                     so `wait_for_response` is unsupported (awaits ACP elicitation RFD). \
+                     Retry with `wait_for_response: false`."
+                )),
+            });
+        }
+
         // Send the escalation message
         let msg = SendMessage::new(&text, "");
         if let Err(e) = channel.send(&msg).await {
@@ -609,6 +627,99 @@ mod tests {
         assert!(!result.success);
         assert_eq!(result.output, "TIMEOUT");
         assert!(result.error.as_deref().unwrap().contains("1 seconds"));
+    }
+
+    /// Stub channel that mirrors ACP's constraint: `send` works, but
+    /// `listen` is unsupported and `supports_free_form_ask` reports false.
+    struct StructuredOnlyChannel {
+        channel_name: String,
+        sent: Arc<RwLock<Vec<String>>>,
+    }
+
+    impl StructuredOnlyChannel {
+        fn new(name: &str) -> Self {
+            Self {
+                channel_name: name.to_string(),
+                sent: Arc::new(RwLock::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Channel for StructuredOnlyChannel {
+        fn name(&self) -> &str {
+            &self.channel_name
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent.write().push(message.content.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("listen not supported")
+        }
+
+        fn supports_free_form_ask(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_response_fails_fast_on_structured_only_channel() {
+        // ACP-shaped channel: can't listen, so wait_for_response must fail
+        // immediately rather than timing out silently.
+        let stub = Arc::new(StructuredOnlyChannel::new("acp"));
+        let stub_clone: Arc<dyn Channel> = stub.clone();
+        let tool = make_tool_with_channels(vec![("acp", stub_clone)]);
+
+        let started = std::time::Instant::now();
+        let result = tool
+            .execute(json!({
+                "summary": "Need confirmation",
+                "wait_for_response": true,
+                "timeout_secs": 30,
+            }))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(!result.success, "expected failure, got: {:?}", result);
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("wait_for_response"),
+            "error should mention wait_for_response: {err}"
+        );
+        // Must fail fast — well under the 30s timeout.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "expected fast-fail; took {elapsed:?}"
+        );
+        // No message should have been sent — gate fires before send.
+        assert!(stub.sent.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_blocking_works_on_structured_only_channel() {
+        // The gate must NOT fire when wait_for_response is false — the
+        // escalation message itself goes through `send`, which ACP supports.
+        let stub = Arc::new(StructuredOnlyChannel::new("acp"));
+        let stub_clone: Arc<dyn Channel> = stub.clone();
+        let tool = make_tool_with_channels(vec![("acp", stub_clone)]);
+
+        let result = tool
+            .execute(json!({
+                "summary": "FYI: deploy started",
+                "urgency": "low",
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        assert_eq!(stub.sent.read().len(), 1);
     }
 
     // ── 10. test_pushover_not_required ──
