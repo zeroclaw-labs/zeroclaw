@@ -792,6 +792,24 @@ mod client {
         cache: &Arc<RwLock<HashMap<String, OwnedRoomId>>>,
         id_or_alias: &str,
     ) -> Result<OwnedRoomId> {
+        // Be lenient with `<anything>||<room-id-or-alias>` recipients (some
+        // operators write cron `delivery.to` that way). Extract the last
+        // segment that parses as a Matrix room id (`!…`) or alias (`#…`).
+        let id_or_alias = if id_or_alias.contains("||") {
+            let segments: Vec<&str> = id_or_alias.split("||").map(|s| s.trim()).collect();
+            let chosen = segments
+                .iter()
+                .rev()
+                .find(|s| s.starts_with('!') || s.starts_with('#'))
+                .copied()
+                .unwrap_or(id_or_alias);
+            warn!(
+                "matrix: recipient {id_or_alias:?} contains `||`; using {chosen:?} as the room target. Update channels.matrix or cron `delivery.to` to a plain room id/alias to silence this warning."
+            );
+            chosen
+        } else {
+            id_or_alias
+        };
         if id_or_alias.starts_with('!') {
             return id_or_alias
                 .parse::<matrix_sdk::ruma::OwnedRoomId>()
