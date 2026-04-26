@@ -2107,7 +2107,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<String> {
             Ok(String::new())
         }
@@ -2116,7 +2116,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> Result<zeroclaw_providers::ChatResponse> {
             Ok(zeroclaw_providers::ChatResponse {
                 text: Some(String::new()),
@@ -2130,7 +2130,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             _options: zeroclaw_providers::traits::StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
