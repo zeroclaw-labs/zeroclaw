@@ -182,6 +182,12 @@ mod mention {
 
 // ─── allowlist ─────────────────────────────────────────────────────────────
 mod allowlist {
+    /// Matrix user IDs are spec-lowercase for the localpart, but some
+    /// homeservers accept capitalised forms in the auth layer. An operator
+    /// who configured `allowed_users = ["@Bot:Example.org"]` would silently
+    /// see no messages on a strict byte match — the channel filters to
+    /// `@bot:example.org`. ASCII case-insensitive match is the conservative
+    /// reading.
     pub(super) fn user_allowed(allowed_users: &[String], sender: &str) -> bool {
         if allowed_users.is_empty() {
             return false;
@@ -189,7 +195,7 @@ mod allowlist {
         if allowed_users.iter().any(|u| u == "*") {
             return true;
         }
-        allowed_users.iter().any(|u| u == sender)
+        allowed_users.iter().any(|u| u.eq_ignore_ascii_case(sender))
     }
 
     pub(super) fn room_allowed_static(allowed_rooms: &[String], room_id: &str) -> bool {
@@ -2722,6 +2728,20 @@ mod tests {
         #[test]
         fn user_not_in_list_denied() {
             assert!(!user_allowed(&["@a:b".to_string()], "@c:d"));
+        }
+
+        #[test]
+        fn user_in_list_case_insensitive() {
+            // Operator-configured case shouldn't matter — Matrix MXIDs are
+            // spec-lowercase but tolerated in mixed case by some servers.
+            assert!(user_allowed(
+                &["@Bot:Example.org".to_string()],
+                "@bot:example.org"
+            ));
+            assert!(user_allowed(
+                &["@bot:example.org".to_string()],
+                "@Bot:EXAMPLE.org"
+            ));
         }
 
         #[test]
