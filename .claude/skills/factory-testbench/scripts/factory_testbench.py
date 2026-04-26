@@ -25,6 +25,9 @@ CLERK_PATH = ROOT / ".claude/skills/factory-clerk/scripts/factory_clerk.py"
 INSPECTOR_PATH = ROOT / ".claude/skills/factory-inspector/scripts/factory_inspector.py"
 FOREMAN_PATH = ROOT / ".claude/skills/factory-foreman/scripts/factory_foreman.py"
 REF_RE = re.compile(r"(?<![\w/.-])#(?P<number>\d+)\b")
+CLOSING_REF_RE = re.compile(
+    r"(?i)\b(?P<keyword>close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(?P<number>\d+)\b"
+)
 
 
 def load_module(path: Path, name: str) -> Any:
@@ -322,9 +325,27 @@ def rewrite_refs(text: str, number_map: dict[int, int]) -> str:
     return REF_RE.sub(replace, text or "")
 
 
-def sandbox_body(kind: str, source_repo: str, item: dict[str, Any], number_map: dict[int, int]) -> str:
+def neutralize_closing_refs(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        return (
+            f"sandbox reference #{match.group('number')} "
+            f"(original closing keyword: {match.group('keyword')})"
+        )
+
+    return CLOSING_REF_RE.sub(replace, text)
+
+
+def sandbox_body(
+    kind: str,
+    source_repo: str,
+    item: dict[str, Any],
+    number_map: dict[int, int],
+    neutralize_closing: bool = False,
+) -> str:
     marker = compact_metadata(kind, source_repo, item)
     original = rewrite_refs(item.get("body") or "", number_map)
+    if neutralize_closing:
+        original = neutralize_closing_refs(original)
     header = [
         f"<!-- factory-sandbox:original:{marker} -->",
         f"Factory sandbox replay of `{source_repo}#{item.get('number')}`.",
@@ -439,7 +460,7 @@ def create_sandbox_prs(
         original = int(pr["number"])
         base = ensure_base_branch(clone_dir, pr.get("baseRefName") or "master")
         branch = create_sandbox_branch(clone_dir, pr, base)
-        placeholder = sandbox_body("pr", source_repo, pr, issue_map)
+        placeholder = sandbox_body("pr", source_repo, pr, issue_map, neutralize_closing=True)
         args = [
             "pr",
             "create",
@@ -851,6 +872,15 @@ def run_fixture_test(args: argparse.Namespace) -> dict[str, Any]:
     failures = list(payload["invariants"]["failures"])
     if auto_closes != expected:
         failures.append(f"unexpected auto-close set: {sorted(auto_closes)} expected {sorted(expected)}")
+
+    body_item = {"number": 99, "body": "Fixes #4 and resolves #5.", "state": "OPEN"}
+    neutral_body = sandbox_body("pr", "example/replay", body_item, {4: 40, 5: 50}, neutralize_closing=True)
+    restored_body = sandbox_body("pr", "example/replay", body_item, {4: 40, 5: 50})
+    if CLOSING_REF_RE.search(neutral_body):
+        failures.append("sandbox neutral body still contains a GitHub closing reference")
+    if not CLOSING_REF_RE.search(restored_body):
+        failures.append("sandbox restored body lost original closing references")
+
     payload["fixture"] = {
         "passed": not failures,
         "failures": failures,
@@ -924,6 +954,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     sandbox_parser.add_argument("--run-foreman-mode", choices=("none", "preview", "comment-only", "apply-safe"), default="none")
     sandbox_parser.add_argument("--allow-apply-safe", action="store_true")
     sandbox_parser.add_argument("--max-mutations", type=int, default=25)
+    sandbox_parser.add_argument("--no-audit-file", action="store_true")
 
     return parser.parse_args(argv)
 
@@ -951,8 +982,9 @@ def main(argv: list[str]) -> int:
         print(f"Issues: {payload['issue_count']}")
         print(f"PRs: {payload['pr_count']}")
         print(f"Dry run: {payload['dry_run']}")
-        path = write_json(payload, output_dir, "sandbox")
-        print(f"Sandbox file: {path}")
+        if not args.no_audit_file:
+            path = write_json(payload, output_dir, "sandbox")
+            print(f"Sandbox file: {path}")
         foreman = payload.get("foreman")
         if isinstance(foreman, dict) and foreman.get("returncode"):
             return int(foreman["returncode"])
