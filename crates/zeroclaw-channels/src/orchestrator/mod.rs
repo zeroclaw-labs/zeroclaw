@@ -5619,7 +5619,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 (k, mt)
             })
             .collect();
-        keyed.sort_by(|a, b| b.1.cmp(&a.1));
+        keyed.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         keyed.truncate(MAX_CONVERSATION_SENDERS);
         let session_keys: Vec<String> = keyed.into_iter().map(|(k, _)| k).collect();
 

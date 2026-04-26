@@ -815,11 +815,7 @@ pub fn scrub_secret_patterns(input: &str) -> String {
 
     for prefix in PREFIXES {
         let mut search_from = 0;
-        loop {
-            let Some(rel) = scrubbed[search_from..].find(prefix) else {
-                break;
-            };
-
+        while let Some(rel) = scrubbed[search_from..].find(prefix) {
             let start = search_from + rel;
             let content_start = start + prefix.len();
             let end = token_end(&scrubbed, content_start);
