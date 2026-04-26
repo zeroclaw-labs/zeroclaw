@@ -105,7 +105,10 @@ struct Session {
     #[allow(dead_code)] // WIP: intended for session expiry logic
     created_at: Instant,
     last_active: Instant,
-    #[allow(dead_code)] // WIP: stored for future session routing
+    /// Absolute, canonicalized directory the ACP client supplied as `cwd`.
+    /// The process is `chdir`'d here on session/new and re-pinned at the start
+    /// of each session/prompt so tool calls and relative paths resolve
+    /// consistently for this session.
     workspace_dir: String,
 }
 
@@ -277,24 +280,50 @@ impl AcpServer {
             });
         }
 
-        let workspace_dir = params
+        let requested_cwd = params
             .get("cwd")
             .or_else(|| params.get("workspaceDir"))
             .or_else(|| params.get("workspace_dir"))
             .and_then(|v| v.as_str())
-            .unwrap_or_else(|| self.config.workspace_dir.to_str().unwrap_or("."))
-            .to_string();
+            .unwrap_or_else(|| self.config.workspace_dir.to_str().unwrap_or("."));
+
+        let workspace_dir = std::fs::canonicalize(requested_cwd)
+            .map_err(|e| RpcError {
+                code: INVALID_PARAMS,
+                message: format!("cwd is not a usable directory ({requested_cwd}): {e}"),
+                data: None,
+            })?
+            .to_string_lossy()
+            .into_owned();
+
+        // Pin the process working directory for this session. ACP clients
+        // expect file links and shell commands to resolve relative to `cwd`,
+        // so we mutate the global cwd here and re-apply it at the start of
+        // each session/prompt. Concurrent prompts across sessions can race
+        // — last writer wins, which is acceptable given typical ACP usage
+        // (one active session at a time).
+        std::env::set_current_dir(&workspace_dir).map_err(|e| RpcError {
+            code: INTERNAL_ERROR,
+            message: format!("Failed to chdir to {workspace_dir}: {e}"),
+            data: None,
+        })?;
 
         let session_id = Uuid::new_v4().to_string();
 
-        // Build agent from global config
-        let agent = Agent::from_config(&self.config)
-            .await
-            .map_err(|e| RpcError {
-                code: INTERNAL_ERROR,
-                message: format!("Failed to create agent: {e}"),
-                data: None,
-            })?;
+        // Build agent from global config, with the session's cwd pinned as
+        // the file/shell sandbox boundary. The agent's data directory
+        // (memory DB, identity, scheduled tasks) still lives under
+        // `config.workspace_dir`.
+        let agent = Agent::from_config_with_session_cwd(
+            &self.config,
+            Some(std::path::Path::new(&workspace_dir)),
+        )
+        .await
+        .map_err(|e| RpcError {
+            code: INTERNAL_ERROR,
+            message: format!("Failed to create agent: {e}"),
+            data: None,
+        })?;
 
         let now = Instant::now();
         sessions.insert(
@@ -339,6 +368,21 @@ impl AcpServer {
                 data: None,
             })?
         };
+
+        // Re-pin process cwd to this session's directory. Another session
+        // may have chdir'd elsewhere in the meantime; without this, tool
+        // calls would resolve paths against the wrong directory.
+        if let Err(e) = std::env::set_current_dir(&session.workspace_dir) {
+            let workspace_dir = session.workspace_dir.clone();
+            // Put the session back before bailing.
+            let mut sessions = self.sessions.lock().await;
+            sessions.insert(session_id.clone(), session);
+            return Err(RpcError {
+                code: INTERNAL_ERROR,
+                message: format!("Failed to chdir to session workspace {workspace_dir}: {e}"),
+                data: None,
+            });
+        }
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(100);
 

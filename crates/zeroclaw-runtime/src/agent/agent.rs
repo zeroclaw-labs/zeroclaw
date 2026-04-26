@@ -12,6 +12,7 @@ use anyhow::Result;
 use chrono::{Datelike, Timelike};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write as IoWrite;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use zeroclaw_config::schema::Config;
@@ -362,13 +363,30 @@ impl Agent {
     }
 
     pub async fn from_config(config: &Config) -> Result<Self> {
+        Self::from_config_with_session_cwd(config, None).await
+    }
+
+    /// Build an Agent with an optional per-session working directory override.
+    ///
+    /// `session_cwd`, when supplied, becomes [`SecurityPolicy::workspace_dir`]
+    /// for this agent — i.e. the boundary used by file_read/write/edit and the
+    /// cwd used by the shell tool. Memory storage, identity files, scheduled
+    /// task DBs, and other on-disk state continue to live under
+    /// `config.workspace_dir`.
+    ///
+    /// This is what ACP sessions use to pin tool path resolution to the
+    /// IDE-provided `cwd` without relocating the agent's data directory.
+    pub async fn from_config_with_session_cwd(
+        config: &Config,
+        session_cwd: Option<&Path>,
+    ) -> Result<Self> {
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
-            &config.workspace_dir,
+            session_cwd.unwrap_or(&config.workspace_dir),
         ));
 
         let fallback_provider_ag = config.providers.fallback_provider();
