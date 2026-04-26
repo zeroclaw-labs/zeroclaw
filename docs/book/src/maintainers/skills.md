@@ -120,7 +120,18 @@ Snapshot and replay live GitHub state:
 python3 .claude/skills/factory-testbench/scripts/factory_testbench.py roundtrip --repo zeroclaw-labs/zeroclaw
 ```
 
-Run from Actions with **Factory Testbench**. The workflow is read-only and uploads snapshot/replay artifacts. Optional `--clone-dir` creates or updates a local bare mirror clone for deeper replay experiments, but sandbox GitHub mutation is intentionally not part of this first version.
+Run from Actions with **Factory Testbench**. The workflow is read-only and uploads snapshot/replay artifacts. Optional `--clone-dir` creates or updates a local bare mirror clone for deeper replay experiments. Private GitHub sandbox creation is intentionally local/manual only.
+
+Create a private GitHub sandbox locally:
+
+```bash
+python3 .claude/skills/factory-testbench/scripts/factory_testbench.py sandbox \
+  --repo zeroclaw-labs/zeroclaw \
+  --target-repo OWNER/zeroclaw-factory-sandbox \
+  --run-foreman-mode preview
+```
+
+Sandbox replay creates a private target repository, mirror-pushes code, recreates labels/issues/PRs/comments, records number mappings, and can run Foreman against the sandbox instead of production. It is intentionally explicit and is not scheduled by default.
 
 ## Factory foreman workflow
 

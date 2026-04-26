@@ -13,7 +13,7 @@ Read `references/policy.md` before using live GitHub data. Short version:
 
 - Snapshot and replay are read-only.
 - Invariant failures block promotion to mutation modes.
-- Sandbox mutation is future work; this first version is offline replay.
+- GitHub sandbox creation is allowed only through the explicit `sandbox --target-repo ...` command.
 
 ## Runner
 
@@ -45,6 +45,26 @@ Run snapshot plus replay in one pass:
 python3 .claude/skills/factory-testbench/scripts/factory_testbench.py roundtrip
 ```
 
+Create a private GitHub sandbox from a snapshot:
+
+```bash
+python3 .claude/skills/factory-testbench/scripts/factory_testbench.py \
+  sandbox \
+  --repo zeroclaw-labs/zeroclaw \
+  --target-repo OWNER/zeroclaw-factory-sandbox \
+  --run-foreman-mode preview
+```
+
+Dry-run the sandbox plan without creating anything:
+
+```bash
+python3 .claude/skills/factory-testbench/scripts/factory_testbench.py \
+  sandbox \
+  --snapshot artifacts/factory-testbench/snapshot-latest.json \
+  --target-repo OWNER/zeroclaw-factory-sandbox \
+  --dry-run
+```
+
 The runner writes JSON output to `artifacts/factory-testbench/` unless `--no-audit-file` is passed.
 
 ## Checks
@@ -55,3 +75,7 @@ The runner writes JSON output to `artifacts/factory-testbench/` unless `--no-aud
 - Inspector never mutates issues.
 - Inspector markers remain stable per PR intake check.
 - Replayed decisions are serializable for audit/baseline comparison.
+
+## Sandbox Shape
+
+The sandbox command creates a private repository, mirror-pushes code, recreates labels, issues, PRs, and comments, and records original-to-sandbox number mappings. PR branches use synthetic commits under `.factory-sandbox/`, while PR bodies carry hidden metadata with original file paths so Inspector can evaluate original risk paths.

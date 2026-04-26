@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +23,8 @@ DEFAULT_OUTPUT_DIR = Path("artifacts/factory-testbench")
 ROOT = Path(__file__).resolve().parents[4]
 CLERK_PATH = ROOT / ".claude/skills/factory-clerk/scripts/factory_clerk.py"
 INSPECTOR_PATH = ROOT / ".claude/skills/factory-inspector/scripts/factory_inspector.py"
+FOREMAN_PATH = ROOT / ".claude/skills/factory-foreman/scripts/factory_foreman.py"
+REF_RE = re.compile(r"(?<![\w/.-])#(?P<number>\d+)\b")
 
 
 def load_module(path: Path, name: str) -> Any:
@@ -41,10 +46,16 @@ def utc_stamp() -> str:
 
 
 def run_gh_json(args: list[str]) -> Any:
+    out = run_gh_text(args)
+    return json.loads(out) if out.strip() else None
+
+
+def run_gh_text(args: list[str], input_text: str | None = None) -> str:
     cmd = ["gh", *args]
     try:
         result = subprocess.run(
             cmd,
+            input=input_text,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -55,7 +66,20 @@ def run_gh_json(args: list[str]) -> Any:
     except subprocess.CalledProcessError as exc:
         detail = exc.stderr.strip() or exc.stdout.strip()
         raise RuntimeError(f"{' '.join(cmd)} failed: {detail}") from exc
-    return json.loads(result.stdout) if result.stdout.strip() else None
+    return result.stdout
+
+
+def run_cmd(args: list[str], cwd: Path | None = None, input_text: str | None = None) -> str:
+    result = subprocess.run(
+        args,
+        cwd=cwd,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    return result.stdout.strip() or result.stderr.strip()
 
 
 def run_git(args: list[str], cwd: Path | None = None) -> str:
@@ -70,6 +94,18 @@ def run_git(args: list[str], cwd: Path | None = None) -> str:
     if result.returncode != 0:
         return ""
     return result.stdout.strip()
+
+
+def git_success(args: list[str], cwd: Path | None = None) -> bool:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    return result.returncode == 0
 
 
 def clone_mirror(repo: str, clone_dir: Path) -> str:
@@ -120,7 +156,7 @@ def list_prs(repo: str, state: str, limit: int) -> list[dict[str, Any]]:
         "--limit",
         str(limit),
         "--json",
-        "number,title,body,labels,comments,mergedAt,state,url,isDraft,files,baseRefName,author",
+        "number,title,body,labels,comments,mergedAt,state,url,isDraft,files,baseRefName,headRefName,headRepositoryOwner,author",
     ])
 
 
@@ -162,6 +198,418 @@ def snapshot(repo: str, limit: int, output_dir: Path, clone_dir: Path | None) ->
         "prs": prs,
     }
     return write_json(payload, output_dir, "snapshot")
+
+
+def parse_created_number(url: str) -> int:
+    match = re.search(r"/(?:issues|pull)/(?P<number>\d+)\s*$", url.strip())
+    if not match:
+        raise RuntimeError(f"Could not parse GitHub number from: {url}")
+    return int(match.group("number"))
+
+
+def repo_exists(repo: str) -> bool:
+    result = subprocess.run(
+        ["gh", "repo", "view", repo, "--json", "nameWithOwner"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def create_private_repo(repo: str, reuse_existing: bool, dry_run: bool) -> str:
+    if dry_run:
+        return f"dry-run: would create private repo {repo}"
+    if repo_exists(repo):
+        if reuse_existing:
+            return f"reusing existing repo {repo}"
+        raise RuntimeError(f"Target repo {repo} already exists. Pass --reuse-existing to use it.")
+    return run_gh_text([
+        "repo",
+        "create",
+        repo,
+        "--private",
+        "--description",
+        "Factory sandbox replay repository",
+        "--disable-wiki",
+    ]).strip()
+
+
+def push_mirror_to_target(source_repo: str, target_repo: str, work_dir: Path, dry_run: bool) -> str:
+    if dry_run:
+        return f"dry-run: would push branches/tags from {source_repo} to {target_repo}"
+    mirror_dir = work_dir / "source.git"
+    clone_mirror(source_repo, mirror_dir)
+    return run_cmd([
+        "git",
+        "push",
+        "--prune",
+        f"https://github.com/{target_repo}.git",
+        "+refs/heads/*:refs/heads/*",
+        "+refs/tags/*:refs/tags/*",
+    ], mirror_dir)
+
+
+def label_payload(data: dict[str, Any]) -> dict[str, dict[str, str]]:
+    labels: dict[str, dict[str, str]] = {}
+    for collection in ("issues", "prs"):
+        for item in data.get(collection, []):
+            for label in item.get("labels", []):
+                name = label.get("name")
+                if not name:
+                    continue
+                labels[name] = {
+                    "color": (label.get("color") or "ededed").lstrip("#")[:6] or "ededed",
+                    "description": label.get("description") or "",
+                }
+    return labels
+
+
+def create_labels(repo: str, labels: dict[str, dict[str, str]], dry_run: bool) -> list[str]:
+    results: list[str] = []
+    for name, meta in sorted(labels.items()):
+        if dry_run:
+            results.append(f"dry-run: label {name}")
+            continue
+        args = [
+            "label",
+            "create",
+            name,
+            "--repo",
+            repo,
+            "--color",
+            meta["color"],
+            "--force",
+        ]
+        if meta["description"]:
+            args.extend(["--description", meta["description"]])
+        results.append(run_gh_text(args).strip())
+    return results
+
+
+def label_args(labels: list[dict[str, Any]]) -> list[str]:
+    args: list[str] = []
+    for label in labels:
+        name = label.get("name")
+        if name:
+            args.extend(["--label", name])
+    return args
+
+
+def compact_metadata(kind: str, source_repo: str, item: dict[str, Any]) -> str:
+    payload = {
+        "kind": kind,
+        "source_repo": source_repo,
+        "number": item.get("number"),
+        "url": item.get("url"),
+        "state": item.get("state"),
+        "merged_at": item.get("mergedAt"),
+        "base_ref": item.get("baseRefName"),
+        "head_ref": item.get("headRefName"),
+        "head_owner": (item.get("headRepositoryOwner") or {}).get("login"),
+        "files": [file.get("path") for file in item.get("files", []) if file.get("path")],
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def rewrite_refs(text: str, number_map: dict[int, int]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        original = int(match.group("number"))
+        return f"#{number_map.get(original, original)}"
+
+    return REF_RE.sub(replace, text or "")
+
+
+def sandbox_body(kind: str, source_repo: str, item: dict[str, Any], number_map: dict[int, int]) -> str:
+    marker = compact_metadata(kind, source_repo, item)
+    original = rewrite_refs(item.get("body") or "", number_map)
+    header = [
+        f"<!-- factory-sandbox:original:{marker} -->",
+        f"Factory sandbox replay of `{source_repo}#{item.get('number')}`.",
+        "",
+    ]
+    return "\n".join(header) + original
+
+
+def comment_body(source_repo: str, comment: dict[str, Any], number_map: dict[int, int]) -> str:
+    author = (comment.get("author") or {}).get("login") or "unknown"
+    association = comment.get("authorAssociation") or "NONE"
+    created = comment.get("createdAt") or "unknown time"
+    body = rewrite_refs(comment.get("body") or "", number_map)
+    return (
+        f"Factory sandbox replay of a comment from @{author} "
+        f"({association}) on {created} in `{source_repo}`.\n\n"
+        f"{body}"
+    )
+
+
+def ensure_work_clone(target_repo: str, work_dir: Path) -> Path:
+    clone_dir = work_dir / "target"
+    if clone_dir.exists():
+        run_cmd(["git", "fetch", "origin", "--prune"], clone_dir)
+        return clone_dir
+    run_cmd(["git", "clone", f"https://github.com/{target_repo}.git", str(clone_dir)])
+    run_cmd(["git", "config", "user.name", "Factory Sandbox"], clone_dir)
+    run_cmd(["git", "config", "user.email", "factory-sandbox@example.invalid"], clone_dir)
+    return clone_dir
+
+
+def ensure_base_branch(clone_dir: Path, base: str) -> str:
+    run_cmd(["git", "fetch", "origin", "--prune"], clone_dir)
+    if run_git(["show-ref", "--verify", f"refs/remotes/origin/{base}"], clone_dir):
+        return base
+    fallback = "master"
+    run_cmd(["git", "checkout", "-B", base, f"origin/{fallback}"], clone_dir)
+    run_cmd(["git", "push", "origin", base], clone_dir)
+    return base
+
+
+def create_sandbox_branch(clone_dir: Path, pr: dict[str, Any], base: str) -> str:
+    branch = f"factory-sandbox/pr-{pr['number']}"
+    run_cmd(["git", "checkout", "-B", branch, f"origin/{base}"], clone_dir)
+    target = clone_dir / ".factory-sandbox" / "prs" / f"original-{pr['number']}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    files = "\n".join(f"- `{file.get('path')}`" for file in pr.get("files", []) if file.get("path"))
+    target.write_text(
+        "\n".join([
+            f"# Original PR #{pr['number']}",
+            "",
+            f"Title: {pr.get('title') or ''}",
+            f"Original URL: {pr.get('url') or ''}",
+            f"Original base: {pr.get('baseRefName') or ''}",
+            "",
+            "## Original files",
+            "",
+            files or "- None captured",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+    run_cmd(["git", "add", str(target.relative_to(clone_dir))], clone_dir)
+    if not git_success(["diff", "--cached", "--quiet"], clone_dir):
+        run_cmd(["git", "commit", "-m", f"factory sandbox replay for PR {pr['number']}"], clone_dir)
+    run_cmd(["git", "push", "-f", "origin", branch], clone_dir)
+    return branch
+
+
+def create_sandbox_issues(
+    repo: str,
+    source_repo: str,
+    issues: list[dict[str, Any]],
+    dry_run: bool,
+) -> dict[int, int]:
+    issue_map: dict[int, int] = {}
+    for issue in issues:
+        original = int(issue["number"])
+        if dry_run:
+            issue_map[original] = original
+            continue
+        body = sandbox_body("issue", source_repo, issue, {})
+        args = [
+            "issue",
+            "create",
+            "--repo",
+            repo,
+            "--title",
+            issue.get("title") or f"Original issue #{original}",
+            "--body-file",
+            "-",
+        ]
+        args.extend(label_args(issue.get("labels", [])))
+        url = run_gh_text(args, input_text=body)
+        issue_map[original] = parse_created_number(url)
+    return issue_map
+
+
+def create_sandbox_prs(
+    repo: str,
+    source_repo: str,
+    prs: list[dict[str, Any]],
+    issue_map: dict[int, int],
+    work_dir: Path,
+    dry_run: bool,
+) -> dict[int, int]:
+    pr_map: dict[int, int] = {}
+    if dry_run:
+        return {int(pr["number"]): int(pr["number"]) for pr in prs}
+    clone_dir = ensure_work_clone(repo, work_dir)
+    for pr in prs:
+        original = int(pr["number"])
+        base = ensure_base_branch(clone_dir, pr.get("baseRefName") or "master")
+        branch = create_sandbox_branch(clone_dir, pr, base)
+        placeholder = sandbox_body("pr", source_repo, pr, issue_map)
+        args = [
+            "pr",
+            "create",
+            "--repo",
+            repo,
+            "--base",
+            base,
+            "--head",
+            branch,
+            "--title",
+            pr.get("title") or f"Original PR #{original}",
+            "--body-file",
+            "-",
+        ]
+        if pr.get("isDraft"):
+            args.append("--draft")
+        args.extend(label_args(pr.get("labels", [])))
+        url = run_gh_text(args, input_text=placeholder)
+        pr_map[original] = parse_created_number(url)
+    return pr_map
+
+
+def edit_bodies_and_comments(
+    repo: str,
+    source_repo: str,
+    issues: list[dict[str, Any]],
+    prs: list[dict[str, Any]],
+    issue_map: dict[int, int],
+    pr_map: dict[int, int],
+    dry_run: bool,
+) -> list[str]:
+    results: list[str] = []
+    number_map = {**issue_map, **pr_map}
+    if dry_run:
+        return ["dry-run: would edit bodies and replay comments"]
+
+    for issue in issues:
+        mapped = issue_map[int(issue["number"])]
+        body = sandbox_body("issue", source_repo, issue, number_map)
+        run_gh_text(["issue", "edit", str(mapped), "--repo", repo, "--body-file", "-"], input_text=body)
+        for comment in issue.get("comments", []):
+            run_gh_text(
+                ["issue", "comment", str(mapped), "--repo", repo, "--body-file", "-"],
+                input_text=comment_body(source_repo, comment, number_map),
+            )
+        if (issue.get("state") or "OPEN").lower() == "closed":
+            run_gh_text([
+                "issue",
+                "close",
+                str(mapped),
+                "--repo",
+                repo,
+                "--reason",
+                "not planned",
+                "--comment",
+                "Factory sandbox replay: original issue was closed.",
+            ])
+        results.append(f"issue {issue['number']} -> {mapped}")
+
+    for pr in prs:
+        mapped = pr_map[int(pr["number"])]
+        body = sandbox_body("pr", source_repo, pr, number_map)
+        should_merge = bool(pr.get("mergedAt"))
+        if should_merge:
+            run_gh_text([
+                "pr",
+                "merge",
+                str(mapped),
+                "--repo",
+                repo,
+                "--merge",
+                "--subject",
+                f"Factory sandbox merge for original PR #{pr['number']}",
+                "--body",
+                "Merged before replay body restoration so closing keywords do not auto-close sandbox issues.",
+            ])
+        run_gh_text(["pr", "edit", str(mapped), "--repo", repo, "--body-file", "-"], input_text=body)
+        for comment in pr.get("comments", []):
+            run_gh_text(
+                ["pr", "comment", str(mapped), "--repo", repo, "--body-file", "-"],
+                input_text=comment_body(source_repo, comment, number_map),
+            )
+        if not should_merge and (pr.get("state") or "OPEN").lower() == "closed":
+            run_gh_text([
+                "pr",
+                "close",
+                str(mapped),
+                "--repo",
+                repo,
+                "--comment",
+                "Factory sandbox replay: original PR was closed without merge.",
+            ])
+        results.append(f"pr {pr['number']} -> {mapped}")
+    return results
+
+
+def run_foreman_on_sandbox(repo: str, mode: str, allow_apply_safe: bool, max_mutations: int, output_dir: Path) -> dict[str, Any]:
+    if mode == "none":
+        return {"mode": "none", "returncode": 0}
+    cmd = [
+        "python3",
+        str(FOREMAN_PATH),
+        "--repo",
+        repo,
+        "--mode",
+        mode,
+        "--max-mutations",
+        str(max_mutations),
+        "--output-dir",
+        str(output_dir / "foreman"),
+        "--summary-file",
+        str(output_dir / "foreman" / "summary.md"),
+    ]
+    if allow_apply_safe:
+        cmd.append("--allow-apply-safe")
+    result = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    return {
+        "mode": mode,
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def sandbox(data: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    target_repo = args.target_repo
+    output_dir = Path(args.output_dir)
+    work_dir = Path(args.work_dir) if args.work_dir else Path(tempfile.mkdtemp(prefix="factory-sandbox-"))
+    issues = data.get("issues", [])[:args.limit]
+    prs = data.get("prs", [])[:args.limit]
+    summary: dict[str, Any] = {
+        "schema": "factory-testbench-sandbox-v1",
+        "source_repo": data.get("repo"),
+        "target_repo": target_repo,
+        "generated_at": utc_stamp(),
+        "dry_run": args.dry_run,
+        "work_dir": str(work_dir),
+        "issue_count": len(issues),
+        "pr_count": len(prs),
+        "steps": [],
+        "issue_map": {},
+        "pr_map": {},
+    }
+
+    summary["steps"].append(create_private_repo(target_repo, args.reuse_existing, args.dry_run))
+    summary["steps"].append(push_mirror_to_target(data.get("repo") or DEFAULT_REPO, target_repo, work_dir, args.dry_run))
+    labels = label_payload({"issues": issues, "prs": prs})
+    summary["steps"].extend(create_labels(target_repo, labels, args.dry_run))
+    issue_map = create_sandbox_issues(target_repo, data.get("repo") or DEFAULT_REPO, issues, args.dry_run)
+    pr_map = create_sandbox_prs(target_repo, data.get("repo") or DEFAULT_REPO, prs, issue_map, work_dir, args.dry_run)
+    summary["issue_map"] = issue_map
+    summary["pr_map"] = pr_map
+    summary["steps"].extend(edit_bodies_and_comments(
+        target_repo,
+        data.get("repo") or DEFAULT_REPO,
+        issues,
+        prs,
+        issue_map,
+        pr_map,
+        args.dry_run,
+    ))
+    if args.run_foreman_mode != "none" and not args.dry_run:
+        summary["foreman"] = run_foreman_on_sandbox(
+            target_repo,
+            args.run_foreman_mode,
+            args.allow_apply_safe,
+            args.max_mutations,
+            output_dir,
+        )
+    return summary
 
 
 @dataclass
@@ -427,6 +875,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     roundtrip_parser.add_argument("--clone-dir")
     common_replay_args(roundtrip_parser)
 
+    sandbox_parser = sub.add_parser("sandbox")
+    sandbox_parser.add_argument("--snapshot")
+    sandbox_parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", DEFAULT_REPO))
+    sandbox_parser.add_argument("--target-repo", required=True)
+    sandbox_parser.add_argument("--limit", type=int, default=1000)
+    sandbox_parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
+    sandbox_parser.add_argument("--work-dir")
+    sandbox_parser.add_argument("--reuse-existing", action="store_true")
+    sandbox_parser.add_argument("--dry-run", action="store_true")
+    sandbox_parser.add_argument("--run-foreman-mode", choices=("none", "preview", "comment-only", "apply-safe"), default="none")
+    sandbox_parser.add_argument("--allow-apply-safe", action="store_true")
+    sandbox_parser.add_argument("--max-mutations", type=int, default=25)
+
     return parser.parse_args(argv)
 
 
@@ -437,6 +898,27 @@ def main(argv: list[str]) -> int:
     if args.command == "snapshot":
         path = snapshot(args.repo, args.limit, output_dir, Path(args.clone_dir) if args.clone_dir else None)
         print(f"Snapshot file: {path}")
+        return 0
+
+    if args.command == "sandbox":
+        if args.snapshot:
+            data = json.loads(Path(args.snapshot).read_text(encoding="utf-8"))
+        else:
+            snapshot_path = snapshot(args.repo, args.limit, output_dir, None)
+            data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        payload = sandbox(data, args)
+        print("Factory Sandbox summary")
+        print("=======================")
+        print(f"Source: {payload['source_repo']}")
+        print(f"Target: {payload['target_repo']}")
+        print(f"Issues: {payload['issue_count']}")
+        print(f"PRs: {payload['pr_count']}")
+        print(f"Dry run: {payload['dry_run']}")
+        path = write_json(payload, output_dir, "sandbox")
+        print(f"Sandbox file: {path}")
+        foreman = payload.get("foreman")
+        if isinstance(foreman, dict) and foreman.get("returncode"):
+            return int(foreman["returncode"])
         return 0
 
     if args.command == "roundtrip":

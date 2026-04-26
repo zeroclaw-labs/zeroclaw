@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import json
 import os
@@ -32,6 +33,7 @@ REQUIRED_TEMPLATE_SECTIONS = (
     "Rollback (required for `risk: medium` and `risk: high`)",
 )
 BOT_LOGINS = {"github-actions", "dependabot", "dependabot[bot]"}
+SANDBOX_ORIGINAL_RE = re.compile(r"<!-- factory-sandbox:original:(?P<payload>[A-Za-z0-9_=-]+) -->")
 
 
 @dataclass
@@ -154,7 +156,23 @@ def risk_labels(labels: set[str]) -> set[str]:
     return {label for label in labels if label.startswith("risk:")}
 
 
+def sandbox_original(pr: dict[str, Any]) -> dict[str, Any] | None:
+    body = pr.get("body") or ""
+    match = SANDBOX_ORIGINAL_RE.search(body)
+    if not match:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(match.group("payload").encode("ascii"))
+        decoded = json.loads(raw)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
 def touched_paths(pr: dict[str, Any]) -> list[str]:
+    original = sandbox_original(pr)
+    if original and isinstance(original.get("files"), list):
+        return [path for path in original["files"] if isinstance(path, str)]
     return [file["path"] for file in pr.get("files", [])]
 
 
