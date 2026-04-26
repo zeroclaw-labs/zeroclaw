@@ -548,7 +548,11 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
                 match ch {
                     '\'' => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
-                    '&' if chars.next_if_eq(&'&').is_none() => return true,
+                    // This must consume the second '&' so `&&` is not later
+                    // re-read as a lone trailing '&'.
+                    '&' if chars.next_if_eq(&'&').is_none() => {
+                        return true;
+                    }
                     _ => {}
                 }
             }

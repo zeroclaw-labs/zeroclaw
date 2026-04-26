@@ -596,10 +596,70 @@ impl AcpServer {
 
         // Forward events as they arrive. Use standard ACP `session/update`
         // notifications: `tool_call` for initial (pending + title/kind for UI/icons),
-        // `tool_call_update` for completion (status + rawOutput/content). This enables
-        // proper pending→completed flow in ACP clients.
+        // `tool_call_update` for completion (status + rawOutput). This enables
+        // proper pending→completed flow without duplicating large tool output in
+        // multiple fields on the wire.
         while let Some(event) = event_rx.recv().await {
-            let notification = notification_for_turn_event(&session_id, &event);
+            let notification = match &event {
+                TurnEvent::Chunk { delta } => JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/update",
+                    params: serde_json::json!({
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {
+                                "type": "text",
+                                "text": delta
+                            }
+                        }
+                    }),
+                },
+                TurnEvent::ToolCall { id, name, args } => JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/update",
+                    params: serde_json::json!({
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": id,
+                            "title": name,
+                            "kind": map_tool_kind(name),
+                            "rawInput": args,
+                            "status": "pending"
+                        }
+                    }),
+                },
+                TurnEvent::ToolResult { id, name, output } => JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/update",
+                    params: serde_json::json!({
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": id,
+                            "title": name,
+                            "kind": map_tool_kind(name),
+                            "status": "completed",
+                            "rawOutput": output
+                        }
+                    }),
+                },
+                TurnEvent::Thinking { delta } => JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/update",
+                    params: serde_json::json!({
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_thought_chunk",
+                            "content": {
+                                "type": "text",
+                                "text": delta
+                            }
+                        }
+                    }),
+                },
+            };
             self.write_notification(&notification).await;
         }
 
@@ -780,6 +840,7 @@ impl AcpServer {
     }
 }
 
+<<<<<<< HEAD
 /// Single writer task that owns stdout. All outbound JSON-RPC messages flow
 /// through here, so concurrent notifications and outbound requests don't
 /// interleave bytes.
@@ -800,6 +861,8 @@ async fn writer_task(mut rx: mpsc::Receiver<String>) {
     }
 }
 
+=======
+>>>>>>> master
 fn map_tool_kind(name: &str) -> &'static str {
     match name {
         "ask_user" | "calculator" | "claude_code" | "claude_code_runner" | "codex_cli"
@@ -848,6 +911,7 @@ fn map_tool_kind(name: &str) -> &'static str {
     }
 }
 
+<<<<<<< HEAD
 fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> JsonRpcNotification {
     match event {
         TurnEvent::Chunk { delta } => JsonRpcNotification {
@@ -920,6 +984,8 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> JsonRpcNo
     }
 }
 
+=======
+>>>>>>> master
 // ── Error helper ─────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -1109,7 +1175,10 @@ mod tests {
                 "update": {
                     "sessionUpdate": "tool_call",
                     "toolCallId": "tc-12345",
+<<<<<<< HEAD
                     "name": "shell",
+=======
+>>>>>>> master
                     "title": "shell",
                     "kind": "execute",
                     "rawInput": {"command": "ls -la"},
@@ -1120,7 +1189,10 @@ mod tests {
         let json1 = serde_json::to_string(&tool_call_notif).unwrap();
         assert!(json1.contains("\"sessionUpdate\":\"tool_call\""));
         assert!(json1.contains("\"toolCallId\":\"tc-12345\""));
+<<<<<<< HEAD
         assert!(json1.contains("\"name\":\"shell\""));
+=======
+>>>>>>> master
         assert!(json1.contains("\"title\":\"shell\""));
         assert!(json1.contains("\"kind\":\"execute\""));
         assert!(json1.contains("\"status\":\"pending\""));
@@ -1135,6 +1207,7 @@ mod tests {
                 "update": {
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": "tc-12345",
+<<<<<<< HEAD
                     "name": "shell",
                     "title": "shell",
                     "kind": "execute",
@@ -1147,17 +1220,29 @@ mod tests {
                             "text": "file1.txt\nfile2.txt"
                         }
                     }]
+=======
+                    "title": "shell",
+                    "kind": "execute",
+                    "status": "completed",
+                    "rawOutput": "file1.txt\nfile2.txt"
+>>>>>>> master
                 }
             }),
         };
         let json2 = serde_json::to_string(&tool_update_notif).unwrap();
         assert!(json2.contains("\"sessionUpdate\":\"tool_call_update\""));
         assert!(json2.contains("\"toolCallId\":\"tc-12345\""));
+<<<<<<< HEAD
         assert!(json2.contains("\"name\":\"shell\""));
         assert!(json2.contains("\"status\":\"completed\""));
         assert!(json2.contains("\"rawOutput\""));
         assert!(json2.contains("\"content\""));
         assert!(json2.contains("\"type\":\"content\""));
+=======
+        assert!(json2.contains("\"status\":\"completed\""));
+        assert!(json2.contains("\"rawOutput\""));
+        assert!(!json2.contains("\"content\""));
+>>>>>>> master
         assert!(json2.contains("file1.txt"));
         // Verify matching toolCallId across events
         assert!(json1.contains("tc-12345") && json2.contains("tc-12345"));
@@ -1173,6 +1258,7 @@ mod tests {
         assert_eq!(map_tool_kind("web_fetch"), "fetch");
         assert_eq!(map_tool_kind("unknown_tool"), "other");
     }
+<<<<<<< HEAD
 
     #[test]
     fn turn_tool_events_include_client_visible_tool_fields() {
@@ -1223,4 +1309,6 @@ mod tests {
             "file1.txt\nfile2.txt"
         );
     }
+=======
+>>>>>>> master
 }
