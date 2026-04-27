@@ -51,7 +51,7 @@ Create a private GitHub sandbox from a snapshot:
 python3 .claude/skills/factory-testbench/scripts/factory_testbench.py \
   sandbox \
   --repo zeroclaw-labs/zeroclaw \
-  --target-repo OWNER/zeroclaw-factory-sandbox \
+  --target-owner OWNER \
   --run-foreman-mode preview
 ```
 
@@ -61,11 +61,15 @@ Dry-run the sandbox plan without creating anything:
 python3 .claude/skills/factory-testbench/scripts/factory_testbench.py \
   sandbox \
   --snapshot artifacts/factory-testbench/snapshot-latest.json \
-  --target-repo OWNER/zeroclaw-factory-sandbox \
+  --target-owner OWNER \
   --dry-run
 ```
 
 The runner writes JSON output to `artifacts/factory-testbench/` unless `--no-audit-file` is passed.
+
+When `--target-owner` is used, the target repo is named with full UTC datetime precision: `SOURCE-factory-sandbox-YYYYMMDDTHHMMSSZ`. Pass `--target-repo OWNER/NAME` only for a fully explicit name; generated-looking `factory-sandbox-YYYYMMDD...` names are rejected unless they include the full `YYYYMMDDTHHMMSSZ` timestamp.
+
+Sandbox creation disables GitHub Actions in the target repository by default before the mirror push and keeps Actions disabled after replay. Pass `--allow-actions` only when intentionally testing target-repo workflows.
 
 ## Checks
 
@@ -78,4 +82,4 @@ The runner writes JSON output to `artifacts/factory-testbench/` unless `--no-aud
 
 ## Sandbox Shape
 
-The sandbox command creates a private repository, mirror-pushes code, recreates labels, issues, PRs, and comments, and records original-to-sandbox number mappings. PR branches use synthetic commits under `.factory-sandbox/`, while PR bodies carry hidden metadata with original file paths so Inspector can evaluate original risk paths.
+The sandbox command creates a private repository, disables target-repo GitHub Actions by default, mirror-pushes code, recreates labels, issues, PRs, and comments, and records original-to-sandbox number mappings. PR branches use synthetic commits under `.factory-sandbox/`, while PR bodies carry hidden metadata with original file paths so Inspector can evaluate original risk paths.

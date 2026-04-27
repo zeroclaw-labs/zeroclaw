@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +35,16 @@ REQUIRED_TEMPLATE_SECTIONS = (
 )
 BOT_LOGINS = {"github-actions", "dependabot", "dependabot[bot]"}
 SANDBOX_ORIGINAL_RE = re.compile(r"<!-- factory-sandbox:original:(?P<payload>[A-Za-z0-9_=-]+) -->")
+GH_MUTATION_DELAY = float(os.environ.get("FACTORY_INSPECTOR_GH_DELAY", "1.5"))
+GH_RETRYABLE_ERRORS = (
+    "was submitted too quickly",
+    "secondary rate limit",
+    "abuse detection",
+    "api rate limit exceeded",
+    "http 502",
+    "http 503",
+    "http 504",
+)
 
 
 @dataclass
@@ -64,20 +75,27 @@ class Gh:
 
     def run(self, *args: str) -> str:
         cmd = ["gh", *args]
-        try:
-            result = subprocess.run(
-                cmd,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
-            )
-        except FileNotFoundError:
-            raise SystemExit("gh CLI is required but was not found in PATH")
-        except subprocess.CalledProcessError as exc:
-            detail = exc.stderr.strip() or exc.stdout.strip()
-            raise RuntimeError(f"{' '.join(cmd)} failed: {detail}") from exc
-        return result.stdout
+        last_detail = ""
+        for attempt in range(1, 7):
+            try:
+                result = subprocess.run(
+                    cmd,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                )
+                throttle_gh_mutation(list(args))
+                return result.stdout
+            except FileNotFoundError:
+                raise SystemExit("gh CLI is required but was not found in PATH")
+            except subprocess.CalledProcessError as exc:
+                detail = exc.stderr.strip() or exc.stdout.strip()
+                last_detail = detail
+                if not is_retryable_gh_error(detail) or attempt == 6:
+                    raise RuntimeError(f"{' '.join(cmd)} failed: {detail}") from exc
+                time.sleep(min(90.0, 5.0 * attempt * attempt))
+        raise RuntimeError(f"{' '.join(cmd)} failed: {last_detail}")
 
     def json(self, *args: str) -> Any:
         out = self.run(*args)
@@ -121,6 +139,18 @@ class Gh:
             "--body",
             body,
         ).strip()
+
+
+def is_retryable_gh_error(detail: str) -> bool:
+    lowered = detail.lower()
+    return any(token in lowered for token in GH_RETRYABLE_ERRORS)
+
+
+def throttle_gh_mutation(args: list[str]) -> None:
+    if GH_MUTATION_DELAY <= 0 or len(args) < 2:
+        return
+    if (args[0], args[1]) == ("pr", "comment"):
+        time.sleep(GH_MUTATION_DELAY)
 
 
 def label_names(item: dict[str, Any]) -> set[str]:

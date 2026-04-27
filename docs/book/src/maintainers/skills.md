@@ -128,11 +128,15 @@ Create a private GitHub sandbox locally:
 ```bash
 python3 .claude/skills/factory-testbench/scripts/factory_testbench.py sandbox \
   --repo zeroclaw-labs/zeroclaw \
-  --target-repo OWNER/zeroclaw-factory-sandbox \
+  --target-owner OWNER \
   --run-foreman-mode preview
 ```
 
 Sandbox replay creates a private target repository, mirror-pushes code, recreates labels/issues/PRs/comments, records number mappings, and can run Foreman against the sandbox instead of production. It is intentionally explicit and is not scheduled by default.
+
+When `--target-owner` is used, the target repo name includes a full UTC timestamp: `SOURCE-factory-sandbox-YYYYMMDDTHHMMSSZ`. Use `--target-repo OWNER/NAME` only for a fully explicit name; generated-looking date-only sandbox names are rejected.
+
+Sandbox replay disables GitHub Actions in the target repository by default before pushing mirrored branches/tags or opening recreated PRs. Use `--allow-actions` only when intentionally testing sandbox workflows.
 
 ## Factory foreman workflow
 

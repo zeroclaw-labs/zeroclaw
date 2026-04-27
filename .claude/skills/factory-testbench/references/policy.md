@@ -16,7 +16,7 @@ Factory Testbench must not mutate GitHub. It may:
 - write local snapshot, replay, and invariant JSON files;
 - optionally create a local bare mirror clone when explicitly requested with `--clone-dir`.
 
-The `sandbox` command is the only exception to the no-mutation rule. It may create and mutate a private target repository only when `--target-repo OWNER/REPO` is explicitly provided.
+The `sandbox` command is the only exception to the no-mutation rule. It may create and mutate a private target repository only when `--target-repo OWNER/REPO` is explicitly provided or when `--target-owner OWNER` is provided so Testbench can generate a timestamped target name.
 
 Outside the `sandbox` command, Testbench must not:
 
@@ -51,6 +51,7 @@ Protected label checks are case-insensitive in replay, matching the Clerk runtim
 Sandbox replay is allowed to:
 
 - create a private target repository;
+- disable GitHub Actions in the target repository before any mirror push or PR creation;
 - mirror-push source code into the target repository;
 - recreate labels, issues, PRs, and comments;
 - close sandbox issues and PRs that were closed in the source snapshot;
@@ -59,6 +60,9 @@ Sandbox replay is allowed to:
 
 Sandbox replay must:
 
+- keep target-repo GitHub Actions disabled by default unless `--allow-actions` is explicitly passed;
+- use full UTC datetime precision (`YYYYMMDDTHHMMSSZ`) for generated sandbox repository names;
+- reject generated-looking date-only sandbox names such as `factory-sandbox-YYYYMMDD-*`;
 - write original-to-sandbox number mappings;
 - preserve original issue/PR metadata in hidden body markers;
 - avoid auto-closing sandbox issues while replaying merged PRs, then restore PR bodies afterward;

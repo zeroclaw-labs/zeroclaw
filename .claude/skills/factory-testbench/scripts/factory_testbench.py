@@ -29,6 +29,8 @@ REF_RE = re.compile(r"(?<![\w/.-])#(?P<number>\d+)\b")
 CLOSING_REF_RE = re.compile(
     r"(?i)\b(?P<keyword>close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(?P<number>\d+)\b"
 )
+SANDBOX_FULL_DATETIME_RE = re.compile(r"factory-sandbox-\d{8}T\d{6}Z(?:\b|$)")
+SANDBOX_DATE_ONLY_RE = re.compile(r"factory-sandbox-\d{8}(?:\D|$)")
 GH_MUTATION_DELAY = float(os.environ.get("FACTORY_SANDBOX_GH_DELAY", "1.5"))
 GH_RETRYABLE_ERRORS = (
     "was submitted too quickly",
@@ -57,6 +59,45 @@ inspector = load_module(INSPECTOR_PATH, "factory_inspector_replay")
 
 def utc_stamp() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def repo_name_stamp() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def generated_target_repo(target_owner: str, source_repo: str, stamp: str | None = None) -> str:
+    return f"{target_owner}/{source_repo_name(source_repo)}-factory-sandbox-{stamp or repo_name_stamp()}"
+
+
+def validate_target_repo_name(repo: str) -> None:
+    name = source_repo_name(repo)
+    if "factory-sandbox-" not in name:
+        return
+    if SANDBOX_FULL_DATETIME_RE.search(name):
+        return
+    if SANDBOX_DATE_ONLY_RE.search(name):
+        raise RuntimeError(
+            "sandbox repository names must use full UTC datetime precision "
+            "(`YYYYMMDDTHHMMSSZ`), not date-only names"
+        )
+
+
+def source_repo_name(repo: str) -> str:
+    name = repo.rsplit("/", 1)[-1].strip()
+    if not name:
+        raise RuntimeError(f"Could not derive source repo name from: {repo}")
+    return name
+
+
+def resolve_target_repo(target_repo: str | None, target_owner: str | None, source_repo: str) -> str:
+    if target_repo:
+        validate_target_repo_name(target_repo)
+        return target_repo
+    if not target_owner:
+        raise RuntimeError("--target-owner is required when --target-repo is omitted")
+    generated = generated_target_repo(target_owner, source_repo)
+    validate_target_repo_name(generated)
+    return generated
 
 
 def run_gh_json(args: list[str]) -> Any:
@@ -316,6 +357,24 @@ def create_private_repo(repo: str, reuse_existing: bool, dry_run: bool) -> str:
         "Factory sandbox replay repository",
         "--disable-wiki",
     ]).strip()
+
+
+def configure_actions(repo: str, allow_actions: bool, dry_run: bool) -> str:
+    if allow_actions:
+        if dry_run:
+            return "dry-run: would leave GitHub Actions enabled by explicit --allow-actions"
+        return "GitHub Actions left enabled by explicit --allow-actions"
+    if dry_run:
+        return f"dry-run: would disable GitHub Actions for {repo}"
+    run_gh_text([
+        "api",
+        "-X",
+        "PUT",
+        f"repos/{repo}/actions/permissions",
+        "-F",
+        "enabled=false",
+    ])
+    return f"disabled GitHub Actions for {repo}"
 
 
 def push_mirror_to_target(source_repo: str, target_repo: str, work_dir: Path, dry_run: bool) -> str:
@@ -663,17 +722,19 @@ def run_foreman_on_sandbox(repo: str, mode: str, allow_apply_safe: bool, max_mut
 
 
 def sandbox(data: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
-    target_repo = args.target_repo
+    source_repo = data.get("repo") or DEFAULT_REPO
+    target_repo = resolve_target_repo(args.target_repo, args.target_owner, source_repo)
     output_dir = Path(args.output_dir)
     work_dir = Path(args.work_dir) if args.work_dir else Path(tempfile.mkdtemp(prefix="factory-sandbox-"))
     issues = data.get("issues", [])[:args.limit]
     prs = data.get("prs", [])[:args.limit]
     summary: dict[str, Any] = {
         "schema": "factory-testbench-sandbox-v1",
-        "source_repo": data.get("repo"),
+        "source_repo": source_repo,
         "target_repo": target_repo,
         "generated_at": utc_stamp(),
         "dry_run": args.dry_run,
+        "actions_enabled": args.allow_actions,
         "work_dir": str(work_dir),
         "issue_count": len(issues),
         "pr_count": len(prs),
@@ -683,16 +744,17 @@ def sandbox(data: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     }
 
     summary["steps"].append(create_private_repo(target_repo, args.reuse_existing, args.dry_run))
-    summary["steps"].append(push_mirror_to_target(data.get("repo") or DEFAULT_REPO, target_repo, work_dir, args.dry_run))
+    summary["steps"].append(configure_actions(target_repo, args.allow_actions, args.dry_run))
+    summary["steps"].append(push_mirror_to_target(source_repo, target_repo, work_dir, args.dry_run))
     labels = label_payload({"issues": issues, "prs": prs})
     summary["steps"].extend(create_labels(target_repo, labels, args.dry_run))
-    issue_map = create_sandbox_issues(target_repo, data.get("repo") or DEFAULT_REPO, issues, args.dry_run)
-    pr_map = create_sandbox_prs(target_repo, data.get("repo") or DEFAULT_REPO, prs, issue_map, work_dir, args.dry_run)
+    issue_map = create_sandbox_issues(target_repo, source_repo, issues, args.dry_run)
+    pr_map = create_sandbox_prs(target_repo, source_repo, prs, issue_map, work_dir, args.dry_run)
     summary["issue_map"] = issue_map
     summary["pr_map"] = pr_map
     summary["steps"].extend(edit_bodies_and_comments(
         target_repo,
-        data.get("repo") or DEFAULT_REPO,
+        source_repo,
         issues,
         prs,
         issue_map,
@@ -707,6 +769,7 @@ def sandbox(data: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
             args.max_mutations,
             output_dir,
         )
+    summary["steps"].append(configure_actions(target_repo, args.allow_actions, args.dry_run))
     return summary
 
 
@@ -958,6 +1021,28 @@ def run_fixture_test(args: argparse.Namespace) -> dict[str, Any]:
     if not CLOSING_REF_RE.search(restored_body):
         failures.append("sandbox restored body lost original closing references")
 
+    default_sandbox_args = parse_args(["sandbox", "--snapshot", "snapshot.json", "--target-repo", "example/sandbox"])
+    opt_in_sandbox_args = parse_args([
+        "sandbox",
+        "--snapshot",
+        "snapshot.json",
+        "--target-repo",
+        "example/sandbox",
+        "--allow-actions",
+    ])
+    if default_sandbox_args.allow_actions:
+        failures.append("sandbox Actions should be disabled by default")
+    if not opt_in_sandbox_args.allow_actions:
+        failures.append("sandbox --allow-actions did not opt in to Actions")
+    generated_repo = generated_target_repo("owner", "zeroclaw-labs/zeroclaw", "20260426T223308Z")
+    if generated_repo != "owner/zeroclaw-factory-sandbox-20260426T223308Z":
+        failures.append(f"unexpected generated sandbox repo name: {generated_repo}")
+    try:
+        resolve_target_repo("owner/zeroclaw-factory-sandbox-20260426-open-4", None, "zeroclaw-labs/zeroclaw")
+        failures.append("date-only sandbox target repo name was not rejected")
+    except RuntimeError:
+        pass
+
     payload["fixture"] = {
         "passed": not failures,
         "failures": failures,
@@ -1026,7 +1111,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     sandbox_parser = sub.add_parser("sandbox")
     sandbox_parser.add_argument("--snapshot")
     sandbox_parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", DEFAULT_REPO))
-    sandbox_parser.add_argument("--target-repo", required=True)
+    sandbox_parser.add_argument("--target-repo")
+    sandbox_parser.add_argument("--target-owner")
     sandbox_parser.add_argument("--limit", type=int, default=1000)
     sandbox_parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     sandbox_parser.add_argument("--issue-state", choices=("open", "closed", "all"), default="all")
@@ -1034,6 +1120,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     sandbox_parser.add_argument("--work-dir")
     sandbox_parser.add_argument("--reuse-existing", action="store_true")
     sandbox_parser.add_argument("--dry-run", action="store_true")
+    sandbox_parser.add_argument("--allow-actions", action="store_true")
     sandbox_parser.add_argument("--run-foreman-mode", choices=("none", "preview", "comment-only", "apply-safe"), default="none")
     sandbox_parser.add_argument("--allow-apply-safe", action="store_true")
     sandbox_parser.add_argument("--max-mutations", type=int, default=25)
@@ -1079,6 +1166,7 @@ def main(argv: list[str]) -> int:
         print(f"Issues: {payload['issue_count']}")
         print(f"PRs: {payload['pr_count']}")
         print(f"Dry run: {payload['dry_run']}")
+        print(f"Actions enabled: {payload['actions_enabled']}")
         if not args.no_audit_file:
             path = write_json(payload, output_dir, "sandbox")
             print(f"Sandbox file: {path}")
