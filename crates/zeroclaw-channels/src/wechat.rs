@@ -8,6 +8,7 @@ use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 const LONG_POLL_TIMEOUT_MS: u64 = 35_000;
+const LONG_POLL_CLIENT_BUFFER_MS: u64 = 10_000;
 const API_TIMEOUT_MS: u64 = 15_000;
 const SESSION_EXPIRED_ERRCODE: i32 = -14;
 const ITEM_TEXT: i32 = 1;
@@ -293,6 +294,8 @@ impl Channel for WeChatChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        // context_token is not forwarded: SendMessage has no carrier for it.
+        // Replies go to the recipient's primary iLink context.
         self.send_text(&message.recipient, None, &message.content).await
     }
 
@@ -302,7 +305,7 @@ impl Channel for WeChatChannel {
         let mut next_timeout = LONG_POLL_TIMEOUT_MS;
 
         loop {
-            let resp = match self.get_updates(&sync_buf, next_timeout).await {
+            let resp = match self.get_updates(&sync_buf, next_timeout + LONG_POLL_CLIENT_BUFFER_MS).await {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("WeChat getupdates error (retrying): {e}");
