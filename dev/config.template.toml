@@ -22,6 +22,10 @@ monthly_limit_usd = 100.0
 warn_at_percent = 80
 allow_override = false
 
+[sop]
+default_execution_mode = "deterministic"
+sops_dir = "sops"
+
 # Per-model pricing (USD per 1M tokens)
 # Uncomment and customize to override default pricing
 # [cost.prices."anthropic/claude-sonnet-4-20250514"]

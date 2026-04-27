@@ -11362,8 +11362,8 @@ pub struct SopConfig {
     pub sops_dir: Option<String>,
 
     /// Default execution mode for SOPs that omit `execution_mode`.
-    /// Values: `auto`, `supervised` (default), `step_by_step`,
-    /// `priority_based`, `deterministic`.
+    /// Values: `auto`, `supervised`, `step_by_step`,
+    /// `priority_based`, `deterministic` (default).
     #[serde(default = "default_sop_execution_mode")]
     pub default_execution_mode: String,
 
@@ -11384,7 +11384,7 @@ pub struct SopConfig {
 }
 
 fn default_sop_execution_mode() -> String {
-    "supervised".to_string()
+    "deterministic".to_string()
 }
 
 fn default_sop_max_concurrent_total() -> usize {
