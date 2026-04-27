@@ -1,10 +1,11 @@
 //! AWS Bedrock provider using the Converse API.
 //!
-//! Authentication: supports two methods:
+//! Authentication: supports three methods:
 //! - **Bearer token**: set `BEDROCK_API_KEY` env var (takes precedence).
 //! - **SigV4 signing**: AWS AKSK (Access Key ID + Secret Access Key)
-//!   via environment variables or EC2 IMDSv2. SigV4 signing is implemented
-//!   manually using hmac/sha2 crates — no AWS SDK dependency.
+//!   via environment variables, `credential_process` in `~/.aws/config`,
+//!   or EC2 IMDSv2. SigV4 signing is implemented manually using hmac/sha2
+//!   crates — no AWS SDK dependency.
 
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -15,6 +16,7 @@ use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::Mutex;
 use zeroclaw_api::tool::ToolSpec;
 
 /// Hostname prefix for the Bedrock Runtime endpoint.
@@ -34,11 +36,15 @@ enum BedrockAuth {
 // ── AWS Credentials ─────────────────────────────────────────────
 
 /// Resolved AWS credentials for SigV4 signing.
+#[derive(Clone)]
 struct AwsCredentials {
     access_key_id: String,
     secret_access_key: String,
     session_token: Option<String>,
     region: String,
+    /// Credential expiry (from `credential_process` `Expiration` field).
+    /// `None` means no known expiry — treat as long-lived.
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl AwsCredentials {
@@ -58,6 +64,97 @@ impl AwsCredentials {
             secret_access_key,
             session_token,
             region,
+            expires_at: None,
+        })
+    }
+
+    /// Parse `~/.aws/config` (or `$AWS_CONFIG_FILE`) and return the
+    /// `credential_process` command and optional `region` for the active profile.
+    fn parse_aws_config(content: &str, profile: &str) -> Option<(String, Option<String>)> {
+        let target = if profile == "default" {
+            "[default]".to_string()
+        } else {
+            format!("[profile {profile}]")
+        };
+
+        let mut in_section = false;
+        let mut cred_process = None;
+        let mut region = None;
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_section = trimmed == target;
+                continue;
+            }
+            if !in_section || trimmed.starts_with('#') || trimmed.starts_with(';') {
+                continue;
+            }
+            if let Some((key, value)) = trimmed.split_once('=') {
+                match key.trim() {
+                    "credential_process" => cred_process = Some(value.trim().to_string()),
+                    "region" => region = Some(value.trim().to_string()),
+                    _ => {}
+                }
+            }
+        }
+        cred_process.map(|cmd| (cmd, region))
+    }
+
+    /// Resolve credentials via `credential_process` in `~/.aws/config`.
+    fn from_credential_process() -> anyhow::Result<Self> {
+        let config_path = std::env::var("AWS_CONFIG_FILE").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+            format!("{home}/.aws/config")
+        });
+        let content = std::fs::read_to_string(&config_path)
+            .map_err(|e| anyhow::anyhow!("Cannot read {config_path}: {e}"))?;
+        let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string());
+        let (cmd, config_region) = Self::parse_aws_config(&content, &profile)
+            .ok_or_else(|| anyhow::anyhow!("No credential_process in [{profile}]"))?;
+
+        let output = std::process::Command::new("sh")
+            .args(["-c", &cmd])
+            .output()
+            .map_err(|e| anyhow::anyhow!("Failed to run credential_process: {e}"))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "credential_process exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|e| anyhow::anyhow!("credential_process output is not valid JSON: {e}"))?;
+
+        let access_key_id = json["AccessKeyId"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing AccessKeyId in credential_process output"))?
+            .to_string();
+        let secret_access_key = json["SecretAccessKey"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing SecretAccessKey in credential_process output"))?
+            .to_string();
+        let session_token = json["SessionToken"].as_str().map(|s| s.to_string());
+
+        let expires_at = json["Expiration"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        let region = env_optional("AWS_REGION")
+            .or_else(|| env_optional("AWS_DEFAULT_REGION"))
+            .or(config_region)
+            .unwrap_or_else(|| DEFAULT_REGION.to_string());
+
+        tracing::debug!("Loaded AWS credentials via credential_process");
+
+        Ok(Self {
+            access_key_id,
+            secret_access_key,
+            session_token,
+            region,
+            expires_at,
         })
     }
 
@@ -138,12 +235,16 @@ impl AwsCredentials {
             secret_access_key,
             session_token,
             region,
+            expires_at: None,
         })
     }
 
-    /// Resolve credentials: env vars first, then EC2 IMDS.
+    /// Resolve credentials: env vars first, then credential_process, then EC2 IMDS.
     async fn resolve() -> anyhow::Result<Self> {
         if let Ok(creds) = Self::from_env() {
+            return Ok(creds);
+        }
+        if let Ok(creds) = Self::from_credential_process() {
             return Ok(creds);
         }
         Self::from_imds().await
@@ -151,6 +252,15 @@ impl AwsCredentials {
 
     fn host(&self) -> String {
         format!("{ENDPOINT_PREFIX}.{}.amazonaws.com", self.region)
+    }
+
+    /// Returns `true` if credentials have a known expiry that has passed
+    /// (with 60s skew to allow for clock drift and network latency).
+    fn is_expired(&self) -> bool {
+        match self.expires_at {
+            Some(exp) => chrono::Utc::now() >= exp - chrono::Duration::seconds(60),
+            None => false,
+        }
     }
 }
 
@@ -472,6 +582,8 @@ struct ResponseToolUseWrapper {
 pub struct BedrockProvider {
     auth: Option<BedrockAuth>,
     max_tokens: u32,
+    /// Cached SigV4 credentials from `credential_process` (with expiry).
+    cred_cache: Mutex<Option<AwsCredentials>>,
 }
 
 impl Default for BedrockProvider {
@@ -487,11 +599,16 @@ impl BedrockProvider {
             return Self {
                 auth: Some(BedrockAuth::BearerToken(token)),
                 max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+                cred_cache: Mutex::new(None),
             };
         }
         Self {
-            auth: AwsCredentials::from_env().ok().map(BedrockAuth::SigV4),
+            auth: AwsCredentials::from_env()
+                .or_else(|_| AwsCredentials::from_credential_process())
+                .ok()
+                .map(BedrockAuth::SigV4),
             max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            cred_cache: Mutex::new(None),
         }
     }
 
@@ -501,12 +618,14 @@ impl BedrockProvider {
             return Self {
                 auth: Some(BedrockAuth::BearerToken(token)),
                 max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+                cred_cache: Mutex::new(None),
             };
         }
         let auth = AwsCredentials::resolve().await.ok().map(BedrockAuth::SigV4);
         Self {
             auth,
             max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            cred_cache: Mutex::new(None),
         }
     }
 
@@ -515,6 +634,7 @@ impl BedrockProvider {
         Self {
             auth: Some(BedrockAuth::BearerToken(token.to_string())),
             max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            cred_cache: Mutex::new(None),
         }
     }
 
@@ -568,7 +688,13 @@ impl BedrockProvider {
                     return Ok(BedrockAuth::BearerToken(token.clone()));
                 }
                 BedrockAuth::SigV4(_) => {
-                    // Re-resolve SigV4 credentials (they may have rotated).
+                    // Check credential cache before re-resolving.
+                    if let Ok(cache) = self.cred_cache.lock()
+                        && let Some(ref creds) = *cache
+                        && !creds.is_expired()
+                    {
+                        return Ok(BedrockAuth::SigV4(creds.clone()));
+                    }
                 }
             }
         }
@@ -578,6 +704,13 @@ impl BedrockProvider {
         }
         // Fall back to SigV4.
         if let Ok(creds) = AwsCredentials::from_env() {
+            return Ok(BedrockAuth::SigV4(creds));
+        }
+        if let Ok(creds) = AwsCredentials::from_credential_process() {
+            // Cache the credentials for reuse.
+            if let Ok(mut cache) = self.cred_cache.lock() {
+                *cache = Some(creds.clone());
+            }
             return Ok(BedrockAuth::SigV4(creds));
         }
         Ok(BedrockAuth::SigV4(AwsCredentials::from_imds().await?))
@@ -1296,6 +1429,7 @@ mod tests {
             secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
             session_token: None,
             region: "us-east-1".to_string(),
+            expires_at: None,
         };
 
         let timestamp = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
@@ -1335,6 +1469,7 @@ mod tests {
             secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
             session_token: Some("session-token-value".to_string()),
             region: "us-east-1".to_string(),
+            expires_at: None,
         };
 
         let timestamp = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
@@ -1376,6 +1511,7 @@ mod tests {
             secret_access_key: "secret".to_string(),
             session_token: None,
             region: "us-west-2".to_string(),
+            expires_at: None,
         };
         assert_eq!(creds.host(), "bedrock-runtime.us-west-2.amazonaws.com");
     }
@@ -1390,12 +1526,15 @@ mod tests {
 
     #[tokio::test]
     async fn chat_fails_without_credentials() {
-        let provider = {
-            let _env_lock = env_lock();
-            BedrockProvider {
-                auth: None,
-                max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
-            }
+        let _env_lock = env_lock();
+        let _ak = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
+        let _sk = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
+        let _bearer = EnvGuard::set("BEDROCK_API_KEY", None);
+        let _config = EnvGuard::set("AWS_CONFIG_FILE", Some("/dev/null"));
+        let provider = BedrockProvider {
+            auth: None,
+            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            cred_cache: Mutex::new(None),
         };
         let result = provider
             .chat_with_system(None, "hello", "anthropic.claude-sonnet-4-6", Some(0.7))
@@ -1788,6 +1927,7 @@ mod tests {
         let provider = BedrockProvider {
             auth: None,
             max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            cred_cache: Mutex::new(None),
         };
         let result = provider.warmup().await;
         assert!(result.is_ok());
@@ -1798,6 +1938,7 @@ mod tests {
         let provider = BedrockProvider {
             auth: None,
             max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            cred_cache: Mutex::new(None),
         };
         let caps = provider.capabilities();
         assert!(caps.native_tool_calling);
@@ -1975,5 +2116,107 @@ mod tests {
         } else {
             panic!("Expected Text block for assistant message");
         }
+    }
+
+    // ── credential_process tests ────────────────────────────────
+
+    #[test]
+    fn parse_aws_config_default_profile() {
+        let config = "\
+[default]
+region=us-west-2
+credential_process=ada credentials print --account=123 --provider=conduit --role=MyRole
+";
+        let result = AwsCredentials::parse_aws_config(config, "default");
+        assert!(result.is_some());
+        let (cmd, region) = result.unwrap();
+        assert_eq!(
+            cmd,
+            "ada credentials print --account=123 --provider=conduit --role=MyRole"
+        );
+        assert_eq!(region.as_deref(), Some("us-west-2"));
+    }
+
+    #[test]
+    fn parse_aws_config_named_profile() {
+        let config = "\
+[default]
+region=us-east-1
+
+[profile myprofile]
+region=eu-west-1
+credential_process=aws sso get-role-credentials --profile myprofile
+";
+        let result = AwsCredentials::parse_aws_config(config, "myprofile");
+        assert!(result.is_some());
+        let (cmd, region) = result.unwrap();
+        assert!(cmd.contains("myprofile"));
+        assert_eq!(region.as_deref(), Some("eu-west-1"));
+    }
+
+    #[test]
+    fn parse_aws_config_missing_credential_process() {
+        let config = "\
+[default]
+region=us-west-2
+";
+        let result = AwsCredentials::parse_aws_config(config, "default");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_aws_config_ignores_comments() {
+        let config = "\
+[default]
+# credential_process=should-be-ignored
+; credential_process=also-ignored
+credential_process=real-command
+";
+        let result = AwsCredentials::parse_aws_config(config, "default");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, "real-command");
+    }
+
+    #[test]
+    fn parse_aws_config_nonexistent_profile() {
+        let config = "\
+[default]
+credential_process=some-command
+";
+        let result = AwsCredentials::parse_aws_config(config, "nonexistent");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn from_credential_process_parses_json_output() {
+        // Verify config parsing + JSON shape by using `echo` as the command.
+        let config = "\
+[default]
+credential_process=echo '{\"Version\":1,\"AccessKeyId\":\"AKIA\",\"SecretAccessKey\":\"secret\",\"SessionToken\":\"tok\"}'
+region=ap-southeast-1
+";
+        let (cmd, region) = AwsCredentials::parse_aws_config(config, "default").unwrap();
+        assert!(cmd.starts_with("echo"));
+        assert_eq!(region.as_deref(), Some("ap-southeast-1"));
+
+        let output = std::process::Command::new("sh")
+            .args(["-c", &cmd])
+            .output()
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["AccessKeyId"].as_str(), Some("AKIA"));
+        assert_eq!(json["SecretAccessKey"].as_str(), Some("secret"));
+        assert_eq!(json["SessionToken"].as_str(), Some("tok"));
+    }
+
+    #[test]
+    fn env_vars_take_precedence_over_credential_process() {
+        let _env_lock = env_lock();
+        let _ak = EnvGuard::set("AWS_ACCESS_KEY_ID", Some("FROM_ENV"));
+        let _sk = EnvGuard::set("AWS_SECRET_ACCESS_KEY", Some("secret_from_env"));
+
+        let creds = AwsCredentials::from_env();
+        assert!(creds.is_ok());
+        assert_eq!(creds.unwrap().access_key_id, "FROM_ENV");
     }
 }
