@@ -10,7 +10,7 @@
 //!
 //! | Method            | Description                              |
 //! |-------------------|------------------------------------------|
-//! | `initialize`      | Handshake — returns server capabilities (incl. defaultModel) |
+//! | `initialize`      | Handshake — returns server capabilities (incl. defaultModel when configured) |
 //! | `session/new`     | Create an isolated agent session          |
 //! | `session/prompt`  | Send a prompt, stream back `session/update` events |
 //! | `session/stop`    | Gracefully terminate a session            |
@@ -228,8 +228,16 @@ impl AcpServer {
             .config
             .providers
             .fallback_provider()
-            .and_then(|e| e.model.clone())
-            .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string());
+            .and_then(|e| e.model.clone());
+
+        let mut capabilities = serde_json::json!({
+            "streaming": true,
+            "maxSessions": self.acp_config.max_sessions,
+            "sessionTimeoutSecs": self.acp_config.session_timeout_secs,
+        });
+        if let Some(model) = default_model {
+            capabilities["defaultModel"] = serde_json::json!(model);
+        }
 
         Ok(serde_json::json!({
             "protocolVersion": "1.0",
@@ -237,12 +245,7 @@ impl AcpServer {
                 "name": "zeroclaw-acp",
                 "version": env!("CARGO_PKG_VERSION"),
             },
-            "capabilities": {
-                "streaming": true,
-                "maxSessions": self.acp_config.max_sessions,
-                "sessionTimeoutSecs": self.acp_config.session_timeout_secs,
-                "defaultModel": default_model,
-            },
+            "capabilities": capabilities,
             "methods": [
                 "initialize",
                 "session/new",
@@ -789,6 +792,34 @@ mod tests {
         let missing_params = serde_json::json!({});
         let result = AcpServer::parse_prompt(&missing_params);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn handle_initialize_default_model_absent_when_unconfigured() {
+        let server = AcpServer::new(Config::default(), AcpServerConfig::default());
+        let result = server.handle_initialize(&serde_json::json!({})).unwrap();
+        assert!(
+            result["capabilities"].get("defaultModel").is_none(),
+            "defaultModel must be absent when no provider is configured, got: {}",
+            result["capabilities"]["defaultModel"]
+        );
+    }
+
+    #[test]
+    fn handle_initialize_default_model_reflects_configured_provider() {
+        use zeroclaw_config::schema::ModelProviderConfig;
+        let mut config = Config::default();
+        config.providers.fallback = Some("myprovider".to_string());
+        config.providers.models.insert(
+            "myprovider".to_string(),
+            ModelProviderConfig {
+                model: Some("llama3.2".to_string()),
+                ..Default::default()
+            },
+        );
+        let server = AcpServer::new(config, AcpServerConfig::default());
+        let result = server.handle_initialize(&serde_json::json!({})).unwrap();
+        assert_eq!(result["capabilities"]["defaultModel"], "llama3.2");
     }
 
     #[test]

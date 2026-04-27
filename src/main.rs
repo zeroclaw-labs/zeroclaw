@@ -1596,6 +1596,38 @@ async fn main() -> Result<()> {
             } else {
                 info!("🧠 Starting ZeroClaw Daemon on {host}:{port}");
             }
+
+            #[cfg(target_os = "linux")]
+            {
+                use zeroclaw_config::schema::SandboxBackend;
+                let sandbox_docker =
+                    matches!(config.security.sandbox.backend, SandboxBackend::Docker);
+                let runtime_docker_mem = config.runtime.kind == "docker"
+                    && config
+                        .runtime
+                        .docker
+                        .memory_limit_mb
+                        .is_some_and(|mb| mb > 0);
+                if (sandbox_docker || runtime_docker_mem)
+                    && !zeroclaw_runtime::security::linux_memcg_available()
+                {
+                    let which = match (sandbox_docker, runtime_docker_mem) {
+                        (true, true) => {
+                            "security.sandbox.backend = \"docker\" and runtime.kind = \"docker\""
+                        }
+                        (true, false) => "security.sandbox.backend = \"docker\"",
+                        _ => "runtime.kind = \"docker\"",
+                    };
+                    warn!(
+                        "Docker memory limits are configured but the Linux kernel has no memcg support. \
+                         Affected config: {which}. \
+                         Consequence: --memory limits are silently ignored; agents can OOM the host. \
+                         Fix: add 'cgroup_memory=1 cgroup_enable=memory' to /boot/firmware/cmdline.txt \
+                         (Raspberry Pi) or enable CONFIG_MEMCG in your kernel, then reboot."
+                    );
+                }
+            }
+
             // Wire CLI channel for interactive mode
             #[cfg(feature = "agent-runtime")]
             zeroclaw_runtime::agent::loop_::register_cli_channel_fn(Box::new(|| {
