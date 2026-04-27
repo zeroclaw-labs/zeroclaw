@@ -295,11 +295,68 @@ pub enum ToolsPayload {
     PromptGuided { instructions: String },
 }
 
+/// Industry-neutral sampling temperature. OpenAI, Gemini, OpenRouter, and
+/// most OpenAI-compatible endpoints document 0.7 as their typical default;
+/// Anthropic and Ollama override (1.0 and 0.0 respectively).
+pub const BASELINE_TEMPERATURE: f64 = 0.7;
+
+/// Output-token budget roomy enough for typical agent turns. Providers
+/// override per family where the model's own context window is the
+/// binding constraint.
+pub const BASELINE_MAX_TOKENS: u32 = 4096;
+
+/// HTTP timeout for cloud inference. Local providers (Ollama) override
+/// upward since CPU/GPU-bound inference runs slower than round-tripping to
+/// a hyperscaler.
+pub const BASELINE_TIMEOUT_SECS: u64 = 120;
+
+/// Wire protocol used when the provider doesn't declare one. Only OpenAI's
+/// Codex stack uses the "responses" protocol; everything else speaks the
+/// classic chat completions shape.
+pub const BASELINE_WIRE_API: &str = "chat_completions";
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Query provider capabilities.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
+    }
+
+    // ── Provider-family defaults ────────────────────────────────────────────
+    // Called by every chat/stream method's `temperature.unwrap_or(self.default_temperature())`
+    // and by `zeroclaw onboard` to prefill prompts with a visible default.
+    // Baselines are the industry-neutral fallback; override per family where
+    // the API docs disagree (Anthropic → 1.0, Ollama → 0.0 for deterministic
+    // local inference).
+
+    /// Temperature used when the caller passes `None`. Override per family.
+    fn default_temperature(&self) -> f64 {
+        BASELINE_TEMPERATURE
+    }
+
+    /// Max output tokens used when the caller / config doesn't set one.
+    fn default_max_tokens(&self) -> u32 {
+        BASELINE_MAX_TOKENS
+    }
+
+    /// HTTP timeout (seconds) used when the caller / config doesn't set one.
+    fn default_timeout_secs(&self) -> u64 {
+        BASELINE_TIMEOUT_SECS
+    }
+
+    /// Canonical public API endpoint, when there is one. Returned as a
+    /// string slice so provider impls can serve from `const &'static str`s
+    /// without allocations. `None` = provider has no universal endpoint
+    /// (local providers, auth-less CLIs, user-BYO endpoints).
+    fn default_base_url(&self) -> Option<&str> {
+        None
+    }
+
+    /// Wire protocol variant. Either `"responses"` (OpenAI Codex-style) or
+    /// `"chat_completions"` (everything else). Providers override to their
+    /// native format.
+    fn default_wire_api(&self) -> &str {
+        BASELINE_WIRE_API
     }
 
     /// Convert tool specifications to provider-native format.
@@ -310,31 +367,46 @@ pub trait Provider: Send + Sync {
     }
 
     /// Simple one-shot chat (single user message, no explicit system prompt).
+    ///
+    /// `temperature == None` means "use `self.default_temperature()`". The
+    /// unwrap lives inside each provider impl, not at every call site.
     async fn simple_chat(
         &self,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         self.chat_with_system(None, message, model, temperature)
             .await
     }
 
-    /// One-shot chat with optional system prompt.
+    /// One-shot chat with optional system prompt. See `simple_chat` for
+    /// the `temperature` contract.
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String>;
 
-    /// Multi-turn conversation.
+    /// Fetch the list of available model IDs for this provider.
+    ///
+    /// Used by onboard to present a live model picker. Default bails with
+    /// "not supported"; concrete providers override to hit their own public
+    /// endpoint (OpenRouter, Ollama) or delegate to the shared models.dev
+    /// catalog (no auth required) in `zeroclaw_providers::models_dev`.
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        anyhow::bail!("live model listing is not supported for this provider")
+    }
+
+    /// Multi-turn conversation. See `simple_chat` for the `temperature`
+    /// contract.
     async fn chat_with_history(
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let system = messages
             .iter()
@@ -349,12 +421,13 @@ pub trait Provider: Send + Sync {
             .await
     }
 
-    /// Structured chat API for agent loop callers.
+    /// Structured chat API for agent loop callers. See `simple_chat` for
+    /// the `temperature` contract.
     async fn chat(
         &self,
         request: ChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         if let Some(tools) = request.tools
             && !tools.is_empty()
@@ -418,12 +491,13 @@ pub trait Provider: Send + Sync {
     }
 
     /// Chat with tool definitions for native function calling support.
+    /// See `simple_chat` for the `temperature` contract.
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
         _tools: &[serde_json::Value],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let text = self.chat_with_history(messages, model, temperature).await?;
         Ok(ChatResponse {
@@ -444,24 +518,26 @@ pub trait Provider: Send + Sync {
         false
     }
 
-    /// Streaming chat with optional system prompt.
+    /// Streaming chat with optional system prompt. See `simple_chat` for
+    /// the `temperature` contract.
     fn stream_chat_with_system(
         &self,
         _system_prompt: Option<&str>,
         _message: &str,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
         _options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         stream::empty().boxed()
     }
 
-    /// Streaming chat with history.
+    /// Streaming chat with history. See `simple_chat` for the `temperature`
+    /// contract.
     fn stream_chat_with_history(
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         let system = messages
@@ -476,12 +552,13 @@ pub trait Provider: Send + Sync {
         self.stream_chat_with_system(system, last_user, model, temperature, options)
     }
 
-    /// Structured streaming chat interface.
+    /// Structured streaming chat interface. See `simple_chat` for the
+    /// `temperature` contract.
     fn stream_chat(
         &self,
         request: ChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         self.stream_chat_with_history(request.messages, model, temperature, options)
@@ -498,6 +575,26 @@ pub trait Provider: Send + Sync {
 impl<T: Provider + ?Sized> Provider for Arc<T> {
     fn capabilities(&self) -> ProviderCapabilities {
         self.as_ref().capabilities()
+    }
+
+    fn default_temperature(&self) -> f64 {
+        self.as_ref().default_temperature()
+    }
+
+    fn default_max_tokens(&self) -> u32 {
+        self.as_ref().default_max_tokens()
+    }
+
+    fn default_timeout_secs(&self) -> u64 {
+        self.as_ref().default_timeout_secs()
+    }
+
+    fn default_base_url(&self) -> Option<&str> {
+        self.as_ref().default_base_url()
+    }
+
+    fn default_wire_api(&self) -> &str {
+        self.as_ref().default_wire_api()
     }
 
     fn convert_tools(&self, tools: &[ToolSpec]) -> ToolsPayload {
@@ -517,7 +614,7 @@ impl<T: Provider + ?Sized> Provider for Arc<T> {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         self.as_ref()
             .chat_with_system(system_prompt, message, model, temperature)
@@ -528,7 +625,7 @@ impl<T: Provider + ?Sized> Provider for Arc<T> {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         self.as_ref()
             .chat_with_history(messages, model, temperature)
@@ -539,7 +636,7 @@ impl<T: Provider + ?Sized> Provider for Arc<T> {
         &self,
         request: ChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         self.as_ref().chat(request, model, temperature).await
     }
@@ -553,7 +650,7 @@ impl<T: Provider + ?Sized> Provider for Arc<T> {
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         self.as_ref()
             .chat_with_tools(messages, tools, model, temperature)
@@ -573,7 +670,7 @@ impl<T: Provider + ?Sized> Provider for Arc<T> {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         self.as_ref()
@@ -584,7 +681,7 @@ impl<T: Provider + ?Sized> Provider for Arc<T> {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         self.as_ref()
@@ -595,7 +692,7 @@ impl<T: Provider + ?Sized> Provider for Arc<T> {
         &self,
         request: ChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         self.as_ref()

@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
-import { LogOut, Settings, ChevronDown, PanelLeftClose, PanelLeftOpen, Menu } from 'lucide-react';
+import { LogOut, Settings, ChevronDown, PanelLeftClose, PanelLeftOpen, Menu, Globe } from 'lucide-react';
 import { t, SUPPORTED_LOCALES } from '@/lib/i18n';
 import { useLocaleContext } from '@/App';
 import { useAuth } from '@/hooks/useAuth';
@@ -35,7 +35,6 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
 
   const titleKey = routeTitles[location.pathname] ?? 'nav.dashboard';
   const pageTitle = t(titleKey);
-  const currentFlag = SUPPORTED_LOCALES.find((l) => l.code === locale)?.flag ?? '🌐';
 
   // Close dropdown when clicking outside
   useEffect(() => {
@@ -119,7 +118,7 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
                 }
               }}
             >
-              <span>{currentFlag}</span>
+              <Globe className="h-3.5 w-3.5" />
               {locale.toUpperCase()}
               <ChevronDown className="h-3 w-3" style={{ transform: langOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.15s' }} />
             </button>
@@ -136,7 +135,7 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
                   zIndex: 9999,
                 }}
               >
-                {SUPPORTED_LOCALES.map(({ code, name, flag }) => (
+                {SUPPORTED_LOCALES.map(({ code, name }) => (
                   <button
                     key={code}
                     type="button"
@@ -163,7 +162,6 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
                       }
                     }}
                   >
-                    <span style={{ fontSize: '14px' }}>{flag}</span>
                     <span className="flex-1">{name}</span>
                     <span className="font-mono opacity-40">{code.toUpperCase()}</span>
                   </button>
