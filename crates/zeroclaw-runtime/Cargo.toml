@@ -15,6 +15,7 @@ zeroclaw-memory.workspace = true
 zeroclaw-tools.workspace = true
 zeroclaw-plugins = { workspace = true, optional = true }
 zeroclaw-tool-call-parser.workspace = true
+fluent = "0.16"
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
@@ -76,15 +77,14 @@ prometheus = { version = "0.14", default-features = false, optional = true }
 opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
+# Optional deps for specific features
+pdf-extract = { version = "0.10", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { version = "0.4", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-# Optional deps for specific features
-pdf-extract = { version = "0.10", optional = true }
 
 [features]
 default = ["observability-prometheus", "schema-export"]

@@ -10,7 +10,7 @@
 //!
 //! | Method            | Description                              |
 //! |-------------------|------------------------------------------|
-//! | `initialize`      | Handshake — returns server capabilities (incl. defaultModel) |
+//! | `initialize`      | Handshake — returns server capabilities (incl. defaultModel when configured) |
 //! | `session/new`     | Create an isolated agent session          |
 //! | `session/prompt`  | Send a prompt, stream back `session/update` events |
 //! | `session/stop`    | Gracefully terminate a session            |
@@ -228,8 +228,16 @@ impl AcpServer {
             .config
             .providers
             .fallback_provider()
-            .and_then(|e| e.model.clone())
-            .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string());
+            .and_then(|e| e.model.clone());
+
+        let mut capabilities = serde_json::json!({
+            "streaming": true,
+            "maxSessions": self.acp_config.max_sessions,
+            "sessionTimeoutSecs": self.acp_config.session_timeout_secs,
+        });
+        if let Some(model) = default_model {
+            capabilities["defaultModel"] = serde_json::json!(model);
+        }
 
         Ok(serde_json::json!({
             "protocolVersion": "1.0",
@@ -237,12 +245,7 @@ impl AcpServer {
                 "name": "zeroclaw-acp",
                 "version": env!("CARGO_PKG_VERSION"),
             },
-            "capabilities": {
-                "streaming": true,
-                "maxSessions": self.acp_config.max_sessions,
-                "sessionTimeoutSecs": self.acp_config.session_timeout_secs,
-                "defaultModel": default_model,
-            },
+            "capabilities": capabilities,
             "methods": [
                 "initialize",
                 "session/new",
@@ -340,13 +343,15 @@ impl AcpServer {
         // the whole Session and returns it alongside the result so we can
         // put the session back into the map afterwards.
         let turn_handle = tokio::spawn(async move {
-            let result = session.agent.turn_streamed(&prompt, event_tx).await;
+            let result = session.agent.turn_streamed(&prompt, event_tx, None).await;
             (session, result)
         });
 
         // Forward events as they arrive. Use standard ACP `session/update`
-        // notifications with `sessionUpdate` + structured `content` so that
-        // clients like agentic.nvim route them to MessageWriter.
+        // notifications: `tool_call` for initial (pending + title/kind for UI/icons),
+        // `tool_call_update` for completion (status + rawOutput). This enables
+        // proper pending→completed flow without duplicating large tool output in
+        // multiple fields on the wire.
         while let Some(event) = event_rx.recv().await {
             let notification = match &event {
                 TurnEvent::Chunk { delta } => JsonRpcNotification {
@@ -363,31 +368,33 @@ impl AcpServer {
                         }
                     }),
                 },
-                TurnEvent::ToolCall { name, args } => JsonRpcNotification {
+                TurnEvent::ToolCall { id, name, args } => JsonRpcNotification {
                     jsonrpc: "2.0",
                     method: "session/update",
                     params: serde_json::json!({
                         "sessionId": session_id,
                         "update": {
                             "sessionUpdate": "tool_call",
-                            "toolCallId": name,  // simplistic; full impl would generate UUID
-                            "name": name,
-                            "kind": "other",
-                            "argument": args,
+                            "toolCallId": id,
+                            "title": name,
+                            "kind": map_tool_kind(name),
+                            "rawInput": args,
                             "status": "pending"
                         }
                     }),
                 },
-                TurnEvent::ToolResult { name, output } => JsonRpcNotification {
+                TurnEvent::ToolResult { id, name, output } => JsonRpcNotification {
                     jsonrpc: "2.0",
                     method: "session/update",
                     params: serde_json::json!({
                         "sessionId": session_id,
                         "update": {
                             "sessionUpdate": "tool_call_update",
-                            "toolCallId": name,
+                            "toolCallId": id,
+                            "title": name,
+                            "kind": map_tool_kind(name),
                             "status": "completed",
-                            "body": output
+                            "rawOutput": output
                         }
                     }),
                 },
@@ -593,6 +600,54 @@ impl AcpServer {
     }
 }
 
+fn map_tool_kind(name: &str) -> &'static str {
+    match name {
+        "ask_user" | "calculator" | "claude_code" | "claude_code_runner" | "codex_cli"
+        | "composio" | "delegate" | "escalate_to_human" | "execute_pipeline" | "gemini_cli"
+        | "jira" | "llm_task" | "opencode_cli" | "schedule" | "security_ops" | "shell"
+        | "sop_advance" | "sop_approve" | "sop_execute" | "swarm" | "vi_verify" => "execute",
+        "backup" | "browser_open" | "canvas" | "cloud_ops" | "file_edit" | "file_write"
+        | "memory_export" | "memory_store" | "report_template" => "edit",
+        "cron_add" | "poll" | "reaction" => "edit",
+        "memory_forget" | "memory_purge" => "delete",
+        "content_search" | "discord_search" | "glob_search" | "knowledge" | "search"
+        | "tool_search" | "web_search_tool" => "search",
+        "browser"
+        | "browser_delegate"
+        | "cloud_patterns"
+        | "data_management"
+        | "file_read"
+        | "git_operations"
+        | "google_workspace"
+        | "hardware_board_info"
+        | "hardware_memory_map"
+        | "hardware_memory_read"
+        | "image_info"
+        | "linkedin"
+        | "microsoft365"
+        | "model_routing_config"
+        | "model_switch"
+        | "pdf_read"
+        | "project_intel"
+        | "proxy_config"
+        | "read_skill"
+        | "sessions_history"
+        | "sessions_list"
+        | "sop_list"
+        | "sop_status"
+        | "text_browser"
+        | "weather"
+        | "workspace" => "read",
+        "cron_list" | "cron_runs" | "memory_recall" => "read",
+        "http_request" | "web_fetch" => "fetch",
+        "image_gen" => "other",
+        "cron_remove" => "delete",
+        "cron_run" => "execute",
+        "sessions_send" => "execute",
+        _ => "other",
+    }
+}
+
 // ── Error helper ─────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -737,5 +792,97 @@ mod tests {
         let missing_params = serde_json::json!({});
         let result = AcpServer::parse_prompt(&missing_params);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn handle_initialize_default_model_absent_when_unconfigured() {
+        let server = AcpServer::new(Config::default(), AcpServerConfig::default());
+        let result = server.handle_initialize(&serde_json::json!({})).unwrap();
+        assert!(
+            result["capabilities"].get("defaultModel").is_none(),
+            "defaultModel must be absent when no provider is configured, got: {}",
+            result["capabilities"]["defaultModel"]
+        );
+    }
+
+    #[test]
+    fn handle_initialize_default_model_reflects_configured_provider() {
+        use zeroclaw_config::schema::ModelProviderConfig;
+        let mut config = Config::default();
+        config.providers.fallback = Some("myprovider".to_string());
+        config.providers.models.insert(
+            "myprovider".to_string(),
+            ModelProviderConfig {
+                model: Some("llama3.2".to_string()),
+                ..Default::default()
+            },
+        );
+        let server = AcpServer::new(config, AcpServerConfig::default());
+        let result = server.handle_initialize(&serde_json::json!({})).unwrap();
+        assert_eq!(result["capabilities"]["defaultModel"], "llama3.2");
+    }
+
+    #[test]
+    fn test_tool_call_and_update_serialization() {
+        // Test tool_call (initial pending event)
+        let tool_call_notif = JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": "test-sid",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc-12345",
+                    "title": "shell",
+                    "kind": "execute",
+                    "rawInput": {"command": "ls -la"},
+                    "status": "pending"
+                }
+            }),
+        };
+        let json1 = serde_json::to_string(&tool_call_notif).unwrap();
+        assert!(json1.contains("\"sessionUpdate\":\"tool_call\""));
+        assert!(json1.contains("\"toolCallId\":\"tc-12345\""));
+        assert!(json1.contains("\"title\":\"shell\""));
+        assert!(json1.contains("\"kind\":\"execute\""));
+        assert!(json1.contains("\"status\":\"pending\""));
+        assert!(json1.contains("\"rawInput\""));
+
+        // Test tool_call_update completion payload
+        let tool_update_notif = JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": "test-sid",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-12345",
+                    "title": "shell",
+                    "kind": "execute",
+                    "status": "completed",
+                    "rawOutput": "file1.txt\nfile2.txt"
+                }
+            }),
+        };
+        let json2 = serde_json::to_string(&tool_update_notif).unwrap();
+        assert!(json2.contains("\"sessionUpdate\":\"tool_call_update\""));
+        assert!(json2.contains("\"toolCallId\":\"tc-12345\""));
+        assert!(json2.contains("\"status\":\"completed\""));
+        assert!(json2.contains("\"rawOutput\""));
+        assert!(!json2.contains("\"content\""));
+        assert!(json2.contains("file1.txt"));
+        // Verify matching toolCallId across events
+        assert!(json1.contains("tc-12345") && json2.contains("tc-12345"));
+    }
+
+    #[test]
+    fn map_tool_kind_uses_explicit_tool_names() {
+        assert_eq!(map_tool_kind("memory_forget"), "delete");
+        assert_eq!(map_tool_kind("memory_purge"), "delete");
+        assert_eq!(map_tool_kind("cron_run"), "execute");
+        assert_eq!(map_tool_kind("file_read"), "read");
+        assert_eq!(map_tool_kind("file_write"), "edit");
+        assert_eq!(map_tool_kind("web_fetch"), "fetch");
+        assert_eq!(map_tool_kind("unknown_tool"), "other");
     }
 }

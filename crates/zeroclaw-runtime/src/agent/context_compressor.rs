@@ -29,6 +29,10 @@ const PROBE_TIERS: &[usize] = &[
     2_000_000, 1_000_000, 512_000, 200_000, 128_000, 64_000, 32_000,
 ];
 
+/// Low temperature for near-deterministic summarization; history compression
+/// must faithfully reflect the source conversation, not invent or embellish.
+const SUMMARIZER_TEMPERATURE: f64 = 0.1;
+
 fn next_probe_tier(current: usize) -> usize {
     PROBE_TIERS
         .iter()
@@ -325,7 +329,12 @@ impl ContextCompressor {
         let timeout = Duration::from_secs(self.config.timeout_secs);
         let summary_raw = match tokio::time::timeout(
             timeout,
-            provider.chat_with_system(Some(SUMMARIZER_SYSTEM), &user_prompt, summary_model, 0.1),
+            provider.chat_with_system(
+                Some(SUMMARIZER_SYSTEM),
+                &user_prompt,
+                summary_model,
+                Some(SUMMARIZER_TEMPERATURE),
+            ),
         )
         .await
         {
