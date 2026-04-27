@@ -527,7 +527,7 @@ impl KnowledgeGraph {
             }
         }
         let mut top_tags: Vec<(String, usize)> = tag_counts.into_iter().collect();
-        top_tags.sort_by(|a, b| b.1.cmp(&a.1));
+        top_tags.sort_by_key(|tag| std::cmp::Reverse(tag.1));
         top_tags.truncate(10);
 
         Ok(GraphStats {

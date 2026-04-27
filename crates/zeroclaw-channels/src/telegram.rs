@@ -5563,11 +5563,17 @@ mod tests {
 
     #[test]
     fn truncate_telegram_command_description_multibyte_within_char_limit() {
-        // 31 chars but >100 bytes in UTF-8 — must be returned unchanged without trailing '…'
-        let desc = "Show current weather 🌤️🌧️⛈️🌨️🌩️🌪️🌊💨🌡️🌬️";
+        // Multibyte string within Telegram's 100-character description limit
+        // but well over 100 bytes in UTF-8 encoding. The function must use
+        // character count (not byte count) to decide whether to truncate, so
+        // a string like this should pass through unchanged with no trailing
+        // ellipsis. Construction is deterministic via `repeat` so the byte
+        // arithmetic is verifiable from the source: 31 ASCII bytes + 30 × 4
+        // bytes (`🌧` is U+1F327, 4 bytes UTF-8) = 151 bytes, 61 chars.
+        let desc = format!("Multibyte weather description: {}", "🌧".repeat(30));
         assert!(desc.chars().count() <= TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN);
         assert!(desc.len() > TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN);
-        let result = truncate_telegram_command_description(desc);
+        let result = truncate_telegram_command_description(&desc);
         assert!(
             !result.ends_with('…'),
             "should not append ellipsis when within char limit"

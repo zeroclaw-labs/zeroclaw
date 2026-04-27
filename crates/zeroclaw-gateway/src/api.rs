@@ -888,6 +888,37 @@ pub async fn handle_api_cli_tools(
     Json(serde_json::json!({"cli_tools": tools})).into_response()
 }
 
+/// GET /api/channels — list configured channels with status
+pub async fn handle_api_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let channels: Vec<serde_json::Value> = config
+        .channels
+        .channels()
+        .into_iter()
+        .filter(|(_, present)| *present)
+        .map(|(ch, _)| {
+            serde_json::json!({
+                "name": ch.name(),
+                "type": ch.name(),
+                "enabled": true,
+                "status": "active",
+                "message_count": 0,
+                "last_message_at": null,
+                "health": "healthy",
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "channels": channels })).into_response()
+}
+
 /// GET /api/health — component health snapshot
 pub async fn handle_api_health(
     State(state): State<AppState>,

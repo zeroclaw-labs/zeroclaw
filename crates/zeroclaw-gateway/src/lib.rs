@@ -1020,6 +1020,7 @@ pub async fn run_gateway(
         .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
+        .route("/api/channels", get(api::handle_api_channels))
         .route("/api/health", get(api::handle_api_health))
         .route("/api/sessions", get(api::handle_api_sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
