@@ -473,6 +473,7 @@ impl Channel for WuKongIMChannel {
                             // 1. Decode Base64 payload
                             let decoded_payload = base64::engine::general_purpose::STANDARD.decode(&params.payload)?;
                             let payload_json: serde_json::Value = serde_json::from_slice(&decoded_payload)?;
+                            tracing::debug!("WuKongIM: decoded payload: {:?}", payload_json);
 
                             // 2. Filter out system commands (type 99 or presence of 'cmd')
                             let msg_type = payload_json.get("type").and_then(|t| t.as_u64()).unwrap_or(0);
@@ -514,31 +515,72 @@ impl Channel for WuKongIMChannel {
                             let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
 
                             // Extract text content
-                            let content = payload_json.get("content")
-                                .and_then(|c| c.as_str())
-                                .unwrap_or(&params.payload)
-                                .to_string();
+                            let content = if let Some(c) =
+                                payload_json.get("content").and_then(|c| c.as_str())
+                            {
+                                c.to_string()
+                            } else if let Some(s) = payload_json.as_str() {
+                                s.to_string()
+                            } else {
+                                String::new()
+                            };
+                            tracing::info!(
+                                "WuKongIM: received message from {} (channel: {}:{}): {}",
+                                params.from_uid,
+                                params.channel_type,
+                                params.channel_id,
+                                content
+                            );
 
                             // 3. Handle mention_only logic for group chats
                             let is_group = params.channel_type != 1;
                             if self.mention_only && is_group {
                                 let mut mentioned = false;
+
+                                // Check formal mention object
                                 if let Some(mention) = payload_json.get("mention") {
-                                    if let Some(all) = mention.get("all").and_then(|v| v.as_u64()) {
-                                        if all == 1 {
+                                    // Check 'all'
+                                    if let Some(all) = mention.get("all") {
+                                        if all.as_u64() == Some(1)
+                                            || all.as_str() == Some("1")
+                                            || all.as_str() == Some("true")
+                                            || all.as_bool() == Some(true)
+                                        {
                                             mentioned = true;
                                         }
                                     }
+                                    // Check 'uids'
                                     if !mentioned {
-                                        if let Some(uids) = mention.get("uids").and_then(|v| v.as_array()) {
-                                            if uids.iter().any(|u| u.as_str() == Some(&self.uid)) {
+                                        if let Some(uids) =
+                                            mention.get("uids").and_then(|v| v.as_array())
+                                        {
+                                            if uids.iter().any(|u| {
+                                                u.as_str() == Some(&self.uid)
+                                                    || u.as_u64()
+                                                        .map(|n| n.to_string())
+                                                        .as_deref()
+                                                        == Some(&self.uid)
+                                            }) {
                                                 mentioned = true;
                                             }
                                         }
                                     }
                                 }
+
+                                // Check content for @mention if not already found
                                 if !mentioned {
-                                    tracing::trace!("WuKongIM: ignoring non-mention message in group");
+                                    if content.contains(&format!("@{}", self.uid))
+                                        || content.contains("@all")
+                                    {
+                                        mentioned = true;
+                                    }
+                                }
+
+                                if !mentioned {
+                                    tracing::debug!(
+                                        "WuKongIM: ignoring non-mention message in group (uid: {})",
+                                        self.uid
+                                    );
                                     continue;
                                 }
                             }
