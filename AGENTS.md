@@ -113,6 +113,8 @@ Branch/commit/PR rules:
 - Do not modify unrelated modules "while here".
 - Do not bypass failing checks without explicit explanation.
 - Do not hide behavior-changing side effects in refactor commits.
+- Do not suppress unused production code with underscore prefixes or `#[allow(dead_code)]`; delete it, wire it into behavior, or document a tracked follow-up.
+- Do not leave `unwrap()` / `expect()` in production paths; propagate errors or document why the invariant makes a panic impossible.
 - Do not include personal identity or sensitive information in test data, examples, docs, or commits.
 
 ## Skills
