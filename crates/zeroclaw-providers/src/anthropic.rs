@@ -10,13 +10,16 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::tool::ToolSpec;
 
+/// Anthropic's API documentation lists 1.0 as the default sampling temperature.
+const TEMPERATURE_DEFAULT: f64 = 1.0;
+/// Anthropic's public API endpoint. Overrideable via `providers.models.<name>.base-url`.
+const BASE_URL: &str = "https://api.anthropic.com";
+
 pub struct AnthropicProvider {
     credential: Option<String>,
     base_url: String,
     max_tokens: u32,
 }
-
-const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 4096;
 
 #[cfg(test)]
 #[derive(Debug, Serialize)]
@@ -191,7 +194,7 @@ impl AnthropicProvider {
     pub fn with_base_url(credential: Option<&str>, base_url: Option<&str>) -> Self {
         let base_url = base_url
             .map(|u| u.trim_end_matches('/'))
-            .unwrap_or("https://api.anthropic.com")
+            .unwrap_or(BASE_URL)
             .to_string();
         Self {
             credential: credential
@@ -199,7 +202,7 @@ impl AnthropicProvider {
                 .filter(|k| !k.is_empty())
                 .map(ToString::to_string),
             base_url,
-            max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
+            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
         }
     }
 
@@ -751,13 +754,23 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
+    // ── Provider-family defaults ──
+    fn default_temperature(&self) -> f64 {
+        TEMPERATURE_DEFAULT
+    }
+
+    fn default_base_url(&self) -> Option<&str> {
+        Some(BASE_URL)
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
@@ -815,8 +828,9 @@ impl Provider for AnthropicProvider {
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token)."
@@ -894,7 +908,7 @@ impl Provider for AnthropicProvider {
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
         // Convert OpenAI-format tool JSON to ToolSpec so we can reuse the
         // existing `chat()` method which handles full message history,
@@ -950,6 +964,12 @@ impl Provider for AnthropicProvider {
         Ok(())
     }
 
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        // Anthropic's /v1/models requires a credential. Onboard pulls the
+        // catalog from models.dev before the user has entered a key.
+        crate::models_dev::list_models_for("anthropic").await
+    }
+
     fn supports_streaming(&self) -> bool {
         true
     }
@@ -962,12 +982,13 @@ impl Provider for AnthropicProvider {
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         if !options.enabled {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
+        let temperature = temperature.unwrap_or(self.default_temperature());
 
         let credential = match self.credential.as_ref() {
             Some(c) => c.clone(),
@@ -1130,7 +1151,7 @@ mod tests {
     async fn chat_fails_without_key() {
         let p = AnthropicProvider::new(None);
         let result = p
-            .chat_with_system(None, "hello", "claude-3-opus", 0.7)
+            .chat_with_system(None, "hello", "claude-3-opus", Some(0.7))
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1211,7 +1232,12 @@ mod tests {
     async fn chat_with_system_fails_without_key() {
         let p = AnthropicProvider::new(None);
         let result = p
-            .chat_with_system(Some("You are ZeroClaw"), "hello", "claude-3-opus", 0.7)
+            .chat_with_system(
+                Some("You are ZeroClaw"),
+                "hello",
+                "claude-3-opus",
+                Some(0.7),
+            )
             .await;
         assert!(result.is_err());
     }
@@ -1762,7 +1788,7 @@ mod tests {
         let provider = AnthropicProvider {
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
-            max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
+            max_tokens: 4096,
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
@@ -1791,7 +1817,7 @@ mod tests {
         })];
 
         let result = provider
-            .chat_with_tools(&messages, &tools, "claude-opus-4-6", 0.7)
+            .chat_with_tools(&messages, &tools, "claude-opus-4-6", Some(0.7))
             .await;
         assert!(result.is_ok(), "chat_with_tools failed: {:?}", result.err());
 

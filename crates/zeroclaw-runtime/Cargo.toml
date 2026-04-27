@@ -15,6 +15,7 @@ zeroclaw-memory.workspace = true
 zeroclaw-tools.workspace = true
 zeroclaw-plugins = { workspace = true, optional = true }
 zeroclaw-tool-call-parser.workspace = true
+fluent = "0.16"
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"

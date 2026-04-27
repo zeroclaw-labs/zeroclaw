@@ -1740,8 +1740,9 @@ impl Provider for OpenAiCompatibleProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_deref();
 
         let merge = self.effective_merge_system(model);
@@ -1861,8 +1862,9 @@ impl Provider for OpenAiCompatibleProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_deref();
 
         let merge = self.effective_merge_system(model);
@@ -1961,8 +1963,9 @@ impl Provider for OpenAiCompatibleProvider {
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_deref();
 
         let merge = self.effective_merge_system(model);
@@ -2008,7 +2011,9 @@ impl Provider for OpenAiCompatibleProvider {
                     "{} native tool call transport failed: {error}; falling back to history path",
                     self.name
                 );
-                let text = self.chat_with_history(messages, model, temperature).await?;
+                let text = self
+                    .chat_with_history(messages, model, Some(temperature))
+                    .await?;
                 return Ok(ProviderChatResponse {
                     text: Some(text),
                     tool_calls: vec![],
@@ -2066,8 +2071,9 @@ impl Provider for OpenAiCompatibleProvider {
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_deref();
 
         let merge = self.effective_merge_system(model);
@@ -2130,7 +2136,7 @@ impl Provider for OpenAiCompatibleProvider {
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
                 let text = self
-                    .chat_with_history(&fallback_messages, model, temperature)
+                    .chat_with_history(&fallback_messages, model, Some(temperature))
                     .await?;
                 return Ok(ProviderChatResponse {
                     text: Some(text),
@@ -2195,13 +2201,14 @@ impl Provider for OpenAiCompatibleProvider {
         &self,
         request: ProviderChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         if !options.enabled {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
 
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.clone();
 
         let merge = self.effective_merge_system(model);
@@ -2311,9 +2318,10 @@ impl Provider for OpenAiCompatibleProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.clone();
 
         let merge = self.effective_merge_system(model);
@@ -2411,9 +2419,10 @@ impl Provider for OpenAiCompatibleProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.clone();
 
         let merge = self.effective_merge_system(model);
@@ -2532,7 +2541,9 @@ mod tests {
     #[tokio::test]
     async fn chat_without_key_attempts_request() {
         let p = make_provider("Local", "http://127.0.0.1:1", None);
-        let result = p.chat_with_system(None, "hello", "default", 0.7).await;
+        let result = p
+            .chat_with_system(None, "hello", "default", Some(0.7))
+            .await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -2722,7 +2733,7 @@ mod tests {
         ];
 
         for p in providers {
-            let result = p.chat_with_system(None, "test", "model", 0.7).await;
+            let result = p.chat_with_system(None, "test", "model", Some(0.7)).await;
             assert!(result.is_err(), "{} should fail (unreachable host)", p.name);
             let err_msg = result.unwrap_err().to_string();
             assert!(
@@ -3746,7 +3757,9 @@ mod tests {
             }
         })];
 
-        let result = p.chat_with_tools(&messages, &tools, "model", 0.7).await;
+        let result = p
+            .chat_with_tools(&messages, &tools, "model", Some(0.7))
+            .await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
