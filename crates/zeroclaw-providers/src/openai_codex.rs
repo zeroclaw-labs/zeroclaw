@@ -427,11 +427,7 @@ fn parse_sse_text(body: &str) -> anyhow::Result<Option<String>> {
         Ok(())
     };
 
-    loop {
-        let Some(idx) = buffer.find("\n\n") else {
-            break;
-        };
-
+    while let Some(idx) = buffer.find("\n\n") {
         let chunk = buffer[..idx].to_string();
         buffer = buffer[idx + 2..].to_string();
         process_chunk(&chunk)?;

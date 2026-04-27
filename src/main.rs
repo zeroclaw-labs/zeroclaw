@@ -2355,7 +2355,10 @@ async fn main() -> Result<()> {
                         }
                         println!("Capabilities: {:?}", info.capabilities);
                         println!("Permissions: {:?}", info.permissions);
-                        println!("WASM: {}", info.wasm_path.display());
+                        match &info.wasm_path {
+                            Some(path) => println!("WASM: {}", path.display()),
+                            None => println!("WASM: (skill-only plugin)"),
+                        }
                     }
                     None => println!("Plugin '{name}' not found."),
                 }

@@ -9939,6 +9939,27 @@ impl Config {
             .map(|(name, profile)| (name.clone(), profile.clone()))
     }
 
+    /// Apply Codex-app-server compatibility shims to the resolved fallback provider entry.
+    ///
+    /// Historically this method mutated `self.providers.fallback` to a "canonical" key
+    /// derived from the profile's `name` field, `wire_api`, or `base_url`. That mutation
+    /// caused two problems:
+    ///
+    /// 1. **CLI get/set divergence.** `Config::load_or_init` calls `apply_env_overrides`,
+    ///    which calls this function. After load, `providers.fallback` no longer matched
+    ///    what was on disk, so `zeroclaw config get providers.fallback` returned the
+    ///    rewritten value while the file still had the user's literal value. The next
+    ///    `save()` would then persist the rewrite, silently changing the user's config.
+    /// 2. **Orphaned references.** When the rewrite pointed at a key that did not exist
+    ///    in `providers.models` (e.g. profile had `name = "gemini"` but no
+    ///    `[providers.models.gemini]` entry), runtime `fallback_provider()` lookups
+    ///    returned `None` and downstream code fell through to a hardcoded default model.
+    ///
+    /// The fix: keep `self.providers.fallback` as the literal user-supplied key.
+    /// Propagate the profile's `base_url` / `api_path` / `max_tokens` / `api_key` onto the
+    /// resolved entry as before, and mirror the entry under any canonical alias keys so
+    /// runtime lookups by either name still resolve. The user's `[providers] fallback`
+    /// value is preserved end-to-end through load → save → load.
     fn apply_named_model_provider_profile(&mut self) {
         let Some(current_provider) = self.providers.fallback.clone() else {
             return;
@@ -10029,29 +10050,30 @@ impl Config {
             .map(str::trim)
             .filter(|value| !value.is_empty());
 
+        // Mirror the resolved entry under any canonical alias keys so that runtime
+        // lookups by the profile-implied name (e.g. wire_api → "openai-codex",
+        // explicit `name = ...`, or `custom:<base_url>`) also resolve. We do NOT
+        // rewrite `providers.fallback` itself: that is the user's literal config
+        // value and must round-trip cleanly through CLI get/set/save.
+        let mut alias_keys: Vec<String> = Vec::new();
         if normalized_wire_api == Some("responses") {
-            self.providers.fallback = Some("openai-codex".to_string());
-            return;
+            alias_keys.push("openai-codex".to_string());
         }
-
         if let Some(profile_name) = profile_name
             && !profile_name.eq_ignore_ascii_case(&profile_key)
         {
-            self.providers.fallback = Some(profile_name.to_string());
-            return;
+            alias_keys.push(profile_name.to_string());
+        }
+        if let Some(ref base_url) = base_url {
+            alias_keys.push(format!("custom:{base_url}"));
         }
 
-        if let Some(base_url) = base_url {
-            let canonical_key = format!("custom:{base_url}");
-            // Mirror the profile under the canonical key so runtime
-            // `fallback_provider()` lookups resolve — without this the rename
-            // would orphan the entry still keyed under the original profile name.
-            if !self.providers.models.contains_key(&canonical_key)
+        for alias in alias_keys {
+            if !self.providers.models.contains_key(&alias)
                 && let Some(entry) = self.providers.models.get(&profile_key).cloned()
             {
-                self.providers.models.insert(canonical_key.clone(), entry);
+                self.providers.models.insert(alias, entry);
             }
-            self.providers.fallback = Some(canonical_key);
         }
     }
 
@@ -14124,10 +14146,10 @@ requires_openai_auth = true
         );
 
         config.apply_env_overrides();
-        assert_eq!(
-            config.providers.fallback.as_deref(),
-            Some("custom:https://api.tonsof.blue/v1")
-        );
+        // The user's literal fallback key is preserved; we no longer rewrite it
+        // to a canonical alias. This is the round-trip-safe contract that the
+        // `zeroclaw config get/set` CLI relies on.
+        assert_eq!(config.providers.fallback.as_deref(), Some("sub2api"));
         // The original entry is still stored under its config key.
         assert_eq!(
             config
@@ -14137,8 +14159,9 @@ requires_openai_auth = true
                 .and_then(|e| e.base_url.as_deref()),
             Some("https://api.tonsof.blue/v1")
         );
-        // The entry is also mirrored under the canonical fallback key so
-        // runtime fallback_provider() lookups resolve.
+        // The entry is also mirrored under the canonical alias key so runtime
+        // lookups by `custom:<base_url>` still resolve even though the user's
+        // fallback string is the original profile key.
         assert_eq!(
             config
                 .providers
@@ -14177,7 +14200,10 @@ requires_openai_auth = true
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("OPENAI_API_KEY") };
 
-        assert_eq!(config.providers.fallback.as_deref(), Some("openai-codex"));
+        // The user's literal fallback key is preserved; we no longer rewrite it
+        // to "openai-codex". The Codex-app-server compatibility shim instead
+        // mirrors the resolved entry under that alias key for runtime lookups.
+        assert_eq!(config.providers.fallback.as_deref(), Some("sub2api"));
         // The original entry is still stored under its config key.
         let entry = config
             .providers
@@ -14186,6 +14212,175 @@ requires_openai_auth = true
             .expect("sub2api entry");
         assert_eq!(entry.base_url.as_deref(), Some("https://api.tonsof.blue"));
         assert_eq!(entry.api_key.as_deref(), Some("sk-test-codex-key"));
+        // The entry is mirrored under the "openai-codex" alias so any code
+        // path that looks providers up by that canonical key still finds it.
+        let aliased = config
+            .providers
+            .models
+            .get("openai-codex")
+            .expect("openai-codex alias entry");
+        assert_eq!(aliased.base_url.as_deref(), Some("https://api.tonsof.blue"));
+        assert_eq!(aliased.api_key.as_deref(), Some("sk-test-codex-key"));
+    }
+
+    /// Regression test for the config CLI get/set divergence bug.
+    ///
+    /// Before the fix, `apply_named_model_provider_profile` rewrote
+    /// `self.providers.fallback` to the profile's `name` field whenever they
+    /// differed. That meant:
+    ///
+    /// - `zeroclaw config get providers.fallback` returned the rewritten value
+    ///   even though the on-disk TOML still held the user's literal key.
+    /// - `zeroclaw config set providers.fallback <new>` would persist `<new>`
+    ///   to disk, but the next load mutated it back in memory, so a subsequent
+    ///   `get` reported a stale value and the daemon's resolver looked up a
+    ///   provider key that did not exist in `[providers.models.*]`.
+    ///
+    /// The fix preserves the literal fallback key end-to-end. The named-profile
+    /// shim now only mirrors the resolved entry under canonical alias keys for
+    /// runtime lookup convenience.
+    #[test]
+    async fn apply_env_overrides_preserves_user_supplied_fallback_key() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        // User configures fallback = "primary" with a profile whose `name` field
+        // differs from the key. This is the exact shape that triggered the bug.
+        config.providers.fallback = Some("primary".to_string());
+        config.providers.models.insert(
+            "primary".to_string(),
+            ModelProviderConfig {
+                name: Some("alias-name".to_string()),
+                base_url: Some("https://example.invalid/v1".to_string()),
+                model: Some("primary-model".to_string()),
+                ..Default::default()
+            },
+        );
+
+        config.apply_env_overrides();
+
+        // The literal user key must survive. This is what `config get` returns
+        // and what `config set` persists.
+        assert_eq!(
+            config.providers.fallback.as_deref(),
+            Some("primary"),
+            "providers.fallback must preserve the user's literal key after \
+             apply_env_overrides; got {:?}",
+            config.providers.fallback,
+        );
+        // Runtime resolution must still find the entry under the original key.
+        assert!(
+            config.providers.fallback_provider().is_some(),
+            "fallback_provider() must still resolve via the user's literal key",
+        );
+    }
+
+    /// Round-trip test for the config CLI: a TOML file with the user's value
+    /// must deserialize, apply env overrides, and serialize back to the same
+    /// `providers.fallback`. This is the full path that backed the user-visible
+    /// `config set` -> `config get` divergence.
+    #[test]
+    async fn fallback_round_trips_through_load_apply_serialize() {
+        let _env_guard = env_override_lock().await;
+        let toml_in = r#"
+schema_version = 1
+
+[providers]
+fallback = "primary"
+
+[providers.models.primary]
+name = "alias-name"
+base_url = "https://example.invalid/v1"
+model = "primary-model"
+"#;
+
+        let mut config: Config = toml::from_str(toml_in).expect("parse toml");
+        config.apply_env_overrides();
+
+        // What `config get providers.fallback` returns post-load.
+        assert_eq!(
+            config.get_prop("providers.fallback").unwrap(),
+            "primary",
+            "config get providers.fallback must return the user's literal value",
+        );
+
+        // What `config save` would write back to disk.
+        let toml_out = toml::to_string(&config).expect("serialize toml");
+        assert!(
+            toml_out.contains(r#"fallback = "primary""#),
+            "serialized config must keep fallback = \"primary\"; got:\n{toml_out}",
+        );
+    }
+
+    /// `set_prop` followed by `get_prop` must return the value that was set,
+    /// even when the surrounding profile shape would historically have caused
+    /// the in-memory value to be rewritten.
+    #[test]
+    async fn set_prop_then_get_prop_round_trips_for_fallback() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.providers.models.insert(
+            "primary".to_string(),
+            ModelProviderConfig {
+                name: Some("alias-name".to_string()),
+                model: Some("primary-model".to_string()),
+                ..Default::default()
+            },
+        );
+        // Simulate the daemon's load path before the user runs `config set`.
+        config.apply_env_overrides();
+
+        config.set_prop("providers.fallback", "primary").unwrap();
+        // Mimic any post-set normalization a future codepath might add.
+        config.apply_env_overrides();
+
+        assert_eq!(config.get_prop("providers.fallback").unwrap(), "primary");
+    }
+
+    /// `resolve_default_model` returns the fallback provider's model when set,
+    /// and falls through to the first available `models.*` entry otherwise.
+    /// Returning `None` is reserved for "no provider has any model configured",
+    /// which callers must surface as a configuration error rather than silently
+    /// substituting a vendor default.
+    #[test]
+    async fn resolve_default_model_prefers_fallback_then_first_available() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        // Empty config: no model anywhere -> None (caller errors loudly).
+        assert_eq!(config.providers.resolve_default_model(), None);
+
+        // Add an entry without a model -> still None.
+        config
+            .providers
+            .models
+            .insert("secondary".to_string(), ModelProviderConfig::default());
+        assert_eq!(config.providers.resolve_default_model(), None);
+
+        // Add an entry with a model -> first-available wins when no fallback.
+        config.providers.models.insert(
+            "tertiary".to_string(),
+            ModelProviderConfig {
+                model: Some("tertiary-model".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            config.providers.resolve_default_model().as_deref(),
+            Some("tertiary-model"),
+        );
+
+        // Set fallback to a provider with its own model -> fallback wins.
+        config.providers.fallback = Some("primary".to_string());
+        config.providers.models.insert(
+            "primary".to_string(),
+            ModelProviderConfig {
+                model: Some("primary-model".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            config.providers.resolve_default_model().as_deref(),
+            Some("primary-model"),
+        );
     }
 
     #[test]

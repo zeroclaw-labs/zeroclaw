@@ -10,7 +10,7 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
 use anyhow::Result;
 use chrono::{Datelike, Timelike};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
@@ -297,9 +297,12 @@ impl AgentBuilder {
                 .memory_loader
                 .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
             config: self.config.unwrap_or_default(),
-            model_name: self
-                .model_name
-                .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into()),
+            // No silent vendor-default model. Callers that construct `Agent` via the
+            // builder must set `model_name` explicitly (via `.model_name(...)` or via
+            // `Agent::from_config`, which resolves from `[providers]`). The sentinel
+            // keeps the field non-empty so accidental dispatch surfaces a clear 4xx
+            // rather than misrouting to a real vendor model.
+            model_name: self.model_name.unwrap_or_else(|| "<unconfigured>".into()),
             temperature: self.temperature.unwrap_or(0.7),
             workspace_dir: self
                 .workspace_dir
@@ -479,10 +482,34 @@ impl Agent {
 
         let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
 
-        let model_name = fallback_provider_ag
+        let model_name = match fallback_provider_ag
             .and_then(|e| e.model.as_deref())
-            .unwrap_or("anthropic/claude-sonnet-4-20250514")
-            .to_string();
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            Some(m) => m.to_string(),
+            None => match config.providers.resolve_default_model() {
+                Some(m) => {
+                    tracing::warn!(
+                        provider = provider_name,
+                        model = %m,
+                        "fallback provider has no `model` set; using first configured \
+                         providers.models entry as default. Set [providers.models.{provider_name}] \
+                         model = \"...\" to silence this warning.",
+                    );
+                    m
+                }
+                None => {
+                    anyhow::bail!(
+                        "no model configured: providers.fallback = {:?} resolves with no model, \
+                         and no [[providers.models.*]] entry has a `model` field set. \
+                         Configure at least one [providers.models.<name>] model = \"...\" \
+                         or define a [[model_routes]] hint.",
+                        config.providers.fallback,
+                    )
+                }
+            },
+        };
 
         let provider_runtime_options =
             zeroclaw_providers::provider_runtime_options_from_config(config);
@@ -1113,6 +1140,7 @@ impl Agent {
             let mut streamed_text = String::new();
             let mut streamed_tool_calls: Vec<zeroclaw_providers::traits::ToolCall> = Vec::new();
             let mut got_stream = false;
+            let mut pre_executed_call_ids: HashMap<String, VecDeque<String>> = HashMap::new();
             let mut was_cancelled = false;
 
             // Consume the stream, checking for cancellation between chunks.
@@ -1163,8 +1191,14 @@ impl Agent {
                             name,
                             args,
                         } => {
+                            let call_id = uuid::Uuid::new_v4().to_string();
+                            pre_executed_call_ids
+                                .entry(name.clone())
+                                .or_default()
+                                .push_back(call_id.clone());
                             let _ = event_tx
                                 .send(TurnEvent::ToolCall {
+                                    id: call_id,
                                     name,
                                     args: serde_json::from_str(&args).unwrap_or_default(),
                                 })
@@ -1175,7 +1209,17 @@ impl Agent {
                             name,
                             output,
                         } => {
-                            let _ = event_tx.send(TurnEvent::ToolResult { name, output }).await;
+                            let result_id = pre_executed_call_ids
+                                .get_mut(&name)
+                                .and_then(|ids| ids.pop_front())
+                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                            let _ = event_tx
+                                .send(TurnEvent::ToolResult {
+                                    id: result_id,
+                                    name,
+                                    output,
+                                })
+                                .await;
                         }
                         zeroclaw_providers::traits::StreamEvent::Final => break,
                     },
@@ -1242,7 +1286,7 @@ impl Agent {
                 }
             };
 
-            let (text, calls) = self.tool_dispatcher.parse_response(&response);
+            let (text, mut calls) = self.tool_dispatcher.parse_response(&response);
             if calls.is_empty() {
                 let final_text = if text.is_empty() {
                     response.text.unwrap_or_default()
@@ -1279,6 +1323,13 @@ impl Agent {
                 return Ok(final_text);
             }
 
+            // Pre-assign stable IDs to tool calls that don't have one
+            for call in &mut calls {
+                if call.tool_call_id.is_none() {
+                    call.tool_call_id = Some(uuid::Uuid::new_v4().to_string());
+                }
+            }
+
             // ── Tool calls ─────────────────────────────────────────────
             if !text.is_empty() {
                 self.history
@@ -1295,8 +1346,10 @@ impl Agent {
 
             // Notify about each tool call
             for call in &calls {
+                let call_id = call.tool_call_id.as_ref().unwrap().clone();
                 let _ = event_tx
                     .send(TurnEvent::ToolCall {
+                        id: call_id,
                         name: call.name.clone(),
                         args: call.arguments.clone(),
                     })
@@ -1307,8 +1360,10 @@ impl Agent {
 
             // Notify about each tool result
             for result in &results {
+                let result_id = result.tool_call_id.as_ref().unwrap().clone();
                 let _ = event_tx
                     .send(TurnEvent::ToolResult {
+                        id: result_id,
                         name: result.name.clone(),
                         output: result.output.clone(),
                     })
@@ -1386,12 +1441,19 @@ pub async fn run(
         .as_deref()
         .unwrap_or("openrouter")
         .to_string();
+    // `Agent::from_config` above has already errored if no model could be resolved,
+    // so this telemetry line should always find one. We keep `resolve_default_model`
+    // as a cheap secondary lookup and emit "<unresolved>" only if nothing matches —
+    // never silently substitute a hardcoded vendor model.
     let model_name = effective_config
         .providers
         .fallback_provider()
         .and_then(|e| e.model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4-20250514")
-        .to_string();
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| effective_config.providers.resolve_default_model())
+        .unwrap_or_else(|| "<unresolved>".to_string());
 
     agent.observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.clone(),
@@ -1897,7 +1959,7 @@ mod tests {
                 Ok(zeroclaw_providers::ChatResponse {
                     text: Some(String::new()),
                     tool_calls: vec![zeroclaw_providers::ToolCall {
-                        id: "tc_stream_1".into(),
+                        id: "00000000-0000-0000-0000-000000000001".into(),
                         name: "echo".into(),
                         arguments: "{}".into(),
                     }],
@@ -1935,7 +1997,7 @@ mod tests {
             if *count == 1 {
                 let tc = zeroclaw_providers::traits::StreamEvent::ToolCall(
                     zeroclaw_providers::ToolCall {
-                        id: "tc_stream_1".into(),
+                        id: "00000000-0000-0000-0000-000000000001".into(),
                         name: "echo".into(),
                         arguments: "{}".into(),
                     },
@@ -2033,6 +2095,166 @@ mod tests {
             has_tool_result,
             "Should have emitted a ToolResult event for 'echo'"
         );
+
+        // Verify ID correlation
+        let call_id = events
+            .iter()
+            .find_map(|e| {
+                if let TurnEvent::ToolCall { id, .. } = e {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("ToolCall should have an ID");
+
+        let result_id = events
+            .iter()
+            .find_map(|e| {
+                if let TurnEvent::ToolResult { id, .. } = e {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("ToolResult should have an ID");
+
+        assert_eq!(
+            call_id, result_id,
+            "ToolCall and ToolResult should share the same ID for correlation"
+        );
+
+        // Verify it's a valid UUID
+        assert!(
+            uuid::Uuid::parse_str(&call_id).is_ok(),
+            "Generated ID should be a valid UUID: got '{}'",
+            call_id
+        );
+    }
+
+    struct PreExecutedToolProvider;
+
+    #[async_trait]
+    impl Provider for PreExecutedToolProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok(String::new())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::stream::{self, StreamExt};
+
+            stream::iter(vec![
+                Ok(
+                    zeroclaw_providers::traits::StreamEvent::PreExecutedToolCall {
+                        name: "file_read".into(),
+                        args: "{\"path\":\"a.txt\"}".into(),
+                    },
+                ),
+                Ok(
+                    zeroclaw_providers::traits::StreamEvent::PreExecutedToolCall {
+                        name: "shell".into(),
+                        args: "{\"command\":\"pwd\"}".into(),
+                    },
+                ),
+                Ok(
+                    zeroclaw_providers::traits::StreamEvent::PreExecutedToolResult {
+                        name: "file_read".into(),
+                        output: "a".into(),
+                    },
+                ),
+                Ok(
+                    zeroclaw_providers::traits::StreamEvent::PreExecutedToolResult {
+                        name: "shell".into(),
+                        output: "b".into(),
+                    },
+                ),
+                Ok(zeroclaw_providers::traits::StreamEvent::Final),
+            ])
+            .boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_executed_tool_results_keep_ids_when_calls_overlap() {
+        let provider = Box::new(PreExecutedToolProvider);
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let _ = agent
+            .turn_streamed("use pre-executed tools", event_tx, None)
+            .await
+            .unwrap();
+
+        let mut call_ids = HashMap::new();
+        let mut result_ids = HashMap::new();
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                TurnEvent::ToolCall { id, name, .. } => {
+                    call_ids.insert(name, id);
+                }
+                TurnEvent::ToolResult { id, name, .. } => {
+                    result_ids.insert(name, id);
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(call_ids.len(), 2, "expected two pre-executed tool calls");
+        assert_eq!(
+            result_ids.len(),
+            2,
+            "expected two pre-executed tool results"
+        );
+        assert_eq!(call_ids.get("file_read"), result_ids.get("file_read"));
+        assert_eq!(call_ids.get("shell"), result_ids.get("shell"));
     }
 
     /// Reproduction test for the orphan-tool_results trim bug.

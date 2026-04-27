@@ -16,16 +16,37 @@ use zeroclaw_infra::session_backend::SessionBackend;
 
 /// Validate that a session ID is non-empty and contains at least one
 /// alphanumeric character (prevents blank keys after sanitization).
-fn validate_session_id(session_id: &str) -> Result<(), ToolResult> {
-    let trimmed = session_id.trim();
-    if trimmed.is_empty() || !trimmed.chars().any(|c| c.is_alphanumeric()) {
-        return Err(ToolResult {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionValidationError {
+    Empty,
+    NoAlphanumeric,
+}
+
+impl SessionValidationError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Empty | Self::NoAlphanumeric => {
+                "Invalid 'session_id': must be non-empty and contain at least one alphanumeric character."
+            }
+        }
+    }
+
+    fn into_tool_result(self) -> ToolResult {
+        ToolResult {
             success: false,
             output: String::new(),
-            error: Some(
-                "Invalid 'session_id': must be non-empty and contain at least one alphanumeric character.".into(),
-            ),
-        });
+            error: Some(self.message().into()),
+        }
+    }
+}
+
+fn validate_session_id(session_id: &str) -> Result<(), SessionValidationError> {
+    let trimmed = session_id.trim();
+    if trimmed.is_empty() {
+        return Err(SessionValidationError::Empty);
+    }
+    if !trimmed.chars().any(|c| c.is_alphanumeric()) {
+        return Err(SessionValidationError::NoAlphanumeric);
     }
     Ok(())
 }
@@ -160,8 +181,8 @@ impl Tool for SessionsHistoryTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'session_id' parameter"))?;
 
-        if let Err(result) = validate_session_id(session_id) {
-            return Ok(result);
+        if let Err(error) = validate_session_id(session_id) {
+            return Ok(error.into_tool_result());
         }
 
         #[allow(clippy::cast_possible_truncation)]
@@ -260,8 +281,8 @@ impl Tool for SessionsSendTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'session_id' parameter"))?;
 
-        if let Err(result) = validate_session_id(session_id) {
-            return Ok(result);
+        if let Err(error) = validate_session_id(session_id) {
+            return Ok(error.into_tool_result());
         }
 
         let message = args
@@ -350,8 +371,8 @@ impl Tool for SessionResetTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'session_id' parameter"))?;
 
-        if let Err(result) = validate_session_id(session_id) {
-            return Ok(result);
+        if let Err(error) = validate_session_id(session_id) {
+            return Ok(error.into_tool_result());
         }
 
         // TOCTOU: a message appended between load() and the last remove_last()
@@ -440,8 +461,8 @@ impl Tool for SessionDeleteTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'session_id' parameter"))?;
 
-        if let Err(result) = validate_session_id(session_id) {
-            return Ok(result);
+        if let Err(error) = validate_session_id(session_id) {
+            return Ok(error.into_tool_result());
         }
 
         let existed = !self.backend.load(session_id).is_empty();
@@ -509,6 +530,48 @@ mod tests {
             .append("discord__bob", &ChatMessage::user("Hey from Bob"))
             .unwrap();
         (tmp, Arc::new(store))
+    }
+
+    // ── Session ID validation tests ─────────────────────────────────
+
+    #[test]
+    fn validate_session_id_rejects_empty() {
+        assert_eq!(validate_session_id(""), Err(SessionValidationError::Empty));
+    }
+
+    #[test]
+    fn validate_session_id_rejects_whitespace_only() {
+        assert_eq!(
+            validate_session_id("   "),
+            Err(SessionValidationError::Empty)
+        );
+    }
+
+    #[test]
+    fn validate_session_id_rejects_non_alphanumeric() {
+        assert_eq!(
+            validate_session_id("///"),
+            Err(SessionValidationError::NoAlphanumeric)
+        );
+    }
+
+    #[test]
+    fn validate_session_id_accepts_valid_id() {
+        assert_eq!(validate_session_id("test_session_id"), Ok(()));
+    }
+
+    #[test]
+    fn validation_error_message_starts_with_invalid() {
+        assert!(
+            SessionValidationError::Empty
+                .message()
+                .starts_with("Invalid")
+        );
+        assert!(
+            SessionValidationError::NoAlphanumeric
+                .message()
+                .starts_with("Invalid")
+        );
     }
 
     // ── SessionsListTool tests ──────────────────────────────────────
@@ -617,7 +680,7 @@ mod tests {
         let tool = SessionsHistoryTool::new(backend, test_security());
         let result = tool.execute(json!({"session_id": "   "})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("Invalid"));
+        assert!(result.error.is_some());
     }
 
     #[test]
@@ -703,7 +766,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("Invalid"));
+        assert!(result.error.is_some());
     }
 
     #[tokio::test]
@@ -718,7 +781,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("Invalid"));
+        assert!(result.error.is_some());
     }
 
     #[tokio::test]
@@ -808,7 +871,7 @@ mod tests {
         let tool = SessionResetTool::new(backend, test_security());
         let result = tool.execute(json!({"session_id": ""})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("Invalid"));
+        assert!(result.error.is_some());
     }
 
     #[test]
@@ -874,7 +937,7 @@ mod tests {
         let tool = SessionDeleteTool::new(backend, test_security());
         let result = tool.execute(json!({"session_id": "   "})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("Invalid"));
+        assert!(result.error.is_some());
     }
 
     #[test]

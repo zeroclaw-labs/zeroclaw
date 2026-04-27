@@ -19,11 +19,40 @@ A plugin is a directory containing:
 ```
 my-plugin/
   manifest.toml    # Plugin metadata and permissions
-  plugin.wasm      # Compiled WASM module
+  plugin.wasm      # Compiled WASM module (optional for skill-only plugins)
 ```
 
 Plugins are discovered from `~/.zeroclaw/plugins/` (configurable via
 `plugins.plugins_dir` in config).
+
+### Skill-only plugin layout (markdown bundle)
+
+A plugin whose only capability is `skill` ships skills under a `skills/`
+directory in [agentskills.io](https://agentskills.io) format and omits
+`wasm_path`:
+
+```
+my-toolkit/
+  manifest.toml              # capabilities = ["skill"]
+  README.md                  # optional bundle-level overview
+  skills/
+    design-review/
+      SKILL.md
+      scripts/
+      references/
+    code-review/
+      SKILL.md
+    data-analysis/
+      SKILL.md
+      references/
+```
+
+Each `SKILL.md` must include YAML frontmatter with `name` and `description`
+fields; the runtime rejects bundles whose skills omit either at discovery time
+rather than at first invocation. Skills register under plugin-namespaced IDs
+of the form `plugin:<plugin-name>/<skill-name>` (e.g.
+`plugin:my-toolkit/design-review`) to avoid collisions with user-authored
+skills and between bundles.
 
 ## Manifest format
 
@@ -32,7 +61,7 @@ name = "my-plugin"                    # Unique identifier (required)
 version = "0.1.0"                     # Semver version (required)
 description = "What this plugin does" # Human-readable (optional)
 author = "Your Name"                  # Author (optional)
-wasm_path = "plugin.wasm"             # Path to .wasm relative to manifest (required)
+wasm_path = "plugin.wasm"             # Path to .wasm relative to manifest (required for non-skill capabilities; optional/ignored for skill-only)
 capabilities = ["tool"]               # What the plugin provides (required)
 permissions = ["http_client"]          # What the plugin needs (optional)
 signature = "base64url..."            # Ed25519 signature (optional)
@@ -47,6 +76,7 @@ publisher_key = "hex..."              # Publisher public key (optional)
 | `channel` | Provides a communication channel (not yet implemented) |
 | `memory` | Provides a memory backend (not yet implemented) |
 | `observer` | Provides an observability backend (not yet implemented) |
+| `skill` | Provides one or more agentskills.io-format skills under `skills/`; no WASM payload |
 
 ### Permissions
 
