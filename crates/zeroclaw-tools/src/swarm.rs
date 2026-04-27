@@ -75,15 +75,13 @@ impl SwarmTool {
             .create_provider_for_agent(agent_config, agent_name)
             .map_err(|r| r.error.unwrap_or_default())?;
 
-        let temperature = agent_config.temperature.unwrap_or(0.7);
-
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
             provider.chat_with_system(
                 agent_config.system_prompt.as_deref(),
                 prompt,
                 &agent_config.model,
-                temperature,
+                agent_config.temperature,
             ),
         )
         .await;
@@ -220,7 +218,7 @@ impl SwarmTool {
             let prompt_clone = full_prompt.clone();
             let timeout = swarm_config.timeout_secs;
             let model = agent_config.model.clone();
-            let temperature = agent_config.temperature.unwrap_or(0.7);
+            let temperature = agent_config.temperature;
             let system_prompt = agent_config.system_prompt.clone();
             let provider_name = agent_config.provider.clone();
 
@@ -337,13 +335,16 @@ impl SwarmTool {
             agent_descriptions.join("\n")
         );
 
+        // Greedy sampling: the router must pick one concrete agent name,
+        // not generate a creative rewording.
+        const ROUTER_TEMPERATURE: f64 = 0.0;
         let chosen = tokio::time::timeout(
             Duration::from_secs(SWARM_AGENT_TIMEOUT_SECS),
             router_provider.chat_with_system(
                 Some("You are a routing assistant. Respond with only the agent name."),
                 &routing_prompt,
                 &first_agent_config.model,
-                0.0,
+                Some(ROUTER_TEMPERATURE),
             ),
         )
         .await;

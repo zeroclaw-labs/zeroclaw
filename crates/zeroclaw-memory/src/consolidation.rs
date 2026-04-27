@@ -79,8 +79,16 @@ pub async fn consolidate_turn(
         turn_text.clone()
     };
 
+    // Low temperature for consolidation — we want deterministic
+    // summarization, not creative rewrites.
+    const CONSOLIDATION_TEMPERATURE: f64 = 0.1;
     let raw = provider
-        .chat_with_system(Some(CONSOLIDATION_SYSTEM_PROMPT), &truncated, model, 0.1)
+        .chat_with_system(
+            Some(CONSOLIDATION_SYSTEM_PROMPT),
+            &truncated,
+            model,
+            Some(CONSOLIDATION_TEMPERATURE),
+        )
         .await?;
 
     let result: ConsolidationResult = parse_consolidation_response(&raw, &turn_text);

@@ -201,7 +201,7 @@ impl Provider for RouterProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let (provider_idx, resolved_model) = self.resolve(model);
 
@@ -221,7 +221,7 @@ impl Provider for RouterProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let (provider_idx, resolved_model) = self.resolve(model);
         let (_, provider) = &self.providers[provider_idx];
@@ -234,7 +234,7 @@ impl Provider for RouterProvider {
         &self,
         request: ChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let (provider_idx, resolved_model) = self.resolve(model);
         let (_, provider) = &self.providers[provider_idx];
@@ -246,7 +246,7 @@ impl Provider for RouterProvider {
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let (provider_idx, resolved_model) = self.resolve(model);
         let (_, provider) = &self.providers[provider_idx];
@@ -278,7 +278,7 @@ impl Provider for RouterProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
         let (provider_idx, resolved_model) = self.resolve(model);
@@ -290,7 +290,7 @@ impl Provider for RouterProvider {
         &self,
         request: ChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
         let (provider_idx, resolved_model) = self.resolve(model);
@@ -354,7 +354,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_model.lock() = model.to_string();
@@ -425,7 +425,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("ok".to_string())
         }
@@ -438,7 +438,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamChunk>> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
@@ -476,7 +476,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("ok".to_string())
         }
@@ -493,7 +493,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
@@ -526,7 +526,7 @@ mod tests {
         );
 
         let result = router
-            .simple_chat("hello", "hint:reasoning", 0.5)
+            .simple_chat("hello", "hint:reasoning", Some(0.5))
             .await
             .unwrap();
         assert_eq!(result, "smart-response");
@@ -542,7 +542,10 @@ mod tests {
             vec![("fast", "fast", "llama-3-70b")],
         );
 
-        let result = router.simple_chat("hello", "hint:fast", 0.5).await.unwrap();
+        let result = router
+            .simple_chat("hello", "hint:fast", Some(0.5))
+            .await
+            .unwrap();
         assert_eq!(result, "fast-response");
         assert_eq!(mocks[0].call_count(), 1);
         assert_eq!(mocks[0].last_model(), "llama-3-70b");
@@ -556,7 +559,7 @@ mod tests {
         );
 
         let result = router
-            .simple_chat("hello", "hint:nonexistent", 0.5)
+            .simple_chat("hello", "hint:nonexistent", Some(0.5))
             .await
             .unwrap();
         assert_eq!(result, "default-response");
@@ -576,7 +579,7 @@ mod tests {
         );
 
         let result = router
-            .simple_chat("hello", "anthropic/claude-sonnet-4-20250514", 0.5)
+            .simple_chat("hello", "anthropic/claude-sonnet-4-20250514", Some(0.5))
             .await
             .unwrap();
         assert_eq!(result, "primary-response");
@@ -637,7 +640,7 @@ mod tests {
         );
 
         let result = router
-            .chat_with_system(Some("system"), "hello", "model", 0.5)
+            .chat_with_system(Some("system"), "hello", "model", Some(0.5))
             .await
             .unwrap();
         assert_eq!(result, "response");
@@ -672,7 +675,7 @@ mod tests {
         // chat_with_tools should delegate through the router to the mock.
         // MockProvider's default chat_with_tools calls chat_with_history -> chat_with_system.
         let result = router
-            .chat_with_tools(&messages, &tools, "model", 0.7)
+            .chat_with_tools(&messages, &tools, "model", Some(0.7))
             .await
             .unwrap();
         assert_eq!(result.text.as_deref(), Some("tool-response"));
@@ -694,7 +697,7 @@ mod tests {
         let tools = vec![serde_json::json!({"type": "function", "function": {"name": "test"}})];
 
         let result = router
-            .chat_with_tools(&messages, &tools, "hint:reasoning", 0.5)
+            .chat_with_tools(&messages, &tools, "hint:reasoning", Some(0.5))
             .await
             .unwrap();
         assert_eq!(result.text.as_deref(), Some("smart-tool"));
@@ -739,7 +742,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(self.response.to_string())
         }
@@ -1025,7 +1028,7 @@ mod tests {
         let mut stream = router.stream_chat_with_history(
             &messages,
             "hint:reasoning",
-            0.0,
+            Some(0.0),
             StreamOptions::new(true),
         );
 
@@ -1082,7 +1085,7 @@ mod tests {
                 tools: Some(&tools),
             },
             "hint:reasoning",
-            0.0,
+            Some(0.0),
             StreamOptions::new(true),
         );
 

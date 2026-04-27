@@ -22,6 +22,8 @@ pub mod session_queue;
 pub mod sse;
 pub mod static_files;
 pub mod tls;
+#[cfg(feature = "gateway-voice-duplex")]
+pub mod voice_duplex;
 pub mod ws;
 
 use anyhow::{Context, Result};
@@ -52,7 +54,7 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
-use zeroclaw_providers::{self, Provider};
+use zeroclaw_providers::{self, ChatMessage, Provider};
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
@@ -384,6 +386,13 @@ pub struct AppState {
     /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
     #[cfg(feature = "webauthn")]
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
+    /// Per-session cancellation tokens for aborting in-flight agent responses.
+    /// Key is session_key (e.g. `gw_<session_id>`), value is the token for the
+    /// current turn. Entries are inserted before each turn and removed after
+    /// completion (normal or cancelled).
+    pub cancel_tokens: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+    >,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -905,6 +914,7 @@ pub async fn run_gateway(
         path_prefix: path_prefix.unwrap_or("").to_string(),
         web_dist_dir,
         canvas_store,
+        cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -986,6 +996,7 @@ pub async fn run_gateway(
         .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
+        .route("/api/channels", get(api::handle_api_channels))
         .route("/api/health", get(api::handle_api_health))
         .route("/api/sessions", get(api::handle_api_sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
@@ -995,6 +1006,7 @@ pub async fn run_gateway(
         )
         .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
         .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
+        .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort))
         // ── Pairing + Device management API ──
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
         .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
@@ -1326,6 +1338,52 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
     // Keep shared runtime config in sync with persisted tokens.
     *config.lock() = updated_cfg;
     Ok(())
+}
+
+/// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
+#[allow(dead_code)]
+async fn run_gateway_chat_simple(
+    state: &AppState,
+    message: &str,
+) -> anyhow::Result<zeroclaw_api::provider::ChatResponse> {
+    let user_messages = vec![ChatMessage::user(message)];
+
+    // Keep webhook/gateway prompts aligned with channel behavior by injecting
+    // workspace-aware system context before model invocation.
+    let system_prompt = {
+        let config_guard = state.config.lock();
+        zeroclaw_runtime::agent::system_prompt::build_system_prompt(
+            &config_guard.workspace_dir,
+            &state.model,
+            &[], // tools - empty for simple chat
+            &[], // skills
+            Some(&config_guard.identity),
+            None, // bootstrap_max_chars - use default
+        )
+    };
+
+    let mut messages = Vec::with_capacity(1 + user_messages.len());
+    messages.push(ChatMessage::system(system_prompt));
+    messages.extend(user_messages);
+
+    let multimodal_config = state.config.lock().multimodal.clone();
+    let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
+        &messages,
+        &multimodal_config,
+    )
+    .await?;
+
+    state
+        .provider
+        .chat(
+            zeroclaw_api::provider::ChatRequest {
+                messages: &prepared.messages,
+                tools: None,
+            },
+            &state.model,
+            Some(state.temperature),
+        )
+        .await
 }
 
 /// Full-featured chat with tools for channel and webhook handlers.
@@ -1671,6 +1729,17 @@ async fn handle_whatsapp_message(
             msg.sender,
             truncate_with_ellipsis(&msg.content, 50)
         );
+
+        // Route approval replies to pending approval requests before dispatching to agent
+        if let Some((token, response)) = zeroclaw_channels::util::parse_approval_reply(&msg.content)
+        {
+            let mut map = wa.pending_approvals().lock().await;
+            if let Some(sender) = map.remove(&token) {
+                let _ = sender.send(response);
+                continue;
+            }
+        }
+
         let session_id = sender_session_id("whatsapp", msg);
 
         // Auto-save to memory
@@ -2370,6 +2439,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2442,6 +2512,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2727,7 +2798,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("ok".into())
@@ -2840,6 +2911,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2920,6 +2992,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3012,6 +3085,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3076,6 +3150,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3145,6 +3220,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3219,6 +3295,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3290,6 +3367,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
