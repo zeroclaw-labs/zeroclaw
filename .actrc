@@ -1,0 +1,16 @@
+# act defaults — keeps `act` runs reproducible without flag soup.
+# https://github.com/nektos/act
+
+# Map the ARM runner used in production to a standard amd64 image so act
+# can run it on any host. (Prod still uses ubuntu-24.04-arm via GitHub.)
+-P ubuntu-24.04-arm=catthehacker/ubuntu:act-latest
+-P ubuntu-latest=catthehacker/ubuntu:act-latest
+
+# Load secrets (e.g. ANTHROPIC_API_KEY) from a local file. Create it as:
+#   ANTHROPIC_API_KEY=sk-ant-...
+# .secrets is gitignored.
+--secret-file .secrets
+
+# Force amd64 container architecture (Apple Silicon hosts otherwise pull
+# arm64 images that lack many tools).
+--container-architecture linux/amd64

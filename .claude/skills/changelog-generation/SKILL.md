@@ -15,7 +15,7 @@ checked out and up to date.
 
 Read the protocol reference before doing anything else:
 
-- `docs/contributing/changelog-generation.md` — **the full procedure**; follow it
+- `docs/book/src/maintainers/changelog-generation.md` — **the full procedure**; follow it
   exactly for every run. It defines the commit range logic, categorisation rules,
   GraphQL contributor resolution, filter lists, output format, and release workflow
   integration.
@@ -130,7 +130,7 @@ to `master` directly.
 
 ## Execution rules
 
-1. **Always read `docs/contributing/changelog-generation.md` first.** The protocol
+1. **Always read `docs/book/src/maintainers/changelog-generation.md` first.** The protocol
    file is authoritative. If anything in this skill conflicts with it, the protocol
    wins.
 2. **Always report the resolved range before doing any work.** The user should

@@ -236,10 +236,19 @@ pub trait Channel: Send + Sync {
 
     /// Request interactive tool-call approval from the channel operator.
     ///
-    /// Returns `Ok(Some(response))` when the channel supports interactive
-    /// approval (e.g. Telegram inline keyboards). Returns `Ok(None)` when the
-    /// channel does not support approval prompts — the caller should fall back
-    /// to its default policy (typically auto-deny).
+    /// Returns `Ok(Some(response))` when the operator answers within the
+    /// channel's configured `approval_timeout_secs`; timeouts are surfaced
+    /// as `Deny`. Returns `Ok(None)` only for channels that do not implement
+    /// the prompt at all — the caller should fall back to its default policy
+    /// (typically auto-deny).
+    ///
+    /// Surface varies by channel:
+    /// - **Telegram** uses inline keyboard buttons.
+    /// - **Slack** Socket Mode uses Block Kit buttons; webhook fallback and
+    ///   non–Socket Mode deployments use a token text reply.
+    /// - **Discord, Signal, Matrix, WhatsApp** embed a 6-character
+    ///   alphanumeric token in the prompt and wait for a
+    ///   `<token> approve|deny|always` reply on the same conversation.
     async fn request_approval(
         &self,
         _recipient: &str,

@@ -16,16 +16,37 @@ use zeroclaw_infra::session_backend::SessionBackend;
 
 /// Validate that a session ID is non-empty and contains at least one
 /// alphanumeric character (prevents blank keys after sanitization).
-fn validate_session_id(session_id: &str) -> Result<(), ToolResult> {
-    let trimmed = session_id.trim();
-    if trimmed.is_empty() || !trimmed.chars().any(|c| c.is_alphanumeric()) {
-        return Err(ToolResult {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionValidationError {
+    Empty,
+    NoAlphanumeric,
+}
+
+impl SessionValidationError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Empty | Self::NoAlphanumeric => {
+                "Invalid 'session_id': must be non-empty and contain at least one alphanumeric character."
+            }
+        }
+    }
+
+    fn into_tool_result(self) -> ToolResult {
+        ToolResult {
             success: false,
             output: String::new(),
-            error: Some(
-                "Invalid 'session_id': must be non-empty and contain at least one alphanumeric character.".into(),
-            ),
-        });
+            error: Some(self.message().into()),
+        }
+    }
+}
+
+fn validate_session_id(session_id: &str) -> Result<(), SessionValidationError> {
+    let trimmed = session_id.trim();
+    if trimmed.is_empty() {
+        return Err(SessionValidationError::Empty);
+    }
+    if !trimmed.chars().any(|c| c.is_alphanumeric()) {
+        return Err(SessionValidationError::NoAlphanumeric);
     }
     Ok(())
 }
@@ -160,8 +181,8 @@ impl Tool for SessionsHistoryTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'session_id' parameter"))?;
 
-        if let Err(result) = validate_session_id(session_id) {
-            return Ok(result);
+        if let Err(error) = validate_session_id(session_id) {
+            return Ok(error.into_tool_result());
         }
 
         #[allow(clippy::cast_possible_truncation)]
@@ -260,8 +281,8 @@ impl Tool for SessionsSendTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'session_id' parameter"))?;
 
-        if let Err(result) = validate_session_id(session_id) {
-            return Ok(result);
+        if let Err(error) = validate_session_id(session_id) {
+            return Ok(error.into_tool_result());
         }
 
         let message = args
@@ -289,6 +310,188 @@ impl Tool for SessionsSendTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to send message: {e}")),
+            }),
+        }
+    }
+}
+
+// ── SessionResetTool ────────────────────────────────────────────────
+
+/// Resets a session by clearing its message history. The session key
+/// remains valid for new messages. Useful for cleaning up stale
+/// conversations without deleting the session entry itself.
+pub struct SessionResetTool {
+    backend: Arc<dyn SessionBackend>,
+    security: Arc<SecurityPolicy>,
+}
+
+impl SessionResetTool {
+    pub fn new(backend: Arc<dyn SessionBackend>, security: Arc<SecurityPolicy>) -> Self {
+        Self { backend, security }
+    }
+}
+
+#[async_trait]
+impl Tool for SessionResetTool {
+    fn name(&self) -> &str {
+        "sessions_reset"
+    }
+
+    fn description(&self) -> &str {
+        "Reset a session by clearing all its messages. The session can still receive new messages after reset."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "The session ID to reset (e.g. telegram__user123)"
+                }
+            },
+            "required": ["session_id"]
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Act, "sessions_reset")
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
+
+        let session_id = args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'session_id' parameter"))?;
+
+        if let Err(error) = validate_session_id(session_id) {
+            return Ok(error.into_tool_result());
+        }
+
+        // TOCTOU: a message appended between load() and the last remove_last()
+        // will also be removed. Acceptable until clear_messages lands (#5701).
+        let messages = self.backend.load(session_id);
+        if messages.is_empty() {
+            return Ok(ToolResult {
+                success: true,
+                output: format!("Session '{session_id}' is already empty."),
+                error: None,
+            });
+        }
+
+        // Remove messages one by one via remove_last until empty
+        let msg_count = messages.len();
+        for _ in 0..msg_count {
+            if let Err(e) = self.backend.remove_last(session_id) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to reset session: {e}")),
+                });
+            }
+        }
+
+        Ok(ToolResult {
+            success: true,
+            output: format!("Session '{session_id}' reset ({msg_count} messages cleared)."),
+            error: None,
+        })
+    }
+}
+
+// ── SessionDeleteTool ──────────────────────────────────────────────
+
+/// Permanently deletes a session and all its messages. The session key
+/// becomes invalid and must be recreated for new conversations.
+pub struct SessionDeleteTool {
+    backend: Arc<dyn SessionBackend>,
+    security: Arc<SecurityPolicy>,
+}
+
+impl SessionDeleteTool {
+    pub fn new(backend: Arc<dyn SessionBackend>, security: Arc<SecurityPolicy>) -> Self {
+        Self { backend, security }
+    }
+}
+
+#[async_trait]
+impl Tool for SessionDeleteTool {
+    fn name(&self) -> &str {
+        "sessions_delete"
+    }
+
+    fn description(&self) -> &str {
+        "Permanently delete a session and all its messages. This cannot be undone."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "The session ID to delete (e.g. telegram__user123)"
+                }
+            },
+            "required": ["session_id"]
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Act, "sessions_delete")
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
+
+        let session_id = args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'session_id' parameter"))?;
+
+        if let Err(error) = validate_session_id(session_id) {
+            return Ok(error.into_tool_result());
+        }
+
+        let existed = !self.backend.load(session_id).is_empty();
+
+        match self.backend.delete_session(session_id) {
+            Ok(true) => Ok(ToolResult {
+                success: true,
+                output: format!("Session '{session_id}' deleted."),
+                error: None,
+            }),
+            Ok(false) if !existed => Ok(ToolResult {
+                success: true,
+                output: format!(
+                    "Session '{session_id}' not found (may have already been deleted)."
+                ),
+                error: None,
+            }),
+            Ok(false) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Session '{session_id}' exists but could not be deleted \
+                     — the storage backend may not support this operation."
+                )),
+            }),
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Failed to delete session: {e}")),
             }),
         }
     }
@@ -327,6 +530,48 @@ mod tests {
             .append("discord__bob", &ChatMessage::user("Hey from Bob"))
             .unwrap();
         (tmp, Arc::new(store))
+    }
+
+    // ── Session ID validation tests ─────────────────────────────────
+
+    #[test]
+    fn validate_session_id_rejects_empty() {
+        assert_eq!(validate_session_id(""), Err(SessionValidationError::Empty));
+    }
+
+    #[test]
+    fn validate_session_id_rejects_whitespace_only() {
+        assert_eq!(
+            validate_session_id("   "),
+            Err(SessionValidationError::Empty)
+        );
+    }
+
+    #[test]
+    fn validate_session_id_rejects_non_alphanumeric() {
+        assert_eq!(
+            validate_session_id("///"),
+            Err(SessionValidationError::NoAlphanumeric)
+        );
+    }
+
+    #[test]
+    fn validate_session_id_accepts_valid_id() {
+        assert_eq!(validate_session_id("test_session_id"), Ok(()));
+    }
+
+    #[test]
+    fn validation_error_message_starts_with_invalid() {
+        assert!(
+            SessionValidationError::Empty
+                .message()
+                .starts_with("Invalid")
+        );
+        assert!(
+            SessionValidationError::NoAlphanumeric
+                .message()
+                .starts_with("Invalid")
+        );
     }
 
     // ── SessionsListTool tests ──────────────────────────────────────
@@ -435,7 +680,7 @@ mod tests {
         let tool = SessionsHistoryTool::new(backend, test_security());
         let result = tool.execute(json!({"session_id": "   "})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("Invalid"));
+        assert!(result.error.is_some());
     }
 
     #[test]
@@ -521,7 +766,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("Invalid"));
+        assert!(result.error.is_some());
     }
 
     #[tokio::test]
@@ -536,7 +781,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("Invalid"));
+        assert!(result.error.is_some());
     }
 
     #[tokio::test]
@@ -575,5 +820,171 @@ mod tests {
                 .unwrap()
                 .contains(&json!("message"))
         );
+    }
+
+    // ── SessionResetTool tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn reset_clears_messages() {
+        let (_tmp, backend) = seeded_backend();
+        let tool = SessionResetTool::new(backend.clone(), test_security());
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("2 messages cleared"));
+
+        // Verify messages are gone
+        let messages = backend.load("telegram__alice");
+        assert!(messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_empty_session_is_noop() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionResetTool::new(backend, test_security());
+        let result = tool
+            .execute(json!({"session_id": "nonexistent"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("already empty"));
+    }
+
+    #[tokio::test]
+    async fn reset_does_not_affect_other_sessions() {
+        let (_tmp, backend) = seeded_backend();
+        let tool = SessionResetTool::new(backend.clone(), test_security());
+        tool.execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+
+        // Bob's session should be untouched
+        let bob_msgs = backend.load("discord__bob");
+        assert_eq!(bob_msgs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reset_rejects_empty_session_id() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionResetTool::new(backend, test_security());
+        let result = tool.execute(json!({"session_id": ""})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.is_some());
+    }
+
+    #[test]
+    fn reset_tool_name_and_schema() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionResetTool::new(backend, test_security());
+        assert_eq!(tool.name(), "sessions_reset");
+        let schema = tool.parameters_schema();
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("session_id"))
+        );
+    }
+
+    // ── SessionDeleteTool tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_removes_session() {
+        let (_tmp, backend) = seeded_backend();
+        let tool = SessionDeleteTool::new(backend.clone(), test_security());
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("deleted"));
+
+        // Verify session is gone
+        let messages = backend.load("telegram__alice");
+        assert!(messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_nonexistent_session_succeeds() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionDeleteTool::new(backend, test_security());
+        let result = tool
+            .execute(json!({"session_id": "nonexistent"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn delete_does_not_affect_other_sessions() {
+        let (_tmp, backend) = seeded_backend();
+        let tool = SessionDeleteTool::new(backend.clone(), test_security());
+        tool.execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+
+        // Bob's session should be untouched
+        let bob_msgs = backend.load("discord__bob");
+        assert_eq!(bob_msgs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_empty_session_id() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionDeleteTool::new(backend, test_security());
+        let result = tool.execute(json!({"session_id": "   "})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.is_some());
+    }
+
+    #[test]
+    fn delete_tool_name_and_schema() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionDeleteTool::new(backend, test_security());
+        assert_eq!(tool.name(), "sessions_delete");
+        let schema = tool.parameters_schema();
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("session_id"))
+        );
+    }
+
+    // ── NoOpDeleteBackend (test helper) ────────────────────────────
+
+    /// Delegates everything except delete_session, which uses the trait
+    /// default (returns Ok(false) without deleting anything).
+    struct NoOpDeleteBackend(Arc<dyn SessionBackend>);
+
+    impl SessionBackend for NoOpDeleteBackend {
+        fn load(&self, key: &str) -> Vec<ChatMessage> {
+            self.0.load(key)
+        }
+        fn append(&self, key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            self.0.append(key, msg)
+        }
+        fn remove_last(&self, key: &str) -> std::io::Result<bool> {
+            self.0.remove_last(key)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            self.0.list_sessions()
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_detects_noop_backend() {
+        let (_tmp, inner) = seeded_backend();
+        let backend: Arc<dyn SessionBackend> = Arc::new(NoOpDeleteBackend(inner));
+        let tool = SessionDeleteTool::new(backend, test_security());
+        let result = tool
+            .execute(json!({"session_id": "telegram__alice"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("could not be deleted"));
     }
 }
