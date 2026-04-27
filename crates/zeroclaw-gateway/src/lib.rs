@@ -54,8 +54,6 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
-#[cfg(test)]
-use zeroclaw_providers::ChatMessage;
 use zeroclaw_providers::{self, Provider};
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::platform;
@@ -1347,53 +1345,6 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
     // Keep shared runtime config in sync with persisted tokens.
     *config.lock() = updated_cfg;
     Ok(())
-}
-
-/// Simple chat without tools — used in tests to exercise webhook infrastructure
-/// (idempotency, auth, autosave) without bootstrapping the full agent runtime.
-#[cfg(test)]
-async fn run_gateway_chat_simple(
-    state: &AppState,
-    message: &str,
-) -> anyhow::Result<zeroclaw_api::provider::ChatResponse> {
-    let user_messages = vec![ChatMessage::user(message)];
-
-    // Keep webhook/gateway prompts aligned with channel behavior by injecting
-    // workspace-aware system context before model invocation.
-    let system_prompt = {
-        let config_guard = state.config.lock();
-        zeroclaw_runtime::agent::system_prompt::build_system_prompt(
-            &config_guard.workspace_dir,
-            &state.model,
-            &[], // tools - empty for simple chat
-            &[], // skills
-            Some(&config_guard.identity),
-            None, // bootstrap_max_chars - use default
-        )
-    };
-
-    let mut messages = Vec::with_capacity(1 + user_messages.len());
-    messages.push(ChatMessage::system(system_prompt));
-    messages.extend(user_messages);
-
-    let multimodal_config = state.config.lock().multimodal.clone();
-    let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
-        &messages,
-        &multimodal_config,
-    )
-    .await?;
-
-    state
-        .provider
-        .chat(
-            zeroclaw_api::provider::ChatRequest {
-                messages: &prepared.messages,
-                tools: None,
-            },
-            &state.model,
-            Some(state.temperature),
-        )
-        .await
 }
 
 /// Full-featured chat with tools for channel and webhook handlers.
