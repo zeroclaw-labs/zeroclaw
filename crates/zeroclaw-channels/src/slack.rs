@@ -56,6 +56,8 @@ pub struct SlackChannel {
     /// Emoji reaction name (without colons) that cancels an in-flight request.
     cancel_reaction: Option<String>,
     pending_approvals: Arc<AsyncMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    /// Seconds to wait for an operator reply to a `request_approval` prompt
+    /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
 }
 
@@ -455,7 +457,7 @@ impl SlackChannel {
     /// Update an existing Slack message in-place using `chat.update`.
     ///
     /// `channel` is the channel ID and `ts` is the timestamp of the original
-    /// message (returned by [`post_message`]).
+    /// message (returned by `post_message`).
     pub async fn update_message(&self, channel: &str, ts: &str, text: &str) -> anyhow::Result<()> {
         let body = serde_json::json!({
             "channel": channel,

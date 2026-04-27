@@ -44,6 +44,8 @@ pub struct DiscordChannel {
     /// Stall-watchdog timeout in seconds (0 = disabled).
     stall_timeout_secs: u64,
     pending_approvals: Arc<AsyncMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    /// Seconds to wait for an operator reply to a `request_approval` prompt
+    /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
 }
 

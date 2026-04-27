@@ -2,8 +2,9 @@
 //!
 //! This module provides the multi-channel messaging infrastructure that connects
 //! ZeroClaw to external platforms. Each channel implements the [`Channel`] trait
-//! defined in [`traits`], which provides a uniform interface for sending messages,
-//! listening for incoming messages, health checking, and typing indicators.
+//! defined in the `traits` submodule, which provides a uniform interface for
+//! sending messages, listening for incoming messages, health checking, and typing
+//! indicators.
 //!
 //! Channels are instantiated by [`start_channels`] based on the runtime configuration.
 //! The subsystem manages per-sender conversation history, concurrent message processing
@@ -2055,7 +2056,7 @@ async fn classify_channel_reply_intent(
     }
 
     let response = provider
-        .chat_with_system(Some(system_prompt), &convo, model, temperature)
+        .chat_with_system(Some(system_prompt), &convo, model, Some(temperature))
         .await?;
     let trimmed = response.trim();
     if trimmed.is_empty() {
@@ -4860,15 +4861,19 @@ fn collect_configured_channels(
     }
 
     if let Some(ref mc) = config.channels.mochat {
-        channels.push(ConfiguredChannel {
-            display_name: "Mochat",
-            channel: Arc::new(MochatChannel::new(
-                mc.api_url.clone(),
-                mc.api_token.clone(),
-                mc.allowed_users.clone(),
-                mc.poll_interval_secs,
-            )),
-        });
+        if mc.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "Mochat",
+                channel: Arc::new(MochatChannel::new(
+                    mc.api_url.clone(),
+                    mc.api_token.clone(),
+                    mc.allowed_users.clone(),
+                    mc.poll_interval_secs,
+                )),
+            });
+        } else {
+            tracing::info!("Mochat channel configured but disabled (enabled = false)");
+        }
     }
 
     if let Some(ref wc) = config.channels.wecom {
@@ -5238,16 +5243,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     let tools_registry = Arc::new(built_tools);
 
-    // ── Load locale-aware tool descriptions ────────────────────────
+    // ── Initialize locale-aware tool descriptions ──────────────────
     let i18n_locale = config
         .locale
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(zeroclaw_runtime::i18n::detect_locale);
-    let i18n_search_dirs = zeroclaw_runtime::i18n::default_search_dirs(&workspace);
-    let i18n_descs =
-        zeroclaw_runtime::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+    zeroclaw_runtime::i18n::init(&i18n_locale);
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -5343,10 +5346,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         config.agent.max_system_prompt_chars,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(
-            tools_registry.as_ref(),
-            Some(&i18n_descs),
-        ));
+        system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
     }
 
     // Append deferred MCP tool names so the LLM knows what is available
@@ -5619,7 +5619,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 (k, mt)
             })
             .collect();
-        keyed.sort_by(|a, b| b.1.cmp(&a.1));
+        keyed.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         keyed.truncate(MAX_CONVERSATION_SENDERS);
         let session_keys: Vec<String> = keyed.into_iter().map(|(k, _)| k).collect();
 
@@ -6488,7 +6488,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("ok".to_string())
         }
@@ -6505,7 +6505,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("NO_REPLY: not addressed to agent".to_string())
         }
@@ -6520,7 +6520,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("ok".to_string())
         }
@@ -6529,7 +6529,7 @@ mod tests {
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             if messages
                 .iter()
@@ -6694,7 +6694,7 @@ mod tests {
             _system_prompt: Option<&str>,
             message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             tokio::time::sleep(self.delay).await;
             Ok(format!("echo: {message}"))
@@ -6724,7 +6724,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(tool_call_payload())
         }
@@ -6733,7 +6733,7 @@ mod tests {
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let has_tool_results = messages
                 .iter()
@@ -6755,7 +6755,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(tool_call_payload_with_alias_tag())
         }
@@ -6764,7 +6764,7 @@ mod tests {
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let has_tool_results = messages
                 .iter()
@@ -6786,7 +6786,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("fallback".to_string())
         }
@@ -6795,7 +6795,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(r#"{"name":"mock_price","parameters":{"symbol":"BTC"}}
 {"result":{"symbol":"BTC","price_usd":65000}}
@@ -6824,7 +6824,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(tool_call_payload())
         }
@@ -6833,7 +6833,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let completed_iterations = Self::completed_tool_iterations(messages);
             if completed_iterations >= self.required_tool_iterations {
@@ -6858,7 +6858,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("fallback".to_string())
         }
@@ -6867,7 +6867,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let snapshot = messages
                 .iter()
@@ -6891,7 +6891,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("fallback".to_string())
         }
@@ -6900,7 +6900,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let snapshot = messages
                 .iter()
@@ -6931,7 +6931,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("fallback".to_string())
         }
@@ -6940,7 +6940,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &self,
             _messages: &[ChatMessage],
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             self.models
@@ -8953,7 +8953,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "build_system_prompt should not emit protocol block directly"
         );
 
-        prompt.push_str(&build_tool_instructions(&[], None));
+        prompt.push_str(&build_tool_instructions(&[]));
 
         assert_eq!(
             prompt.matches("## Tool Use Protocol").count(),

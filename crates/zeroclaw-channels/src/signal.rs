@@ -35,6 +35,8 @@ pub struct SignalChannel {
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
     pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    /// Seconds to wait for an operator reply to a `request_approval` prompt
+    /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
 }
 

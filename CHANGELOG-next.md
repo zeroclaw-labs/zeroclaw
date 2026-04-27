@@ -113,6 +113,10 @@
 - Slack config: `channel_id` deprecated in favour of `channel_ids` (plural) for V2.
 - Nostr, WhatsApp Web, and hardware wizard sections wired into the onboarding flow
   (#5640).
+- Fresh `[providers.models.<name>]` entries no longer serialize family-irrelevant
+  default flags: `requires_openai_auth = false`, `merge_system_into_user = false`,
+  and empty `name`/`base_url`/`wire_api` entries are now omitted when they carry
+  their struct-level defaults. Existing configs deserialize unchanged.
 
 ### Observability
 
@@ -147,6 +151,27 @@
 - Fixed: `cron_run` tool output was not being delivered to configured channels.
 - Windows: the shell console window is now hidden when running as a background process
   (#5563).
+- `zeroclaw onboard` now defaults to the ratatui TUI backend. Pass `--cli` to force the
+  terminal-prompt backend; `--tui` is accepted as a deprecated no-op for one release.
+  Falls back to the terminal-prompt backend automatically when stdout isn't a TTY or
+  ratatui init fails.
+- `zeroclaw onboard` advanced-settings walk now filters out fields that don't apply to
+  the selected provider family — no more `azure_openai_*` prompts when configuring
+  Anthropic, no more `wire_api` / `requires_openai_auth` prompts outside the OpenAI
+  family.
+- `zeroclaw onboard` model-catalog fetch failures now name the provider in the fallback
+  note (`"Catalog lookup failed for <provider> — enter a model id manually"`) and log
+  the underlying error at `debug` level instead of swallowing it entirely.
+- `zeroclaw models` restored — routes to the same live model-probe output as
+  `zeroclaw doctor models`, preserving the `--provider` flag for `models list` /
+  `models refresh` subcommands.
+- Fixed: `TermUi::editor` close-without-save now returns `Answer::Back` (rewind)
+  instead of accepting the unchanged buffer silently. Matches the navigation contract
+  every other prompt method honors.
+- Fixed: `channels.mochat` now respects its `enabled` flag. Previously the orchestrator
+  registered the Mochat channel whenever the `[channels.mochat]` section existed,
+  producing `Mochat: poll request error: builder error` log spam on invalid or empty
+  URLs. Matches the WeCom / ClawdTalk enabled-gate pattern.
 
 ### Skills (Claude Code)
 
@@ -230,6 +255,14 @@ release but will not be supported indefinitely.
 
 Use `zeroclaw config` instead. The `props` subcommand still works and will not be
 removed in this release, but it will emit a deprecation notice.
+
+### `zeroclaw onboard` defaults to TUI
+
+`zeroclaw onboard` now launches the ratatui TUI backend by default. Users who were
+relying on the old terminal-prompt behavior should pass `--cli` explicitly. The
+previous `--tui` flag is accepted for one release as a deprecated no-op and emits a
+warning pointing at the new default. In non-TTY environments (piped output, CI without
+`--quick`) onboarding automatically falls back to the terminal-prompt backend.
 
 ### Slack `channel_id` deprecated
 

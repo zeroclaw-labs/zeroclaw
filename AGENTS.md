@@ -102,7 +102,7 @@ Branch/commit/PR rules:
 - Work from a non-`master` branch. Open a PR to `master`; do not push directly.
 - Use conventional commit titles. Prefer small PRs (`size: XS/S/M`).
 - Follow `.github/pull_request_template.md` fully.
-- Never commit secrets, personal data, or real identity information (see `@docs/contributing/pr-discipline.md`).
+- Never commit secrets, personal data, or real identity information (see `@docs/book/src/contributing/privacy.md`).
 
 ## Anti-Patterns
 
@@ -122,8 +122,26 @@ AI coding assistant skills live in `.claude/skills/`. Use the right one for the 
 - `.claude/skills/github-pr-review-session/SKILL.md` — PR review co-pilot; assists **you** as the human reviewer. Posts reviews as WareWolf-MoonWall using the RFC feedback taxonomy (🔴/🟡/✅/🔵/🟢). Trigger: `review 1234`, `re-review 1234`, `go through the queue`.
 - `.claude/skills/changelog-generation/SKILL.md` — generates `CHANGELOG-next.md` between stable tags, resolves contributors via GraphQL, feeds the release workflow. Trigger: `generate changelog`, `release notes for v0.7.x`.
 
+## Localization
+
+- All user-facing output (CLI messages, tool descriptions, onboarding prompts) must use `fl!()` / Fluent strings — never bare string literals.
+- Log messages, `tracing::` spans/events, and panic messages stay in English with stable `error_key` fields (RFC #5653 §4.6).
+- Panics and `tracing::` lines are never translated.
+- The Wiki and internal developer docs are English only.
+
+Dev-operational contracts — files consumed by AI coding skills and development tooling. Do not move or delete without updating all consuming skills and AGENTS.md:
+
+| Protected file | Consuming skill / tool |
+|---|---|
+| `docs/book/src/contributing/pr-review-protocol.md` | `github-pr-review-session` — review protocol |
+| `docs/book/src/maintainers/changelog-generation.md` | `changelog-generation` — release procedure |
+| `docs/book/src/maintainers/reviewer-playbook.md` | `github-issue-triage` — triage governance |
+| `docs/book/src/maintainers/pr-workflow.md` | `github-issue-triage` — triage discipline |
+| `docs/book/src/contributing/privacy.md` | `github-issue-triage`, PR template — privacy rules |
+| `docs/book/src/foundations/fnd-00*.md` | `github-pr-review-session` — RFC reference data; public transparency documents |
+
 ## Linked References
 
-- `@docs/contributing/change-playbooks.md` — adding providers, channels, tools, peripherals; security/gateway changes; architecture boundaries
-- `@docs/contributing/pr-discipline.md` — privacy rules, superseded-PR attribution/templates, handoff template
-- `@docs/contributing/docs-contract.md` — docs system contract, i18n rules, locale parity
+- `@docs/book/src/developing/extension-examples.md` — adding providers, channels, tools, peripherals; tool shared-state contract; architecture boundary rules
+- `@docs/book/src/contributing/privacy.md` — privacy rules and neutral-placeholder palette
+- `@docs/book/src/maintainers/superseding.md` — superseded-PR attribution, PR/commit templates, handoff template

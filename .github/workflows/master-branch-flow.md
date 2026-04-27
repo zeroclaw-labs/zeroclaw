@@ -4,8 +4,8 @@ How code moves from a PR to a shipped release.
 
 Use with:
 
-- [`docs/contributing/ci-map.md`](../../docs/contributing/ci-map.md)
-- [`docs/maintainers/release-runbook.md`](../../docs/maintainers/release-runbook.md)
+- [`docs/book/src/maintainers/ci-and-actions.md`](../../docs/book/src/maintainers/ci-and-actions.md)
+- [`docs/book/src/maintainers/release-runbook.md`](../../docs/book/src/maintainers/release-runbook.md)
 
 Last updated: **May 2026** (post-v0.7.4 cleanup).
 
@@ -67,7 +67,7 @@ deliberate tag push.
 
 ### 2) Stable Release (manual)
 
-See [`docs/maintainers/release-runbook.md`](../../docs/maintainers/release-runbook.md)
+See [`docs/book/src/maintainers/release-runbook.md`](../../docs/book/src/maintainers/release-runbook.md)
 for the full procedure. In summary:
 
 1. Maintainer verifies CI is green on the version bump PR.

@@ -1573,7 +1573,7 @@ pub async fn handle_api_session_abort(
 // ── Claude Code hook endpoint ────────────────────────────────────
 
 /// POST /hooks/claude-code — receives HTTP hook events from Claude Code
-/// sessions spawned by [`ClaudeCodeRunnerTool`].
+/// sessions spawned by `ClaudeCodeRunnerTool`.
 ///
 /// Claude Code posts structured JSON describing tool executions, completions,
 /// and errors. This handler logs the event and (when a Slack channel is
@@ -1675,7 +1675,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("ok".to_string())
         }
