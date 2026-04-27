@@ -235,12 +235,15 @@ libc = "0.2"
 [features]
 default = [
     "agent-runtime",
+    "channels-all",
     "observability-prometheus",
     "schema-export",
 ]
 
-# The full agent runtime — agent loop, channels, tools, gateway, TUI, all subsystems.
-# Without this, you get the kernel: config + providers + memory + CLI chat.
+# The agent runtime — agent loop, hardware peripheral wiring, TUI, gateway,
+# tools. Channel integrations live in `channels-all` (separate); without that,
+# enabling `agent-runtime` alone gives a slim build that still satisfies all
+# `cfg(feature = "agent-runtime")` gates. The hackathon demo uses this.
 agent-runtime = [
     "dep:zeroclaw-runtime", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
     "dep:rusqlite",
@@ -248,10 +251,16 @@ agent-runtime = [
     "dep:ratatui", "dep:crossterm",
     "dep:tokio-tungstenite", "dep:tokio-socks", "dep:hostname",
     "dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:webpki-roots",
-    "dep:lettre", "dep:mail-parser", "dep:async-imap",
     "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tower-http", "dep:http-body-util",
     "dep:mime_guess",
     "gateway", "tui-onboarding",
+]
+
+# Aggregate of all channel integrations + the email crates they depend on.
+# Pulled in by `default` so existing builds are unchanged. Skip via
+# `--no-default-features --features "agent-runtime,..."` for a slim build.
+channels-all = [
+    "dep:lettre", "dep:mail-parser", "dep:async-imap",
     "channel-email", "channel-telegram", "channel-lark",
     "channel-discord", "channel-slack", "channel-signal",
     "channel-mattermost", "channel-irc", "channel-imessage",
@@ -308,6 +317,10 @@ observability-prometheus = [
 ]
 observability-otel = ["zeroclaw-runtime/observability-otel"]
 hardware = ["dep:zeroclaw-hardware", "zeroclaw-hardware/hardware"]
+# Forwards `zeroclaw-hardware/dev-sim`: extends the serial allow-list with
+# `/tmp/zc-sim-*` for hardware-free simulation. Off by default; opt-in for the
+# demo container.
+dev-sim = ["dep:zeroclaw-hardware", "zeroclaw-hardware/dev-sim"]
 peripheral-rpi = ["dep:zeroclaw-hardware", "zeroclaw-hardware/peripheral-rpi"]
 sandbox-landlock = ["zeroclaw-runtime/sandbox-landlock"]
 sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]

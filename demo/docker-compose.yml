@@ -1,0 +1,21 @@
+services:
+  zeroclaw:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile
+    container_name: zeroclaw-demo
+    init: true
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      MINIMAX_API_KEY: "${MINIMAX_API_KEY:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      RUST_LOG: "${RUST_LOG:-zeroclaw=info,zeroclaw_hardware=info,esp32_sim=info}"
+    volumes:
+      # Bind the demo config file at the path zeroclaw expects ($ZEROCLAW_CONFIG_DIR/config.toml)
+      # so we can edit zeroclaw.toml on the host without rebuilding the image.
+      - ./zeroclaw.toml:/app/data/config/config.toml:ro
+    # Default command (esp32_sim) comes from the Dockerfile CMD. The simulator
+    # owns /tmp/zc-sim-* (created via socat) and serves the frontend on :8080.
+    # Chat happens via:
+    #     docker compose exec zeroclaw zeroclaw agent --config /app/zeroclaw.toml

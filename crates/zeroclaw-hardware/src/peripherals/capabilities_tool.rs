@@ -56,12 +56,22 @@ impl Tool for HardwareCapabilitiesTool {
                         if let Ok(parsed) =
                             serde_json::from_str::<serde_json::Value>(&result.output)
                         {
-                            format!(
+                            // Surface gpio + led_pin AND any pin_devices map / description
+                            // the firmware reports — the latter is what tells the agent
+                            // which pin controls which named device.
+                            let mut s = format!(
                                 "{}: gpio {:?}, led_pin {:?}",
                                 board_name,
                                 parsed.get("gpio").unwrap_or(&json!([])),
                                 parsed.get("led_pin").unwrap_or(&json!(null))
-                            )
+                            );
+                            if let Some(desc) = parsed.get("description").and_then(|v| v.as_str()) {
+                                s.push_str(&format!("\n  description: {desc}"));
+                            }
+                            if let Some(devices) = parsed.get("pin_devices") {
+                                s.push_str(&format!("\n  pin_devices: {devices}"));
+                            }
+                            s
                         } else {
                             format!("{}: {}", board_name, result.output)
                         }

@@ -1,0 +1,115 @@
+# ZeroClaw demo config — ESP32 Smart Room hackathon MVP.
+#
+# Designed to be minimal and safe:
+#   • only the hardware peripheral tool is exposed to the agent
+#   • shell, browser, web-search, file-write are off by default and stay off
+#   • data dir is the demo/ folder, not ~/.zeroclaw, so nothing in the user's
+#     real ZeroClaw install is touched
+#
+# Providers: MiniMax M2.7 primary, OpenRouter fallback. Switch via the
+# ZEROCLAW_FALLBACK env var or by editing `providers.fallback` below.
+#
+# Run from the repo root:
+#     source demo/.env
+#     zeroclaw --config demo/zeroclaw.toml chat
+
+# ─── Providers ─────────────────────────────────────────────────────────────
+
+[providers]
+# Section key "minimax" matches the credential-resolution alias chain (see
+# zeroclaw-providers/src/lib.rs MINIMAX_*_ENV) so MINIMAX_API_KEY env var is
+# auto-resolved. Schema migration may auto-add an empty "default" entry; we
+# define both keys so neither validator complains.
+fallback = "minimax"
+
+[providers.models.minimax]
+name = "minimax"                 # locks provider type → MiniMax auth path (Bearer)
+model = "MiniMax-M2.7"
+base_url = "https://api.minimax.io/v1"
+merge_system_into_user = true    # MiniMax rejects role:system messages
+temperature = 0.3                # tighter sampling = more reliable tool calls
+max_tokens = 1024
+
+# Stub default entry — migration auto-creates it; populate so validator passes.
+# Points at the same minimax config; ZeroClaw uses fallback="minimax" anyway.
+[providers.models.default]
+model = "MiniMax-M2.7"
+base_url = "https://api.minimax.io/v1"
+
+[providers.models.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+model = "minimax/minimax-m2.7"
+temperature = 0.3
+max_tokens = 1024
+
+# ─── Hardware peripherals (the only enabled tool surface) ──────────────────
+
+[peripherals]
+enabled = true
+
+[[peripherals.boards]]
+board = "esp32"
+transport = "serial"
+path = "/tmp/zc-sim-esp32"   # pty endpoint owned by socat; allowed via dev-sim feature
+baud = 115200
+
+# ─── Restrict every other tool surface ──────────────────────────────────────
+# Defaults for these are already off in a fresh install, but we set them
+# explicitly so this config is self-documenting about what the agent CAN'T do.
+# (Section names use kebab-case to match the schema's `#[prefix = "..."]`.)
+
+[shell-tool]
+enabled = false
+
+[browser]
+enabled = false
+
+[browser-delegate]
+enabled = false
+
+[text-browser]
+enabled = false
+
+[web-search]
+enabled = false
+
+[http-request]
+enabled = false
+
+[transcription]
+enabled = false
+
+[mcp]
+enabled = false
+
+# ─── Runtime / safety ───────────────────────────────────────────────────────
+
+[autonomy]
+# Cap actions per hour as a belt-and-suspenders guard.
+max_actions_per_hour = 60
+# Auto-approve hardware actuation in the demo (otherwise each gpio call prompts
+# Y/N which breaks non-interactive shells). Other tools still require approval.
+auto_approve = ["set_device", "read_device", "gpio_write", "gpio_read", "hardware_capabilities"]
+
+# ─── Telegram channel ──────────────────────────────────────────────────────
+
+[channels.telegram]
+enabled = true
+bot_token = "your bot token"
+allowed_users = ["your telegram user id"]
+
+[security.otp]
+# Demo mode — no OTP gating on tool calls.
+challenge_max_attempts = 3
+token_ttl_secs = 300
+cache_valid_secs = 600
+gated_actions = []
+
+# ─── Optional: gateway for in-browser chat (stretch goal) ──────────────────
+# Uncomment if/when we wire chat into the frontend instead of the TUI.
+#
+# [gateway]
+# port = 42617
+# host = "127.0.0.1"
+# require_pairing = false
+# allow_public_bind = false

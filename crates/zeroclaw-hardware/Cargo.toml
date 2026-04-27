@@ -41,3 +41,15 @@ default = []
 hardware = ["dep:nusb", "dep:tokio-serial", "dep:dialoguer", "dep:console"]
 peripheral-rpi = ["rppal"]
 probe = ["dep:probe-rs"]
+# Extends the serial peripheral allow-list with `/tmp/zc-sim-*` for hardware-free
+# local testing (paired with the `esp32_sim` example). Off by default; opt-in.
+dev-sim = []
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws", "macros"] }
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "time", "sync", "process", "fs", "io-util", "signal"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+
+[[example]]
+name = "esp32_sim"
+required-features = ["hardware", "dev-sim"]
