@@ -1,5 +1,6 @@
 /target
 /target-*/
+/.worktrees/
 /docs/book/book/
 /docs/book/po/messages.pot
 /docs/book/po/*.failures.log
