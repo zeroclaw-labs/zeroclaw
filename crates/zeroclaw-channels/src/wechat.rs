@@ -24,15 +24,11 @@ struct AccountData {
 fn state_dir() -> PathBuf {
     // Mirrors weixin-agent-rs resolution order:
     // $OPENCLAW_STATE_DIR → $CLAWDBOT_STATE_DIR → ~/.openclaw
-    if let Ok(v) = std::env::var("OPENCLAW_STATE_DIR") {
-        if !v.is_empty() {
-            return PathBuf::from(v);
-        }
+    if let Some(v) = std::env::var("OPENCLAW_STATE_DIR").ok().filter(|s| !s.is_empty()) {
+        return PathBuf::from(v);
     }
-    if let Ok(v) = std::env::var("CLAWDBOT_STATE_DIR") {
-        if !v.is_empty() {
-            return PathBuf::from(v);
-        }
+    if let Some(v) = std::env::var("CLAWDBOT_STATE_DIR").ok().filter(|s| !s.is_empty()) {
+        return PathBuf::from(v);
     }
     directories::BaseDirs::new()
         .map(|d| d.home_dir().join(".openclaw"))
@@ -81,9 +77,11 @@ struct GetUpdatesResp {
 struct WeixinMessage {
     message_id: Option<u64>,
     from_user_id: Option<String>,
+    #[allow(dead_code)]
     to_user_id: Option<String>,
     create_time_ms: Option<u64>,
     item_list: Option<Vec<MessageItem>>,
+    #[allow(dead_code)]
     context_token: Option<String>,
 }
 
@@ -146,6 +144,7 @@ impl WeChatChannel {
             base_url,
             account_id,
             allowed_users,
+            // Plain client — iLink Bot API doesn't require proxy routing.
             client: reqwest::Client::new(),
         })
     }
@@ -271,16 +270,14 @@ fn extract_text(msg: &WeixinMessage) -> Option<String> {
     for item in items {
         match item.item_type {
             Some(t) if t == ITEM_TEXT => {
-                if let Some(text) = item.text_item.as_ref().and_then(|i| i.text.clone()) {
-                    return Some(text);
+                if let Some(text) = item.text_item.as_ref().and_then(|i| i.text.as_deref()) {
+                    return Some(text.to_owned());
                 }
             }
             Some(t) if t == ITEM_VOICE => {
                 // voice messages carry ASR transcript in text field
-                if let Some(text) = item.voice_item.as_ref().and_then(|i| i.text.clone()) {
-                    if !text.is_empty() {
-                        return Some(text);
-                    }
+                if let Some(text) = item.voice_item.as_ref().and_then(|i| i.text.as_deref()).filter(|t| !t.is_empty()) {
+                    return Some(text.to_owned());
                 }
             }
             _ => {}
@@ -314,10 +311,8 @@ impl Channel for WeChatChannel {
                 }
             };
 
-            if let Some(t) = resp.longpolling_timeout_ms {
-                if t > 0 {
-                    next_timeout = t;
-                }
+            if let Some(t) = resp.longpolling_timeout_ms.filter(|&t| t > 0) {
+                next_timeout = t;
             }
 
             let ret = resp.ret.unwrap_or(0);
@@ -338,8 +333,8 @@ impl Channel for WeChatChannel {
             }
 
             if let Some(new_buf) = resp.get_updates_buf.filter(|s| !s.is_empty()) {
-                sync_buf = new_buf.clone();
-                save_sync_buf(&self.account_id, &sync_buf);
+                save_sync_buf(&self.account_id, &new_buf);
+                sync_buf = new_buf;
             }
 
             for msg in resp.msgs.unwrap_or_default() {
@@ -403,8 +398,14 @@ mod tests {
 
     #[test]
     fn test_name() {
-        // WeChatChannel::new requires credentials on disk — unit-test name() via extract_text
-        assert_eq!("wechat", "wechat");
+        let ch = WeChatChannel {
+            bot_token: "t".into(),
+            base_url: "u".into(),
+            account_id: "a".into(),
+            allowed_users: vec![],
+            client: reqwest::Client::new(),
+        };
+        assert_eq!(ch.name(), "wechat");
     }
 
     #[test]
