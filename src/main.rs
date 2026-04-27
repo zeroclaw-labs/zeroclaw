@@ -1478,7 +1478,8 @@ async fn main() -> Result<()> {
                     info!("🔄 Restarting ZeroClaw Gateway on {addr}");
 
                     // Try to gracefully shutdown existing gateway via admin endpoint
-                    match shutdown_gateway(&host, port).await {
+                    match shutdown_gateway(&host, port, config.gateway.path_prefix.as_deref()).await
+                    {
                         Ok(()) => {
                             info!("   ✓ Existing gateway on {addr} shut down gracefully");
                             // Poll until the port is free (connection refused) or timeout
@@ -2649,8 +2650,9 @@ fn log_gateway_start(host: &str, port: u16) {
 
 /// Gracefully shutdown a running gateway via the admin endpoint.
 #[cfg(feature = "agent-runtime")]
-async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
-    let url = format!("http://{host}:{port}/admin/shutdown");
+async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> Result<()> {
+    let prefix = path_prefix.unwrap_or("");
+    let url = format!("http://{host}:{port}{prefix}/admin/shutdown");
     let client = reqwest::Client::new();
 
     match client
