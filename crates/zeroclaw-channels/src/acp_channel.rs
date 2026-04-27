@@ -22,7 +22,9 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+};
 
 use crate::orchestrator::acp_server::RpcOutbound;
 
@@ -193,6 +195,84 @@ impl Channel for AcpChannel {
             other => anyhow::bail!("ACP returned unexpected outcome: {other}"),
         }
     }
+
+    async fn request_approval(
+        &self,
+        _recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        let options = [
+            json!({
+                "optionId": "allow-once",
+                "name": "Allow once",
+                "kind": "allow_once",
+            }),
+            json!({
+                "optionId": "allow-always",
+                "name": "Always allow",
+                "kind": "allow_always",
+            }),
+            json!({
+                "optionId": "reject-once",
+                "name": "Reject",
+                "kind": "reject_once",
+            }),
+        ];
+
+        let tool_call_id = format!("approval-{}", uuid::Uuid::new_v4());
+        let title = format!("Approve {}?", request.tool_name);
+        let params = json!({
+            "sessionId": self.session_id,
+            "options": options,
+            "toolCall": {
+                "toolCallId": tool_call_id,
+                "title": title,
+                "kind": "execute",
+                "status": "pending",
+                "rawInput": {
+                    "tool": request.tool_name,
+                    "summary": request.arguments_summary,
+                },
+                "content": [{
+                    "type": "content",
+                    "content": {
+                        "type": "text",
+                        "text": request.arguments_summary,
+                    }
+                }]
+            }
+        });
+
+        let response = self.rpc.request("session/request_permission", params).await;
+        let response = match response {
+            Ok(value) => value,
+            Err(e) => {
+                anyhow::bail!("ACP request_permission failed: {} ({})", e.message, e.code)
+            }
+        };
+
+        let outcome = response.get("outcome");
+        let kind = outcome
+            .and_then(|o| o.get("outcome"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        match kind {
+            "selected" => {
+                let option_id = outcome
+                    .and_then(|o| o.get("optionId"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                match option_id {
+                    "allow-once" => Ok(Some(ChannelApprovalResponse::Approve)),
+                    "allow-always" => Ok(Some(ChannelApprovalResponse::AlwaysApprove)),
+                    "reject-once" | "reject-always" => Ok(Some(ChannelApprovalResponse::Deny)),
+                    other => anyhow::bail!("ACP returned unknown permission optionId: {other}"),
+                }
+            }
+            "cancelled" => Ok(Some(ChannelApprovalResponse::Deny)),
+            other => anyhow::bail!("ACP returned unexpected permission outcome: {other}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -354,5 +434,89 @@ mod tests {
         assert!(res.is_err());
         let msg = format!("{}", res.unwrap_err());
         assert!(msg.contains("timed out"), "unexpected error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn request_approval_emits_request_permission_and_resolves_approve() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc));
+        let request = ChannelApprovalRequest {
+            tool_name: "git".to_string(),
+            arguments_summary: "git status --short".to_string(),
+        };
+
+        let task = tokio::spawn(async move { ch.request_approval("", &request).await });
+
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "session/request_permission");
+        assert_eq!(req["params"]["sessionId"], "sess-1");
+        assert_eq!(req["params"]["options"].as_array().unwrap().len(), 3);
+        assert_eq!(req["params"]["options"][0]["optionId"], "allow-once");
+        assert_eq!(req["params"]["options"][1]["kind"], "allow_always");
+        assert_eq!(req["params"]["toolCall"]["title"], "Approve git?");
+        assert_eq!(req["params"]["toolCall"]["status"], "pending");
+        assert_eq!(
+            req["params"]["toolCall"]["content"][0]["content"]["text"],
+            "git status --short"
+        );
+        let id = req["id"].as_str().unwrap().to_string();
+
+        rpc_for_resp.dispatch_response_for_test(
+            &id,
+            Some(json!({"outcome": {"outcome": "selected", "optionId": "allow-once"}})),
+            None,
+        );
+
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result, Some(ChannelApprovalResponse::Approve));
+    }
+
+    #[tokio::test]
+    async fn request_approval_maps_always_and_cancel() {
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc));
+        let request = ChannelApprovalRequest {
+            tool_name: "git".to_string(),
+            arguments_summary: "git commit".to_string(),
+        };
+
+        let task = tokio::spawn(async move { ch.request_approval("", &request).await });
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let id = req["id"].as_str().unwrap().to_string();
+
+        rpc_for_resp.dispatch_response_for_test(
+            &id,
+            Some(json!({"outcome": {"outcome": "selected", "optionId": "allow-always"}})),
+            None,
+        );
+        assert_eq!(
+            task.await.unwrap().unwrap(),
+            Some(ChannelApprovalResponse::AlwaysApprove)
+        );
+
+        let (rpc, mut rx) = make_rpc();
+        let rpc_for_resp = Arc::clone(&rpc);
+        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc));
+        let request = ChannelApprovalRequest {
+            tool_name: "git".to_string(),
+            arguments_summary: "git push".to_string(),
+        };
+        let task = tokio::spawn(async move { ch.request_approval("", &request).await });
+        let line = rx.recv().await.unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc_for_resp.dispatch_response_for_test(
+            &id,
+            Some(json!({"outcome": {"outcome": "cancelled"}})),
+            None,
+        );
+        assert_eq!(
+            task.await.unwrap().unwrap(),
+            Some(ChannelApprovalResponse::Deny)
+        );
     }
 }

@@ -28,6 +28,14 @@ impl SeatbeltSandbox {
     /// Returns an error if `sandbox-exec` is not available or the policy file
     /// cannot be written.
     pub fn new() -> std::io::Result<Self> {
+        Self::with_workspace(None)
+    }
+
+    /// Create a new Seatbelt sandbox for the provided workspace root.
+    ///
+    /// If no workspace is provided, falls back to the process current
+    /// directory for compatibility with direct construction.
+    pub fn with_workspace(workspace: Option<&Path>) -> std::io::Result<Self> {
         if !Self::is_installed() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -41,7 +49,9 @@ impl SeatbeltSandbox {
         let session_id = uuid::Uuid::new_v4();
         let policy_path = policy_dir.join(format!("{session_id}.sb"));
 
-        let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+        let workspace = workspace
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp")));
         let policy = generate_policy(&workspace);
         std::fs::write(&policy_path, &policy)?;
 
@@ -240,6 +250,19 @@ mod tests {
         let workspace = PathBuf::from("/Users/test/project");
         let policy = generate_policy(&workspace);
         assert!(policy.contains("/Users/test/project"));
+    }
+
+    #[test]
+    fn generate_policy_uses_provided_workspace_for_access_rules() {
+        let workspace = PathBuf::from("/tmp/zeroclaw-seatbelt-test-workspace");
+        let policy = generate_policy(&workspace);
+
+        assert!(
+            policy.contains(
+                r#"(allow file-read* (subpath "/tmp/zeroclaw-seatbelt-test-workspace"))"#
+            )
+        );
+        assert!(policy.contains(r#"(subpath "/tmp/zeroclaw-seatbelt-test-workspace")"#));
     }
 
     #[test]

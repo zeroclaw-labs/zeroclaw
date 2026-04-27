@@ -1,6 +1,7 @@
 //! Auto-detection of available security features
 
 use crate::security::traits::Sandbox;
+use std::path::Path;
 use std::sync::Arc;
 use zeroclaw_config::schema::{SandboxBackend, SecurityConfig};
 
@@ -10,7 +11,11 @@ use zeroclaw_config::schema::{SandboxBackend, SecurityConfig};
 /// (e.g. `"native"`, `"docker"`). When the caller has set `runtime.kind = "native"`,
 /// Docker must never be selected as the sandbox backend during auto-detection —
 /// the user explicitly opted out of container wrapping.
-pub fn create_sandbox(config: &SecurityConfig, runtime_kind: &str) -> Arc<dyn Sandbox> {
+pub fn create_sandbox(
+    config: &SecurityConfig,
+    runtime_kind: &str,
+    workspace_dir: Option<&Path>,
+) -> Arc<dyn Sandbox> {
     let backend = &config.sandbox.backend;
 
     // If explicitly disabled, return noop
@@ -25,7 +30,9 @@ pub fn create_sandbox(config: &SecurityConfig, runtime_kind: &str) -> Arc<dyn Sa
             {
                 #[cfg(target_os = "linux")]
                 {
-                    if let Ok(sandbox) = super::landlock::LandlockSandbox::new() {
+                    if let Ok(sandbox) = super::landlock::LandlockSandbox::with_workspace(
+                        workspace_dir.map(Path::to_path_buf),
+                    ) {
                         return Arc::new(sandbox);
                     }
                 }
@@ -72,7 +79,8 @@ pub fn create_sandbox(config: &SecurityConfig, runtime_kind: &str) -> Arc<dyn Sa
         SandboxBackend::SandboxExec => {
             #[cfg(target_os = "macos")]
             {
-                if let Ok(sandbox) = super::seatbelt::SeatbeltSandbox::new() {
+                if let Ok(sandbox) = super::seatbelt::SeatbeltSandbox::with_workspace(workspace_dir)
+                {
                     return Arc::new(sandbox);
                 }
             }
@@ -83,7 +91,7 @@ pub fn create_sandbox(config: &SecurityConfig, runtime_kind: &str) -> Arc<dyn Sa
         }
         SandboxBackend::Auto | SandboxBackend::None => {
             // Auto-detect best available, skipping Docker when native runtime is in use
-            detect_best_sandbox(runtime_kind)
+            detect_best_sandbox(runtime_kind, workspace_dir)
         }
     }
 }
@@ -93,7 +101,7 @@ pub fn create_sandbox(config: &SecurityConfig, runtime_kind: &str) -> Arc<dyn Sa
 /// When `runtime_kind` is `"native"` the caller has explicitly opted out of
 /// container wrapping, so Docker is excluded from consideration even if it is
 /// installed on the host.
-fn detect_best_sandbox(runtime_kind: &str) -> Arc<dyn Sandbox> {
+fn detect_best_sandbox(runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<dyn Sandbox> {
     let skip_docker = runtime_kind == "native";
 
     #[cfg(target_os = "linux")]
@@ -101,7 +109,9 @@ fn detect_best_sandbox(runtime_kind: &str) -> Arc<dyn Sandbox> {
         // Try Landlock first (native, no dependencies)
         #[cfg(feature = "sandbox-landlock")]
         {
-            if let Ok(sandbox) = super::landlock::LandlockSandbox::probe() {
+            if let Ok(sandbox) = super::landlock::LandlockSandbox::with_workspace(
+                workspace_dir.map(Path::to_path_buf),
+            ) {
                 tracing::info!("Landlock sandbox enabled (Linux kernel 5.13+)");
                 return Arc::new(sandbox);
             }
@@ -126,7 +136,7 @@ fn detect_best_sandbox(runtime_kind: &str) -> Arc<dyn Sandbox> {
         }
 
         // Try sandbox-exec (Seatbelt) — built into macOS
-        if let Ok(sandbox) = super::seatbelt::SeatbeltSandbox::probe() {
+        if let Ok(sandbox) = super::seatbelt::SeatbeltSandbox::with_workspace(workspace_dir) {
             tracing::info!("macOS sandbox-exec (Seatbelt) enabled");
             return Arc::new(sandbox);
         }
@@ -159,7 +169,7 @@ mod tests {
 
     #[test]
     fn detect_best_sandbox_returns_something() {
-        let sandbox = detect_best_sandbox("");
+        let sandbox = detect_best_sandbox("", None);
         // Should always return at least NoopSandbox
         assert!(sandbox.is_available());
     }
@@ -174,7 +184,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let sandbox = create_sandbox(&config, "");
+        let sandbox = create_sandbox(&config, "", None);
         assert_eq!(sandbox.name(), "none");
     }
 
@@ -188,7 +198,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let sandbox = create_sandbox(&config, "");
+        let sandbox = create_sandbox(&config, "", None);
         // Should return some sandbox (at least NoopSandbox)
         assert!(sandbox.is_available());
     }
@@ -198,7 +208,7 @@ mod tests {
         // When runtime.kind = "native", Docker must be skipped in auto-detection
         // even when Docker is installed on the host. The sandbox must be
         // NoopSandbox or something OS-native (Landlock, Firejail, Seatbelt).
-        let sandbox = detect_best_sandbox("native");
+        let sandbox = detect_best_sandbox("native", None);
         assert_ne!(sandbox.name(), "docker");
     }
 
@@ -214,7 +224,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let sandbox = create_sandbox(&config, "native");
+        let sandbox = create_sandbox(&config, "native", None);
         // If Docker is available, it will be selected; if not, NoopSandbox fallback.
         // The point is that runtime.kind doesn't override explicit `backend = "docker"`.
         assert!(sandbox.is_available());

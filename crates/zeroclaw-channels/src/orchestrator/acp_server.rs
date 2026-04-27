@@ -20,6 +20,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -247,11 +248,6 @@ struct Session {
     #[allow(dead_code)] // WIP: intended for session expiry logic
     created_at: Instant,
     last_active: Instant,
-    /// Absolute, canonicalized directory the ACP client supplied as `cwd`.
-    /// The process is `chdir`'d here on session/new and re-pinned at the start
-    /// of each session/prompt so tool calls and relative paths resolve
-    /// consistently for this session.
-    workspace_dir: String,
 }
 
 // ── ACP Server ───────────────────────────────────────────────────
@@ -467,33 +463,19 @@ impl AcpServer {
             });
         }
 
-        let requested_cwd = params
-            .get("cwd")
-            .or_else(|| params.get("workspaceDir"))
-            .or_else(|| params.get("workspace_dir"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_else(|| self.config.workspace_dir.to_str().unwrap_or("."));
+        let requested_cwd = self.requested_session_cwd(params);
 
-        let workspace_dir = std::fs::canonicalize(requested_cwd)
+        let workspace_dir = std::fs::canonicalize(&requested_cwd)
             .map_err(|e| RpcError {
                 code: INVALID_PARAMS,
-                message: format!("cwd is not a usable directory ({requested_cwd}): {e}"),
+                message: format!(
+                    "cwd is not a usable directory ({}): {e}",
+                    requested_cwd.display()
+                ),
                 data: None,
             })?
             .to_string_lossy()
             .into_owned();
-
-        // Pin the process working directory for this session. ACP clients
-        // expect file links and shell commands to resolve relative to `cwd`,
-        // so we mutate the global cwd here and re-apply it at the start of
-        // each session/prompt. Concurrent prompts across sessions can race
-        // — last writer wins, which is acceptable given typical ACP usage
-        // (one active session at a time).
-        std::env::set_current_dir(&workspace_dir).map_err(|e| RpcError {
-            code: INTERNAL_ERROR,
-            message: format!("Failed to chdir to {workspace_dir}: {e}"),
-            data: None,
-        })?;
 
         let session_id = Uuid::new_v4().to_string();
 
@@ -501,9 +483,10 @@ impl AcpServer {
         // the file/shell sandbox boundary. The agent's data directory
         // (memory DB, identity, scheduled tasks) still lives under
         // `config.workspace_dir`.
-        let agent = Agent::from_config_with_session_cwd(
+        let agent = Agent::from_config_with_session_cwd_and_mcp(
             &self.config,
             Some(std::path::Path::new(&workspace_dir)),
+            false,
         )
         .await
         .map_err(|e| RpcError {
@@ -530,7 +513,6 @@ impl AcpServer {
                 agent,
                 created_at: now,
                 last_active: now,
-                workspace_dir: workspace_dir.clone(),
             },
         );
 
@@ -540,6 +522,18 @@ impl AcpServer {
             "sessionId": session_id,
             "workspaceDir": workspace_dir,
         }))
+    }
+
+    fn requested_session_cwd(&self, params: &Value) -> PathBuf {
+        params
+            .get("cwd")
+            .or_else(|| params.get("workspaceDir"))
+            .or_else(|| params.get("workspace_dir"))
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| self.config.workspace_dir.clone())
+            })
     }
 
     async fn handle_session_prompt(&self, params: &Value, _request_id: &Value) -> RpcResult {
@@ -566,21 +560,6 @@ impl AcpServer {
                 data: None,
             })?
         };
-
-        // Re-pin process cwd to this session's directory. Another session
-        // may have chdir'd elsewhere in the meantime; without this, tool
-        // calls would resolve paths against the wrong directory.
-        if let Err(e) = std::env::set_current_dir(&session.workspace_dir) {
-            let workspace_dir = session.workspace_dir.clone();
-            // Put the session back before bailing.
-            let mut sessions = self.sessions.lock().await;
-            sessions.insert(session_id.clone(), session);
-            return Err(RpcError {
-                code: INTERNAL_ERROR,
-                message: format!("Failed to chdir to session workspace {workspace_dir}: {e}"),
-                data: None,
-            });
-        }
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(100);
 
@@ -811,8 +790,12 @@ fn map_tool_kind(name: &str) -> &'static str {
         | "memory_export" | "memory_store" | "report_template" => "edit",
         "cron_add" | "poll" | "reaction" => "edit",
         "memory_forget" | "memory_purge" => "delete",
+        // ACP clients often treat `read`/`search`/`fetch` calls as noisy
+        // background context gathering and keep their content collapsed. These
+        // ZeroClaw tools return user-visible text, so use `other` to keep the
+        // result content surfaced consistently across clients.
         "content_search" | "discord_search" | "glob_search" | "knowledge" | "search"
-        | "tool_search" | "web_search_tool" => "search",
+        | "tool_search" | "web_search_tool" => "other",
         "browser"
         | "browser_delegate"
         | "cloud_patterns"
@@ -838,9 +821,9 @@ fn map_tool_kind(name: &str) -> &'static str {
         | "sop_status"
         | "text_browser"
         | "weather"
-        | "workspace" => "read",
-        "cron_list" | "cron_runs" | "memory_recall" => "read",
-        "http_request" | "web_fetch" => "fetch",
+        | "workspace" => "other",
+        "cron_list" | "cron_runs" | "memory_recall" => "other",
+        "http_request" | "web_fetch" => "other",
         "image_gen" => "other",
         "cron_remove" => "delete",
         "cron_run" => "execute",
@@ -894,6 +877,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> JsonRpcNo
                     "kind": map_tool_kind(name),
                     "status": "completed",
                     "rawOutput": output,
+                    "body": output,
                     "content": [{
                         "type": "content",
                         "content": {
@@ -1025,6 +1009,66 @@ mod tests {
     }
 
     #[test]
+    fn session_new_defaults_to_launch_cwd_when_client_omits_cwd() {
+        let config = Config {
+            workspace_dir: PathBuf::from("/not/the/project"),
+            ..Default::default()
+        };
+        let server = AcpServer::new(config, AcpServerConfig::default());
+        let expected = std::env::current_dir().unwrap();
+
+        assert_eq!(
+            server.requested_session_cwd(&serde_json::json!({})),
+            expected
+        );
+    }
+
+    #[test]
+    fn session_new_respects_client_cwd_when_present() {
+        let server = AcpServer::new(Config::default(), AcpServerConfig::default());
+        let cwd = std::env::current_dir().unwrap();
+
+        assert_eq!(
+            server.requested_session_cwd(&serde_json::json!({"cwd": cwd})),
+            cwd
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_does_not_wait_for_configured_mcp_servers() {
+        let cwd = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace_dir: cwd.path().to_path_buf(),
+            mcp: zeroclaw_config::schema::McpConfig {
+                enabled: true,
+                servers: vec![zeroclaw_config::schema::McpServerConfig {
+                    name: "slow".to_string(),
+                    transport: zeroclaw_config::schema::McpTransport::Stdio,
+                    command: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), "sleep 60".to_string()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let server = AcpServer::new(config, AcpServerConfig::default());
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            server.handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "mcpServers": []
+            })),
+        )
+        .await
+        .expect("session/new should not block on configured MCP startup")
+        .expect("session/new should create a session");
+
+        assert!(result["sessionId"].as_str().is_some());
+    }
+
+    #[test]
     fn json_rpc_error_response_serialize() {
         let resp = JsonRpcResponse {
             jsonrpc: "2.0",
@@ -1141,6 +1185,7 @@ mod tests {
                     "kind": "execute",
                     "status": "completed",
                     "rawOutput": "file1.txt\nfile2.txt",
+                    "body": "file1.txt\nfile2.txt",
                     "content": [{
                         "type": "content",
                         "content": {
@@ -1157,6 +1202,7 @@ mod tests {
         assert!(json2.contains("\"name\":\"shell\""));
         assert!(json2.contains("\"status\":\"completed\""));
         assert!(json2.contains("\"rawOutput\""));
+        assert!(json2.contains("\"body\""));
         assert!(json2.contains("\"content\""));
         assert!(json2.contains("\"type\":\"content\""));
         assert!(json2.contains("file1.txt"));
@@ -1169,9 +1215,10 @@ mod tests {
         assert_eq!(map_tool_kind("memory_forget"), "delete");
         assert_eq!(map_tool_kind("memory_purge"), "delete");
         assert_eq!(map_tool_kind("cron_run"), "execute");
-        assert_eq!(map_tool_kind("file_read"), "read");
+        assert_eq!(map_tool_kind("file_read"), "other");
+        assert_eq!(map_tool_kind("knowledge"), "other");
+        assert_eq!(map_tool_kind("web_fetch"), "other");
         assert_eq!(map_tool_kind("file_write"), "edit");
-        assert_eq!(map_tool_kind("web_fetch"), "fetch");
         assert_eq!(map_tool_kind("unknown_tool"), "other");
     }
 
@@ -1217,6 +1264,10 @@ mod tests {
         assert_eq!(result_value["params"]["update"]["status"], "completed");
         assert_eq!(
             result_value["params"]["update"]["rawOutput"],
+            "file1.txt\nfile2.txt"
+        );
+        assert_eq!(
+            result_value["params"]["update"]["body"],
             "file1.txt\nfile2.txt"
         );
         assert_eq!(
