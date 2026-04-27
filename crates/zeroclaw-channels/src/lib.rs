@@ -68,6 +68,8 @@ pub mod wati;
 pub mod webhook;
 #[cfg(feature = "channel-wecom")]
 pub mod wecom;
+#[cfg(feature = "channel-wechat")]
+pub mod wechat;
 #[cfg(feature = "channel-whatsapp-cloud")]
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
