@@ -200,8 +200,9 @@ impl Provider for KiloCliProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         Self::validate_temperature(temperature)?;
 
         let full_message = match system_prompt {
@@ -218,7 +219,7 @@ impl Provider for KiloCliProvider {
         &self,
         request: ChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let text = self
             .chat_with_history(request.messages, model, temperature)

@@ -30,7 +30,6 @@ pub fn register_peripheral_tools_fn(f: PeripheralToolsFn) {
     let _ = PERIPHERAL_TOOLS_FN.set(f);
 }
 use crate::cost::types::BudgetCheck;
-use crate::i18n::ToolDescriptions;
 use crate::observability::{self, Observer, ObserverEvent, runtime_trace};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -563,7 +562,7 @@ async fn consume_provider_streaming_response(
             tools: request_tools,
         },
         model,
-        temperature,
+        Some(temperature),
         zeroclaw_providers::traits::StreamOptions::new(true),
     );
     let mut outcome = StreamedChatOutcome::default();
@@ -1155,7 +1154,7 @@ pub async fn run_tool_call_loop(
                                 tools: request_tools,
                             },
                             active_model,
-                            temperature,
+                            Some(temperature),
                         );
                         if let Some(token) = cancellation_token.as_ref() {
                             tokio::select! {
@@ -1177,7 +1176,7 @@ pub async fn run_tool_call_loop(
                     tools: request_tools,
                 },
                 active_model,
-                temperature,
+                Some(temperature),
             );
 
             match pacing.step_timeout_secs {
@@ -1781,7 +1780,7 @@ pub async fn run_tool_call_loop(
         for ((idx, call), outcome) in executable_indices
             .iter()
             .zip(executable_calls.iter())
-            .zip(executed_outcomes.into_iter())
+            .zip(executed_outcomes)
         {
             runtime_trace::record_event(
                 "tool_call_result",
@@ -2014,7 +2013,10 @@ pub async fn run_tool_call_loop(
         messages: history,
         tools: None, // No tools — force a text response
     };
-    match provider.chat(summary_request, model, temperature).await {
+    match provider
+        .chat(summary_request, model, Some(temperature))
+        .await
+    {
         Ok(resp) => {
             let text = resp.text.unwrap_or_default();
             if text.is_empty() {
@@ -2035,10 +2037,7 @@ pub async fn run_tool_call_loop(
 
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
-pub fn build_tool_instructions(
-    tools_registry: &[Box<dyn Tool>],
-    tool_descriptions: Option<&ToolDescriptions>,
-) -> String {
+pub fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
@@ -2054,9 +2053,7 @@ pub fn build_tool_instructions(
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools_registry {
-        let desc = tool_descriptions
-            .and_then(|td| td.get(tool.name()))
-            .unwrap_or_else(|| tool.description());
+        let desc = tool.description();
         let _ = writeln!(
             instructions,
             "**{}**: {}\nParameters: `{}`\n",
@@ -2300,15 +2297,14 @@ pub async fn run(
         .map(|b| b.board.clone())
         .collect();
 
-    // ── Load locale-aware tool descriptions ────────────────────────
+    // ── Initialize locale-aware tool descriptions ──────────────────
     let i18n_locale = config
         .locale
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(crate::i18n::detect_locale);
-    let i18n_search_dirs = crate::i18n::default_search_dirs(&config.workspace_dir);
-    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+    crate::i18n::init(&i18n_locale);
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
@@ -2456,7 +2452,7 @@ pub async fn run(
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
+        system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
     // Append deferred MCP tool names so the LLM knows what is available
@@ -3218,9 +3214,34 @@ pub async fn process_message(
     }
 
     let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
-    let model_name = fallback_provider_pm
-        .and_then(|e| e.model.clone())
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+    let model_name = match fallback_provider_pm
+        .and_then(|e| e.model.as_deref())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        Some(m) => m.to_string(),
+        None => match config.providers.resolve_default_model() {
+            Some(m) => {
+                tracing::warn!(
+                    provider = provider_name,
+                    model = %m,
+                    "fallback provider has no `model` set; using first configured \
+                     providers.models entry as default. Set [providers.models.{provider_name}] \
+                     model = \"...\" to silence this warning.",
+                );
+                m
+            }
+            None => {
+                anyhow::bail!(
+                    "no model configured: providers.fallback = {:?} resolves with no model, \
+                     and no [[providers.models.*]] entry has a `model` field set. \
+                     Configure at least one [providers.models.<name>] model = \"...\" \
+                     or define a [[model_routes]] hint.",
+                    config.providers.fallback,
+                )
+            }
+        },
+    };
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_from_config(&config);
     let provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
@@ -3248,15 +3269,14 @@ pub async fn process_message(
         .map(|b| b.board.clone())
         .collect();
 
-    // ── Load locale-aware tool descriptions ────────────────────────
+    // ── Initialize locale-aware tool descriptions ──────────────────
     let i18n_locale = config
         .locale
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(crate::i18n::detect_locale);
-    let i18n_search_dirs = crate::i18n::default_search_dirs(&config.workspace_dir);
-    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+    crate::i18n::init(&i18n_locale);
 
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
 
@@ -3349,7 +3369,7 @@ pub async fn process_message(
         config.agent.max_system_prompt_chars,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
+        system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
     if !deferred_section.is_empty() {
         system_prompt.push('\n');
@@ -3925,7 +3945,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("ok".to_string())
@@ -3951,7 +3971,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("ok".to_string())
@@ -3961,7 +3981,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let marker_count =
@@ -4022,7 +4042,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!("chat_with_system should not be used in scripted provider tests");
         }
@@ -4031,7 +4051,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             let mut responses = self
                 .responses
@@ -4068,7 +4088,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!(
                 "chat_with_system should not be used in streaming scripted provider tests"
@@ -4079,7 +4099,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("chat should not be called when streaming succeeds")
@@ -4093,7 +4113,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             options: StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
@@ -4156,7 +4176,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!(
                 "chat_with_system should not be used in streaming native tool event provider tests"
@@ -4167,7 +4187,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("chat should not be called when native streaming events succeed")
@@ -4185,7 +4205,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             options: StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
@@ -4245,7 +4265,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!("chat_with_system should not be used in route-aware stream tests");
         }
@@ -4254,7 +4274,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("chat should not be called when routed streaming succeeds")
@@ -4268,7 +4288,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             options: StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
@@ -6224,7 +6244,7 @@ mod tests {
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
-        let instructions = build_tool_instructions(&tools, None);
+        let instructions = build_tool_instructions(&tools);
 
         assert!(instructions.contains("## Tool Use Protocol"));
         assert!(instructions.contains("<tool_call>"));

@@ -178,8 +178,13 @@ export function getCronJobs(): Promise<CronJob[]> {
 
 export function addCronJob(body: {
   name?: string;
-  command: string;
   schedule: string;
+  command?: string;
+  job_type?: string;
+  prompt?: string;
+  model?: string;
+  session_target?: string;
+  allowed_tools?: string[];
   enabled?: boolean;
 }): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>('/api/cron', {
@@ -195,7 +200,7 @@ export function deleteCronJob(id: string): Promise<void> {
 }
 export function patchCronJob(
   id: string,
-  patch: { name?: string; schedule?: string; command?: string },
+  patch: { name?: string; schedule?: string; command?: string; prompt?: string },
 ): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>(
     `/api/cron/${encodeURIComponent(id)}`,

@@ -169,12 +169,18 @@ pub fn load_skills_with_config(
     workspace_dir: &Path,
     config: &zeroclaw_config::schema::Config,
 ) -> Vec<Skill> {
-    load_skills_with_open_skills_config(
+    #[allow(unused_mut)]
+    let mut skills = load_skills_with_open_skills_config(
         workspace_dir,
         Some(config.skills.open_skills_enabled),
         config.skills.open_skills_dir.as_deref(),
         Some(config.skills.allow_scripts),
-    )
+    );
+
+    #[cfg(feature = "plugins-wasm")]
+    skills.extend(load_plugin_skills_from_config(config));
+
+    skills
 }
 
 /// Load skills using explicit open-skills settings.
@@ -1603,6 +1609,74 @@ pub fn install_registry_skill_source(
         skills_path,
         allow_scripts,
     )
+}
+
+// ─── Plugin-shipped skills (plugins-wasm only) ───────────────────────────────
+
+/// Load skills from skill-capable plugins discovered by the plugin host.
+///
+/// Each plugin's `skills/` directory is fed to the existing skill loader, and
+/// every loaded skill is renamed to `plugin:<plugin>/<skill>` to avoid
+/// collisions with user-authored skills and between bundles. The `plugin:<name>`
+/// tag is also added so prompts can distinguish plugin skills.
+#[cfg(feature = "plugins-wasm")]
+pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) -> Vec<Skill> {
+    if !config.plugins.enabled {
+        return Vec::new();
+    }
+
+    let plugins_dir = expand_plugins_dir(&config.plugins.plugins_dir);
+    let parent = match plugins_dir.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return Vec::new(),
+    };
+
+    let signature_mode = zeroclaw_plugins::host::PluginHost::parse_signature_mode(
+        &config.plugins.security.signature_mode,
+    );
+    let trusted_keys = config.plugins.security.trusted_publisher_keys.clone();
+
+    let host = match zeroclaw_plugins::host::PluginHost::with_security(
+        &parent,
+        signature_mode,
+        trusted_keys,
+    ) {
+        Ok(host) => host,
+        Err(err) => {
+            tracing::warn!("failed to discover plugin skills: {err}");
+            return Vec::new();
+        }
+    };
+
+    let allow_scripts = config.skills.allow_scripts;
+    let mut skills = Vec::new();
+    for (manifest, skills_dir) in host.skill_plugin_details() {
+        for raw in load_skills_from_directory(&skills_dir, allow_scripts) {
+            skills.push(namespace_plugin_skill(&manifest.name, raw));
+        }
+    }
+    skills
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn expand_plugins_dir(plugins_dir: &str) -> PathBuf {
+    if let Some(rest) = plugins_dir.strip_prefix("~/")
+        && let Some(dirs) = UserDirs::new()
+    {
+        return dirs.home_dir().join(rest);
+    }
+    PathBuf::from(plugins_dir)
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn namespace_plugin_skill(plugin_name: &str, mut skill: Skill) -> Skill {
+    let qualified = format!("plugin:{}/{}", plugin_name, skill.name);
+    skill.name = qualified;
+    let plugin_tag = format!("plugin:{plugin_name}");
+    if !skill.tags.iter().any(|t| t == &plugin_tag) {
+        skill.tags.push(plugin_tag);
+    }
+    skill
 }
 
 #[cfg(test)]
