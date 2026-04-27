@@ -1775,6 +1775,77 @@ fn parse_provider_profile(s: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Resolved fallback-provider construction inputs derived from a fallback
+/// reference and the workspace `[providers.models]` table.
+///
+/// Mirrors the same precedence the primary-provider load path follows in
+/// `apply_named_model_provider_profile`: a `name` override on the profile
+/// wins; otherwise a profile carrying only `base_url` is promoted to the
+/// canonical `custom:<base_url>` provider id so the factory accepts it
+/// instead of failing with `Unknown provider`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FallbackResolution {
+    actual_provider_name: String,
+    profile_override: Option<String>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+}
+
+fn resolve_fallback_provider(
+    fallback_name: &str,
+    providers_config: Option<&zeroclaw_config::providers::ProvidersConfig>,
+) -> FallbackResolution {
+    let (provider_name, profile_override_raw) = parse_provider_profile(fallback_name);
+    let profile_override = profile_override_raw.map(str::to_string);
+
+    let model_profile = providers_config.and_then(|pc| {
+        pc.models
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(provider_name))
+            .map(|(_, value)| value)
+    });
+
+    let api_key = model_profile.and_then(|m| m.api_key.clone());
+    let base_url = model_profile.and_then(|m| {
+        m.base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(String::from)
+    });
+    let name_override = model_profile.and_then(|m| {
+        m.name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case(provider_name))
+            .map(String::from)
+    });
+
+    let actual_provider_name = if let Some(name) = name_override {
+        name
+    } else if !provider_name.starts_with("custom:")
+        && !provider_name.starts_with("anthropic-custom:")
+        && let Some(ref url) = base_url
+    {
+        // Profile carries a base_url and no name override. Promote to the
+        // same custom:<url> shape that `apply_named_model_provider_profile`
+        // produces for the primary path, so a fallback like
+        // `[providers.models.local] { base_url = ... }` is accepted by the
+        // factory instead of being dropped as `Unknown provider`. Mirrors
+        // schema.rs::apply_named_model_provider_profile for consistency.
+        format!("custom:{url}")
+    } else {
+        provider_name.to_string()
+    };
+
+    FallbackResolution {
+        actual_provider_name,
+        profile_override,
+        api_key,
+        base_url,
+    }
+}
+
 /// Create provider chain with retry and fallback behavior.
 pub fn create_resilient_provider(
     primary_name: &str,
@@ -1814,50 +1885,41 @@ pub fn create_resilient_provider_with_options(
             continue;
         }
 
-        let (provider_name, profile_override) = parse_provider_profile(fallback);
+        // Look up api_key, base_url, and provider-type from
+        // [providers.models.<name>] before falling back to env var resolution.
+        // This makes fallback providers config-aware the same way the primary
+        // provider is. When no profile entry exists, the per-provider factories
+        // fall through to env vars (e.g. XAI_API_KEY for "xai") as before.
+        let resolution =
+            resolve_fallback_provider(fallback, options.fallback_providers_config.as_ref());
 
-        // Look up api_key, base_url, and provider-type from [providers.<name>]
-        // before falling back to env var resolution. This makes fallback providers
-        // config-aware the same way the primary provider is. If no profile entry
-        // exists, resolve_provider_credential falls through to provider-specific env
-        // vars (e.g. XAI_API_KEY for "xai") as before.
-        let model_profile = options
-            .fallback_providers_config
-            .as_ref()
-            .and_then(|pc| pc.models.get(provider_name));
-        let config_api_key = model_profile.and_then(|m| m.api_key.as_deref());
-        let config_api_url = model_profile.and_then(|m| m.base_url.as_deref());
-        // If the profile has a name override (e.g. name = "ollama" for a custom
-        // profile key), use it as the actual provider type for the factory.
-        let actual_provider_name = model_profile
-            .and_then(|m| m.name.as_deref())
-            .unwrap_or(provider_name);
+        // Propagate auth profile override (e.g. "openai-codex:second") through
+        // ProviderRuntimeOptions so the provider picks up the right OAuth
+        // credential set.
+        let mut fallback_options = options.clone();
+        if let Some(profile) = resolution.profile_override.as_deref() {
+            fallback_options.auth_profile_override = Some(profile.to_string());
+        }
 
-        // When a profile override is present (e.g. "openai-codex:second"),
-        // propagate it through `auth_profile_override` so the provider
-        // picks up the correct OAuth credential set.
-        let fallback_options = match profile_override {
-            Some(profile) => {
-                let mut opts = options.clone();
-                opts.auth_profile_override = Some(profile.to_string());
-                opts
+        let create_result = match resolution.actual_provider_name.as_str() {
+            // Codex manages its own endpoint via OAuth token exchange and
+            // reads the override from `provider_api_url`, not from a positional
+            // url argument. Forward the resolved base_url through that field
+            // so a fallback profile's base_url is honored on the codex path.
+            "openai-codex" | "openai_codex" | "codex" => {
+                if let Some(ref url) = resolution.base_url {
+                    fallback_options.provider_api_url = Some(url.clone());
+                }
+                create_provider_with_options(
+                    &resolution.actual_provider_name,
+                    resolution.api_key.as_deref(),
+                    &fallback_options,
+                )
             }
-            None => options.clone(),
-        };
-
-        let create_result = match actual_provider_name {
-            // Codex manages its own endpoint via OAuth token exchange; config
-            // base_url is intentionally not forwarded — use provider_api_url
-            // in ProviderRuntimeOptions if an endpoint override is needed.
-            "openai-codex" | "openai_codex" | "codex" => create_provider_with_options(
-                actual_provider_name,
-                config_api_key,
-                &fallback_options,
-            ),
             _ => create_provider_with_url_and_options(
-                actual_provider_name,
-                config_api_key,
-                config_api_url,
+                &resolution.actual_provider_name,
+                resolution.api_key.as_deref(),
+                resolution.base_url.as_deref(),
                 &fallback_options,
             ),
         };
@@ -3799,82 +3861,126 @@ mod tests {
         assert_eq!(check_api_key_prefix("anthropic", "some-random-key"), None);
     }
 
-    // --- config-aware fallback ---
+    // --- config-aware fallback resolver ---
+    //
+    // These tests target `resolve_fallback_provider` directly because the
+    // `create_resilient_provider_with_options` call site swallows errors for
+    // invalid fallbacks (a single bad fallback must not poison the chain).
+    // Asserting on the resolver gives behaviour-first coverage that fails
+    // when the lookup is broken, instead of relying on the outer Ok signal
+    // which holds even when no profile data is read.
 
-    #[test]
-    fn fallback_uses_config_api_key_when_set() {
+    fn make_providers_config(
+        entries: Vec<(&str, zeroclaw_config::schema::ModelProviderConfig)>,
+    ) -> zeroclaw_config::providers::ProvidersConfig {
         let mut models = std::collections::HashMap::new();
-        models.insert(
-            "ollama".to_string(),
-            zeroclaw_config::schema::ModelProviderConfig {
-                api_key: Some("config-test-key".to_string()),
-                base_url: Some("http://localhost:11434".to_string()),
-                ..Default::default()
-            },
-        );
-        let providers_config = zeroclaw_config::providers::ProvidersConfig {
+        for (key, value) in entries {
+            models.insert(key.to_string(), value);
+        }
+        zeroclaw_config::providers::ProvidersConfig {
             models,
             ..Default::default()
-        };
-
-        let reliability = zeroclaw_config::schema::ReliabilityConfig {
-            provider_retries: 1,
-            provider_backoff_ms: 100,
-            fallback_providers: vec!["ollama".into()],
-            api_keys: Vec::new(),
-            model_fallbacks: std::collections::HashMap::new(),
-            channel_initial_backoff_secs: 2,
-            channel_max_backoff_secs: 60,
-            scheduler_poll_secs: 15,
-            scheduler_retries: 2,
-        };
-
-        let options = ProviderRuntimeOptions {
-            fallback_providers_config: Some(providers_config),
-            ..ProviderRuntimeOptions::default()
-        };
-
-        let provider =
-            create_resilient_provider_with_options("lmstudio", None, None, &reliability, &options);
-        assert!(provider.is_ok());
+        }
     }
 
     #[test]
-    fn fallback_name_override_routes_to_correct_provider() {
-        let mut models = std::collections::HashMap::new();
-        models.insert(
-            "my-local".to_string(),
+    fn resolve_fallback_uses_config_api_key_when_set() {
+        let cfg = make_providers_config(vec![(
+            "xai",
+            zeroclaw_config::schema::ModelProviderConfig {
+                api_key: Some("config-xai-key".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let resolution = resolve_fallback_provider("xai", Some(&cfg));
+        assert_eq!(resolution.actual_provider_name, "xai");
+        assert_eq!(resolution.api_key.as_deref(), Some("config-xai-key"));
+        assert_eq!(resolution.base_url, None);
+        assert_eq!(resolution.profile_override, None);
+    }
+
+    #[test]
+    fn resolve_fallback_uses_name_override_for_factory_dispatch() {
+        let cfg = make_providers_config(vec![(
+            "my-local",
             zeroclaw_config::schema::ModelProviderConfig {
                 name: Some("ollama".to_string()),
                 base_url: Some("http://localhost:11434".to_string()),
                 ..Default::default()
             },
+        )]);
+        let resolution = resolve_fallback_provider("my-local", Some(&cfg));
+        // Name override wins over the base_url-only promotion path.
+        assert_eq!(resolution.actual_provider_name, "ollama");
+        assert_eq!(
+            resolution.base_url.as_deref(),
+            Some("http://localhost:11434")
         );
-        let providers_config = zeroclaw_config::providers::ProvidersConfig {
-            models,
-            ..Default::default()
-        };
+    }
 
-        let reliability = zeroclaw_config::schema::ReliabilityConfig {
-            provider_retries: 1,
-            provider_backoff_ms: 100,
-            fallback_providers: vec!["my-local".into()],
-            api_keys: Vec::new(),
-            model_fallbacks: std::collections::HashMap::new(),
-            channel_initial_backoff_secs: 2,
-            channel_max_backoff_secs: 60,
-            scheduler_poll_secs: 15,
-            scheduler_retries: 2,
-        };
+    #[test]
+    fn resolve_fallback_promotes_base_url_only_profile_to_custom_url() {
+        // Profile carries only a base_url and no canonical name. Without
+        // promotion the factory would reject "local" as Unknown provider and
+        // the fallback would be silently dropped (Audacity finding on #6092).
+        let cfg = make_providers_config(vec![(
+            "local",
+            zeroclaw_config::schema::ModelProviderConfig {
+                base_url: Some("http://192.168.2.4:11434".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let resolution = resolve_fallback_provider("local", Some(&cfg));
+        assert_eq!(
+            resolution.actual_provider_name,
+            "custom:http://192.168.2.4:11434"
+        );
+        assert_eq!(
+            resolution.base_url.as_deref(),
+            Some("http://192.168.2.4:11434")
+        );
+    }
 
-        let options = ProviderRuntimeOptions {
-            fallback_providers_config: Some(providers_config),
-            ..ProviderRuntimeOptions::default()
-        };
+    #[test]
+    fn resolve_fallback_returns_raw_name_when_no_profile() {
+        let resolution = resolve_fallback_provider("xai", None);
+        assert_eq!(resolution.actual_provider_name, "xai");
+        assert!(resolution.api_key.is_none());
+        assert!(resolution.base_url.is_none());
+        assert!(resolution.profile_override.is_none());
 
-        let provider =
-            create_resilient_provider_with_options("lmstudio", None, None, &reliability, &options);
-        assert!(provider.is_ok());
+        let empty = make_providers_config(vec![]);
+        let resolution = resolve_fallback_provider("xai", Some(&empty));
+        assert_eq!(resolution.actual_provider_name, "xai");
+        assert!(resolution.api_key.is_none());
+    }
+
+    #[test]
+    fn resolve_fallback_propagates_profile_override() {
+        let resolution = resolve_fallback_provider("openai-codex:second", None);
+        assert_eq!(resolution.actual_provider_name, "openai-codex");
+        assert_eq!(resolution.profile_override.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn resolve_fallback_does_not_promote_existing_custom_url_key() {
+        // A fallback already named `custom:<url>` must not be re-wrapped into
+        // `custom:custom:<url>` even if a matching profile exists.
+        let cfg = make_providers_config(vec![(
+            "custom:http://proxy.example.com/v1",
+            zeroclaw_config::schema::ModelProviderConfig {
+                base_url: Some("http://proxy.example.com/v1".to_string()),
+                api_key: Some("proxy-key".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let resolution =
+            resolve_fallback_provider("custom:http://proxy.example.com/v1", Some(&cfg));
+        assert_eq!(
+            resolution.actual_provider_name,
+            "custom:http://proxy.example.com/v1"
+        );
+        assert_eq!(resolution.api_key.as_deref(), Some("proxy-key"));
     }
 
     #[test]
