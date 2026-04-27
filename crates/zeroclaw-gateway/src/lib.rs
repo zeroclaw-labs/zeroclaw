@@ -54,9 +54,9 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
-use zeroclaw_providers::{self, Provider};
 #[cfg(test)]
 use zeroclaw_providers::ChatMessage;
+use zeroclaw_providers::{self, Provider};
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
@@ -2736,6 +2736,65 @@ mod tests {
         assert!(key1.starts_with("webhook_msg_"));
         assert!(key2.starts_with("webhook_msg_"));
         assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn webhook_session_id_accepts_valid() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Session-Id", HeaderValue::from_static("abc-DEF_123.foo"));
+        assert_eq!(webhook_session_id(&headers), Some("abc-DEF_123.foo".into()));
+    }
+
+    #[test]
+    fn webhook_session_id_trims_whitespace() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Session-Id", HeaderValue::from_static("  my-session  "));
+        assert_eq!(webhook_session_id(&headers), Some("my-session".into()));
+    }
+
+    #[test]
+    fn webhook_session_id_rejects_empty() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Session-Id", HeaderValue::from_static(""));
+        assert_eq!(webhook_session_id(&headers), None);
+
+        headers.insert("X-Session-Id", HeaderValue::from_static("   "));
+        assert_eq!(webhook_session_id(&headers), None);
+    }
+
+    #[test]
+    fn webhook_session_id_rejects_missing() {
+        let headers = HeaderMap::new();
+        assert_eq!(webhook_session_id(&headers), None);
+    }
+
+    #[test]
+    fn webhook_session_id_rejects_oversized() {
+        let mut headers = HeaderMap::new();
+        let long = "a".repeat(129);
+        headers.insert("X-Session-Id", HeaderValue::from_str(&long).unwrap());
+        assert_eq!(webhook_session_id(&headers), None);
+
+        let at_limit = "b".repeat(128);
+        headers.insert("X-Session-Id", HeaderValue::from_str(&at_limit).unwrap());
+        assert!(webhook_session_id(&headers).is_some());
+    }
+
+    #[test]
+    fn webhook_session_id_rejects_invalid_chars() {
+        let mut headers = HeaderMap::new();
+        for bad in &[
+            "has/slash",
+            "has:colon",
+            "has space",
+            "has@at",
+            "emoji\u{1f600}",
+        ] {
+            if let Ok(val) = HeaderValue::from_str(bad) {
+                headers.insert("X-Session-Id", val);
+                assert_eq!(webhook_session_id(&headers), None, "should reject: {bad}");
+            }
+        }
     }
 
     #[test]
