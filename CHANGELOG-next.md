@@ -131,7 +131,7 @@
 - "Run now" action added to each cron job in the dashboard, with a matching
   `POST /api/cron/{id}/run` endpoint that executes the job, persists the run, and
   broadcasts the result over SSE (#5501). The route runs on its own router with
-  a 10-minute timeout (overridable via `ZEROCLAW_GATEWAY_CRON_RUN_TIMEOUT_SECS`)
+  a 10-minute timeout (overridable via `ZEROCLAW_GATEWAY_LONG_RUNNING_REQUEST_TIMEOUT_SECS`)
   so long-running agent jobs aren't cut off by the 30s gateway-wide default.
 - Theme mode switch fixed — light/dark selection now applies correctly on load (#5724).
 - Visual preview swatches added to the theme mode selector (#5767).

@@ -74,7 +74,7 @@ pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// particular can take minutes to complete a full reasoning loop. Capping at
 /// 10 minutes keeps the route from hanging indefinitely while still allowing
 /// realistic workloads to finish.
-pub const CRON_RUN_TIMEOUT_SECS: u64 = 600;
+pub const LONG_RUNNING_REQUEST_TIMEOUT_SECS: u64 = 600;
 
 /// Read gateway request timeout from `ZEROCLAW_GATEWAY_TIMEOUT_SECS` env var
 /// at runtime, falling back to [`REQUEST_TIMEOUT_SECS`].
@@ -90,15 +90,15 @@ pub fn gateway_request_timeout_secs() -> u64 {
 }
 
 /// Read manual cron-run request timeout from
-/// `ZEROCLAW_GATEWAY_CRON_RUN_TIMEOUT_SECS` at runtime, falling back to
-/// [`CRON_RUN_TIMEOUT_SECS`]. Long-running jobs (e.g. agent prompts that
+/// `ZEROCLAW_GATEWAY_LONG_RUNNING_REQUEST_TIMEOUT_SECS` at runtime, falling back to
+/// [`LONG_RUNNING_REQUEST_TIMEOUT_SECS`]. Long-running jobs (e.g. agent prompts that
 /// invoke tools) can comfortably exceed the 30s gateway-wide default, so the
 /// `/api/cron/{id}/run` route gets its own timeout layer.
-pub fn gateway_cron_run_timeout_secs() -> u64 {
-    std::env::var("ZEROCLAW_GATEWAY_CRON_RUN_TIMEOUT_SECS")
+pub fn gateway_long_running_request_timeout_secs() -> u64 {
+    std::env::var("ZEROCLAW_GATEWAY_LONG_RUNNING_REQUEST_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(CRON_RUN_TIMEOUT_SECS)
+        .unwrap_or(LONG_RUNNING_REQUEST_TIMEOUT_SECS)
 }
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
@@ -1120,7 +1120,7 @@ pub async fn run_gateway(
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(gateway_cron_run_timeout_secs()),
+            Duration::from_secs(gateway_long_running_request_timeout_secs()),
         ));
 
     let inner = inner.merge(cron_run_router);
@@ -2418,15 +2418,15 @@ mod tests {
     }
 
     #[test]
-    fn cron_run_timeout_default_is_ten_minutes() {
-        assert_eq!(CRON_RUN_TIMEOUT_SECS, 600);
+    fn long_running_request_timeout_default_is_ten_minutes() {
+        assert_eq!(LONG_RUNNING_REQUEST_TIMEOUT_SECS, 600);
     }
 
     #[test]
-    fn cron_run_timeout_falls_back_to_default() {
+    fn long_running_request_timeout_falls_back_to_default() {
         // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_CRON_RUN_TIMEOUT_SECS") };
-        assert_eq!(gateway_cron_run_timeout_secs(), 600);
+        unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_LONG_RUNNING_REQUEST_TIMEOUT_SECS") };
+        assert_eq!(gateway_long_running_request_timeout_secs(), 600);
     }
 
     #[test]
