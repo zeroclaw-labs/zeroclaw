@@ -105,6 +105,14 @@ def run_gh_json(args: list[str]) -> Any:
     return json.loads(out) if out.strip() else None
 
 
+def run_gh_api_json(path: str, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    out = run_gh_text(
+        ["api", path, "-X", method, "--input", "-"],
+        input_text=json.dumps(payload),
+    )
+    return json.loads(out) if out.strip() else {}
+
+
 def run_gh_text(args: list[str], input_text: str | None = None) -> str:
     cmd = ["gh", *args]
     last_detail = ""
@@ -138,6 +146,15 @@ def is_retryable_gh_error(detail: str) -> bool:
 
 def throttle_gh_mutation(args: list[str]) -> None:
     if GH_MUTATION_DELAY <= 0 or len(args) < 2:
+        return
+    if args[0] == "api":
+        method = "GET"
+        if "-X" in args:
+            index = args.index("-X")
+            if index + 1 < len(args):
+                method = args[index + 1].upper()
+        if method in {"POST", "PATCH", "PUT", "DELETE"}:
+            time.sleep(GH_MUTATION_DELAY)
         return
     mutating = {
         ("repo", "create"),
@@ -379,17 +396,18 @@ def configure_actions(repo: str, allow_actions: bool, dry_run: bool) -> str:
 
 def push_mirror_to_target(source_repo: str, target_repo: str, work_dir: Path, dry_run: bool) -> str:
     if dry_run:
-        return f"dry-run: would push branches/tags from {source_repo} to {target_repo}"
+        return f"dry-run: would push master branch from {source_repo} to {target_repo}"
     mirror_dir = work_dir / "source.git"
     clone_mirror(source_repo, mirror_dir)
-    return run_cmd([
+    result = run_cmd([
         "git",
         "push",
         "--prune",
         github_ssh_url(target_repo),
-        "+refs/heads/*:refs/heads/*",
-        "+refs/tags/*:refs/tags/*",
+        "+refs/heads/master:refs/heads/master",
     ], mirror_dir)
+    run_gh_text(["repo", "edit", target_repo, "--default-branch", "master"])
+    return result
 
 
 def label_payload(data: dict[str, Any]) -> dict[str, dict[str, str]]:
@@ -436,6 +454,10 @@ def label_args(labels: list[dict[str, Any]]) -> list[str]:
         if name:
             args.extend(["--label", name])
     return args
+
+
+def label_names_from_payload(labels: list[dict[str, Any]]) -> list[str]:
+    return [label["name"] for label in labels if label.get("name")]
 
 
 def compact_metadata(kind: str, source_repo: str, item: dict[str, Any]) -> str:
@@ -566,18 +588,13 @@ def create_sandbox_issues(
             issue_map[original] = original
             continue
         body = sandbox_body("issue", source_repo, issue, {})
-        args = [
-            "issue",
-            "create",
-            "--repo",
-            repo,
-            "--title",
-            issue.get("title") or f"Original issue #{original}",
-            "--body-file",
-            "-",
-        ]
-        args.extend(label_args(issue.get("labels", [])))
-        issue_map[original] = run_gh_create_number(args, input_text=body)
+        payload = {
+            "title": issue.get("title") or f"Original issue #{original}",
+            "body": body,
+            "labels": label_names_from_payload(issue.get("labels", [])),
+        }
+        created = run_gh_api_json(f"repos/{repo}/issues", "POST", payload)
+        issue_map[original] = int(created["number"])
     return issue_map
 
 
@@ -598,25 +615,57 @@ def create_sandbox_prs(
         base = ensure_base_branch(clone_dir, pr.get("baseRefName") or "master")
         branch = create_sandbox_branch(clone_dir, pr, base)
         placeholder = sandbox_body("pr", source_repo, pr, issue_map, neutralize_closing=True)
-        args = [
+        payload = {
+            "title": pr.get("title") or f"Original PR #{original}",
+            "body": placeholder,
+            "head": branch,
+            "base": base,
+            "draft": bool(pr.get("isDraft")),
+        }
+        created = run_gh_api_json(f"repos/{repo}/pulls", "POST", payload)
+        mapped = int(created["number"])
+        labels = label_names_from_payload(pr.get("labels", []))
+        if labels:
+            run_gh_api_json(f"repos/{repo}/issues/{mapped}/labels", "POST", {"labels": labels})
+        pr_map[original] = mapped
+    return pr_map
+
+
+def close_unmapped_open_prs(repo: str, mapped_prs: set[int], dry_run: bool) -> list[str]:
+    open_prs = run_gh_json([
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "open",
+        "--limit",
+        "1000",
+        "--json",
+        "number,headRefName,title",
+    ])
+    results: list[str] = []
+    for pr in open_prs:
+        number = int(pr["number"])
+        if number in mapped_prs:
+            continue
+        head = pr.get("headRefName") or ""
+        if head.startswith("factory-sandbox/pr-"):
+            continue
+        if dry_run:
+            results.append(f"dry-run: would close unmapped PR #{number}")
+            continue
+        run_gh_text([
             "pr",
-            "create",
+            "close",
+            str(number),
             "--repo",
             repo,
-            "--base",
-            base,
-            "--head",
-            branch,
-            "--title",
-            pr.get("title") or f"Original PR #{original}",
-            "--body-file",
-            "-",
-        ]
-        if pr.get("isDraft"):
-            args.append("--draft")
-        args.extend(label_args(pr.get("labels", [])))
-        pr_map[original] = run_gh_create_number(args, input_text=placeholder)
-    return pr_map
+            "--comment",
+            "Closing unrelated PR opened outside the factory sandbox replay.",
+        ])
+        results.append(f"closed unmapped PR #{number}: {pr.get('title') or ''}")
+    return results
 
 
 def edit_bodies_and_comments(
@@ -752,6 +801,7 @@ def sandbox(data: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     pr_map = create_sandbox_prs(target_repo, source_repo, prs, issue_map, work_dir, args.dry_run)
     summary["issue_map"] = issue_map
     summary["pr_map"] = pr_map
+    summary["steps"].extend(close_unmapped_open_prs(target_repo, set(pr_map.values()), args.dry_run))
     summary["steps"].extend(edit_bodies_and_comments(
         target_repo,
         source_repo,
