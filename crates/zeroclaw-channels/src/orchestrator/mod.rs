@@ -4160,7 +4160,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     wc.api_base_url.clone(),
                     wc.cdn_base_url.clone(),
                     wc.state_dir.as_ref().map(std::path::PathBuf::from),
-                )
+                )?
                 .with_workspace_dir(config.workspace_dir.clone()),
             ))
         }
@@ -4924,18 +4924,24 @@ fn collect_configured_channels(
     #[cfg(feature = "channel-wechat")]
     if let Some(ref wechat) = config.channels.wechat {
         if wechat.enabled {
-            channels.push(ConfiguredChannel {
-                display_name: "WeChat",
-                channel: Arc::new(
-                    WeChatChannel::new(
-                        wechat.allowed_users.clone(),
-                        wechat.api_base_url.clone(),
-                        wechat.cdn_base_url.clone(),
-                        wechat.state_dir.as_ref().map(std::path::PathBuf::from),
-                    )
-                    .with_workspace_dir(config.workspace_dir.clone()),
-                ),
-            });
+            match WeChatChannel::new(
+                wechat.allowed_users.clone(),
+                wechat.api_base_url.clone(),
+                wechat.cdn_base_url.clone(),
+                wechat.state_dir.as_ref().map(std::path::PathBuf::from),
+            ) {
+                Ok(channel) => {
+                    channels.push(ConfiguredChannel {
+                        display_name: "WeChat",
+                        channel: Arc::new(channel.with_workspace_dir(config.workspace_dir.clone())),
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "WeChat channel configuration is invalid; skipping WeChat {matrix_skip_context}: {err}"
+                    );
+                }
+            }
         } else {
             tracing::info!("WeChat channel configured but disabled (enabled = false)");
         }
@@ -4945,7 +4951,7 @@ fn collect_configured_channels(
     if let Some(ref wechat) = config.channels.wechat {
         if wechat.enabled {
             tracing::warn!(
-                "WeChat channel is configured but this build was compiled without `channel-wechat`; skipping WeChat {context}."
+                "WeChat channel is configured but this build was compiled without `channel-wechat`; skipping WeChat {matrix_skip_context}."
             );
         }
     }
@@ -5832,10 +5838,14 @@ pub async fn deliver_announcement(
                 wc.api_base_url.clone(),
                 wc.cdn_base_url.clone(),
                 wc.state_dir.as_ref().map(std::path::PathBuf::from),
-            )
+            )?
             .with_workspace_dir(config.workspace_dir.clone());
             zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
                 .await?;
+        }
+        #[cfg(not(feature = "channel-wechat"))]
+        "wechat" => {
+            anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }

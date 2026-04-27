@@ -129,7 +129,7 @@ struct WeChatMediaPayload {
 
 #[derive(Debug, Clone)]
 struct InboundAttachmentSpec {
-    _kind: WeChatAttachmentKind,
+    kind: WeChatAttachmentKind,
     encrypted_query_param: String,
     aes_key: Option<String>,
     file_name: String,
@@ -143,19 +143,7 @@ struct UploadedWeChatMedia {
     encrypted_size: usize,
 }
 
-fn is_image_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| {
-            matches!(
-                ext.to_ascii_lowercase().as_str(),
-                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn is_http_url(target: &str) -> bool {
+fn is_remote_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
 }
 
@@ -261,7 +249,7 @@ fn parse_path_only_attachment(message: &str) -> Option<WeChatAttachment> {
     let candidate = candidate.strip_prefix("file://").unwrap_or(candidate);
     let kind = infer_attachment_kind_from_target(candidate)?;
 
-    if !is_http_url(candidate) && !Path::new(candidate).exists() {
+    if !is_remote_url(candidate) && !Path::new(candidate).exists() {
         return None;
     }
 
@@ -271,8 +259,12 @@ fn parse_path_only_attachment(message: &str) -> Option<WeChatAttachment> {
     })
 }
 
-fn format_attachment_content(local_filename: &str, local_path: &Path) -> String {
-    if is_image_extension(local_path) {
+fn format_attachment_content(
+    kind: WeChatAttachmentKind,
+    local_filename: &str,
+    local_path: &Path,
+) -> String {
+    if kind == WeChatAttachmentKind::Image {
         format!("[IMAGE:{}]", local_path.display())
     } else {
         format!("[Document: {}] {}", local_filename, local_path.display())
@@ -343,6 +335,19 @@ fn parse_aes_key(raw: &str) -> anyhow::Result<[u8; 16]> {
         "WeChat media aes_key must decode to 16 raw bytes or 32 hex chars, got {} bytes",
         decoded.len()
     )
+}
+
+fn https_base_url(
+    field_name: &str,
+    value: Option<String>,
+    default: &str,
+) -> anyhow::Result<String> {
+    let url = value.unwrap_or_else(|| default.to_string());
+    let url = url.trim().trim_end_matches('/').to_string();
+    if !url.starts_with("https://") {
+        anyhow::bail!("WeChat {field_name} must use https://, got {url}");
+    }
+    Ok(url)
 }
 
 /// WeChat iLink Bot channel — long-polls the iLink Bot API for updates.
@@ -423,6 +428,7 @@ fn build_base_info() -> serde_json::Value {
 }
 
 fn markdown_to_plain_text(text: &str) -> String {
+    // TODO: Cache these Regex values instead of compiling them on every send path.
     let code_block_re = regex::Regex::new(r"```[^\n]*\n?([\s\S]*?)```").unwrap();
     let image_re = regex::Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap();
     let link_re = regex::Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap();
@@ -553,7 +559,10 @@ impl WeChatChannel {
         api_base_url: Option<String>,
         cdn_base_url: Option<String>,
         state_dir: Option<PathBuf>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        let api_base_url = https_base_url("api_base_url", api_base_url, DEFAULT_API_BASE_URL)?;
+        let cdn_base_url = https_base_url("cdn_base_url", cdn_base_url, CDN_BASE_URL)?;
+
         let pairing = if allowed_users.is_empty() {
             let guard = PairingGuard::new(true, &[]);
             if let Some(code) = guard.pairing_code() {
@@ -574,8 +583,8 @@ impl WeChatChannel {
         let mut channel = Self {
             bot_token: RwLock::new(None),
             account_id: RwLock::new(None),
-            api_base_url: api_base_url.unwrap_or_else(|| DEFAULT_API_BASE_URL.to_string()),
-            cdn_base_url: cdn_base_url.unwrap_or_else(|| CDN_BASE_URL.to_string()),
+            api_base_url,
+            cdn_base_url,
             allowed_users: Arc::new(RwLock::new(allowed_users)),
             pairing,
             client: reqwest::Client::new(),
@@ -589,7 +598,7 @@ impl WeChatChannel {
 
         // Try to load persisted state
         channel.load_persisted_state();
-        channel
+        Ok(channel)
     }
 
     pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
@@ -866,7 +875,7 @@ impl WeChatChannel {
         attachment: &WeChatAttachment,
     ) -> anyhow::Result<WeChatMediaPayload> {
         let target = attachment.target.trim();
-        if is_http_url(target) {
+        if is_remote_url(target) {
             return self
                 .download_remote_attachment(target, attachment.kind)
                 .await;
@@ -1060,7 +1069,7 @@ impl WeChatChannel {
                         .or_else(|| media.get("aes_key").and_then(|value| value.as_str()))
                         .map(str::to_string);
                     Some(InboundAttachmentSpec {
-                        _kind: WeChatAttachmentKind::Image,
+                        kind: WeChatAttachmentKind::Image,
                         encrypted_query_param,
                         aes_key,
                         file_name: default_name(WeChatAttachmentKind::Image, message_id),
@@ -1083,7 +1092,7 @@ impl WeChatChannel {
                             default_name(WeChatAttachmentKind::Document, message_id)
                         });
                     Some(InboundAttachmentSpec {
-                        _kind: WeChatAttachmentKind::Document,
+                        kind: WeChatAttachmentKind::Document,
                         encrypted_query_param,
                         aes_key,
                         file_name,
@@ -1099,7 +1108,7 @@ impl WeChatChannel {
                         .and_then(|value| value.as_str())
                         .map(str::to_string);
                     Some(InboundAttachmentSpec {
-                        _kind: WeChatAttachmentKind::Video,
+                        kind: WeChatAttachmentKind::Video,
                         encrypted_query_param,
                         aes_key,
                         file_name: default_name(WeChatAttachmentKind::Video, message_id),
@@ -1115,7 +1124,7 @@ impl WeChatChannel {
                         .and_then(|value| value.as_str())
                         .map(str::to_string);
                     Some(InboundAttachmentSpec {
-                        _kind: WeChatAttachmentKind::Voice,
+                        kind: WeChatAttachmentKind::Voice,
                         encrypted_query_param,
                         aes_key,
                         file_name: default_name(WeChatAttachmentKind::Voice, message_id),
@@ -1211,7 +1220,11 @@ impl WeChatChannel {
             return None;
         }
 
-        Some(format_attachment_content(&spec.file_name, &local_path))
+        Some(format_attachment_content(
+            spec.kind,
+            &spec.file_name,
+            &local_path,
+        ))
     }
 
     /// Perform QR-code login flow. Returns (bot_token, account_id, user_id).
@@ -1932,8 +1945,37 @@ mod tests {
             None,
             None,
             Some("/tmp/test-wechat".into()),
-        );
+        )
+        .unwrap();
         assert_eq!(ch.name(), "wechat");
+    }
+
+    #[test]
+    fn wechat_channel_rejects_http_api_base_url() {
+        let result = WeChatChannel::new(
+            vec!["*".into()],
+            Some("http://ilink.example.test".into()),
+            None,
+            Some("/tmp/test-wechat".into()),
+        );
+        assert!(result.is_err());
+
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("api_base_url must use https://"));
+    }
+
+    #[test]
+    fn wechat_channel_rejects_http_cdn_base_url() {
+        let result = WeChatChannel::new(
+            vec!["*".into()],
+            None,
+            Some("http://cdn.example.test".into()),
+            Some("/tmp/test-wechat".into()),
+        );
+        assert!(result.is_err());
+
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("cdn_base_url must use https://"));
     }
 
     #[test]
@@ -1988,7 +2030,8 @@ mod tests {
             None,
             None,
             Some("/tmp/test-wechat".into()),
-        );
+        )
+        .unwrap();
         assert!(ch.is_user_allowed("anyone@im.wechat"));
     }
 
@@ -1999,7 +2042,8 @@ mod tests {
             None,
             None,
             Some("/tmp/test-wechat".into()),
-        );
+        )
+        .unwrap();
         assert!(ch.is_user_allowed("user1@im.wechat"));
         assert!(!ch.is_user_allowed("user2@im.wechat"));
     }
@@ -2067,7 +2111,7 @@ mod tests {
     fn format_attachment_content_uses_image_marker_for_images() {
         let path = PathBuf::from("/tmp/workspace/photo.png");
         assert_eq!(
-            format_attachment_content("photo.png", &path),
+            format_attachment_content(WeChatAttachmentKind::Image, "photo.png", &path),
             "[IMAGE:/tmp/workspace/photo.png]"
         );
     }
@@ -2076,7 +2120,7 @@ mod tests {
     fn format_attachment_content_uses_document_marker_for_non_images() {
         let path = PathBuf::from("/tmp/workspace/report.pdf");
         assert_eq!(
-            format_attachment_content("report.pdf", &path),
+            format_attachment_content(WeChatAttachmentKind::Document, "report.pdf", &path),
             "[Document: report.pdf] /tmp/workspace/report.pdf"
         );
     }
@@ -2120,7 +2164,7 @@ mod tests {
         ];
 
         let spec = WeChatChannel::find_inbound_attachment(&items, "123").unwrap();
-        assert_eq!(spec._kind, WeChatAttachmentKind::Image);
+        assert_eq!(spec.kind, WeChatAttachmentKind::Image);
         assert_eq!(spec.encrypted_query_param, "direct");
     }
 
