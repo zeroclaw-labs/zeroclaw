@@ -640,6 +640,11 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
             Nav::Done => {}
         }
 
+        // Promote the configured provider to providers.fallback so the
+        // runtime resolves it. Done last so we only persist a fallback
+        // pointing at an entry that actually has auth + model wired up.
+        persist(cfg, "providers.fallback", &picked).await?;
+
         break;
     }
 
