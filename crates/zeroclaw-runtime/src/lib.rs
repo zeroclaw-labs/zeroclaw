@@ -1,7 +1,6 @@
 //! Agent runtime — orchestration, security, observability, cron, SOP, skills, hardware, and more.
 
 pub mod cli_input;
-pub mod i18n;
 pub mod identity;
 pub mod migration;
 pub mod util;
@@ -15,6 +14,7 @@ pub mod doctor;
 pub mod health;
 pub mod heartbeat;
 pub mod hooks;
+pub mod i18n;
 pub mod integrations;
 pub mod nodes;
 pub mod observability;
