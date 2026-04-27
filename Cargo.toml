@@ -257,7 +257,7 @@ agent-runtime = [
     "channel-dingtalk", "channel-qq", "channel-bluesky",
     "channel-twitter", "channel-reddit", "channel-notion",
     "channel-linq", "channel-wati", "channel-nextcloud",
-    "channel-mochat", "channel-wechat", "channel-wecom", "channel-clawdtalk",
+    "channel-mochat", "channel-wecom", "channel-clawdtalk",
     "channel-webhook", "channel-acp-server", "channel-whatsapp-cloud",
     "channel-voice-call",
 ]

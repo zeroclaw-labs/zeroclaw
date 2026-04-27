@@ -82,7 +82,7 @@ default = [
     "channel-irc", "channel-imessage", "channel-dingtalk", "channel-qq",
     "channel-bluesky", "channel-twitter", "channel-reddit", "channel-notion",
     "channel-linq", "channel-wati", "channel-nextcloud", "channel-mochat",
-    "channel-wechat", "channel-wecom", "channel-clawdtalk", "channel-webhook",
+    "channel-wecom", "channel-clawdtalk", "channel-webhook",
     "channel-whatsapp-cloud", "channel-voice-call",
 ]
 # Channels with optional deps
