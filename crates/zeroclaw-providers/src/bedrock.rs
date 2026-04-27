@@ -374,7 +374,16 @@ enum SystemBlock {
 #[serde(rename_all = "camelCase")]
 struct InferenceConfig {
     max_tokens: u32,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+}
+
+/// Some Bedrock models (the Claude opus-4-7 family) reject `temperature` in
+/// `inferenceConfig` with a 400 "temperature is deprecated for this model".
+/// Substring match covers region/profile prefixes (e.g. `us.anthropic.…`)
+/// and version suffixes (e.g. `-v1:0`).
+fn bedrock_model_omits_temperature(model: &str) -> bool {
+    model.contains("claude-opus-4-7")
 }
 
 #[derive(Debug, Serialize)]
@@ -1133,7 +1142,11 @@ impl Provider for BedrockProvider {
             messages,
             inference_config: Some(InferenceConfig {
                 max_tokens: self.max_tokens,
-                temperature,
+                temperature: if bedrock_model_omits_temperature(model) {
+                    None
+                } else {
+                    Some(temperature)
+                },
             }),
             tool_config: None,
         };
@@ -1190,7 +1203,11 @@ impl Provider for BedrockProvider {
             messages: converse_messages,
             inference_config: Some(InferenceConfig {
                 max_tokens: self.max_tokens,
-                temperature,
+                temperature: if bedrock_model_omits_temperature(model) {
+                    None
+                } else {
+                    Some(temperature)
+                },
             }),
             tool_config,
         };
@@ -1606,7 +1623,7 @@ mod tests {
             }],
             inference_config: Some(InferenceConfig {
                 max_tokens: 4096,
-                temperature: 0.7,
+                temperature: Some(0.7),
             }),
             tool_config: None,
         };
@@ -1614,6 +1631,59 @@ mod tests {
         assert!(!json.contains("system"));
         assert!(json.contains("Hello"));
         assert!(json.contains("maxTokens"));
+    }
+
+    // ── Opus 4.7 temperature-omission tests (issue #6095) ────────
+
+    #[test]
+    fn bedrock_model_omits_temperature_matches_opus_4_7() {
+        assert!(bedrock_model_omits_temperature(
+            "us.anthropic.claude-opus-4-7"
+        ));
+        assert!(bedrock_model_omits_temperature(
+            "anthropic.claude-opus-4-7-v1:0"
+        ));
+    }
+
+    #[test]
+    fn bedrock_model_omits_temperature_skips_other_models() {
+        assert!(!bedrock_model_omits_temperature(
+            "us.anthropic.claude-opus-4-6-v1"
+        ));
+        assert!(!bedrock_model_omits_temperature(
+            "us.anthropic.claude-sonnet-4-6-v1"
+        ));
+        assert!(!bedrock_model_omits_temperature(
+            "us.anthropic.claude-haiku-4-5-v1"
+        ));
+    }
+
+    #[test]
+    fn inference_config_serializes_without_temperature_when_none() {
+        let cfg = InferenceConfig {
+            max_tokens: 4096,
+            temperature: None,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("maxTokens"));
+        assert!(
+            !json.contains("temperature"),
+            "expected temperature to be omitted, got: {json}"
+        );
+    }
+
+    #[test]
+    fn inference_config_serializes_with_temperature_when_some() {
+        let cfg = InferenceConfig {
+            max_tokens: 4096,
+            temperature: Some(0.7),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("maxTokens"));
+        assert!(
+            json.contains("temperature"),
+            "expected temperature to be present, got: {json}"
+        );
     }
 
     #[test]

@@ -366,9 +366,12 @@ impl AgentBuilder {
                 .memory_loader
                 .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
             config: self.config.unwrap_or_default(),
-            model_name: self
-                .model_name
-                .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into()),
+            // No silent vendor-default model. Callers that construct `Agent` via the
+            // builder must set `model_name` explicitly (via `.model_name(...)` or via
+            // `Agent::from_config`, which resolves from `[providers]`). The sentinel
+            // keeps the field non-empty so accidental dispatch surfaces a clear 4xx
+            // rather than misrouting to a real vendor model.
+            model_name: self.model_name.unwrap_or_else(|| "<unconfigured>".into()),
             temperature: self.temperature.unwrap_or(0.7),
             workspace_dir: self
                 .workspace_dir
@@ -589,10 +592,34 @@ impl Agent {
 
         let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
 
-        let model_name = fallback_provider_ag
+        let model_name = match fallback_provider_ag
             .and_then(|e| e.model.as_deref())
-            .unwrap_or("anthropic/claude-sonnet-4-20250514")
-            .to_string();
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            Some(m) => m.to_string(),
+            None => match config.providers.resolve_default_model() {
+                Some(m) => {
+                    tracing::warn!(
+                        provider = provider_name,
+                        model = %m,
+                        "fallback provider has no `model` set; using first configured \
+                         providers.models entry as default. Set [providers.models.{provider_name}] \
+                         model = \"...\" to silence this warning.",
+                    );
+                    m
+                }
+                None => {
+                    anyhow::bail!(
+                        "no model configured: providers.fallback = {:?} resolves with no model, \
+                         and no [[providers.models.*]] entry has a `model` field set. \
+                         Configure at least one [providers.models.<name>] model = \"...\" \
+                         or define a [[model_routes]] hint.",
+                        config.providers.fallback,
+                    )
+                }
+            },
+        };
 
         let provider_runtime_options =
             zeroclaw_providers::provider_runtime_options_from_config(config);
@@ -1139,10 +1166,6 @@ impl Agent {
             }
 
             if !text.is_empty() {
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        text.clone(),
-                    )));
                 print!("{text}");
                 let _ = std::io::stdout().flush();
             }
@@ -1488,13 +1511,6 @@ impl Agent {
             }
 
             // ── Tool calls ─────────────────────────────────────────────
-            if !text.is_empty() {
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        text.clone(),
-                    )));
-            }
-
             self.history.push(ConversationMessage::AssistantToolCalls {
                 text: response.text.clone(),
                 tool_calls: response.tool_calls.clone(),
@@ -1598,12 +1614,19 @@ pub async fn run(
         .as_deref()
         .unwrap_or("openrouter")
         .to_string();
+    // `Agent::from_config` above has already errored if no model could be resolved,
+    // so this telemetry line should always find one. We keep `resolve_default_model`
+    // as a cheap secondary lookup and emit "<unresolved>" only if nothing matches —
+    // never silently substitute a hardcoded vendor model.
     let model_name = effective_config
         .providers
         .fallback_provider()
         .and_then(|e| e.model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4-20250514")
-        .to_string();
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| effective_config.providers.resolve_default_model())
+        .unwrap_or_else(|| "<unresolved>".to_string());
 
     agent.observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.clone(),
@@ -2682,6 +2705,198 @@ mod tests {
                      entry — pair was split during trim"
                 );
             }
+        }
+    }
+
+    // ── Duplicate narration guard ────────────────────────────────────
+
+    /// When the model returns narration text alongside tool calls, the agent
+    /// must store exactly ONE assistant history entry (AssistantToolCalls) —
+    /// not a plain Chat(assistant) followed by AssistantToolCalls. The latter
+    /// pattern causes providers that enforce role-alternation to reject the
+    /// next request with a consecutive-assistant-role error.
+    #[tokio::test]
+    async fn narration_with_tool_calls_produces_no_consecutive_assistant_entries() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                text: Some("I will echo the message.".into()),
+                tool_calls: vec![zeroclaw_providers::ToolCall {
+                    id: "tc1".into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                }],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        });
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        agent.turn("hi").await.unwrap();
+
+        let history = agent.history();
+        for window in history.windows(2) {
+            let prev_is_assistant_chat = matches!(
+                &window[0],
+                ConversationMessage::Chat(m) if m.role == "assistant"
+            );
+            let next_is_tool_calls =
+                matches!(&window[1], ConversationMessage::AssistantToolCalls { .. });
+            assert!(
+                !(prev_is_assistant_chat && next_is_tool_calls),
+                "history contains Chat(assistant) immediately before AssistantToolCalls — \
+                 duplicate narration push was not removed"
+            );
+        }
+    }
+
+    /// Streaming mock that emits narration text + tool call on the first turn,
+    /// then a plain text response on the second. Used to verify the streaming
+    /// path has the same duplicate-narration guard as the blocking path.
+    struct NarrationStreamProvider {
+        call_count: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl Provider for NarrationStreamProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::stream::{self, StreamExt};
+            let mut count = self.call_count.lock();
+            *count += 1;
+            if *count == 1 {
+                stream::iter(vec![
+                    Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                        zeroclaw_providers::traits::StreamChunk {
+                            delta: "I will echo the message.".into(),
+                            is_final: false,
+                            reasoning: None,
+                            token_count: 0,
+                        },
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::ToolCall(
+                        zeroclaw_providers::ToolCall {
+                            id: "tc1".into(),
+                            name: "echo".into(),
+                            arguments: "{}".into(),
+                        },
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            } else {
+                stream::iter(vec![
+                    Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
+                        zeroclaw_providers::traits::StreamChunk {
+                            delta: "done".into(),
+                            is_final: false,
+                            reasoning: None,
+                            token_count: 0,
+                        },
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_narration_with_tool_calls_produces_no_consecutive_assistant_entries() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let provider = Box::new(NarrationStreamProvider {
+            call_count: Arc::new(Mutex::new(0)),
+        });
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent.turn_streamed("hi", event_tx, None).await.unwrap();
+
+        let history = agent.history();
+        for window in history.windows(2) {
+            let prev_is_assistant_chat = matches!(
+                &window[0],
+                ConversationMessage::Chat(m) if m.role == "assistant"
+            );
+            let next_is_tool_calls =
+                matches!(&window[1], ConversationMessage::AssistantToolCalls { .. });
+            assert!(
+                !(prev_is_assistant_chat && next_is_tool_calls),
+                "streaming path: history contains Chat(assistant) immediately before \
+                 AssistantToolCalls — duplicate narration push was not removed"
+            );
         }
     }
 

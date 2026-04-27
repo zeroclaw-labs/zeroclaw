@@ -41,6 +41,9 @@ credentials.json
 .worktrees/
 .zeroclaw/*
 
+# Claude Code project settings (machine-specific directory config)
+.claude/settings.json
+
 # Skill eval workspaces (test outputs, transcripts, grading)
 .claude/skills/*-workspace/
 
