@@ -149,6 +149,8 @@ pub struct WuKongIMChannel {
     approval_timeout_secs: u64,
     /// Outbound WS sink
     ws_sink: Arc<RwLock<Option<WsSink>>>,
+    /// When true, only respond to messages that @-mention the bot in groups.
+    mention_only: bool,
 }
 
 impl WuKongIMChannel {
@@ -163,6 +165,7 @@ impl WuKongIMChannel {
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             approval_timeout_secs: config.approval_timeout_secs,
             ws_sink: Arc::new(RwLock::new(None)),
+            mention_only: config.mention_only,
         }
     }
 
@@ -515,6 +518,30 @@ impl Channel for WuKongIMChannel {
                                 .and_then(|c| c.as_str())
                                 .unwrap_or(&params.payload)
                                 .to_string();
+
+                            // 3. Handle mention_only logic for group chats
+                            let is_group = params.channel_type != 1;
+                            if self.mention_only && is_group {
+                                let mut mentioned = false;
+                                if let Some(mention) = payload_json.get("mention") {
+                                    if let Some(all) = mention.get("all").and_then(|v| v.as_u64()) {
+                                        if all == 1 {
+                                            mentioned = true;
+                                        }
+                                    }
+                                    if !mentioned {
+                                        if let Some(uids) = mention.get("uids").and_then(|v| v.as_array()) {
+                                            if uids.iter().any(|u| u.as_str() == Some(&self.uid)) {
+                                                mentioned = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                if !mentioned {
+                                    tracing::trace!("WuKongIM: ignoring non-mention message in group");
+                                    continue;
+                                }
+                            }
 
                             // Determine target: for type 1 (personal), reply to from_uid. For others, reply to channel_id.
                             let target_id = if params.channel_type == 1 {

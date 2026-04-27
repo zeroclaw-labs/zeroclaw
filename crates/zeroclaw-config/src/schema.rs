@@ -7920,6 +7920,10 @@ pub struct WuKongIMConfig {
     /// Allowed user IDs (empty = deny all, "*" = allow all)
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, only respond to messages that @-mention the bot in groups.
+    /// Direct messages (channel_type=1) are always processed.
+    #[serde(default)]
+    pub mention_only: bool,
     /// How long (seconds) to wait for the operator to approve a tool call. Default: 300.
     #[serde(default = "default_wukongim_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
