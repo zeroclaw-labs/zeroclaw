@@ -10782,9 +10782,6 @@ impl Config {
             .fallback
             .clone()
             .unwrap_or_else(|| "default".into());
-        if self.providers.fallback.is_none() {
-            self.providers.fallback = Some(fallback.clone());
-        }
         self.providers.models.entry(fallback).or_default()
     }
 
