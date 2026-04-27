@@ -222,7 +222,7 @@ fn split_message(message: &str, max_bytes: usize) -> Vec<String> {
     chunks
 }
 
-// Configuration for constructing an `IrcChannel`.
+/// Configuration for constructing an `IrcChannel`.
 pub struct IrcChannelConfig {
     pub server: String,
     pub port: u16,
