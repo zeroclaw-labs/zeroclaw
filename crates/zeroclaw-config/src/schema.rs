@@ -8599,7 +8599,8 @@ pub struct WeChatConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Allowed WeChat user IDs (e.g. `"xxx@im.wechat"`).
-    /// Empty = deny all, `"*"` = allow all.
+    /// `"*"` = allow all. Empty = require pairing (`/bind <code>` from WeChat);
+    /// the QR-login user is auto-added at first connect.
     #[serde(default)]
     pub allowed_users: Vec<String>,
     /// Override the iLink API base URL. Default: `https://ilinkai.weixin.qq.com`.

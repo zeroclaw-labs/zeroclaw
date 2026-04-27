@@ -398,6 +398,17 @@ struct SyncData {
     get_updates_buf: String,
 }
 
+/// Write bytes to a file with owner-only permissions (0o600) on Unix.
+fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, data)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 /// Generate a random X-WECHAT-UIN header value.
 fn random_wechat_uin() -> String {
     let bytes: [u8; 4] = rand::random();
@@ -629,7 +640,7 @@ impl WeChatChannel {
         let path = self.state_dir.join("account.json");
         match serde_json::to_string_pretty(&data) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
+                if let Err(e) = write_private(&path, json.as_bytes()) {
                     tracing::warn!("WeChat: failed to write account data: {e}");
                 }
             }
@@ -649,7 +660,7 @@ impl WeChatChannel {
         let path = self.state_dir.join("sync.json");
         match serde_json::to_string(&data) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
+                if let Err(e) = write_private(&path, json.as_bytes()) {
                     tracing::warn!("WeChat: failed to write sync data: {e}");
                 }
             }
@@ -804,6 +815,9 @@ impl WeChatChannel {
         url: &str,
         kind: WeChatAttachmentKind,
     ) -> anyhow::Result<WeChatMediaPayload> {
+        if !url.starts_with("https://") {
+            anyhow::bail!("WeChat: refusing non-HTTPS attachment URL: {url}");
+        }
         let resp = self
             .client
             .get(url)
