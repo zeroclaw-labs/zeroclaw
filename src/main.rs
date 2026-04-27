@@ -1413,6 +1413,28 @@ async fn main() -> Result<()> {
     }
 
     #[cfg(feature = "agent-runtime")]
+    {
+        // Wire cron delivery to the channels orchestrator. Registered before
+        // dispatch so that *any* command path that may execute cron jobs —
+        // `daemon`, `gateway start`, or a one-shot `cron run` — has a working
+        // delivery handler. Previously this lived only inside the daemon
+        // branch, which left `zeroclaw gateway start` unable to deliver
+        // manually-triggered cron announcements ("no delivery handler
+        // registered"). `register_delivery_fn` is idempotent (backed by
+        // `OnceLock::set`), so calling it once here is safe.
+        zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
+            |config, channel, target, output| {
+                Box::pin(async move {
+                    zeroclaw_channels::orchestrator::deliver_announcement(
+                        &config, &channel, &target, &output,
+                    )
+                    .await
+                })
+            },
+        ));
+    }
+
+    #[cfg(feature = "agent-runtime")]
     match cli.command {
         Commands::Onboard { .. }
         | Commands::Completions { .. }
@@ -1610,18 +1632,8 @@ async fn main() -> Result<()> {
                 })
             }));
 
-            // Wire cron delivery to the channels orchestrator
-            #[cfg(feature = "agent-runtime")]
-            zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
-                |config, channel, target, output| {
-                    Box::pin(async move {
-                        zeroclaw_channels::orchestrator::deliver_announcement(
-                            &config, &channel, &target, &output,
-                        )
-                        .await
-                    })
-                },
-            ));
+            // Cron delivery is registered earlier (before the command match)
+            // so it works for both `daemon` and `gateway start`.
 
             let subsystems = daemon::DaemonSubsystems {
                 #[cfg(feature = "gateway")]
