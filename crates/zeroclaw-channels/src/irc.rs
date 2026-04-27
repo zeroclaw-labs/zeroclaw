@@ -265,7 +265,7 @@ impl IrcChannel {
             .any(|u| u.eq_ignore_ascii_case(nick))
     }
 
-    fn is_mentioned(&self, my_nick: &str, text: &str) -> bool {
+    fn is_mentioned(my_nick: &str, text: &str) -> bool {
         text.to_ascii_lowercase()
             .contains(&my_nick.to_ascii_lowercase())
     }
@@ -553,7 +553,7 @@ impl Channel for IrcChannel {
                         continue;
                     }
 
-                    if self.mention_only && is_channel && !self.is_mentioned(&current_nick, text) {
+                    if self.mention_only && is_channel && !Self::is_mentioned(&current_nick, text) {
                         continue;
                     }
 
@@ -881,24 +881,35 @@ mod tests {
 
     #[test]
     fn mention_only_case_insensitive() {
-        let nick = "bot";
-        let ch = IrcChannel::new(IrcChannelConfig {
-            server: "irc.test".into(),
-            port: 6697,
-            nickname: nick.into(),
-            username: None,
-            channels: vec![],
-            allowed_users: vec![],
-            server_password: None,
-            nickserv_password: None,
-            sasl_password: None,
-            verify_tls: true,
-            mention_only: false,
-        });
-        assert!(ch.is_mentioned("bot", "Hello, bot!"));
-        assert!(ch.is_mentioned("bot", "HI BOT!"));
-        assert!(ch.is_mentioned("bot", "Bot: how are you doing?"));
-        assert!(!ch.is_mentioned("bot", "This one doesn't mention."));
+        assert!(IrcChannel::is_mentioned("bot", "Hello, bot!"));
+        assert!(IrcChannel::is_mentioned("bot", "HI BOT!"));
+        assert!(IrcChannel::is_mentioned("bot", "Bot: how are you doing?"));
+        assert!(!IrcChannel::is_mentioned(
+            "bot",
+            "This one doesn't mention."
+        ));
+    }
+
+    #[test]
+    fn mention_only_filters_channel_messages() {
+        // With mention_only = true: channel messages that don't mention the
+        // nick are silently dropped; messages that do mention it pass through.
+        assert!(
+            !IrcChannel::is_mentioned("bot", "anyone see the game last night?"),
+            "non-mention should not pass the filter"
+        );
+        assert!(
+            IrcChannel::is_mentioned("bot", "bot: what time is it?"),
+            "direct address should pass the filter"
+        );
+        assert!(
+            IrcChannel::is_mentioned("bot", "hey BOT, help me out"),
+            "case-insensitive mention should pass the filter"
+        );
+        // DMs are never gated by mention_only (is_channel = false for DMs),
+        // so the filtering branch does not run for private messages.
+        // That invariant is documented here, not separately tested, because
+        // listen() is async and cannot be unit-tested without a live IRC socket.
     }
 
     // ── Constructor ─────────────────────────────────────────
