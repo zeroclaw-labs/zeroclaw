@@ -278,4 +278,109 @@ mod tests {
         let result = create_plugin(Path::new("/nonexistent/plugin.wasm"), &[]);
         assert!(result.is_err());
     }
+
+    /// Integration tests that load the actual image-gen WASM plugin.
+    /// These require the plugin to be built first:
+    ///   cd plugins/image-gen-fal && cargo build --target wasm32-wasip1 --release
+    mod integration {
+        use super::*;
+
+        fn wasm_path() -> Option<std::path::PathBuf> {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../plugins/image-gen-fal/image_gen_fal.wasm");
+            if path.exists() { Some(path) } else { None }
+        }
+
+        #[test]
+        fn load_and_read_metadata() {
+            let Some(path) = wasm_path() else {
+                eprintln!("SKIP: image_gen_fal.wasm not found (build the plugin first)");
+                return;
+            };
+            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
+            let mut plugin = create_plugin(&path, &perms).unwrap();
+            let meta = call_tool_metadata(&mut plugin).unwrap();
+            assert_eq!(meta.name, "image_gen_fal");
+            assert!(meta.description.contains("image"));
+            assert!(
+                meta.parameters_schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v == "prompt")
+            );
+        }
+
+        #[test]
+        fn execute_missing_prompt() {
+            let Some(path) = wasm_path() else { return };
+            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
+            let mut plugin = create_plugin(&path, &perms).unwrap();
+            let args = serde_json::to_vec(&serde_json::json!({})).unwrap();
+            let result = call_execute(&mut plugin, &args).unwrap();
+            assert!(!result.success);
+            assert!(result.error.as_deref().unwrap().contains("prompt"));
+        }
+
+        #[test]
+        fn execute_invalid_size() {
+            let Some(path) = wasm_path() else { return };
+            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
+            let mut plugin = create_plugin(&path, &perms).unwrap();
+            let args =
+                serde_json::to_vec(&serde_json::json!({"prompt": "test", "size": "bad"})).unwrap();
+            let result = call_execute(&mut plugin, &args).unwrap();
+            assert!(!result.success);
+            assert!(result.error.as_deref().unwrap().contains("Invalid size"));
+        }
+
+        #[test]
+        fn execute_invalid_model_traversal() {
+            let Some(path) = wasm_path() else { return };
+            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
+            let mut plugin = create_plugin(&path, &perms).unwrap();
+            let args =
+                serde_json::to_vec(&serde_json::json!({"prompt": "test", "model": "../../evil"}))
+                    .unwrap();
+            let result = call_execute(&mut plugin, &args).unwrap();
+            assert!(!result.success);
+            assert!(result.error.as_deref().unwrap().contains("Invalid model"));
+        }
+
+        /// End-to-end: missing `FAL_API_KEY` exercises the `zc_env_read` host
+        /// function — the host returns Err (var unset), which Extism propagates
+        /// as a plugin-call trap. Proves the env_read path is wired.
+        #[test]
+        fn execute_missing_api_key_exercises_env_read_host_fn() {
+            let Some(path) = wasm_path() else { return };
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("FAL_API_KEY") };
+            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
+            let mut plugin = create_plugin(&path, &perms).unwrap();
+            let args = serde_json::to_vec(&serde_json::json!({"prompt": "a sunset"})).unwrap();
+            let err = call_execute(&mut plugin, &args).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("FAL_API_KEY") || msg.contains("not set"),
+                "expected env-var error, got: {msg}"
+            );
+        }
+
+        /// End-to-end permission enforcement: without `EnvRead`, the host
+        /// function returns permission-denied and Extism propagates it as a trap.
+        #[test]
+        fn execute_without_env_read_permission_fails() {
+            let Some(path) = wasm_path() else { return };
+            // Only HttpClient granted — EnvRead missing
+            let perms = vec![PluginPermission::HttpClient];
+            let mut plugin = create_plugin(&path, &perms).unwrap();
+            let args = serde_json::to_vec(&serde_json::json!({"prompt": "a sunset"})).unwrap();
+            let err = call_execute(&mut plugin, &args).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("permission") || msg.contains("env_read"),
+                "expected permission-denied error, got: {msg}"
+            );
+        }
+    }
 }

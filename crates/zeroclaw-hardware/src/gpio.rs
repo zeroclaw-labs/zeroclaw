@@ -1,9 +1,9 @@
 //! GPIO tools — `gpio_read` and `gpio_write` for LLM-driven hardware control.
 //!
 //! These are the first built-in hardware tools. They implement the standard
-//! [`Tool`](zeroclaw_api::tool::Tool) trait so the LLM can call them via function
+//! [`Tool`] trait so the LLM can call them via function
 //! calling, and dispatch commands to physical devices via the
-//! [`Transport`](super::Transport) layer.
+//! `Transport` layer.
 //!
 //! Wire protocol (ZeroClaw serial JSON):
 //! ```text

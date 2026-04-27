@@ -7,7 +7,7 @@
 //! so that user-facing keys remain stable.
 //!
 //! The subsystem supports resilient multi-provider configurations through the
-//! [`ReliableProvider`](reliable::ReliableProvider) wrapper, which handles fallback
+//! [`ReliableProvider`] wrapper, which handles fallback
 //! chains and automatic retry. Model routing across providers is available via
 //! [`create_routed_provider`].
 //!
@@ -27,6 +27,7 @@ pub mod gemini;
 pub mod gemini_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod kilocli;
+pub mod models_dev;
 pub mod multimodal;
 pub mod ollama;
 pub mod openai;
@@ -814,11 +815,7 @@ pub fn scrub_secret_patterns(input: &str) -> String {
 
     for prefix in PREFIXES {
         let mut search_from = 0;
-        loop {
-            let Some(rel) = scrubbed[search_from..].find(prefix) else {
-                break;
-            };
-
+        while let Some(rel) = scrubbed[search_from..].find(prefix) {
             let start = search_from + rel;
             let content_start = start + prefix.len();
             let end = token_end(&scrubbed, content_start);

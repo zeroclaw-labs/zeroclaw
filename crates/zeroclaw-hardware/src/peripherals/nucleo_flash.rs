@@ -63,7 +63,12 @@ pub fn flash_nucleo_firmware() -> Result<()> {
 
     println!("Flashing to Nucleo-F401RE (connect via USB)...");
     let flash = Command::new("probe-rs")
-        .args(["run", "--chip", CHIP, elf_path.to_str().unwrap()])
+        .args([
+            "run",
+            "--chip",
+            CHIP,
+            elf_path.to_str().context("ELF path is not valid UTF-8")?,
+        ])
         .output()
         .context("probe-rs run failed")?;
 

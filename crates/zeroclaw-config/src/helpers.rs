@@ -2,6 +2,34 @@
 
 use crate::traits::{PropFieldInfo, PropKind};
 
+/// For a `#[nested] HashMap<String, T>` field, parse a `get_prop`/`set_prop`
+/// path of the form `<my_prefix>.<field_name>.<hm_key>.<inner_suffix>` and
+/// return the HashMap key + the fully-qualified inner name that the value
+/// type's own `get_prop` / `set_prop` expects.
+///
+/// Returns `None` when the path doesn't match, letting the derive's
+/// generated code fall through to the next nested field.
+pub fn route_hashmap_path<'a>(
+    name: &'a str,
+    my_prefix: &str,
+    field_name: &str,
+    inner_prefix: &str,
+) -> Option<(&'a str, String)> {
+    let key_prefix = if my_prefix.is_empty() {
+        field_name.to_string()
+    } else {
+        format!("{my_prefix}.{field_name}")
+    };
+    let rest = name.strip_prefix(&key_prefix)?.strip_prefix('.')?;
+    let (hm_key, inner_suffix) = rest.split_once('.')?;
+    let inner_name = if inner_prefix.is_empty() {
+        inner_suffix.to_string()
+    } else {
+        format!("{inner_prefix}.{inner_suffix}")
+    };
+    Some((hm_key, inner_name))
+}
+
 /// Return a comma-separated string of valid enum variant names for display in error messages.
 #[cfg(feature = "schema-export")]
 pub fn enum_variants<T: schemars::JsonSchema>() -> String {
@@ -40,15 +68,17 @@ pub fn enum_variants<T: schemars::JsonSchema>() -> String {
 }
 
 /// Build a `PropFieldInfo` by reading the display value from a serialized TOML table.
+#[allow(clippy::too_many_arguments)]
 pub fn make_prop_field(
     table: Option<&toml::Table>,
-    name: &'static str,
+    name: &str,
     serde_name: &str,
     category: &'static str,
     type_hint: &'static str,
     kind: PropKind,
     is_secret: bool,
     enum_variants: Option<fn() -> Vec<String>>,
+    description: &'static str,
 ) -> PropFieldInfo {
     let display_value = if is_secret {
         match table.and_then(|t| t.get(serde_name)) {
@@ -62,13 +92,14 @@ pub fn make_prop_field(
         toml_value_to_display(table.and_then(|t| t.get(serde_name)))
     };
     PropFieldInfo {
-        name,
+        name: name.to_string(),
         category,
         display_value,
         type_hint,
         kind,
         is_secret,
         enum_variants,
+        description,
     }
 }
 
@@ -146,6 +177,16 @@ fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Val
         }
         PropKind::String | PropKind::Enum => Ok(toml::Value::String(value_str.to_string())),
         PropKind::StringArray => {
+            let trimmed = value_str.trim();
+            // Accept JSON/TOML array syntax: ["a", "b", "c"]
+            if trimmed.starts_with('[')
+                && let Ok(arr) = serde_json::from_str::<Vec<String>>(trimmed)
+            {
+                return Ok(toml::Value::Array(
+                    arr.into_iter().map(toml::Value::String).collect(),
+                ));
+            }
+            // Fall back to comma-separated input.
             let items = value_str
                 .split(',')
                 .map(|s| toml::Value::String(s.trim().to_string()))

@@ -19,7 +19,7 @@ the logged-in account, in the first-person voice of that reviewer — never as
 Read these files at the start of every session. They are authoritative.
 
 - `AGENTS.md` — risk tiers, high-risk paths, anti-patterns, commands
-- `docs/contributing/pr-review-prompt.md` — **the full review protocol**;
+- `docs/book/src/contributing/pr-review-protocol.md` — **the full review protocol**;
   follow it exactly for every PR
 - `.github/pull_request_template.md` — required PR body sections; used to
   check template completeness
@@ -74,7 +74,7 @@ is 1234 ready to merge
 
 ### Phase 2 — Execute the protocol
 
-Follow `docs/contributing/pr-review-prompt.md` exactly for every PR.
+Follow `docs/book/src/contributing/pr-review-protocol.md` exactly for every PR.
 
 The protocol specifies:
 - **What to fetch** (PR metadata, comments, inline threads, formal reviews,
@@ -142,7 +142,7 @@ These norms come from FND-005 (#5615). Read it.
 
 1. **Always read `tmp/handoff.md` first.** Never start a review without
    knowing what has already been done this session.
-2. **Always follow the protocol in `pr-review-prompt.md`.** Do not
+2. **Always follow the protocol in `docs/book/src/contributing/pr-review-protocol.md`.** Do not
    improvise the fetch sequence or skip the RFC step.
 3. **Always write to `tmp/review-<number>.md` before posting.** The tmp
    file is the source of truth for what was posted. It also lets you
