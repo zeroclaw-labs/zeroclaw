@@ -26,7 +26,7 @@ impl QdrantMemory {
     /// Create a new Qdrant memory backend.
     ///
     /// # Arguments
-    /// * `url` - Qdrant server URL (e.g., "http://localhost:6333")
+    /// * `url` - Qdrant server URL (e.g., `"http://localhost:6333"`)
     /// * `collection` - Collection name for storing memories
     /// * `api_key` - Optional API key for Qdrant Cloud
     /// * `embedder` - Embedding provider for vector conversion

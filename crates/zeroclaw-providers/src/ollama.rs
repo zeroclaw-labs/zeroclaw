@@ -7,6 +7,16 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Matches Ollama's upstream Modelfile default
+/// (<https://docs.ollama.com/modelfile>): "Increasing the temperature will
+/// make the model answer more creatively. (Default: 0.8)".
+const TEMPERATURE_DEFAULT: f64 = 0.8;
+/// Local inference is CPU/GPU-bound; give it more headroom than cloud calls.
+const TIMEOUT_SECS_DEFAULT: u64 = 600;
+/// Ollama's standard localhost endpoint. Overrideable via
+/// `providers.models.<name>.base-url` for remote GPU boxes or non-default ports.
+const BASE_URL: &str = "http://localhost:11434";
+
 pub struct OllamaProvider {
     base_url: String,
     api_key: Option<String>,
@@ -141,7 +151,7 @@ impl OllamaProvider {
         });
 
         Self {
-            base_url: Self::normalize_base_url(base_url.unwrap_or("http://localhost:11434")),
+            base_url: Self::normalize_base_url(base_url.unwrap_or(BASE_URL)),
             api_key,
             reasoning_enabled,
         }
@@ -625,6 +635,19 @@ impl OllamaProvider {
 
 #[async_trait]
 impl Provider for OllamaProvider {
+    // ── Provider-family defaults ──
+    fn default_temperature(&self) -> f64 {
+        TEMPERATURE_DEFAULT
+    }
+
+    fn default_timeout_secs(&self) -> u64 {
+        TIMEOUT_SECS_DEFAULT
+    }
+
+    fn default_base_url(&self) -> Option<&str> {
+        Some(BASE_URL)
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: false,
@@ -638,8 +661,9 @@ impl Provider for OllamaProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
 
         let mut messages = Vec::new();
@@ -694,8 +718,9 @@ impl Provider for OllamaProvider {
         &self,
         messages: &[crate::traits::ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
 
         let api_messages = self.convert_messages(messages);
@@ -738,8 +763,9 @@ impl Provider for OllamaProvider {
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let (normalized_model, should_auth) = self.resolve_request_details(model)?;
 
         let api_messages = self.convert_messages(messages);
@@ -834,7 +860,7 @@ impl Provider for OllamaProvider {
         &self,
         request: zeroclaw_api::provider::ChatRequest<'_>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         // Convert ToolSpec to OpenAI-compatible JSON and delegate to chat_with_tools.
         if let Some(specs) = request.tools
@@ -870,6 +896,31 @@ impl Provider for OllamaProvider {
             usage: None,
             reasoning_content: None,
         })
+    }
+
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        // Local Ollama's /api/tags lists installed models and requires no auth.
+        // Remote Ollama endpoints attach the Bearer key; local ones don't.
+        let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
+        let mut request = self.http_client().get(&url);
+        if !self.is_local_endpoint()
+            && let Some(key) = self.api_key.as_deref()
+        {
+            request = request.header("Authorization", format!("Bearer {key}"));
+        }
+        let response = request.send().await?.error_for_status()?;
+
+        #[derive(Deserialize)]
+        struct Resp {
+            models: Vec<Entry>,
+        }
+        #[derive(Deserialize)]
+        struct Entry {
+            name: String,
+        }
+
+        let body: Resp = response.json().await?;
+        Ok(body.models.into_iter().map(|e| e.name).collect())
     }
 }
 

@@ -42,7 +42,7 @@ pub struct ClaudeCodeHookEvent {
 pub struct ClaudeCodeRunnerTool {
     security: Arc<SecurityPolicy>,
     config: ClaudeCodeRunnerConfig,
-    /// Base URL of the ZeroClaw gateway (e.g. "http://localhost:3000").
+    /// Base URL of the ZeroClaw gateway (e.g. `"http://localhost:3000"`).
     gateway_url: String,
 }
 

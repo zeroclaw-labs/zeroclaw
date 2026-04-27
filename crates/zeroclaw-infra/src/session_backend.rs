@@ -44,6 +44,20 @@ pub trait SessionBackend: Send + Sync {
     /// Remove the last message from a session. Returns `true` if a message was removed.
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool>;
 
+    /// Update the content of the last message in a session. Used for incremental
+    /// persistence of streaming responses — append a placeholder first, then
+    /// update_last periodically as more content arrives. Returns `false` if
+    /// the session is empty. Default implementation is remove_last + append
+    /// (backends can override for efficiency).
+    fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
+        if self.remove_last(session_key)? {
+            self.append(session_key, message)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// List all session keys.
     fn list_sessions(&self) -> Vec<String>;
 
@@ -93,6 +107,26 @@ pub trait SessionBackend: Send + Sync {
     /// Get the human-readable name for a session (if set).
     fn get_session_name(&self, _session_key: &str) -> std::io::Result<Option<String>> {
         Ok(None)
+    }
+
+    /// Look up metadata for a single session by key.
+    ///
+    /// The default impl loads all messages to derive the count and calls
+    /// `get_session_name` for the name. `created_at` and `last_activity` are
+    /// set to `Utc::now()` at call time — backends with stored timestamps
+    /// (e.g. SQLite) should override this method.
+    fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
+        let messages = self.load(session_key);
+        if messages.is_empty() {
+            return None;
+        }
+        Some(SessionMetadata {
+            key: session_key.to_string(),
+            name: self.get_session_name(session_key).ok().flatten(),
+            created_at: Utc::now(),
+            last_activity: Utc::now(),
+            message_count: messages.len(),
+        })
     }
 
     /// Set the session state (e.g. "idle", "running", "error").

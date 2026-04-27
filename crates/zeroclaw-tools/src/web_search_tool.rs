@@ -19,7 +19,7 @@ pub struct WebSearchTool {
     provider: String,
     /// Boot-time key snapshot (may be `None` if not yet configured at startup).
     boot_brave_api_key: Option<String>,
-    /// SearXNG instance base URL (e.g. "https://searx.example.com").
+    /// SearXNG instance base URL (e.g. `"https://searx.example.com"`).
     searxng_instance_url: Option<String>,
     max_results: usize,
     timeout_secs: u64,

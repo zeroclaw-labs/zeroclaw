@@ -1,14 +1,14 @@
 //! Tool subsystem for agent-callable capabilities.
 //!
 //! This module implements the tool execution surface exposed to the LLM during
-//! agentic loops. Each tool implements the [`Tool`] trait defined in [`traits`],
-//! which requires a name, description, JSON parameter schema, and an async
-//! `execute` method returning a structured [`ToolResult`].
+//! agentic loops. Each tool implements the [`Tool`] trait defined in the
+//! `traits` submodule, which requires a name, description, JSON parameter
+//! schema, and an async `execute` method returning a structured [`ToolResult`].
 //!
 //! Tools are assembled into registries by [`default_tools`] (shell, file read/write)
 //! and [`all_tools`] (full set including memory, browser, cron, HTTP, delegation,
 //! and optional integrations). Security policy enforcement is injected via
-//! [`SecurityPolicy`](crate::security::SecurityPolicy) at construction time.
+//! [`SecurityPolicy`] at construction time.
 //!
 //! # Extension
 //!
@@ -98,7 +98,9 @@ pub use zeroclaw_tools::pushover::PushoverTool;
 pub use zeroclaw_tools::reaction::ReactionTool;
 pub use zeroclaw_tools::report_template_tool::ReportTemplateTool;
 pub use zeroclaw_tools::screenshot::ScreenshotTool;
-pub use zeroclaw_tools::sessions::{SessionsHistoryTool, SessionsListTool, SessionsSendTool};
+pub use zeroclaw_tools::sessions::{
+    SessionDeleteTool, SessionResetTool, SessionsHistoryTool, SessionsListTool, SessionsSendTool,
+};
 pub use zeroclaw_tools::swarm::SwarmTool;
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
@@ -681,6 +683,13 @@ pub fn all_tools_with_runtime(
             security.clone(),
         )));
         tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+        // NOTE: SessionResetTool and SessionDeleteTool are available via
+        // zeroclaw_tools::sessions but NOT registered by default. They are
+        // destructive operations (clear/delete conversation history) and
+        // should only be enabled by callers that explicitly need them
+        // (e.g., orchestration dashboards). To enable:
+        //   tool_arcs.push(Arc::new(SessionResetTool::new(backend.clone(), security.clone())));
+        //   tool_arcs.push(Arc::new(SessionDeleteTool::new(backend, security.clone())));
     }
 
     // LinkedIn integration (config-gated)

@@ -24,8 +24,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{Mutex, OnceCell, RwLock, mpsc};
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use tokio::sync::{Mutex, OnceCell, RwLock, mpsc, oneshot};
+use zeroclaw_api::channel::{
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+};
 
 /// Matrix channel for Matrix Client-Server API.
 /// Uses matrix-sdk for reliable sync and encrypted-room decryption.
@@ -61,6 +63,10 @@ pub struct MatrixChannel {
     multi_message_sent_len: Arc<Mutex<HashMap<String, usize>>>,
     /// Thread context captured from `send_draft()` for MultiMessage paragraph delivery.
     multi_message_thread_ts: Arc<Mutex<HashMap<String, Option<String>>>>,
+    pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    /// Seconds to wait for an operator reply to a `request_approval` prompt
+    /// before treating the silence as a deny. Default 300.
+    approval_timeout_secs: u64,
 }
 
 impl std::fmt::Debug for MatrixChannel {
@@ -269,7 +275,14 @@ impl MatrixChannel {
             last_draft_edit: Arc::new(Mutex::new(HashMap::new())),
             multi_message_sent_len: Arc::new(Mutex::new(HashMap::new())),
             multi_message_thread_ts: Arc::new(Mutex::new(HashMap::new())),
+            pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+            approval_timeout_secs: 300,
         }
+    }
+
+    pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
+        self.approval_timeout_secs = secs;
+        self
     }
 
     /// Extract body text and media source from a message type.
@@ -1025,6 +1038,36 @@ impl Channel for MatrixChannel {
         Ok(())
     }
 
+    async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        let token = crate::util::new_approval_token();
+        let (tx_approval, rx_approval) = oneshot::channel();
+        {
+            let mut map = self.pending_approvals.lock().await;
+            map.insert(token.clone(), tx_approval);
+        }
+
+        let text = format!(
+            "APPROVAL REQUIRED [{}]\nTool: {}\nArgs: {}\n\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
+            token, request.tool_name, request.arguments_summary, token, token, token
+        );
+        self.send(&SendMessage::new(text, recipient)).await?;
+
+        let timeout = std::time::Duration::from_secs(self.approval_timeout_secs);
+        let response = match tokio::time::timeout(timeout, rx_approval).await {
+            Ok(Ok(response)) => response,
+            _ => {
+                let mut map = self.pending_approvals.lock().await;
+                map.remove(&token);
+                ChannelApprovalResponse::Deny
+            }
+        };
+        Ok(Some(response))
+    }
+
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         if self.otk_conflict_detected.load(Ordering::Relaxed) {
             tracing::debug!("Matrix OTK conflict flag is set, refusing listen");
@@ -1082,6 +1125,7 @@ impl Channel for MatrixChannel {
         let voice_mode_for_handler = Arc::clone(&self.voice_mode);
         let transcription_mgr_for_handler = self.transcription_manager.clone();
         let mention_only_for_handler = self.mention_only;
+        let pending_approvals_for_handler = Arc::clone(&self.pending_approvals);
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
@@ -1094,6 +1138,7 @@ impl Channel for MatrixChannel {
             let voice_mode = Arc::clone(&voice_mode_for_handler);
             let transcription_mgr = transcription_mgr_for_handler.clone();
             let mention_only = mention_only_for_handler;
+            let pending_approvals = Arc::clone(&pending_approvals_for_handler);
 
             async move {
                 // Room filtering: use allowed_rooms if set, otherwise fall back to single room_id
@@ -1279,6 +1324,14 @@ impl Channel for MatrixChannel {
                 // Start typing notification while processing begins
                 if let Err(error) = room.typing_notice(true).await {
                     tracing::warn!("Matrix failed to start typing notification: {error}");
+                }
+
+                if let Some((token, response)) = crate::util::parse_approval_reply(&body) {
+                    let mut map = pending_approvals.lock().await;
+                    if let Some(sender) = map.remove(&token) {
+                        let _ = sender.send(response);
+                        return;
+                    }
                 }
 
                 let thread_ts = match &event.content.relates_to {
@@ -2624,5 +2677,20 @@ mod tests {
         let (body, media) = MatrixChannel::extract_media_info(&msgtype);
         assert_eq!(body, "hello world");
         assert!(media.is_none());
+    }
+
+    #[test]
+    fn pending_approvals_map_is_initially_empty() {
+        let ch = make_channel();
+        let map = ch.pending_approvals.blocking_lock();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn approval_timeout_defaults_to_300_and_is_overridable() {
+        let ch = make_channel();
+        assert_eq!(ch.approval_timeout_secs, 300);
+        let ch2 = ch.with_approval_timeout_secs(60);
+        assert_eq!(ch2.approval_timeout_secs, 60);
     }
 }

@@ -2,8 +2,9 @@
 //!
 //! This module provides the multi-channel messaging infrastructure that connects
 //! ZeroClaw to external platforms. Each channel implements the [`Channel`] trait
-//! defined in [`traits`], which provides a uniform interface for sending messages,
-//! listening for incoming messages, health checking, and typing indicators.
+//! defined in the `traits` submodule, which provides a uniform interface for
+//! sending messages, listening for incoming messages, health checking, and typing
+//! indicators.
 //!
 //! Channels are instantiated by [`start_channels`] based on the runtime configuration.
 //! The subsystem manages per-sender conversation history, concurrent message processing
@@ -2055,7 +2056,7 @@ async fn classify_channel_reply_intent(
     }
 
     let response = provider
-        .chat_with_system(Some(system_prompt), &convo, model, temperature)
+        .chat_with_system(Some(system_prompt), &convo, model, Some(temperature))
         .await?;
     let trimmed = response.trim();
     if trimmed.is_empty() {
@@ -3951,7 +3952,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     dc.multi_message_delay_ms,
                 )
                 .with_transcription(config.transcription.clone())
-                .with_stall_timeout(dc.stall_timeout_secs),
+                .with_stall_timeout(dc.stall_timeout_secs)
+                .with_approval_timeout_secs(dc.approval_timeout_secs),
             ))
         }
         "slack" => {
@@ -3971,7 +3973,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .with_markdown_blocks(sl.use_markdown_blocks)
                 .with_transcription(config.transcription.clone())
                 .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
-                .with_cancel_reaction(sl.cancel_reaction.clone()),
+                .with_cancel_reaction(sl.cancel_reaction.clone())
+                .with_approval_timeout_secs(sl.approval_timeout_secs),
             ))
         }
         "mattermost" => {
@@ -3995,14 +3998,17 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .signal
                 .as_ref()
                 .context("Signal channel is not configured")?;
-            Ok(Arc::new(SignalChannel::new(
-                sg.http_url.clone(),
-                sg.account.clone(),
-                sg.group_id.clone(),
-                sg.allowed_from.clone(),
-                sg.ignore_attachments,
-                sg.ignore_stories,
-            )))
+            Ok(Arc::new(
+                SignalChannel::new(
+                    sg.http_url.clone(),
+                    sg.account.clone(),
+                    sg.group_id.clone(),
+                    sg.allowed_from.clone(),
+                    sg.ignore_attachments,
+                    sg.ignore_stories,
+                )
+                .with_approval_timeout_secs(sg.approval_timeout_secs),
+            ))
         }
         "matrix" => {
             #[cfg(feature = "channel-matrix")]
@@ -4012,14 +4018,17 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     .matrix
                     .as_ref()
                     .context("Matrix channel is not configured")?;
-                Ok(Arc::new(MatrixChannel::new(
-                    mx.homeserver.clone(),
-                    mx.access_token.clone(),
-                    // "" sentinel = no specific room (join logic handles "allow all")
-                    mx.allowed_rooms.first().cloned().unwrap_or_default(),
-                    mx.allowed_users.clone(),
-                    mx.mention_only,
-                )))
+                Ok(Arc::new(
+                    MatrixChannel::new(
+                        mx.homeserver.clone(),
+                        mx.access_token.clone(),
+                        // "" sentinel = no specific room (join logic handles "allow all")
+                        mx.allowed_rooms.first().cloned().unwrap_or_default(),
+                        mx.allowed_users.clone(),
+                        mx.mention_only,
+                    )
+                    .with_approval_timeout_secs(mx.approval_timeout_secs),
+                ))
             }
             #[cfg(not(feature = "channel-matrix"))]
             {
@@ -4336,8 +4345,10 @@ struct ConfiguredChannel {
 fn collect_configured_channels(
     config: &Config,
     matrix_skip_context: &str,
+    tool_specs: &[(String, String)],
 ) -> Vec<ConfiguredChannel> {
     let _ = matrix_skip_context;
+    let _ = tool_specs;
     let mut channels = Vec::new();
 
     #[cfg(feature = "channel-telegram")]
@@ -4358,6 +4369,7 @@ fn collect_configured_channels(
                     .with_tts(config.tts.clone())
                     .with_workspace_dir(config.workspace_dir.clone())
                     .with_proxy_url(tg.proxy_url.clone())
+                    .with_tool_command_specs(tool_specs.to_vec())
                     .with_approval_timeout_secs(tg.approval_timeout_secs),
                 ),
             });
@@ -4385,7 +4397,8 @@ fn collect_configured_channels(
                     )
                     .with_proxy_url(dc.proxy_url.clone())
                     .with_transcription(config.transcription.clone())
-                    .with_stall_timeout(dc.stall_timeout_secs),
+                    .with_stall_timeout(dc.stall_timeout_secs)
+                    .with_approval_timeout_secs(dc.approval_timeout_secs),
                 ),
             });
         } else {
@@ -4440,7 +4453,8 @@ fn collect_configured_channels(
                     .with_proxy_url(sl.proxy_url.clone())
                     .with_transcription(config.transcription.clone())
                     .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
-                    .with_cancel_reaction(sl.cancel_reaction.clone()),
+                    .with_cancel_reaction(sl.cancel_reaction.clone())
+                    .with_approval_timeout_secs(sl.approval_timeout_secs),
                 ),
             });
         } else {
@@ -4505,7 +4519,8 @@ fn collect_configured_channels(
                         mx.draft_update_interval_ms,
                         mx.multi_message_delay_ms,
                     )
-                    .with_transcription(config.transcription.clone()),
+                    .with_transcription(config.transcription.clone())
+                    .with_approval_timeout_secs(mx.approval_timeout_secs),
                 ),
             });
         } else {
@@ -4534,7 +4549,8 @@ fn collect_configured_channels(
                         sig.ignore_attachments,
                         sig.ignore_stories,
                     )
-                    .with_proxy_url(sig.proxy_url.clone()),
+                    .with_proxy_url(sig.proxy_url.clone())
+                    .with_approval_timeout_secs(sig.approval_timeout_secs),
                 ),
             });
         } else {
@@ -4565,7 +4581,8 @@ fn collect_configured_channels(
                                 )
                                 .with_proxy_url(wa.proxy_url.clone())
                                 .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
-                                .with_group_mention_patterns(wa.group_mention_patterns.clone()),
+                                .with_group_mention_patterns(wa.group_mention_patterns.clone())
+                                .with_approval_timeout_secs(wa.approval_timeout_secs),
                             ),
                         });
                     } else {
@@ -4844,15 +4861,19 @@ fn collect_configured_channels(
     }
 
     if let Some(ref mc) = config.channels.mochat {
-        channels.push(ConfiguredChannel {
-            display_name: "Mochat",
-            channel: Arc::new(MochatChannel::new(
-                mc.api_url.clone(),
-                mc.api_token.clone(),
-                mc.allowed_users.clone(),
-                mc.poll_interval_secs,
-            )),
-        });
+        if mc.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "Mochat",
+                channel: Arc::new(MochatChannel::new(
+                    mc.api_url.clone(),
+                    mc.api_token.clone(),
+                    mc.allowed_users.clone(),
+                    mc.poll_interval_secs,
+                )),
+            });
+        } else {
+            tracing::info!("Mochat channel configured but disabled (enabled = false)");
+        }
     }
 
     if let Some(ref wc) = config.channels.wecom {
@@ -4978,7 +4999,7 @@ fn collect_configured_channels(
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
     #[allow(unused_mut)]
-    let mut channels = collect_configured_channels(&config, "health check");
+    let mut channels = collect_configured_channels(&config, "health check", &[]);
 
     #[cfg(feature = "channel-nostr")]
     if let Some(ref ns) = config.channels.nostr {
@@ -5214,18 +5235,22 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // appear in the system prompt but return "Unknown tool" when called.
     zeroclaw_runtime::tools::register_skill_tools(&mut built_tools, &skills, security.clone());
 
+    // Extract (name, description) specs from built tools for channel command registration.
+    let tool_specs: Vec<(String, String)> = built_tools
+        .iter()
+        .map(|t| (t.name().to_string(), t.description().to_string()))
+        .collect();
+
     let tools_registry = Arc::new(built_tools);
 
-    // ── Load locale-aware tool descriptions ────────────────────────
+    // ── Initialize locale-aware tool descriptions ──────────────────
     let i18n_locale = config
         .locale
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(zeroclaw_runtime::i18n::detect_locale);
-    let i18n_search_dirs = zeroclaw_runtime::i18n::default_search_dirs(&workspace);
-    let i18n_descs =
-        zeroclaw_runtime::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+    zeroclaw_runtime::i18n::init(&i18n_locale);
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -5321,10 +5346,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         config.agent.max_system_prompt_chars,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(
-            tools_registry.as_ref(),
-            Some(&i18n_descs),
-        ));
+        system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
     }
 
     // Append deferred MCP tool names so the LLM knows what is available
@@ -5347,7 +5369,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Collect active channels from a shared builder to keep startup and doctor parity.
     #[allow(unused_mut)]
     let mut channels: Vec<Arc<dyn Channel>> =
-        collect_configured_channels(&config, "runtime startup")
+        collect_configured_channels(&config, "runtime startup", &tool_specs)
             .into_iter()
             .map(|configured| configured.channel)
             .collect();
@@ -5597,7 +5619,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 (k, mt)
             })
             .collect();
-        keyed.sort_by(|a, b| b.1.cmp(&a.1));
+        keyed.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         keyed.truncate(MAX_CONVERSATION_SENDERS);
         let session_keys: Vec<String> = keyed.into_iter().map(|(k, _)| k).collect();
 
@@ -6466,7 +6488,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("ok".to_string())
         }
@@ -6483,7 +6505,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("NO_REPLY: not addressed to agent".to_string())
         }
@@ -6498,7 +6520,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("ok".to_string())
         }
@@ -6507,7 +6529,7 @@ mod tests {
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             if messages
                 .iter()
@@ -6672,7 +6694,7 @@ mod tests {
             _system_prompt: Option<&str>,
             message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             tokio::time::sleep(self.delay).await;
             Ok(format!("echo: {message}"))
@@ -6702,7 +6724,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(tool_call_payload())
         }
@@ -6711,7 +6733,7 @@ mod tests {
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let has_tool_results = messages
                 .iter()
@@ -6733,7 +6755,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(tool_call_payload_with_alias_tag())
         }
@@ -6742,7 +6764,7 @@ mod tests {
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let has_tool_results = messages
                 .iter()
@@ -6764,7 +6786,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("fallback".to_string())
         }
@@ -6773,7 +6795,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(r#"{"name":"mock_price","parameters":{"symbol":"BTC"}}
 {"result":{"symbol":"BTC","price_usd":65000}}
@@ -6802,7 +6824,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok(tool_call_payload())
         }
@@ -6811,7 +6833,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let completed_iterations = Self::completed_tool_iterations(messages);
             if completed_iterations >= self.required_tool_iterations {
@@ -6836,7 +6858,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("fallback".to_string())
         }
@@ -6845,7 +6867,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let snapshot = messages
                 .iter()
@@ -6869,7 +6891,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("fallback".to_string())
         }
@@ -6878,7 +6900,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &self,
             messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let snapshot = messages
                 .iter()
@@ -6909,7 +6931,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             Ok("fallback".to_string())
         }
@@ -6918,7 +6940,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &self,
             _messages: &[ChatMessage],
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             self.models
@@ -8931,7 +8953,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "build_system_prompt should not emit protocol block directly"
         );
 
-        prompt.push_str(&build_tool_instructions(&[], None));
+        prompt.push_str(&build_tool_instructions(&[]));
 
         assert_eq!(
             prompt.matches("## Tool Use Protocol").count(),
@@ -10416,7 +10438,7 @@ This is an example JSON object for profile settings."#;
             proxy_url: None,
         });
 
-        let channels = collect_configured_channels(&config, "test");
+        let channels = collect_configured_channels(&config, "test", &[]);
 
         assert!(
             channels
@@ -10439,7 +10461,7 @@ This is an example JSON object for profile settings."#;
             ..Default::default()
         });
 
-        let channels = collect_configured_channels(&config, "test");
+        let channels = collect_configured_channels(&config, "test", &[]);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Email"),
             "disabled email should not be collected"
@@ -10455,7 +10477,7 @@ This is an example JSON object for profile settings."#;
             ..Default::default()
         });
 
-        let channels = collect_configured_channels(&config, "test");
+        let channels = collect_configured_channels(&config, "test", &[]);
         assert!(
             !channels
                 .iter()
