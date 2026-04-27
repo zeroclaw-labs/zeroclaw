@@ -6649,6 +6649,9 @@ pub struct ChannelsConfig {
     /// WeCom (WeChat Enterprise) Bot Webhook channel configuration.
     #[nested]
     pub wecom: Option<WeComConfig>,
+    /// WeChat personal account (iLink Bot) channel configuration.
+    #[nested]
+    pub wechat: Option<WeChatConfig>,
     /// QQ Official Bot channel configuration.
     #[nested]
     pub qq: Option<QQConfig>,
@@ -6822,6 +6825,10 @@ impl ChannelsConfig {
                 self.wecom.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.wechat.as_ref())),
+                self.wechat.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.qq.as_ref())),
                 self.qq.is_some()
             ),
@@ -6897,6 +6904,7 @@ impl Default for ChannelsConfig {
             feishu: None,
             dingtalk: None,
             wecom: None,
+            wechat: None,
             qq: None,
             twitter: None,
             mochat: None,
@@ -8641,6 +8649,35 @@ impl ChannelConfig for WeComConfig {
     }
     fn desc() -> &'static str {
         "WeCom Bot Webhook"
+    }
+}
+
+/// WeChat personal account (iLink Bot) channel configuration.
+///
+/// Requires running `wechat-agent login` first to save credentials to
+/// `~/.openclaw/openclaw-weixin/accounts/<account_id>.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.wechat"]
+pub struct WeChatConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Account ID returned by `wechat-agent login`. Credentials (bot_token, base_url)
+    /// are loaded from `~/.openclaw/openclaw-weixin/accounts/<account_id>.json`.
+    #[serde(default)]
+    pub account_id: String,
+    /// Allowed WeChat iLink user IDs. Empty = deny all, "*" = allow all.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
+impl ChannelConfig for WeChatConfig {
+    fn name() -> &'static str {
+        "WeChat"
+    }
+    fn desc() -> &'static str {
+        "WeChat personal account via iLink Bot"
     }
 }
 
@@ -11999,6 +12036,7 @@ auto_save = true
                 feishu: None,
                 dingtalk: None,
                 wecom: None,
+                wechat: None,
                 qq: None,
                 twitter: None,
                 mochat: None,
@@ -13162,6 +13200,7 @@ allowed_users = ["@u:matrix.org"]
             feishu: None,
             dingtalk: None,
             wecom: None,
+            wechat: None,
             qq: None,
             twitter: None,
             mochat: None,
@@ -13543,6 +13582,7 @@ bot_token = "xoxb-tok"
             feishu: None,
             dingtalk: None,
             wecom: None,
+            wechat: None,
             qq: None,
             twitter: None,
             mochat: None,
