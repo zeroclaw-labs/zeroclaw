@@ -933,32 +933,82 @@ impl Channel for MatrixChannel {
             room.send(content).await?;
         }
 
+        let outbound_workspace = std::path::PathBuf::from(
+            shellexpand::tilde(
+                &std::env::var("ZEROCLAW_WORKSPACE")
+                    .unwrap_or_else(|_| "/tmp/zeroclaw-uploads".to_string()),
+            )
+            .as_ref(),
+        );
+        let _ = tokio::fs::create_dir_all(&outbound_workspace).await;
+        let outbound_workspace_root = tokio::fs::canonicalize(&outbound_workspace)
+            .await
+            .unwrap_or_else(|_| outbound_workspace.clone());
+
         for (_kind, target) in &attachments {
             let path = std::path::Path::new(target.as_str());
-            if let Ok(data) = tokio::fs::read(path).await {
-                let mime = mime_guess::from_path(path).first_or_octet_stream();
-                let name = path
-                    .file_name()
-                    .unwrap_or(path.as_os_str())
-                    .to_string_lossy();
-                let mut attachment_config = matrix_sdk::attachment::AttachmentConfig::new();
-                if let Some(ref thread_ts) = message.thread_ts
-                    && let Ok(event_id) = thread_ts.parse::<OwnedEventId>()
-                {
-                    attachment_config =
-                        attachment_config.reply(Some(matrix_sdk::room::reply::Reply {
-                            event_id,
-                            enforce_thread: matrix_sdk::room::reply::EnforceThread::Threaded(
-                                ReplyWithinThread::Yes,
-                            ),
-                        }));
+            if !path.is_absolute() {
+                tracing::warn!(
+                    target = %target,
+                    "Matrix: outbound attachment refused (path must be absolute in workspace)"
+                );
+                continue;
+            }
+
+            let canonical_path = match tokio::fs::canonicalize(path).await {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    tracing::warn!(
+                        target = %target,
+                        err = %e,
+                        "Matrix: outbound attachment read failed"
+                    );
+                    continue;
                 }
-                if let Err(e) = room
-                    .send_attachment(&*name, &mime, data, attachment_config)
-                    .await
-                {
-                    tracing::warn!(file = %name, err = %e, "Matrix: attachment upload failed");
+            };
+
+            if !canonical_path.starts_with(&outbound_workspace_root) {
+                tracing::warn!(
+                    target = %target,
+                    workspace = %outbound_workspace_root.display(),
+                    "Matrix: outbound attachment refused (outside workspace)"
+                );
+                continue;
+            }
+
+            let data = match tokio::fs::read(&canonical_path).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(
+                        target = %canonical_path.display(),
+                        err = %e,
+                        "Matrix: outbound attachment read failed"
+                    );
+                    continue;
                 }
+            };
+
+            let mime = mime_guess::from_path(&canonical_path).first_or_octet_stream();
+            let name = canonical_path
+                .file_name()
+                .unwrap_or(canonical_path.as_os_str())
+                .to_string_lossy();
+            let mut attachment_config = matrix_sdk::attachment::AttachmentConfig::new();
+            if let Some(ref thread_ts) = message.thread_ts
+                && let Ok(event_id) = thread_ts.parse::<OwnedEventId>()
+            {
+                attachment_config = attachment_config.reply(Some(matrix_sdk::room::reply::Reply {
+                    event_id,
+                    enforce_thread: matrix_sdk::room::reply::EnforceThread::Threaded(
+                        ReplyWithinThread::Yes,
+                    ),
+                }));
+            }
+            if let Err(e) = room
+                .send_attachment(&*name, &mime, data, attachment_config)
+                .await
+            {
+                tracing::warn!(file = %name, err = %e, "Matrix: attachment upload failed");
             }
         }
 
