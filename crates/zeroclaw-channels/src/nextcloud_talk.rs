@@ -450,7 +450,7 @@ impl NextcloudTalkChannel {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            tracing::error!("Nextcloud Talk send_draft failed: {status} — {body}");
+            tracing::warn!("Nextcloud Talk send_to_room_with_id failed: {status} — {body}");
             anyhow::bail!("Nextcloud Talk API error: {status}");
         }
 
