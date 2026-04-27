@@ -25,10 +25,7 @@ enum SessionValidationError {
 impl SessionValidationError {
     fn message(self) -> &'static str {
         match self {
-            SessionValidationError::Empty => {
-                "Invalid 'session_id': must be non-empty and contain at least one alphanumeric character."
-            }
-            SessionValidationError::NoAlphanumeric => {
+            Self::Empty | Self::NoAlphanumeric => {
                 "Invalid 'session_id': must be non-empty and contain at least one alphanumeric character."
             }
         }
@@ -561,6 +558,20 @@ mod tests {
     #[test]
     fn validate_session_id_accepts_valid_id() {
         assert_eq!(validate_session_id("test_session_id"), Ok(()));
+    }
+
+    #[test]
+    fn validation_error_message_starts_with_invalid() {
+        assert!(
+            SessionValidationError::Empty
+                .message()
+                .starts_with("Invalid")
+        );
+        assert!(
+            SessionValidationError::NoAlphanumeric
+                .message()
+                .starts_with("Invalid")
+        );
     }
 
     // ── SessionsListTool tests ──────────────────────────────────────
