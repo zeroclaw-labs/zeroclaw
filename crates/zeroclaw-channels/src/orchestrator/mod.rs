@@ -4948,12 +4948,12 @@ fn collect_configured_channels(
     }
 
     #[cfg(not(feature = "channel-wechat"))]
-    if let Some(ref wechat) = config.channels.wechat {
-        if wechat.enabled {
-            tracing::warn!(
-                "WeChat channel is configured but this build was compiled without `channel-wechat`; skipping WeChat {matrix_skip_context}."
-            );
-        }
+    if let Some(ref wechat) = config.channels.wechat
+        && wechat.enabled
+    {
+        tracing::warn!(
+            "WeChat channel is configured but this build was compiled without `channel-wechat`; skipping WeChat {matrix_skip_context}."
+        );
     }
 
     if let Some(ref ct) = config.channels.clawdtalk {
