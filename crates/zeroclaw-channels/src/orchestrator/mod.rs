@@ -901,7 +901,10 @@ fn decrypt_optional_secret_for_runtime_reload(
 
 async fn load_runtime_defaults_from_config_file(
     path: &Path,
-) -> Result<(ChannelRuntimeDefaults, zeroclaw_providers::ProviderRuntimeOptions)> {
+) -> Result<(
+    ChannelRuntimeDefaults,
+    zeroclaw_providers::ProviderRuntimeOptions,
+)> {
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Failed to read {}", path.display()))?;

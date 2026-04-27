@@ -509,12 +509,7 @@ impl Provider for ReliableProvider {
                                     .first()
                                     .map(|(n, _)| n.as_str())
                                     .unwrap_or("");
-                                record_provider_fallback(
-                                    primary,
-                                    model,
-                                    provider_name,
-                                    eff_model,
-                                );
+                                record_provider_fallback(primary, model, provider_name, eff_model);
                             }
                             return Ok(resp);
                         }
@@ -661,12 +656,7 @@ impl Provider for ReliableProvider {
                                     .first()
                                     .map(|(n, _)| n.as_str())
                                     .unwrap_or("");
-                                record_provider_fallback(
-                                    primary,
-                                    model,
-                                    provider_name,
-                                    eff_model,
-                                );
+                                record_provider_fallback(primary, model, provider_name, eff_model);
                             }
                             return Ok(resp);
                         }
@@ -833,12 +823,7 @@ impl Provider for ReliableProvider {
                                     .first()
                                     .map(|(n, _)| n.as_str())
                                     .unwrap_or("");
-                                record_provider_fallback(
-                                    primary,
-                                    model,
-                                    provider_name,
-                                    eff_model,
-                                );
+                                record_provider_fallback(primary, model, provider_name, eff_model);
                             }
                             return Ok(resp);
                         }
@@ -992,12 +977,7 @@ impl Provider for ReliableProvider {
                                     .first()
                                     .map(|(n, _)| n.as_str())
                                     .unwrap_or("");
-                                record_provider_fallback(
-                                    primary,
-                                    model,
-                                    provider_name,
-                                    eff_model,
-                                );
+                                record_provider_fallback(primary, model, provider_name, eff_model);
                             }
                             return Ok(resp);
                         }
@@ -3067,7 +3047,10 @@ mod tests {
 
         let provider = ReliableProvider::new(
             vec![
-                ("primary".into(), Box::new(FailProvider) as Box<dyn Provider>),
+                (
+                    "primary".into(),
+                    Box::new(FailProvider) as Box<dyn Provider>,
+                ),
                 (
                     "fallback".into(),
                     Box::new(RecordingProvider {
@@ -3157,7 +3140,10 @@ mod tests {
 
         let provider = ReliableProvider::new(
             vec![
-                ("primary".into(), Box::new(FailProvider) as Box<dyn Provider>),
+                (
+                    "primary".into(),
+                    Box::new(FailProvider) as Box<dyn Provider>,
+                ),
                 (
                     "fallback".into(),
                     Box::new(RecordingProvider {
@@ -3195,8 +3181,7 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert("openai-codex:second".to_string(), "gpt-4o".to_string());
 
-        let provider = ReliableProvider::new(vec![], 0, 1)
-            .with_provider_model_overrides(overrides);
+        let provider = ReliableProvider::new(vec![], 0, 1).with_provider_model_overrides(overrides);
 
         // Full profile key → override applied
         assert_eq!(
