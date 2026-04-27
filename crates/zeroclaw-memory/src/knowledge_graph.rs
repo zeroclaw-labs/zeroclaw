@@ -395,7 +395,7 @@ impl KnowledgeGraph {
 
     /// Extract a subgraph starting from `root_id` up to `depth` hops.
     ///
-    /// `depth` must be between 1 and [`Self::MAX_SUBGRAPH_DEPTH`] (100).
+    /// `depth` must be between 1 and `MAX_SUBGRAPH_DEPTH` (100).
     /// Uses a recursive CTE for efficient single-query bidirectional traversal.
     pub fn get_subgraph(
         &self,
@@ -527,7 +527,7 @@ impl KnowledgeGraph {
             }
         }
         let mut top_tags: Vec<(String, usize)> = tag_counts.into_iter().collect();
-        top_tags.sort_by(|a, b| b.1.cmp(&a.1));
+        top_tags.sort_by_key(|tag| std::cmp::Reverse(tag.1));
         top_tags.truncate(10);
 
         Ok(GraphStats {
