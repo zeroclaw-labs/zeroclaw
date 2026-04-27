@@ -752,11 +752,14 @@ impl WeChatChannel {
             && !canonical.starts_with(&allowed)
         {
             tracing::warn!(
-                "WeChat: attachment path {} escapes workspace {}, blocking",
+                "WeChat: attachment path {} escapes workspace {}, rejected",
                 canonical.display(),
                 allowed.display()
             );
-            return workspace_dir.join("blocked_attachment");
+            return PathBuf::from(format!(
+                "/nonexistent/blocked_path_traversal_{}",
+                uuid::Uuid::new_v4()
+            ));
         }
 
         resolved
