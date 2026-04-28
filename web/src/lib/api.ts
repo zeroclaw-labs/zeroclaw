@@ -298,6 +298,96 @@ export function getOpenApiSchema(): Promise<unknown> {
   return apiFetch<unknown>('/api/openapi.json');
 }
 
+// ── Templates + map-key creation (issue #6175) ───────────────────────
+
+/**
+ * One addable shape — a HashMap<String, T> (Map) or Vec<T> (List) section
+ * the dashboard can render a "+ Add" affordance for. Discovered from the
+ * `Configurable` derive's `map_key_sections()`; never hand-listed.
+ */
+export interface TemplateEntry {
+  path: string;
+  /** 'map' for HashMap<String, T>; 'list' for Vec<T>. */
+  kind: 'map' | 'list';
+  /** Rust value type, for display only. */
+  value_type: string;
+  /** Doc comment from the schema field — describes what the user is adding. */
+  description: string;
+}
+
+export interface TemplatesResponse {
+  templates: TemplateEntry[];
+}
+
+export function getTemplates(): Promise<TemplatesResponse> {
+  return apiFetch<TemplatesResponse>('/api/config/templates');
+}
+
+export interface MapKeyResponse {
+  path: string;
+  key: string;
+  /** false for idempotent re-add on Map kinds; true on first creation. */
+  created: boolean;
+}
+
+/**
+ * Create a new entry under a map-keyed or list-shaped section. For Map
+ * kinds the `key` is the new HashMap key; for List kinds it's the new
+ * entry's natural identifier (e.g. `name` or `hint`).
+ */
+export function createMapKey(path: string, key: string): Promise<MapKeyResponse> {
+  return apiFetch<MapKeyResponse>(
+    `/api/config/map-key?path=${encodeURIComponent(path)}&key=${encodeURIComponent(key)}`,
+    { method: 'POST' },
+  );
+}
+
+// ── Onboard catalog (provider + model picker source of truth) ────────
+
+export interface CatalogProvider {
+  name: string;
+  display_name: string;
+  local: boolean;
+  aliases: string[];
+}
+
+export interface CatalogResponse {
+  providers: CatalogProvider[];
+}
+
+export function getCatalog(): Promise<CatalogResponse> {
+  return apiFetch<CatalogResponse>('/api/onboard/catalog');
+}
+
+export interface ModelsResponse {
+  provider: string;
+  models: string[];
+  /** false when the upstream catalog fetch failed; form should fall back to free-text. */
+  live: boolean;
+}
+
+export function getCatalogModels(provider: string): Promise<ModelsResponse> {
+  return apiFetch<ModelsResponse>(
+    `/api/onboard/catalog/models?provider=${encodeURIComponent(provider)}`,
+  );
+}
+
+// ── Daemon admin (localhost-only on the gateway) ─────────────────────
+
+export interface AdminResponse {
+  success: boolean;
+  message: string;
+}
+
+/**
+ * Restart the daemon process. Spawns a replacement, then signals the
+ * current process down. Brief connection-refused window — clients should
+ * poll `/health` to detect when the new instance is ready.
+ */
+export function restartDaemon(): Promise<AdminResponse> {
+  return apiFetch<AdminResponse>('/admin/restart', { method: 'POST' });
+}
+
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------

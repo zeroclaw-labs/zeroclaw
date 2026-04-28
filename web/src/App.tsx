@@ -8,6 +8,7 @@ import Tools from './pages/Tools';
 import Cron from './pages/Cron';
 import Integrations from './pages/Integrations';
 import Memory from './pages/Memory';
+import Config from './pages/Config';
 import Cost from './pages/Cost';
 import Logs from './pages/Logs';
 import Doctor from './pages/Doctor';
@@ -234,6 +235,7 @@ function AppContent() {
             <Route path="/cron" element={<Cron />} />
             <Route path="/integrations" element={<Integrations />} />
             <Route path="/memory" element={<Memory />} />
+            <Route path="/config" element={<Config />} />
             <Route path="/cost" element={<Cost />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/doctor" element={<Doctor />} />

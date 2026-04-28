@@ -13,6 +13,7 @@ const routeTitles: Record<string, string> = {
   '/cron': 'nav.cron',
   '/integrations': 'nav.integrations',
   '/memory': 'nav.memory',
+  '/config': 'nav.config',
   '/cost': 'nav.cost',
   '/logs': 'nav.logs',
   '/doctor': 'nav.doctor',
