@@ -156,6 +156,108 @@ export function putConfig(toml: string): Promise<void> {
   });
 }
 
+// ── Per-property CRUD (issue #6175) ──────────────────────────────────
+
+export interface PropResponse {
+  path: string;
+  value?: unknown;
+  populated?: boolean;
+}
+
+export interface ListResponseEntry {
+  path: string;
+  category: string;
+  value?: unknown;
+  populated: boolean;
+  is_secret: boolean;
+  onboard_section?: string;
+}
+
+export interface DriftEntry {
+  path: string;
+  secret?: boolean;
+  drifted: boolean;
+  in_memory_value?: unknown;
+  on_disk_value?: unknown;
+}
+
+export interface ListResponse {
+  entries: ListResponseEntry[];
+  drifted?: DriftEntry[];
+}
+
+export interface PatchOp {
+  op: 'add' | 'replace' | 'remove' | 'test';
+  path: string;
+  value?: unknown;
+  comment?: string;
+}
+
+export interface PatchOpResult {
+  op: string;
+  path: string;
+  value?: unknown;
+  populated?: boolean;
+}
+
+export interface PatchResponse {
+  saved: boolean;
+  results: PatchOpResult[];
+}
+
+export interface ConfigApiError {
+  code: string;
+  message: string;
+  path?: string;
+  op_index?: number;
+}
+
+export function getProp(path: string): Promise<PropResponse> {
+  return apiFetch<PropResponse>(`/api/config/prop?path=${encodeURIComponent(path)}`);
+}
+
+export function putProp(
+  path: string,
+  value: unknown,
+  comment?: string,
+): Promise<PropResponse> {
+  return apiFetch<PropResponse>('/api/config/prop', {
+    method: 'PUT',
+    body: JSON.stringify({ path, value, comment }),
+  });
+}
+
+export function deleteProp(path: string): Promise<PropResponse> {
+  return apiFetch<PropResponse>(`/api/config/prop?path=${encodeURIComponent(path)}`, {
+    method: 'DELETE',
+  });
+}
+
+export function listProps(prefix?: string): Promise<ListResponse> {
+  const q = prefix ? `?prefix=${encodeURIComponent(prefix)}` : '';
+  return apiFetch<ListResponse>(`/api/config/list${q}`);
+}
+
+export function patchConfig(ops: PatchOp[]): Promise<PatchResponse> {
+  return apiFetch<PatchResponse>('/api/config', {
+    method: 'PATCH',
+    body: JSON.stringify(ops),
+  });
+}
+
+export function initSection(section?: string): Promise<{ initialized: string[] }> {
+  const q = section ? `?section=${encodeURIComponent(section)}` : '';
+  return apiFetch<{ initialized: string[] }>(`/api/config/init${q}`, { method: 'POST' });
+}
+
+export function getDrift(): Promise<{ drifted: DriftEntry[] }> {
+  return apiFetch<{ drifted: DriftEntry[] }>('/api/config/drift');
+}
+
+export function getOpenApiSchema(): Promise<unknown> {
+  return apiFetch<unknown>('/api/openapi.json');
+}
+
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------

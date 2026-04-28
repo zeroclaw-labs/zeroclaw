@@ -92,6 +92,19 @@ export default function Config() {
         </div>
       </div>
 
+      {/* Onboarding flow link (issue #6175) */}
+      <div className="flex items-start gap-3 rounded-2xl p-4 border flex-shrink-0" style={{ borderColor: 'rgba(0, 122, 255, 0.2)', background: 'rgba(0, 122, 255, 0.05)' }}>
+        <SlidersHorizontal className="h-5 w-5 flex-shrink-0 mt-0.5" style={{ color: 'var(--pc-accent)' }} />
+        <div>
+          <p className="text-sm font-medium" style={{ color: 'var(--pc-accent)' }}>
+            New: schema-driven onboarding flow
+          </p>
+          <p className="text-sm mt-0.5" style={{ color: 'var(--pc-text-secondary)' }}>
+            For first-run setup, use <a href="#/onboard" className="underline">/onboard</a> — it walks the gateway's per-property API one section at a time and saves atomically. The page below remains for whole-file edits.
+          </p>
+        </div>
+      </div>
+
       {/* Success message */}
       {success && (
         <div className="flex items-center gap-2 rounded-xl p-3 border animate-fade-in flex-shrink-0" style={{ borderColor: 'rgba(0, 230, 138, 0.2)', background: 'rgba(0, 230, 138, 0.06)' }}>
