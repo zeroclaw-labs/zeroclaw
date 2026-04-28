@@ -31,6 +31,11 @@ pub struct OtelObserver {
     hand_runs: Counter<u64>,
     hand_duration: Histogram<f64>,
     hand_findings: Counter<u64>,
+    memory_recall_count: Counter<u64>,
+    memory_recall_duration: Histogram<f64>,
+    memory_store_count: Counter<u64>,
+    rag_retrieve_count: Counter<u64>,
+    rag_retrieve_duration: Histogram<f64>,
 }
 
 impl OtelObserver {
@@ -184,6 +189,38 @@ impl OtelObserver {
             .with_description("Total findings produced by hand runs")
             .build();
 
+        // ── Memory observability instruments (Unit 2 of memory-OTel PR) ──
+        // The OTel SDK's PeriodicReader is non-blocking: aggregations are
+        // updated synchronously in record_event, but export happens on a
+        // background interval. New instruments cannot back-pressure the
+        // runtime hot path under burst writes.
+        let memory_recall_count = meter
+            .u64_counter("zeroclaw.memory.recall.count")
+            .with_description("Total memory.recall calls from the runtime boundary")
+            .build();
+
+        let memory_recall_duration = meter
+            .f64_histogram("zeroclaw.memory.recall.duration")
+            .with_description("memory.recall duration in seconds")
+            .with_unit("s")
+            .build();
+
+        let memory_store_count = meter
+            .u64_counter("zeroclaw.memory.store.count")
+            .with_description("Total memory.store calls from the runtime boundary")
+            .build();
+
+        let rag_retrieve_count = meter
+            .u64_counter("zeroclaw.rag.retrieve.count")
+            .with_description("Total rag.retrieve calls from the runtime boundary")
+            .build();
+
+        let rag_retrieve_duration = meter
+            .f64_histogram("zeroclaw.rag.retrieve.duration")
+            .with_description("rag.retrieve duration in seconds")
+            .with_unit("s")
+            .build();
+
         Ok(Self {
             tracer_provider,
             meter_provider: meter_provider_clone,
@@ -203,6 +240,11 @@ impl OtelObserver {
             hand_runs,
             hand_duration,
             hand_findings,
+            memory_recall_count,
+            memory_recall_duration,
+            memory_store_count,
+            rag_retrieve_count,
+            rag_retrieve_duration,
         })
     }
 }
@@ -225,13 +267,147 @@ impl Observer for OtelObserver {
             | ObserverEvent::ToolCallStart { .. }
             | ObserverEvent::TurnComplete
             | ObserverEvent::CacheHit { .. }
-            | ObserverEvent::CacheMiss { .. }
-            | ObserverEvent::MemoryRecall { .. }
-            | ObserverEvent::MemoryStore { .. }
-            | ObserverEvent::RagRetrieve { .. } => {
-                // Full implementations land in Unit 2 (gen_ai.* attrs +
-                // metric instruments). Unit 1 keeps OtelObserver compiling
-                // without observable behavior change.
+            | ObserverEvent::CacheMiss { .. } => {}
+            ObserverEvent::MemoryRecall {
+                query_summary,
+                duration,
+                num_entries,
+                backend,
+                success,
+            } => {
+                let secs = duration.as_secs_f64();
+                let start_time = SystemTime::now()
+                    .checked_sub(*duration)
+                    .unwrap_or(SystemTime::now());
+
+                let mut span_attrs = vec![
+                    // Legacy / ZeroClaw-specific attrs
+                    KeyValue::new("memory.backend", backend.clone()),
+                    KeyValue::new("memory.hits", *num_entries as i64),
+                    KeyValue::new("memory.success", *success),
+                    KeyValue::new("duration_s", secs),
+                    // OTel GenAI semantic conventions
+                    KeyValue::new("gen_ai.operation.name", "retrieval"),
+                    KeyValue::new("gen_ai.system", backend.clone()),
+                ];
+                if let Some(q) = query_summary {
+                    // Langfuse-specific Input/Output pane attrs. Emitting
+                    // both keeps vendor-agnostic backends happy while
+                    // Langfuse renders the query and the hit count in its
+                    // GenAI-aware retrieval view.
+                    span_attrs.push(KeyValue::new("input.value", q.clone()));
+                    span_attrs.push(KeyValue::new(
+                        "output.value",
+                        format!("{} hits", num_entries),
+                    ));
+                }
+
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("memory.recall")
+                        .with_kind(SpanKind::Internal)
+                        .with_start_time(start_time)
+                        .with_attributes(span_attrs),
+                );
+                if *success {
+                    span.set_status(Status::Ok);
+                } else {
+                    span.set_status(Status::error(""));
+                }
+                span.end();
+
+                let metric_attrs = [KeyValue::new("backend", backend.clone())];
+                self.memory_recall_count.add(1, &metric_attrs);
+                self.memory_recall_duration.record(secs, &metric_attrs);
+            }
+            ObserverEvent::RagRetrieve {
+                query_summary,
+                duration,
+                num_chunks,
+                num_boards,
+            } => {
+                let secs = duration.as_secs_f64();
+                let start_time = SystemTime::now()
+                    .checked_sub(*duration)
+                    .unwrap_or(SystemTime::now());
+
+                // NOTE: `rag.num_chunks` / `rag.num_boards` are
+                // ZeroClaw-specific. OTel GenAI semconv defines
+                // `gen_ai.operation.name = "retrieval"` but no canonical
+                // attribute for chunk count or domain partitioning yet.
+                // Revisit when the GenAI WG publishes retrieval-attribute
+                // extensions.
+                let mut span_attrs = vec![
+                    KeyValue::new("rag.num_chunks", *num_chunks as i64),
+                    KeyValue::new("rag.num_boards", *num_boards as i64),
+                    KeyValue::new("duration_s", secs),
+                    KeyValue::new("gen_ai.operation.name", "retrieval"),
+                    KeyValue::new("gen_ai.system", "zeroclaw_rag"),
+                ];
+                if let Some(q) = query_summary {
+                    span_attrs.push(KeyValue::new("input.value", q.clone()));
+                    span_attrs.push(KeyValue::new(
+                        "output.value",
+                        format!("{} chunks across {} boards", num_chunks, num_boards),
+                    ));
+                }
+
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("rag.retrieve")
+                        .with_kind(SpanKind::Internal)
+                        .with_start_time(start_time)
+                        .with_attributes(span_attrs),
+                );
+                span.set_status(Status::Ok);
+                span.end();
+
+                self.rag_retrieve_count.add(1, &[]);
+                self.rag_retrieve_duration.record(secs, &[]);
+            }
+            ObserverEvent::MemoryStore {
+                category,
+                backend,
+                duration,
+                success,
+            } => {
+                let secs = duration.as_secs_f64();
+                let start_time = SystemTime::now()
+                    .checked_sub(*duration)
+                    .unwrap_or(SystemTime::now());
+
+                // NOTE: OTel GenAI semconv has no canonical "store"
+                // operation value (canonical: chat, create_agent,
+                // embeddings, execute_tool, generate_content,
+                // invoke_agent, retrieval, text_completion). We omit
+                // `gen_ai.operation.name` and lean on `db.*` conventions
+                // instead.
+                let span_attrs = vec![
+                    KeyValue::new("memory.category", category.clone()),
+                    KeyValue::new("memory.backend", backend.clone()),
+                    KeyValue::new("memory.success", *success),
+                    KeyValue::new("duration_s", secs),
+                    KeyValue::new("db.system", backend.clone()),
+                    KeyValue::new("db.operation", "INSERT"),
+                ];
+
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("memory.store")
+                        .with_kind(SpanKind::Internal)
+                        .with_start_time(start_time)
+                        .with_attributes(span_attrs),
+                );
+                if *success {
+                    span.set_status(Status::Ok);
+                } else {
+                    span.set_status(Status::error(""));
+                }
+                span.end();
+
+                let metric_attrs = [
+                    KeyValue::new("category", category.clone()),
+                    KeyValue::new("backend", backend.clone()),
+                    KeyValue::new("success", success.to_string()),
+                ];
+                self.memory_store_count.add(1, &metric_attrs);
             }
             ObserverEvent::LlmResponse {
                 provider,
@@ -660,6 +836,65 @@ mod tests {
         let obs = test_observer();
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.flush();
+    }
+
+    /// Regression test for memory observability — the three new memory/RAG
+    /// event variants must accept fully populated payloads without panicking
+    /// and must exercise the optional `query_summary` field on
+    /// `MemoryRecall` and `RagRetrieve` (Some/None). We cannot assert on
+    /// exported span attributes here (OTLP pipeline runs asynchronously),
+    /// but verifying the recording path for all three arms is sufficient
+    /// regression coverage.
+    #[test]
+    fn memory_rag_events_do_not_panic() {
+        let obs = test_observer();
+
+        // MemoryRecall with populated query_summary (Langfuse path).
+        obs.record_event(&ObserverEvent::MemoryRecall {
+            query_summary: Some("what did the user say about coffee".into()),
+            duration: Duration::from_millis(45),
+            num_entries: 7,
+            backend: "sqlite".into(),
+            success: true,
+        });
+        // MemoryRecall failure path with query_summary: None.
+        obs.record_event(&ObserverEvent::MemoryRecall {
+            query_summary: None,
+            duration: Duration::from_millis(12),
+            num_entries: 0,
+            backend: "qdrant".into(),
+            success: false,
+        });
+
+        // RagRetrieve with populated query_summary.
+        obs.record_event(&ObserverEvent::RagRetrieve {
+            query_summary: Some("ESP32-S3 GPIO pinout".into()),
+            duration: Duration::from_millis(120),
+            num_chunks: 12,
+            num_boards: 3,
+        });
+        // RagRetrieve with query_summary: None.
+        obs.record_event(&ObserverEvent::RagRetrieve {
+            query_summary: None,
+            duration: Duration::ZERO,
+            num_chunks: 0,
+            num_boards: 0,
+        });
+
+        // MemoryStore success path.
+        obs.record_event(&ObserverEvent::MemoryStore {
+            category: "conversation".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(8),
+            success: true,
+        });
+        // MemoryStore failure path.
+        obs.record_event(&ObserverEvent::MemoryStore {
+            category: "fact".into(),
+            backend: "qdrant".into(),
+            duration: Duration::from_millis(3),
+            success: false,
+        });
     }
 
     /// Regression test for upstream issue #5980 — tool spans must accept a
