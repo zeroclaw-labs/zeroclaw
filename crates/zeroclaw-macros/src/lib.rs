@@ -103,7 +103,7 @@ fn has_serde_skip(field: &syn::Field) -> bool {
 /// in `crates/zeroclaw-config/src/schema.rs`.
 #[proc_macro_derive(
     Configurable,
-    attributes(secret, nested, prefix, serde, onboard_section, derived_from_secret)
+    attributes(secret, nested, prefix, serde, derived_from_secret)
 )]
 pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -158,7 +158,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let is_secret = has_attr(field, "secret");
         let is_nested = has_attr(field, "nested");
         let serde_skip = has_serde_skip(field);
-        let onboard_section_value = extract_onboard_section(field);
         let derived_from_secret = has_attr(field, "derived_from_secret");
 
         // ── Secret handling ──
@@ -551,14 +550,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         prop_kind_tokens.push(kind_token.clone());
         prop_is_option_flags.push(is_option);
 
-        let onboard_section_expr = match &onboard_section_value {
-            Some(value) => {
-                let value_lit = value.as_str();
-                quote! { Some(#value_lit) }
-            }
-            None => quote! { None },
-        };
-
         prop_field_entries.push(quote! {
             crate::config::make_prop_field(
                 __table.as_ref(),
@@ -570,7 +561,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 #is_secret,
                 #enum_variants_expr,
                 #description_lit,
-                #onboard_section_expr,
                 #derived_from_secret,
             )
         });
@@ -718,26 +708,6 @@ fn has_attr(field: &syn::Field, name: &str) -> bool {
     field.attrs.iter().any(|attr| attr.path().is_ident(name))
 }
 
-/// Extract the string value from `#[onboard_section = "providers"]` on a field.
-/// Returns `None` when the attribute is absent or malformed.
-fn extract_onboard_section(field: &syn::Field) -> Option<String> {
-    for attr in &field.attrs {
-        if !attr.path().is_ident("onboard_section") {
-            continue;
-        }
-        let Meta::NameValue(nv) = &attr.meta else {
-            continue;
-        };
-        let syn::Expr::Lit(expr_lit) = &nv.value else {
-            continue;
-        };
-        let Lit::Str(lit_str) = &expr_lit.lit else {
-            continue;
-        };
-        return Some(lit_str.value());
-    }
-    None
-}
 
 fn snake_to_kebab(s: &str) -> String {
     s.replace('_', "-")

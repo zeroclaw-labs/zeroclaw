@@ -79,7 +79,6 @@ pub fn make_prop_field(
     is_secret: bool,
     enum_variants: Option<fn() -> Vec<String>>,
     description: &'static str,
-    onboard_section: Option<&'static str>,
     derived_from_secret: bool,
 ) -> PropFieldInfo {
     let display_value = if is_secret || derived_from_secret {
@@ -102,7 +101,6 @@ pub fn make_prop_field(
         is_secret,
         enum_variants,
         description,
-        onboard_section,
         derived_from_secret,
     }
 }

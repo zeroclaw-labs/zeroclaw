@@ -18,6 +18,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
+use zeroclaw_runtime::onboard::Section;
 
 use super::AppState;
 use super::api::require_auth;
@@ -75,8 +76,12 @@ pub struct ListEntry {
     pub value: Option<serde_json::Value>,
     pub populated: bool,
     pub is_secret: bool,
+    /// Onboard section name derived from the path's first segment via
+    /// `Section::from_path`. `None` for paths that aren't part of any wizard
+    /// section. The dashboard groups list entries by this for per-section
+    /// rendering — same source the CLI wizard uses, no schema attribute.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub onboard_section: Option<String>,
+    pub onboard_section: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -335,13 +340,14 @@ pub async fn handle_list(
             } else {
                 Some(serde_json::Value::String(info.display_value.clone()))
             };
+            let section = Section::from_path(&info.name).and_then(Section::as_path_prefix);
             ListEntry {
                 path: info.name,
                 category: info.category.to_string(),
                 value,
                 populated,
                 is_secret: is_sensitive,
-                onboard_section: info.onboard_section.map(str::to_string),
+                onboard_section: section,
             }
         })
         .collect();

@@ -44,6 +44,43 @@ pub enum Section {
     Tunnel,
 }
 
+impl Section {
+    /// Stable string name used in TOML paths (`providers.fallback`, etc.) and
+    /// surfaced over the HTTP CRUD API for grouping prop lists by section.
+    /// `All` has no path representation; returns `None`.
+    pub fn as_path_prefix(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Workspace => Some("workspace"),
+            Self::Providers => Some("providers"),
+            Self::Channels => Some("channels"),
+            Self::Memory => Some("memory"),
+            Self::Hardware => Some("hardware"),
+            Self::Tunnel => Some("tunnel"),
+        }
+    }
+
+    /// Map a dotted property path back to its onboarding section by looking
+    /// at the path's first segment. Returns `None` for paths that don't fall
+    /// into any wizard section (e.g. `onboard_state.completed_sections`).
+    ///
+    /// This is the substitute for a `#[onboard_section]` schema attribute —
+    /// the section is implicit in the path, derived once from this table
+    /// rather than duplicated on every field.
+    pub fn from_path(path: &str) -> Option<Self> {
+        let prefix = path.split('.').next()?;
+        match prefix {
+            "workspace" => Some(Self::Workspace),
+            "providers" => Some(Self::Providers),
+            "channels" => Some(Self::Channels),
+            "memory" => Some(Self::Memory),
+            "hardware" => Some(Self::Hardware),
+            "tunnel" => Some(Self::Tunnel),
+            _ => None,
+        }
+    }
+}
+
 /// Runtime knobs sourced from CLI flags. `--quick`/`--tui` select the UI
 /// backend at the binary edge and don't appear here — the orchestrator only
 /// cares about per-section behavior.
