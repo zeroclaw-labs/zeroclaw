@@ -9,7 +9,7 @@ use zeroclaw_config::policy::SecurityPolicy;
 /// Uses `old_string` → `new_string` precise replacement within the workspace.
 /// The `old_string` must appear exactly once in the file (zero matches = not
 /// found, multiple matches = ambiguous). `new_string` may be empty to delete
-/// the matched text. Security checks mirror [`super::file_write::FileWriteTool`].
+/// the matched text.
 pub struct FileEditTool {
     security: Arc<SecurityPolicy>,
 }
@@ -17,6 +17,45 @@ pub struct FileEditTool {
 impl FileEditTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
         Self { security }
+    }
+
+    /// Validate and resolve a caller-supplied path to an absolute candidate.
+    /// See [`super::file_write::FileWriteTool::resolve_candidate`] for details.
+    fn resolve_candidate(&self, path: &str) -> anyhow::Result<std::path::PathBuf> {
+        let workspace_dir = &self.security.workspace_dir;
+
+        if path.contains('\0') {
+            anyhow::bail!("Path not allowed: contains null byte");
+        }
+        if std::path::Path::new(path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            anyhow::bail!("Path not allowed by security policy: {path}");
+        }
+
+        let p = std::path::Path::new(path);
+        if p.is_absolute() {
+            let workspace_canonical = workspace_dir
+                .canonicalize()
+                .unwrap_or_else(|_| workspace_dir.clone());
+            if !p.starts_with(&workspace_canonical) && !p.starts_with(workspace_dir.as_path()) {
+                anyhow::bail!("Path not allowed by security policy: {path}");
+            }
+            return Ok(p.to_path_buf());
+        }
+
+        if let Ok(workspace_rootless) = workspace_dir.strip_prefix("/") {
+            if let Ok(stripped) = p.strip_prefix(workspace_rootless) {
+                return Ok(if stripped.as_os_str().is_empty() {
+                    workspace_dir.clone()
+                } else {
+                    workspace_dir.join(stripped)
+                });
+            }
+        }
+
+        Ok(workspace_dir.join(p))
     }
 }
 
@@ -36,7 +75,7 @@ impl Tool for FileEditTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file. Relative paths resolve from workspace; outside paths require policy allowlist."
+                    "description": "Path to the file. Relative paths resolve from workspace root; absolute paths must be within the workspace."
                 },
                 "old_string": {
                     "type": "string",
@@ -94,18 +133,19 @@ impl Tool for FileEditTool {
             });
         }
 
-        // ── 4. Path pre-validation ─────────────────────────────────
-        if !self.security.is_path_allowed(path) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Path not allowed by security policy: {path}")),
-            });
-        }
+        // ── 4. Resolve candidate path ──────────────────────────────
+        let full_path = match self.resolve_candidate(path) {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
 
-        let full_path = self.security.resolve_tool_path(path);
-
-        // ── 5. Canonicalize parent ─────────────────────────────────
+        // ── 5. Canonicalise parent ─────────────────────────────────
         let Some(parent) = full_path.parent() else {
             return Ok(ToolResult {
                 success: false,
@@ -125,15 +165,18 @@ impl Tool for FileEditTool {
             }
         };
 
-        // ── 6. Resolved path post-validation ───────────────────────
-        if !self.security.is_resolved_path_allowed(&resolved_parent) {
+        // ── 6. Workspace boundary check ────────────────────────────
+        let workspace_canonical = self
+            .security
+            .workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.security.workspace_dir.clone());
+
+        if !resolved_parent.starts_with(&workspace_canonical) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(
-                    self.security
-                        .resolved_path_violation_message(&resolved_parent),
-                ),
+                error: Some(format!("Path escapes workspace directory: {path}")),
             });
         }
 
@@ -146,17 +189,6 @@ impl Tool for FileEditTool {
         };
 
         let resolved_target = resolved_parent.join(file_name);
-
-        if self.security.is_runtime_config_path(&resolved_target) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(
-                    self.security
-                        .runtime_config_violation_message(&resolved_target),
-                ),
-            });
-        }
 
         // ── 7. Symlink check ───────────────────────────────────────
         if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await
@@ -239,36 +271,38 @@ mod tests {
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
-    fn test_security(workspace: std::path::PathBuf) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
+    fn test_tool(workspace: std::path::PathBuf) -> FileEditTool {
+        let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: workspace,
             ..SecurityPolicy::default()
-        })
+        });
+        FileEditTool::new(security)
     }
 
-    fn test_security_with(
+    fn test_tool_with(
         workspace: std::path::PathBuf,
         autonomy: AutonomyLevel,
         max_actions_per_hour: u32,
-    ) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
+    ) -> FileEditTool {
+        let security = Arc::new(SecurityPolicy {
             autonomy,
             workspace_dir: workspace,
             max_actions_per_hour,
             ..SecurityPolicy::default()
-        })
+        });
+        FileEditTool::new(security)
     }
 
     #[test]
     fn file_edit_name() {
-        let tool = FileEditTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         assert_eq!(tool.name(), "file_edit");
     }
 
     #[test]
     fn file_edit_schema_has_required_params() {
-        let tool = FileEditTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["path"].is_object());
         assert!(schema["properties"]["old_string"].is_object());
@@ -288,7 +322,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "test.txt",
@@ -318,7 +352,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "test.txt",
@@ -331,7 +365,6 @@ mod tests {
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("not found"));
 
-        // File should be unchanged
         let content = tokio::fs::read_to_string(dir.join("test.txt"))
             .await
             .unwrap();
@@ -349,7 +382,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "test.txt",
@@ -368,7 +401,6 @@ mod tests {
                 .contains("matches 2 times")
         );
 
-        // File should be unchanged
         let content = tokio::fs::read_to_string(dir.join("test.txt"))
             .await
             .unwrap();
@@ -386,7 +418,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "test.txt",
@@ -412,7 +444,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_edit_missing_path_param() {
-        let tool = FileEditTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let result = tool
             .execute(json!({"old_string": "a", "new_string": "b"}))
             .await;
@@ -421,7 +453,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_edit_missing_old_string_param() {
-        let tool = FileEditTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let result = tool
             .execute(json!({"path": "f.txt", "new_string": "b"}))
             .await;
@@ -430,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_edit_missing_new_string_param() {
-        let tool = FileEditTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let result = tool
             .execute(json!({"path": "f.txt", "old_string": "a"}))
             .await;
@@ -446,7 +478,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "test.txt",
@@ -479,7 +511,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "../../etc/passwd",
@@ -497,7 +529,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_edit_blocks_absolute_path() {
-        let tool = FileEditTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let result = tool
             .execute(json!({
                 "path": "/etc/passwd",
@@ -523,7 +555,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileEditTool::new(test_security(workspace.clone()));
+        let tool = test_tool(workspace.clone());
         let workspace_prefixed = workspace
             .strip_prefix(std::path::Path::new("/"))
             .unwrap()
@@ -562,7 +594,7 @@ mod tests {
 
         symlink(&outside, workspace.join("escape_dir")).unwrap();
 
-        let tool = FileEditTool::new(test_security(workspace.clone()));
+        let tool = test_tool(workspace.clone());
         let result = tool
             .execute(json!({
                 "path": "escape_dir/target.txt",
@@ -602,7 +634,7 @@ mod tests {
             .unwrap();
         symlink(outside.join("target.txt"), workspace.join("linked.txt")).unwrap();
 
-        let tool = FileEditTool::new(test_security(workspace.clone()));
+        let tool = test_tool(workspace.clone());
         let result = tool
             .execute(json!({
                 "path": "linked.txt",
@@ -635,7 +667,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileEditTool::new(test_security_with(dir.clone(), AutonomyLevel::ReadOnly, 20));
+        let tool = test_tool_with(dir.clone(), AutonomyLevel::ReadOnly, 20);
         let result = tool
             .execute(json!({
                 "path": "test.txt",
@@ -665,11 +697,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileEditTool::new(test_security_with(
-            dir.clone(),
-            AutonomyLevel::Supervised,
-            0,
-        ));
+        let tool = test_tool_with(dir.clone(), AutonomyLevel::Supervised, 0);
         let result = tool
             .execute(json!({
                 "path": "test.txt",
@@ -702,7 +730,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "missing.txt",
@@ -737,9 +765,8 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
 
-        // Pass an absolute path that is within the workspace
         let abs_path = dir.join("target.txt");
         let result = tool
             .execute(json!({
@@ -770,7 +797,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "test\0evil.txt",
@@ -786,41 +813,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_edit_blocks_runtime_config_path() {
-        let root = std::env::temp_dir().join("zeroclaw_test_file_edit_runtime_config");
+    async fn file_edit_blocks_path_outside_workspace() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_edit_outside_workspace");
         let workspace = root.join("workspace");
-        let config_path = root.join("config.toml");
+        let outside = root.join("outside.txt");
         let _ = tokio::fs::remove_dir_all(&root).await;
         tokio::fs::create_dir_all(&workspace).await.unwrap();
-        tokio::fs::write(&config_path, "always_ask = [\"cron_add\"]")
-            .await
-            .unwrap();
+        tokio::fs::write(&outside, "original").await.unwrap();
 
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: workspace.clone(),
-            workspace_only: false,
-            allowed_roots: vec![root.clone()],
-            forbidden_paths: vec![],
-            ..SecurityPolicy::default()
-        });
-        let tool = FileEditTool::new(security);
+        let tool = test_tool(workspace.clone());
         let result = tool
             .execute(json!({
-                "path": config_path.to_string_lossy(),
-                "old_string": "always_ask",
-                "new_string": "auto_approve"
+                "path": outside.to_string_lossy(),
+                "old_string": "original",
+                "new_string": "hacked"
             }))
             .await
             .unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .unwrap_or_default()
-                .contains("runtime config/state file")
-        );
+        let content = tokio::fs::read_to_string(&outside).await.unwrap();
+        assert_eq!(content, "original", "file outside workspace must not be modified");
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
