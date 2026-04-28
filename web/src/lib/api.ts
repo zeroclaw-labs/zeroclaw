@@ -372,6 +372,61 @@ export function getCatalogModels(provider: string): Promise<ModelsResponse> {
   );
 }
 
+// ── Onboard sections + picker (mirrors the TUI flow) ────────────────
+
+export interface SectionInfo {
+  /** Stable section key — matches `Section::as_path_prefix` in zeroclaw-runtime. */
+  key: string;
+  /** Human-readable section name. */
+  label: string;
+  /** Help text shown under the section header (verbatim from the TUI). */
+  help: string;
+  /** True when the section requires picking an item before fields render. */
+  has_picker: boolean;
+  /** True when the user has marked the section completed in onboard_state. */
+  completed: boolean;
+}
+
+export interface SectionsResponse {
+  sections: SectionInfo[];
+}
+
+export function getSections(): Promise<SectionsResponse> {
+  return apiFetch<SectionsResponse>('/api/onboard/sections');
+}
+
+export interface PickerItem {
+  key: string;
+  label: string;
+  description?: string;
+  badge?: string;
+}
+
+export interface PickerResponse {
+  section: string;
+  items: PickerItem[];
+  help: string;
+}
+
+export function getSectionPicker(section: string): Promise<PickerResponse> {
+  return apiFetch<PickerResponse>(
+    `/api/onboard/sections/${encodeURIComponent(section)}`,
+  );
+}
+
+export interface SelectItemResponse {
+  /** Dotted prefix to fetch fields under via listProps(prefix). */
+  fields_prefix: string;
+  created: boolean;
+}
+
+export function selectSectionItem(section: string, key: string): Promise<SelectItemResponse> {
+  return apiFetch<SelectItemResponse>(
+    `/api/onboard/sections/${encodeURIComponent(section)}/items/${encodeURIComponent(key)}`,
+    { method: 'POST' },
+  );
+}
+
 
 // ---------------------------------------------------------------------------
 // Tools
