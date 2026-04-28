@@ -9,6 +9,7 @@
 
 pub mod api;
 pub mod api_config;
+pub mod openapi;
 pub mod api_pairing;
 #[cfg(feature = "plugins-wasm")]
 pub mod api_plugins;
@@ -986,6 +987,7 @@ pub async fn run_gateway(
         .route("/api/config/list", get(api_config::handle_list))
         .route("/api/config/init", post(api_config::handle_init))
         .route("/api/config/migrate", post(api_config::handle_migrate))
+        .route("/api/openapi.json", get(openapi::handle_openapi_json))
         .route("/api/tools", get(api::handle_api_tools))
         .route("/api/cron", get(api::handle_api_cron_list))
         .route("/api/cron", post(api::handle_api_cron_add))
