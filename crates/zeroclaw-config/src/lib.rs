@@ -1,5 +1,6 @@
 //! Configuration schema, secrets, and related types for ZeroClaw.
 
+pub mod api_error;
 pub mod autonomy;
 pub mod cost;
 pub mod domain_matcher;
