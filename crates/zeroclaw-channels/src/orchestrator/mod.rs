@@ -17,6 +17,7 @@
 //! gate, and wire it into [`start_channels`] here. See `AGENTS.md` §7.2 for the
 //! full change playbook.
 
+#[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
 pub mod media_pipeline;
 pub mod mqtt;

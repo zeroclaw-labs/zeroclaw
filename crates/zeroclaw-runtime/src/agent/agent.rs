@@ -522,7 +522,7 @@ impl Agent {
             &config.browser,
             &config.http_request,
             &config.web_fetch,
-            &config.workspace_dir,
+            &security.workspace_dir,
             &config.agents,
             fallback_provider_ag.and_then(|e| e.api_key.as_deref()),
             config,
