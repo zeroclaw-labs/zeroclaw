@@ -156,8 +156,9 @@ impl Provider for GlmProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let token = self.generate_token()?;
 
         let mut messages = Vec::new();
@@ -209,8 +210,9 @@ impl Provider for GlmProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let token = self.generate_token()?;
 
         let api_messages: Vec<Message> = messages
@@ -326,7 +328,7 @@ mod tests {
     async fn chat_fails_without_key() {
         let p = GlmProvider::new(None);
         let result = p
-            .chat_with_system(None, "hello", "glm-4.7", 0.7)
+            .chat_with_system(None, "hello", "glm-4.7", Some(0.7))
             .await;
         assert!(result.is_err());
     }
@@ -340,7 +342,9 @@ mod tests {
             ChatMessage::assistant("Hi there!"),
             ChatMessage::user("What did I say?"),
         ];
-        let result = p.chat_with_history(&messages, "glm-4.7", 0.7).await;
+        let result = p
+            .chat_with_history(&messages, "glm-4.7", Some(0.7))
+            .await;
         assert!(result.is_err());
     }
 

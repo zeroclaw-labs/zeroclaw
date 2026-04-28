@@ -1,5 +1,12 @@
 /target
 /target-*/
+/docs/book/book/
+/docs/book/po/messages.pot
+/docs/book/po/*.failures.log
+/docs/book/po-extract/
+/docs/book/src/reference/cli.md
+/docs/book/src/reference/config.md
+.secrets
 firmware/*/target
 web/dist/*
 !web/dist/.gitkeep
@@ -34,11 +41,17 @@ credentials.json
 .worktrees/
 .zeroclaw/*
 
+# Claude Code project settings (machine-specific directory config)
+.claude/settings.json
+
 # Skill eval workspaces (test outputs, transcripts, grading)
 .claude/skills/*-workspace/
 
 # Claude Code agent worktrees (temporary isolated workspaces)
 .claude/worktrees/
+
+# Claude Code skill session state (review handoffs, changelog drafts, review bodies)
+tmp/
 
 # Local state backups
 .local-state-backups/

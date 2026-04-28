@@ -30,7 +30,6 @@ pub fn register_peripheral_tools_fn(f: PeripheralToolsFn) {
     let _ = PERIPHERAL_TOOLS_FN.set(f);
 }
 use crate::cost::types::BudgetCheck;
-use crate::i18n::ToolDescriptions;
 use crate::observability::{self, Observer, ObserverEvent, runtime_trace};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -351,6 +350,12 @@ async fn build_context(
                 if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
                     continue;
                 }
+                // Skip raw per-turn user messages: re-injecting them causes each
+                // recalled entry to embed all prior generations, growing exponentially.
+                // Consolidated knowledge is already promoted to Core/Daily entries.
+                if zeroclaw_memory::is_user_autosave_key(&entry.key) {
+                    continue;
+                }
                 if zeroclaw_memory::should_skip_autosave_content(&entry.content) {
                     continue;
                 }
@@ -545,7 +550,7 @@ async fn consume_provider_streaming_response(
             tools: request_tools,
         },
         model,
-        temperature,
+        Some(temperature),
         zeroclaw_providers::traits::StreamOptions::new(true),
     );
     let mut outcome = StreamedChatOutcome::default();
@@ -672,6 +677,8 @@ pub async fn agent_turn(
         0,    // context_token_budget: 0 = disabled (legacy callers)
         None, // shared_budget: no shared budget for legacy callers
         channel,
+        None, // receipt_generator
+        None, // collected_receipts
     )
     .await
 }
@@ -782,6 +789,32 @@ fn maybe_inject_channel_delivery_defaults(
 //   • max_iterations is reached (runaway safety), or
 //   • the cancellation token fires (external abort).
 
+/// Append a receipt footer to the response text if any receipts were collected.
+///
+/// Format:
+/// ```text
+/// \n\n---\nTool receipts:\n  shell: zc-receipt-...\n  web_search: zc-receipt-...
+/// ```
+pub fn append_receipt_footer(
+    response: String,
+    collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
+) -> String {
+    let Some(store) = collected_receipts else {
+        return response;
+    };
+    let Ok(receipts) = store.lock() else {
+        return response;
+    };
+    if receipts.is_empty() {
+        return response;
+    }
+    let mut footer = format!("{response}\n\n---\nTool receipts:");
+    for entry in receipts.iter() {
+        footer.push_str(&format!("\n  {entry}"));
+    }
+    footer
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 #[allow(clippy::too_many_arguments)]
@@ -811,6 +844,8 @@ pub async fn run_tool_call_loop(
     context_token_budget: usize,
     shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
     channel: Option<&dyn Channel>,
+    receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
+    collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -1107,7 +1142,7 @@ pub async fn run_tool_call_loop(
                                 tools: request_tools,
                             },
                             active_model,
-                            temperature,
+                            Some(temperature),
                         );
                         if let Some(token) = cancellation_token.as_ref() {
                             tokio::select! {
@@ -1129,7 +1164,7 @@ pub async fn run_tool_call_loop(
                     tools: request_tools,
                 },
                 active_model,
-                temperature,
+                Some(temperature),
             );
 
             match pacing.step_timeout_secs {
@@ -1419,7 +1454,10 @@ pub async fn run_tool_call_loop(
             }
 
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(accumulated_display_text);
+            return Ok(append_receipt_footer(
+                accumulated_display_text,
+                collected_receipts,
+            ));
         }
 
         // Accumulate text from this iteration (tool calls present, loop continues).
@@ -1499,6 +1537,7 @@ pub async fn run_tool_call_loop(
                                 success: false,
                                 error_reason: Some(scrub_credentials(&reason)),
                                 duration: Duration::ZERO,
+                                receipt: None,
                             },
                         ));
                         continue;
@@ -1599,6 +1638,7 @@ pub async fn run_tool_call_loop(
                             success: false,
                             error_reason: Some(denied),
                             duration: Duration::ZERO,
+                            receipt: None,
                         },
                     ));
                     continue;
@@ -1647,6 +1687,7 @@ pub async fn run_tool_call_loop(
                         success: false,
                         error_reason: Some(duplicate),
                         duration: Duration::ZERO,
+                        receipt: None,
                     },
                 ));
                 continue;
@@ -1709,6 +1750,7 @@ pub async fn run_tool_call_loop(
                 activated_tools,
                 observer,
                 cancellation_token.as_ref(),
+                receipt_generator,
             )
             .await?
         } else {
@@ -1718,6 +1760,7 @@ pub async fn run_tool_call_loop(
                 activated_tools,
                 observer,
                 cancellation_token.as_ref(),
+                receipt_generator,
             )
             .await?
         };
@@ -1725,7 +1768,7 @@ pub async fn run_tool_call_loop(
         for ((idx, call), outcome) in executable_indices
             .iter()
             .zip(executable_calls.iter())
-            .zip(executed_outcomes.into_iter())
+            .zip(executed_outcomes)
         {
             runtime_trace::record_event(
                 "tool_call_result",
@@ -1828,7 +1871,17 @@ pub async fn run_tool_call_loop(
                     }
                 }
             }
-            let result_output = truncate_tool_result(&outcome.output, max_tool_result_chars);
+            let mut result_output = truncate_tool_result(&outcome.output, max_tool_result_chars);
+            // Append HMAC receipt to tool result when receipts are enabled (#4830)
+            if let Some(ref receipt) = outcome.receipt {
+                tracing::debug!(tool = %tool_name, receipt = %receipt, "Tool receipt generated");
+                result_output = format!("{result_output}\n\n[receipt: {receipt}]");
+                if let Some(store) = collected_receipts
+                    && let Ok(mut v) = store.lock()
+                {
+                    v.push(format!("{tool_name}: {receipt}"));
+                }
+            }
             individual_results.push((tool_call_id, result_output.clone()));
             let _ = writeln!(
                 tool_results,
@@ -1948,14 +2001,20 @@ pub async fn run_tool_call_loop(
         messages: history,
         tools: None, // No tools — force a text response
     };
-    match provider.chat(summary_request, model, temperature).await {
+    match provider
+        .chat(summary_request, model, Some(temperature))
+        .await
+    {
         Ok(resp) => {
             let text = resp.text.unwrap_or_default();
             if text.is_empty() {
                 anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
             }
             accumulated_display_text.push_str(&text);
-            Ok(accumulated_display_text)
+            Ok(append_receipt_footer(
+                accumulated_display_text,
+                collected_receipts,
+            ))
         }
         Err(e) => {
             tracing::warn!(error = %e, "Final summary LLM call failed, bailing");
@@ -1966,10 +2025,7 @@ pub async fn run_tool_call_loop(
 
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
-pub fn build_tool_instructions(
-    tools_registry: &[Box<dyn Tool>],
-    tool_descriptions: Option<&ToolDescriptions>,
-) -> String {
+pub fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
@@ -1985,9 +2041,7 @@ pub fn build_tool_instructions(
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools_registry {
-        let desc = tool_descriptions
-            .and_then(|td| td.get(tool.name()))
-            .unwrap_or_else(|| tool.description());
+        let desc = tool.description();
         let _ = writeln!(
             instructions,
             "**{}**: {}\nParameters: `{}`\n",
@@ -2231,15 +2285,14 @@ pub async fn run(
         .map(|b| b.board.clone())
         .collect();
 
-    // ── Load locale-aware tool descriptions ────────────────────────
+    // ── Initialize locale-aware tool descriptions ──────────────────
     let i18n_locale = config
         .locale
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(crate::i18n::detect_locale);
-    let i18n_search_dirs = crate::i18n::default_search_dirs(&config.workspace_dir);
-    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+    crate::i18n::init(&i18n_locale);
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
@@ -2387,7 +2440,7 @@ pub async fn run(
 
     // Append structured tool-use instructions with schemas (only for non-native providers)
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
+        system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
     // Append deferred MCP tool names so the LLM knows what is available
@@ -2542,6 +2595,8 @@ pub async fn run(
                         config.agent.max_context_tokens,
                         None, // shared_budget
                         None, // channel: CLI mode — uses prompt_cli
+                        None, // receipt_generator
+                        None, // collected_receipts
                     ),
                 )
                 .await
@@ -2852,6 +2907,8 @@ pub async fn run(
                             config.agent.max_context_tokens,
                             None, // shared_budget
                             None, // channel: interactive CLI — uses prompt_cli
+                            None, // receipt_generator
+                            None, // collected_receipts
                         ),
                     )
                     .await
@@ -3145,9 +3202,34 @@ pub async fn process_message(
     }
 
     let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
-    let model_name = fallback_provider_pm
-        .and_then(|e| e.model.clone())
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+    let model_name = match fallback_provider_pm
+        .and_then(|e| e.model.as_deref())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        Some(m) => m.to_string(),
+        None => match config.providers.resolve_default_model() {
+            Some(m) => {
+                tracing::warn!(
+                    provider = provider_name,
+                    model = %m,
+                    "fallback provider has no `model` set; using first configured \
+                     providers.models entry as default. Set [providers.models.{provider_name}] \
+                     model = \"...\" to silence this warning.",
+                );
+                m
+            }
+            None => {
+                anyhow::bail!(
+                    "no model configured: providers.fallback = {:?} resolves with no model, \
+                     and no [[providers.models.*]] entry has a `model` field set. \
+                     Configure at least one [providers.models.<name>] model = \"...\" \
+                     or define a [[model_routes]] hint.",
+                    config.providers.fallback,
+                )
+            }
+        },
+    };
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_from_config(&config);
     let provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
@@ -3175,15 +3257,14 @@ pub async fn process_message(
         .map(|b| b.board.clone())
         .collect();
 
-    // ── Load locale-aware tool descriptions ────────────────────────
+    // ── Initialize locale-aware tool descriptions ──────────────────
     let i18n_locale = config
         .locale
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(crate::i18n::detect_locale);
-    let i18n_search_dirs = crate::i18n::default_search_dirs(&config.workspace_dir);
-    let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
+    crate::i18n::init(&i18n_locale);
 
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
 
@@ -3276,7 +3357,7 @@ pub async fn process_message(
         config.agent.max_system_prompt_chars,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry, Some(&i18n_descs)));
+        system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
     if !deferred_section.is_empty() {
         system_prompt.push('\n');
@@ -3696,6 +3777,37 @@ mod tests {
         assert_eq!(restored[1].content, "orphan");
     }
 
+    /// Regression test for issue #5813: a persisted session whose assistant
+    /// (tool_use) was lost to compaction must self-heal on load so the next
+    /// API call doesn't fail with "unexpected tool_use_id found in tool_result
+    /// blocks".
+    #[test]
+    fn load_interactive_session_heals_orphaned_tool_result() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let orphan_tool = ChatMessage::tool(
+            r#"{"tool_call_id":"toolu_01OrphanFromCompaction","content":"stale result"}"#,
+        );
+        let payload = serde_json::to_string_pretty(&InteractiveSessionState {
+            version: 1,
+            history: vec![
+                ChatMessage::system("sys"),
+                orphan_tool,
+                ChatMessage::user("next question"),
+            ],
+        })
+        .unwrap();
+        std::fs::write(&path, payload).unwrap();
+
+        let restored = load_interactive_session_history(&path, "fallback").unwrap();
+
+        assert!(
+            !restored.iter().any(|m| m.role == "tool"),
+            "orphaned tool_result should be removed on load; got roles {:?}",
+            restored.iter().map(|m| &m.role).collect::<Vec<_>>()
+        );
+    }
+
     use super::*;
     use async_trait::async_trait;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -3734,8 +3846,16 @@ mod tests {
             .expect("should produce a sample whose byte index 300 is not a char boundary");
 
         let observer = NoopObserver;
-        let result =
-            execute_one_tool("unknown_tool", call_arguments, &[], None, &observer, None).await;
+        let result = execute_one_tool(
+            "unknown_tool",
+            call_arguments,
+            &[],
+            None,
+            &observer,
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_ok(), "execute_one_tool should not panic or error");
 
         let outcome = result.unwrap();
@@ -3764,6 +3884,7 @@ mod tests {
             Some(&activated),
             &observer,
             None,
+            None, // receipt_generator
         )
         .await
         .expect("suffix alias should execute the unique activated tool");
@@ -3785,6 +3906,7 @@ mod tests {
             None,
             &observer,
             None,
+            None, // receipt_generator
         )
         .await
         .expect("empty successful tool output should still execute");
@@ -3811,7 +3933,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("ok".to_string())
@@ -3837,7 +3959,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("ok".to_string())
@@ -3847,7 +3969,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let marker_count =
@@ -3908,7 +4030,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!("chat_with_system should not be used in scripted provider tests");
         }
@@ -3917,7 +4039,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             let mut responses = self
                 .responses
@@ -3954,7 +4076,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!(
                 "chat_with_system should not be used in streaming scripted provider tests"
@@ -3965,7 +4087,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("chat should not be called when streaming succeeds")
@@ -3979,7 +4101,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             options: StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
@@ -4042,7 +4164,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!(
                 "chat_with_system should not be used in streaming native tool event provider tests"
@@ -4053,7 +4175,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("chat should not be called when native streaming events succeed")
@@ -4071,7 +4193,7 @@ mod tests {
             &self,
             request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             options: StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
@@ -4131,7 +4253,7 @@ mod tests {
             _system_prompt: Option<&str>,
             _message: &str,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             anyhow::bail!("chat_with_system should not be used in route-aware stream tests");
         }
@@ -4140,7 +4262,7 @@ mod tests {
             &self,
             _request: ChatRequest<'_>,
             _model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("chat should not be called when routed streaming succeeds")
@@ -4154,7 +4276,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             model: &str,
-            _temperature: f64,
+            _temperature: Option<f64>,
             options: StreamOptions,
         ) -> futures_util::stream::BoxStream<
             'static,
@@ -4462,6 +4584,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -4518,6 +4642,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4568,6 +4694,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -4617,6 +4745,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect_err("should fail without vision_provider config");
@@ -4673,6 +4803,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect_err("should fail when vision provider cannot be created");
@@ -4729,6 +4861,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("text-only messages should succeed with default provider");
@@ -4786,6 +4920,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect_err("should fail due to nonexistent vision provider");
@@ -4841,6 +4977,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -4896,6 +5034,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect_err("should attempt vision provider creation for multiple images");
@@ -5034,6 +5174,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("parallel execution should complete");
@@ -5112,6 +5254,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -5182,6 +5326,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -5247,6 +5393,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -5325,6 +5473,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -5393,6 +5543,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -5481,6 +5633,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("loop should complete");
@@ -5543,6 +5697,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("native fallback id flow should complete");
@@ -5632,6 +5788,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -5698,6 +5856,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("streaming provider should complete");
@@ -5767,6 +5927,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -5843,6 +6005,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -5928,6 +6092,8 @@ mod tests {
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("routed streaming provider should complete");
@@ -6066,7 +6232,7 @@ mod tests {
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
-        let instructions = build_tool_instructions(&tools, None);
+        let instructions = build_tool_instructions(&tools);
 
         assert!(instructions.contains("## Tool Use Protocol"));
         assert!(instructions.contains("<tool_call>"));
@@ -6180,7 +6346,7 @@ mod tests {
         .await
         .unwrap();
         mem.store(
-            "user_msg_real",
+            "user_preference",
             "User asked for concise status updates",
             MemoryCategory::Conversation,
             None,
@@ -6189,9 +6355,44 @@ mod tests {
         .unwrap();
 
         let context = build_context(&mem, "status updates", 0.0, None).await;
-        assert!(context.contains("user_msg_real"));
+        assert!(context.contains("user_preference"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
+    }
+
+    #[tokio::test]
+    async fn build_context_ignores_user_autosave_entries() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        mem.store(
+            "user_msg",
+            "Original user message with full conversation history",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "user_msg_a1b2c3d4",
+            "Follow-up user message embedding prior context verbatim",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "user_preference",
+            "User prefers concise answers",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let context = build_context(&mem, "answers", 0.0, None).await;
+        assert!(context.contains("user_preference"));
+        assert!(!context.contains("user_msg"));
+        assert!(!context.contains("embedding prior context"));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -6990,6 +7191,8 @@ Let me check the result."#;
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("tool loop should complete");
@@ -7150,6 +7353,8 @@ Let me check the result."#;
                     0,
                     None,
                     None, // channel
+                    None, // receipt_generator
+                    None, // collected_receipts
                 ),
             )
             .await
@@ -7236,6 +7441,8 @@ Let me check the result."#;
                     0,
                     None,
                     None, // channel
+                    None, // receipt_generator
+                    None, // collected_receipts
                 ),
             )
             .await
@@ -7295,10 +7502,52 @@ Let me check the result."#;
             0,
             None,
             None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
         )
         .await
         .expect("should succeed without cost scope");
 
         assert_eq!(result, "ok");
+    }
+
+    // ── append_receipt_footer tests ──────────────────────────────
+
+    #[test]
+    fn receipt_footer_empty_receipts_unchanged() {
+        let store = std::sync::Mutex::new(Vec::<String>::new());
+        let result = super::append_receipt_footer("Hello world".to_string(), Some(&store));
+        assert_eq!(result, "Hello world");
+    }
+
+    #[test]
+    fn receipt_footer_none_store_unchanged() {
+        let result = super::append_receipt_footer("Hello world".to_string(), None);
+        assert_eq!(result, "Hello world");
+    }
+
+    #[test]
+    fn receipt_footer_single_receipt() {
+        let store = std::sync::Mutex::new(vec!["shell: zc-receipt-1234567890-abcdef".to_string()]);
+        let result = super::append_receipt_footer("The date is Monday.".to_string(), Some(&store));
+        assert_eq!(
+            result,
+            "The date is Monday.\n\n---\nTool receipts:\n  shell: zc-receipt-1234567890-abcdef"
+        );
+    }
+
+    #[test]
+    fn receipt_footer_multiple_receipts() {
+        let store = std::sync::Mutex::new(vec![
+            "shell: zc-receipt-100-aaa".to_string(),
+            "web_search: zc-receipt-200-bbb".to_string(),
+            "file_read: zc-receipt-300-ccc".to_string(),
+        ]);
+        let result = super::append_receipt_footer("Done.".to_string(), Some(&store));
+        let expected = "Done.\n\n---\nTool receipts:\
+            \n  shell: zc-receipt-100-aaa\
+            \n  web_search: zc-receipt-200-bbb\
+            \n  file_read: zc-receipt-300-ccc";
+        assert_eq!(result, expected);
     }
 }

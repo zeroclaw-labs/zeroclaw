@@ -380,7 +380,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          token: ${{ secrets.RELEASE_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -439,14 +439,16 @@ jobs:
 
       - name: Create tag and release
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.validate.outputs.tag }}
           EVENT_NAME: ${{ github.event_name }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
-          # For manual dispatch, use --target to create tag + release atomically
-          # via RELEASE_TOKEN (admin PAT) which bypasses tag protection rules.
+          # For manual dispatch, use --target to create tag + release atomically.
           # For tag push, the tag already exists — just create the release.
+          # GITHUB_TOKEN with contents:write is sufficient for both paths.
+          # Note: workflow_dispatch requires github-actions[bot] to be on the
+          # tag protection allowlist if v* tags are protected.
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             gh release create "$TAG" release-assets/* \
               --repo "$GITHUB_REPOSITORY" \
@@ -531,6 +533,7 @@ jobs:
             'port = 42617' \
             'host = "[::]"' \
             'allow_public_bind = true' \
+            'web_dist_dir = "/zeroclaw-data/web/dist"' \
             > docker-ctx/zeroclaw-data/.zeroclaw/config.toml
 
           cp Dockerfile.ci docker-ctx/Dockerfile

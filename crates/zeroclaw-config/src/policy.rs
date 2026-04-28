@@ -76,7 +76,7 @@ impl Clone for ActionTracker {
 ///
 /// Each unique sender key (Telegram thread ID, Discord channel, etc.) gets
 /// its own independent [`ActionTracker`] bucket. When no sender is in scope
-/// (cron jobs, CLI), the [`GLOBAL_KEY`] bucket is used.
+/// (cron jobs, CLI), the `GLOBAL_KEY` bucket is used.
 ///
 /// Note: sender buckets accumulate for the daemon lifetime with no eviction.
 /// This is acceptable for bounded sets of chat IDs; in high-cardinality deployments,
@@ -181,7 +181,7 @@ pub struct SecurityPolicy {
 
 /// Default allowed commands for Unix platforms.
 #[cfg(not(target_os = "windows"))]
-fn default_allowed_commands() -> Vec<String> {
+pub(crate) fn default_allowed_commands() -> Vec<String> {
     #[allow(unused_mut)]
     let mut cmds = vec![
         "git".into(),
@@ -218,7 +218,7 @@ fn default_allowed_commands() -> Vec<String> {
 /// Includes both native Windows commands and their Unix equivalents
 /// (available via Git for Windows, WSL, etc.).
 #[cfg(target_os = "windows")]
-fn default_allowed_commands() -> Vec<String> {
+pub(crate) fn default_allowed_commands() -> Vec<String> {
     vec![
         // Cross-platform tools
         "git".into(),
@@ -255,7 +255,7 @@ fn default_allowed_commands() -> Vec<String> {
 
 /// Default forbidden paths for Unix platforms.
 #[cfg(not(target_os = "windows"))]
-fn default_forbidden_paths() -> Vec<String> {
+pub(crate) fn default_forbidden_paths() -> Vec<String> {
     vec![
         "/etc".into(),
         "/root".into(),
@@ -280,7 +280,7 @@ fn default_forbidden_paths() -> Vec<String> {
 
 /// Default forbidden paths for Windows platforms.
 #[cfg(target_os = "windows")]
-fn default_forbidden_paths() -> Vec<String> {
+pub(crate) fn default_forbidden_paths() -> Vec<String> {
     vec![
         "C:\\Windows".into(),
         "C:\\Windows\\System32".into(),
@@ -548,10 +548,10 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
                 match ch {
                     '\'' => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
-                    '&' => {
-                        if chars.next_if_eq(&'&').is_none() {
-                            return true;
-                        }
+                    // This must consume the second '&' so `&&` is not later
+                    // re-read as a lone trailing '&'.
+                    '&' if chars.next_if_eq(&'&').is_none() => {
+                        return true;
                     }
                     _ => {}
                 }
@@ -989,15 +989,6 @@ impl SecurityPolicy {
 
         let risk = self.command_risk_level(command);
 
-        // When the operator has set `allowed_commands = ["*"]` AND explicitly
-        // disabled `block_high_risk_commands`, they have opted out of all
-        // command-level restrictions.  Short-circuit: skip the risk and
-        // autonomy gates entirely.  See #4485.
-        let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
-        if has_wildcard && !self.block_high_risk_commands {
-            return Ok(risk);
-        }
-
         if risk == CommandRiskLevel::High {
             if self.block_high_risk_commands && !self.is_command_explicitly_allowed(command) {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
@@ -1087,6 +1078,15 @@ impl SecurityPolicy {
     pub fn is_command_allowed(&self, command: &str) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
             return false;
+        }
+
+        // When the operator has explicitly opted out of all command-level
+        // restrictions (wildcard + no high-risk blocking), skip the
+        // subshell/expansion guard entirely. This allows backticks,
+        // $(), heredocs, etc. in trusted environments.
+        let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
+        if has_wildcard && !self.block_high_risk_commands {
+            return true;
         }
 
         // Block subshell/expansion operators — these allow hiding arbitrary
@@ -3529,6 +3529,118 @@ mod tests {
         let result = p.validate_command_execution("rm -rf /tmp/test", true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("high-risk"));
+    }
+
+    // ── Shell guard bypass with wildcard + unblocked ──────────
+
+    #[test]
+    fn wildcard_unblocked_allows_backticks() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("echo `whoami`"));
+        assert!(p.is_command_allowed("ls `which git`"));
+    }
+
+    #[test]
+    fn wildcard_unblocked_allows_dollar_paren() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("echo $(cat /etc/hostname)"));
+        assert!(p.is_command_allowed("echo $(rm -rf /)"));
+    }
+
+    #[test]
+    fn wildcard_unblocked_allows_dollar_brace() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("echo ${HOME}"));
+        assert!(p.is_command_allowed("echo ${PATH}"));
+    }
+
+    #[test]
+    fn wildcard_unblocked_allows_process_substitution() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("diff <(ls dir1) <(ls dir2)"));
+        assert!(p.is_command_allowed("tee >(grep error > errors.log)"));
+    }
+
+    #[test]
+    fn wildcard_unblocked_allows_pipes_and_chains() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("ps aux | grep python | wc -l"));
+        assert!(p.is_command_allowed("echo hello && echo world"));
+    }
+
+    #[test]
+    fn wildcard_blocked_still_runs_shell_guard() {
+        // allowed_commands=["*"] but block_high_risk_commands=true (default)
+        // — the shell expansion guard must still fire.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed("echo `whoami`"));
+        assert!(!p.is_command_allowed("echo $(cat /etc/passwd)"));
+        assert!(!p.is_command_allowed("echo ${HOME}"));
+        assert!(!p.is_command_allowed("diff <(ls dir1) <(ls dir2)"));
+    }
+
+    #[test]
+    fn specific_allowlist_still_runs_shell_guard() {
+        // Non-wildcard allowlist — the guard must always run regardless
+        // of block_high_risk_commands.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["echo".into(), "ls".into(), "diff".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed("echo `whoami`"));
+        assert!(!p.is_command_allowed("echo $(cat /etc/passwd)"));
+        assert!(!p.is_command_allowed("echo ${HOME}"));
+        assert!(!p.is_command_allowed("diff <(ls dir1) <(ls dir2)"));
+    }
+
+    #[test]
+    fn specific_allowlist_with_block_true_still_runs_shell_guard() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["echo".into(), "ls".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed("echo `whoami`"));
+        assert!(!p.is_command_allowed("echo $(rm -rf /)"));
+        assert!(!p.is_command_allowed("echo ${HOME}"));
+    }
+
+    #[test]
+    fn wildcard_unblocked_readonly_still_blocked() {
+        // Even with wildcard + unblocked, ReadOnly trumps everything.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed("ls"));
+        assert!(!p.is_command_allowed("echo `whoami`"));
     }
 
     #[test]

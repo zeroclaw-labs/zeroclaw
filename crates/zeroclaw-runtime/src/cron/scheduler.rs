@@ -49,6 +49,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
             enabled: true,
             model: None,
             allowed_tools: None,
+            uses_memory: true,
             session_target: None,
             delivery: None,
         };
@@ -272,38 +273,43 @@ async fn run_agent_job(
     let prompt = job.prompt.clone().unwrap_or_default();
 
     // Recall relevant memories so cron jobs have context awareness.
+    // Skipped when `job.uses_memory` is false (e.g. stateless digest jobs).
     // Exclude `Conversation` memories to prevent chat context from
     // leaking into scheduled executions (see #5415).
-    let memory_context = match zeroclaw_memory::create_memory(
-        &config.memory,
-        &config.workspace_dir,
-        config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.api_key.as_deref()),
-    ) {
-        Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
-            Ok(entries) if !entries.is_empty() => {
-                let ctx: String = entries
-                    .iter()
-                    .filter(|e| {
-                        !matches!(
-                            e.category,
-                            zeroclaw_memory::traits::MemoryCategory::Conversation
-                        )
-                    })
-                    .map(|e| format!("- {}: {}", e.key, e.content))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if ctx.is_empty() {
-                    String::new()
-                } else {
-                    format!("[Memory context]\n{ctx}\n\n")
+    let memory_context = if !job.uses_memory {
+        String::new()
+    } else {
+        match zeroclaw_memory::create_memory(
+            &config.memory,
+            &config.workspace_dir,
+            config
+                .providers
+                .fallback_provider()
+                .and_then(|e| e.api_key.as_deref()),
+        ) {
+            Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
+                Ok(entries) if !entries.is_empty() => {
+                    let ctx: String = entries
+                        .iter()
+                        .filter(|e| {
+                            !matches!(
+                                e.category,
+                                zeroclaw_memory::traits::MemoryCategory::Conversation
+                            )
+                        })
+                        .map(|e| format!("- {}: {}", e.key, e.content))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if ctx.is_empty() {
+                        String::new()
+                    } else {
+                        format!("[Memory context]\n{ctx}\n\n")
+                    }
                 }
-            }
-            _ => String::new(),
-        },
-        Err(_) => String::new(),
+                _ => String::new(),
+            },
+            Err(_) => String::new(),
+        }
     };
 
     let prefixed_prompt = format!("{memory_context}[cron:{} {name}] {prompt}", job.id);
@@ -311,6 +317,11 @@ async fn run_agent_job(
 
     let mut cron_config = config.clone();
     cron_config.memory.auto_save = false;
+
+    // Assign a unique session ID so memories written during this run can be
+    // purged atomically if the run fails (prevents snowball accumulation).
+    let run_session_id = uuid::Uuid::new_v4().to_string();
+    let session_path = std::path::PathBuf::from(format!("cron-{run_session_id}"));
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
@@ -326,7 +337,7 @@ async fn run_agent_job(
                     .unwrap_or(0.7),
                 vec![],
                 false,
-                None,
+                Some(session_path.clone()),
                 job.allowed_tools.clone(),
             ))
             .await
@@ -342,7 +353,22 @@ async fn run_agent_job(
                 response
             },
         ),
-        Err(e) => (false, format!("agent job failed: {e}")),
+        Err(e) => {
+            // Purge memories written during this failed run so they don't
+            // pollute future recall and cause context snowball.
+            let mem_session_key = format!("cli:{}", session_path.display());
+            if let Ok(mem) = zeroclaw_memory::create_memory(
+                &config.memory,
+                &config.workspace_dir,
+                config
+                    .providers
+                    .fallback_provider()
+                    .and_then(|e| e.api_key.as_deref()),
+            ) {
+                let _ = mem.purge_session(&mem_session_key).await;
+            }
+            (false, format!("agent job failed: {e}"))
+        }
     }
 }
 
@@ -495,10 +521,23 @@ pub async fn deliver_announcement(
         )
         .await
     } else {
+        // No handler registered: this is a runtime-level state (the binary
+        // hasn't called `register_delivery_fn`), not a per-job failure.
+        // Returning `Err` here would force every announce-mode job to set
+        // `best_effort=true` just to survive a system that legitimately has
+        // no delivery wired (e.g. headless test runs, gateway-only deployments
+        // where channel orchestration lives elsewhere).
+        //
+        // We log loudly via `tracing::warn` so operators see the dropped
+        // delivery in their logs, then return `Ok(())` so `persist_job_result`
+        // records the job execution itself as successful. Operators that
+        // actively rely on delivery wire a handler at startup; absence is a
+        // configuration signal, not a delivery error.
         tracing::warn!(
             channel = %channel,
             target = %target,
-            "Cron delivery skipped: no delivery handler registered"
+            "Cron delivery skipped: no delivery handler registered \
+             (register_delivery_fn was not called by the binary)"
         );
         Ok(())
     }
@@ -659,6 +698,7 @@ mod tests {
             delivery: DeliveryConfig::default(),
             delete_after_run: false,
             allowed_tools: None,
+            uses_memory: true,
             source: "imperative".into(),
             created_at: Utc::now(),
             next_run: Utc::now(),
@@ -1244,21 +1284,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_if_configured_announce_stub_returns_ok() {
+    async fn deliver_announcement_returns_ok_when_no_handler_registered() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
-        let mut job = test_job("echo ok");
-        job.delivery = DeliveryConfig {
-            mode: "announce".into(),
-            channel: Some("telegram".into()),
-            to: Some("123456".into()),
-            best_effort: true,
-        };
-
-        // deliver_announcement is a stub that logs a warning and returns Ok.
-        // Once delivery is wired through the orchestrator callback, these
-        // tests should be updated to verify actual delivery behaviour.
-        assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
+        // No registered handler is a runtime-level state, not a delivery
+        // failure. The caller (persist_job_result) should record the job
+        // execution as successful; the missing handler is logged via
+        // tracing::warn for operator visibility.
+        deliver_announcement(&config, "telegram", "chat-id", "payload")
+            .await
+            .expect("missing delivery handler should be Ok with a warn log");
     }
 
     #[test]

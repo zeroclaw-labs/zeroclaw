@@ -1,0 +1,24 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "mdbook"
+path = "src/bin/mdbook.rs"
+
+[[bin]]
+name = "fluent"
+path = "src/bin/fluent.rs"
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+clap = { version = "4.5", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+serde_json = "1.0"
+toml = "0.8"
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "net"] }
+tower-http = { version = "0.6", default-features = false, features = ["fs"] }

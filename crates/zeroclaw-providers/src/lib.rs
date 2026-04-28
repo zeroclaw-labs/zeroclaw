@@ -7,7 +7,7 @@
 //! so that user-facing keys remain stable.
 //!
 //! The subsystem supports resilient multi-provider configurations through the
-//! [`ReliableProvider`](reliable::ReliableProvider) wrapper, which handles fallback
+//! [`ReliableProvider`] wrapper, which handles fallback
 //! chains and automatic retry. Model routing across providers is available via
 //! [`create_routed_provider`].
 //!
@@ -27,6 +27,7 @@ pub mod gemini;
 pub mod gemini_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod kilocli;
+pub mod models_dev;
 pub mod multimodal;
 pub mod ollama;
 pub mod openai;
@@ -713,6 +714,9 @@ pub struct ProviderRuntimeOptions {
     /// When true, system messages are merged into the first user message before
     /// sending. Propagated from `ModelProviderConfig::merge_system_into_user`.
     pub merge_system_into_user: bool,
+    /// Extra JSON parameters merged into API request bodies at the top level.
+    /// Propagated from `ModelProviderConfig::provider_extra`.
+    pub provider_extra: Option<serde_json::Value>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -729,6 +733,7 @@ impl Default for ProviderRuntimeOptions {
             api_path: None,
             provider_max_tokens: None,
             merge_system_into_user: false,
+            provider_extra: None,
         }
     }
 }
@@ -771,6 +776,7 @@ pub fn provider_runtime_options_from_config(
         api_path: fallback.and_then(|e| e.api_path.clone()),
         provider_max_tokens: fallback.and_then(|e| e.max_tokens),
         merge_system_into_user,
+        provider_extra: fallback.and_then(|e| e.provider_extra.clone()),
     }
 }
 
@@ -809,11 +815,7 @@ pub fn scrub_secret_patterns(input: &str) -> String {
 
     for prefix in PREFIXES {
         let mut search_from = 0;
-        loop {
-            let Some(rel) = scrubbed[search_from..].find(prefix) else {
-                break;
-            };
-
+        while let Some(rel) = scrubbed[search_from..].find(prefix) {
             let start = search_from + rel;
             let content_start = start + prefix.len();
             let end = token_end(&scrubbed, content_start);
@@ -1183,10 +1185,14 @@ fn create_provider_with_url_and_options(
             )?))
         }
         // ── Primary providers (custom implementations) ───────
-        "openrouter" => Ok(Box::new(
-            openrouter::OpenRouterProvider::new(key, options.provider_timeout_secs)
-                .with_max_tokens(options.provider_max_tokens),
-        )),
+        "openrouter" => {
+            let mut p = openrouter::OpenRouterProvider::new(key, options.provider_timeout_secs)
+                .with_max_tokens(options.provider_max_tokens);
+            if let Some(extra) = options.provider_extra.clone() {
+                p = p.with_extra_body(extra);
+            }
+            Ok(Box::new(p))
+        }
         "anthropic" => {
             let mut p = anthropic::AnthropicProvider::new(key);
             if let Some(mt) = options.provider_max_tokens {
@@ -1299,12 +1305,13 @@ fn create_provider_with_url_and_options(
             )))
         }
         name if minimax_base_url(name).is_some() => Ok(compat(
-            OpenAiCompatibleProvider::new_merge_system_into_user(
+            OpenAiCompatibleProvider::new(
                 "MiniMax",
                 minimax_base_url(name).expect("checked in guard"),
                 key,
                 AuthStyle::Bearer,
-            ),
+            )
+            .with_merge_system_into_user(),
         )),
         "azure_openai" | "azure-openai" | "azure" => {
             let resource = std::env::var("AZURE_OPENAI_RESOURCE")
@@ -1389,12 +1396,15 @@ fn create_provider_with_url_and_options(
         }
 
         // ── Extended ecosystem (community favorites) ─────────
-        "groq" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Groq",
-            "https://api.groq.com/openai/v1",
-            key,
-            AuthStyle::Bearer,
-        ))),
+        "groq" => Ok(compat(
+            OpenAiCompatibleProvider::new(
+                "Groq",
+                "https://api.groq.com/openai/v1",
+                key,
+                AuthStyle::Bearer,
+            )
+            .without_native_tools(),
+        )),
         "mistral" => Ok(compat(OpenAiCompatibleProvider::new(
             "Mistral",
             "https://api.mistral.ai/v1",
@@ -2831,13 +2841,13 @@ mod tests {
     }
 
     #[test]
-    fn factory_minimax_disables_native_tool_calling() {
+    fn factory_minimax_supports_native_tool_calling() {
         let minimax = create_provider("minimax", Some("key")).expect("provider should resolve");
-        assert!(!minimax.supports_native_tools());
+        assert!(minimax.supports_native_tools());
 
         let minimax_cn =
             create_provider("minimax-cn", Some("key")).expect("provider should resolve");
-        assert!(!minimax_cn.supports_native_tools());
+        assert!(minimax_cn.supports_native_tools());
     }
 
     #[test]

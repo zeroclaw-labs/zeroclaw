@@ -523,8 +523,15 @@ impl ModelRoutingConfigTool {
             Err(_) => return Ok(()),
         };
 
+        // Greedy sampling: the ping is a liveness check, not a generation task.
+        const PING_TEMPERATURE: f64 = 0.0;
         provider
-            .chat_with_system(Some("Respond with OK."), "ping", model, 0.0)
+            .chat_with_system(
+                Some("Respond with OK."),
+                "ping",
+                model,
+                Some(PING_TEMPERATURE),
+            )
             .await?;
 
         Ok(())
