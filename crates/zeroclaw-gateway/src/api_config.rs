@@ -85,6 +85,11 @@ pub struct PatchOpResult {
     pub value: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub populated: Option<bool>,
+    /// Comment that was applied alongside this op (if any). Echoed so
+    /// clients can confirm the comment was actually written to disk
+    /// without having to round-trip through `GET` and parse the TOML.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -678,6 +683,7 @@ pub async fn handle_patch(
                     path,
                     value: Some(actual),
                     populated: None,
+                    comment: None, // `test` ops don't write
                 });
             }
             "add" | "replace" => {
@@ -710,6 +716,7 @@ pub async fn handle_patch(
                         path,
                         value: None,
                         populated: Some(!value_str.is_empty()),
+                        comment: op.comment.clone(),
                     });
                 } else {
                     results.push(PatchOpResult {
@@ -717,6 +724,7 @@ pub async fn handle_patch(
                         path,
                         value: Some(serde_json::Value::String(value_str)),
                         populated: None,
+                        comment: op.comment.clone(),
                     });
                 }
             }
@@ -730,6 +738,7 @@ pub async fn handle_patch(
                         path,
                         value: None,
                         populated: Some(false),
+                        comment: op.comment.clone(),
                     });
                 } else {
                     results.push(PatchOpResult {
@@ -737,6 +746,7 @@ pub async fn handle_patch(
                         path,
                         value: Some(serde_json::Value::Null),
                         populated: None,
+                        comment: op.comment.clone(),
                     });
                 }
             }

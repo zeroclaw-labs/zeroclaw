@@ -208,6 +208,8 @@ export interface PatchOpResult {
   path: string;
   value?: unknown;
   populated?: boolean;
+  /** Echoed back from the request so clients can confirm the comment was written. */
+  comment?: string;
 }
 
 export interface PatchResponse {
