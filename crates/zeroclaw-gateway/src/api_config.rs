@@ -120,11 +120,11 @@ pub struct SecretResponse {
 /// Single entry in the list response. Secrets carry only `path + populated`;
 /// non-secrets additionally carry `value`.
 ///
-/// `kind` and `type_hint` are the wire form of the field's declared `PropKind`
-/// + Rust type signature. Frontends bind input renderers to these directly
-/// (bool → toggle, integer → number input, string-array → list editor) rather
-/// than sniffing the runtime shape of `value`. `enum_variants` is populated
-/// for fields whose macro derive surfaces a variant list — dropdown source.
+/// `kind` and `type_hint` are the wire form of the field's declared
+/// `PropKind` plus its Rust type signature. Frontends bind input renderers
+/// to these directly (no value-sniffing). `enum_variants` is populated for
+/// fields whose macro derive surfaces a variant list (drives `select`
+/// option rendering).
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ListEntry {
@@ -468,7 +468,9 @@ pub async fn handle_prop_put(
     }
     if let Some(comment) = body.comment.as_ref() {
         let annotations = [(body.path.clone(), comment.clone())];
-        if let Err(e) = zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await {
+        if let Err(e) =
+            zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
+        {
             tracing::warn!(error = %e, "failed to apply PUT comment to config.toml");
         }
     }
@@ -571,10 +573,7 @@ pub async fn handle_list(
                 Some(serde_json::Value::String(info.display_value.clone()))
             };
             let section = Section::from_path(&info.name).and_then(Section::as_path_prefix);
-            let enum_variants = info
-                .enum_variants
-                .map(|f| f())
-                .unwrap_or_default();
+            let enum_variants = info.enum_variants.map(|f| f()).unwrap_or_default();
             ListEntry {
                 path: info.name,
                 category: info.category.to_string(),
@@ -829,7 +828,8 @@ pub async fn handle_patch(
         return error_response(e);
     }
     if !annotations.is_empty()
-        && let Err(e) = zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
+        && let Err(e) =
+            zeroclaw_config::comment_writer::apply_comments(&config_path, &annotations).await
     {
         // Comments are best-effort decoration; surface as a non-fatal warn.
         // The patch itself succeeded — return success but log the failure.
@@ -1296,7 +1296,10 @@ mod tests {
             .iter()
             .position(|l| l.trim_start().starts_with("host"))
             .expect("host = line in saved config");
-        assert!(host_line_idx > 0, "host line is at top — comment can't precede it");
+        assert!(
+            host_line_idx > 0,
+            "host line is at top — comment can't precede it"
+        );
         let above = lines[host_line_idx - 1];
         assert_eq!(
             above.trim(),
@@ -1328,13 +1331,25 @@ mod tests {
         // keys are typically written as `"key": "value"`).
         let cases = [
             // Field=value style log line.
-            ("api-key=sk-live-abcdef-1234567890", "sk-live-abcdef-1234567890"),
+            (
+                "api-key=sk-live-abcdef-1234567890",
+                "sk-live-abcdef-1234567890",
+            ),
             // JSON-ish quoted key-value pair.
-            (r#""token": "sk-test-supersecret-12345""#, "sk-test-supersecret-12345"),
+            (
+                r#""token": "sk-test-supersecret-12345""#,
+                "sk-test-supersecret-12345",
+            ),
             // Explicit secret key.
-            ("secret: hunter2-not-a-real-password", "hunter2-not-a-real-password"),
+            (
+                "secret: hunter2-not-a-real-password",
+                "hunter2-not-a-real-password",
+            ),
             // Bearer credential pair.
-            ("credential: bearer-token-abcdef-9876", "bearer-token-abcdef-9876"),
+            (
+                "credential: bearer-token-abcdef-9876",
+                "bearer-token-abcdef-9876",
+            ),
         ];
         for (input, raw_secret) in cases {
             let scrubbed = scrub_credentials(input);
@@ -1464,12 +1479,18 @@ mod tests {
         cfg.set_prop("gateway.host", "10.0.0.5").expect("set_prop");
         cfg.save().await.expect("save");
 
-        zeroclaw_config::comment_writer::apply_comments(&path, &[("gateway.host".into(), "first reason".into())])
-            .await
-            .expect("apply first comment");
-        zeroclaw_config::comment_writer::apply_comments(&path, &[("gateway.host".into(), String::new())])
-            .await
-            .expect("apply empty");
+        zeroclaw_config::comment_writer::apply_comments(
+            &path,
+            &[("gateway.host".into(), "first reason".into())],
+        )
+        .await
+        .expect("apply first comment");
+        zeroclaw_config::comment_writer::apply_comments(
+            &path,
+            &[("gateway.host".into(), String::new())],
+        )
+        .await
+        .expect("apply empty");
 
         let raw = tokio::fs::read_to_string(&path).await.expect("read back");
         assert!(

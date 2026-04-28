@@ -67,8 +67,16 @@ async fn apply_comment_inline(
 /// helper that the gateway PATCH/PUT endpoints use. Looking up a path's
 /// declared `PropKind` requires a `Config` reference, which the patch handler
 /// has — so this looks the kind up against the live config and forwards.
-fn json_value_to_setprop_string(value: &serde_json::Value, config: &Config, path: &str) -> Result<String> {
-    let kind = config.prop_fields().into_iter().find(|f| f.name == path).map(|f| f.kind);
+fn json_value_to_setprop_string(
+    value: &serde_json::Value,
+    config: &Config,
+    path: &str,
+) -> Result<String> {
+    let kind = config
+        .prop_fields()
+        .into_iter()
+        .find(|f| f.name == path)
+        .map(|f| f.kind);
     zeroclaw_config::typed_value::coerce_for_set_prop(value, kind)
         .map_err(|e| anyhow::anyhow!("{}", e.message))
 }
@@ -2290,10 +2298,11 @@ async fn main() -> Result<()> {
                             // the CLI's --json envelope matches the HTTP shape.
                             // Same single-source-of-truth helper the gateway
                             // uses; never hardcode a code at the call site.
-                            let api_err = zeroclaw_config::api_error::ConfigApiError::from_validation(
-                                anyhow::anyhow!("{e}"),
-                            )
-                            .with_path(&path);
+                            let api_err =
+                                zeroclaw_config::api_error::ConfigApiError::from_validation(
+                                    anyhow::anyhow!("{e}"),
+                                )
+                                .with_path(&path);
                             if json {
                                 eprintln!("{}", serde_json::to_string_pretty(&api_err)?);
                                 std::process::exit(1);

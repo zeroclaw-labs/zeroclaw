@@ -108,7 +108,10 @@ pub fn coerce_for_set_prop(
         }
         (Some(PropKind::Float), other) => Err(ConfigApiError::new(
             ConfigApiCode::ValueTypeMismatch,
-            format!("float field requires a number; got {}", json_type_name(other)),
+            format!(
+                "float field requires a number; got {}",
+                json_type_name(other)
+            ),
         )),
 
         // Scalar / enum fields and unknown-kind paths: best-effort coerce.
@@ -152,7 +155,10 @@ mod tests {
             Some(PropKind::Enum),
             Some(PropKind::StringArray),
         ] {
-            assert_eq!(coerce_for_set_prop(&serde_json::Value::Null, k).unwrap(), "");
+            assert_eq!(
+                coerce_for_set_prop(&serde_json::Value::Null, k).unwrap(),
+                ""
+            );
         }
     }
 
@@ -211,11 +217,9 @@ mod tests {
 
     #[test]
     fn integer_field_rejects_float() {
-        let err = coerce_for_set_prop(
-            &serde_json::json!(3.14),
-            Some(PropKind::Integer),
-        )
-        .unwrap_err();
+        // Use a non-pi float so clippy's approx_constant lint doesn't flag.
+        let err =
+            coerce_for_set_prop(&serde_json::json!(2.5_f64), Some(PropKind::Integer)).unwrap_err();
         assert_eq!(err.code, ConfigApiCode::ValueTypeMismatch);
     }
 
