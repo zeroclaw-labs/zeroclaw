@@ -149,6 +149,8 @@ pub struct WuKongIMChannel {
     approval_timeout_secs: u64,
     /// Outbound WS sink
     ws_sink: Arc<RwLock<Option<WsSink>>>,
+    /// When true, only respond to messages that @-mention the bot in groups.
+    mention_only: bool,
 }
 
 impl WuKongIMChannel {
@@ -163,6 +165,7 @@ impl WuKongIMChannel {
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             approval_timeout_secs: config.approval_timeout_secs,
             ws_sink: Arc::new(RwLock::new(None)),
+            mention_only: config.mention_only,
         }
     }
 
@@ -249,43 +252,44 @@ impl WuKongIMChannel {
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
         timeout_secs: u64,
     ) -> serde_json::Value {
+        // Human-readable summarization for cron_add or other tools
+        let (title, content) = if request.tool_name == "cron_add" {
+            let mut summary = request.arguments_summary.clone();
+            // Basic cleanup of common patterns in cron_add summary
+            summary = summary
+                .replace("job_type: agent, ", "任务类型: 智能体, ")
+                .replace("name: ", "任务名称: ")
+                .replace("prompt: ", "提示词: ")
+                .replace("schedule: ", "\n执行计划: ");
+
+            (
+                "📋 任务执行审批",
+                format!(
+                    "1. **执行的是什么**\n添加定时任务: **{}**\n\n2. **执行的时间相关信息**\n{}\n\n3. **执行内容的总结**\n{}",
+                    request.tool_name,
+                    summary.split("\n执行计划: ").last().unwrap_or("按计划执行"),
+                    summary
+                ),
+            )
+        } else {
+            (
+                "📋 任务执行审批",
+                format!(
+                    "🔧 智能体请求执行: **{}**\n\n**执行内容总结**:\n{}",
+                    request.tool_name, request.arguments_summary
+                ),
+            )
+        };
+
+        let content = format!("{}\n\n1批准，2拒绝 3总是允许", content);
+
         serde_json::json!({
             "type": 20,
             "approval_id": approval_id,
             "timeout_secs": timeout_secs,
-            "header": {
-                "title": "需要审批"
-            },
+            "title": title,
             "body": {
-                "elements": [
-                    {
-                        "tag": "markdown",
-                        "content": format!("🔧 Agent wants to execute: **{}**\n\n{}", request.tool_name, request.arguments_summary)
-                    },
-                    {
-                        "tag": "action",
-                        "actions": [
-                            {
-                                "tag": "button",
-                                "text": { "tag": "plain_text", "content": "Approve" },
-                                "type": "primary",
-                                "value": "approve"
-                            },
-                            {
-                                "tag": "button",
-                                "text": { "tag": "plain_text", "content": "Deny" },
-                                "type": "danger",
-                                "value": "deny"
-                            },
-                            {
-                                "tag": "button",
-                                "text": { "tag": "plain_text", "content": "Always" },
-                                "type": "default",
-                                "value": "always"
-                            }
-                        ]
-                    }
-                ]
+                "content": content
             }
         })
     }
@@ -456,6 +460,11 @@ impl Channel for WuKongIMChannel {
                                 serde_json::from_value(val)?;
                             let params = notification.params;
 
+                            if params.from_uid == self.uid {
+                                tracing::trace!("WuKongIM: ignoring message from self");
+                                continue;
+                            }
+
                             if !self.is_user_allowed(&params.from_uid) {
                                 tracing::warn!("WuKongIM: ignoring message from {} (unauthorized)", params.from_uid);
                                 continue;
@@ -464,6 +473,7 @@ impl Channel for WuKongIMChannel {
                             // 1. Decode Base64 payload
                             let decoded_payload = base64::engine::general_purpose::STANDARD.decode(&params.payload)?;
                             let payload_json: serde_json::Value = serde_json::from_slice(&decoded_payload)?;
+                            tracing::debug!("WuKongIM: decoded payload: {:?}", payload_json);
 
                             // 2. Filter out system commands (type 99 or presence of 'cmd')
                             let msg_type = payload_json.get("type").and_then(|t| t.as_u64()).unwrap_or(0);
@@ -505,10 +515,75 @@ impl Channel for WuKongIMChannel {
                             let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
 
                             // Extract text content
-                            let content = payload_json.get("content")
-                                .and_then(|c| c.as_str())
-                                .unwrap_or(&params.payload)
-                                .to_string();
+                            let content = if let Some(c) =
+                                payload_json.get("content").and_then(|c| c.as_str())
+                            {
+                                c.to_string()
+                            } else if let Some(s) = payload_json.as_str() {
+                                s.to_string()
+                            } else {
+                                String::new()
+                            };
+                            tracing::info!(
+                                "WuKongIM: received message from {} (channel: {}:{}): {}",
+                                params.from_uid,
+                                params.channel_type,
+                                params.channel_id,
+                                content
+                            );
+
+                            // 3. Handle mention_only logic for group chats
+                            let is_group = params.channel_type != 1;
+                            if self.mention_only && is_group {
+                                let mut mentioned = false;
+
+                                // Check formal mention object
+                                if let Some(mention) = payload_json.get("mention") {
+                                    // Check 'all'
+                                    if let Some(all) = mention.get("all") {
+                                        if all.as_u64() == Some(1)
+                                            || all.as_str() == Some("1")
+                                            || all.as_str() == Some("true")
+                                            || all.as_bool() == Some(true)
+                                        {
+                                            mentioned = true;
+                                        }
+                                    }
+                                    // Check 'uids'
+                                    if !mentioned {
+                                        if let Some(uids) =
+                                            mention.get("uids").and_then(|v| v.as_array())
+                                        {
+                                            if uids.iter().any(|u| {
+                                                u.as_str() == Some(&self.uid)
+                                                    || u.as_u64()
+                                                        .map(|n| n.to_string())
+                                                        .as_deref()
+                                                        == Some(&self.uid)
+                                            }) {
+                                                mentioned = true;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Check content for @mention if not already found
+                                if !mentioned {
+                                    if content.contains(&format!("@{}", self.uid))
+                                        || content.contains("@all")
+                                    {
+                                        mentioned = true;
+                                    }
+                                }
+
+                                if !mentioned {
+                                    tracing::debug!(
+                                        "WuKongIM: ignoring non-mention message in group (uid: {})",
+                                        self.uid
+                                    );
+                                    continue;
+                                }
+                            }
 
                             // Determine target: for type 1 (personal), reply to from_uid. For others, reply to channel_id.
                             let target_id = if params.channel_type == 1 {
