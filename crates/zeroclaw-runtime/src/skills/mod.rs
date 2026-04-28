@@ -77,6 +77,7 @@ struct SkillManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SkillMeta {
     name: String,
     description: String,
@@ -1732,5 +1733,83 @@ mod registry_tests {
     fn test_is_registry_source_rejects_special_chars() {
         assert!(!is_registry_source(".hidden"));
         assert!(!is_registry_source("~tilde"));
+    }
+}
+
+#[cfg(test)]
+mod skill_manifest_tests {
+    use super::*;
+
+    fn parse_manifest(toml: &str) -> Result<SkillManifest, toml::de::Error> {
+        toml::from_str::<SkillManifest>(toml)
+    }
+
+    #[test]
+    fn skill_manifest_known_fields_parse_ok() {
+        let toml = r#"
+[skill]
+name = "demo"
+description = "demo skill"
+version = "1.2.3"
+author = "Sai"
+tags = ["a", "b"]
+"#;
+        let manifest = parse_manifest(toml).expect("known fields must parse");
+        assert_eq!(manifest.skill.name, "demo");
+        assert_eq!(manifest.skill.description, "demo skill");
+        assert_eq!(manifest.skill.version, "1.2.3");
+        assert_eq!(manifest.skill.author.as_deref(), Some("Sai"));
+        assert_eq!(manifest.skill.tags, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn skill_manifest_uses_default_version_when_omitted() {
+        let toml = r#"
+[skill]
+name = "demo"
+description = "demo skill"
+"#;
+        let manifest = parse_manifest(toml).expect("optional fields must default");
+        assert_eq!(manifest.skill.version, default_version());
+        assert!(manifest.skill.author.is_none());
+        assert!(manifest.skill.tags.is_empty());
+    }
+
+    #[test]
+    fn skill_manifest_unknown_field_under_skill_is_an_error() {
+        // Regression test for issue #6128: a typo in the [skill] section used
+        // to be silently dropped because SkillMeta lacked
+        // `#[serde(deny_unknown_fields)]`. Skill authors hit this with names
+        // like `descriptin` or `autor`, got zero behavioural effect, and gave
+        // up. Now those typos surface as a parse error that names the field.
+        let toml = r#"
+[skill]
+name = "demo"
+description = "demo skill"
+descriptin = "typo - should be 'description'"
+"#;
+        let err = parse_manifest(toml).expect_err("unknown field must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("descriptin") || msg.contains("unknown field"),
+            "expected the parse error to name the unknown field; got: {msg}",
+        );
+    }
+
+    #[test]
+    fn skill_manifest_unknown_field_at_top_level_still_allowed() {
+        // We only deny unknown fields under the `[skill]` table; the top-level
+        // SkillManifest deliberately stays permissive so future top-level
+        // tables (e.g. registry-specific extensions) don't break older
+        // SKILL.toml consumers.
+        let toml = r#"
+[skill]
+name = "demo"
+description = "demo skill"
+
+[future_table]
+some_key = "value"
+"#;
+        let _ = parse_manifest(toml).expect("unknown top-level table must still parse");
     }
 }
