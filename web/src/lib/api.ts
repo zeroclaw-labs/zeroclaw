@@ -372,21 +372,6 @@ export function getCatalogModels(provider: string): Promise<ModelsResponse> {
   );
 }
 
-// ── Daemon admin (localhost-only on the gateway) ─────────────────────
-
-export interface AdminResponse {
-  success: boolean;
-  message: string;
-}
-
-/**
- * Restart the daemon process. Spawns a replacement, then signals the
- * current process down. Brief connection-refused window — clients should
- * poll `/health` to detect when the new instance is ready.
- */
-export function restartDaemon(): Promise<AdminResponse> {
-  return apiFetch<AdminResponse>('/admin/restart', { method: 'POST' });
-}
 
 // ---------------------------------------------------------------------------
 // Tools

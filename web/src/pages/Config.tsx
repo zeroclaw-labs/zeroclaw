@@ -10,12 +10,9 @@
 // gateway derives from `Configurable::map_key_sections()` — single source of
 // truth, no hand-maintained list. Provider picker uses the upstream catalog
 // the CLI wizard fetches (`GET /api/onboard/catalog`).
-//
-// Daemon restart button hits `POST /admin/restart` and polls `/health` until
-// the new instance is ready.
 
 import { useEffect, useMemo, useState } from 'react';
-import { Plus, RotateCw, Save, Trash2 } from 'lucide-react';
+import { Plus, Save, Settings, Trash2, X } from 'lucide-react';
 import {
   ApiError,
   createMapKey,
@@ -25,7 +22,6 @@ import {
   getTemplates,
   listProps,
   patchConfig,
-  restartDaemon,
   type CatalogProvider,
   type ConfigApiError,
   type ListResponseEntry,
@@ -95,7 +91,6 @@ function parseInput(entry: ListResponseEntry, raw: string): unknown {
   }
 }
 
-/** Cache of `provider name → models` so we don't refetch on every render. */
 const modelsCache: Record<string, string[]> = {};
 
 export default function Config() {
@@ -109,9 +104,10 @@ export default function Config() {
   const [fieldErrors, setFieldErrors] = useState<Record<string, ConfigApiError>>({});
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<string | null>(null);
-  const [addingTo, setAddingTo] = useState<string | null>(null);
+  const [addModalTemplate, setAddModalTemplate] = useState<TemplateEntry | null>(null);
   const [addKey, setAddKey] = useState('');
-  const [restartState, setRestartState] = useState<'idle' | 'restarting' | 'waiting' | 'back'>('idle');
+  const [addError, setAddError] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
 
   const reload = async () => {
     setLoading(true);
@@ -146,8 +142,6 @@ export default function Config() {
     setSavedAt(null);
     setFieldErrors({});
 
-    // Build PATCH ops only for fields whose draft differs from the current
-    // display value. Skip secret fields with empty input (means "leave it").
     const ops: PatchOp[] = [];
     for (const e of entries) {
       const raw = draft[e.path] ?? '';
@@ -186,21 +180,26 @@ export default function Config() {
     }
   };
 
-  const handleAdd = async (template: TemplateEntry) => {
+  const handleAdd = async () => {
+    if (!addModalTemplate) return;
     const key = addKey.trim();
     if (!key) return;
+    setAdding(true);
+    setAddError(null);
     try {
-      await createMapKey(template.path, key);
-      setAddingTo(null);
+      await createMapKey(addModalTemplate.path, key);
+      setAddModalTemplate(null);
       setAddKey('');
       await reload();
     } catch (e) {
       if (e instanceof ApiError) {
         const env = e.envelope as ConfigApiError;
-        setError(`[${env.code}] ${env.message}`);
+        setAddError(`[${env.code}] ${env.message}`);
       } else {
-        setError(String(e instanceof Error ? e.message : e));
+        setAddError(String(e instanceof Error ? e.message : e));
       }
+    } finally {
+      setAdding(false);
     }
   };
 
@@ -218,39 +217,6 @@ export default function Config() {
     }
   };
 
-  const handleRestart = async () => {
-    if (!confirm('Restart the daemon? Connections will briefly drop until the new instance is ready.')) return;
-    setRestartState('restarting');
-    try {
-      await restartDaemon();
-      setRestartState('waiting');
-      // Poll /health until it answers.
-      const start = Date.now();
-      while (Date.now() - start < 30_000) {
-        await new Promise((r) => setTimeout(r, 800));
-        try {
-          const r = await fetch('/health');
-          if (r.ok) {
-            setRestartState('back');
-            setTimeout(() => {
-              setRestartState('idle');
-              void reload();
-            }, 1500);
-            return;
-          }
-        } catch {
-          // keep polling
-        }
-      }
-      setError('Daemon did not respond within 30s. Check the gateway logs.');
-      setRestartState('idle');
-    } catch (e) {
-      setError(String(e instanceof Error ? e.message : e));
-      setRestartState('idle');
-    }
-  };
-
-  // Fetch model list for a provider when the user picks it.
   const ensureModelsLoaded = async (provider: string) => {
     if (modelsCache[provider]) return modelsCache[provider];
     try {
@@ -263,138 +229,245 @@ export default function Config() {
     }
   };
 
-  if (loading) return <div className="p-6">Loading config…</div>;
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <div
+          className="h-8 w-8 border-2 rounded-full animate-spin"
+          style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
+        />
+      </div>
+    );
+  }
 
   return (
-    <div className="flex flex-col gap-4 p-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold">Configuration</h1>
-          <p className="text-sm text-gray-500">
-            Schema-driven editor. Every field comes from the gateway's per-property API.
-          </p>
-        </div>
+    <div className="flex flex-col h-full p-6 gap-4 animate-fade-in overflow-y-auto">
+      {/* Header — matches the convention used by Memory.tsx, Tools.tsx, etc. */}
+      <div className="flex items-center justify-between flex-shrink-0">
         <div className="flex items-center gap-2">
-          <button
-            onClick={handleRestart}
-            disabled={restartState !== 'idle'}
-            className="flex items-center gap-2 rounded border px-3 py-2 text-sm disabled:opacity-50"
+          <Settings className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
+          <h2
+            className="text-sm font-semibold uppercase tracking-wider"
+            style={{ color: 'var(--pc-text-primary)' }}
           >
-            <RotateCw className={`h-4 w-4 ${restartState !== 'idle' ? 'animate-spin' : ''}`} />
-            {restartState === 'idle'
-              ? 'Restart daemon'
-              : restartState === 'restarting'
-              ? 'Restarting…'
-              : restartState === 'waiting'
-              ? 'Waiting for daemon…'
-              : 'Daemon back ✓'}
-          </button>
-          <button
-            onClick={handleSaveAll}
-            disabled={saving}
-            className="flex items-center gap-2 rounded bg-blue-600 px-4 py-2 text-sm text-white disabled:opacity-50"
-          >
-            <Save className="h-4 w-4" />
-            {saving ? 'Saving…' : 'Save all changes'}
-          </button>
+            Configuration
+          </h2>
         </div>
+        <button
+          onClick={handleSaveAll}
+          disabled={saving}
+          className="btn-electric flex items-center gap-2 text-sm px-4 py-2"
+        >
+          <Save className="h-4 w-4" />
+          {saving ? 'Saving…' : 'Save all changes'}
+        </button>
       </div>
 
+      {/* Status banners */}
       {error && (
-        <div className="rounded border border-red-300 bg-red-50 p-3 text-sm text-red-700">{error}</div>
+        <div
+          className="rounded-xl border p-3 text-sm animate-fade-in flex-shrink-0"
+          style={{
+            background: 'rgba(239, 68, 68, 0.08)',
+            borderColor: 'rgba(239, 68, 68, 0.2)',
+            color: '#f87171',
+          }}
+        >
+          {error}
+        </div>
       )}
       {savedAt && (
-        <div className="rounded border border-green-300 bg-green-50 p-3 text-sm text-green-700">{savedAt}</div>
+        <div
+          className="rounded-xl border p-3 text-sm animate-fade-in flex-shrink-0"
+          style={{
+            background: 'rgba(0, 230, 138, 0.06)',
+            borderColor: 'rgba(0, 230, 138, 0.2)',
+            color: 'var(--color-status-success)',
+          }}
+        >
+          {savedAt}
+        </div>
       )}
 
-      {/* "+ Add" affordances for map-keyed and list-shaped sections — discovered
-          from /api/config/templates, which the gateway derives from
-          Configurable::map_key_sections(). No hardcoded list anywhere. */}
+      {/* "+ Add new entry" — one button per addable section. Clicking opens
+          a modal so the input flow is unambiguous (no inline-input puzzle). */}
       {templates.length > 0 && (
-        <div className="rounded border border-gray-200 bg-gray-50 p-4">
-          <h2 className="mb-2 text-sm font-semibold text-gray-700">Add new entry</h2>
+        <div className="surface-panel p-4 flex-shrink-0">
+          <h3
+            className="text-xs font-semibold uppercase tracking-wider mb-3"
+            style={{ color: 'var(--pc-text-secondary)' }}
+          >
+            Add new entry
+          </h3>
           <div className="flex flex-wrap gap-2">
             {templates.map((t) => (
-              <div key={t.path} className="flex flex-col">
-                <button
-                  onClick={() => setAddingTo(t.path === addingTo ? null : t.path)}
-                  className="flex items-center gap-1 rounded border px-2 py-1 text-xs hover:bg-gray-100"
-                  title={t.description || `${t.kind}: ${t.value_type}`}
+              <button
+                key={t.path}
+                onClick={() => {
+                  setAddModalTemplate(t);
+                  setAddKey('');
+                  setAddError(null);
+                }}
+                className="btn-secondary flex items-center gap-2 text-xs px-3 py-2"
+                title={t.description || `${t.kind}: ${t.value_type}`}
+              >
+                <Plus className="h-3 w-3" />
+                <span style={{ color: 'var(--pc-text-primary)' }}>{t.path}</span>
+                <span style={{ color: 'var(--pc-text-muted)' }}>· {t.value_type}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Add modal — same dialog pattern as Memory's add-entry modal. */}
+      {addModalTemplate && (
+        <div className="fixed inset-0 modal-backdrop flex items-center justify-center z-50">
+          <div className="surface-panel p-6 w-full max-w-md mx-4 animate-fade-in-scale">
+            <div className="flex items-center justify-between mb-4">
+              <h3
+                className="text-lg font-semibold"
+                style={{ color: 'var(--pc-text-primary)' }}
+              >
+                Add to <code style={{ color: 'var(--pc-accent)' }}>{addModalTemplate.path}</code>
+              </h3>
+              <button
+                onClick={() => {
+                  setAddModalTemplate(null);
+                  setAddKey('');
+                  setAddError(null);
+                }}
+                className="btn-icon"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            {addModalTemplate.description && (
+              <p
+                className="text-sm mb-4"
+                style={{ color: 'var(--pc-text-secondary)' }}
+              >
+                {addModalTemplate.description}
+              </p>
+            )}
+            {addError && (
+              <div
+                className="mb-4 rounded-xl border p-3 text-sm animate-fade-in"
+                style={{
+                  background: 'rgba(239, 68, 68, 0.08)',
+                  borderColor: 'rgba(239, 68, 68, 0.2)',
+                  color: '#f87171',
+                }}
+              >
+                {addError}
+              </div>
+            )}
+            <div className="space-y-4">
+              <div>
+                <label
+                  className="block text-xs font-semibold mb-1.5 uppercase tracking-wider"
+                  style={{ color: 'var(--pc-text-secondary)' }}
                 >
-                  <Plus className="h-3 w-3" />
-                  {t.path}
-                  <span className="ml-1 text-gray-400">[{t.kind}]</span>
-                </button>
-                {addingTo === t.path && (
-                  <div className="mt-1 flex items-center gap-1">
-                    {t.path === 'providers.models' && catalog.length > 0 ? (
-                      <select
-                        value={addKey}
-                        onChange={(e) => setAddKey(e.target.value)}
-                        className="rounded border px-2 py-1 text-xs"
-                      >
-                        <option value="">— pick provider —</option>
-                        {catalog.map((p) => (
-                          <option key={p.name} value={p.name}>
-                            {p.display_name}
-                            {p.local ? ' (local)' : ''}
-                          </option>
-                        ))}
-                      </select>
-                    ) : (
-                      <input
-                        autoFocus
-                        value={addKey}
-                        onChange={(e) => setAddKey(e.target.value)}
-                        placeholder={t.kind === 'map' ? 'name' : 'identifier'}
-                        className="rounded border px-2 py-1 text-xs"
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') void handleAdd(t);
-                          if (e.key === 'Escape') {
-                            setAddingTo(null);
-                            setAddKey('');
-                          }
-                        }}
-                      />
-                    )}
-                    <button
-                      onClick={() => void handleAdd(t)}
-                      disabled={!addKey.trim()}
-                      className="rounded bg-blue-600 px-2 py-1 text-xs text-white disabled:opacity-50"
-                    >
-                      Add
-                    </button>
-                  </div>
+                  {addModalTemplate.kind === 'map' ? 'Key' : 'Identifier'}{' '}
+                  <span style={{ color: 'var(--color-status-error)' }}>*</span>
+                </label>
+                {/* For providers.models specifically, source the picker from
+                    the catalog so users don't have to know canonical names. */}
+                {addModalTemplate.path === 'providers.models' && catalog.length > 0 ? (
+                  <select
+                    autoFocus
+                    value={addKey}
+                    onChange={(e) => setAddKey(e.target.value)}
+                    className="input-electric w-full px-3 py-2.5 text-sm appearance-none cursor-pointer"
+                  >
+                    <option value="">— pick a provider —</option>
+                    {catalog.map((p) => (
+                      <option key={p.name} value={p.name}>
+                        {p.display_name}
+                        {p.local ? ' (local)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    autoFocus
+                    type="text"
+                    value={addKey}
+                    onChange={(e) => setAddKey(e.target.value)}
+                    placeholder={
+                      addModalTemplate.kind === 'map'
+                        ? 'e.g. anthropic'
+                        : 'e.g. my-server'
+                    }
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') void handleAdd();
+                    }}
+                    className="input-electric w-full px-3 py-2.5 text-sm"
+                  />
                 )}
               </div>
-            ))}
+            </div>
+            <div className="flex justify-end gap-3 mt-6">
+              <button
+                onClick={() => {
+                  setAddModalTemplate(null);
+                  setAddKey('');
+                  setAddError(null);
+                }}
+                className="btn-secondary px-4 py-2 text-sm font-medium"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleAdd}
+                disabled={!addKey.trim() || adding}
+                className="btn-electric px-4 py-2 text-sm font-medium"
+              >
+                {adding ? 'Adding…' : 'Add'}
+              </button>
+            </div>
           </div>
         </div>
       )}
 
       {/* Field groups, one per category. */}
-      {groups.map((g) => (
-        <section key={g.category} className="rounded border border-gray-200">
-          <h2 className="border-b border-gray-200 bg-gray-50 px-4 py-2 text-sm font-semibold uppercase tracking-wider text-gray-600">
-            {g.category}
-          </h2>
-          <div className="divide-y divide-gray-100">
-            {g.entries.map((f) => (
-              <FieldRow
-                key={f.path}
-                entry={f}
-                value={draft[f.path] ?? ''}
-                onChange={(v) => setDraft((d) => ({ ...d, [f.path]: v }))}
-                comment={comments[f.path] ?? ''}
-                onCommentChange={(v) => setComments((c) => ({ ...c, [f.path]: v }))}
-                error={fieldErrors[f.path]}
-                onDelete={() => handleDelete(f.path)}
-                onProviderModelsLoad={ensureModelsLoaded}
-              />
-            ))}
-          </div>
-        </section>
-      ))}
+      <div className="flex flex-col gap-4 flex-1 min-h-0">
+        {groups.map((g) => (
+          <section
+            key={g.category}
+            className="surface-panel overflow-hidden"
+          >
+            <h3
+              className="px-4 py-2.5 text-xs font-semibold uppercase tracking-wider border-b"
+              style={{
+                color: 'var(--pc-text-secondary)',
+                background: 'var(--pc-bg-elevated)',
+                borderColor: 'var(--pc-border)',
+              }}
+            >
+              {g.category}
+            </h3>
+            <div
+              className="divide-y"
+              style={{ borderColor: 'var(--pc-border)' }}
+            >
+              {g.entries.map((f) => (
+                <FieldRow
+                  key={f.path}
+                  entry={f}
+                  value={draft[f.path] ?? ''}
+                  onChange={(v) => setDraft((d) => ({ ...d, [f.path]: v }))}
+                  comment={comments[f.path] ?? ''}
+                  onCommentChange={(v) => setComments((c) => ({ ...c, [f.path]: v }))}
+                  error={fieldErrors[f.path]}
+                  onDelete={() => handleDelete(f.path)}
+                  onProviderModelsLoad={ensureModelsLoaded}
+                />
+              ))}
+            </div>
+          </section>
+        ))}
+      </div>
     </div>
   );
 }
@@ -424,7 +497,6 @@ function FieldRow({
   const [providerModels, setProviderModels] = useState<string[] | null>(null);
   const isProviderModelField = /^providers\.models\.[^.]+\.model$/.test(entry.path);
 
-  // For provider model fields, lazy-fetch the catalog when the row mounts.
   useEffect(() => {
     if (!isProviderModelField) return;
     const provider = entry.path.split('.')[2];
@@ -435,35 +507,48 @@ function FieldRow({
   return (
     <div className="px-4 py-3">
       <div className="flex items-start justify-between gap-3">
-        <div className="flex-1">
-          <label className="block text-sm font-medium" htmlFor={entry.path}>
+        <div className="flex-1 min-w-0">
+          <label
+            className="block text-sm font-medium"
+            style={{ color: 'var(--pc-text-primary)' }}
+            htmlFor={entry.path}
+          >
             {fieldLabel(entry)}
             {entry.is_secret && (
-              <span className="ml-2 text-xs text-gray-500">
+              <span
+                className="ml-2 text-xs"
+                style={{ color: 'var(--pc-text-muted)' }}
+              >
                 🔒 {entry.populated ? 'set' : 'unset'}
               </span>
             )}
           </label>
-          <code className="block text-xs text-gray-400">
-            {entry.path} <span className="text-gray-300">({entry.type_hint})</span>
+          <code
+            className="block text-xs mt-0.5"
+            style={{ color: 'var(--pc-text-faint)' }}
+          >
+            {entry.path}{' '}
+            <span style={{ color: 'var(--pc-text-faint)', opacity: 0.6 }}>
+              ({entry.type_hint})
+            </span>
           </code>
         </div>
         <button
           onClick={onDelete}
           title="Reset to default / unset"
-          className="text-gray-400 hover:text-red-500"
+          className="btn-icon flex-shrink-0"
         >
           <Trash2 className="h-4 w-4" />
         </button>
       </div>
 
-      <div className="mt-2">
+      <div className="mt-2 space-y-1.5">
         {renderer === 'bool' ? (
           <select
             id={entry.path}
             value={value || 'false'}
             onChange={(e) => onChange(e.target.value)}
-            className="w-full rounded border px-2 py-1"
+            className="input-electric w-full px-3 py-2 text-sm appearance-none cursor-pointer"
           >
             <option value="true">true</option>
             <option value="false">false</option>
@@ -473,7 +558,7 @@ function FieldRow({
             id={entry.path}
             value={value}
             onChange={(e) => onChange(e.target.value)}
-            className="w-full rounded border px-2 py-1"
+            className="input-electric w-full px-3 py-2 text-sm appearance-none cursor-pointer"
           >
             <option value="">—</option>
             {(entry.enum_variants ?? []).map((v) => (
@@ -483,15 +568,13 @@ function FieldRow({
             ))}
           </select>
         ) : isProviderModelField && providerModels && providerModels.length > 0 ? (
-          // Provider-model-field gets a catalog-backed datalist on top of a
-          // text input — pick from the live catalog OR type freely.
           <>
             <input
               id={entry.path}
               list={`models-${entry.path}`}
               value={value}
               onChange={(e) => onChange(e.target.value)}
-              className="w-full rounded border px-2 py-1"
+              className="input-electric w-full px-3 py-2 text-sm"
               placeholder={entry.type_hint}
             />
             <datalist id={`models-${entry.path}`}>
@@ -506,7 +589,7 @@ function FieldRow({
             rows={3}
             value={value}
             onChange={(e) => onChange(e.target.value)}
-            className="w-full rounded border px-2 py-1 font-mono text-sm"
+            className="input-electric w-full px-3 py-2 text-sm font-mono resize-y"
             placeholder="One value per line"
           />
         ) : renderer === 'number' ? (
@@ -515,7 +598,7 @@ function FieldRow({
             type="number"
             value={value}
             onChange={(e) => onChange(e.target.value)}
-            className="w-full rounded border px-2 py-1"
+            className="input-electric w-full px-3 py-2 text-sm"
           />
         ) : (
           <input
@@ -523,7 +606,7 @@ function FieldRow({
             type={renderer === 'secret' ? 'password' : 'text'}
             value={value}
             onChange={(e) => onChange(e.target.value)}
-            className="w-full rounded border px-2 py-1"
+            className="input-electric w-full px-3 py-2 text-sm"
             placeholder={
               renderer === 'secret'
                 ? entry.populated
@@ -539,12 +622,16 @@ function FieldRow({
           value={comment}
           onChange={(e) => onCommentChange(e.target.value)}
           placeholder="Optional comment (why?)"
-          className="mt-1 w-full rounded border px-2 py-1 text-xs text-gray-600"
+          className="input-electric w-full px-3 py-1.5 text-xs"
+          style={{ color: 'var(--pc-text-secondary)' }}
         />
 
         {error && (
-          <p className="mt-1 text-sm text-red-600">
-            <span className="font-mono">{error.code}</span>: {error.message}
+          <p
+            className="mt-1 text-sm"
+            style={{ color: 'var(--color-status-error)' }}
+          >
+            <span className="font-mono text-xs">{error.code}</span>: {error.message}
           </p>
         )}
       </div>

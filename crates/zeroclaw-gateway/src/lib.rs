@@ -948,7 +948,6 @@ pub async fn run_gateway(
     let inner = Router::new()
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
-        .route("/admin/restart", post(handle_admin_restart))
         .route("/admin/paircode", get(handle_admin_paircode))
         .route("/admin/paircode/new", post(handle_admin_paircode_new))
         // ── Existing routes ──
@@ -2333,71 +2332,6 @@ async fn handle_admin_paircode_new(
             Ok((StatusCode::BAD_REQUEST, Json(body)))
         }
     }
-}
-
-/// POST /admin/restart — graceful restart from CLI / dashboard (localhost only).
-///
-/// Spawns a replacement process with the same exe path + args, then signals
-/// the current process to shut down. The new process binds to the same port
-/// once the current one releases it (small race window during which clients
-/// may see connection-refused; the dashboard polls `/health` to detect when
-/// the new instance is ready).
-async fn handle_admin_restart(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_localhost(&peer)?;
-
-    let exe = std::env::current_exe().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("can't resolve current exe: {e}")})),
-        )
-    })?;
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    tracing::info!(
-        exe = %exe.display(),
-        "🔄 Admin restart request received — respawning"
-    );
-
-    let shutdown_tx = state.shutdown_tx.clone();
-    tokio::spawn(async move {
-        // Brief delay so the HTTP response flushes before we tear down.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-        // Spawn the replacement detached. Inherits TTY env so logs continue
-        // streaming if the daemon was launched interactively; redirects stdio
-        // to /dev/null otherwise so the parent can exit cleanly.
-        let spawn_result = std::process::Command::new(&exe)
-            .args(&args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-
-        match spawn_result {
-            Ok(_child) => {
-                // Give the replacement a moment to start binding before we
-                // release the port by shutting down.
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                let _ = shutdown_tx.send(true);
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Restart respawn failed; cancelling shutdown");
-                // Don't shut down if we couldn't spawn the replacement —
-                // user is better off with the current instance still running.
-            }
-        }
-    });
-
-    Ok((
-        StatusCode::OK,
-        Json(AdminResponse {
-            success: true,
-            message: "Gateway restart initiated".to_string(),
-        }),
-    ))
 }
 
 /// GET /pair/code — fetch the initial pairing code (no auth, no localhost restriction).
