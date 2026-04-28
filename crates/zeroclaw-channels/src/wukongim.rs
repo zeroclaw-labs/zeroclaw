@@ -549,20 +549,18 @@ impl Channel for WuKongIMChannel {
                                         mentioned = true;
                                     }
                                     // Check 'uids'
-                                    if !mentioned {
-                                        if let Some(uids) =
+                                    if !mentioned
+                                        && let Some(uids) =
                                             mention.get("uids").and_then(|v| v.as_array())
-                                        {
-                                            if uids.iter().any(|u| {
-                                                u.as_str() == Some(&self.uid)
-                                                    || u.as_u64()
-                                                        .map(|n| n.to_string())
-                                                        .as_deref()
-                                                        == Some(&self.uid)
-                                            }) {
-                                                mentioned = true;
-                                            }
-                                        }
+                                        && uids.iter().any(|u| {
+                                            u.as_str() == Some(&self.uid)
+                                                || u.as_u64()
+                                                    .map(|n| n.to_string())
+                                                    .as_deref()
+                                                    == Some(&self.uid)
+                                        })
+                                    {
+                                        mentioned = true;
                                     }
                                 }
 
