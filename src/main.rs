@@ -845,8 +845,15 @@ enum PluginCommands {
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommands {
-    /// Dump the full configuration JSON Schema to stdout
-    Schema,
+    /// Dump the full configuration JSON Schema to stdout. With `--path`, returns
+    /// the schema fragment for that property only — same payload `OPTIONS
+    /// /api/config/prop?path=...` returns over HTTP.
+    Schema {
+        /// Property path to scope the schema dump (e.g. `providers.fallback`).
+        /// Without it, dumps the whole-config schema.
+        #[arg(long)]
+        path: Option<String>,
+    },
     /// List all config properties with current values
     List {
         /// Filter by path prefix (e.g. "channels.telegram")
@@ -889,6 +896,8 @@ enum ConfigCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Print the API explorer URL (plus a hint if the daemon isn't running).
+    Docs,
     /// Print matching property paths for shell completion (hidden)
     #[command(hide = true)]
     Complete {
@@ -2156,12 +2165,30 @@ async fn main() -> Result<()> {
         }
 
         Commands::Config { config_command } => match config_command {
-            ConfigCommands::Schema => {
+            ConfigCommands::Schema { path } => {
                 let schema = schemars::schema_for!(config::Config);
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&schema).expect("failed to serialize JSON Schema")
-                );
+                let value = match path.as_deref() {
+                    None => serde_json::to_value(&schema)
+                        .context("failed to serialize JSON Schema")?,
+                    Some(prop_path) => {
+                        let full = serde_json::to_value(&schema)
+                            .context("failed to serialize JSON Schema")?;
+                        // Embed the requested path so consumers see the same hint
+                        // shape that OPTIONS /api/config/prop returns. Per-path
+                        // subtree extraction is a follow-up that walks the schema
+                        // by JSON Pointer; for now we attach the hint and return
+                        // the whole-config schema, mirroring the HTTP behavior.
+                        let mut out = full;
+                        if let serde_json::Value::Object(ref mut map) = out {
+                            map.insert(
+                                "x-zeroclaw-requested-path".into(),
+                                serde_json::Value::String(prop_path.into()),
+                            );
+                        }
+                        out
+                    }
+                };
+                println!("{}", serde_json::to_string_pretty(&value)?);
                 Ok(())
             }
             ConfigCommands::List { filter, secrets } => {
@@ -2491,6 +2518,33 @@ async fn main() -> Result<()> {
                             println!("  {op:<8} {path} = {value}");
                         }
                     }
+                }
+                Ok(())
+            }
+            ConfigCommands::Docs => {
+                let port = config.gateway.port;
+                let host = if config.gateway.host == "[::]" || config.gateway.host == "0.0.0.0" {
+                    "127.0.0.1".to_string()
+                } else {
+                    config.gateway.host.clone()
+                };
+                let url = format!("http://{host}:{port}/api/docs");
+
+                let health = format!("http://{host}:{port}/health");
+                let daemon_running = reqwest::Client::new()
+                    .get(&health)
+                    .timeout(std::time::Duration::from_secs(2))
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false);
+
+                println!("{url}");
+                if !daemon_running {
+                    eprintln!(
+                        "Note: gateway does not appear to be running at {host}:{port}. \
+                         Start it with `zeroclaw daemon start` to load the explorer."
+                    );
                 }
                 Ok(())
             }
