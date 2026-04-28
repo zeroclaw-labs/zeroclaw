@@ -564,13 +564,11 @@ impl Channel for WuKongIMChannel {
                                     }
                                 }
 
-                                // Check content for @mention if not already found
-                                if !mentioned {
-                                    if content.contains(&format!("@{}", self.uid))
-                                        || content.contains("@all")
-                                    {
-                                        mentioned = true;
-                                    }
+                                if !mentioned
+                                    && (content.contains(&format!("@{}", self.uid))
+                                        || content.contains("@all"))
+                                {
+                                    mentioned = true;
                                 }
 
                                 if !mentioned {
