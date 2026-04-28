@@ -231,6 +231,25 @@ static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
 });
 
+/// Build a `query_summary` field for memory observability events from a raw
+/// user query.
+///
+/// Applies [`scrub_credentials`] first, then truncates to ≤200 chars via
+/// [`truncate_with_ellipsis`]. The order matters: `scrub_credentials` may
+/// insert placeholder substrings, so truncating first risks chopping a
+/// half-token.
+///
+/// Returns `None` for empty input so observers can distinguish "no query
+/// recorded" from "empty query string". Always call this helper at memory
+/// emit sites — never inline the scrub-then-truncate pattern, since that
+/// invites drift where one site accidentally skips the scrubber.
+pub fn make_query_summary(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+    Some(truncate_with_ellipsis(&scrub_credentials(raw), 200))
+}
+
 /// Scrub credentials from tool output to prevent accidental exfiltration.
 /// Replaces known credential patterns with a redacted placeholder while preserving
 /// a small prefix for context.
@@ -326,53 +345,84 @@ fn autosave_memory_key(prefix: &str) -> String {
 /// Core memories are exempt from time decay (evergreen).
 async fn build_context(
     mem: &dyn Memory,
+    observer: &dyn Observer,
     user_msg: &str,
     min_relevance_score: f64,
     session_id: Option<&str>,
 ) -> String {
     let mut context = String::new();
+    let backend = mem.name().to_string();
 
-    // Pull relevant memories for this message
-    if let Ok(mut entries) = mem.recall(user_msg, 5, session_id, None, None).await {
-        // Apply time decay: older non-Core memories score lower
-        decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
+    // Pull relevant memories for this message. The original code used
+    // `if let Ok(...)` to silently swallow recall errors; we keep that
+    // behavior but refactor to an explicit match so the failure path can
+    // still emit a `MemoryRecall` observer event.
+    let start = std::time::Instant::now();
+    let recall_result = mem.recall(user_msg, 5, session_id, None, None).await;
+    let duration = start.elapsed();
+    let query_summary = make_query_summary(user_msg);
 
-        let relevant: Vec<_> = entries
-            .iter()
-            .filter(|e| match e.score {
-                Some(score) => score >= min_relevance_score,
-                None => true,
-            })
-            .collect();
+    match recall_result {
+        Ok(mut entries) => {
+            observer.record_event(&ObserverEvent::MemoryRecall {
+                query_summary,
+                duration,
+                num_entries: entries.len(),
+                backend,
+                success: true,
+            });
 
-        if !relevant.is_empty() {
-            context.push_str("[Memory context]\n");
-            for entry in &relevant {
-                if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
-                    continue;
+            // Apply time decay: older non-Core memories score lower
+            decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
+
+            let relevant: Vec<_> = entries
+                .iter()
+                .filter(|e| match e.score {
+                    Some(score) => score >= min_relevance_score,
+                    None => true,
+                })
+                .collect();
+
+            if !relevant.is_empty() {
+                context.push_str("[Memory context]\n");
+                for entry in &relevant {
+                    if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
+                        continue;
+                    }
+                    // Skip raw per-turn user messages: re-injecting them causes each
+                    // recalled entry to embed all prior generations, growing exponentially.
+                    // Consolidated knowledge is already promoted to Core/Daily entries.
+                    if zeroclaw_memory::is_user_autosave_key(&entry.key) {
+                        continue;
+                    }
+                    if zeroclaw_memory::should_skip_autosave_content(&entry.content) {
+                        continue;
+                    }
+                    // Skip entries containing tool_result blocks — they can leak
+                    // stale tool output from previous heartbeat ticks into new
+                    // sessions, presenting the LLM with orphan tool_result data.
+                    if entry.content.contains("<tool_result") {
+                        continue;
+                    }
+                    let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
                 }
-                // Skip raw per-turn user messages: re-injecting them causes each
-                // recalled entry to embed all prior generations, growing exponentially.
-                // Consolidated knowledge is already promoted to Core/Daily entries.
-                if zeroclaw_memory::is_user_autosave_key(&entry.key) {
-                    continue;
+                if context == "[Memory context]\n" {
+                    context.clear();
+                } else {
+                    context.push_str("[/Memory context]\n\n");
                 }
-                if zeroclaw_memory::should_skip_autosave_content(&entry.content) {
-                    continue;
-                }
-                // Skip entries containing tool_result blocks — they can leak
-                // stale tool output from previous heartbeat ticks into new
-                // sessions, presenting the LLM with orphan tool_result data.
-                if entry.content.contains("<tool_result") {
-                    continue;
-                }
-                let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
-            if context == "[Memory context]\n" {
-                context.clear();
-            } else {
-                context.push_str("[/Memory context]\n\n");
-            }
+        }
+        Err(_) => {
+            observer.record_event(&ObserverEvent::MemoryRecall {
+                query_summary,
+                duration,
+                num_entries: 0,
+                backend,
+                success: false,
+            });
+            // Preserve original swallow behavior — recall errors are not
+            // propagated; an empty context string is returned.
         }
     }
 
@@ -383,6 +433,7 @@ async fn build_context(
 /// Includes pin-alias lookup (e.g. "red_led" → 13) when query matches, plus retrieved chunks.
 fn build_hardware_context(
     rag: &crate::rag::HardwareRag,
+    observer: &dyn Observer,
     user_msg: &str,
     boards: &[String],
     chunk_limit: usize,
@@ -399,7 +450,16 @@ fn build_hardware_context(
         context.push_str(&pin_ctx);
     }
 
+    let start = std::time::Instant::now();
     let chunks = rag.retrieve(user_msg, boards, chunk_limit);
+    let duration = start.elapsed();
+    observer.record_event(&ObserverEvent::RagRetrieve {
+        query_summary: make_query_summary(user_msg),
+        duration,
+        num_chunks: chunks.len(),
+        num_boards: boards.len(),
+    });
+
     if chunks.is_empty() && pin_ctx.is_empty() {
         return String::new();
     }
@@ -2529,6 +2589,7 @@ pub async fn run(
         // Inject memory + hardware RAG context into user message
         let mem_context = build_context(
             mem.as_ref(),
+            &*observer,
             &effective_msg,
             config.memory.min_relevance_score,
             memory_session_id.as_deref(),
@@ -2537,7 +2598,7 @@ pub async fn run(
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
-            .map(|r| build_hardware_context(r, &effective_msg, &board_names, rag_limit))
+            .map(|r| build_hardware_context(r, &*observer, &effective_msg, &board_names, rag_limit))
             .unwrap_or_default();
         let context = format!("{mem_context}{hw_context}");
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -2816,6 +2877,7 @@ pub async fn run(
             // Inject memory + hardware RAG context into user message
             let mem_context = build_context(
                 mem.as_ref(),
+                &*observer,
                 &effective_input,
                 config.memory.min_relevance_score,
                 memory_session_id.as_deref(),
@@ -2824,7 +2886,9 @@ pub async fn run(
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
-                .map(|r| build_hardware_context(r, &effective_input, &board_names, rag_limit))
+                .map(|r| {
+                    build_hardware_context(r, &*observer, &effective_input, &board_names, rag_limit)
+                })
                 .unwrap_or_default();
             let context = format!("{mem_context}{hw_context}");
             let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -3376,6 +3440,7 @@ pub async fn process_message(
     let effective_msg_ref = effective_message.as_str();
     let mem_context = build_context(
         mem.as_ref(),
+        &*observer,
         effective_msg_ref,
         config.memory.min_relevance_score,
         session_id,
@@ -3384,7 +3449,7 @@ pub async fn process_message(
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
     let hw_context = hardware_rag
         .as_ref()
-        .map(|r| build_hardware_context(r, effective_msg_ref, &board_names, rag_limit))
+        .map(|r| build_hardware_context(r, &*observer, effective_msg_ref, &board_names, rag_limit))
         .unwrap_or_default();
     let context = format!("{mem_context}{hw_context}");
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -3433,11 +3498,13 @@ pub async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        emergency_history_trim, estimate_history_tokens, fast_trim_tool_results,
-        load_interactive_session_history, save_interactive_session_history, truncate_tool_result,
+        build_context, emergency_history_trim, estimate_history_tokens, fast_trim_tool_results,
+        load_interactive_session_history, make_query_summary, save_interactive_session_history,
+        truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::execute_one_tool;
+    use crate::observability::NoopObserver;
     use tempfile::tempdir;
     use zeroclaw_providers::ChatMessage;
     use zeroclaw_tool_call_parser::parse_tool_calls;
@@ -3898,7 +3965,6 @@ mod tests {
         assert_eq!(outcome.output, "(no output)");
         assert!(outcome.error_reason.is_none());
     }
-    use crate::observability::NoopObserver;
     use tempfile::TempDir;
     use zeroclaw_api::provider::{ProviderCapabilities, StreamChunk, StreamEvent, StreamOptions};
     use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
@@ -6295,6 +6361,44 @@ mod tests {
         assert_ne!(key1, key2);
     }
 
+    #[test]
+    fn make_query_summary_redacts_credentials_and_caps_length() {
+        // Empty input → None (so observers can distinguish "no query
+        // recorded" from "empty query string").
+        assert!(make_query_summary("").is_none());
+
+        // Plain query passes through unchanged when within the cap.
+        let plain = make_query_summary("hello world").unwrap();
+        assert_eq!(plain, "hello world");
+
+        // Credential pattern is scrubbed by `scrub_credentials` before
+        // the truncation step. The raw token must not appear in the
+        // emitted summary.
+        let scrubbed =
+            make_query_summary("connect with api_key: sk-proj-abcdef1234567890zzz").unwrap();
+        assert!(
+            !scrubbed.contains("sk-proj-abcdef1234567890zzz"),
+            "raw credential leaked into query_summary: {scrubbed:?}"
+        );
+
+        // Long input is truncated. `truncate_with_ellipsis(s, 200)`
+        // keeps up to 200 content chars and appends "..." when it had
+        // to truncate, for a total ceiling of 203 chars. The cap
+        // matches the existing free-text precedent at loop_.rs:1529,
+        // 1811.
+        let long_input = "a".repeat(500);
+        let truncated = make_query_summary(&long_input).unwrap();
+        assert!(
+            truncated.chars().count() <= 203,
+            "expected ≤203 chars (200 content + ellipsis), got {}",
+            truncated.chars().count()
+        );
+        assert!(
+            truncated.ends_with("..."),
+            "expected trailing ellipsis on truncated input, got {truncated:?}"
+        );
+    }
+
     #[tokio::test]
     async fn autosave_memory_keys_preserve_multiple_turns() {
         let tmp = TempDir::new().unwrap();
@@ -6337,7 +6441,7 @@ mod tests {
         .await
         .unwrap();
 
-        let context = build_context(&mem, "status updates", 0.0, None).await;
+        let context = build_context(&mem, &NoopObserver, "status updates", 0.0, None).await;
         assert!(context.contains("user_preference"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
@@ -6372,7 +6476,7 @@ mod tests {
         .await
         .unwrap();
 
-        let context = build_context(&mem, "answers", 0.0, None).await;
+        let context = build_context(&mem, &NoopObserver, "answers", 0.0, None).await;
         assert!(context.contains("user_preference"));
         assert!(!context.contains("user_msg"));
         assert!(!context.contains("embedding prior context"));

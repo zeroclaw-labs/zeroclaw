@@ -860,6 +860,7 @@ impl Agent {
             .memory_loader
             .load_context(
                 self.memory.as_ref(),
+                &*self.observer,
                 user_message,
                 self.memory_session_id.as_deref(),
             )
@@ -1040,6 +1041,7 @@ impl Agent {
             .memory_loader
             .load_context(
                 self.memory.as_ref(),
+                &*self.observer,
                 user_message,
                 self.memory_session_id.as_deref(),
             )
