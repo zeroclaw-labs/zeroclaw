@@ -631,7 +631,48 @@ pub async fn handle_patch(
         return e.into_response();
     }
 
-    let mut working = state.config.lock().clone();
+    let working = state.config.lock().clone();
+
+    // Drift guard: if the on-disk file diverges from in-memory state on any
+    // path the PATCH would touch, refuse with 409 ConfigChangedExternally
+    // unless the client explicitly opts in to overwrite via the
+    // `X-ZeroClaw-Override-Drift: true` header. The opt-in surface keeps
+    // the contract loud: the only way to silently overwrite a hand-edit is
+    // a deliberate header, never an accident.
+    let override_drift = headers
+        .get("x-zeroclaw-override-drift")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !override_drift {
+        let drifted = compute_drift(&working).await;
+        if !drifted.is_empty() {
+            let touched: std::collections::HashSet<String> = ops
+                .iter()
+                .map(|op| json_pointer_to_dotted(&op.path))
+                .collect();
+            let conflicts: Vec<&DriftEntry> = drifted
+                .iter()
+                .filter(|d| touched.contains(&d.path))
+                .collect();
+            if !conflicts.is_empty() {
+                let conflict_paths: Vec<String> =
+                    conflicts.iter().map(|d| d.path.clone()).collect();
+                return error_response(ConfigApiError::new(
+                    ConfigApiCode::ConfigChangedExternally,
+                    format!(
+                        "on-disk config has drifted from in-memory state on \
+                         {} path(s) being patched: {}. Send `X-ZeroClaw-Override-Drift: true` \
+                         to overwrite, or GET /api/config/drift to inspect first.",
+                        conflicts.len(),
+                        conflict_paths.join(", "),
+                    ),
+                ));
+            }
+        }
+    }
+
+    let mut working = working;
     let mut results = Vec::with_capacity(ops.len());
 
     for (idx, op) in ops.iter().enumerate() {
@@ -1267,6 +1308,40 @@ mod tests {
         // decoration target produces malformed TOML).
         let _: toml::Value = toml::from_str(&raw)
             .unwrap_or_else(|e| panic!("re-parse failed after apply_comments: {e}\nfile:\n{raw}"));
+    }
+
+    #[tokio::test]
+    async fn compute_drift_detects_external_edit_to_field() {
+        // Persist initial state, externally edit the file, drift surfaces
+        // the touched path. This is the substrate the PATCH 409 guard fires on.
+        let (_tmp, path) = temp_config_path();
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: path.clone(),
+            ..Default::default()
+        };
+        cfg.set_prop("gateway.host", "10.0.0.1").expect("set");
+        cfg.save().await.expect("save");
+
+        // Simulate a hand-edit while the daemon "wasn't looking".
+        let on_disk = tokio::fs::read_to_string(&path).await.unwrap();
+        let edited = on_disk.replace("10.0.0.1", "192.168.1.1");
+        tokio::fs::write(&path, edited).await.unwrap();
+
+        // In-memory still believes 10.0.0.1; on-disk now says 192.168.1.1.
+        let drift = compute_drift(&cfg).await;
+        let entry = drift
+            .iter()
+            .find(|d| d.path == "gateway.host")
+            .expect("expected gateway.host in drift summary after external edit");
+        assert!(entry.drifted);
+        assert_eq!(
+            entry.in_memory_value,
+            Some(serde_json::Value::String("10.0.0.1".into()))
+        );
+        assert_eq!(
+            entry.on_disk_value,
+            Some(serde_json::Value::String("192.168.1.1".into()))
+        );
     }
 
     #[test]

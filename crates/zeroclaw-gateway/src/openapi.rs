@@ -194,7 +194,14 @@ fn build_spec() -> serde_json::Value {
             "patch": {
                 "tags": ["config"],
                 "summary": "Apply a JSON Patch (RFC 6902) document atomically",
-                "description": "Operations execute in order against an in-memory copy; `Config::validate()` runs once at the end; on success the snapshot persists and swaps. On failure, on-disk and in-memory state are unchanged. `move`/`copy` return `op_not_supported`. `test` against a secret path returns `secret_test_forbidden`.",
+                "description": "Operations execute in order against an in-memory copy; `Config::validate()` runs once at the end; on success the snapshot persists and swaps. On failure, on-disk and in-memory state are unchanged. `move`/`copy` return `op_not_supported`. `test` against a secret path returns `secret_test_forbidden`.\n\n**Drift guard:** if the on-disk file has drifted from in-memory state on any path being patched, returns 409 `config_changed_externally` unless the request carries `X-ZeroClaw-Override-Drift: true`. GET /api/config/drift to inspect first.",
+                "parameters": [{
+                    "name": "X-ZeroClaw-Override-Drift",
+                    "in": "header",
+                    "required": false,
+                    "schema": { "type": "string", "enum": ["true"] },
+                    "description": "Set to `true` to overwrite externally-edited values without confirmation."
+                }],
                 "requestBody": {
                     "required": true,
                     "content": {
