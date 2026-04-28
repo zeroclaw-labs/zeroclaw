@@ -170,6 +170,46 @@ pub fn parse_attachment_markers(message: &str) -> (String, Vec<(String, String)>
     (cleaned.trim().to_string(), attachments)
 }
 
+/// Generate a short 6-character lowercase alphanumeric approval token.
+///
+/// Uses the full `[a-z0-9]` alphabet (36 options per position, 36^6 ≈ 2.2B
+/// combinations) — not UUID hex (which would give only 16^6 ≈ 16.7M and
+/// would materially weaken the WhatsApp no-per-sender-check design
+/// described in the PR #6010 security note).
+pub(crate) fn new_approval_token() -> String {
+    use rand::RngExt;
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::rng();
+    (0..6)
+        .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
+        .collect()
+}
+
+/// Parse an approval reply of the form `"TOKEN yes|no|always ..."`.
+///
+/// Returns `Some((token, response))` when the text begins with a 6-character
+/// alphanumeric token followed by a recognised action word. Returns `None`
+/// for any other input so normal messages are not intercepted.
+pub fn parse_approval_reply(
+    text: &str,
+) -> Option<(String, zeroclaw_api::channel::ChannelApprovalResponse)> {
+    use zeroclaw_api::channel::ChannelApprovalResponse;
+    let lower = text.trim().to_lowercase();
+    let mut parts = lower.splitn(2, ' ');
+    let token = parts.next()?.to_string();
+    if token.len() != 6 || !token.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let action_word = parts.next()?.split_whitespace().next()?;
+    let response = match action_word {
+        "yes" | "y" | "approve" => ChannelApprovalResponse::Approve,
+        "no" | "n" | "deny" => ChannelApprovalResponse::Deny,
+        "always" => ChannelApprovalResponse::AlwaysApprove,
+        _ => return None,
+    };
+    Some((token, response))
+}
+
 /// Generate a conversation history key from a channel message.
 pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     match &msg.thread_ts {
@@ -228,5 +268,60 @@ mod tests {
         let (_, attachments) = parse_attachment_markers("[image:/tmp/a.png]");
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].0, "IMAGE");
+    }
+
+    #[test]
+    fn new_approval_token_is_6_char_alphanumeric() {
+        let token = super::new_approval_token();
+        assert_eq!(token.len(), 6);
+        assert!(token.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn parse_approval_reply_accepts_canonical_forms() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        let cases = [
+            ("abc123 yes", ChannelApprovalResponse::Approve),
+            ("abc123 y", ChannelApprovalResponse::Approve),
+            ("abc123 approve", ChannelApprovalResponse::Approve),
+            ("ABC123 YES", ChannelApprovalResponse::Approve),
+            (
+                "abc123 yes please go ahead",
+                ChannelApprovalResponse::Approve,
+            ),
+            ("abc123 no", ChannelApprovalResponse::Deny),
+            ("abc123 n", ChannelApprovalResponse::Deny),
+            ("abc123 deny", ChannelApprovalResponse::Deny),
+            ("abc123 always", ChannelApprovalResponse::AlwaysApprove),
+        ];
+        for (input, expected) in cases {
+            let (token, response) = super::parse_approval_reply(input)
+                .unwrap_or_else(|| panic!("expected Some for input {:?}", input));
+            assert_eq!(
+                token,
+                input.trim().to_lowercase().split(' ').next().unwrap()
+            );
+            assert_eq!(response, expected, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn parse_approval_reply_rejects_bad_input() {
+        let bad = [
+            "yes",
+            "abc123",
+            "abc 123 yes",
+            "toolname yes",
+            "abc123 maybe",
+            "",
+            "abc123 ",
+        ];
+        for input in bad {
+            assert!(
+                super::parse_approval_reply(input).is_none(),
+                "expected None for input {:?}",
+                input
+            );
+        }
     }
 }

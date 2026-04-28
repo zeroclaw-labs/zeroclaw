@@ -73,7 +73,7 @@ impl Provider for ScriptedProvider {
         _system_prompt: Option<&str>,
         _message: &str,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<String> {
         Ok("fallback".into())
     }
@@ -82,7 +82,7 @@ impl Provider for ScriptedProvider {
         &self,
         request: ChatRequest<'_>,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<ChatResponse> {
         self.requests
             .lock()
@@ -112,7 +112,7 @@ impl Provider for FailingProvider {
         _system_prompt: Option<&str>,
         _message: &str,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<String> {
         anyhow::bail!("provider error")
     }
@@ -121,7 +121,7 @@ impl Provider for FailingProvider {
         &self,
         _request: ChatRequest<'_>,
         _model: &str,
-        _temperature: f64,
+        _temperature: Option<f64>,
     ) -> Result<ChatResponse> {
         anyhow::bail!("provider error")
     }

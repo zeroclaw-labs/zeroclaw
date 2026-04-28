@@ -30,7 +30,7 @@ pub struct AskUserTool {
 
 impl AskUserTool {
     /// Create a new ask_user tool with an empty channel map.
-    /// Call [`channel_map_handle`] and write to the returned handle once channels
+    /// Call `channel_map_handle` and write to the returned handle once channels
     /// are available.
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
         Self {
