@@ -32,11 +32,15 @@ Two endpoints answer the question "what can I do here?":
   an `Allow` header listing the methods supported on the resource. Static per
   build; clients should cache against the `ETag` header.
 - `OPTIONS /api/config/prop?path=<dotted>` returns the schema fragment for a
-  specific path with `Allow: GET, PUT, DELETE, OPTIONS`.
+  specific path with `Allow: GET, PUT, DELETE, OPTIONS`. Returns 404 if the
+  path doesn't exist in the schema.
 
-`OPTIONS` returns capabilities. `GET` returns the user's current values. Forms
-in the dashboard issue `OPTIONS` once at load time to learn types and
-constraints, then `GET` to populate fields, then `PUT`/`PATCH` to write.
+`OPTIONS` returns capabilities. `GET /api/config/prop` and `GET /api/config/list`
+return the user's current values. Forms in the dashboard issue `OPTIONS` once
+at load time to learn types and constraints, then `GET` to populate fields,
+then `PUT`/`PATCH` to write. There is no whole-file `GET /api/config` —
+deliberately. Walk the per-property surface; the schema is the source of truth
+for what fields exist.
 
 CORS preflight requests (those carrying `Access-Control-Request-Method`) get
 the standard preflight response and short-circuit before the schema body is
@@ -46,10 +50,8 @@ returned.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/config` | Whole-config TOML, secrets masked. |
-| `PUT` | `/api/config` | Replace whole-config TOML. Preserved for backward compatibility; prefer `PATCH` for atomic field-level edits. |
 | `PATCH` | `/api/config` | Apply a JSON Patch (RFC 6902) document atomically. |
-| `OPTIONS` | `/api/config` | Whole-config JSON Schema. |
+| `OPTIONS` | `/api/config` | Whole-config JSON Schema (capabilities, not values). |
 | `GET` | `/api/config/prop?path=...` | Read one field. Secrets return `{path, populated}` only. |
 | `PUT` | `/api/config/prop` | Write one field. Body: `{path, value, comment?}`. Secrets respond with `{path, populated: true}` only. |
 | `DELETE` | `/api/config/prop?path=...` | Reset one field to its default. Secrets respond with `{path, populated: false}`. |

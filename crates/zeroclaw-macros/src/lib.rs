@@ -153,6 +153,17 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let mut nested_prop_is_secret = Vec::new();
     let mut init_defaults_ops = Vec::new();
 
+    // ── Map-key (HashMap<String, T>) and List (Vec<T:Configurable>) section
+    //    accumulators. Both surface a "+ Add entry" affordance in the
+    //    dashboard / CLI; both are auto-discovered from #[nested] fields
+    //    whose type is a container. The dispatch table at the gateway
+    //    `handle_map_key` walks `Config::map_key_sections()` and matches
+    //    on the path string — no hand-maintained list anywhere.
+    let mut map_key_section_entries: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut create_map_key_arms: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut create_map_key_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
+
     for field in fields {
         let field_ident = field.ident.as_ref().expect("Named field must have ident");
         let is_secret = has_attr(field, "secret");
@@ -357,6 +368,57 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     }
                 });
 
+                // ── Map-key section emission (HashMap<String, T>) ──
+                // The dashboard / CLI consume `Self::map_key_sections()` to
+                // surface "+ Add" affordances; `create_map_key()` is the
+                // typed insertion. Both auto-derived — no hand-table.
+                let value_ty_name = value_ty.to_token_stream().to_string();
+                let field_doc = extract_doc(&field.attrs);
+                map_key_section_entries.push(quote! {
+                    out.push(crate::config::MapKeySection {
+                        // Path is computed at static-init time via the
+                        // configurable_prefix const + field name literal.
+                        path: {
+                            // SAFETY: leak-once for static lifetime; runs
+                            // exactly per (Type, field) pair, bounded by the
+                            // schema's field count.
+                            let prefix = Self::configurable_prefix();
+                            let s = if prefix.is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #field_name_lit)
+                            };
+                            Box::leak(s.into_boxed_str())
+                        },
+                        kind: crate::config::MapKeyKind::Map,
+                        value_type: #value_ty_name,
+                        description: #field_doc,
+                    });
+                });
+                create_map_key_arms.push(quote! {
+                    {
+                        let prefix = Self::configurable_prefix();
+                        let expected = if prefix.is_empty() {
+                            #field_name_lit.to_string()
+                        } else {
+                            format!("{prefix}.{}", #field_name_lit)
+                        };
+                        if section_path == expected {
+                            if self.#field_ident.contains_key(map_key) {
+                                return Ok(false);
+                            }
+                            let value: #value_ty = serde_json::from_value(
+                                serde_json::json!({}),
+                            ).map_err(|e| format!(
+                                "default-construct {} failed: {e}",
+                                stringify!(#value_ty)
+                            ))?;
+                            self.#field_ident.insert(map_key.to_string(), value);
+                            return Ok(true);
+                        }
+                    }
+                });
+
                 continue;
             } else if is_option {
                 nested_collect.push(quote! {
@@ -435,6 +497,19 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                             return true;
                         }
                     });
+
+                    // Recurse: pull the inner type's map_key_sections + create_map_key.
+                    map_key_recurse.push(quote! {
+                        out.extend(<#inner_ty_tokens>::map_key_sections());
+                    });
+                    create_map_key_recurse.push(quote! {
+                        if let Some(inner) = &mut self.#field_ident {
+                            match inner.create_map_key(section_path, map_key) {
+                                Ok(created) => return Ok(created),
+                                Err(_) => {} // not handled by this branch; try next
+                            }
+                        }
+                    });
                 }
             } else {
                 nested_collect.push(quote! {
@@ -479,6 +554,72 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 init_defaults_ops.push(quote! {
                     initialized.extend(self.#field_ident.init_defaults(prefix));
                 });
+
+                // Recurse into the nested type's map_key_sections AND
+                // create_map_key for non-Option nested fields. This is how
+                // the root Config picks up `providers.models` (declared on
+                // ProvidersConfig, not on Config).
+                let field_ty = &field.ty;
+                map_key_recurse.push(quote! {
+                    out.extend(<#field_ty>::map_key_sections());
+                });
+                create_map_key_recurse.push(quote! {
+                    if let Ok(created) = self.#field_ident.create_map_key(section_path, map_key) {
+                        return Ok(created);
+                    }
+                });
+
+                // Vec<T> with #[nested]: T is Configurable; surface as a
+                // List section + emit a push-with-default arm.
+                if let Some(vec_inner_ty) = extract_vec_inner(&field.ty) {
+                    let vec_inner_name = vec_inner_ty.to_token_stream().to_string();
+                    let field_doc = extract_doc(&field.attrs);
+                    let vec_field_name_lit = snake_to_kebab(&field_ident.to_string());
+                    map_key_section_entries.push(quote! {
+                        out.push(crate::config::MapKeySection {
+                            path: {
+                                let prefix = Self::configurable_prefix();
+                                let s = if prefix.is_empty() {
+                                    #vec_field_name_lit.to_string()
+                                } else {
+                                    format!("{prefix}.{}", #vec_field_name_lit)
+                                };
+                                Box::leak(s.into_boxed_str())
+                            },
+                            kind: crate::config::MapKeyKind::List,
+                            value_type: #vec_inner_name,
+                            description: #field_doc,
+                        });
+                    });
+                    create_map_key_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let expected = if prefix.is_empty() {
+                                #vec_field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #vec_field_name_lit)
+                            };
+                            if section_path == expected {
+                                let value: #vec_inner_ty = serde_json::from_value(
+                                    serde_json::json!({}),
+                                ).map_err(|e| format!(
+                                    "default-construct {} failed: {e}",
+                                    stringify!(#vec_inner_ty)
+                                ))?;
+                                self.#field_ident.push(value);
+                                let new_idx = self.#field_ident.len() - 1;
+                                let inner_prefix = <#vec_inner_ty>::configurable_prefix();
+                                let _ = self.#field_ident[new_idx].set_prop(
+                                    &format!("{inner_prefix}.name"), map_key,
+                                );
+                                let _ = self.#field_ident[new_idx].set_prop(
+                                    &format!("{inner_prefix}.hint"), map_key,
+                                );
+                                return Ok(true);
+                            }
+                        }
+                    });
+                }
             }
 
             continue; // nested fields handled above
@@ -659,6 +800,39 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 let mut initialized: Vec<&'static str> = Vec::new();
                 #(#init_defaults_ops)*
                 initialized
+            }
+
+            /// Enumerate every map-keyed (`HashMap<String, T>`) and list-shaped
+            /// (`Vec<T>`) section discoverable from this Configurable's tree.
+            /// The dashboard / CLI consume this to surface "+ Add" affordances
+            /// without hardcoding the section list.
+            pub fn map_key_sections() -> Vec<crate::config::MapKeySection> {
+                let mut out: Vec<crate::config::MapKeySection> = Vec::new();
+                #(#map_key_section_entries)*
+                #(#map_key_recurse)*
+                out
+            }
+
+            /// Insert a default-valued entry under a map-keyed section, or
+            /// append to a list-shaped one, with `map_key` as the new entry's
+            /// natural identifier (HashMap key for Map sections; identifier
+            /// field for List sections).
+            ///
+            /// Returns `Ok(true)` if a new entry was created, `Ok(false)` if
+            /// the entry already existed (idempotent), or `Err(reason)` if
+            /// the section path doesn't resolve to a Map/List in this tree.
+            pub fn create_map_key(
+                &mut self,
+                section_path: &str,
+                map_key: &str,
+            ) -> Result<bool, String> {
+                #(#create_map_key_arms)*
+                #(#create_map_key_recurse)*
+                Err(format!(
+                    "no map-keyed/list section at `{}` in `{}`",
+                    section_path,
+                    Self::configurable_prefix(),
+                ))
             }
         }
     };

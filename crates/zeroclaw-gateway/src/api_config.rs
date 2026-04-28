@@ -609,6 +609,115 @@ pub async fn handle_drift(State(state): State<AppState>, headers: HeaderMap) -> 
     axum::Json(DriftResponse { drifted }).into_response()
 }
 
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct MapKeyQuery {
+    /// Map-keyed section path, e.g. `providers.models`, `agents`, `swarms`.
+    pub path: String,
+    /// New key to insert under that section, e.g. `anthropic`.
+    pub key: String,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct MapKeyResponse {
+    pub path: String,
+    pub key: String,
+    pub created: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct TemplatesResponse {
+    pub templates: Vec<TemplateEntry>,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct TemplateEntry {
+    pub path: &'static str,
+    /// `map` for `HashMap<String, T>`, `list` for `Vec<T>`.
+    pub kind: &'static str,
+    /// Rust type name of the value, e.g. `ModelProviderConfig`.
+    pub value_type: &'static str,
+    /// Doc comment from the schema (description of what gets added).
+    pub description: &'static str,
+}
+
+/// `GET /api/config/templates` — enumerate every map-keyed and list-shaped
+/// section the dashboard can offer "+ Add" affordances for. Discovered
+/// from the `Configurable` derive's `map_key_sections()` — single source of
+/// truth, no hand-maintained list. Adding a new `HashMap<String, T>` or
+/// `#[nested] Vec<T>` field anywhere in the schema makes it appear here
+/// automatically.
+pub async fn handle_templates(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let _ = state; // templates are static per build, but auth-gated for consistency
+
+    let templates: Vec<TemplateEntry> = zeroclaw_config::schema::Config::map_key_sections()
+        .into_iter()
+        .map(|s| TemplateEntry {
+            path: s.path,
+            kind: match s.kind {
+                zeroclaw_config::traits::MapKeyKind::Map => "map",
+                zeroclaw_config::traits::MapKeyKind::List => "list",
+            },
+            value_type: s.value_type,
+            description: s.description,
+        })
+        .collect();
+
+    axum::Json(TemplatesResponse { templates }).into_response()
+}
+
+/// `POST /api/config/map-key?path=<section>&key=<name>` — instantiate a new
+/// entry under a map-keyed section with default values, or append to a
+/// list-shaped one with `key` as the new entry's natural identifier.
+/// Idempotent for Map kinds: returns `{created: false}` if the key already
+/// exists.
+///
+/// Dispatch happens via `Config::create_map_key()` — emitted by the
+/// `Configurable` derive, single source of truth. Adding a new
+/// `HashMap<String, T>` or `#[nested] Vec<T>` field to the schema makes it
+/// addable here automatically.
+pub async fn handle_map_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<MapKeyQuery>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let mut working = state.config.lock().clone();
+    let path = q.path.clone();
+    let key = q.key.clone();
+
+    let created = match working.create_map_key(&path, &key) {
+        Ok(b) => b,
+        Err(msg) => {
+            return error_response(
+                ConfigApiError::new(ConfigApiCode::PathNotFound, msg).with_path(&path),
+            );
+        }
+    };
+
+    if created
+        && let Err(e) = persist_and_swap(&state, working).await
+    {
+        return error_response(e);
+    }
+
+    axum::Json(MapKeyResponse {
+        path,
+        key,
+        created,
+    })
+    .into_response()
+}
+
 /// PATCH /api/config — apply a JSON Patch document atomically.
 ///
 /// Body is an array of operations executed in order against an in-memory

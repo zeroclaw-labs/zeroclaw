@@ -101,6 +101,41 @@ impl std::fmt::Debug for PropFieldInfo {
     }
 }
 
+/// Stable wire-form for an addable section — a `HashMap<String, T>` (Map) or
+/// `Vec<T>` (List) field whose value type implements `Configurable`. The
+/// dashboard / CLI use this to surface `+ Add` affordances without
+/// hardcoding the section list. Auto-discovered by the `Configurable` derive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "schema-export",
+    derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)
+)]
+#[cfg_attr(feature = "schema-export", serde(rename_all = "snake_case"))]
+pub enum MapKeyKind {
+    /// `HashMap<String, T>` — key is user-supplied; new value is default.
+    Map,
+    /// `Vec<T>` — entries are appended; the user-supplied "key" is stored
+    /// in the value type's natural identifier field (e.g. `name`, `hint`).
+    List,
+}
+
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    feature = "schema-export",
+    derive(serde::Serialize, schemars::JsonSchema)
+)]
+pub struct MapKeySection {
+    /// Dotted section path, e.g. `providers.models`, `mcp.servers`.
+    pub path: &'static str,
+    /// Whether the section is a map or a list.
+    pub kind: MapKeyKind,
+    /// Rust type name of the value, e.g. `ModelProviderConfig`. For display only.
+    pub value_type: &'static str,
+    /// Doc comment on the field (flattened to one line). What the user sees
+    /// when picking which kind of thing to add.
+    pub description: &'static str,
+}
+
 /// The trait for describing a channel
 pub trait ChannelConfig {
     /// human-readable name

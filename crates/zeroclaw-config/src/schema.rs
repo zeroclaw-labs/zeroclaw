@@ -17686,6 +17686,55 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[test]
+    async fn map_key_sections_discovers_providers_models() {
+        // The Configurable derive walks #[nested] HashMap<String, T> fields
+        // and exposes them via map_key_sections(). Without this enumeration,
+        // the dashboard has no way to know `providers.models.<name>` is an
+        // addable shape — it only sees fields that already exist.
+        let sections = Config::map_key_sections();
+        let providers_models = sections
+            .iter()
+            .find(|s| s.path == "providers.models")
+            .expect("providers.models must be discoverable as a map-keyed section");
+        assert_eq!(providers_models.kind, crate::traits::MapKeyKind::Map);
+        assert_eq!(providers_models.value_type, "ModelProviderConfig");
+
+        // agents is also #[nested] HashMap on root Config.
+        assert!(
+            sections.iter().any(|s| s.path == "agents"),
+            "agents map should be discoverable"
+        );
+    }
+
+    #[test]
+    async fn create_map_key_inserts_default_provider() {
+        // Round-trip: `+ Add anthropic provider` from the dashboard.
+        let mut config = Config::default();
+        assert!(!config.providers.models.contains_key("anthropic"));
+
+        let created = config
+            .create_map_key("providers.models", "anthropic")
+            .expect("providers.models should accept new map keys");
+        assert!(created, "first add should report created=true");
+        assert!(config.providers.models.contains_key("anthropic"));
+
+        // Idempotent: second add returns false, doesn't error.
+        let again = config
+            .create_map_key("providers.models", "anthropic")
+            .expect("second add still resolves the section");
+        assert!(!again, "duplicate add should report created=false");
+    }
+
+    #[test]
+    async fn create_map_key_rejects_unknown_section() {
+        let mut config = Config::default();
+        let err = config
+            .create_map_key("not.a.real.section", "anything")
+            .expect_err("unknown section path should error");
+        assert!(err.contains("not.a.real.section"));
+    }
+
+    #[test]
     async fn init_defaults_instantiates_none_sections() {
         let mut config = Config::default();
         assert!(config.channels.matrix.is_none());

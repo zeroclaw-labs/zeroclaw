@@ -182,24 +182,9 @@ export function getHealth(): Promise<HealthSnapshot> {
 }
 
 // ---------------------------------------------------------------------------
-// Config
+// Config — per-property CRUD (issue #6175). Whole-file getConfig/putConfig
+// removed; the gateway no longer exposes those endpoints.
 // ---------------------------------------------------------------------------
-
-export function getConfig(): Promise<string> {
-  return apiFetch<string | { format?: string; content: string }>('/api/config').then((data) =>
-    typeof data === 'string' ? data : data.content,
-  );
-}
-
-export function putConfig(toml: string): Promise<void> {
-  return apiFetch<void>('/api/config', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/toml' },
-    body: toml,
-  });
-}
-
-// ── Per-property CRUD (issue #6175) ──────────────────────────────────
 
 export interface PropResponse {
   path: string;
