@@ -160,7 +160,6 @@ pub fn classify_validation_message(msg: &str) -> ConfigApiCode {
 }
 
 impl ConfigApiError {
-
     /// Convenience: a `path_not_found` error for the given path.
     pub fn path_not_found(path: impl Into<String>) -> Self {
         let path = path.into();

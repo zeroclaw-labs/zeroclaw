@@ -255,7 +255,10 @@ fn json_to_setprop_string(
         }
         (Some(PropKind::Bool), other) => Err(ConfigApiError::new(
             ConfigApiCode::ValueTypeMismatch,
-            format!("bool field requires `true`/`false`; got {}", json_type_name(other)),
+            format!(
+                "bool field requires `true`/`false`; got {}",
+                json_type_name(other)
+            ),
         )),
 
         // Integer fields.
@@ -267,7 +270,10 @@ fn json_to_setprop_string(
         }
         (Some(PropKind::Integer), other) => Err(ConfigApiError::new(
             ConfigApiCode::ValueTypeMismatch,
-            format!("integer field requires a whole number; got {}", json_type_name(other)),
+            format!(
+                "integer field requires a whole number; got {}",
+                json_type_name(other)
+            ),
         )),
 
         // Float fields.
@@ -277,7 +283,10 @@ fn json_to_setprop_string(
         }
         (Some(PropKind::Float), other) => Err(ConfigApiError::new(
             ConfigApiCode::ValueTypeMismatch,
-            format!("float field requires a number; got {}", json_type_name(other)),
+            format!(
+                "float field requires a number; got {}",
+                json_type_name(other)
+            ),
         )),
 
         // Scalar / enum fields and unknown-kind paths: best-effort coerce.
@@ -337,10 +346,8 @@ async fn persist_and_swap(
     // the file doesn't exist yet, snapshot is None — we'll remove the file
     // again on rollback so a failed first-write doesn't leak partial state.
     let snapshot = if config_path.exists() {
-        match tokio::fs::read(&config_path).await {
-            Ok(bytes) => Some(bytes),
-            Err(_) => None, // best-effort; if we can't read, we can't revert
-        }
+        // best-effort; if we can't read, we can't revert
+        tokio::fs::read(&config_path).await.ok()
     } else {
         None
     };
@@ -407,7 +414,10 @@ fn decorate_key(root: &mut toml_edit::Table, dotted: &str, comment: &str) {
         Some(s) => s,
         None => return,
     };
-    fn walk<'a>(table: &'a mut toml_edit::Table, segs: &[&str]) -> Option<&'a mut toml_edit::Table> {
+    fn walk<'a>(
+        table: &'a mut toml_edit::Table,
+        segs: &[&str],
+    ) -> Option<&'a mut toml_edit::Table> {
         let mut cursor = table;
         for seg in segs {
             cursor = cursor.get_mut(seg)?.as_table_mut()?;
@@ -465,9 +475,7 @@ fn build_comment_prefix(existing: Option<&toml_edit::RawString>, comment: &str) 
 /// on-disk side is round-tripped through the full deserializer + decrypt
 /// pass before comparison, so we only surface drift the daemon would
 /// actually pick up on its next read of the file.
-pub async fn compute_drift(
-    in_memory: &zeroclaw_config::schema::Config,
-) -> Vec<DriftEntry> {
+pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<DriftEntry> {
     let path = &in_memory.config_path;
     if !path.exists() {
         return Vec::new();
@@ -931,11 +939,7 @@ pub async fn handle_patch(
     let annotations: Vec<(String, String)> = ops
         .iter()
         .zip(results.iter())
-        .filter_map(|(op, res)| {
-            op.comment
-                .as_ref()
-                .map(|c| (res.path.clone(), c.clone()))
-        })
+        .filter_map(|(op, res)| op.comment.as_ref().map(|c| (res.path.clone(), c.clone())))
         .collect();
 
     let config_path = working.config_path.clone();
@@ -1246,10 +1250,7 @@ mod tests {
             Some(zeroclaw_config::traits::PropKind::StringArray),
         );
         assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().code,
-            ConfigApiCode::ValueTypeMismatch
-        );
+        assert_eq!(result.unwrap_err().code, ConfigApiCode::ValueTypeMismatch);
     }
 
     #[test]
@@ -1259,10 +1260,7 @@ mod tests {
             Some(zeroclaw_config::traits::PropKind::StringArray),
         );
         assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().code,
-            ConfigApiCode::ValueTypeMismatch
-        );
+        assert_eq!(result.unwrap_err().code, ConfigApiCode::ValueTypeMismatch);
     }
 
     #[test]
@@ -1386,8 +1384,10 @@ mod tests {
     #[tokio::test]
     async fn compute_drift_returns_empty_when_in_memory_matches_disk() {
         let (_tmp, path) = temp_config_path();
-        let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.config_path = path.clone();
+        let cfg = zeroclaw_config::schema::Config {
+            config_path: path.clone(),
+            ..Default::default()
+        };
         // Write the in-memory state to disk first so they agree by definition.
         cfg.save().await.expect("save");
 
@@ -1401,13 +1401,14 @@ mod tests {
     #[tokio::test]
     async fn compute_drift_surfaces_mismatched_non_secret_field() {
         let (_tmp, path) = temp_config_path();
-        let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.config_path = path.clone();
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: path.clone(),
+            ..Default::default()
+        };
         cfg.save().await.expect("initial save");
 
         // Mutate the in-memory config without saving.
-        cfg.set_prop("gateway.host", "10.0.0.1")
-            .expect("set_prop");
+        cfg.set_prop("gateway.host", "10.0.0.1").expect("set_prop");
 
         let drift = compute_drift(&cfg).await;
         let entry = drift
@@ -1423,8 +1424,10 @@ mod tests {
     #[tokio::test]
     async fn compute_drift_returns_empty_when_no_disk_file() {
         let (_tmp, path) = temp_config_path();
-        let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.config_path = path.clone();
+        let cfg = zeroclaw_config::schema::Config {
+            config_path: path.clone(),
+            ..Default::default()
+        };
         // Don't save — file does not exist.
         let drift = compute_drift(&cfg).await;
         assert!(drift.is_empty());
@@ -1433,18 +1436,16 @@ mod tests {
     #[tokio::test]
     async fn apply_comments_writes_decoration_to_existing_value() {
         let (_tmp, path) = temp_config_path();
-        let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.config_path = path.clone();
-        cfg.set_prop("gateway.host", "10.0.0.5")
-            .expect("set_prop");
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: path.clone(),
+            ..Default::default()
+        };
+        cfg.set_prop("gateway.host", "10.0.0.5").expect("set_prop");
         cfg.save().await.expect("save");
 
         apply_comments(
             &path,
-            &[(
-                "gateway.host".into(),
-                "raised after Q3 backlog".into(),
-            )],
+            &[("gateway.host".into(), "raised after Q3 backlog".into())],
         )
         .await
         .expect("apply_comments");
@@ -1468,7 +1469,11 @@ mod tests {
         let json = serde_json::to_value(&r).expect("serialize");
         let obj = json.as_object().expect("object");
         let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-        assert_eq!(keys, vec!["path", "populated"], "SecretResponse must carry only path + populated");
+        assert_eq!(
+            keys,
+            vec!["path", "populated"],
+            "SecretResponse must carry only path + populated"
+        );
         assert!(!obj.contains_key("value"));
         assert!(!obj.contains_key("length"));
         assert!(!obj.contains_key("hash"));
@@ -1488,7 +1493,10 @@ mod tests {
         let json = serde_json::to_value(&entry).expect("serialize");
         let obj = json.as_object().expect("object");
         // skip_serializing_if on `value` means it must be absent.
-        assert!(!obj.contains_key("value"), "secret list entry leaks `value` field");
+        assert!(
+            !obj.contains_key("value"),
+            "secret list entry leaks `value` field"
+        );
         // is_secret marker must be present so the dashboard can render it as locked.
         assert_eq!(obj.get("is_secret"), Some(&serde_json::Value::Bool(true)));
         assert_eq!(obj.get("populated"), Some(&serde_json::Value::Bool(true)));
@@ -1505,8 +1513,14 @@ mod tests {
         };
         let json = serde_json::to_value(&entry).expect("serialize");
         let obj = json.as_object().expect("object");
-        assert!(!obj.contains_key("in_memory_value"), "secret drift entry leaks in_memory_value");
-        assert!(!obj.contains_key("on_disk_value"), "secret drift entry leaks on_disk_value");
+        assert!(
+            !obj.contains_key("in_memory_value"),
+            "secret drift entry leaks in_memory_value"
+        );
+        assert!(
+            !obj.contains_key("on_disk_value"),
+            "secret drift entry leaks on_disk_value"
+        );
         assert_eq!(obj.get("secret"), Some(&serde_json::Value::Bool(true)));
         assert_eq!(obj.get("drifted"), Some(&serde_json::Value::Bool(true)));
     }
@@ -1514,27 +1528,19 @@ mod tests {
     #[tokio::test]
     async fn apply_comments_clears_existing_comment_when_passed_empty() {
         let (_tmp, path) = temp_config_path();
-        let mut cfg = zeroclaw_config::schema::Config::default();
-        cfg.config_path = path.clone();
-        cfg.set_prop("gateway.host", "10.0.0.5")
-            .expect("set_prop");
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: path.clone(),
+            ..Default::default()
+        };
+        cfg.set_prop("gateway.host", "10.0.0.5").expect("set_prop");
         cfg.save().await.expect("save");
 
-        apply_comments(
-            &path,
-            &[(
-                "gateway.host".into(),
-                "first reason".into(),
-            )],
-        )
-        .await
-        .expect("apply first comment");
-        apply_comments(
-            &path,
-            &[("gateway.host".into(), String::new())],
-        )
-        .await
-        .expect("apply empty");
+        apply_comments(&path, &[("gateway.host".into(), "first reason".into())])
+            .await
+            .expect("apply first comment");
+        apply_comments(&path, &[("gateway.host".into(), String::new())])
+            .await
+            .expect("apply empty");
 
         let raw = tokio::fs::read_to_string(&path).await.expect("read back");
         assert!(
@@ -1542,5 +1548,4 @@ mod tests {
             "expected the prior comment to be cleared, got:\n{raw}"
         );
     }
-
 }

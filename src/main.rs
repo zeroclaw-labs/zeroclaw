@@ -63,7 +63,10 @@ async fn apply_comment_inline(
         Some(s) => s,
         None => return Ok(()),
     };
-    fn walk<'a>(table: &'a mut toml_edit::Table, segs: &[&str]) -> Option<&'a mut toml_edit::Table> {
+    fn walk<'a>(
+        table: &'a mut toml_edit::Table,
+        segs: &[&str],
+    ) -> Option<&'a mut toml_edit::Table> {
         let mut cursor = table;
         for seg in segs {
             cursor = cursor.get_mut(seg)?.as_table_mut()?;
