@@ -540,40 +540,35 @@ impl Channel for WuKongIMChannel {
                                 // Check formal mention object
                                 if let Some(mention) = payload_json.get("mention") {
                                     // Check 'all'
-                                    if let Some(all) = mention.get("all") {
-                                        if all.as_u64() == Some(1)
+                                    if let Some(all) = mention.get("all")
+                                        && (all.as_u64() == Some(1)
                                             || all.as_str() == Some("1")
                                             || all.as_str() == Some("true")
-                                            || all.as_bool() == Some(true)
-                                        {
-                                            mentioned = true;
-                                        }
-                                    }
-                                    // Check 'uids'
-                                    if !mentioned {
-                                        if let Some(uids) =
-                                            mention.get("uids").and_then(|v| v.as_array())
-                                        {
-                                            if uids.iter().any(|u| {
-                                                u.as_str() == Some(&self.uid)
-                                                    || u.as_u64()
-                                                        .map(|n| n.to_string())
-                                                        .as_deref()
-                                                        == Some(&self.uid)
-                                            }) {
-                                                mentioned = true;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Check content for @mention if not already found
-                                if !mentioned {
-                                    if content.contains(&format!("@{}", self.uid))
-                                        || content.contains("@all")
+                                            || all.as_bool() == Some(true))
                                     {
                                         mentioned = true;
                                     }
+                                    // Check 'uids'
+                                    if !mentioned
+                                        && let Some(uids) =
+                                            mention.get("uids").and_then(|v| v.as_array())
+                                        && uids.iter().any(|u| {
+                                            u.as_str() == Some(&self.uid)
+                                                || u.as_u64()
+                                                    .map(|n| n.to_string())
+                                                    .as_deref()
+                                                    == Some(&self.uid)
+                                        })
+                                    {
+                                        mentioned = true;
+                                    }
+                                }
+
+                                if !mentioned
+                                    && (content.contains(&format!("@{}", self.uid))
+                                        || content.contains("@all"))
+                                {
+                                    mentioned = true;
                                 }
 
                                 if !mentioned {
