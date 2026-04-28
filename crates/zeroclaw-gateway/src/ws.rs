@@ -214,6 +214,7 @@ async fn handle_socket(
     let mut session_start = serde_json::json!({
         "type": "session_start",
         "session_id": session_id,
+        "session_key": session_key,
         "resumed": resumed,
         "message_count": message_count,
     });
@@ -505,16 +506,40 @@ async fn process_chat_message(
                         last_partial_save = std::time::Instant::now();
                     }
 
-                    serde_json::json!({ "type": "chunk", "content": delta })
+                    serde_json::json!({
+                        "type": "chunk",
+                        "content": delta,
+                        "session_key": session_key,
+                        "turn_id": turn_id,
+                    })
                 }
                 TurnEvent::Thinking { delta } => {
-                    serde_json::json!({ "type": "thinking", "content": delta })
+                    serde_json::json!({
+                        "type": "thinking",
+                        "content": delta,
+                        "session_key": session_key,
+                        "turn_id": turn_id,
+                    })
                 }
                 TurnEvent::ToolCall { id, name, args } => {
-                    serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
+                    serde_json::json!({
+                        "type": "tool_call",
+                        "id": id,
+                        "name": name,
+                        "args": args,
+                        "session_key": session_key,
+                        "turn_id": turn_id,
+                    })
                 }
                 TurnEvent::ToolResult { id, name, output } => {
-                    serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
+                    serde_json::json!({
+                        "type": "tool_result",
+                        "id": id,
+                        "name": name,
+                        "output": output,
+                        "session_key": session_key,
+                        "turn_id": turn_id,
+                    })
                 }
             };
             let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
@@ -558,7 +583,11 @@ async fn process_chat_message(
         }
 
         // Inform the client the turn was aborted
-        let aborted = serde_json::json!({ "type": "aborted" });
+        let aborted = serde_json::json!({
+            "type": "aborted",
+            "session_key": session_key,
+            "turn_id": turn_id,
+        });
         let _ = sender.send(Message::Text(aborted.to_string().into())).await;
 
         // Set session state to idle
@@ -614,12 +643,18 @@ async fn process_chat_message(
 
             // Send chunk_reset so the client clears any accumulated draft
             // before the authoritative done message.
-            let reset = serde_json::json!({ "type": "chunk_reset" });
+            let reset = serde_json::json!({
+                "type": "chunk_reset",
+                "session_key": session_key,
+                "turn_id": turn_id,
+            });
             let _ = sender.send(Message::Text(reset.to_string().into())).await;
 
             let done = serde_json::json!({
                 "type": "done",
                 "full_response": response,
+                "session_key": session_key,
+                "turn_id": turn_id,
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 
@@ -659,6 +694,8 @@ async fn process_chat_message(
                 "type": "error",
                 "message": sanitized,
                 "code": error_code,
+                "session_key": session_key,
+                "turn_id": turn_id,
             });
             let _ = sender.send(Message::Text(err.to_string().into())).await;
 
