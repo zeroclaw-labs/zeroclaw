@@ -663,6 +663,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/webhook", post(handle_webhook))
+        .route("/api/chat", post(handle_api_chat))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
@@ -1170,6 +1171,152 @@ async fn handle_webhook(
 
             tracing::error!("Webhook provider error: {}", sanitized);
             let err = serde_json::json!({"error": "LLM request failed"});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// POST /api/chat — Bearer-authenticated chat that runs the full agent
+/// loop (tool execution, multi-turn LLM calls). Same auth/rate-limit/
+/// idempotency contract as `/webhook`, but routes through
+/// `run_gateway_chat_with_tools` so tool_calls are actually executed
+/// instead of being returned verbatim as text.
+///
+/// Request:  POST /api/chat   {"message": "..."}   Authorization: Bearer <token>
+/// Response: 200 {"response": "...", "model": "..."}
+async fn handle_api_chat(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        tracing::warn!("/api/chat rate limit exceeded");
+        let err = serde_json::json!({
+            "error": "Too many chat requests. Please retry later.",
+            "retry_after": RATE_LIMIT_WINDOW_SECS,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+    }
+
+    // Bearer auth (same model as /webhook, no X-Webhook-Secret layer)
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            tracing::warn!("/api/chat: rejected — invalid bearer token");
+            let err = serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            });
+            return (StatusCode::UNAUTHORIZED, Json(err));
+        }
+    }
+
+    let Json(req_body) = match body {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("/api/chat JSON parse error: {e}");
+            let err = serde_json::json!({
+                "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
+            });
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    if let Some(idempotency_key) = headers
+        .get("X-Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !state.idempotency_store.record_if_new(idempotency_key) {
+            tracing::info!("/api/chat duplicate ignored (idempotency key: {idempotency_key})");
+            let body = serde_json::json!({
+                "status": "duplicate",
+                "idempotent": true,
+                "message": "Request already processed for this idempotency key"
+            });
+            return (StatusCode::OK, Json(body));
+        }
+    }
+
+    let message = &req_body.message;
+
+    if state.auto_save {
+        let key = webhook_memory_key();
+        let _ = state
+            .mem
+            .store(&key, message, MemoryCategory::Conversation, None)
+            .await;
+    }
+
+    let provider_label = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let model_label = state.model.clone();
+    let started_at = Instant::now();
+
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::AgentStart {
+            provider: provider_label.clone(),
+            model: model_label.clone(),
+        });
+
+    // ── KEY DIFFERENCE FROM /webhook ──
+    // run_gateway_chat_with_tools -> process_message -> full agent loop
+    // (tool calls executed, multi-turn LLM, observer emits tool_call events)
+    let result = run_gateway_chat_with_tools(&state, message).await;
+
+    let duration = started_at.elapsed();
+    match result {
+        Ok(response) => {
+            state.observer.record_metric(
+                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+            );
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::AgentEnd {
+                    provider: provider_label,
+                    model: model_label,
+                    duration,
+                    tokens_used: None,
+                    cost_usd: None,
+                });
+
+            let body = serde_json::json!({"response": response, "model": state.model});
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let sanitized = providers::sanitize_api_error(&e.to_string());
+            state.observer.record_metric(
+                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+            );
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::Error {
+                    component: "gateway".to_string(),
+                    message: sanitized.clone(),
+                });
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::AgentEnd {
+                    provider: provider_label,
+                    model: model_label,
+                    duration,
+                    tokens_used: None,
+                    cost_usd: None,
+                });
+            tracing::error!("/api/chat agent error: {}", sanitized);
+            let err = serde_json::json!({"error": "Chat failed", "detail": sanitized});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
     }
