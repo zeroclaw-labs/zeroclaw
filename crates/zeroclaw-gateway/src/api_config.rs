@@ -576,6 +576,138 @@ fn json_pointer_to_dotted(path: &str) -> String {
     }
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct InitQuery {
+    /// Optional section prefix to scope the init pass (e.g. `providers`).
+    /// Without it, every uninitialized nested section gets its defaults.
+    #[serde(default)]
+    pub section: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InitResponse {
+    pub initialized: Vec<String>,
+}
+
+/// POST /api/config/init?section=providers — instantiate `None` nested
+/// sections with defaults. Mirrors `zeroclaw config init`. When every
+/// requested section is already configured, returns `{initialized: []}`.
+pub async fn handle_init(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<InitQuery>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let mut working = state.config.lock().clone();
+    let initialized: Vec<String> = working
+        .init_defaults(q.section.as_deref())
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    if initialized.is_empty() {
+        return axum::Json(InitResponse { initialized }).into_response();
+    }
+
+    if let Err(e) = working.validate() {
+        return error_response(ConfigApiError::from_validation(e));
+    }
+    if let Err(e) = persist_and_swap(&state, working).await {
+        return error_response(e);
+    }
+
+    axum::Json(InitResponse { initialized }).into_response()
+}
+
+#[derive(Debug, Serialize)]
+pub struct MigrateResponse {
+    pub migrated: bool,
+    /// Backup path written when migration ran; absent when the config was
+    /// already at the current schema version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
+    pub schema_version: u32,
+}
+
+/// POST /api/config/migrate — apply V1→V2 migration to the on-disk
+/// config file in place. Mirrors `zeroclaw config migrate`. Backs up the
+/// previous content alongside the original (`config.toml.bak`) before
+/// writing the migrated form. Returns `{migrated: false}` when the config
+/// is already at the current schema version.
+pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config_path = state.config.lock().config_path.clone();
+
+    let raw = match tokio::fs::read_to_string(&config_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::InternalError,
+                format!("failed to read config file: {e}"),
+            ));
+        }
+    };
+
+    let migrated = match zeroclaw_config::migration::migrate_file(&raw) {
+        Ok(out) => out,
+        Err(e) => {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::ValidationFailed,
+                format!("migration failed: {e}"),
+            ));
+        }
+    };
+
+    match migrated {
+        Some(new_content) => {
+            let backup_path = config_path.with_extension("toml.bak");
+            if let Err(e) = tokio::fs::copy(&config_path, &backup_path).await {
+                return error_response(ConfigApiError::new(
+                    ConfigApiCode::InternalError,
+                    format!("failed to write backup: {e}"),
+                ));
+            }
+            if let Err(e) = tokio::fs::write(&config_path, &new_content).await {
+                return error_response(ConfigApiError::new(
+                    ConfigApiCode::InternalError,
+                    format!("failed to write migrated config: {e}"),
+                ));
+            }
+
+            // Re-read into memory so subsequent requests see the migrated state.
+            let new_cfg: zeroclaw_config::schema::Config = match toml::from_str(&new_content) {
+                Ok(c) => c,
+                Err(e) => {
+                    return error_response(ConfigApiError::new(
+                        ConfigApiCode::ReloadFailed,
+                        format!("re-parse after migration failed: {e}"),
+                    ));
+                }
+            };
+            *state.config.lock() = new_cfg;
+
+            axum::Json(MigrateResponse {
+                migrated: true,
+                backup_path: Some(backup_path.display().to_string()),
+                schema_version: zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
+            })
+            .into_response()
+        }
+        None => axum::Json(MigrateResponse {
+            migrated: false,
+            backup_path: None,
+            schema_version: zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
+        })
+        .into_response(),
+    }
+}
+
 /// OPTIONS /api/config — whole-config schema (capabilities, not values)
 ///
 /// Returns the JSON Schema document for the `Config` type. Distinguishes CORS

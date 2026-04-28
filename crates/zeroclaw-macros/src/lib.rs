@@ -708,7 +708,6 @@ fn has_attr(field: &syn::Field, name: &str) -> bool {
     field.attrs.iter().any(|attr| attr.path().is_ident(name))
 }
 
-
 fn snake_to_kebab(s: &str) -> String {
     s.replace('_', "-")
 }
