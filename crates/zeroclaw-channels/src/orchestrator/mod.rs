@@ -2196,6 +2196,9 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     let stripped_json = strip_isolated_tool_json_artifacts(&stripped_xml, &known_tool_names);
     // Strip leading narration lines that announce tool usage
     let sanitized = strip_tool_narration(&stripped_json);
+    // Strip &lt;think&gt;...&lt;/think&gt; blocks so channels that don't support
+    // draft updates (QQ, Lark/Feishu, Webhook) never see reasoning text.
+    let sanitized = strip_think_tags_inline(&sanitized);
 
     // Scan for credential leaks before returning to caller
     match zeroclaw_runtime::security::LeakDetector::new().scan(&sanitized) {
@@ -12002,6 +12005,30 @@ This is an example JSON object for profile settings."#;
         let result = sanitize_channel_response(clean_text, &tools);
 
         assert_eq!(result, clean_text);
+    }
+
+    #[test]
+    fn sanitize_channel_response_strips_think_tags() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        // Reasoning interleaved with visible text — must strip the  blocks.
+        let input = "Thinking...The real answer";
+        let result = sanitize_channel_response(input, &tools);
+        assert!(
+            !result.contains("Thinking..."),
+            "think block not stripped: {result}"
+        );
+        assert!(
+            result.contains("The real answer"),
+            "visible text lost: {result}"
+        );
+    }
+
+    #[test]
+    fn sanitize_channel_response_strips_think_tags_handles_no_tags() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let input = "Just a normal message";
+        let result = sanitize_channel_response(input, &tools);
+        assert_eq!(result, "Just a normal message");
     }
 
     // ── Tests for strip_think_tags_inline (streaming draft sanitization) ──
