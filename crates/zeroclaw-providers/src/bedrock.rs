@@ -1535,6 +1535,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn chat_fails_without_credentials() {
         let _env_lock = env_lock();
         let _ak = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
