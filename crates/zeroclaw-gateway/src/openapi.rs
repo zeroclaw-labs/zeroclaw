@@ -39,8 +39,8 @@ pub async fn handle_openapi_json() -> Response {
 #[cfg(feature = "schema-export")]
 fn build_spec() -> serde_json::Value {
     use crate::api_config::{
-        InitQuery, InitResponse, ListResponse, MigrateResponse, PatchOp, PatchResponse,
-        PropPutBody, PropResponse, SecretResponse,
+        DriftEntry, DriftResponse, InitQuery, InitResponse, ListResponse, MigrateResponse, PatchOp,
+        PatchResponse, PropPutBody, PropResponse, SecretResponse,
     };
     use zeroclaw_config::api_error::ConfigApiError;
 
@@ -60,6 +60,8 @@ fn build_spec() -> serde_json::Value {
             "InitQuery":        schema_value::<InitQuery>(),
             "InitResponse":     schema_value::<InitResponse>(),
             "MigrateResponse":  schema_value::<MigrateResponse>(),
+            "DriftEntry":       schema_value::<DriftEntry>(),
+            "DriftResponse":    schema_value::<DriftResponse>(),
             "Config":           schema_value::<zeroclaw_config::schema::Config>(),
         },
         "securitySchemes": {
@@ -208,6 +210,19 @@ fn build_spec() -> serde_json::Value {
                     "200": {
                         "description": "Initialized section names (empty when nothing was uninitialized).",
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/InitResponse" } } }
+                    }
+                }
+            }
+        },
+        "/api/config/drift": {
+            "get": {
+                "tags": ["config"],
+                "summary": "Drift between in-memory and on-disk config",
+                "description": "Returns properties whose in-memory values differ from what's on disk now. Empty when they agree. Secret entries carry only `{path, secret: true, drifted: true}`; values never leave the server.",
+                "responses": {
+                    "200": {
+                        "description": "Drift summary.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DriftResponse" } } }
                     }
                 }
             }

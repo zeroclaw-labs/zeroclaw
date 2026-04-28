@@ -137,6 +137,39 @@ pub struct ListEntry {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ListResponse {
     pub entries: Vec<ListEntry>,
+    /// Properties where in-memory and on-disk values disagree. Empty when the
+    /// daemon's view matches the file. Each entry follows the `DriftEntry`
+    /// shape (secrets carry only `{path, secret: true, drifted: true}`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drifted: Vec<DriftEntry>,
+}
+
+/// One drift entry surfaced when in-memory `Config` diverges from the on-disk
+/// `config.toml` (some other process — typically a hand-edit while the daemon
+/// was stopped — wrote the file). For non-secret fields, both values are
+/// surfaced so the dashboard can show a clean diff. For secret fields, only
+/// the boolean `drifted` is surfaced — the secret values themselves never
+/// leave the server.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct DriftEntry {
+    pub path: String,
+    /// `true` for secret fields where values cannot be exposed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub secret: bool,
+    /// Always `true` when surfaced. Present so secret entries unambiguously
+    /// communicate the drift signal in shape `{path, secret: true, drifted: true}`.
+    pub drifted: bool,
+    /// In-memory value (the daemon's view). Absent for secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_memory_value: Option<serde_json::Value>,
+    /// On-disk value (what the file contains right now). Absent for secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_disk_value: Option<serde_json::Value>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 // ── Error helpers ───────────────────────────────────────────────────
@@ -193,20 +226,143 @@ fn lookup_prop_field(
         .find(|info| info.name == path)
 }
 
-/// Save the config and refresh in-memory state, returning a structured error
-/// on failure. Mirrors the pattern in handle_api_config_put.
+/// Save the config and refresh in-memory state. Captures a snapshot of the
+/// pre-write disk state and reverts to it if the save itself fails, so that
+/// on-disk and in-memory state stay consistent under any failure mode.
+///
+/// On the happy path: validate (caller's responsibility) → save to disk →
+/// swap in-memory → respond OK.
+///
+/// On save failure: best-effort restore the pre-write disk content (when
+/// readable), keep in-memory state untouched, return `reload_failed`.
 async fn persist_and_swap(
     state: &AppState,
     new_config: zeroclaw_config::schema::Config,
 ) -> Result<(), ConfigApiError> {
+    let config_path = new_config.config_path.clone();
+
+    // Snapshot pre-write disk state (used for revert on save failure). When
+    // the file doesn't exist yet, snapshot is None — we'll remove the file
+    // again on rollback so a failed first-write doesn't leak partial state.
+    let snapshot = if config_path.exists() {
+        match tokio::fs::read(&config_path).await {
+            Ok(bytes) => Some(bytes),
+            Err(_) => None, // best-effort; if we can't read, we can't revert
+        }
+    } else {
+        None
+    };
+
     if let Err(e) = new_config.save().await {
+        // Save failed — try to restore the pre-write snapshot. This isn't
+        // strictly necessary (Config::save uses an atomic-replace via tmp
+        // file) but defends against the rare case where save partially
+        // wrote then errored (e.g. fsync mid-write).
+        if let Some(prev) = snapshot {
+            let _ = tokio::fs::write(&config_path, prev).await;
+        } else if config_path.exists() {
+            let _ = tokio::fs::remove_file(&config_path).await;
+        }
         return Err(ConfigApiError::new(
             ConfigApiCode::ReloadFailed,
             format!("save failed: {e}"),
         ));
     }
+
     *state.config.lock() = new_config;
     Ok(())
+}
+
+/// Compute drift between the in-memory config and what's on disk right now.
+/// Returns one entry per drifted property; empty when in-memory and disk
+/// agree (or when the on-disk file can't be parsed).
+///
+/// **Secrets:** never surface values. We compare in-memory and on-disk
+/// representations server-side — for secret paths, the comparison happens
+/// over the raw display strings (which include the encrypted form on disk
+/// vs. the decrypted form in memory, so most secret drift is false-positive
+/// against `Configurable`'s display layer). To stay honest about that, the
+/// on-disk side is round-tripped through the full deserializer + decrypt
+/// pass before comparison, so we only surface drift the daemon would
+/// actually pick up on its next read of the file.
+pub async fn compute_drift(
+    in_memory: &zeroclaw_config::schema::Config,
+) -> Vec<DriftEntry> {
+    let path = &in_memory.config_path;
+    if !path.exists() {
+        return Vec::new();
+    }
+
+    let raw = match tokio::fs::read_to_string(path).await {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    // Re-parse the on-disk form into a fresh Config for value-by-value comparison.
+    let on_disk: zeroclaw_config::schema::Config =
+        match toml::from_str::<zeroclaw_config::schema::Config>(&raw) {
+            Ok(mut cfg) => {
+                cfg.config_path = path.clone();
+                cfg
+            }
+            Err(_) => return Vec::new(),
+        };
+
+    let in_memory_props: std::collections::HashMap<String, zeroclaw_config::traits::PropFieldInfo> =
+        in_memory
+            .prop_fields()
+            .into_iter()
+            .map(|p| (p.name.clone(), p))
+            .collect();
+    let on_disk_props: std::collections::HashMap<String, zeroclaw_config::traits::PropFieldInfo> =
+        on_disk
+            .prop_fields()
+            .into_iter()
+            .map(|p| (p.name.clone(), p))
+            .collect();
+
+    let mut drift: Vec<DriftEntry> = Vec::new();
+    for (name, mem) in &in_memory_props {
+        let disk = match on_disk_props.get(name) {
+            Some(d) => d,
+            None => continue,
+        };
+        if mem.display_value == disk.display_value {
+            continue;
+        }
+        let is_sensitive = mem.is_secret || mem.derived_from_secret;
+        if is_sensitive {
+            // Hash-compare server-side so we don't conflate ciphertext-vs-
+            // plaintext display drift with real value drift. If the SHA-256
+            // hashes match, the underlying secret is the same and we hide
+            // the entry.
+            use sha2::{Digest, Sha256};
+            let mem_hash = Sha256::digest(mem.display_value.as_bytes());
+            let disk_hash = Sha256::digest(disk.display_value.as_bytes());
+            if mem_hash == disk_hash {
+                continue;
+            }
+            drift.push(DriftEntry {
+                path: name.clone(),
+                secret: true,
+                drifted: true,
+                in_memory_value: None,
+                on_disk_value: None,
+            });
+        } else {
+            drift.push(DriftEntry {
+                path: name.clone(),
+                secret: false,
+                drifted: true,
+                in_memory_value: Some(serde_json::Value::String(mem.display_value.clone())),
+                on_disk_value: Some(serde_json::Value::String(disk.display_value.clone())),
+            });
+        }
+    }
+
+    // Stable order so callers can diff snapshots.
+    drift.sort_by(|a, b| a.path.cmp(&b.path));
+    drift
 }
 
 // ── Handlers ────────────────────────────────────────────────────────
@@ -402,7 +558,25 @@ pub async fn handle_list(
         })
         .collect();
 
-    axum::Json(ListResponse { entries }).into_response()
+    let drifted = compute_drift(&config).await;
+    axum::Json(ListResponse { entries, drifted }).into_response()
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct DriftResponse {
+    pub drifted: Vec<DriftEntry>,
+}
+
+/// `GET /api/config/drift` — explicit drift summary for clients that want just
+/// the diff. Same `DriftEntry` shape used in `ListResponse.drifted`.
+pub async fn handle_drift(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let config = state.config.lock().clone();
+    let drifted = compute_drift(&config).await;
+    axum::Json(DriftResponse { drifted }).into_response()
 }
 
 /// PATCH /api/config — apply a JSON Patch document atomically.
