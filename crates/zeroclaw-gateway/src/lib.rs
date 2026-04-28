@@ -989,6 +989,7 @@ pub async fn run_gateway(
         .route("/api/config/init", post(api_config::handle_init))
         .route("/api/config/migrate", post(api_config::handle_migrate))
         .route("/api/openapi.json", get(openapi::handle_openapi_json))
+        .route("/api/docs", get(openapi::handle_docs))
         .route("/api/tools", get(api::handle_api_tools))
         .route("/api/cron", get(api::handle_api_cron_list))
         .route("/api/cron", post(api::handle_api_cron_add))

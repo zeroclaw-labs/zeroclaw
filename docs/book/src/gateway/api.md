@@ -110,7 +110,16 @@ Frontends and scripts match against the code; UI matches against the path.
 
 ## Live exploration
 
-Once a gateway is running, browse to `/api/docs` for the OpenAPI explorer.
-Schema definitions and "Try it out" forms come from the same `schemars`
-annotations the daemon uses, so the documentation cannot lie about the
-runtime surface.
+Once a gateway is running, browse to `http://<gateway-host>:<port>/api/docs`
+for the Scalar API explorer. Schema definitions and "Try it out" forms come
+from the same `schemars` annotations the daemon uses, so the documentation
+cannot lie about the runtime surface.
+
+The explorer's authentication panel binds to the `bearerAuth` scheme declared
+in the spec — paste your pairing-derived bearer token there before issuing
+live calls. The CLI shortcut for the URL is `zeroclaw config docs`.
+
+If the Scalar bundle can't load from the CDN (offline / air-gapped install),
+the page degrades gracefully and points you at the raw spec at
+`/api/openapi.json` so you can use any compatible viewer
+(Insomnia, Postman, Swagger UI, etc.).

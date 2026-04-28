@@ -23,6 +23,23 @@ use schemars::{JsonSchema, schema_for};
 
 static CACHED: OnceLock<serde_json::Value> = OnceLock::new();
 
+/// `GET /api/docs` — the Scalar API explorer page. Loads the standalone Scalar
+/// bundle from a CDN and points it at `/api/openapi.json`. The page is a
+/// single static HTML blob — no NPM dep, no committed bundle, ~2KB.
+///
+/// Authentication: Scalar's built-in panel prompts the user for the bearer
+/// token before any "Try it out" call, so the docs themselves are
+/// unauthenticated but the live calls honor the existing pairing/bearer auth.
+pub async fn handle_docs() -> Response {
+    let html = include_str!("openapi_docs.html");
+    let mut response = (StatusCode::OK, html).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response
+}
+
 /// `GET /api/openapi.json` — returns the OpenAPI 3.1 document for the gateway
 /// surface that is documented today (`/api/config/*`). Static per build;
 /// browsers and the eventual Scalar explorer consume this as their data source.
