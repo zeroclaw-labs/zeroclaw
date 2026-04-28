@@ -679,6 +679,23 @@ impl BedrockProvider {
         format!("/model/{encoded}/converse")
     }
 
+    /// Check the credential cache for unexpired credentials.
+    fn cached_credentials(&self) -> Option<AwsCredentials> {
+        let cache = self.cred_cache.lock().ok()?;
+        let creds = cache.as_ref()?;
+        if creds.is_expired() {
+            return None;
+        }
+        Some(creds.clone())
+    }
+
+    /// Store credentials in the cache.
+    fn cache_credentials(&self, creds: &AwsCredentials) {
+        if let Ok(mut cache) = self.cred_cache.lock() {
+            *cache = Some(creds.clone());
+        }
+    }
+
     /// Resolve auth: use cached if available, otherwise try env vars then IMDS.
     async fn resolve_auth(&self) -> anyhow::Result<BedrockAuth> {
         // If we already have auth cached, re-resolve from the same source.
@@ -688,12 +705,8 @@ impl BedrockProvider {
                     return Ok(BedrockAuth::BearerToken(token.clone()));
                 }
                 BedrockAuth::SigV4(_) => {
-                    // Check credential cache before re-resolving.
-                    if let Ok(cache) = self.cred_cache.lock()
-                        && let Some(ref creds) = *cache
-                        && !creds.is_expired()
-                    {
-                        return Ok(BedrockAuth::SigV4(creds.clone()));
+                    if let Some(creds) = self.cached_credentials() {
+                        return Ok(BedrockAuth::SigV4(creds));
                     }
                 }
             }
@@ -707,10 +720,7 @@ impl BedrockProvider {
             return Ok(BedrockAuth::SigV4(creds));
         }
         if let Ok(creds) = AwsCredentials::from_credential_process() {
-            // Cache the credentials for reuse.
-            if let Ok(mut cache) = self.cred_cache.lock() {
-                *cache = Some(creds.clone());
-            }
+            self.cache_credentials(&creds);
             return Ok(BedrockAuth::SigV4(creds));
         }
         Ok(BedrockAuth::SigV4(AwsCredentials::from_imds().await?))
