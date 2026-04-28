@@ -9,6 +9,7 @@
 
 pub mod api;
 pub mod api_config;
+pub mod api_onboard;
 pub mod api_pairing;
 #[cfg(feature = "plugins-wasm")]
 pub mod api_plugins;
@@ -982,6 +983,11 @@ pub async fn run_gateway(
         .route("/api/config/drift", get(api_config::handle_drift))
         .route("/api/config/templates", get(api_config::handle_templates))
         .route("/api/config/map-key", post(api_config::handle_map_key))
+        .route("/api/onboard/catalog", get(api_onboard::handle_catalog))
+        .route(
+            "/api/onboard/catalog/models",
+            get(api_onboard::handle_catalog_models),
+        )
         .route("/api/config/init", post(api_config::handle_init))
         .route("/api/config/migrate", post(api_config::handle_migrate))
         .route("/api/openapi.json", get(openapi::handle_openapi_json))
