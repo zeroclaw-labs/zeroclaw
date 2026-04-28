@@ -27,6 +27,28 @@ export class UnauthorizedError extends Error {
   }
 }
 
+/**
+ * Thrown when the gateway returns a structured `ConfigApiError` response body.
+ * Carries the parsed envelope directly so callers can dispatch on `.code`
+ * instead of regex-matching the message string. Also includes the HTTP
+ * status for callers that care about it (typically just for Retry-After
+ * 429 logic; the code is the authoritative dispatch key).
+ */
+export class ApiError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly envelope: {
+      code: string;
+      message: string;
+      path?: string;
+      op_index?: number;
+    },
+  ) {
+    super(`[${envelope.code}] ${envelope.message}`);
+    this.name = 'ApiError';
+  }
+}
+
 export async function apiFetch<T = unknown>(
   path: string,
   options: RequestInit = {},
@@ -55,7 +77,28 @@ export async function apiFetch<T = unknown>(
   }
 
   if (!response.ok) {
+    // Try to parse a structured ConfigApiError envelope. Falls back to a
+    // plain Error when the body is non-JSON or doesn't match the shape.
+    // Centralises the parsing so callers (including the onboarding flow)
+    // never have to regex-match `error.message` to recover the structured
+    // code — they just `instanceof ApiError` and read `.envelope.code`.
     const text = await response.text().catch(() => '');
+    if (text) {
+      try {
+        const parsed = JSON.parse(text);
+        if (
+          parsed &&
+          typeof parsed === 'object' &&
+          typeof parsed.code === 'string' &&
+          typeof parsed.message === 'string'
+        ) {
+          throw new ApiError(response.status, parsed);
+        }
+      } catch (e) {
+        if (e instanceof ApiError) throw e;
+        // JSON.parse failure → fall through to the plain Error path.
+      }
+    }
     throw new Error(`API ${response.status}: ${text || response.statusText}`);
   }
 

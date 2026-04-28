@@ -11,6 +11,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import {
+  ApiError,
   listProps,
   patchConfig,
   type ConfigApiError,
@@ -154,19 +155,19 @@ export default function Onboard() {
       const next = sections.findIndex((s, i) => i > activeIdx && !completed.has(s.name));
       if (next >= 0) setActiveIdx(next);
     } catch (e) {
-      // Try to parse a structured error envelope.
-      let parsed: ConfigApiError | null = null;
-      const msg = String(e instanceof Error ? e.message : e);
-      try {
-        const m = msg.match(/API \d+:\s*(\{.*\})$/);
-        if (m && m[1]) parsed = JSON.parse(m[1]) as ConfigApiError;
-      } catch {
-        /* ignore */
-      }
-      if (parsed && parsed.path) {
-        setFieldErrors({ [parsed.path]: parsed });
+      // Structured ApiError thrown by apiFetch carries the parsed envelope
+      // directly — no regex over the message string. If the error is bound
+      // to a path, surface it inline next to that field; otherwise show
+      // a top-level error.
+      if (e instanceof ApiError) {
+        const env = e.envelope as ConfigApiError;
+        if (env.path) {
+          setFieldErrors({ [env.path]: env });
+        } else {
+          setError(`[${env.code}] ${env.message}`);
+        }
       } else {
-        setError(msg);
+        setError(String(e instanceof Error ? e.message : e));
       }
     } finally {
       setSaving(false);
