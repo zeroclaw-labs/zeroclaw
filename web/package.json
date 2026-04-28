@@ -9,7 +9,7 @@
     "dev": "vite"
   },
   "engines": {
-    "node": ">24"
+    "node": ">=24"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",
