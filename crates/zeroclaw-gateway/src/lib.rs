@@ -987,6 +987,15 @@ pub async fn run_gateway(
             "/api/onboard/catalog/models",
             get(api_onboard::handle_catalog_models),
         )
+        .route("/api/onboard/sections", get(api_onboard::handle_sections))
+        .route(
+            "/api/onboard/sections/{section}",
+            get(api_onboard::handle_section_picker),
+        )
+        .route(
+            "/api/onboard/sections/{section}/items/{key}",
+            post(api_onboard::handle_section_select),
+        )
         .route("/api/config/init", post(api_config::handle_init))
         .route("/api/config/migrate", post(api_config::handle_migrate))
         .route("/api/openapi.json", get(openapi::handle_openapi_json))
