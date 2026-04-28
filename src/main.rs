@@ -53,50 +53,12 @@ async fn apply_comment_inline(
     path: &str,
     comment: &str,
 ) -> Result<()> {
-    let raw = tokio::fs::read_to_string(config_path).await?;
-    let mut doc: toml_edit::DocumentMut = match raw.parse() {
-        Ok(d) => d,
-        Err(_) => return Ok(()),
-    };
-    let segments: Vec<&str> = path.split('.').collect();
-    let (last, rest) = match segments.split_last() {
-        Some(s) => s,
-        None => return Ok(()),
-    };
-    fn walk<'a>(
-        table: &'a mut toml_edit::Table,
-        segs: &[&str],
-    ) -> Option<&'a mut toml_edit::Table> {
-        let mut cursor = table;
-        for seg in segs {
-            cursor = cursor.get_mut(seg)?.as_table_mut()?;
-        }
-        Some(cursor)
-    }
-    let table = match walk(doc.as_table_mut(), rest) {
-        Some(t) => t,
-        None => return Ok(()),
-    };
-    if let Some(mut key) = table.key_mut(last) {
-        let decor = key.leaf_decor_mut();
-        let prev = decor.prefix().and_then(|r| r.as_str()).unwrap_or("");
-        let mut kept = String::new();
-        for line in prev.split_inclusive('\n') {
-            if !line.trim_start().starts_with('#') {
-                kept.push_str(line);
-            }
-        }
-        if !comment.is_empty() {
-            for line in comment.lines() {
-                kept.push_str("# ");
-                kept.push_str(line);
-                kept.push('\n');
-            }
-        }
-        decor.set_prefix(kept);
-    }
-    tokio::fs::write(config_path, doc.to_string()).await?;
-    Ok(())
+    zeroclaw_config::comment_writer::apply_comments(
+        config_path,
+        &[(path.to_string(), comment.to_string())],
+    )
+    .await
+    .context("failed to write comment annotation")
 }
 
 /// Coerce a JSON value into the string form `Config::set_prop` accepts. Mirrors
