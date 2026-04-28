@@ -540,14 +540,13 @@ impl Channel for WuKongIMChannel {
                                 // Check formal mention object
                                 if let Some(mention) = payload_json.get("mention") {
                                     // Check 'all'
-                                    if let Some(all) = mention.get("all") {
-                                        if all.as_u64() == Some(1)
+                                    if let Some(all) = mention.get("all")
+                                        && (all.as_u64() == Some(1)
                                             || all.as_str() == Some("1")
                                             || all.as_str() == Some("true")
-                                            || all.as_bool() == Some(true)
-                                        {
-                                            mentioned = true;
-                                        }
+                                            || all.as_bool() == Some(true))
+                                    {
+                                        mentioned = true;
                                     }
                                     // Check 'uids'
                                     if !mentioned {
