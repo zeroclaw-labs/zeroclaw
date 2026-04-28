@@ -812,7 +812,14 @@ pub async fn run_gateway(
         println!("     Send: POST {pfx}/pair with header X-Pairing-Code: {code}");
     } else if pairing.require_pairing() {
         println!("  🔒 Pairing: ACTIVE (bearer token required)");
-        println!("     To pair a new device: zeroclaw gateway get-paircode --new");
+        println!(
+            "     To pair a new device: {}",
+            format_paircode_recovery_command(host, actual_port)
+        );
+        println!(
+            "     Fallback: {}",
+            format_paircode_recovery_curl(host, actual_port, pfx)
+        );
         println!();
     } else {
         println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
@@ -1177,6 +1184,26 @@ pub async fn run_gateway(
     }
 
     Ok(())
+}
+
+fn format_paircode_recovery_command(host: &str, port: u16) -> String {
+    let mut cmd = format!("zeroclaw gateway get-paircode --new --port {port}");
+    if let Some(host_arg) = paircode_recovery_host_arg(host) {
+        cmd.push_str(" --host ");
+        cmd.push_str(host_arg);
+    }
+    cmd
+}
+
+fn paircode_recovery_host_arg(host: &str) -> Option<&str> {
+    match host {
+        "127.0.0.1" | "localhost" | "::1" | "0.0.0.0" | "::" => None,
+        _ => Some(host),
+    }
+}
+
+fn format_paircode_recovery_curl(host: &str, port: u16, path_prefix: &str) -> String {
+    format!("curl -s -X POST http://{host}:{port}{path_prefix}/admin/paircode/new")
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2369,6 +2396,38 @@ mod tests {
     #[test]
     fn security_timeout_default_is_30_seconds() {
         assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+    }
+
+    #[test]
+    fn paircode_recovery_command_includes_alternate_port() {
+        assert_eq!(
+            format_paircode_recovery_command("127.0.0.1", 42617),
+            "zeroclaw gateway get-paircode --new --port 42617"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_command_includes_specific_host_when_needed() {
+        assert_eq!(
+            format_paircode_recovery_command("192.168.1.20", 42617),
+            "zeroclaw gateway get-paircode --new --port 42617 --host 192.168.1.20"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_curl_targets_running_instance() {
+        assert_eq!(
+            format_paircode_recovery_curl("127.0.0.1", 42617, ""),
+            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_curl_preserves_path_prefix() {
+        assert_eq!(
+            format_paircode_recovery_curl("127.0.0.1", 42617, "/gw"),
+            "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
+        );
     }
 
     #[test]
