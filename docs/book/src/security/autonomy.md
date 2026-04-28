@@ -33,7 +33,7 @@ Risk classification:
 | Medium | `file_write` within workspace, `shell` with allowed commands, `http POST` to allowed domains | Asks operator |
 | High | `shell` with unknown/denied commands, `file_write` outside workspace, destructive patterns | Blocks |
 
-**Approval channel:** the approval prompt is delivered through whichever channel initiated the conversation. Telegram uses inline keyboard buttons; Slack Socket Mode uses Block Kit buttons; Discord, Signal, Matrix, and WhatsApp embed a short token in the prompt and wait for a `<token> approve|deny|always` reply. In the CLI, it's an inline prompt. In ACP, it's a `session/update` with `kind: "approval_request"`.
+**Approval channel:** the approval prompt is delivered through whichever channel initiated the conversation. Telegram uses inline keyboard buttons; Slack Socket Mode uses Block Kit buttons; Discord, Signal, Matrix, and WhatsApp embed a short token in the prompt and wait for a `<token> approve|deny|always` reply. In the CLI, it's an inline prompt. In ACP, the agent issues a `session/request_permission` JSON-RPC *request* from agent to client (not a `session/update` notification); the client responds with `{"outcome": {"outcome": "selected", "optionId": "allow-once|allow-always|reject-once"}}` or `{"outcome": {"outcome": "cancelled"}}` to approve, always-approve, or deny. See [ACP → `session/request_permission`](../channels/acp.md#sessionrequest_permission-agent--client-outbound-request).
 
 **Timeout:** unanswered approval requests expire after `[autonomy] approval_timeout_secs` (default 300). Timeouts are treated as denials.
 

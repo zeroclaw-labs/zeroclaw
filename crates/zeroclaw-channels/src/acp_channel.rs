@@ -34,20 +34,31 @@ pub struct AcpChannel {
     name: String,
     session_id: String,
     rpc: Arc<RpcOutbound>,
+    /// How long to wait for a `session/request_permission` response before
+    /// giving up and returning an error. Callers that never respond (crash,
+    /// network drop, user closes IDE) would otherwise park `execute_tool_call`
+    /// forever and hold the session slot against `max_sessions`.
+    approval_timeout: Duration,
 }
 
 impl AcpChannel {
     /// Build an ACP channel bound to a specific ACP session id and the
     /// server's outbound JSON-RPC plumbing.
+    ///
+    /// `approval_timeout` caps how long `request_approval` and `request_choice`
+    /// will wait for a client response. Pass `session_timeout_secs` from
+    /// `AcpServerConfig` so the bound is consistent with the session lifetime.
     pub fn new(
         name: impl Into<String>,
         session_id: impl Into<String>,
         rpc: Arc<RpcOutbound>,
+        approval_timeout: Duration,
     ) -> Self {
         Self {
             name: name.into(),
             session_id: session_id.into(),
             rpc,
+            approval_timeout,
         }
     }
 }
@@ -191,7 +202,7 @@ impl Channel for AcpChannel {
                     None => anyhow::bail!("ACP returned unknown optionId: {option_id}"),
                 }
             }
-            "cancelled" => Ok(Some(String::from("CANCELLED"))),
+            "cancelled" => Ok(None),
             other => anyhow::bail!("ACP returned unexpected outcome: {other}"),
         }
     }
@@ -243,12 +254,16 @@ impl Channel for AcpChannel {
             }
         });
 
-        let response = self.rpc.request("session/request_permission", params).await;
-        let response = match response {
-            Ok(value) => value,
-            Err(e) => {
+        let call = self.rpc.request("session/request_permission", params);
+        let response = match tokio::time::timeout(self.approval_timeout, call).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(e)) => {
                 anyhow::bail!("ACP request_permission failed: {} ({})", e.message, e.code)
             }
+            Err(_) => anyhow::bail!(
+                "ACP request_permission timed out after {:?}",
+                self.approval_timeout
+            ),
         };
 
         let outcome = response.get("outcome");
@@ -291,21 +306,21 @@ mod tests {
     #[tokio::test]
     async fn name_returns_provided_name() {
         let (rpc, _rx) = make_rpc();
-        let ch = AcpChannel::new("acp", "sess-1", rpc);
+        let ch = AcpChannel::new("acp", "sess-1", rpc, Duration::from_secs(30));
         assert_eq!(ch.name(), "acp");
     }
 
     #[tokio::test]
     async fn supports_free_form_ask_is_false() {
         let (rpc, _rx) = make_rpc();
-        let ch = AcpChannel::new("acp", "sess-1", rpc);
+        let ch = AcpChannel::new("acp", "sess-1", rpc, Duration::from_secs(30));
         assert!(!ch.supports_free_form_ask());
     }
 
     #[tokio::test]
     async fn send_emits_agent_message_chunk_notification() {
         let (rpc, mut rx) = make_rpc();
-        let ch = AcpChannel::new("acp", "sess-1", rpc);
+        let ch = AcpChannel::new("acp", "sess-1", rpc, Duration::from_secs(30));
 
         ch.send(&SendMessage::new("hello", "")).await.unwrap();
 
@@ -326,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn add_reaction_returns_error() {
         let (rpc, _rx) = make_rpc();
-        let ch = AcpChannel::new("acp", "sess-1", rpc);
+        let ch = AcpChannel::new("acp", "sess-1", rpc, Duration::from_secs(30));
         let res = ch.add_reaction("chan", "msg", "👍").await;
         assert!(res.is_err());
     }
@@ -334,7 +349,7 @@ mod tests {
     #[tokio::test]
     async fn remove_reaction_returns_error() {
         let (rpc, _rx) = make_rpc();
-        let ch = AcpChannel::new("acp", "sess-1", rpc);
+        let ch = AcpChannel::new("acp", "sess-1", rpc, Duration::from_secs(30));
         let res = ch.remove_reaction("chan", "msg", "👍").await;
         assert!(res.is_err());
     }
@@ -342,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn listen_returns_error() {
         let (rpc, _rx) = make_rpc();
-        let ch = AcpChannel::new("acp", "sess-1", rpc);
+        let ch = AcpChannel::new("acp", "sess-1", rpc, Duration::from_secs(30));
         let (tx, _) = mpsc::channel(1);
         let res = ch.listen(tx).await;
         assert!(res.is_err());
@@ -351,7 +366,7 @@ mod tests {
     #[tokio::test]
     async fn request_choice_rejects_empty_choices() {
         let (rpc, _rx) = make_rpc();
-        let ch = AcpChannel::new("acp", "sess-1", rpc);
+        let ch = AcpChannel::new("acp", "sess-1", rpc, Duration::from_secs(30));
         let res = ch
             .request_choice("Pick one", &[], Duration::from_secs(1))
             .await;
@@ -362,7 +377,7 @@ mod tests {
     async fn request_choice_emits_request_permission_and_resolves_selection() {
         let (rpc, mut rx) = make_rpc();
         let rpc_for_resp = Arc::clone(&rpc);
-        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc));
+        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
 
         let choices = vec![
             "Option A".to_string(),
@@ -400,7 +415,7 @@ mod tests {
     async fn request_choice_handles_cancel_outcome() {
         let (rpc, mut rx) = make_rpc();
         let rpc_for_resp = Arc::clone(&rpc);
-        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc));
+        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
 
         let choices = vec!["Yes".to_string(), "No".to_string()];
 
@@ -420,13 +435,13 @@ mod tests {
         );
 
         let result = task.await.unwrap().unwrap();
-        assert_eq!(result, Some("CANCELLED".to_string()));
+        assert_eq!(result, None);
     }
 
     #[tokio::test]
     async fn request_choice_times_out_when_no_response() {
         let (rpc, _rx) = make_rpc();
-        let ch = AcpChannel::new("acp", "sess-1", rpc);
+        let ch = AcpChannel::new("acp", "sess-1", rpc, Duration::from_secs(30));
         let choices = vec!["Yes".to_string(), "No".to_string()];
         let res = ch
             .request_choice("Confirm?", &choices, Duration::from_millis(50))
@@ -440,7 +455,7 @@ mod tests {
     async fn request_approval_emits_request_permission_and_resolves_approve() {
         let (rpc, mut rx) = make_rpc();
         let rpc_for_resp = Arc::clone(&rpc);
-        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc));
+        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
         let request = ChannelApprovalRequest {
             tool_name: "git".to_string(),
             arguments_summary: "git status --short".to_string(),
@@ -477,7 +492,7 @@ mod tests {
     async fn request_approval_maps_always_and_cancel() {
         let (rpc, mut rx) = make_rpc();
         let rpc_for_resp = Arc::clone(&rpc);
-        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc));
+        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
         let request = ChannelApprovalRequest {
             tool_name: "git".to_string(),
             arguments_summary: "git commit".to_string(),
@@ -500,7 +515,7 @@ mod tests {
 
         let (rpc, mut rx) = make_rpc();
         let rpc_for_resp = Arc::clone(&rpc);
-        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc));
+        let ch = AcpChannel::new("acp", "sess-1", Arc::clone(&rpc), Duration::from_secs(30));
         let request = ChannelApprovalRequest {
             tool_name: "git".to_string(),
             arguments_summary: "git push".to_string(),

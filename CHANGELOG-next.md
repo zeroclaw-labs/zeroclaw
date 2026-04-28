@@ -10,6 +10,12 @@
 
 ## Highlights
 
+- **ACP v1 — full IDE integration protocol** — ZeroClaw's Agent Client Protocol has been upgraded to schema v1. The initialize response now carries `protocolVersion`, `agentCapabilities`, `agentInfo`, and `_meta.zeroclaw` extension fields. Session/update notifications use a `sessionUpdate` discriminant with four variants (`agent_message_chunk`, `tool_call`, `tool_call_update`, `agent_thought_chunk`). Tool-call approval now flows via an outbound `session/request_permission` JSON-RPC request from agent to IDE — the IDE acknowledges with `allow-once`, `allow-always`, or `reject-once`. A new ACP back-channel (`AcpChannel`) lets `ask_user`, `escalate_to_human`, and `reaction` tools reach the connected IDE client. The gateway WebSocket gains a connect-time `cwd` parameter that pins the per-session security sandbox root. Clients still on v0 must migrate; see the [ACP migration guide](docs/book/src/channels/acp.md#version-compatibility).
+
+- **`escalate_to_human` tool** — New agent-callable tool for urgency-aware human escalation. `high`/`critical` urgency fires a Pushover mobile notification when credentials are configured. Integrates with ACP via `session/request_permission` for `wait_for_response` flows.
+
+- **Per-session security sandbox root** — Both ACP (`session/new`) and the gateway WebSocket (connect-time `cwd`) now pin an independent workspace boundary per session. The daemon's data directory (memory, cron, identity) remains separate from the per-session sandbox, enabling multi-project setups where each IDE window gets its own file-access scope.
+
 - **Workspace split complete** — ZeroClaw is now a multi-crate Cargo workspace. The
   monolithic source tree has been decomposed into 12+ focused crates
   (`zeroclaw-api`, `zeroclaw-runtime`, `zeroclaw-gateway`, `zeroclaw-channels`,

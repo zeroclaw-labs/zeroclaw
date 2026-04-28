@@ -24,6 +24,10 @@ Docs: [Autonomy levels](./autonomy.md).
 
 The agent operates within a configured workspace directory. `file_read`, `file_write`, and `shell` (for commands that touch the filesystem) refuse paths outside it unless `workspace_only = false`.
 
+**Per-session sandbox roots (ACP and gateway WebSocket):** When a session is opened via ACP (`session/new` with a `cwd` parameter) or via the gateway WebSocket (connect-time `cwd` parameter), the security sandbox root is pinned to that path for the lifetime of the session. This is independent of the daemon's global `workspace_dir`, which remains the data directory for memory, identity, cron, and other persistent state. The model is: `session sandbox root` = project boundary the agent can touch; `workspace_dir` = where ZeroClaw stores its own files. This separation enables multi-project setups where each IDE window or connection gets its own file-access scope without sharing a single workspace constraint.
+
+**Important:** the `cwd` parameter changes which directory on the **ZeroClaw host** the agent is sandboxed to — it does not affect which machine tools run on. Tool use (shell commands, file reads/writes) always executes on the machine running ZeroClaw. If you connect to a remote ZeroClaw instance over the gateway WebSocket, tool calls operate on the remote machine's filesystem, not on your local machine. For localhost-only deployments this distinction does not matter, but remote setups should account for it.
+
 Beyond the workspace, a `forbidden_paths` list (default: `/etc`, `/sys`, `/boot`, `~/.ssh`, …) is always blocked regardless of workspace setting.
 
 ## 4. Shell command policy

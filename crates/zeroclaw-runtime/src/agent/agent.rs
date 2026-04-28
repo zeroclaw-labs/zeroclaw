@@ -839,24 +839,50 @@ impl Agent {
                 arguments: tool_args.clone(),
             };
 
-            let decision = if mgr.is_non_interactive() {
-                let channel_decision = if let Some(ch) = self.channel_handles.get_channel("acp") {
-                    let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
-                        tool_name: request.tool_name.clone(),
-                        arguments_summary: crate::approval::summarize_args(&request.arguments),
-                    };
+            let (decision, decision_channel) = if mgr.is_non_interactive() {
+                // Iterate every registered channel looking for one that can
+                // handle the approval request. The first Ok(Some(_)) wins.
+                // This avoids hard-coding a channel name (e.g. "acp") and
+                // naturally supports WS sessions or any future back-channel.
+                let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
+                    tool_name: request.tool_name.clone(),
+                    arguments_summary: crate::approval::summarize_args(&request.arguments),
+                };
+                let mut channel_decision: Option<zeroclaw_api::channel::ChannelApprovalResponse> =
+                    None;
+                let mut decision_channel_name = String::new();
+                // Collect channels while holding the lock briefly, then drop
+                // the lock before any await points so the guard is not Send.
+                let channels: Vec<(String, Arc<dyn zeroclaw_api::channel::Channel>)> = self
+                    .channel_handles
+                    .ask_user
+                    .as_ref()
+                    .map(|h| {
+                        h.read()
+                            .iter()
+                            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (ch_name, ch) in &channels {
                     match ch.request_approval("", &ch_request).await {
-                        Ok(Some(r)) => Some(r),
-                        Ok(None) => None,
+                        Ok(Some(r)) => {
+                            decision_channel_name = ch_name.clone();
+                            channel_decision = Some(r);
+                            break;
+                        }
+                        Ok(None) => continue,
                         Err(e) => {
-                            tracing::warn!("Channel approval request failed: {e}");
-                            None
+                            tracing::warn!(
+                                tool = %tool_name,
+                                channel = %ch_name,
+                                error = %e,
+                                "channel approval request failed"
+                            );
                         }
                     }
-                } else {
-                    None
-                };
-                match channel_decision {
+                }
+                let approval = match channel_decision {
                     Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve) => {
                         ApprovalResponse::Yes
                     }
@@ -866,13 +892,22 @@ impl Agent {
                     Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny) => {
                         ApprovalResponse::No
                     }
-                    None => ApprovalResponse::No,
-                }
+                    None => {
+                        tracing::warn!(
+                            tool = %tool_name,
+                            "no approval channel handled this request — denying. \
+                             Configure a back-channel (ACP or WS) that implements \
+                             request_approval to enable interactive approval."
+                        );
+                        ApprovalResponse::No
+                    }
+                };
+                (approval, decision_channel_name)
             } else {
-                mgr.prompt_cli(&request)
+                (mgr.prompt_cli(&request), String::new())
             };
 
-            mgr.record_decision(&tool_name, &tool_args, decision, "acp");
+            mgr.record_decision(&tool_name, &tool_args, decision, &decision_channel);
 
             if decision == ApprovalResponse::No {
                 return ToolExecutionResult {

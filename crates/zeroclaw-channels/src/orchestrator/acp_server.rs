@@ -503,6 +503,7 @@ impl AcpServer {
             "acp",
             session_id.clone(),
             Arc::clone(&self.rpc),
+            Duration::from_secs(self.acp_config.session_timeout_secs),
         ));
         agent.channel_handles().register_channel("acp", acp_channel);
 
