@@ -3946,6 +3946,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     dc.listen_to_bots,
                     dc.mention_only,
                 )
+                .with_workspace_dir(config.workspace_dir.clone())
                 .with_streaming(
                     dc.stream_mode,
                     dc.draft_update_interval_ms,
@@ -4390,6 +4391,7 @@ fn collect_configured_channels(
                         dc.listen_to_bots,
                         dc.mention_only,
                     )
+                    .with_workspace_dir(config.workspace_dir.clone())
                     .with_streaming(
                         dc.stream_mode,
                         dc.draft_update_interval_ms,
@@ -5723,7 +5725,8 @@ pub async fn deliver_announcement(
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
                 dc.mention_only,
-            );
+            )
+            .with_workspace_dir(config.workspace_dir.clone());
             zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
                 .await?;
         }
