@@ -13352,6 +13352,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "include_dir",
  "mime_guess",
  "parking_lot",
  "rand 0.10.1",
