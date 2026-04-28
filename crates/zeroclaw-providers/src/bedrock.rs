@@ -2230,4 +2230,91 @@ region=ap-southeast-1
         assert!(creds.is_ok());
         assert_eq!(creds.unwrap().access_key_id, "FROM_ENV");
     }
+
+    // ── credential cache tests ──────────────────────────────────
+
+    fn make_creds(expires_at: Option<chrono::DateTime<chrono::Utc>>) -> AwsCredentials {
+        AwsCredentials {
+            access_key_id: "AKIA".to_string(),
+            secret_access_key: "secret".to_string(),
+            session_token: Some("tok".to_string()),
+            region: "us-west-2".to_string(),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn is_expired_returns_false_when_no_expiry() {
+        let creds = make_creds(None);
+        assert!(!creds.is_expired());
+    }
+
+    #[test]
+    fn is_expired_returns_false_when_future() {
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let creds = make_creds(Some(future));
+        assert!(!creds.is_expired());
+    }
+
+    #[test]
+    fn is_expired_returns_true_when_past() {
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        let creds = make_creds(Some(past));
+        assert!(creds.is_expired());
+    }
+
+    #[test]
+    fn is_expired_returns_true_within_skew_window() {
+        // 30 seconds from now is within the 60s skew — should be treated as expired.
+        let soon = chrono::Utc::now() + chrono::Duration::seconds(30);
+        let creds = make_creds(Some(soon));
+        assert!(creds.is_expired());
+    }
+
+    #[test]
+    fn cached_credentials_returns_none_when_empty() {
+        let provider = BedrockProvider {
+            auth: None,
+            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            cred_cache: Mutex::new(None),
+        };
+        assert!(provider.cached_credentials().is_none());
+    }
+
+    #[test]
+    fn cached_credentials_returns_some_when_valid() {
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let provider = BedrockProvider {
+            auth: None,
+            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            cred_cache: Mutex::new(Some(make_creds(Some(future)))),
+        };
+        let cached = provider.cached_credentials();
+        assert!(cached.is_some());
+        assert_eq!(cached.unwrap().access_key_id, "AKIA");
+    }
+
+    #[test]
+    fn cached_credentials_returns_none_when_expired() {
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        let provider = BedrockProvider {
+            auth: None,
+            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            cred_cache: Mutex::new(Some(make_creds(Some(past)))),
+        };
+        assert!(provider.cached_credentials().is_none());
+    }
+
+    #[test]
+    fn cache_credentials_stores_and_retrieves() {
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let provider = BedrockProvider {
+            auth: None,
+            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            cred_cache: Mutex::new(None),
+        };
+        assert!(provider.cached_credentials().is_none());
+        provider.cache_credentials(&make_creds(Some(future)));
+        assert!(provider.cached_credentials().is_some());
+    }
 }
