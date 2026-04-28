@@ -31,6 +31,7 @@ pub struct Agent {
     tool_dispatcher: Box<dyn ToolDispatcher>,
     memory_loader: Box<dyn MemoryLoader>,
     config: zeroclaw_config::schema::AgentConfig,
+    multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     model_name: String,
     temperature: f64,
     workspace_dir: std::path::PathBuf,
@@ -69,6 +70,7 @@ pub struct AgentBuilder {
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
     memory_loader: Option<Box<dyn MemoryLoader>>,
     config: Option<zeroclaw_config::schema::AgentConfig>,
+    multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
     temperature: Option<f64>,
     workspace_dir: Option<std::path::PathBuf>,
@@ -105,6 +107,7 @@ impl AgentBuilder {
             tool_dispatcher: None,
             memory_loader: None,
             config: None,
+            multimodal_config: None,
             model_name: None,
             temperature: None,
             workspace_dir: None,
@@ -162,6 +165,14 @@ impl AgentBuilder {
 
     pub fn config(mut self, config: zeroclaw_config::schema::AgentConfig) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    pub fn multimodal_config(
+        mut self,
+        multimodal_config: zeroclaw_config::schema::MultimodalConfig,
+    ) -> Self {
+        self.multimodal_config = Some(multimodal_config);
         self
     }
 
@@ -297,6 +308,7 @@ impl AgentBuilder {
                 .memory_loader
                 .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
             config: self.config.unwrap_or_default(),
+            multimodal_config: self.multimodal_config.unwrap_or_default(),
             model_name: self
                 .model_name
                 .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into()),
@@ -552,6 +564,7 @@ impl Agent {
             )))
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(config.agent.clone())
+            .multimodal_config(config.multimodal.clone())
             .model_name(model_name)
             .temperature(
                 fallback_provider_ag
@@ -644,6 +657,18 @@ impl Agent {
             autonomy_level: self.autonomy_level,
         };
         self.prompt_builder.build(&ctx)
+    }
+
+    async fn prepare_provider_messages(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<Vec<ChatMessage>> {
+        let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
+            messages,
+            &self.multimodal_config,
+        )
+        .await?;
+        Ok(prepared.messages)
     }
 
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
@@ -906,11 +931,13 @@ impl Agent {
                 });
             }
 
+            let prepared_messages = self.prepare_provider_messages(&messages).await?;
+
             let response = match self
                 .provider
                 .chat(
                     ChatRequest {
-                        messages: &messages,
+                        messages: &prepared_messages,
                         tools: if self.tool_dispatcher.should_send_tool_specs() {
                             Some(&self.tool_specs)
                         } else {
@@ -1090,6 +1117,8 @@ impl Agent {
                 });
             }
 
+            let prepared_messages = self.prepare_provider_messages(&messages).await?;
+
             // ── Streaming LLM call ────────────────────────────────────
             // Try streaming first; if the provider returns content we
             // forward deltas.  Otherwise fall back to non-streaming chat.
@@ -1098,7 +1127,7 @@ impl Agent {
             let stream_opts = zeroclaw_providers::traits::StreamOptions::new(true);
             let mut stream = self.provider.stream_chat(
                 zeroclaw_providers::ChatRequest {
-                    messages: &messages,
+                    messages: &prepared_messages,
                     tools: if self.tool_dispatcher.should_send_tool_specs() {
                         Some(&self.tool_specs)
                     } else {
@@ -1215,7 +1244,7 @@ impl Agent {
                 // Fall back to non-streaming chat, with cancellation guard
                 let chat_fut = self.provider.chat(
                     ChatRequest {
-                        messages: &messages,
+                        messages: &prepared_messages,
                         tools: if self.tool_dispatcher.should_send_tool_specs() {
                             Some(&self.tool_specs)
                         } else {
@@ -1492,6 +1521,80 @@ mod tests {
                 });
             }
             Ok(guard.remove(0))
+        }
+    }
+
+    struct MultimodalCaptureProvider {
+        seen_user_messages: Arc<Mutex<Vec<String>>>,
+        streamed: bool,
+    }
+
+    #[async_trait]
+    impl Provider for MultimodalCaptureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            if let Some(message) = request.messages.iter().rfind(|msg| msg.role == "user") {
+                self.seen_user_messages.lock().push(message.content.clone());
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+        > {
+            use futures_util::stream::{self, StreamExt};
+
+            if let Some(message) = request.messages.iter().rfind(|msg| msg.role == "user") {
+                self.seen_user_messages.lock().push(message.content.clone());
+            }
+
+            if self.streamed {
+                let chunk = zeroclaw_providers::traits::StreamEvent::TextDelta(
+                    zeroclaw_providers::traits::StreamChunk {
+                        delta: "stream-done".into(),
+                        is_final: false,
+                        reasoning: None,
+                        token_count: 0,
+                    },
+                );
+                stream::iter(vec![
+                    Ok(chunk),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            } else {
+                stream::iter(vec![Ok(zeroclaw_providers::traits::StreamEvent::Final)]).boxed()
+            }
+        }
+
+        fn supports_vision(&self) -> bool {
+            true
         }
     }
 
@@ -2032,6 +2135,111 @@ mod tests {
         assert!(
             has_tool_result,
             "Should have emitted a ToolResult event for 'echo'"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_normalizes_user_image_markers_before_provider_call() {
+        let seen_user_messages = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(MultimodalCaptureProvider {
+            seen_user_messages: seen_user_messages.clone(),
+            streamed: false,
+        });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image_path = temp.path().join("agent-turn.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .expect("write fixture");
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .multimodal_config(zeroclaw_config::schema::MultimodalConfig::default())
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        agent
+            .turn(&format!("inspect [IMAGE:{}]", image_path.display()))
+            .await
+            .expect("turn should succeed");
+
+        let seen = seen_user_messages.lock();
+        let last = seen.last().expect("provider should receive a user message");
+        assert!(
+            last.contains("data:image/png;base64,"),
+            "expected normalized data URI in provider request, got: {last}"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_normalizes_user_image_markers_before_provider_call() {
+        let seen_user_messages = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(MultimodalCaptureProvider {
+            seen_user_messages: seen_user_messages.clone(),
+            streamed: true,
+        });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image_path = temp.path().join("agent-stream.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .expect("write fixture");
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .multimodal_config(zeroclaw_config::schema::MultimodalConfig::default())
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+        agent
+            .turn_streamed(
+                &format!("inspect [IMAGE:{}]", image_path.display()),
+                event_tx,
+                None,
+            )
+            .await
+            .expect("turn_streamed should succeed");
+
+        let seen = seen_user_messages.lock();
+        let last = seen.last().expect("provider should receive a user message");
+        assert!(
+            last.contains("data:image/png;base64,"),
+            "expected normalized data URI in provider request, got: {last}"
         );
     }
 

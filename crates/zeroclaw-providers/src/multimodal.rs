@@ -133,7 +133,7 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
 pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
-        .filter(|m| m.role == "user")
+        .filter(|m| should_normalize_message_images(&m.role))
         .map(|m| parse_image_markers(&m.content).1.len())
         .sum()
 }
@@ -157,6 +157,10 @@ pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     }
 }
 
+fn should_normalize_message_images(role: &str) -> bool {
+    matches!(role, "user" | "tool")
+}
+
 pub async fn prepare_messages_for_provider(
     messages: &[ChatMessage],
     config: &MultimodalConfig,
@@ -175,7 +179,7 @@ pub async fn prepare_messages_for_provider(
 
     // When image count exceeds the limit, strip markers from oldest messages
     // first so that the most recent (most relevant) images survive. This
-    // prevents conversations from becoming permanently stuck once the
+    // prevents conversations from becoming permanently  stuck once the
     // cumulative image count crosses the threshold.
     let trimmed = if total_images > max_images {
         trim_old_images(messages, max_images)
@@ -187,7 +191,7 @@ pub async fn prepare_messages_for_provider(
 
     let mut normalized_messages = Vec::with_capacity(trimmed.len());
     for message in &trimmed {
-        if message.role != "user" {
+        if !should_normalize_message_images(&message.role) {
             normalized_messages.push(message.clone());
             continue;
         }
@@ -225,7 +229,7 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
     let image_positions: Vec<(usize, usize)> = messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.role == "user")
+        .filter(|(_, m)| should_normalize_message_images(&m.role))
         .filter_map(|(i, m)| {
             let count = parse_image_markers(&m.content).1.len();
             if count > 0 { Some((i, count)) } else { None }
@@ -631,6 +635,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_messages_normalizes_tool_message_local_image_to_data_uri() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("tool-sample.png");
+
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let messages = vec![ChatMessage::tool(format!(
+            "<tool_result name=\"image_gen\">\nGenerated image [IMAGE:{}]\n</tool_result>",
+            image_path.display()
+        ))];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert!(prepared.contains_images);
+        assert_eq!(prepared.messages.len(), 1);
+        assert_eq!(prepared.messages[0].role, "tool");
+
+        let (cleaned, refs) = parse_image_markers(&prepared.messages[0].content);
+        assert!(cleaned.contains("<tool_result name=\"image_gen\">"));
+        assert!(cleaned.contains("Generated image"));
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].starts_with("data:image/png;base64,"));
+    }
+
+    #[tokio::test]
     async fn prepare_messages_trims_excess_images_from_older_messages() {
         // 3 messages, each with 1 image — max is 2.
         // The oldest message's image should be stripped.
@@ -718,6 +753,22 @@ mod tests {
         // Newest user image kept
         let (_, refs2) = parse_image_markers(&trimmed[2].content);
         assert_eq!(refs2.len(), 1);
+    }
+
+    #[test]
+    fn trim_old_images_counts_tool_messages() {
+        let messages = vec![
+            ChatMessage::tool("[IMAGE:/tmp/tool-old.png]\nGenerated".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/user-new.png]\nNewest".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 1);
+        let (_, refs0) = parse_image_markers(&trimmed[0].content);
+        assert!(refs0.is_empty(), "oldest tool image should be stripped");
+        assert!(trimmed[0].content.contains("Generated"));
+
+        let (_, refs1) = parse_image_markers(&trimmed[1].content);
+        assert_eq!(refs1.len(), 1);
     }
 
     #[test]

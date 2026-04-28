@@ -1188,11 +1188,19 @@ fn xml_format_results_includes_status_and_output() {
 
 #[test]
 fn native_format_results_maps_tool_call_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let image_path = temp.path().join("generated.png");
+    std::fs::write(
+        &image_path,
+        [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+    )
+    .unwrap();
+
     let dispatcher = NativeToolDispatcher;
     let results = vec![
         ToolExecutionResult {
             name: "a".into(),
-            output: "out1".into(),
+            output: format!("File: {}", image_path.display()),
             success: true,
             tool_call_id: Some("tc-001".into()),
         },
@@ -1209,12 +1217,41 @@ fn native_format_results_maps_tool_call_ids() {
         ConversationMessage::ToolResults(r) => {
             assert_eq!(r.len(), 2);
             assert_eq!(r[0].tool_call_id, "tc-001");
-            assert_eq!(r[0].content, "out1");
+            assert!(r[0].content.contains("[IMAGE:"));
+            assert!(r[0].content.contains(&image_path.display().to_string()));
             assert_eq!(r[1].tool_call_id, "tc-002");
             assert_eq!(r[1].content, "out2");
         }
         _ => panic!("Expected ToolResults"),
     }
+}
+
+#[test]
+fn xml_format_results_wraps_local_image_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let image_path = temp.path().join("xml-generated.png");
+    std::fs::write(
+        &image_path,
+        [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+    )
+    .unwrap();
+
+    let dispatcher = XmlToolDispatcher;
+    let results = vec![ToolExecutionResult {
+        name: "shell".into(),
+        output: format!("Saved image to {}", image_path.display()),
+        success: true,
+        tool_call_id: None,
+    }];
+
+    let msg = dispatcher.format_results(&results);
+    let content = match msg {
+        ConversationMessage::Chat(c) => c.content,
+        _ => panic!("Expected Chat variant"),
+    };
+
+    assert!(content.contains("[IMAGE:"));
+    assert!(content.contains(&image_path.display().to_string()));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1253,11 +1290,19 @@ fn xml_dispatcher_converts_history_to_provider_messages() {
 
 #[test]
 fn native_dispatcher_converts_tool_results_to_tool_messages() {
+    let temp = tempfile::tempdir().unwrap();
+    let image_path = temp.path().join("history.png");
+    std::fs::write(
+        &image_path,
+        [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+    )
+    .unwrap();
+
     let dispatcher = NativeToolDispatcher;
     let history = vec![ConversationMessage::ToolResults(vec![
         ToolResultMessage {
             tool_call_id: "tc1".into(),
-            content: "output1".into(),
+            content: format!("Saved image to {}", image_path.display()),
         },
         ToolResultMessage {
             tool_call_id: "tc2".into(),
@@ -1269,6 +1314,12 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].role, "tool");
     assert_eq!(messages[1].role, "tool");
+    assert!(messages[0].content.contains("[IMAGE:"));
+    assert!(
+        messages[0]
+            .content
+            .contains(&image_path.display().to_string())
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

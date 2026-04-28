@@ -72,9 +72,9 @@ const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
 // History management moved to `super::history`.
 pub use super::history::{
-    emergency_history_trim, estimate_history_tokens, fast_trim_tool_results,
-    load_interactive_session_history, save_interactive_session_history, trim_history,
-    truncate_tool_result,
+    canonicalize_tool_result_media_markers, emergency_history_trim, estimate_history_tokens,
+    fast_trim_tool_results, load_interactive_session_history, save_interactive_session_history,
+    trim_history, truncate_tool_result,
 };
 
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -1871,7 +1871,8 @@ pub async fn run_tool_call_loop(
                     }
                 }
             }
-            let mut result_output = truncate_tool_result(&outcome.output, max_tool_result_chars);
+            let canonical_output = canonicalize_tool_result_media_markers(&outcome.output);
+            let mut result_output = truncate_tool_result(&canonical_output, max_tool_result_chars);
             // Append HMAC receipt to tool result when receipts are enabled (#4830)
             if let Some(ref receipt) = outcome.receipt {
                 tracing::debug!(tool = %tool_name, receipt = %receipt, "Tool receipt generated");
