@@ -704,18 +704,11 @@ pub async fn handle_map_key(
         }
     };
 
-    if created
-        && let Err(e) = persist_and_swap(&state, working).await
-    {
+    if created && let Err(e) = persist_and_swap(&state, working).await {
         return error_response(e);
     }
 
-    axum::Json(MapKeyResponse {
-        path,
-        key,
-        created,
-    })
-    .into_response()
+    axum::Json(MapKeyResponse { path, key, created }).into_response()
 }
 
 /// PATCH /api/config — apply a JSON Patch document atomically.

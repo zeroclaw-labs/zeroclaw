@@ -12,9 +12,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   ApiError,
+  createMapKey,
+  getCatalog,
+  getCatalogModels,
   getProp,
   listProps,
   patchConfig,
+  type CatalogProvider,
   type ConfigApiError,
   type ListResponseEntry,
   type PatchOp,
@@ -107,17 +111,24 @@ export default function Onboard() {
   const [saving, setSaving] = useState(false);
   const [fieldErrors, setFieldErrors] = useState<Record<string, ConfigApiError>>({});
   const [completed, setCompleted] = useState<Set<string>>(new Set());
+  const [catalog, setCatalog] = useState<CatalogProvider[]>([]);
+  const [providerToAdd, setProviderToAdd] = useState('');
+  const [adding, setAdding] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    // Fetch schema + persisted completion state in parallel.
+    // Fetch schema + completion state + provider catalog in parallel.
+    // Catalog backs the "+ Add provider" picker — same source as the CLI
+    // wizard (zeroclaw_providers::list_providers via /api/onboard/catalog).
     Promise.all([
       listProps(),
       getProp(COMPLETED_SECTIONS_PATH).catch(() => ({ value: '[]' })),
+      getCatalog().catch(() => ({ providers: [] })),
     ])
-      .then(([resp, completedResp]) => {
+      .then(([resp, completedResp, catalogResp]) => {
         if (cancelled) return;
+        setCatalog(catalogResp.providers);
         const grouped = groupBySection(resp.entries);
         setSections(grouped);
         // Seed draft with current display values from the schema.
@@ -277,6 +288,76 @@ export default function Onboard() {
               <code>GET /api/config/list</code>). Changes save atomically via{' '}
               <code>PATCH /api/config</code>.
             </p>
+
+            {/* "+ Add provider" picker on the providers section. Source is
+                the same /api/onboard/catalog the CLI wizard uses. Selecting
+                a provider POSTs /api/config/map-key, which instantiates a
+                default-valued [providers.models.<name>] block, then re-loads
+                so the new section's fields appear immediately. */}
+            {active.name === 'providers' && (
+              <div className="mb-6 rounded border border-gray-200 bg-gray-50 p-3">
+                <div className="mb-2 text-sm font-semibold text-gray-700">Add a provider</div>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={providerToAdd}
+                    onChange={(e) => setProviderToAdd(e.target.value)}
+                    disabled={adding}
+                    className="rounded border px-2 py-1 text-sm"
+                  >
+                    <option value="">— pick a provider —</option>
+                    {catalog.map((p) => (
+                      <option key={p.name} value={p.name}>
+                        {p.display_name}
+                        {p.local ? ' (local)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    disabled={!providerToAdd || adding}
+                    onClick={async () => {
+                      setAdding(true);
+                      try {
+                        await createMapKey('providers.models', providerToAdd);
+                        // Lazy-fetch model catalog for the chosen provider so
+                        // the model field below gets a populated dropdown.
+                        await getCatalogModels(providerToAdd).catch(() => null);
+                        // Reload section list — the new fields appear.
+                        const refreshed = await listProps();
+                        const grouped = groupBySection(refreshed.entries);
+                        setSections(grouped);
+                        const seed: Record<string, string> = { ...draft };
+                        for (const g of grouped) {
+                          for (const f of g.entries) {
+                            if (!(f.path in seed)) seed[f.path] = defaultInputValue(f);
+                          }
+                        }
+                        setDraft(seed);
+                        setProviderToAdd('');
+                      } catch (e) {
+                        if (e instanceof ApiError) {
+                          const env = e.envelope as ConfigApiError;
+                          setError(`[${env.code}] ${env.message}`);
+                        } else {
+                          setError(String(e instanceof Error ? e.message : e));
+                        }
+                      } finally {
+                        setAdding(false);
+                      }
+                    }}
+                    className="rounded bg-blue-600 px-3 py-1 text-sm text-white disabled:opacity-50"
+                  >
+                    {adding ? 'Adding…' : 'Add'}
+                  </button>
+                </div>
+                <p className="mt-2 text-xs text-gray-500">
+                  Provider list comes from the gateway's onboard catalog (same source as
+                  the CLI wizard). Pick one to instantiate{' '}
+                  <code>[providers.models.&lt;name&gt;]</code> with defaults; the new
+                  fields (api-key, model, etc.) appear in the form below.
+                </p>
+              </div>
+            )}
 
             <form
               className="space-y-4"

@@ -131,7 +131,6 @@ pub async fn handle_api_status(
     Json(body).into_response()
 }
 
-
 /// GET /api/tools — list registered tool specs
 pub async fn handle_api_tools(
     State(state): State<AppState>,
@@ -751,7 +750,6 @@ pub async fn handle_api_health(
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
-
 
 // ── Session API handlers ─────────────────────────────────────────
 
