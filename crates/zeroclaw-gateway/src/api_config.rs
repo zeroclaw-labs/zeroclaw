@@ -1328,8 +1328,17 @@ mod tests {
     }
 
     #[test]
-    fn map_prop_error_falls_back_to_validation() {
+    fn map_prop_error_classifies_type_mismatch() {
+        // The classifier (config::api_error::classify_validation_message) now
+        // matches "type mismatch" → ValueTypeMismatch; was ValidationFailed.
         let err = anyhow::anyhow!("type mismatch: expected u64");
+        let api_err = map_prop_error(err, "scheduler.max_concurrent");
+        assert_eq!(api_err.code, ConfigApiCode::ValueTypeMismatch);
+    }
+
+    #[test]
+    fn map_prop_error_falls_back_to_validation_on_unknown_message() {
+        let err = anyhow::anyhow!("some completely unrecognized validator message");
         let api_err = map_prop_error(err, "scheduler.max_concurrent");
         assert_eq!(api_err.code, ConfigApiCode::ValidationFailed);
     }
@@ -1445,6 +1454,61 @@ mod tests {
             raw.contains("# raised after Q3 backlog"),
             "expected comment in file, got:\n{raw}"
         );
+    }
+
+    #[test]
+    fn secret_response_only_carries_path_and_populated_flag() {
+        // Belt-and-braces: serialize a SecretResponse and assert the JSON
+        // shape carries neither a `value` field nor a length-leaking string.
+        // If anyone ever adds a field to SecretResponse, this test fires.
+        let r = SecretResponse {
+            path: "providers.models.ollama.api-key".into(),
+            populated: true,
+        };
+        let json = serde_json::to_value(&r).expect("serialize");
+        let obj = json.as_object().expect("object");
+        let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["path", "populated"], "SecretResponse must carry only path + populated");
+        assert!(!obj.contains_key("value"));
+        assert!(!obj.contains_key("length"));
+        assert!(!obj.contains_key("hash"));
+        assert!(!obj.contains_key("masked"));
+    }
+
+    #[test]
+    fn list_entry_for_secret_omits_value_field() {
+        let entry = ListEntry {
+            path: "providers.models.ollama.api-key".into(),
+            category: "providers".into(),
+            value: None,
+            populated: true,
+            is_secret: true,
+            onboard_section: Some("providers"),
+        };
+        let json = serde_json::to_value(&entry).expect("serialize");
+        let obj = json.as_object().expect("object");
+        // skip_serializing_if on `value` means it must be absent.
+        assert!(!obj.contains_key("value"), "secret list entry leaks `value` field");
+        // is_secret marker must be present so the dashboard can render it as locked.
+        assert_eq!(obj.get("is_secret"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(obj.get("populated"), Some(&serde_json::Value::Bool(true)));
+    }
+
+    #[test]
+    fn drift_entry_for_secret_omits_both_values() {
+        let entry = DriftEntry {
+            path: "providers.models.ollama.api-key".into(),
+            secret: true,
+            drifted: true,
+            in_memory_value: None,
+            on_disk_value: None,
+        };
+        let json = serde_json::to_value(&entry).expect("serialize");
+        let obj = json.as_object().expect("object");
+        assert!(!obj.contains_key("in_memory_value"), "secret drift entry leaks in_memory_value");
+        assert!(!obj.contains_key("on_disk_value"), "secret drift entry leaks on_disk_value");
+        assert_eq!(obj.get("secret"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(obj.get("drifted"), Some(&serde_json::Value::Bool(true)));
     }
 
     #[tokio::test]
