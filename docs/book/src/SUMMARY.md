@@ -28,6 +28,7 @@
 - [CLI](./reference/cli.md)
 - [Config](./reference/config.md)
 - [API (rustdoc)](./api.md)
+- [Gateway HTTP API](./gateway/api.md)
 
 # Model Providers
 
