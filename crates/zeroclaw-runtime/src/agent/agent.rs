@@ -868,7 +868,8 @@ impl Agent {
             .unwrap_or_default();
 
         if self.auto_save {
-            let _ = self
+            let store_start = std::time::Instant::now();
+            let store_result = self
                 .memory
                 .store(
                     "user_msg",
@@ -877,6 +878,12 @@ impl Agent {
                     self.memory_session_id.as_deref(),
                 )
                 .await;
+            self.observer.record_event(&ObserverEvent::MemoryStore {
+                category: MemoryCategory::Conversation.to_string(),
+                backend: self.memory.name().to_string(),
+                duration: store_start.elapsed(),
+                success: store_result.is_ok(),
+            });
         }
 
         let now = chrono::Local::now();
@@ -1049,7 +1056,8 @@ impl Agent {
             .unwrap_or_default();
 
         if self.auto_save {
-            let _ = self
+            let store_start = std::time::Instant::now();
+            let store_result = self
                 .memory
                 .store(
                     "user_msg",
@@ -1058,6 +1066,12 @@ impl Agent {
                     self.memory_session_id.as_deref(),
                 )
                 .await;
+            self.observer.record_event(&ObserverEvent::MemoryStore {
+                category: MemoryCategory::Conversation.to_string(),
+                backend: self.memory.name().to_string(),
+                duration: store_start.elapsed(),
+                success: store_result.is_ok(),
+            });
         }
 
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");

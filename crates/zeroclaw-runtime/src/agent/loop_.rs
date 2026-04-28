@@ -2576,7 +2576,8 @@ pub async fn run(
             && !zeroclaw_memory::should_skip_autosave_content(&effective_msg)
         {
             let user_key = autosave_memory_key("user_msg");
-            let _ = mem
+            let store_start = std::time::Instant::now();
+            let store_result = mem
                 .store(
                     &user_key,
                     &effective_msg,
@@ -2584,6 +2585,12 @@ pub async fn run(
                     memory_session_id.as_deref(),
                 )
                 .await;
+            observer.record_event(&ObserverEvent::MemoryStore {
+                category: MemoryCategory::Conversation.to_string(),
+                backend: mem.name().to_string(),
+                duration: store_start.elapsed(),
+                success: store_result.is_ok(),
+            });
         }
 
         // Inject memory + hardware RAG context into user message
@@ -2864,7 +2871,8 @@ pub async fn run(
                 && !zeroclaw_memory::should_skip_autosave_content(&effective_input)
             {
                 let user_key = autosave_memory_key("user_msg");
-                let _ = mem
+                let store_start = std::time::Instant::now();
+                let store_result = mem
                     .store(
                         &user_key,
                         &effective_input,
@@ -2872,6 +2880,12 @@ pub async fn run(
                         memory_session_id.as_deref(),
                     )
                     .await;
+                observer.record_event(&ObserverEvent::MemoryStore {
+                    category: MemoryCategory::Conversation.to_string(),
+                    backend: mem.name().to_string(),
+                    duration: store_start.elapsed(),
+                    success: store_result.is_ok(),
+                });
             }
 
             // Inject memory + hardware RAG context into user message
@@ -3028,7 +3042,8 @@ pub async fn run(
                                     config.agent.context_compression.clone(),
                                     config.agent.max_context_tokens,
                                 )
-                                .with_memory(mem.clone());
+                                .with_memory(mem.clone())
+                                .with_observer(observer.clone());
                             let error_msg = format!("{e}");
                             match compressor
                                 .compress_on_error(
@@ -3087,7 +3102,8 @@ pub async fn run(
                     config.agent.context_compression.clone(),
                     config.agent.max_context_tokens,
                 )
-                .with_memory(mem.clone());
+                .with_memory(mem.clone())
+                .with_observer(observer.clone());
                 match compressor
                     .compress_if_needed(&mut history, provider.as_ref(), &model_name)
                     .await
