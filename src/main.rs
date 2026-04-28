@@ -1508,13 +1508,12 @@ async fn main() -> Result<()> {
                     log_gateway_start(&host, port);
                     Box::pin(run_gateway_if_enabled(&host, port, config, None)).await
                 }
-                Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
-                    let port = config.gateway.port;
-                    let host = &config.gateway.host;
+                Some(zeroclaw::GatewayCommands::GetPaircode { new, port, host }) => {
+                    let (port, host) = resolve_gateway_addr(&config, port, host);
 
                     // Fetch live pairing code from running gateway
                     // If --new is specified, generate a fresh pairing code
-                    match fetch_paircode(host, port, new).await {
+                    match fetch_paircode(&host, port, new).await {
                         Ok(Some(code)) => {
                             println!("🔐 Gateway pairing is enabled.");
                             println!();
@@ -2638,10 +2637,10 @@ async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
 #[cfg(feature = "agent-runtime")]
 async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<String>> {
     let client = reqwest::Client::new();
+    let url = paircode_admin_url(host, port, new);
 
     let response = if new {
         // Generate a new pairing code via POST
-        let url = format!("http://{host}:{port}/admin/paircode/new");
         client
             .post(&url)
             .timeout(std::time::Duration::from_secs(5))
@@ -2649,7 +2648,6 @@ async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<Strin
             .await
     } else {
         // Get existing pairing code via GET
-        let url = format!("http://{host}:{port}/admin/paircode");
         client
             .get(&url)
             .timeout(std::time::Duration::from_secs(5))
@@ -2679,6 +2677,16 @@ async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<Strin
         .get("pairing_code")
         .and_then(|v| v.as_str())
         .map(String::from))
+}
+
+#[cfg(feature = "agent-runtime")]
+fn paircode_admin_url(host: &str, port: u16, new: bool) -> String {
+    let path = if new {
+        "/admin/paircode/new"
+    } else {
+        "/admin/paircode"
+    };
+    format!("http://{host}:{port}{path}")
 }
 
 // ─── Generic Pending OAuth Login ────────────────────────────────────────────
@@ -3512,6 +3520,46 @@ mod tests {
             Commands::Onboard { quick, .. } => assert!(quick),
             other => panic!("expected onboard command, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn gateway_get_paircode_cli_accepts_port_and_host_overrides() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "gateway",
+            "get-paircode",
+            "--new",
+            "--port",
+            "3001",
+            "--host",
+            "192.168.1.20",
+        ])
+        .expect("gateway get-paircode overrides should parse");
+
+        match cli.command {
+            Commands::Gateway {
+                gateway_command: Some(zeroclaw::GatewayCommands::GetPaircode { new, port, host }),
+            } => {
+                assert!(new);
+                assert_eq!(port, Some(3001));
+                assert_eq!(host.as_deref(), Some("192.168.1.20"));
+            }
+            other => panic!("expected gateway get-paircode command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_admin_url_targets_requested_instance() {
+        assert_eq!(
+            paircode_admin_url("127.0.0.1", 3001, false),
+            "http://127.0.0.1:3001/admin/paircode"
+        );
+        assert_eq!(
+            paircode_admin_url("127.0.0.1", 3001, true),
+            "http://127.0.0.1:3001/admin/paircode/new"
+        );
     }
 
     #[test]
