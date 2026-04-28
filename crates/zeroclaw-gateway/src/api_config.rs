@@ -391,39 +391,38 @@ async fn apply_comments(
     };
 
     for (path, comment) in annotations {
-        let segments: Vec<&str> = path.split('.').collect();
-        if segments.is_empty() {
-            continue;
-        }
-
-        if let Some(item) = walk_to_item_mut(doc.as_table_mut(), &segments) {
-            let decor = match item {
-                toml_edit::Item::Value(v) => v.decor_mut(),
-                toml_edit::Item::Table(t) => t.decor_mut(),
-                toml_edit::Item::ArrayOfTables(_) | toml_edit::Item::None => continue,
-            };
-            let new_prefix = build_comment_prefix(decor.prefix(), comment);
-            decor.set_prefix(new_prefix);
-        }
+        decorate_key(doc.as_table_mut(), path, comment);
     }
 
     tokio::fs::write(config_path, doc.to_string()).await?;
     Ok(())
 }
 
-/// Resolve a dotted path through the toml_edit table tree, returning a
-/// mutable reference to the resolved item. Returns `None` if any segment
-/// is missing or the path traverses through a non-table.
-fn walk_to_item_mut<'a>(
-    table: &'a mut toml_edit::Table,
-    segments: &[&str],
-) -> Option<&'a mut toml_edit::Item> {
-    let (last, rest) = segments.split_last()?;
-    let mut cursor: &mut toml_edit::Table = table;
-    for seg in rest {
-        cursor = cursor.get_mut(seg)?.as_table_mut()?;
+/// Walk to the leaf key for `dotted` and decorate it with `# {comment}\n`,
+/// preserving any non-comment whitespace already in the prefix. Empty comment
+/// strips comment lines from the existing prefix.
+fn decorate_key(root: &mut toml_edit::Table, dotted: &str, comment: &str) {
+    let segments: Vec<&str> = dotted.split('.').collect();
+    let (last, rest) = match segments.split_last() {
+        Some(s) => s,
+        None => return,
+    };
+    fn walk<'a>(table: &'a mut toml_edit::Table, segs: &[&str]) -> Option<&'a mut toml_edit::Table> {
+        let mut cursor = table;
+        for seg in segs {
+            cursor = cursor.get_mut(seg)?.as_table_mut()?;
+        }
+        Some(cursor)
     }
-    cursor.get_mut(last)
+    let table = match walk(root, rest) {
+        Some(t) => t,
+        None => return,
+    };
+    if let Some(mut key) = table.key_mut(last) {
+        let decor = key.leaf_decor_mut();
+        let new_prefix = build_comment_prefix(decor.prefix(), comment);
+        decor.set_prefix(new_prefix);
+    }
 }
 
 /// Build the new leading decor for a leaf, applying the `# {comment}\n` line
@@ -1364,4 +1363,120 @@ mod tests {
         assert_eq!(json_pointer_to_dotted(""), "");
         assert_eq!(json_pointer_to_dotted("/"), "");
     }
+
+    // ── Integration-flavored tests: drift detection + comment writing ──
+
+    use std::path::PathBuf;
+
+    fn temp_config_path() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        (tmp, path)
+    }
+
+    #[tokio::test]
+    async fn compute_drift_returns_empty_when_in_memory_matches_disk() {
+        let (_tmp, path) = temp_config_path();
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.config_path = path.clone();
+        // Write the in-memory state to disk first so they agree by definition.
+        cfg.save().await.expect("save");
+
+        let drift = compute_drift(&cfg).await;
+        assert!(
+            drift.is_empty(),
+            "expected no drift right after save, got {drift:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_drift_surfaces_mismatched_non_secret_field() {
+        let (_tmp, path) = temp_config_path();
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.config_path = path.clone();
+        cfg.save().await.expect("initial save");
+
+        // Mutate the in-memory config without saving.
+        cfg.set_prop("gateway.host", "10.0.0.1")
+            .expect("set_prop");
+
+        let drift = compute_drift(&cfg).await;
+        let entry = drift
+            .iter()
+            .find(|d| d.path == "gateway.host")
+            .expect("expected gateway.host in drift summary");
+        assert!(!entry.secret);
+        assert!(entry.drifted);
+        assert!(entry.in_memory_value.is_some());
+        assert!(entry.on_disk_value.is_some());
+    }
+
+    #[tokio::test]
+    async fn compute_drift_returns_empty_when_no_disk_file() {
+        let (_tmp, path) = temp_config_path();
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.config_path = path.clone();
+        // Don't save — file does not exist.
+        let drift = compute_drift(&cfg).await;
+        assert!(drift.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_comments_writes_decoration_to_existing_value() {
+        let (_tmp, path) = temp_config_path();
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.config_path = path.clone();
+        cfg.set_prop("gateway.host", "10.0.0.5")
+            .expect("set_prop");
+        cfg.save().await.expect("save");
+
+        apply_comments(
+            &path,
+            &[(
+                "gateway.host".into(),
+                "raised after Q3 backlog".into(),
+            )],
+        )
+        .await
+        .expect("apply_comments");
+
+        let raw = tokio::fs::read_to_string(&path).await.expect("read back");
+        assert!(
+            raw.contains("# raised after Q3 backlog"),
+            "expected comment in file, got:\n{raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_comments_clears_existing_comment_when_passed_empty() {
+        let (_tmp, path) = temp_config_path();
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.config_path = path.clone();
+        cfg.set_prop("gateway.host", "10.0.0.5")
+            .expect("set_prop");
+        cfg.save().await.expect("save");
+
+        apply_comments(
+            &path,
+            &[(
+                "gateway.host".into(),
+                "first reason".into(),
+            )],
+        )
+        .await
+        .expect("apply first comment");
+        apply_comments(
+            &path,
+            &[("gateway.host".into(), String::new())],
+        )
+        .await
+        .expect("apply empty");
+
+        let raw = tokio::fs::read_to_string(&path).await.expect("read back");
+        assert!(
+            !raw.contains("first reason"),
+            "expected the prior comment to be cleared, got:\n{raw}"
+        );
+    }
+
 }

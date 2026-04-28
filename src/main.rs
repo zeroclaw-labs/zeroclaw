@@ -63,19 +63,19 @@ async fn apply_comment_inline(
         Some(s) => s,
         None => return Ok(()),
     };
-    let mut cursor: &mut toml_edit::Table = doc.as_table_mut();
-    for seg in rest {
-        cursor = match cursor.get_mut(seg).and_then(|i| i.as_table_mut()) {
-            Some(t) => t,
-            None => return Ok(()),
-        };
+    fn walk<'a>(table: &'a mut toml_edit::Table, segs: &[&str]) -> Option<&'a mut toml_edit::Table> {
+        let mut cursor = table;
+        for seg in segs {
+            cursor = cursor.get_mut(seg)?.as_table_mut()?;
+        }
+        Some(cursor)
     }
-    if let Some(item) = cursor.get_mut(last) {
-        let decor = match item {
-            toml_edit::Item::Value(v) => v.decor_mut(),
-            toml_edit::Item::Table(t) => t.decor_mut(),
-            _ => return Ok(()),
-        };
+    let table = match walk(doc.as_table_mut(), rest) {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    if let Some(mut key) = table.key_mut(last) {
+        let decor = key.leaf_decor_mut();
         let prev = decor.prefix().and_then(|r| r.as_str()).unwrap_or("");
         let mut kept = String::new();
         for line in prev.split_inclusive('\n') {
