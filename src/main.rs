@@ -2286,13 +2286,16 @@ async fn main() -> Result<()> {
                             }
                         }
                         Err(e) => {
+                            // Classify the anyhow string into a stable code so
+                            // the CLI's --json envelope matches the HTTP shape.
+                            // Same single-source-of-truth helper the gateway
+                            // uses; never hardcode a code at the call site.
+                            let api_err = zeroclaw_config::api_error::ConfigApiError::from_validation(
+                                anyhow::anyhow!("{e}"),
+                            )
+                            .with_path(&path);
                             if json {
-                                let envelope = serde_json::json!({
-                                    "code": "path_not_found",
-                                    "message": e.to_string(),
-                                    "path": path,
-                                });
-                                eprintln!("{}", serde_json::to_string_pretty(&envelope)?);
+                                eprintln!("{}", serde_json::to_string_pretty(&api_err)?);
                                 std::process::exit(1);
                             }
                             anyhow::bail!("{e}");
