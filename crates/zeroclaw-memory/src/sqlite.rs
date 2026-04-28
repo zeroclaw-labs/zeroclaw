@@ -947,14 +947,17 @@ impl Memory for SqliteMemory {
             .unwrap_or(false)
     }
 
-    /// Safe reindex: rebuild FTS5 + embeddings with rollback on failure.
+    /// Rebuild backend indexes: FTS tables and missing embedding vectors.
     ///
-    /// Fills in vectors for every row with `embedding IS NULL`, using the
-    /// configured embedder. Intended to be run after bulk writes that
-    /// didn't go through `store()` (e.g. `zeroclaw migrate openclaw`,
-    /// which uses `NoopEmbedding` for speed). Returns the number of rows
-    /// that received a new embedding; returns 0 if the embedder has no
-    /// dimensions (Noop) or if everything is already embedded.
+    /// Step 1 rebuilds the FTS5 index unconditionally (idempotent, cheap).
+    /// Step 2 fills in vectors for every row with `embedding IS NULL` using
+    /// the configured embedder. If interrupted, re-running is safe — only
+    /// rows still missing a vector are re-processed. Intended to be run
+    /// after bulk writes that didn't go through `store()` (e.g. `zeroclaw
+    /// migrate openclaw`, which uses `NoopEmbedding` for speed). Returns
+    /// the number of rows that received a new embedding; returns 0 if the
+    /// embedder has no dimensions (Noop) or if everything is already
+    /// embedded.
     async fn reindex(&self) -> anyhow::Result<usize> {
         // Step 1: Rebuild FTS5 (always safe, cheap)
         {
