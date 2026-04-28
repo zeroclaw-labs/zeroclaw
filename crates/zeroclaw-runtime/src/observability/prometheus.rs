@@ -360,7 +360,10 @@ impl Observer for PrometheusObserver {
             | ObserverEvent::TurnComplete
             | ObserverEvent::LlmRequest { .. }
             | ObserverEvent::DeploymentStarted { .. }
-            | ObserverEvent::RecoveryCompleted { .. } => {}
+            | ObserverEvent::RecoveryCompleted { .. }
+            | ObserverEvent::MemoryRecall { .. }
+            | ObserverEvent::MemoryStore { .. }
+            | ObserverEvent::RagRetrieve { .. } => {}
             ObserverEvent::ToolCall {
                 tool,
                 duration,
@@ -461,6 +464,9 @@ impl Observer for PrometheusObserver {
                     self.deployment_failure_rate.set(f as f64 / total as f64);
                 }
             }
+            // `ObserverEvent` is `#[non_exhaustive]` — silently ignore any
+            // future variant added by upstream `zeroclaw-api`.
+            _ => {}
         }
     }
 

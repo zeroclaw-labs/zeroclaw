@@ -6,7 +6,13 @@ use std::time::Duration;
 /// aggregate, or forward to external monitoring systems. Events carry
 /// just enough context for tracing and diagnostics without exposing
 /// sensitive prompt or response content.
+///
+/// Marked `#[non_exhaustive]` so out-of-tree observer implementations
+/// degrade gracefully when new variants are added in future minor
+/// releases — they must include a wildcard arm in their `match`
+/// expressions and will simply ignore unknown event kinds.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ObserverEvent {
     /// The agent orchestration loop has started a new session.
     AgentStart { provider: String, model: String },
@@ -74,6 +80,52 @@ pub enum ObserverEvent {
         /// in trace viewers. Credentials are scrubbed before this field is
         /// emitted.
         result: Option<String>,
+    },
+    /// A memory recall (search) operation has completed.
+    ///
+    /// Emitted at the runtime boundary after a hybrid-search query against
+    /// the brain DB. Carries an optional opaque `query_summary` for
+    /// diagnostics — never the raw user query (the runtime applies
+    /// `scrub_credentials` and truncates to 200 chars before emission).
+    MemoryRecall {
+        /// Scrubbed and truncated query summary. `None` when the caller has
+        /// no meaningful query to record (e.g., session-scoped fetches).
+        query_summary: Option<String>,
+        duration: Duration,
+        /// Number of `MemoryEntry` rows returned by the recall call.
+        num_entries: usize,
+        /// Bounded backend identifier (e.g. `"sqlite"`, `"qdrant"`, `"none"`).
+        backend: String,
+        success: bool,
+    },
+    /// A memory store (write) operation has completed.
+    ///
+    /// Emitted after persisting a memory entry. Carries only bounded
+    /// fields — the raw memory `key` is intentionally omitted because
+    /// keys can encode high-cardinality identifiers (UUIDs, phone
+    /// numbers, message timestamps) that would blow up Prometheus label
+    /// series.
+    MemoryStore {
+        /// Memory category (`"core"`, `"daily"`, `"conversation"`, etc.) —
+        /// bounded set, safe to use as a Prometheus label.
+        category: String,
+        /// Bounded backend identifier (e.g. `"sqlite"`, `"qdrant"`).
+        backend: String,
+        duration: Duration,
+        success: bool,
+    },
+    /// A RAG retrieval pass has completed.
+    ///
+    /// Emitted after vector + keyword retrieval against the hardware
+    /// datasheet index. Reports cardinalities only; carries an optional
+    /// scrubbed-and-truncated query summary on the same terms as
+    /// [`MemoryRecall`]. Has no `success` field because the underlying
+    /// `rag.retrieve` call is synchronous and infallible.
+    RagRetrieve {
+        query_summary: Option<String>,
+        duration: Duration,
+        num_chunks: usize,
+        num_boards: usize,
     },
     /// The agent produced a final answer for the current user message.
     TurnComplete,
@@ -285,6 +337,33 @@ mod tests {
 
         assert!(matches!(cloned_event, ObserverEvent::ToolCall { .. }));
         assert!(matches!(cloned_metric, ObserverMetric::RequestLatency(_)));
+    }
+
+    #[test]
+    fn memory_event_variants_are_cloneable() {
+        let recall = ObserverEvent::MemoryRecall {
+            query_summary: Some("user asked about coffee orders".into()),
+            duration: Duration::from_millis(40),
+            num_entries: 3,
+            backend: "sqlite".into(),
+            success: true,
+        };
+        let store = ObserverEvent::MemoryStore {
+            category: "conversation".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(8),
+            success: true,
+        };
+        let rag = ObserverEvent::RagRetrieve {
+            query_summary: None,
+            duration: Duration::from_millis(120),
+            num_chunks: 5,
+            num_boards: 2,
+        };
+
+        assert!(matches!(recall.clone(), ObserverEvent::MemoryRecall { .. }));
+        assert!(matches!(store.clone(), ObserverEvent::MemoryStore { .. }));
+        assert!(matches!(rag.clone(), ObserverEvent::RagRetrieve { .. }));
     }
 
     #[test]

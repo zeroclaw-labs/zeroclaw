@@ -225,7 +225,14 @@ impl Observer for OtelObserver {
             | ObserverEvent::ToolCallStart { .. }
             | ObserverEvent::TurnComplete
             | ObserverEvent::CacheHit { .. }
-            | ObserverEvent::CacheMiss { .. } => {}
+            | ObserverEvent::CacheMiss { .. }
+            | ObserverEvent::MemoryRecall { .. }
+            | ObserverEvent::MemoryStore { .. }
+            | ObserverEvent::RagRetrieve { .. } => {
+                // Full implementations land in Unit 2 (gen_ai.* attrs +
+                // metric instruments). Unit 1 keeps OtelObserver compiling
+                // without observable behavior change.
+            }
             ObserverEvent::LlmResponse {
                 provider,
                 model,
@@ -479,6 +486,9 @@ impl Observer for OtelObserver {
             | ObserverEvent::RecoveryCompleted { .. } => {
                 // DORA deployment events: OTel pass-through not yet implemented.
             }
+            // `ObserverEvent` is `#[non_exhaustive]` — silently ignore any
+            // future variant added by upstream `zeroclaw-api`.
+            _ => {}
         }
     }
 
