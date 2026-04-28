@@ -79,8 +79,10 @@ pub fn make_prop_field(
     is_secret: bool,
     enum_variants: Option<fn() -> Vec<String>>,
     description: &'static str,
+    onboard_section: Option<&'static str>,
+    derived_from_secret: bool,
 ) -> PropFieldInfo {
-    let display_value = if is_secret {
+    let display_value = if is_secret || derived_from_secret {
         match table.and_then(|t| t.get(serde_name)) {
             Some(toml::Value::String(s)) if !s.is_empty() => "****".to_string(),
             Some(toml::Value::Array(arr)) if !arr.is_empty() => {
@@ -100,6 +102,8 @@ pub fn make_prop_field(
         is_secret,
         enum_variants,
         description,
+        onboard_section,
+        derived_from_secret,
     }
 }
 

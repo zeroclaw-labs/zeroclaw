@@ -79,6 +79,15 @@ pub struct PropFieldInfo {
     /// when the field has no doc comment. Onboard uses this as human-readable
     /// prompt text instead of the raw kebab-case field name.
     pub description: &'static str,
+    /// Optional onboard section binding (`#[onboard_section = "providers"]`).
+    /// `None` for fields not surfaced by the onboarding wizard.
+    /// Web onboarding uses this to group fields into per-section forms;
+    /// schemars emits it as `x-zeroclaw-section` for client-side form generation.
+    pub onboard_section: Option<&'static str>,
+    /// Whether this field's value is derived from a secret (`#[derived_from_secret]`).
+    /// Subject to the same write-only / no-readback rules as `#[secret]`.
+    /// Reserved for future schema additions; currently no fields are derived.
+    pub derived_from_secret: bool,
 }
 
 impl PropFieldInfo {
