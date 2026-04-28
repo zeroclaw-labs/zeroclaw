@@ -22,7 +22,8 @@ Build with `--features hardware` to include Uno Q support.
 ## Prerequisites
 
 - Arduino Uno Q with WiFi configured
-- Arduino App Lab installed on your Mac (for initial setup and deployment)
+- Arduino App Lab installed on your computer (for initial board setup)
+- `arduino-app-cli` available on the Uno Q (pre-installed with the board’s Debian image, used for Bridge deployment)
 - API key for LLM (OpenRouter, etc.)
 
 ---
@@ -70,6 +71,8 @@ git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 
 # Build (takes ~15–30 min on Uno Q)
+# The Uno Q has 2GB RAM. To avoid an out-of-memory kill, limit parallelism:
+export CARGO_BUILD_JOBS=1
 cargo build --release --features hardware
 
 # Install
@@ -138,7 +141,7 @@ ZeroClaw includes the Bridge app and setup command.
 
 ### 5.1 Deploy Bridge App
 
-**From your Mac** (with zeroclaw repo):
+**From your computer** (with zeroclaw repo):
 ```bash
 zeroclaw peripheral setup-uno-q --host 192.168.0.48
 ```
@@ -173,11 +176,14 @@ Now when you message your Telegram bot *"Turn on the LED"* or *"Set pin 13 high"
 | 3 | `curl -sSf https://sh.rustup.rs \| sh -s -- -y && source ~/.cargo/env` |
 | 4 | `sudo apt-get install -y pkg-config libssl-dev` |
 | 5 | `git clone https://github.com/zeroclaw-labs/zeroclaw.git && cd zeroclaw` |
-| 6 | `cargo build --release --features hardware` |
+| 6 | `export CARGO_BUILD_JOBS=1 && cargo build --release --features hardware` |
 | 7 | `zeroclaw onboard --api-key KEY --provider openrouter` |
-| 8 | `zeroclaw config set channels.telegram.bot-token <TOKEN>` |
+| 8 | `zeroclaw channel setup telegram` (or `zeroclaw config set …`) |
 | 9 | `zeroclaw daemon --host 127.0.0.1 --port 42617` |
 | 10 | Message your Telegram bot — it responds |
+| 11 | `zeroclaw peripheral setup-uno-q` (deploys Bridge) |
+| 12 | Add `[peripherals]` block with `board = "arduino-uno-q"` to `config.toml` |
+| 13 | Restart daemon (`zeroclaw daemon …`) — GPIO commands now work |
 
 ---
 
