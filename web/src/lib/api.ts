@@ -298,6 +298,96 @@ export function getOpenApiSchema(): Promise<unknown> {
   return apiFetch<unknown>('/api/openapi.json');
 }
 
+// ── Config schema descriptions ───────────────────────────────────────
+//
+// `OPTIONS /api/config` returns the schemars-derived JSON Schema for the
+// whole `Config` type, with every `///` doc comment surfaced as a
+// `description` property. We fetch it once per session, walk it for any
+// dotted path (kebab segments, snake-cased to match Rust field names),
+// and surface the description as form helper text — no widening of the
+// per-field list endpoint, no per-field round trips.
+
+type JsonSchema = Record<string, unknown> | undefined;
+
+let configSchemaCache: Promise<JsonSchema> | null = null;
+
+export function fetchConfigSchema(): Promise<JsonSchema> {
+  if (!configSchemaCache) {
+    configSchemaCache = apiFetch<JsonSchema>('/api/config', { method: 'OPTIONS' })
+      .catch(() => undefined);
+  }
+  return configSchemaCache;
+}
+
+function resolveRef(node: unknown, root: unknown): unknown {
+  if (!node || typeof node !== 'object') return node;
+  const ref = (node as { $ref?: unknown }).$ref;
+  if (typeof ref !== 'string' || !ref.startsWith('#/')) return node;
+  let target: unknown = root;
+  for (const seg of ref.slice(2).split('/')) {
+    if (target && typeof target === 'object') target = (target as Record<string, unknown>)[seg];
+    else return node;
+  }
+  return target ?? node;
+}
+
+// `Option<T>` serializes as `{ anyOf: [<T schema>, { type: "null" }] }`.
+// Take the non-null branch so traversal can dive into the inner type.
+function unwrapOptional(node: unknown): unknown {
+  if (!node || typeof node !== 'object') return node;
+  const anyOf = (node as { anyOf?: unknown[] }).anyOf;
+  if (!Array.isArray(anyOf)) return node;
+  const nonNull = anyOf.find((b) => {
+    if (!b || typeof b !== 'object') return false;
+    const t = (b as { type?: unknown }).type;
+    return t !== 'null' && !(Array.isArray(t) && t.includes('null') && t.length === 1);
+  });
+  return nonNull ?? node;
+}
+
+// Repeatedly resolve `$ref` and unwrap `Option<T>` until neither applies.
+// Idempotent on plain object/leaf nodes. Bounded by a hop limit to guard
+// against pathological self-refs in a hand-edited schema.
+function resolveAndUnwrap(node: unknown, root: unknown): unknown {
+  let cur = node;
+  for (let i = 0; i < 8; i++) {
+    const next = unwrapOptional(resolveRef(cur, root));
+    if (next === cur) return cur;
+    cur = next;
+  }
+  return cur;
+}
+
+export function descriptionForPath(schema: JsonSchema, kebabPath: string): string | null {
+  if (!schema) return null;
+  let cur: unknown = schema;
+  let last: unknown = null;
+  for (const seg of kebabPath.split('.')) {
+    cur = resolveAndUnwrap(cur, schema);
+    if (!cur || typeof cur !== 'object') return null;
+    const snake = seg.replace(/-/g, '_');
+    const props = (cur as { properties?: Record<string, unknown> }).properties;
+    const additional = (cur as { additionalProperties?: unknown }).additionalProperties;
+    if (props && Object.prototype.hasOwnProperty.call(props, snake)) {
+      last = props[snake];
+    } else if (additional && typeof additional === 'object') {
+      // `HashMap<String, T>` parent: current segment is a user-supplied
+      // map key (e.g. provider name); dive into the value schema.
+      last = additional;
+    } else {
+      return null;
+    }
+    cur = last;
+  }
+  // Wrapper carries the field's own `///` doc comment; the resolved
+  // type's description is a fallback for fields that ref a typed config.
+  const wrapDesc = (last as { description?: unknown } | null)?.description;
+  if (typeof wrapDesc === 'string' && wrapDesc.length > 0) return wrapDesc;
+  const resolved = resolveAndUnwrap(last, schema) as { description?: unknown } | null;
+  const innerDesc = resolved?.description;
+  return typeof innerDesc === 'string' && innerDesc.length > 0 ? innerDesc : null;
+}
+
 // ── Templates + map-key creation (issue #6175) ───────────────────────
 
 /**

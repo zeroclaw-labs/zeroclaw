@@ -23,6 +23,8 @@ import { List as ListIcon, Plus, Save, Trash2, Type as TypeIcon } from 'lucide-r
 import {
   ApiError,
   deleteProp,
+  descriptionForPath,
+  fetchConfigSchema,
   getCatalogModels,
   listProps,
   patchConfig,
@@ -156,6 +158,18 @@ export default function FieldForm({ prefix, onSaved, showDelete = true, title }:
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [drifted, setDrifted] = useState<DriftEntry[]>([]);
+  const [schema, setSchema] = useState<Record<string, unknown> | undefined>(undefined);
+
+  // Schema is whole-Config and ETag-cached server-side; fetch once per
+  // session so every form row can resolve its `///` doc-comment helper
+  // text via descriptionForPath without per-field round trips.
+  useEffect(() => {
+    let cancelled = false;
+    void fetchConfigSchema().then((s) => {
+      if (!cancelled) setSchema(s);
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   const reload = async () => {
     setLoading(true);
@@ -352,6 +366,7 @@ export default function FieldForm({ prefix, onSaved, showDelete = true, title }:
               error={fieldErrors[f.path]}
               onDelete={showDelete ? () => handleDelete(f.path) : undefined}
               drift={drifted.find((d) => d.path === f.path) ?? null}
+              description={descriptionForPath(schema, f.path)}
             />
           ))}
         </form>
@@ -415,9 +430,11 @@ interface FieldRowProps {
   onDelete?: () => void;
   /** Drift entry for this path (in-memory ≠ on-disk). `null` when no drift. */
   drift: DriftEntry | null;
+  /** `///` doc comment resolved from the cached JSON Schema for this path. */
+  description: string | null;
 }
 
-function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onDelete, drift }: FieldRowProps) {
+function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onDelete, drift, description }: FieldRowProps) {
   const renderer = rendererFor(entry);
   const [providerModels, setProviderModels] = useState<string[] | null>(null);
   const [modelsFetchFailed, setModelsFetchFailed] = useState(false);
@@ -465,6 +482,14 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
               </span>
             )}
           </label>
+          {description && (
+            <p
+              className="text-xs mt-0.5"
+              style={{ color: 'var(--pc-text-secondary)' }}
+            >
+              {description}
+            </p>
+          )}
           <code
             className="block text-[10px] mt-0.5 break-all"
             style={{ color: 'var(--pc-text-faint)', opacity: 0.55 }}
