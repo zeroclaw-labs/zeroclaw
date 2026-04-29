@@ -11,6 +11,18 @@ pub struct OpenAiProvider {
     base_url: String,
     credential: Option<String>,
     max_tokens: Option<u32>,
+    /// Explicit override for Anthropic-style `cache_control` markers.
+    ///
+    /// - `None` (default) → auto-detect per call from model name. Marks
+    ///   are added when `model_supports_prompt_caching(model)` is true,
+    ///   i.e. `bedrock/*anthropic*`, `anthropic/*`, `claude-*`. Other
+    ///   models are sent on the legacy plain-string content shape so
+    ///   non-Anthropic backends don't reject the structured form.
+    /// - `Some(true)` → always mark.
+    /// - `Some(false)` → never mark, even for Anthropic.
+    ///
+    /// Set via `with_prompt_caching(...)` from the provider factory.
+    prompt_caching_override: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -25,7 +37,71 @@ struct ChatRequest {
 #[derive(Debug, Serialize)]
 struct Message {
     role: String,
-    content: String,
+    content: MessageContent,
+}
+
+/// `messages[*].content` accepts either a plain string (the OpenAI
+/// classic shape) OR a structured array of content parts (the
+/// Anthropic-style shape that LiteLLM passes through, and the only
+/// shape that supports `cache_control`). `untagged` lets serde pick the
+/// right wire form per-message at serialize time.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl From<&str> for MessageContent {
+    fn from(s: &str) -> Self {
+        MessageContent::Text(s.to_string())
+    }
+}
+
+impl From<String> for MessageContent {
+    fn from(s: String) -> Self {
+        MessageContent::Text(s)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ContentPart {
+    #[serde(rename = "type")]
+    kind: String,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+impl CacheControl {
+    fn ephemeral() -> Self {
+        Self {
+            kind: "ephemeral".to_string(),
+        }
+    }
+}
+
+impl ContentPart {
+    fn text(text: impl Into<String>) -> Self {
+        Self {
+            kind: "text".to_string(),
+            text: text.into(),
+            cache_control: None,
+        }
+    }
+    fn cached_text(text: impl Into<String>) -> Self {
+        Self {
+            kind: "text".to_string(),
+            text: text.into(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,7 +149,7 @@ struct NativeChatRequest {
 struct NativeMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<MessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,6 +165,11 @@ struct NativeToolSpec {
     #[serde(rename = "type")]
     kind: String,
     function: NativeToolFunctionSpec,
+    /// Anthropic-style cache breakpoint at the tool level. Set on the LAST
+    /// tool spec to make Anthropic cache the entire tools block. LiteLLM
+    /// passes this through to Bedrock-Anthropic Converse.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -189,6 +270,7 @@ impl OpenAiProvider {
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             credential: credential.map(ToString::to_string),
             max_tokens: None,
+            prompt_caching_override: None,
         }
     }
 
@@ -196,6 +278,34 @@ impl OpenAiProvider {
     pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
         self.max_tokens = max_tokens;
         self
+    }
+
+    /// Pin Anthropic-style prompt caching to an explicit value, overriding
+    /// the auto-detect-from-model default. Use sparingly: most callers want
+    /// the auto path so the same provider instance can serve mixed
+    /// Anthropic / non-Anthropic models without double-config.
+    pub fn with_prompt_caching(mut self, enabled: bool) -> Self {
+        self.prompt_caching_override = Some(enabled);
+        self
+    }
+
+    /// Heuristic detector for "this model resolves to an Anthropic Claude
+    /// backend that supports prompt caching". Used at chat-call time so
+    /// the same provider instance can correctly handle Anthropic routes
+    /// (mark cache_control) and non-Anthropic routes (legacy shape) on
+    /// the same LiteLLM proxy.
+    pub fn model_supports_prompt_caching(model: &str) -> bool {
+        let m = model.to_ascii_lowercase();
+        m.starts_with("anthropic/")
+            || m.starts_with("bedrock/") && (m.contains("anthropic") || m.contains("claude"))
+            || m.contains("claude-")
+    }
+
+    /// Decide per-call whether to emit Anthropic cache_control markers.
+    /// Explicit override wins; otherwise falls back to model name detection.
+    fn caching_enabled_for(&self, model: &str) -> bool {
+        self.prompt_caching_override
+            .unwrap_or_else(|| Self::model_supports_prompt_caching(model))
     }
 
     /// Adjust temperature for models that have specific requirements.
@@ -230,9 +340,12 @@ impl OpenAiProvider {
         }
     }
 
-    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
+    fn convert_tools(
+        tools: Option<&[ToolSpec]>,
+        enable_caching: bool,
+    ) -> Option<Vec<NativeToolSpec>> {
         tools.map(|items| {
-            items
+            let mut converted: Vec<NativeToolSpec> = items
                 .iter()
                 .map(|tool| NativeToolSpec {
                     kind: "function".to_string(),
@@ -241,83 +354,111 @@ impl OpenAiProvider {
                         description: tool.description.clone(),
                         parameters: tool.parameters.clone(),
                     },
+                    cache_control: None,
                 })
-                .collect()
+                .collect();
+            // Anthropic prompt caching rule: marking cache_control on the
+            // LAST tool spec causes the entire tools block to be cached.
+            // This is the cheapest way to cache the (typically very large
+            // and very stable) tool catalog. We only do this when caching
+            // is on AND there's at least one tool.
+            if enable_caching {
+                if let Some(last) = converted.last_mut() {
+                    last.cache_control = Some(CacheControl::ephemeral());
+                }
+            }
+            converted
         })
     }
 
-    fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
-        messages
-            .iter()
-            .map(|m| {
-                if m.role == "assistant" {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content) {
-                        if let Some(tool_calls_value) = value.get("tool_calls") {
-                            if let Ok(parsed_calls) =
-                                serde_json::from_value::<Vec<ProviderToolCall>>(
-                                    tool_calls_value.clone(),
-                                )
-                            {
-                                let tool_calls = parsed_calls
-                                    .into_iter()
-                                    .map(|tc| NativeToolCall {
-                                        id: Some(tc.id),
-                                        kind: Some("function".to_string()),
-                                        function: NativeFunctionCall {
-                                            name: tc.name,
-                                            arguments: tc.arguments,
-                                        },
-                                    })
-                                    .collect::<Vec<_>>();
-                                let content = value
-                                    .get("content")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(ToString::to_string);
-                                let reasoning_content = value
-                                    .get("reasoning_content")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(ToString::to_string);
-                                return NativeMessage {
-                                    role: "assistant".to_string(),
-                                    content,
-                                    tool_call_id: None,
-                                    tool_calls: Some(tool_calls),
-                                    reasoning_content,
-                                };
+    fn convert_messages(messages: &[ChatMessage], enable_caching: bool) -> Vec<NativeMessage> {
+        let mut converted: Vec<NativeMessage> =
+            messages
+                .iter()
+                .map(|m| {
+                    if m.role == "assistant" {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content) {
+                            if let Some(tool_calls_value) = value.get("tool_calls") {
+                                if let Ok(parsed_calls) =
+                                    serde_json::from_value::<Vec<ProviderToolCall>>(
+                                        tool_calls_value.clone(),
+                                    )
+                                {
+                                    let tool_calls = parsed_calls
+                                        .into_iter()
+                                        .map(|tc| NativeToolCall {
+                                            id: Some(tc.id),
+                                            kind: Some("function".to_string()),
+                                            function: NativeFunctionCall {
+                                                name: tc.name,
+                                                arguments: tc.arguments,
+                                            },
+                                        })
+                                        .collect::<Vec<_>>();
+                                    let content = value
+                                        .get("content")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(|s| MessageContent::Text(s.to_string()));
+                                    let reasoning_content = value
+                                        .get("reasoning_content")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(ToString::to_string);
+                                    return NativeMessage {
+                                        role: "assistant".to_string(),
+                                        content,
+                                        tool_call_id: None,
+                                        tool_calls: Some(tool_calls),
+                                        reasoning_content,
+                                    };
+                                }
                             }
                         }
                     }
-                }
 
-                if m.role == "tool" {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content) {
-                        let tool_call_id = value
-                            .get("tool_call_id")
-                            .and_then(serde_json::Value::as_str)
-                            .map(ToString::to_string);
-                        let content = value
-                            .get("content")
-                            .and_then(serde_json::Value::as_str)
-                            .map(ToString::to_string);
-                        return NativeMessage {
-                            role: "tool".to_string(),
-                            content,
-                            tool_call_id,
-                            tool_calls: None,
-                            reasoning_content: None,
-                        };
+                    if m.role == "tool" {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content) {
+                            let tool_call_id = value
+                                .get("tool_call_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToString::to_string);
+                            let content = value
+                                .get("content")
+                                .and_then(serde_json::Value::as_str)
+                                .map(|s| MessageContent::Text(s.to_string()));
+                            return NativeMessage {
+                                role: "tool".to_string(),
+                                content,
+                                tool_call_id,
+                                tool_calls: None,
+                                reasoning_content: None,
+                            };
+                        }
                     }
-                }
 
-                NativeMessage {
-                    role: m.role.clone(),
-                    content: Some(m.content.clone()),
-                    tool_call_id: None,
-                    tool_calls: None,
-                    reasoning_content: None,
+                    NativeMessage {
+                        role: m.role.clone(),
+                        content: Some(MessageContent::Text(m.content.clone())),
+                        tool_call_id: None,
+                        tool_calls: None,
+                        reasoning_content: None,
+                    }
+                })
+                .collect();
+
+        if enable_caching {
+            // Mark the system prompt as a cache breakpoint. System prompts in
+            // an agentic loop are large (~5–15k tokens incl. persona, tools
+            // hint, format rules) and stable across the whole conversation.
+            // Caching it is the single biggest first-byte win on Anthropic.
+            if let Some(system) = converted.iter_mut().find(|m| m.role == "system") {
+                if let Some(MessageContent::Text(text)) = system.content.take() {
+                    system.content =
+                        Some(MessageContent::Parts(vec![ContentPart::cached_text(text)]));
                 }
-            })
-            .collect()
+            }
+        }
+
+        converted
     }
 
     fn parse_native_response(message: NativeResponseMessage) -> ProviderChatResponse {
@@ -365,15 +506,24 @@ impl Provider for OpenAiProvider {
         let mut messages = Vec::new();
 
         if let Some(sys) = system_prompt {
+            // System prompt is the canonical caching target — large, stable,
+            // identical across every turn in a session. Mark with
+            // cache_control when caching is enabled; otherwise stay on the
+            // plain-string shape that legacy providers expect.
+            let content = if self.caching_enabled_for(model) {
+                MessageContent::Parts(vec![ContentPart::cached_text(sys)])
+            } else {
+                MessageContent::Text(sys.to_string())
+            };
             messages.push(Message {
                 role: "system".to_string(),
-                content: sys.to_string(),
+                content,
             });
         }
 
         messages.push(Message {
             role: "user".to_string(),
-            content: message.to_string(),
+            content: MessageContent::Text(message.to_string()),
         });
 
         let request = ChatRequest {
@@ -417,10 +567,11 @@ impl Provider for OpenAiProvider {
 
         let adjusted_temperature = Self::adjust_temperature_for_model(model, temperature);
 
-        let tools = Self::convert_tools(request.tools);
+        let enable_caching = self.caching_enabled_for(model);
+        let tools = Self::convert_tools(request.tools, enable_caching);
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            messages: Self::convert_messages(request.messages),
+            messages: Self::convert_messages(request.messages, enable_caching),
             temperature: adjusted_temperature,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
@@ -473,21 +624,27 @@ impl Provider for OpenAiProvider {
 
         let adjusted_temperature = Self::adjust_temperature_for_model(model, temperature);
 
+        let enable_caching = self.caching_enabled_for(model);
         let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
             None
         } else {
-            Some(
-                tools
-                    .iter()
-                    .cloned()
-                    .map(parse_native_tool_spec)
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
+            let mut converted: Vec<NativeToolSpec> = tools
+                .iter()
+                .cloned()
+                .map(parse_native_tool_spec)
+                .collect::<Result<Vec<_>, _>>()?;
+            // Tail-of-tools cache breakpoint, same trick as `convert_tools`.
+            if enable_caching {
+                if let Some(last) = converted.last_mut() {
+                    last.cache_control = Some(CacheControl::ephemeral());
+                }
+            }
+            Some(converted)
         };
 
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            messages: Self::convert_messages(messages),
+            messages: Self::convert_messages(messages, enable_caching),
             temperature: adjusted_temperature,
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
@@ -582,11 +739,11 @@ mod tests {
             messages: vec![
                 Message {
                     role: "system".to_string(),
-                    content: "You are ZeroClaw".to_string(),
+                    content: MessageContent::Text("You are ZeroClaw".to_string()),
                 },
                 Message {
                     role: "user".to_string(),
-                    content: "hello".to_string(),
+                    content: MessageContent::Text("hello".to_string()),
                 },
             ],
             temperature: 0.7,
@@ -596,6 +753,9 @@ mod tests {
         assert!(json.contains("\"role\":\"system\""));
         assert!(json.contains("\"role\":\"user\""));
         assert!(json.contains("gpt-4o"));
+        // Plain string shape is preserved when caching is off — important
+        // for non-Anthropic backends that may reject the structured shape.
+        assert!(json.contains("\"content\":\"You are ZeroClaw\""));
     }
 
     #[test]
@@ -604,7 +764,7 @@ mod tests {
             model: "gpt-4o".to_string(),
             messages: vec![Message {
                 role: "user".to_string(),
-                content: "hello".to_string(),
+                content: MessageContent::Text("hello".to_string()),
             }],
             temperature: 0.0,
             max_tokens: None,
@@ -612,6 +772,141 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("system"));
         assert!(json.contains("\"temperature\":0.0"));
+    }
+
+    // ----------------------------------------------------------
+    // Anthropic prompt caching (cache_control) wire format
+    // ----------------------------------------------------------
+
+    #[test]
+    fn cache_control_serializes_as_ephemeral_part() {
+        let part = ContentPart::cached_text("system prompt body");
+        let json = serde_json::to_string(&part).unwrap();
+        // LiteLLM expects exactly this shape (Anthropic-style content part).
+        assert!(json.contains("\"type\":\"text\""));
+        assert!(json.contains("\"text\":\"system prompt body\""));
+        assert!(json.contains("\"cache_control\":{\"type\":\"ephemeral\"}"));
+    }
+
+    #[test]
+    fn parts_message_serializes_as_array() {
+        let msg = Message {
+            role: "system".to_string(),
+            content: MessageContent::Parts(vec![ContentPart::cached_text("be helpful")]),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"role\":\"system\""));
+        // Array shape is the only one Anthropic honors cache_control on.
+        assert!(json.contains("\"content\":[{"));
+        assert!(json.contains("\"cache_control\""));
+    }
+
+    #[test]
+    fn convert_messages_marks_system_when_caching_enabled() {
+        let messages = vec![
+            ChatMessage::system("You are an agent.".to_string()),
+            ChatMessage::user("hi".to_string()),
+        ];
+        let native = OpenAiProvider::convert_messages(&messages, true);
+        let json = serde_json::to_string(&native).unwrap();
+        // System role's content must be the structured array form so
+        // cache_control rides along.
+        assert!(json.contains("\"role\":\"system\""));
+        assert!(json.contains("\"cache_control\":{\"type\":\"ephemeral\"}"));
+        // User role keeps the plain string shape — no need to cache the
+        // ephemeral query, and Anthropic only allows up to 4 breakpoints.
+        assert!(json.contains("\"role\":\"user\",\"content\":\"hi\""));
+    }
+
+    #[test]
+    fn convert_messages_does_not_mark_when_caching_disabled() {
+        let messages = vec![
+            ChatMessage::system("You are an agent.".to_string()),
+            ChatMessage::user("hi".to_string()),
+        ];
+        let native = OpenAiProvider::convert_messages(&messages, false);
+        let json = serde_json::to_string(&native).unwrap();
+        // With caching off the wire stays exactly as before — preserves
+        // back-compat for non-Anthropic backends that may reject the
+        // structured shape or the cache_control field.
+        assert!(!json.contains("cache_control"));
+        assert!(json.contains("\"content\":\"You are an agent.\""));
+    }
+
+    #[test]
+    fn convert_tools_marks_last_when_caching_enabled() {
+        let tools = vec![
+            crate::tools::ToolSpec {
+                name: "shell".into(),
+                description: "Run a shell command".into(),
+                parameters: serde_json::json!({}),
+            },
+            crate::tools::ToolSpec {
+                name: "browser".into(),
+                description: "Browse the web".into(),
+                parameters: serde_json::json!({}),
+            },
+        ];
+        let converted = OpenAiProvider::convert_tools(Some(&tools), true).unwrap();
+        assert_eq!(converted.len(), 2);
+        // Only the LAST tool gets cache_control — that's how Anthropic
+        // caches the entire prefix tools block in one breakpoint.
+        assert!(converted[0].cache_control.is_none());
+        assert!(converted[1].cache_control.is_some());
+    }
+
+    #[test]
+    fn convert_tools_marks_none_when_caching_disabled() {
+        let tools = vec![crate::tools::ToolSpec {
+            name: "shell".into(),
+            description: "Run a shell command".into(),
+            parameters: serde_json::json!({}),
+        }];
+        let converted = OpenAiProvider::convert_tools(Some(&tools), false).unwrap();
+        assert!(converted[0].cache_control.is_none());
+    }
+
+    #[test]
+    fn model_supports_prompt_caching_classification() {
+        // Bedrock-Anthropic is the path used in dev/prod via LiteLLM.
+        assert!(OpenAiProvider::model_supports_prompt_caching(
+            "bedrock/global.anthropic.claude-sonnet-4-6"
+        ));
+        assert!(OpenAiProvider::model_supports_prompt_caching(
+            "anthropic/claude-3-5-sonnet-20240620"
+        ));
+        assert!(OpenAiProvider::model_supports_prompt_caching(
+            "claude-3-5-sonnet-20240620"
+        ));
+        // Non-Anthropic models must NOT auto-enable caching, since
+        // they may not understand `cache_control` and could reject it.
+        assert!(!OpenAiProvider::model_supports_prompt_caching("gpt-4o"));
+        assert!(!OpenAiProvider::model_supports_prompt_caching(
+            "gemini-2.5-pro"
+        ));
+        assert!(!OpenAiProvider::model_supports_prompt_caching(
+            "deepseek-chat"
+        ));
+    }
+
+    #[test]
+    fn caching_enabled_for_uses_model_detection_by_default() {
+        let p = OpenAiProvider::new(Some("k"));
+        // Auto-on for Anthropic-via-Bedrock-via-LiteLLM (the dev setup).
+        assert!(p.caching_enabled_for("bedrock/global.anthropic.claude-sonnet-4-6"));
+        // Auto-off for OpenAI's own models — they use server-side automatic
+        // caching, which doesn't need (or accept) cache_control markers.
+        assert!(!p.caching_enabled_for("gpt-4o"));
+    }
+
+    #[test]
+    fn caching_enabled_for_respects_explicit_override() {
+        // Override-true forces caching even on a model that wouldn't auto-on.
+        let force_on = OpenAiProvider::new(Some("k")).with_prompt_caching(true);
+        assert!(force_on.caching_enabled_for("gpt-4o"));
+        // Override-false disables caching even on a model that would auto-on.
+        let force_off = OpenAiProvider::new(Some("k")).with_prompt_caching(false);
+        assert!(!force_off.caching_enabled_for("bedrock/global.anthropic.claude-sonnet-4-6"));
     }
 
     #[test]
@@ -842,7 +1137,7 @@ mod tests {
         });
 
         let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiProvider::convert_messages(&messages);
+        let native = OpenAiProvider::convert_messages(&messages, false);
         assert_eq!(native.len(), 1);
         assert_eq!(
             native[0].reasoning_content.as_deref(),
@@ -864,7 +1159,7 @@ mod tests {
         });
 
         let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiProvider::convert_messages(&messages);
+        let native = OpenAiProvider::convert_messages(&messages, false);
         assert_eq!(native.len(), 1);
         assert!(native[0].reasoning_content.is_none());
     }
@@ -873,7 +1168,7 @@ mod tests {
     fn native_message_omits_reasoning_content_when_none() {
         let msg = NativeMessage {
             role: "assistant".to_string(),
-            content: Some("hi".to_string()),
+            content: Some(MessageContent::Text("hi".to_string())),
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
@@ -886,7 +1181,7 @@ mod tests {
     fn native_message_includes_reasoning_content_when_some() {
         let msg = NativeMessage {
             role: "assistant".to_string(),
-            content: Some("hi".to_string()),
+            content: Some(MessageContent::Text("hi".to_string())),
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: Some("thinking...".to_string()),
