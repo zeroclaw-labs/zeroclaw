@@ -220,9 +220,9 @@ fn format_probe_url(scheme: &str, configured_host: &str, port: u16, path: &str) 
     let (probe_host, display_host) = resolve_probe_host(configured_host);
     let probed = format!("{scheme}://{probe_host}:{port}{path}");
     match display_host {
-        Some(cfg) => format!(
-            "{scheme}://{cfg}:{port}{path} (probed via {scheme}://{probe_host}:{port})"
-        ),
+        Some(cfg) => {
+            format!("{scheme}://{cfg}:{port}{path} (probed via {scheme}://{probe_host}:{port})")
+        }
         None => probed,
     }
 }
