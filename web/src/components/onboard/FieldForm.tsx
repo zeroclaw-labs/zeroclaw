@@ -27,11 +27,13 @@ import {
   fetchConfigSchema,
   getCatalogModels,
   listProps,
+  objectArrayElementProps,
   patchConfig,
-  reloadDaemon,
+  reloadDaemonAndWait,
   type ConfigApiError,
   type DriftEntry,
   type ListResponseEntry,
+  type ObjectArrayPropMeta,
   type PatchOp,
 } from '../../lib/api';
 import { fuzzyFilter } from '../../lib/fuzzy';
@@ -48,19 +50,25 @@ interface FieldFormProps {
 }
 
 /** Imperative handle the parent uses to flush unsaved changes before
- *  advancing the wizard. Resolves `true` when the form was clean or the
- *  save succeeded; `false` if the save failed (so the parent can stop). */
+ *  advancing the wizard, or to force a refetch of the form's field list
+ *  after a daemon reload (the prefix didn't change so a useEffect-based
+ *  refresh wouldn't fire). */
 export interface FieldFormHandle {
   flushSave: () => Promise<boolean>;
+  reload: () => Promise<void>;
 }
 
-function rendererFor(entry: ListResponseEntry): 'bool' | 'array' | 'secret' | 'select' | 'number' | 'text' {
+function rendererFor(
+  entry: ListResponseEntry,
+): 'bool' | 'array' | 'object-array' | 'secret' | 'select' | 'number' | 'text' {
   if (entry.is_secret) return 'secret';
   switch (entry.kind) {
     case 'bool':
       return 'bool';
     case 'string-array':
       return 'array';
+    case 'object-array':
+      return 'object-array';
     case 'integer':
     case 'float':
       return 'number';
@@ -77,7 +85,7 @@ function fieldShortLabel(entry: ListResponseEntry): string {
 
 function defaultInputValue(entry: ListResponseEntry): string {
   const v = entry.value;
-  if (entry.kind === 'string-array') {
+  if (entry.kind === 'string-array' || entry.kind === 'object-array') {
     // API returns the TOML/JSON array form as a string. Keep it as the
     // canonical draft shape; the row editor parses on render.
     if (typeof v === 'string') return v === '<unset>' ? '[]' : v;
@@ -96,6 +104,16 @@ function parseInput(entry: ListResponseEntry, raw: string): unknown {
       return raw === 'true';
     case 'array':
       return parseArrayDraft(raw);
+    case 'object-array': {
+      const trimmed = raw.trim();
+      if (!trimmed) return [];
+      try {
+        const parsed = JSON.parse(trimmed);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
     case 'number': {
       const n = Number(raw);
       return Number.isNaN(n) ? raw : n;
@@ -277,6 +295,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
 
   useImperativeHandle(ref, () => ({
     flushSave: handleSave,
+    reload,
   }));
 
   const handleDelete = async (path: string) => {
@@ -415,6 +434,9 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
               onDelete={showDelete ? () => handleDelete(f.path) : undefined}
               drift={drifted.find((d) => d.path === f.path) ?? null}
               description={descriptionForPath(schema, f.path)}
+              elementProps={
+                f.kind === 'object-array' ? objectArrayElementProps(schema, f.path) : null
+              }
             />
           ))}
         </form>
@@ -482,9 +504,11 @@ interface FieldRowProps {
   drift: DriftEntry | null;
   /** `///` doc comment resolved from the cached JSON Schema for this path. */
   description: string | null;
+  /** Per-element property metadata for `kind === 'object-array'` fields. */
+  elementProps?: ObjectArrayPropMeta[] | null;
 }
 
-function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onDelete, drift, description }: FieldRowProps) {
+function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onDelete, drift, description, elementProps }: FieldRowProps) {
   const renderer = rendererFor(entry);
   const [providerModels, setProviderModels] = useState<string[] | null>(null);
   const [modelsFetchFailed, setModelsFetchFailed] = useState(false);
@@ -639,6 +663,13 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
             value={value}
             onChange={onChange}
             isOptional={isOptionalArray(entry.type_hint)}
+          />
+        ) : renderer === 'object-array' ? (
+          <ObjectArrayEditor
+            inputId={entry.path}
+            value={value}
+            onChange={onChange}
+            elementProps={elementProps ?? null}
           />
         ) : renderer === 'number' ? (
           <input
@@ -808,6 +839,249 @@ function ArrayFieldEditor({ inputId, value, onChange, isOptional }: ArrayFieldEd
   );
 }
 
+interface ObjectArrayEditorProps {
+  inputId: string;
+  /** JSON-array string of objects. Empty/`<unset>`/invalid JSON normalize to `[]`. */
+  value: string;
+  onChange: (next: string) => void;
+  /** Per-property metadata for the element type, walked from the JSON Schema.
+   *  `null` when the schema isn't loaded yet or the element shape can't be
+   *  resolved — falls back to a raw JSON textarea. */
+  elementProps: ObjectArrayPropMeta[] | null;
+}
+
+// Per-row form editor for `Vec<T>` of structs (e.g. `mcp.servers`).
+// Parses the JSON-array value, renders one row per element with per-property
+// inputs derived from the JSON Schema, and serializes back to JSON on save.
+// Schema v3 / #5947 will migrate the load-bearing Vecs to `HashMap<String, T>`
+// keyed tables; this editor is the bridge so the dashboard doesn't have to
+// wait on that to surface MCP servers / peripheral boards / etc.
+function ObjectArrayEditor({ inputId, value, onChange, elementProps }: ObjectArrayEditorProps) {
+  const rows = useMemo<Record<string, unknown>[]>(() => {
+    try {
+      const parsed = JSON.parse(value || '[]');
+      if (Array.isArray(parsed)) {
+        return parsed.filter((r): r is Record<string, unknown> => typeof r === 'object' && r !== null);
+      }
+    } catch {
+      /* fall through */
+    }
+    return [];
+  }, [value]);
+
+  const writeRows = (next: Record<string, unknown>[]) => {
+    onChange(JSON.stringify(next));
+  };
+
+  const setField = (rowIdx: number, key: string, raw: unknown) => {
+    const next = rows.map((r, i) => (i === rowIdx ? { ...r, [key]: raw } : r));
+    writeRows(next);
+  };
+
+  const removeRow = (rowIdx: number) => {
+    writeRows(rows.filter((_, i) => i !== rowIdx));
+  };
+
+  const addRow = () => {
+    // Seed required-string keys with empty strings so the row renders an
+    // empty input rather than nothing.
+    const seed: Record<string, unknown> = {};
+    if (elementProps) {
+      for (const p of elementProps) {
+        if (p.kind === 'string' && !p.optional) seed[p.key] = '';
+      }
+    }
+    writeRows([...rows, seed]);
+  };
+
+  // Schema not loaded or unresolvable: degrade to a raw JSON textarea so
+  // the field is still editable. Visually distinct so users see why.
+  if (!elementProps || elementProps.length === 0) {
+    return (
+      <div className="space-y-1.5">
+        <p className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+          Element shape unavailable from schema; edit raw JSON below.
+        </p>
+        <textarea
+          id={inputId}
+          rows={Math.max(4, Math.min(rows.length * 4 + 2, 16))}
+          value={value || '[]'}
+          onChange={(e) => onChange(e.target.value)}
+          className="input-electric w-full px-3 py-2 text-sm font-mono resize-y"
+          placeholder='[{"key": "value"}]'
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2" id={inputId}>
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>
+          {rows.length} {rows.length === 1 ? 'entry' : 'entries'}
+        </span>
+        <button
+          type="button"
+          onClick={addRow}
+          className="btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1"
+        >
+          <Plus className="h-3 w-3" /> Add
+        </button>
+      </div>
+      {rows.length === 0 ? (
+        <p className="text-xs italic px-1 py-2" style={{ color: 'var(--pc-text-faint)' }}>
+          No entries. Click "+ Add" to create one.
+        </p>
+      ) : (
+        <ul className="space-y-3">
+          {rows.map((row, rowIdx) => (
+            <li
+              key={rowIdx}
+              className="rounded-md border p-3 space-y-2"
+              style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-base)' }}
+            >
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-mono" style={{ color: 'var(--pc-text-faint)' }}>
+                  [{rowIdx}]
+                  {typeof row.name === 'string' && row.name.length > 0 && (
+                    <span className="ml-2" style={{ color: 'var(--pc-text-secondary)' }}>
+                      {row.name}
+                    </span>
+                  )}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => removeRow(rowIdx)}
+                  title="Remove this entry"
+                  className="btn-icon"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </div>
+              {elementProps.map((p) => (
+                <ObjectArrayField
+                  key={p.key}
+                  meta={p}
+                  rawValue={row[p.key]}
+                  onChange={(v) => setField(rowIdx, p.key, v)}
+                />
+              ))}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function ObjectArrayField({
+  meta,
+  rawValue,
+  onChange,
+}: {
+  meta: ObjectArrayPropMeta;
+  rawValue: unknown;
+  onChange: (next: unknown) => void;
+}) {
+  const display = (() => {
+    if (rawValue === null || rawValue === undefined) return '';
+    if (typeof rawValue === 'string') return rawValue;
+    if (typeof rawValue === 'number' || typeof rawValue === 'boolean') return String(rawValue);
+    return JSON.stringify(rawValue);
+  })();
+  return (
+    <div>
+      <label className="block text-xs font-mono" style={{ color: 'var(--pc-text-secondary)' }}>
+        {meta.key}
+        {meta.optional && (
+          <span className="ml-1.5 text-[10px]" style={{ color: 'var(--pc-text-faint)' }}>
+            optional
+          </span>
+        )}
+      </label>
+      {meta.description && (
+        <p className="text-[11px] mt-0.5" style={{ color: 'var(--pc-text-muted)' }}>
+          {meta.description}
+        </p>
+      )}
+      {meta.kind === 'bool' ? (
+        <select
+          value={display || 'false'}
+          onChange={(e) => onChange(e.target.value === 'true')}
+          className="input-electric w-full px-2 py-1 mt-1 text-sm appearance-none cursor-pointer"
+        >
+          <option value="true">true</option>
+          <option value="false">false</option>
+        </select>
+      ) : meta.kind === 'enum' && meta.enumVariants ? (
+        <select
+          value={display}
+          onChange={(e) => onChange(e.target.value)}
+          className="input-electric w-full px-2 py-1 mt-1 text-sm appearance-none cursor-pointer"
+        >
+          <option value="">—</option>
+          {meta.enumVariants.map((v) => (
+            <option key={v} value={v}>{v}</option>
+          ))}
+        </select>
+      ) : meta.kind === 'integer' || meta.kind === 'float' ? (
+        <input
+          type="number"
+          value={display}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            onChange(Number.isNaN(n) || e.target.value === '' ? null : n);
+          }}
+          className="input-electric w-full px-2 py-1 mt-1 text-sm"
+        />
+      ) : meta.kind === 'string-array' ? (
+        <textarea
+          rows={2}
+          value={Array.isArray(rawValue) ? JSON.stringify(rawValue) : display}
+          onChange={(e) => {
+            const t = e.target.value.trim();
+            if (!t) {
+              onChange([]);
+              return;
+            }
+            try {
+              const p = JSON.parse(t);
+              onChange(Array.isArray(p) ? p : []);
+            } catch {
+              onChange(t.split(',').map((s) => s.trim()).filter(Boolean));
+            }
+          }}
+          className="input-electric w-full px-2 py-1 mt-1 text-sm font-mono resize-y"
+          placeholder='["a", "b"]'
+        />
+      ) : meta.kind === 'object' ? (
+        <textarea
+          rows={2}
+          value={typeof rawValue === 'object' && rawValue !== null ? JSON.stringify(rawValue) : display}
+          onChange={(e) => {
+            try {
+              onChange(JSON.parse(e.target.value || '{}'));
+            } catch {
+              // Keep raw string until the user finishes editing — we can't
+              // emit a meaningful object until JSON parses, so the field
+              // value temporarily diverges from the row state.
+            }
+          }}
+          className="input-electric w-full px-2 py-1 mt-1 text-sm font-mono resize-y"
+          placeholder='{"key": "value"}'
+        />
+      ) : (
+        <input
+          type="text"
+          value={display}
+          onChange={(e) => onChange(e.target.value)}
+          className="input-electric w-full px-2 py-1 mt-1 text-sm"
+        />
+      )}
+    </div>
+  );
+}
+
 interface DriftBannerProps {
   drifted: DriftEntry[];
   onApplied: () => void | Promise<void>;
@@ -828,10 +1102,12 @@ function DriftBanner({ drifted, onApplied }: DriftBannerProps) {
     setRestarting(true);
     setError(null);
     try {
-      await reloadDaemon();
-      // The reload endpoint returns immediately; allow a beat for the
-      // gateway listener to rebind before refreshing the form.
-      await new Promise((resolve) => setTimeout(resolve, 400));
+      // Wait until /health answers from the rebound listener before
+      // refetching — the previous fixed 400 ms sleep raced the rebind
+      // and the post-reload list call hit the still-tearing-down
+      // gateway, returning the same stale drift state and leaving the
+      // banner stuck on screen.
+      await reloadDaemonAndWait();
       await onApplied();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

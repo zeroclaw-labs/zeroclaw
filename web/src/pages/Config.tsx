@@ -7,18 +7,21 @@
 // SectionPicker + FieldForm components. NO hardcoded section names, field
 // labels, dropdown options, or provider lists.
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ArrowLeft, ChevronRight, Plus, Sparkles } from 'lucide-react';
 import {
   ApiError,
+  getDrift,
   getSections,
+  reloadDaemonAndWait,
   selectSectionItem,
   type ConfigApiError,
+  type DriftEntry,
   type PickerItem,
   type SectionInfo,
 } from '../lib/api';
-import FieldForm from '../components/onboard/FieldForm';
+import FieldForm, { type FieldFormHandle } from '../components/onboard/FieldForm';
 import ReloadDaemonButton from '../components/onboard/ReloadDaemonButton';
 import SectionPicker from '../components/onboard/SectionPicker';
 
@@ -62,6 +65,35 @@ export default function Config() {
   const [mode, setMode] = useState<Mode>({ kind: 'section-overview' });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Ref to whichever FieldForm is currently mounted, so the Reload daemon
+  // button can force a refetch after the gateway rebinds. Without this,
+  // staying on the same section after reload leaves `goToSection` a no-op
+  // and FieldForm's `useEffect([prefix])` never re-fires — the drift
+  // banner stays stuck on stale state until the user navigates away.
+  const formRef = useRef<FieldFormHandle | null>(null);
+
+  // Page-level drift state — visible regardless of which view is open
+  // (overview / picker / form). FieldForm's old in-form drift banner only
+  // showed in the form view, so foundation sections that land on
+  // SectionOverview (Channels, Memory, etc.) silently hid drift.
+  const [drifted, setDrifted] = useState<DriftEntry[]>([]);
+  const refreshDrift = async () => {
+    try {
+      const r = await getDrift();
+      setDrifted(r.drifted ?? []);
+    } catch {
+      // Drift is informational; don't block the page on a transient
+      // gateway hiccup mid-reload.
+    }
+  };
+  useEffect(() => {
+    void refreshDrift();
+  }, []);
+
+  const handleDaemonReloaded = () => {
+    void formRef.current?.reload();
+    void refreshDrift();
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -258,15 +290,32 @@ export default function Config() {
                   <Sparkles className="h-3.5 w-3.5" />
                   Run setup again
                 </Link>
-                <ReloadDaemonButton onReloaded={() => goToSection(activeSection.key)} />
+                <ReloadDaemonButton onReloaded={handleDaemonReloaded} />
               </div>
             </div>
+
+            {drifted.length > 0 && (
+              <PageDriftBanner
+                drifted={drifted}
+                onApplied={async () => {
+                  // Same poll-/health-then-refetch flow the top-right
+                  // Reload daemon button uses, so the two surfaces can't
+                  // diverge on what "wait until ready" means.
+                  await reloadDaemonAndWait();
+                  handleDaemonReloaded();
+                }}
+              />
+            )}
 
             {/* Section overview / picker / form */}
             {!activeSection.has_picker ? (
               // Direct-form sections (Workspace, Hardware): no picker, just
               // show the form rooted at the section's path prefix.
-              <FieldForm prefix={activeSection.key} title={activeSection.label} />
+              <FieldForm
+                ref={formRef}
+                prefix={activeSection.key}
+                title={activeSection.label}
+              />
             ) : mode.kind === 'section-overview' ? (
               <SectionOverview
                 section={activeSection}
@@ -303,6 +352,7 @@ export default function Config() {
                   Back to {activeSection.label}
                 </button>
                 <FieldForm
+                  ref={formRef}
                   prefix={mode.fieldsPrefix}
                   title={mode.item.label}
                 />
@@ -311,6 +361,86 @@ export default function Config() {
           </div>
         )}
       </main>
+    </div>
+  );
+}
+
+// Page-level drift banner shown regardless of mode (overview / picker /
+// form). Sibling to the per-row drift indicators inside FieldForm — the
+// banner answers "any disagreement at all?" so users on the section
+// overview see the signal too. The "Restart daemon to apply" button
+// goes through the same poll-/health-then-refetch flow the top-right
+// Reload daemon button uses, so the two surfaces can't disagree.
+function PageDriftBanner({
+  drifted,
+  onApplied,
+}: {
+  drifted: DriftEntry[];
+  onApplied: () => Promise<void> | void;
+}) {
+  const [restarting, setRestarting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleRestart = async () => {
+    setRestarting(true);
+    setError(null);
+    try {
+      await onApplied();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRestarting(false);
+    }
+  };
+
+  return (
+    <div
+      className="rounded-xl border p-3 text-sm flex flex-col gap-2"
+      style={{
+        borderColor: 'var(--color-status-warning, #f5b400)',
+        background: 'rgba(245, 180, 0, 0.06)',
+      }}
+    >
+      <div className="flex items-center justify-between gap-3">
+        <span style={{ color: 'var(--pc-text-primary)' }}>
+          ⚠ {drifted.length} path{drifted.length === 1 ? '' : 's'} differ
+          {drifted.length === 1 ? 's' : ''} from on-disk
+        </span>
+        <button
+          type="button"
+          onClick={() => void handleRestart()}
+          disabled={restarting}
+          className="btn-secondary text-xs px-3 py-1.5"
+        >
+          {restarting ? 'Restarting…' : 'Restart daemon to apply'}
+        </button>
+      </div>
+      <ul
+        className="text-xs flex flex-col gap-0.5"
+        style={{ color: 'var(--pc-text-muted)' }}
+      >
+        {drifted.slice(0, 6).map((d) => (
+          <li key={d.path} className="font-mono break-all">
+            {d.path}
+            {d.secret && (
+              <span style={{ color: 'var(--pc-text-faint)' }}>
+                {' '}
+                (secret — values not shown)
+              </span>
+            )}
+          </li>
+        ))}
+        {drifted.length > 6 && (
+          <li style={{ color: 'var(--pc-text-faint)' }}>
+            …and {drifted.length - 6} more
+          </li>
+        )}
+      </ul>
+      {error && (
+        <p className="text-xs" style={{ color: 'var(--color-status-error)' }}>
+          Restart failed: {error}
+        </p>
+      )}
     </div>
   );
 }

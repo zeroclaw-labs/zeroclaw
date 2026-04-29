@@ -196,6 +196,49 @@ fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Val
                 .collect();
             Ok(toml::Value::Array(items))
         }
+        // `Vec<T>` of structs: round-trip a JSON array of objects to a
+        // TOML array. JSON `null` (used by serde for `Option::None`) is
+        // dropped because TOML has no null — the absent key conveys the
+        // same meaning when the field deserializes back into `Option<T>`.
+        PropKind::ObjectArray => {
+            let v: serde_json::Value = serde_json::from_str(value_str)
+                .map_err(|e| anyhow::anyhow!("invalid JSON array of objects: {e}"))?;
+            json_to_toml(v).ok_or_else(|| {
+                anyhow::anyhow!("JSON value contained only nulls — nothing to write")
+            })
+        }
+    }
+}
+
+/// Walk a `serde_json::Value` into a `toml::Value`, dropping any `null`s
+/// (TOML has no null; absence of a key conveys `Option::None`).
+fn json_to_toml(v: serde_json::Value) -> Option<toml::Value> {
+    match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(b) => Some(toml::Value::Boolean(b)),
+        serde_json::Value::String(s) => Some(toml::Value::String(s)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(toml::Value::Integer(i))
+            } else if let Some(u) = n.as_u64() {
+                // TOML integers are i64; clamp pathological u64 values.
+                Some(toml::Value::Integer(i64::try_from(u).unwrap_or(i64::MAX)))
+            } else {
+                n.as_f64().map(toml::Value::Float)
+            }
+        }
+        serde_json::Value::Array(items) => Some(toml::Value::Array(
+            items.into_iter().filter_map(json_to_toml).collect(),
+        )),
+        serde_json::Value::Object(map) => {
+            let mut table = toml::map::Map::new();
+            for (k, val) in map {
+                if let Some(tv) = json_to_toml(val) {
+                    table.insert(k, tv);
+                }
+            }
+            Some(toml::Value::Table(table))
+        }
     }
 }
 

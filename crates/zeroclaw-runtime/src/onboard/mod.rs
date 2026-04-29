@@ -354,6 +354,25 @@ async fn prompt_field(
                 }
             }
         }
+        PropKind::ObjectArray => {
+            // Vec<T> of structs (e.g. mcp.servers). The TUI doesn't have
+            // a multi-row sub-form UI; surface this as a JSON-array text
+            // input so the field is at least editable from the CLI. The
+            // dashboard renders these properly via the per-row editor.
+            let prefill = if is_set {
+                Some(current.as_str())
+            } else {
+                default
+            };
+            match ui.string(prompt, prefill).await? {
+                Answer::Back => return Ok(Nav::Back),
+                Answer::Value(new) => {
+                    if (is_set || !new.is_empty()) && new != current {
+                        persist(cfg, name, &new).await?;
+                    }
+                }
+            }
+        }
     }
     Ok(Nav::Done)
 }

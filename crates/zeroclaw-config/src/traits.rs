@@ -20,6 +20,13 @@ pub enum PropKind {
     Enum,
     /// A `Vec<String>` field; set via comma-separated input.
     StringArray,
+    /// A `Vec<T>` field where `T` is a serializable struct (e.g. `Vec<McpServerConfig>`,
+    /// `Vec<PeripheralBoardConfig>`). Round-tripped on the wire as a JSON array of
+    /// objects; the dashboard renders a per-row sub-form using the JSON Schema
+    /// from `OPTIONS /api/config` to discover the element type's field shape.
+    /// Schema v3 / #5947 will migrate the load-bearing ones (mcp.servers etc.)
+    /// to `HashMap<String, T>` keyed tables; until then this kind covers them.
+    ObjectArray,
 }
 
 /// Maps Rust types to PropKind at compile time.

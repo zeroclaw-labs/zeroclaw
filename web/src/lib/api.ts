@@ -298,6 +298,34 @@ export function getOpenApiSchema(): Promise<unknown> {
   return apiFetch<unknown>('/api/openapi.json');
 }
 
+/** POST `/admin/reload`, then poll `/health` until the rebound listener
+ *  answers (or `timeoutMs` elapses). Used by both the explicit
+ *  "Reload daemon" button and the inline drift banner so the two
+ *  surfaces can't disagree on what "wait until ready" means. The
+ *  previous inline-drift implementation's fixed 400 ms sleep raced
+ *  the rebind and frequently fired the post-reload refetch against
+ *  the still-tearing-down listener — leaving stale drift on screen. */
+export async function reloadDaemonAndWait(timeoutMs = 30_000): Promise<void> {
+  await reloadDaemon();
+  // Brief delay so the gateway listener actually drops before we start
+  // probing — without it, the first /health probe can hit the still-up
+  // old listener and we'd return before the rebind happened.
+  await new Promise((r) => setTimeout(r, 250));
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown = null;
+  while (Date.now() < deadline) {
+    try {
+      const r = await fetch(`${apiOrigin}${basePath}/health`, { cache: 'no-store' });
+      if (r.ok) return;
+      lastError = new Error(`/health returned ${r.status}`);
+    } catch (e) {
+      lastError = e;
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw lastError ?? new Error(`daemon did not return within ${timeoutMs}ms`);
+}
+
 // ── Config schema descriptions ───────────────────────────────────────
 //
 // `OPTIONS /api/config` returns the schemars-derived JSON Schema for the
@@ -356,6 +384,89 @@ function resolveAndUnwrap(node: unknown, root: unknown): unknown {
     cur = next;
   }
   return cur;
+}
+
+/** One property on an `object-array` element type, derived from the
+ *  JSON Schema. Used by the per-row editor to render each row as a
+ *  small sub-form without hand-coding the element shape. */
+export interface ObjectArrayPropMeta {
+  /** snake_case key as it appears in the wire JSON. */
+  key: string;
+  /** Human-readable label (kebab-cased + spaced from `key`). */
+  label: string;
+  /** `string` | `bool` | `integer` | `float` | `string-array` | `object` | `enum` | `unknown`. */
+  kind: string;
+  /** Doc-comment description, when present. */
+  description?: string;
+  /** Enum variant names for `kind === 'enum'`. */
+  enumVariants?: string[];
+  /** True when the schema declares `Option<T>` (anyOf-with-null wrapper). */
+  optional: boolean;
+}
+
+/** Walk the cached JSON Schema for `kebabPath` (a `Vec<T>` field) and
+ *  return per-property metadata for the element type T. Returns `null`
+ *  when the path doesn't resolve or the element isn't an object. */
+export function objectArrayElementProps(
+  schema: JsonSchema,
+  kebabPath: string,
+): ObjectArrayPropMeta[] | null {
+  if (!schema) return null;
+  let cur: unknown = schema;
+  for (const seg of kebabPath.split('.')) {
+    cur = unwrapOptional(resolveRef(cur, schema));
+    if (!cur || typeof cur !== 'object') return null;
+    const snake = seg.replace(/-/g, '_');
+    const props = (cur as { properties?: Record<string, unknown> }).properties;
+    const additional = (cur as { additionalProperties?: unknown }).additionalProperties;
+    if (props && Object.prototype.hasOwnProperty.call(props, snake)) {
+      cur = props[snake];
+    } else if (additional && typeof additional === 'object') {
+      cur = additional;
+    } else {
+      return null;
+    }
+  }
+  // `cur` should now be an array schema; the element type is `items`.
+  cur = unwrapOptional(resolveRef(cur, schema));
+  if (!cur || typeof cur !== 'object') return null;
+  const items = (cur as { items?: unknown }).items;
+  if (!items) return null;
+  const elem = unwrapOptional(resolveRef(items, schema));
+  if (!elem || typeof elem !== 'object') return null;
+  const elemProps = (elem as { properties?: Record<string, unknown> }).properties;
+  if (!elemProps) return null;
+  const out: ObjectArrayPropMeta[] = [];
+  for (const [snakeKey, raw] of Object.entries(elemProps)) {
+    const wrapped = raw as { description?: unknown; type?: unknown; anyOf?: unknown[]; enum?: unknown[] } | null;
+    const desc = typeof wrapped?.description === 'string' ? wrapped.description : undefined;
+    const isOptional = Array.isArray(wrapped?.anyOf)
+      || (Array.isArray(wrapped?.type) && (wrapped!.type as string[]).includes('null'));
+    const resolved = unwrapOptional(resolveRef(wrapped, schema)) as Record<string, unknown> | null;
+    const t = resolved?.type;
+    const enumVariants = Array.isArray(resolved?.enum)
+      ? (resolved!.enum as unknown[]).filter((v): v is string => typeof v === 'string')
+      : undefined;
+    let kind: string = 'unknown';
+    if (enumVariants && enumVariants.length > 0) kind = 'enum';
+    else if (t === 'boolean' || (Array.isArray(t) && t.includes('boolean'))) kind = 'bool';
+    else if (t === 'integer' || (Array.isArray(t) && t.includes('integer'))) kind = 'integer';
+    else if (t === 'number' || (Array.isArray(t) && t.includes('number'))) kind = 'float';
+    else if (t === 'string' || (Array.isArray(t) && t.includes('string'))) kind = 'string';
+    else if (t === 'array') {
+      const items = resolved?.items as { type?: unknown } | undefined;
+      kind = items?.type === 'string' ? 'string-array' : 'array';
+    } else if (t === 'object') kind = 'object';
+    out.push({
+      key: snakeKey,
+      label: snakeKey.replace(/_/g, ' '),
+      kind,
+      description: desc,
+      enumVariants,
+      optional: isOptional,
+    });
+  }
+  return out;
 }
 
 export function descriptionForPath(schema: JsonSchema, kebabPath: string): string | null {

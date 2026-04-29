@@ -634,11 +634,18 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let is_option = is_option_type(&field.ty);
         let inner_ty = extract_option_inner(&field.ty).unwrap_or(&field.ty);
 
-        // Skip compound types (Vec, HashMap, PathBuf), but expose Vec<String> as StringArray.
-        let is_vec_string = extract_vec_inner(inner_ty)
+        // Skip HashMap and PathBuf compound types (handled by other paths
+        // or omitted from the prop surface). `Vec<T>` is surfaced as a
+        // single prop field — `Vec<String>` becomes PropKind::StringArray
+        // (chip editor on the dashboard), any other `Vec<T>` becomes
+        // PropKind::ObjectArray (per-row sub-form on the dashboard,
+        // JSON-array round-tripped on the wire).
+        let vec_inner = extract_vec_inner(inner_ty);
+        let is_vec_string = vec_inner
             .map(|t| t.to_token_stream().to_string() == "String")
             .unwrap_or(false);
-        if is_compound_type(inner_ty) && !is_vec_string {
+        let is_vec_object = vec_inner.is_some() && !is_vec_string;
+        if is_compound_type(inner_ty) && !is_vec_string && !is_vec_object {
             continue;
         }
 
@@ -660,32 +667,49 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         // PropKind resolved at compile time via HasPropKind trait.
         // All field types must implement HasPropKind — scalars in traits.rs,
         // config enums in schema.rs via impl_enum_prop_kind!.
-        let kind_token = quote! { <#inner_ty as crate::config::HasPropKind>::PROP_KIND };
-        let enum_variants_expr = quote! {
-            {
-                #[cfg(feature = "schema-export")]
+        // Exception: `Vec<T>` of structs (anything that's not `Vec<String>`)
+        // is hardcoded to ObjectArray here because a blanket
+        // `impl<T> HasPropKind for Vec<T>` would conflict with the existing
+        // `Vec<String> -> StringArray` impl, and per-type impls would
+        // be tedious to maintain. The macro already knows the field is a
+        // Vec via `extract_vec_inner`.
+        let kind_token = if is_vec_object {
+            quote! { crate::config::PropKind::ObjectArray }
+        } else {
+            quote! { <#inner_ty as crate::config::HasPropKind>::PROP_KIND }
+        };
+        // Vec<T> object-array fields are never enums; short-circuit the
+        // `HasPropKind::PROP_KIND` probe so the compile doesn't demand
+        // a HasPropKind impl on `Vec<T>` for arbitrary T.
+        let enum_variants_expr = if is_vec_object {
+            quote! { None::<fn() -> Vec<String>> }
+        } else {
+            quote! {
                 {
-                    if <#inner_ty as crate::config::HasPropKind>::PROP_KIND == crate::config::PropKind::Enum {
-                        Some(|| {
-                            crate::config::enum_variants::<#inner_ty>()
-                                .split(", ")
-                                .map(str::to_string)
-                                // Defensive: the helper returns a placeholder
-                                // string ("(unknown variants)") when schemars
-                                // can't enumerate variants for the type. Drop
-                                // empties and the placeholder so the dashboard
-                                // form falls back to a text input instead of
-                                // rendering a one-option dropdown of garbage.
-                                .filter(|v| !v.is_empty() && v != "(unknown variants)")
-                                .collect()
-                        })
-                    } else {
-                        None
+                    #[cfg(feature = "schema-export")]
+                    {
+                        if <#inner_ty as crate::config::HasPropKind>::PROP_KIND == crate::config::PropKind::Enum {
+                            Some(|| {
+                                crate::config::enum_variants::<#inner_ty>()
+                                    .split(", ")
+                                    .map(str::to_string)
+                                    // Defensive: the helper returns a placeholder
+                                    // string ("(unknown variants)") when schemars
+                                    // can't enumerate variants for the type. Drop
+                                    // empties and the placeholder so the dashboard
+                                    // form falls back to a text input instead of
+                                    // rendering a one-option dropdown of garbage.
+                                    .filter(|v| !v.is_empty() && v != "(unknown variants)")
+                                    .collect()
+                            })
+                        } else {
+                            None
+                        }
                     }
-                }
-                #[cfg(not(feature = "schema-export"))]
-                {
-                    None::<fn() -> Vec<String>>
+                    #[cfg(not(feature = "schema-export"))]
+                    {
+                        None::<fn() -> Vec<String>>
+                    }
                 }
             }
         };
@@ -698,20 +722,41 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         prop_kind_tokens.push(kind_token.clone());
         prop_is_option_flags.push(is_option);
 
-        prop_field_entries.push(quote! {
-            crate::config::make_prop_field(
-                __table.as_ref(),
-                #full_name_lit,
-                #serde_name_lit,
-                #category_lit,
-                #type_hint_lit,
-                #kind_token,
-                #is_secret,
-                #enum_variants_expr,
-                #description_lit,
-                #derived_from_secret,
-            )
-        });
+        if is_vec_object {
+            // For `Vec<T>` of structs we bypass make_prop_field's TOML-table
+            // lookup and JSON-serialize the field directly, so the dashboard
+            // gets `value: [{"name":"fs",...}]` instead of `value: "[{name=...}]"`
+            // (TOML inline syntax) that the per-row editor would have to parse.
+            prop_field_entries.push(quote! {
+                crate::config::PropFieldInfo {
+                    name: #full_name_lit.to_string(),
+                    category: #category_lit,
+                    display_value: serde_json::to_string(&self.#field_ident)
+                        .unwrap_or_else(|_| "[]".to_string()),
+                    type_hint: #type_hint_lit,
+                    kind: #kind_token,
+                    is_secret: #is_secret,
+                    enum_variants: #enum_variants_expr,
+                    description: #description_lit,
+                    derived_from_secret: #derived_from_secret,
+                }
+            });
+        } else {
+            prop_field_entries.push(quote! {
+                crate::config::make_prop_field(
+                    __table.as_ref(),
+                    #full_name_lit,
+                    #serde_name_lit,
+                    #category_lit,
+                    #type_hint_lit,
+                    #kind_token,
+                    #is_secret,
+                    #enum_variants_expr,
+                    #description_lit,
+                    #derived_from_secret,
+                )
+            });
+        }
     }
 
     let prefix_lit = &prefix;

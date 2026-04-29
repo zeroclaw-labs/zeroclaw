@@ -71,6 +71,24 @@ pub fn coerce_for_set_prop(
             ),
         )),
 
+        // `Vec<T>` of objects: any JSON array is acceptable; element shape
+        // is validated by serde when `set_prop` deserializes back into the
+        // target type. We just pass the JSON through verbatim.
+        (Some(PropKind::ObjectArray), serde_json::Value::Array(_)) => serde_json::to_string(value)
+            .map_err(|e| {
+                ConfigApiError::new(
+                    ConfigApiCode::ValueTypeMismatch,
+                    format!("could not serialize JSON value: {e}"),
+                )
+            }),
+        (Some(PropKind::ObjectArray), other) => Err(ConfigApiError::new(
+            ConfigApiCode::ValueTypeMismatch,
+            format!(
+                "object-array field requires a JSON array of objects; got {}",
+                json_type_name(other),
+            ),
+        )),
+
         // Bool fields.
         (Some(PropKind::Bool), serde_json::Value::Bool(b)) => Ok(b.to_string()),
         (Some(PropKind::Bool), serde_json::Value::String(s))

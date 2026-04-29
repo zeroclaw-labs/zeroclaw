@@ -18006,6 +18006,31 @@ allowed_users = []
     }
 
     #[test]
+    async fn mcp_servers_object_array_round_trips_through_set_prop() {
+        // Regression for the dashboard `+ Add MCP server` flow: `Vec<T>` of
+        // structs surfaces in prop_fields() with PropKind::ObjectArray, and
+        // set_prop accepts a JSON-array string that re-deserializes into
+        // Vec<McpServerConfig>. No schema change — same pattern Vec<String>
+        // already used, generalized in the macro to any Vec<T>.
+        let mut config = Config::default();
+
+        let fields = config.prop_fields();
+        let mcp_servers = fields
+            .iter()
+            .find(|f| f.name == "mcp.servers")
+            .expect("mcp.servers must appear in prop_fields once Vec<T> is generally supported");
+        assert_eq!(mcp_servers.kind, crate::config::PropKind::ObjectArray);
+
+        let json = r#"[{"name":"fs","transport":"stdio","command":"/usr/bin/mcp-fs","args":[],"env":{},"headers":{}}]"#;
+        config
+            .set_prop("mcp.servers", json)
+            .expect("set_prop should accept JSON-array-of-objects for Vec<McpServerConfig>");
+        assert_eq!(config.mcp.servers.len(), 1);
+        assert_eq!(config.mcp.servers[0].name, "fs");
+        assert_eq!(config.mcp.servers[0].command, "/usr/bin/mcp-fs");
+    }
+
+    #[test]
     async fn init_defaults_skips_already_set() {
         let mut config = Config::default();
         config.channels.matrix = Some(test_matrix_config());
