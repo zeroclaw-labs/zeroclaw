@@ -409,6 +409,7 @@ pub async fn run_gateway(
     port: u16,
     config: Config,
     external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    canvas_store: Option<CanvasStore>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
@@ -473,7 +474,12 @@ pub async fn run_gateway(
         (None, None)
     };
 
-    let canvas_store = tools::CanvasStore::new();
+    // Reuse the daemon-supplied canvas store when present so channel-
+    // server agents (Telegram/Discord/Slack) push frames into the same
+    // store the gateway's WebSocket and REST endpoints serve (#5356).
+    // Standalone gateway invocations (no daemon supervisor) fall back
+    // to a fresh store.
+    let canvas_store = canvas_store.unwrap_or_else(tools::CanvasStore::new);
 
     let (
         mut tools_registry_raw,

@@ -5221,7 +5221,10 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
-pub async fn start_channels(config: Config) -> Result<()> {
+pub async fn start_channels(
+    config: Config,
+    canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_from_config(&config);
@@ -5320,7 +5323,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .fallback_provider()
             .and_then(|e| e.api_key.as_deref()),
         &config,
-        None,
+        // Share the gateway's canvas store so frames pushed from
+        // channel-side agents reach the same WebSocket subscribers and
+        // REST snapshots the gateway serves (#5356). When `None`, the
+        // tool registry creates an orphaned store that nothing can
+        // observe — the original silent-failure shape.
+        canvas_store,
     );
 
     // Wire MCP tools into the registry before freezing — non-fatal.
