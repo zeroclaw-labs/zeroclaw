@@ -298,34 +298,6 @@ export function getOpenApiSchema(): Promise<unknown> {
   return apiFetch<unknown>('/api/openapi.json');
 }
 
-/** POST `/admin/reload`, then poll `/health` until the rebound listener
- *  answers (or `timeoutMs` elapses). Used by both the explicit
- *  "Reload daemon" button and the inline drift banner so the two
- *  surfaces can't disagree on what "wait until ready" means. The
- *  previous inline-drift implementation's fixed 400 ms sleep raced
- *  the rebind and frequently fired the post-reload refetch against
- *  the still-tearing-down listener — leaving stale drift on screen. */
-export async function reloadDaemonAndWait(timeoutMs = 30_000): Promise<void> {
-  await reloadDaemon();
-  // Brief delay so the gateway listener actually drops before we start
-  // probing — without it, the first /health probe can hit the still-up
-  // old listener and we'd return before the rebind happened.
-  await new Promise((r) => setTimeout(r, 250));
-  const deadline = Date.now() + timeoutMs;
-  let lastError: unknown = null;
-  while (Date.now() < deadline) {
-    try {
-      const r = await fetch(`${apiOrigin}${basePath}/health`, { cache: 'no-store' });
-      if (r.ok) return;
-      lastError = new Error(`/health returned ${r.status}`);
-    } catch (e) {
-      lastError = e;
-    }
-    await new Promise((r) => setTimeout(r, 500));
-  }
-  throw lastError ?? new Error(`daemon did not return within ${timeoutMs}ms`);
-}
-
 // ── Config schema descriptions ───────────────────────────────────────
 //
 // `OPTIONS /api/config` returns the schemars-derived JSON Schema for the

@@ -29,7 +29,7 @@ import {
   listProps,
   objectArrayElementProps,
   patchConfig,
-  reloadDaemonAndWait,
+  reloadDaemon,
   type ConfigApiError,
   type DriftEntry,
   type ListResponseEntry,
@@ -50,12 +50,10 @@ interface FieldFormProps {
 }
 
 /** Imperative handle the parent uses to flush unsaved changes before
- *  advancing the wizard, or to force a refetch of the form's field list
- *  after a daemon reload (the prefix didn't change so a useEffect-based
- *  refresh wouldn't fire). */
+ *  advancing the wizard. Resolves `true` when the form was clean or the
+ *  save succeeded; `false` if the save failed (so the parent can stop). */
 export interface FieldFormHandle {
   flushSave: () => Promise<boolean>;
-  reload: () => Promise<void>;
 }
 
 function rendererFor(
@@ -295,7 +293,6 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
 
   useImperativeHandle(ref, () => ({
     flushSave: handleSave,
-    reload,
   }));
 
   const handleDelete = async (path: string) => {
@@ -1208,12 +1205,10 @@ function DriftBanner({ drifted, onApplied }: DriftBannerProps) {
     setRestarting(true);
     setError(null);
     try {
-      // Wait until /health answers from the rebound listener before
-      // refetching — the previous fixed 400 ms sleep raced the rebind
-      // and the post-reload list call hit the still-tearing-down
-      // gateway, returning the same stale drift state and leaving the
-      // banner stuck on screen.
-      await reloadDaemonAndWait();
+      await reloadDaemon();
+      // The reload endpoint returns immediately; allow a beat for the
+      // gateway listener to rebind before refreshing the form.
+      await new Promise((resolve) => setTimeout(resolve, 400));
       await onApplied();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
