@@ -160,8 +160,17 @@ export default function Config() {
       >
         <nav className="flex flex-col">
           {GROUP_ORDER.map((groupName) => {
+            // Sections whose `group` isn't in GROUP_ORDER bucket into
+            // "Other" so a backend rename never silently drops them
+            // (e.g. "Onboarding" → "Foundation" before the daemon is
+            // restarted on the new binary).
+            const known = new Set(GROUP_ORDER);
             const items = sections
-              .filter((s) => s.group === groupName)
+              .filter((s) =>
+                groupName === 'Other'
+                  ? s.group === 'Other' || !known.has(s.group as typeof GROUP_ORDER[number])
+                  : s.group === groupName,
+              )
               .sort((a, b) => a.label.localeCompare(b.label));
             if (items.length === 0) return null;
             return (
