@@ -278,8 +278,12 @@ mod tests {
 
         {
             let store = SessionStore::new(tmp.path()).unwrap();
-            store.append(&runtime_key, &ChatMessage::user("first")).unwrap();
-            store.append(&runtime_key, &ChatMessage::assistant("ack")).unwrap();
+            store
+                .append(&runtime_key, &ChatMessage::user("first"))
+                .unwrap();
+            store
+                .append(&runtime_key, &ChatMessage::assistant("ack"))
+                .unwrap();
         }
 
         let store = SessionStore::new(tmp.path()).unwrap();
