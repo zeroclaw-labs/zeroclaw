@@ -153,6 +153,10 @@ pub struct SectionInfo {
     /// Whether the user has marked the section completed in
     /// `onboard_state.completed_sections`.
     pub completed: bool,
+    /// Display group for the dashboard sidebar (`Onboarding`, `Agent`,
+    /// `Tools`, etc.). Curated server-side until v3 / #5947 lands a schema
+    /// attribute that encodes the grouping declaratively.
+    pub group: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -213,6 +217,7 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
                 label: humanize_section(&key),
                 help: section_help(&key).to_string(),
                 has_picker,
+                group: section_group(&key).to_string(),
                 key,
             }
         })
@@ -244,6 +249,53 @@ fn humanize_section(key: &str) -> String {
         c.make_ascii_uppercase();
     }
     s
+}
+
+/// Display group for a section. Hand-curated until v3 / #5947 lands a
+/// schema attribute that encodes grouping declaratively. Unknown keys
+/// fall into `Other` so new schema additions still surface — they just
+/// land in the catch-all bucket until someone curates them.
+///
+/// Group order in the dashboard sidebar is governed by the frontend (see
+/// `Config.tsx`), not this list.
+fn section_group(key: &str) -> &'static str {
+    match key {
+        // The 6 onboarding sections (TUI's `Section` enum).
+        "workspace" | "providers" | "channels" | "memory" | "hardware" | "tunnel" => "Onboarding",
+        // Agent loop, scheduling, and orchestration.
+        "agent"
+        | "autonomy"
+        | "cron"
+        | "heartbeat"
+        | "hooks"
+        | "pacing"
+        | "pipeline"
+        | "query_classification"
+        | "reliability"
+        | "runtime"
+        | "scheduler"
+        | "skills"
+        | "sop"
+        | "verifiable_intent" => "Agent",
+        // Multi-agent / delegation.
+        "agents" | "swarms" | "delegate" => "Multi-agent",
+        // Tool integrations.
+        "browser" | "browser_delegate" | "http_request" | "image_gen" | "knowledge"
+        | "link_enricher" | "mcp" | "media_pipeline" | "multimodal" | "plugins"
+        | "project_intel" | "shell_tool" | "text_browser" | "transcription" | "tts"
+        | "web_fetch" | "web_search" => "Tools",
+        // External services / vendor integrations.
+        "claude_code" | "claude_code_runner" | "codex_cli" | "composio" | "gemini_cli"
+        | "google_workspace" | "jira" | "linkedin" | "notion" | "opencode_cli" => "Integrations",
+        // Networking / multi-node infrastructure.
+        "gateway" | "node_transport" | "nodes" | "proxy" => "Network",
+        // Storage, identity, secrets.
+        "identity" | "secrets" | "storage" => "Storage",
+        // Operations / monitoring / safety / cost.
+        "backup" | "cloud_ops" | "conversational_ai" | "cost" | "data_retention"
+        | "observability" | "peripherals" | "security" | "security_ops" | "trust" => "Operations",
+        _ => "Other",
+    }
 }
 
 /// Help text for a section. Curated copy for the onboarding sections;

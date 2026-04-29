@@ -29,6 +29,22 @@ type Mode =
   | { kind: 'picker' }
   | { kind: 'form'; item: PickerItem; fieldsPrefix: string };
 
+// Display order for the curated sidebar groups. Each `SectionInfo.group`
+// from the gateway lands in one of these buckets (anything else falls
+// into "Other"). Schema-attribute-driven grouping replaces this in v3 /
+// #5947.
+const GROUP_ORDER = [
+  'Onboarding',
+  'Agent',
+  'Multi-agent',
+  'Tools',
+  'Integrations',
+  'Network',
+  'Storage',
+  'Operations',
+  'Other',
+] as const;
+
 export default function Config() {
   const [sections, setSections] = useState<SectionInfo[]>([]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
@@ -121,37 +137,47 @@ export default function Config() {
           background: 'var(--pc-bg-surface)',
         }}
       >
-        <div
-          className="px-4 py-3 text-xs font-semibold uppercase tracking-wider"
-          style={{ color: 'var(--pc-text-secondary)' }}
-        >
-          Sections
-        </div>
         <nav className="flex flex-col">
-          {sections.map((s) => (
-            <button
-              key={s.key}
-              type="button"
-              onClick={() => goToSection(s.key)}
-              className="flex items-center justify-between gap-2 px-4 py-2.5 text-sm text-left transition-colors"
-              style={{
-                background:
-                  s.key === activeKey ? 'var(--pc-accent-glow)' : 'transparent',
-                color:
-                  s.key === activeKey
-                    ? 'var(--pc-accent)'
-                    : 'var(--pc-text-primary)',
-                fontWeight: s.key === activeKey ? 600 : 400,
-                borderLeft:
-                  s.key === activeKey
-                    ? '2px solid var(--pc-accent)'
-                    : '2px solid transparent',
-              }}
-            >
-              <span>{s.label}</span>
-              {s.key === activeKey && <ChevronRight className="h-3.5 w-3.5" />}
-            </button>
-          ))}
+          {GROUP_ORDER.map((groupName) => {
+            const items = sections
+              .filter((s) => s.group === groupName)
+              .sort((a, b) => a.label.localeCompare(b.label));
+            if (items.length === 0) return null;
+            return (
+              <div key={groupName}>
+                <div
+                  className="px-4 pt-4 pb-1.5 text-xs font-semibold uppercase tracking-wider"
+                  style={{ color: 'var(--pc-text-secondary)' }}
+                >
+                  {groupName}
+                </div>
+                {items.map((s) => (
+                  <button
+                    key={s.key}
+                    type="button"
+                    onClick={() => goToSection(s.key)}
+                    className="flex items-center justify-between gap-2 px-4 py-2 text-sm text-left transition-colors"
+                    style={{
+                      background:
+                        s.key === activeKey ? 'var(--pc-accent-glow)' : 'transparent',
+                      color:
+                        s.key === activeKey
+                          ? 'var(--pc-accent)'
+                          : 'var(--pc-text-primary)',
+                      fontWeight: s.key === activeKey ? 600 : 400,
+                      borderLeft:
+                        s.key === activeKey
+                          ? '2px solid var(--pc-accent)'
+                          : '2px solid transparent',
+                    }}
+                  >
+                    <span>{s.label}</span>
+                    {s.key === activeKey && <ChevronRight className="h-3.5 w-3.5" />}
+                  </button>
+                ))}
+              </div>
+            );
+          })}
         </nav>
       </aside>
 

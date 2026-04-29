@@ -385,6 +385,8 @@ export interface SectionInfo {
   has_picker: boolean;
   /** True when the user has marked the section completed in onboard_state. */
   completed: boolean;
+  /** Display group for the sidebar (`Onboarding`, `Agent`, `Tools`, ...). */
+  group: string;
 }
 
 export interface SectionsResponse {
