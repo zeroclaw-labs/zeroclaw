@@ -479,7 +479,7 @@ pub async fn run_gateway(
     // store the gateway's WebSocket and REST endpoints serve (#5356).
     // Standalone gateway invocations (no daemon supervisor) fall back
     // to a fresh store.
-    let canvas_store = canvas_store.unwrap_or_else(tools::CanvasStore::new);
+    let canvas_store = canvas_store.unwrap_or_default();
 
     let (
         mut tools_registry_raw,
