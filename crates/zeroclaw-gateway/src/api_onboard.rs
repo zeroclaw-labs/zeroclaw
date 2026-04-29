@@ -177,7 +177,13 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
         .collect();
 
     let sections = vec![
-        section_info("workspace", "Workspace", workspace_help(), false, &completed),
+        section_info(
+            "workspace",
+            "Workspace",
+            workspace_help(),
+            false,
+            &completed,
+        ),
         section_info("providers", "Providers", providers_help(), true, &completed),
         section_info("channels", "Channels", channels_help(), true, &completed),
         section_info("memory", "Memory", memory_help(), true, &completed),
@@ -566,9 +572,15 @@ mod tests {
         let cfg = empty_cfg();
         let items = providers_picker(&cfg);
         let names: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
-        assert!(names.contains(&"anthropic"), "expected anthropic in picker, got: {names:?}");
+        assert!(
+            names.contains(&"anthropic"),
+            "expected anthropic in picker, got: {names:?}"
+        );
         assert!(names.contains(&"openai"), "expected openai in picker");
-        assert!(names.contains(&"openrouter"), "expected openrouter in picker");
+        assert!(
+            names.contains(&"openrouter"),
+            "expected openrouter in picker"
+        );
 
         // Display name is human-readable, not the canonical key.
         let anthropic = items.iter().find(|i| i.key == "anthropic").unwrap();
@@ -576,7 +588,10 @@ mod tests {
 
         // Local-only providers carry a description hint.
         let local = items.iter().find(|i| i.description.is_some());
-        assert!(local.is_some(), "at least one provider should be marked local");
+        assert!(
+            local.is_some(),
+            "at least one provider should be marked local"
+        );
 
         // Empty config has no configured providers — no badges yet.
         assert!(
