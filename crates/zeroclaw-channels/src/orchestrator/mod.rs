@@ -431,9 +431,7 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
     // must agree on the same key form — deriving it once here ensures they do.
     let safe_target = msg.reply_target.replace(':', "__");
     match &msg.thread_ts {
-        Some(tid) => format!(
-            "{}_{}_{}_{}", msg.channel, safe_target, tid, msg.sender
-        ),
+        Some(tid) => format!("{}_{}_{}_{}", msg.channel, safe_target, tid, msg.sender),
         None => format!("{}_{}_{}", msg.channel, safe_target, msg.sender),
     }
 }
@@ -5861,12 +5859,8 @@ mod tests {
         // Without sanitization, session_store::session_path would map ':' to
         // '_' on the write path while the in-memory read path kept ':',
         // producing a key mismatch on restart-hydration. See PR #6091.
-        let msg = channel_message_for_history_key(
-            "telegram",
-            "-1003813552641:42",
-            Some("42"),
-            "alice",
-        );
+        let msg =
+            channel_message_for_history_key("telegram", "-1003813552641:42", Some("42"), "alice");
         assert_eq!(
             conversation_history_key(&msg),
             "telegram_-1003813552641__42_42_alice"
@@ -5878,23 +5872,15 @@ mod tests {
         // Slack/Discord and any non-forum-topic Telegram traffic don't put
         // ':' in reply_target — sanitization is a no-op and the key is
         // byte-identical to the pre-fix behaviour.
-        let with_thread = channel_message_for_history_key(
-            "slack",
-            "C12345",
-            Some("1234.5"),
-            "alice",
-        );
+        let with_thread =
+            channel_message_for_history_key("slack", "C12345", Some("1234.5"), "alice");
         assert_eq!(
             conversation_history_key(&with_thread),
             "slack_C12345_1234.5_alice"
         );
 
-        let without_thread = channel_message_for_history_key(
-            "telegram",
-            "-1003813552641",
-            None,
-            "alice",
-        );
+        let without_thread =
+            channel_message_for_history_key("telegram", "-1003813552641", None, "alice");
         assert_eq!(
             conversation_history_key(&without_thread),
             "telegram_-1003813552641_alice"
@@ -5905,18 +5891,10 @@ mod tests {
     fn conversation_history_key_distinguishes_topics_in_same_chat() {
         // Two different forum topics under the same chat must produce
         // distinct history keys; otherwise topic context would cross-pollinate.
-        let topic_42 = channel_message_for_history_key(
-            "telegram",
-            "-1003813552641:42",
-            Some("42"),
-            "alice",
-        );
-        let topic_99 = channel_message_for_history_key(
-            "telegram",
-            "-1003813552641:99",
-            Some("99"),
-            "alice",
-        );
+        let topic_42 =
+            channel_message_for_history_key("telegram", "-1003813552641:42", Some("42"), "alice");
+        let topic_99 =
+            channel_message_for_history_key("telegram", "-1003813552641:99", Some("99"), "alice");
         assert_ne!(
             conversation_history_key(&topic_42),
             conversation_history_key(&topic_99)
