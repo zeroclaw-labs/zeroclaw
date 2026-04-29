@@ -397,6 +397,20 @@ export function getSections(): Promise<SectionsResponse> {
   return apiFetch<SectionsResponse>('/api/onboard/sections');
 }
 
+export interface OnboardStatusResponse {
+  /** True when the user is on a fresh install (no completed sections AND
+   * no provider configured). The Dashboard uses this to redirect first
+   * visits to `/onboard`. */
+  needs_onboarding: boolean;
+  /** Stable machine-readable reason: `fresh_install`, `has_provider`, or
+   * `has_completed_sections`. */
+  reason: string;
+}
+
+export function getOnboardStatus(): Promise<OnboardStatusResponse> {
+  return apiFetch<OnboardStatusResponse>('/api/onboard/status');
+}
+
 export interface PickerItem {
   key: string;
   label: string;

@@ -998,6 +998,7 @@ pub async fn run_gateway(
             "/api/onboard/catalog/models",
             get(api_onboard::handle_catalog_models),
         )
+        .route("/api/onboard/status", get(api_onboard::handle_onboard_status))
         .route("/api/onboard/sections", get(api_onboard::handle_sections))
         .route(
             "/api/onboard/sections/{section}",

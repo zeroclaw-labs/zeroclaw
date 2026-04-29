@@ -165,6 +165,52 @@ pub struct SectionsResponse {
     pub sections: Vec<SectionInfo>,
 }
 
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct OnboardStatusResponse {
+    /// `true` when the user hasn't started onboarding yet — no completed
+    /// section markers AND no usable provider configured. The dashboard
+    /// uses this signal to redirect first-load visits from `/` to
+    /// `/onboard`.
+    pub needs_onboarding: bool,
+    /// Short machine-readable reason for the value of `needs_onboarding`,
+    /// for logs / debugging. Stable: `fresh_install` / `has_provider` /
+    /// `has_completed_sections`.
+    pub reason: &'static str,
+}
+
+/// `GET /api/onboard/status` — boolean signal for the dashboard's
+/// fresh-install redirect. The daemon writes a default `config.toml` on
+/// first init, so file existence isn't a useful "is the user new?" check.
+/// Instead we look at two explicit user-driven markers: any
+/// `onboard_state.completed_sections` entry (set when the wizard finishes
+/// a section) OR any usable provider (`providers.fallback` set, or any
+/// entry under `providers.models`). When neither is present, the user is
+/// fresh and should land at `/onboard` instead of the empty Dashboard.
+pub async fn handle_onboard_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let cfg = state.config.lock().clone();
+
+    let has_completed = !cfg.onboard_state.completed_sections.is_empty();
+    let has_provider = cfg.providers.fallback.is_some() || !cfg.providers.models.is_empty();
+
+    let (needs_onboarding, reason) = if has_completed {
+        (false, "has_completed_sections")
+    } else if has_provider {
+        (false, "has_provider")
+    } else {
+        (true, "fresh_install")
+    };
+
+    axum::Json(OnboardStatusResponse {
+        needs_onboarding,
+        reason,
+    })
+    .into_response()
+}
+
 /// `GET /api/onboard/sections` — list every top-level config section.
 ///
 /// Schema-driven: walks `Config::prop_fields()` and collects unique first
