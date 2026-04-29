@@ -684,3 +684,28 @@ impl Channel for WuKongIMChannel {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_approval_structs() {
+        let card = WkApprovalCard {
+            msg_type: 20,
+            approval_id: "id123".to_string(),
+            timeout_secs: 300,
+            title: "Title".to_string(),
+            body: WkApprovalBody { content: "Body".to_string() },
+        };
+        let json = serde_json::to_string(&card).unwrap();
+        assert!(json.contains("\"type\":20"));
+        assert!(json.contains("\"approval_id\":\"id123\""));
+
+        let action_json = r#"{"type": 21, "approval_id": "id123", "action": "approve"}"#;
+        let action: WkApprovalAction = serde_json::from_str(action_json).unwrap();
+        assert_eq!(action.msg_type, 21);
+        assert_eq!(action.approval_id, "id123");
+        assert_eq!(action.action, "approve");
+    }
+}
