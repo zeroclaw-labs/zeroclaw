@@ -48,14 +48,14 @@ impl FileReadTool {
             anyhow::bail!("Path not allowed by security policy: {path}");
         }
 
-        if let Ok(workspace_rootless) = workspace_dir.strip_prefix("/") {
-            if let Ok(stripped) = p.strip_prefix(workspace_rootless) {
-                return Ok(if stripped.as_os_str().is_empty() {
-                    workspace_dir.clone()
-                } else {
-                    workspace_dir.join(stripped)
-                });
-            }
+        if let Ok(workspace_rootless) = workspace_dir.strip_prefix("/")
+            && let Ok(stripped) = p.strip_prefix(workspace_rootless)
+        {
+            return Ok(if stripped.as_os_str().is_empty() {
+                workspace_dir.clone()
+            } else {
+                workspace_dir.join(stripped)
+            });
         }
 
         Ok(workspace_dir.join(p))

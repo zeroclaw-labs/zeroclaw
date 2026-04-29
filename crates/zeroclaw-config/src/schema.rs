@@ -12149,6 +12149,7 @@ auto_save = true
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            escalation: EscalationConfig::default(),
         };
         // Provider fields are now resolved directly — no cache needed.
 
@@ -12719,6 +12720,7 @@ default_temperature = 0.7
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            escalation: EscalationConfig::default(),
         };
 
         // Provider fields are now resolved directly — no cache needed.
