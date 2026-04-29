@@ -31,8 +31,8 @@ The key checkpoints:
 
 - `cargo fmt` clean (checked in CI)
 - `cargo clippy -D warnings` clean (checked in CI)
-- No dead code — if it's unused, delete it, don't `#[allow(dead_code)]` it
-- Error handling: `anyhow::Result` at binary boundaries, typed errors in library crates. No `unwrap()` / `expect()` in production code paths — propagate with `?` or convert to a typed error
+- No unused production code — delete it, wire it into behavior, or track a follow-up issue. Do not silence it with underscore prefixes or `#[allow(dead_code)]`; reserve underscore names for required but intentionally unused API, trait, or callback parameters.
+- Error handling: `anyhow::Result` at binary boundaries, typed errors in library crates. No `unwrap()` / `expect()` in production code paths — propagate with `?` or document the invariant that makes panic impossible.
 - Minimal dependencies — every dep adds to binary size; weigh the trade before adding one
 - Trait-first — define the trait in `zeroclaw-api`, then implement in the right edge crate
 - Security by default — allowlists, not blocklists. New external surface defaults closed
