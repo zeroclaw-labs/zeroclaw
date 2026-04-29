@@ -202,8 +202,36 @@ export default function FieldForm({ prefix, onSaved, showDelete = true, title }:
     );
   }
 
+  // Count of fields whose draft value differs from the saved display value.
+  // Drives the unsaved-changes counter in the sticky save bar.
+  const unsavedCount = useMemo(() => {
+    let n = 0;
+    for (const e of entries) {
+      const raw = draft[e.path] ?? '';
+      const original = defaultInputValue(e);
+      // Secrets with empty input are "leave alone", not a change.
+      if (e.is_secret && raw.length === 0) continue;
+      if (raw !== original) n += 1;
+    }
+    return n;
+  }, [entries, draft]);
+
+  // Warn user before navigating away with unsaved changes (matches the
+  // beforeunload pattern most form-heavy SPAs use).
+  useEffect(() => {
+    if (unsavedCount === 0) return;
+    const handler = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [unsavedCount]);
+
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-4 pb-20">
+      {/* pb-20 reserves space at the bottom so the last field isn't covered
+          by the sticky save bar when the form is short. */}
       {title && (
         <h2
           className="text-lg font-semibold"
@@ -211,31 +239,6 @@ export default function FieldForm({ prefix, onSaved, showDelete = true, title }:
         >
           {title}
         </h2>
-      )}
-
-      {topError && (
-        <div
-          className="rounded-xl border p-3 text-sm animate-fade-in"
-          style={{
-            background: 'rgba(239, 68, 68, 0.08)',
-            borderColor: 'rgba(239, 68, 68, 0.2)',
-            color: '#f87171',
-          }}
-        >
-          {topError}
-        </div>
-      )}
-      {savedAt && (
-        <div
-          className="rounded-xl border p-3 text-sm animate-fade-in"
-          style={{
-            background: 'rgba(0, 230, 138, 0.06)',
-            borderColor: 'rgba(0, 230, 138, 0.2)',
-            color: 'var(--color-status-success)',
-          }}
-        >
-          {savedAt}
-        </div>
       )}
 
       {entries.length === 0 ? (
@@ -269,17 +272,48 @@ export default function FieldForm({ prefix, onSaved, showDelete = true, title }:
         </form>
       )}
 
+      {/* Sticky footer bar — pinned to the bottom of the scrolling form
+          area so Save is always visible without scrolling. Status (unsaved
+          count / save success / save error) renders inline next to the
+          button so post-save feedback lands where the eye already is. */}
       {entries.length > 0 && (
-        <div className="flex justify-end">
-          <button
-            type="button"
-            onClick={() => void handleSave()}
-            disabled={saving}
-            className="btn-electric flex items-center gap-2 text-sm px-4 py-2"
-          >
-            <Save className="h-4 w-4" />
-            {saving ? 'Saving…' : 'Save'}
-          </button>
+        <div
+          className="sticky bottom-0 left-0 right-0 -mx-6 px-6 py-3 border-t backdrop-blur z-10"
+          style={{
+            borderColor: 'var(--pc-border)',
+            background: 'color-mix(in srgb, var(--pc-bg-base) 88%, transparent)',
+          }}
+        >
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex-1 min-w-0 text-sm">
+              {topError ? (
+                <span style={{ color: 'var(--color-status-error)' }}>
+                  ⚠ {topError}
+                </span>
+              ) : savedAt ? (
+                <span style={{ color: 'var(--color-status-success)' }}>
+                  ✓ {savedAt}
+                </span>
+              ) : unsavedCount > 0 ? (
+                <span style={{ color: 'var(--pc-text-secondary)' }}>
+                  {unsavedCount} unsaved {unsavedCount === 1 ? 'change' : 'changes'}
+                </span>
+              ) : (
+                <span style={{ color: 'var(--pc-text-faint)' }}>
+                  No unsaved changes
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => void handleSave()}
+              disabled={saving || unsavedCount === 0}
+              className="btn-electric flex items-center gap-2 text-sm px-4 py-2 flex-shrink-0"
+            >
+              <Save className="h-4 w-4" />
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+          </div>
         </div>
       )}
     </div>
