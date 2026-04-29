@@ -232,35 +232,47 @@ export default function Onboard() {
       <main className="flex-1 overflow-y-auto p-6">
         {activeSection && (
           <div className="flex flex-col gap-4 max-w-3xl">
-            {/* Breadcrumb */}
-            <div
-              className="text-sm flex items-center gap-1.5 flex-wrap"
-              style={{ color: 'var(--pc-text-muted)' }}
-            >
-              <span style={{ color: 'var(--pc-text-secondary)' }}>Onboard</span>
-              <ChevronRight className="h-3 w-3" />
-              <span
-                style={{
-                  color: picked
-                    ? 'var(--pc-text-secondary)'
-                    : 'var(--pc-accent)',
-                  cursor: picked ? 'pointer' : 'default',
-                  fontWeight: picked ? 400 : 600,
-                }}
-                onClick={() => picked && setPicked(null)}
+            {/* Breadcrumb + always-available Next/Done. The form's own Save
+                bar advances the flow on save, but users editing nothing
+                (Hardware defaults, e.g.) still need a way out — this gives
+                them one regardless of dirty state. */}
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <div
+                className="text-sm flex items-center gap-1.5 flex-wrap"
+                style={{ color: 'var(--pc-text-muted)' }}
               >
-                {activeSection.label}
-              </span>
-              {picked && (
-                <>
-                  <ChevronRight className="h-3 w-3" />
-                  <span
-                    style={{ color: 'var(--pc-accent)', fontWeight: 600 }}
-                  >
-                    {picked.item.label}
-                  </span>
-                </>
-              )}
+                <span style={{ color: 'var(--pc-text-secondary)' }}>Onboard</span>
+                <ChevronRight className="h-3 w-3" />
+                <span
+                  style={{
+                    color: picked
+                      ? 'var(--pc-text-secondary)'
+                      : 'var(--pc-accent)',
+                    cursor: picked ? 'pointer' : 'default',
+                    fontWeight: picked ? 400 : 600,
+                  }}
+                  onClick={() => picked && setPicked(null)}
+                >
+                  {activeSection.label}
+                </span>
+                {picked && (
+                  <>
+                    <ChevronRight className="h-3 w-3" />
+                    <span
+                      style={{ color: 'var(--pc-accent)', fontWeight: 600 }}
+                    >
+                      {picked.item.label}
+                    </span>
+                  </>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => void advanceSection()}
+                className="btn-electric inline-flex items-center gap-1.5 text-sm px-4 py-2"
+              >
+                {isLastSection(sections, activeSection.key) ? 'Done' : 'Next ▶'}
+              </button>
             </div>
 
             {/* Picker view OR form view */}
