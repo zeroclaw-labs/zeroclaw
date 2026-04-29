@@ -122,6 +122,29 @@ pub struct RecvAckParams {
     pub message_seq: u32,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WkApprovalCard {
+    #[serde(rename = "type")]
+    pub msg_type: u32,
+    pub approval_id: String,
+    pub timeout_secs: u64,
+    pub title: String,
+    pub body: WkApprovalBody,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WkApprovalBody {
+    pub content: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WkApprovalAction {
+    #[serde(rename = "type")]
+    pub msg_type: u32,
+    pub approval_id: String,
+    pub action: String,
+}
+
 type WsSink = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     WsMsg,
