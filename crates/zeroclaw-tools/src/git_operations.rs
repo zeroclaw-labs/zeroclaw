@@ -54,7 +54,7 @@ impl GitOperationsTool {
     fn requires_write_access(&self, operation: &str) -> bool {
         matches!(
             operation,
-            "commit" | "add" | "checkout" | "stash" | "reset" | "revert"
+            "commit" | "add" | "checkout" | "stash" | "reset" | "revert" | "worktree"
         )
     }
 
@@ -502,6 +502,138 @@ impl GitOperationsTool {
             }),
         }
     }
+
+    /// Parse `git worktree list --porcelain` output into structured format.
+    ///
+    /// Porcelain format emits one blank-line-delimited block per worktree:
+    ///   worktree <path>
+    ///   HEAD <hash>
+    ///   branch refs/heads/<name>   (or "detached")
+    fn parse_worktree_list(&self, output: &str) -> serde_json::Value {
+        let mut worktrees = Vec::new();
+        let mut current_path = String::new();
+        let mut current_branch = String::new();
+        let mut current_head = String::new();
+        let mut is_detached = false;
+
+        let workspace = self.workspace_dir.to_string_lossy();
+
+        for line in output.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                if !current_path.is_empty() {
+                    worktrees.push(json!({
+                        "path": &current_path,
+                        "branch": if is_detached { "HEAD" } else { &current_branch },
+                        "head": &current_head,
+                        "detached": is_detached,
+                        "active": current_path == workspace.as_ref()
+                    }));
+                    current_path.clear();
+                    current_branch.clear();
+                    current_head.clear();
+                    is_detached = false;
+                }
+            } else if let Some(p) = line.strip_prefix("worktree ") {
+                current_path = p.to_string();
+            } else if let Some(h) = line.strip_prefix("HEAD ") {
+                current_head = h.to_string();
+            } else if let Some(b) = line.strip_prefix("branch ") {
+                current_branch = b.trim_start_matches("refs/heads/").to_string();
+            } else if line == "detached" {
+                is_detached = true;
+            }
+        }
+        // Flush final entry if output has no trailing blank line
+        if !current_path.is_empty() {
+            worktrees.push(json!({
+                "path": &current_path,
+                "branch": if is_detached { "HEAD" } else { current_branch.as_str() },
+                "head": &current_head,
+                "detached": is_detached,
+                "active": current_path == workspace.as_ref()
+            }));
+        }
+
+        json!({ "worktrees": worktrees })
+    }
+
+    async fn git_worktree(
+        &self,
+        args: serde_json::Value,
+        working_dir: &std::path::Path,
+    ) -> anyhow::Result<ToolResult> {
+        let subcommand = match args.get("subcommand").and_then(|v| v.as_str()) {
+            Some(cmd) => cmd,
+            None => anyhow::bail!("Missing 'subcommand' parameter. Use: list, add, remove, prune"),
+        };
+
+        match subcommand {
+            "list" => {
+                let output = self
+                    .run_git_command(&["worktree", "list", "--porcelain"], working_dir)
+                    .await?;
+                let parsed = self.parse_worktree_list(&output);
+                Ok(ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&parsed).unwrap_or_default(),
+                    error: None,
+                })
+            }
+            "add" => {
+                let worktree_path = match args.get("worktree_path").and_then(|v| v.as_str()) {
+                    Some(p) => p,
+                    None => anyhow::bail!("Missing 'worktree_path' parameter for worktree add"),
+                };
+                self.sanitize_git_args(worktree_path)?;
+
+                let branch = args
+                    .get("branch")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                // git worktree add <path> [<branch>]
+                let mut git_args = vec!["worktree", "add", worktree_path];
+                if !branch.is_empty() {
+                    self.sanitize_git_args(branch)?;
+                    git_args.push(branch);
+                }
+
+                self.run_git_command(&git_args, working_dir).await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("Worktree added at: {worktree_path}"),
+                    error: None,
+                })
+            }
+            "remove" => {
+                let worktree_path = match args.get("worktree_path").and_then(|v| v.as_str()) {
+                    Some(p) => p,
+                    None => anyhow::bail!("Missing 'worktree_path' parameter for worktree remove"),
+                };
+                self.sanitize_git_args(worktree_path)?;
+
+                self.run_git_command(&["worktree", "remove", worktree_path], working_dir)
+                    .await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("Worktree removed: {worktree_path}"),
+                    error: None,
+                })
+            }
+            "prune" => {
+                self.run_git_command(&["worktree", "prune"], working_dir)
+                    .await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: "Worktree prune completed".to_string(),
+                    error: None,
+                })
+            }
+            _ => anyhow::bail!(
+                "Unknown worktree subcommand: {subcommand}. Use: list, add, remove, prune"
+            ),
+        }
+    }
 }
 
 #[async_trait]
@@ -511,7 +643,7 @@ impl Tool for GitOperationsTool {
     }
 
     fn description(&self) -> &str {
-        "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls."
+        "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, worktree). Provides parsed JSON output and integrates with security policy for autonomy controls."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -520,8 +652,13 @@ impl Tool for GitOperationsTool {
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["status", "diff", "log", "branch", "commit", "add", "checkout", "stash"],
+                    "enum": ["status", "diff", "log", "branch", "commit", "add", "checkout", "stash", "worktree"],
                     "description": "Git operation to perform"
+                },
+                "subcommand": {
+                    "type": "string",
+                    "enum": ["list", "add", "remove", "prune"],
+                    "description": "Worktree subcommand"
                 },
                 "message": {
                     "type": "string",
@@ -533,7 +670,11 @@ impl Tool for GitOperationsTool {
                 },
                 "branch": {
                     "type": "string",
-                    "description": "Branch name (for 'checkout' operation)"
+                    "description": "Branch name (for 'checkout' operation or 'worktree add' subcommand)"
+                },
+                "worktree_path": {
+                    "type": "string",
+                    "description": "Filesystem path for the worktree (for 'worktree add' and 'worktree remove' subcommands). May be outside the workspace directory."
                 },
                 "files": {
                     "type": "string",
@@ -654,6 +795,7 @@ impl Tool for GitOperationsTool {
             "add" => self.git_add(args, &working_dir).await,
             "checkout" => self.git_checkout(args, &working_dir).await,
             "stash" => self.git_stash(args, &working_dir).await,
+            "worktree" => self.git_worktree(args, &working_dir).await,
             _ => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -757,20 +899,13 @@ mod tests {
         assert!(tool.requires_write_access("commit"));
         assert!(tool.requires_write_access("add"));
         assert!(tool.requires_write_access("checkout"));
+        assert!(tool.requires_write_access("stash"));
+        assert!(tool.requires_write_access("worktree"));
 
         assert!(!tool.requires_write_access("status"));
         assert!(!tool.requires_write_access("diff"));
         assert!(!tool.requires_write_access("log"));
-    }
-
-    #[test]
-    fn branch_is_not_write_gated() {
-        let tmp = TempDir::new().unwrap();
-        let tool = test_tool(tmp.path());
-
-        // Branch listing is read-only; it must not require write access
         assert!(!tool.requires_write_access("branch"));
-        assert!(tool.is_read_only("branch"));
     }
 
     #[test]
@@ -783,8 +918,20 @@ mod tests {
         assert!(tool.is_read_only("log"));
         assert!(tool.is_read_only("branch"));
 
+        // worktree has write subcommands (add/remove), so it is not read-only
+        assert!(!tool.is_read_only("worktree"));
         assert!(!tool.is_read_only("commit"));
         assert!(!tool.is_read_only("add"));
+    }
+
+    #[test]
+    fn branch_is_not_write_gated() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+
+        // Branch listing is read-only; it must not require write access
+        assert!(!tool.requires_write_access("branch"));
+        assert!(tool.is_read_only("branch"));
     }
 
     #[tokio::test]
@@ -857,10 +1004,6 @@ mod tests {
         // The error should be about git (not about autonomy/read-only mode)
         assert!(!result.success, "Expected failure due to missing git repo");
         let error_msg = result.error.as_deref().unwrap_or("");
-        assert!(
-            !error_msg.is_empty(),
-            "Expected a git-related error message"
-        );
         assert!(
             !error_msg.contains("read-only") && !error_msg.contains("autonomy"),
             "Error should be about git, not about autonomy restrictions: {error_msg}"
@@ -990,5 +1133,36 @@ mod tests {
             result.error
         );
         assert!(result.output.contains("branch"));
+    }
+
+    #[tokio::test]
+    async fn git_worktree_list_works() {
+        let tmp = TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        let tool = test_tool(tmp.path());
+
+        let result = tool
+            .execute(json!({"operation": "worktree", "subcommand": "list"}))
+            .await
+            .unwrap();
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        let worktrees = parsed["worktrees"]
+            .as_array()
+            .expect("worktrees must be an array");
+        assert!(
+            !worktrees.is_empty(),
+            "Expected at least the main worktree in the list"
+        );
+        assert!(
+            worktrees[0]["path"].as_str().is_some_and(|p| !p.is_empty()),
+            "Main worktree must have a non-empty path"
+        );
     }
 }

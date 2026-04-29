@@ -265,12 +265,29 @@ pub struct AcpServer {
 impl AcpServer {
     pub fn new(config: Config, acp_config: AcpServerConfig) -> Self {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
+        Self::with_writer(config, acp_config, writer_tx, Some(writer_rx))
+    }
+
+    pub fn new_with_writer(
+        config: Config,
+        acp_config: AcpServerConfig,
+        writer_tx: mpsc::Sender<String>,
+    ) -> Self {
+        Self::with_writer(config, acp_config, writer_tx, None)
+    }
+
+    fn with_writer(
+        config: Config,
+        acp_config: AcpServerConfig,
+        writer_tx: mpsc::Sender<String>,
+        writer_rx: Option<mpsc::Receiver<String>>,
+    ) -> Self {
         Self {
             config,
             acp_config,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
-            writer_rx: std::sync::Mutex::new(Some(writer_rx)),
+            writer_rx: std::sync::Mutex::new(writer_rx),
         }
     }
 
@@ -333,53 +350,74 @@ impl AcpServer {
                 continue;
             }
 
-            // First, peek at whether this is a response (has `result` or
-            // `error`) to a request *we* sent. Inbound requests/notifications
-            // fall through to the JsonRpcRequest path.
-            if let Ok(value) = serde_json::from_str::<Value>(trimmed)
-                && value.is_object()
-                && (value.get("result").is_some() || value.get("error").is_some())
-                && let Some(id) = value.get("id")
-            {
-                let id_str = id
-                    .as_str()
-                    .map(String::from)
-                    .unwrap_or_else(|| id.to_string());
-                let result = value.get("result").cloned();
-                let error: Option<JsonRpcError> = value
-                    .get("error")
-                    .and_then(|e| serde_json::from_value(e.clone()).ok());
-                self.rpc.dispatch_response(&id_str, result, error);
-                continue;
-            }
-
-            match serde_json::from_str::<JsonRpcRequest>(trimmed) {
-                Ok(request) => {
-                    if request.jsonrpc != "2.0" {
-                        if let Some(id) = request.id {
-                            self.write_error(id, INVALID_REQUEST, "Invalid JSON-RPC version")
-                                .await;
-                        }
-                        continue;
-                    }
-                    // Spawn so a long-running session/prompt doesn't block the
-                    // read loop — outbound RPC responses (e.g. for
-                    // session/request_permission) need to be processable
-                    // while a prompt turn is in flight.
-                    let server = Arc::clone(&self);
-                    tokio::spawn(async move {
-                        server.handle_request(request).await;
-                    });
-                }
-                Err(e) => {
-                    warn!("Failed to parse JSON-RPC request: {e}");
-                    self.write_error(Value::Null, PARSE_ERROR, &format!("Parse error: {e}"))
-                        .await;
-                }
-            }
+            self.process_line(trimmed).await;
         }
 
         Ok(())
+    }
+
+    /// Run the ACP server against an already-framed line source.
+    ///
+    /// This is used by the gateway WebSocket bridge, where inbound WebSocket
+    /// text messages are already complete JSON-RPC frames and outbound frames
+    /// are supplied by the writer channel passed to [`new_with_writer`].
+    pub async fn run_messages(self: Arc<Self>, mut input_rx: mpsc::Receiver<String>) -> Result<()> {
+        while let Some(line) = input_rx.recv().await {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            self.process_line(trimmed).await;
+        }
+
+        Ok(())
+    }
+
+    async fn process_line(self: &Arc<Self>, trimmed: &str) {
+        // First, peek at whether this is a response (has `result` or
+        // `error`) to a request *we* sent. Inbound requests/notifications
+        // fall through to the JsonRpcRequest path.
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed)
+            && value.is_object()
+            && (value.get("result").is_some() || value.get("error").is_some())
+            && let Some(id) = value.get("id")
+        {
+            let id_str = id
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| id.to_string());
+            let result = value.get("result").cloned();
+            let error: Option<JsonRpcError> = value
+                .get("error")
+                .and_then(|e| serde_json::from_value(e.clone()).ok());
+            self.rpc.dispatch_response(&id_str, result, error);
+            return;
+        }
+
+        match serde_json::from_str::<JsonRpcRequest>(trimmed) {
+            Ok(request) => {
+                if request.jsonrpc != "2.0" {
+                    if let Some(id) = request.id {
+                        self.write_error(id, INVALID_REQUEST, "Invalid JSON-RPC version")
+                            .await;
+                    }
+                    return;
+                }
+                // Spawn so a long-running session/prompt doesn't block the
+                // read loop — outbound RPC responses (e.g. for
+                // session/request_permission) need to be processable
+                // while a prompt turn is in flight.
+                let server = Arc::clone(self);
+                tokio::spawn(async move {
+                    server.handle_request(request).await;
+                });
+            }
+            Err(e) => {
+                warn!("Failed to parse JSON-RPC request: {e}");
+                self.write_error(Value::Null, PARSE_ERROR, &format!("Parse error: {e}"))
+                    .await;
+            }
+        }
     }
 
     async fn handle_request(&self, request: JsonRpcRequest) {

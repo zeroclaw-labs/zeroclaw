@@ -7,6 +7,7 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod acp;
 pub mod api;
 pub mod api_pairing;
 #[cfg(feature = "plugins-wasm")]
@@ -1075,6 +1076,8 @@ pub async fn run_gateway(
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
         .route("/api/events/history", get(sse::handle_events_history))
+        // ── ACP client bridge ──
+        .route("/acp", get(acp::handle_ws_acp))
         // ── WebSocket agent chat ──
         .route("/ws/chat", get(ws::handle_ws_chat))
         // ── WebSocket canvas updates ──
