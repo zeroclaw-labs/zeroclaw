@@ -191,6 +191,32 @@ export default function FieldForm({ prefix, onSaved, showDelete = true, title }:
     });
   }, [entries]);
 
+  // Count of fields whose draft value differs from the saved display value.
+  // Drives the unsaved-changes counter in the sticky save bar. Must be
+  // declared above the conditional render so hook count stays stable
+  // across the loading / loaded transition (React error #310).
+  const unsavedCount = useMemo(() => {
+    let n = 0;
+    for (const e of entries) {
+      const raw = draft[e.path] ?? '';
+      const original = defaultInputValue(e);
+      if (e.is_secret && raw.length === 0) continue;
+      if (raw !== original) n += 1;
+    }
+    return n;
+  }, [entries, draft]);
+
+  // Warn user before navigating away with unsaved changes.
+  useEffect(() => {
+    if (unsavedCount === 0) return;
+    const handler = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [unsavedCount]);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12">
@@ -201,32 +227,6 @@ export default function FieldForm({ prefix, onSaved, showDelete = true, title }:
       </div>
     );
   }
-
-  // Count of fields whose draft value differs from the saved display value.
-  // Drives the unsaved-changes counter in the sticky save bar.
-  const unsavedCount = useMemo(() => {
-    let n = 0;
-    for (const e of entries) {
-      const raw = draft[e.path] ?? '';
-      const original = defaultInputValue(e);
-      // Secrets with empty input are "leave alone", not a change.
-      if (e.is_secret && raw.length === 0) continue;
-      if (raw !== original) n += 1;
-    }
-    return n;
-  }, [entries, draft]);
-
-  // Warn user before navigating away with unsaved changes (matches the
-  // beforeunload pattern most form-heavy SPAs use).
-  useEffect(() => {
-    if (unsavedCount === 0) return;
-    const handler = (e: BeforeUnloadEvent) => {
-      e.preventDefault();
-      e.returnValue = '';
-    };
-    window.addEventListener('beforeunload', handler);
-    return () => window.removeEventListener('beforeunload', handler);
-  }, [unsavedCount]);
 
   return (
     <div className="flex flex-col gap-4 pb-20">
