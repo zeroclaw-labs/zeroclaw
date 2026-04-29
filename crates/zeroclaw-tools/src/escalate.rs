@@ -394,8 +394,7 @@ mod tests {
 
     #[test]
     fn test_tool_metadata() {
-        let tool =
-            EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), vec![]);
+        let tool = EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), vec![]);
         assert_eq!(tool.name(), "escalate_to_human");
         assert!(!tool.description().is_empty());
         assert!(tool.description().to_lowercase().contains("escalat"));
@@ -405,8 +404,7 @@ mod tests {
 
     #[test]
     fn test_parameters_schema() {
-        let tool =
-            EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), vec![]);
+        let tool = EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), vec![]);
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["summary"].is_object());
