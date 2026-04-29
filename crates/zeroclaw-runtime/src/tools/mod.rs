@@ -99,7 +99,8 @@ pub use zeroclaw_tools::reaction::ReactionTool;
 pub use zeroclaw_tools::report_template_tool::ReportTemplateTool;
 pub use zeroclaw_tools::screenshot::ScreenshotTool;
 pub use zeroclaw_tools::sessions::{
-    SessionDeleteTool, SessionResetTool, SessionsHistoryTool, SessionsListTool, SessionsSendTool,
+    SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
+    SessionsListTool, SessionsSendTool,
 };
 pub use zeroclaw_tools::swarm::SwarmTool;
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
@@ -677,10 +678,12 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
-    // Session-to-session messaging tools (always available when sessions dir exists)
+    // Session tools (JSONL path). If a separate SQLite registration path is
+    // added, these tools need to be registered there too.
     if let Ok(session_store) = zeroclaw_infra::session_store::SessionStore::new(workspace_dir) {
         let backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
             Arc::new(session_store);
+        tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsHistoryTool::new(
             backend.clone(),

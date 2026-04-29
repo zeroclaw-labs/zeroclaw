@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { memo, useState, useEffect, useRef, useCallback } from 'react';
 import { Send, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -438,86 +438,15 @@ export default function AgentChat() {
         )}
 
         {messages.map((msg, idx) => (
-          <div
+          <MessageItem
             key={msg.id}
-            className={`group flex items-start ${compact ? 'gap-2' : 'gap-3'} ${
-              msg.role === 'user' ? 'flex-row-reverse animate-slide-in-right' : 'animate-slide-in-left'
-            }`}
-            style={{ animationDelay: `${Math.min(idx * 30, 200)}ms` }}
-          >
-            {!compact && (
-              <div
-                className="flex-shrink-0 w-9 h-9 rounded-2xl flex items-center justify-center border"
-                style={{
-                  background: msg.role === 'user' ? 'var(--pc-accent)' : 'var(--pc-bg-elevated)',
-                  borderColor: msg.role === 'user' ? 'var(--pc-accent)' : 'var(--pc-border)',
-                }}
-              >
-                {msg.role === 'user' ? (
-                  <User className="h-4 w-4 text-white" />
-                ) : (
-                  <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
-                )}
-              </div>
-            )}
-            <div className="relative max-w-[75%]">
-              <div
-                className={compact ? 'rounded-xl px-3 py-1.5 border' : 'rounded-2xl px-4 py-3 border'}
-                style={
-                  msg.role === 'user'
-                    ? { background: 'var(--pc-accent-glow)', borderColor: 'var(--pc-accent-dim)', color: 'var(--pc-text-primary)', }
-                    : { background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)', color: 'var(--pc-text-primary)', }
-                }
-              >
-                {msg.thinking && (
-                  <details className="mb-2">
-                    <summary className="text-xs cursor-pointer select-none" style={{ color: 'var(--pc-text-muted)' }}>Thinking</summary>
-                    <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-lg" style={{ color: 'var(--pc-text-muted)', background: 'var(--pc-bg-surface)' }}>{msg.thinking}</pre>
-                  </details>
-                )}
-                {msg.toolCall ? (
-                  <ToolCallCard toolCall={msg.toolCall} />
-                ) : msg.markdown ? (
-                  <div className={`${compact ? 'text-xs' : 'text-sm'} break-words leading-relaxed chat-markdown`}><ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown></div>
-                ) : (
-                  <p className={`${compact ? 'text-xs' : 'text-sm'} whitespace-pre-wrap break-words leading-relaxed`}>{msg.content}</p>
-                )}
-                {!compact && (
-                  <p
-                    className="text-[10px] mt-1.5" style={{ color: msg.role === 'user' ? 'var(--pc-accent-light)' : 'var(--pc-text-faint)' }}>
-                    {msg.timestamp.toLocaleTimeString()}
-                  </p>
-                )}
-              </div>
-              {/* Hover action buttons — below the bubble, right-aligned */}
-              <div className="flex items-center justify-end gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                <button
-                  onClick={() => handleCopy(msg.id, msg.content)}
-                  aria-label={t('agent.copy_message')}
-                  className="p-1 rounded-lg"
-                  style={{ color: 'var(--pc-text-muted)' }}
-                  onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--pc-text-primary)'; }}
-                  onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; }}
-                >
-                  {copiedId === msg.id ? (
-                    <Check className="h-3.5 w-3.5" style={{ color: '#34d399' }} />
-                  ) : (
-                    <Copy className="h-3.5 w-3.5" />
-                  )}
-                </button>
-                <button
-                  onClick={() => handleDeleteMessage(msg.id)}
-                  aria-label={t('agent.delete_message')}
-                  className="p-1 rounded-lg"
-                  style={{ color: 'var(--pc-text-muted)' }}
-                  onMouseEnter={(e) => { e.currentTarget.style.color = '#f87171'; }}
-                  onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; }}
-                >
-                  <X className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            </div>
-          </div>
+            msg={msg}
+            idx={idx}
+            compact={compact}
+            isCopied={copiedId === msg.id}
+            onCopy={handleCopy}
+            onDelete={handleDeleteMessage}
+          />
         ))}
 
         {typing && (
@@ -588,3 +517,107 @@ export default function AgentChat() {
     </div>
   );
 }
+
+// Each chat message is rendered through this memoized component so that
+// typing into the input does not re-render every existing message (and
+// re-run ReactMarkdown on each one). Keep the prop surface small and pass
+// `isCopied` rather than the parent's full copiedId so only the affected
+// row re-renders when the copy indicator flips. See #5125.
+interface MessageItemProps {
+  msg: ChatMessage;
+  idx: number;
+  compact: boolean;
+  isCopied: boolean;
+  onCopy: (id: string, content: string) => void;
+  onDelete: (id: string) => void;
+}
+
+const MessageItem = memo(function MessageItem({
+  msg,
+  idx,
+  compact,
+  isCopied,
+  onCopy,
+  onDelete,
+}: MessageItemProps) {
+  return (
+    <div
+      className={`group flex items-start ${compact ? 'gap-2' : 'gap-3'} ${
+        msg.role === 'user' ? 'flex-row-reverse animate-slide-in-right' : 'animate-slide-in-left'
+      }`}
+      style={{ animationDelay: `${Math.min(idx * 30, 200)}ms` }}
+    >
+      {!compact && (
+        <div
+          className="flex-shrink-0 w-9 h-9 rounded-2xl flex items-center justify-center border"
+          style={{
+            background: msg.role === 'user' ? 'var(--pc-accent)' : 'var(--pc-bg-elevated)',
+            borderColor: msg.role === 'user' ? 'var(--pc-accent)' : 'var(--pc-border)',
+          }}
+        >
+          {msg.role === 'user' ? (
+            <User className="h-4 w-4 text-white" />
+          ) : (
+            <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
+          )}
+        </div>
+      )}
+      <div className="relative max-w-[75%]">
+        <div
+          className={compact ? 'rounded-xl px-3 py-1.5 border' : 'rounded-2xl px-4 py-3 border'}
+          style={
+            msg.role === 'user'
+              ? { background: 'var(--pc-accent-glow)', borderColor: 'var(--pc-accent-dim)', color: 'var(--pc-text-primary)' }
+              : { background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)', color: 'var(--pc-text-primary)' }
+          }
+        >
+          {msg.thinking && (
+            <details className="mb-2">
+              <summary className="text-xs cursor-pointer select-none" style={{ color: 'var(--pc-text-muted)' }}>Thinking</summary>
+              <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-lg" style={{ color: 'var(--pc-text-muted)', background: 'var(--pc-bg-surface)' }}>{msg.thinking}</pre>
+            </details>
+          )}
+          {msg.toolCall ? (
+            <ToolCallCard toolCall={msg.toolCall} />
+          ) : msg.markdown ? (
+            <div className={`${compact ? 'text-xs' : 'text-sm'} break-words leading-relaxed chat-markdown`}><ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown></div>
+          ) : (
+            <p className={`${compact ? 'text-xs' : 'text-sm'} whitespace-pre-wrap break-words leading-relaxed`}>{msg.content}</p>
+          )}
+          {!compact && (
+            <p
+              className="text-[10px] mt-1.5" style={{ color: msg.role === 'user' ? 'var(--pc-accent-light)' : 'var(--pc-text-faint)' }}>
+              {msg.timestamp.toLocaleTimeString()}
+            </p>
+          )}
+        </div>
+        <div className="flex items-center justify-end gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
+          <button
+            onClick={() => onCopy(msg.id, msg.content)}
+            aria-label={t('agent.copy_message')}
+            className="p-1 rounded-lg"
+            style={{ color: 'var(--pc-text-muted)' }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--pc-text-primary)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; }}
+          >
+            {isCopied ? (
+              <Check className="h-3.5 w-3.5" style={{ color: '#34d399' }} />
+            ) : (
+              <Copy className="h-3.5 w-3.5" />
+            )}
+          </button>
+          <button
+            onClick={() => onDelete(msg.id)}
+            aria-label={t('agent.delete_message')}
+            className="p-1 rounded-lg"
+            style={{ color: 'var(--pc-text-muted)' }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = '#f87171'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; }}
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+});
