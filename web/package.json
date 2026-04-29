@@ -8,9 +8,6 @@
     "build": "tsc -b && vite build",
     "dev": "vite"
   },
-  "engines": {
-    "node": ">=24"
-  },
   "dependencies": {
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",

@@ -41,7 +41,7 @@ function formatDuration(ms: number | null): string {
   return `${(secs / 60).toFixed(1)}m`;
 }
 
-function RunHistoryPanel({ jobId }: { jobId: string }) {
+function RunHistoryPanel({ jobId, refreshKey = 0 }: { jobId: string; refreshKey?: number }) {
   const [runs, setRuns] = useState<CronRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -55,7 +55,7 @@ function RunHistoryPanel({ jobId }: { jobId: string }) {
       .finally(() => setLoading(false));
   }, [jobId]);
 
-  useEffect(() => { fetchRuns(); }, [fetchRuns]);
+  useEffect(() => { fetchRuns(); }, [fetchRuns, refreshKey]);
 
   if (loading) {
     return (
@@ -152,6 +152,8 @@ export default function Cron() {
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
   const [triggering, setTriggering] = useState<string | null>(null);
+  const [triggerError, setTriggerError] = useState<string | null>(null);
+  const [runHistoryRefresh, setRunHistoryRefresh] = useState<Record<string, number>>({});
   const [settings, setSettings] = useState<CronSettings | null>(null);
   const [togglingCatchUp, setTogglingCatchUp] = useState(false);
 
@@ -324,7 +326,7 @@ export default function Cron() {
 
   const handleTrigger = async (id: string) => {
     setTriggering(id);
-    setError(null);
+    setTriggerError(null);
     try {
       const result = await triggerCronJob(id);
       // Refresh job list so last_run / last_status reflect the manual run.
@@ -334,14 +336,16 @@ export default function Cron() {
       } catch {
         // If list refresh fails, leave the existing rows; the user can reload.
       }
-      // Auto-expand the run history so the user can see the result they just triggered.
+      // Auto-expand the run history so the user can see the result they just triggered,
+      // and bump its refresh key so an already-expanded panel reloads.
       setExpandedJob(id);
+      setRunHistoryRefresh((prev) => ({ ...prev, [id]: (prev[id] ?? 0) + 1 }));
       if (!result.success) {
         const detail = result.output?.trim();
-        setError(detail ? `${t('cron.trigger_error')}: ${detail}` : t('cron.trigger_error'));
+        setTriggerError(detail ? `${t('cron.trigger_error')}: ${detail}` : t('cron.trigger_error'));
       }
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : t('cron.trigger_error'));
+      setTriggerError(err instanceof Error ? err.message : t('cron.trigger_error'));
     } finally {
       setTriggering(null);
     }
@@ -616,6 +620,23 @@ export default function Cron() {
         </div>
       )}
 
+      {/* Inline trigger-error banner — keeps the cron table mounted on failed manual runs */}
+      {triggerError && (
+        <div
+          className="rounded-2xl border p-3 text-sm flex items-start justify-between gap-3 animate-fade-in"
+          style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}
+        >
+          <span className="whitespace-pre-wrap break-words">{triggerError}</span>
+          <button
+            onClick={() => setTriggerError(null)}
+            className="btn-icon shrink-0"
+            title={t('cron.dismiss') || 'Dismiss'}
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+
       {/* Jobs Table */}
       {jobs.length === 0 ? (
         <div className="card p-8 text-center">
@@ -746,7 +767,7 @@ export default function Cron() {
                   {expandedJob === job.id && (
                     <tr>
                       <td colSpan={8} style={{ background: 'var(--pc-bg-elevated)' }}>
-                        <RunHistoryPanel jobId={job.id} />
+                        <RunHistoryPanel jobId={job.id} refreshKey={runHistoryRefresh[job.id] ?? 0} />
                       </td>
                     </tr>
                   )}
