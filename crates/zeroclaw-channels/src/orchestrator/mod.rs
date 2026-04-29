@@ -388,6 +388,14 @@ struct ChannelRuntimeContext {
     max_tool_result_chars: usize,
     context_token_budget: usize,
     debouncer: Arc<zeroclaw_infra::debounce::MessageDebouncer>,
+    /// HMAC receipt generator. `Some` when `[agent.tool_receipts] enabled = true`.
+    /// Threaded into `run_tool_call_loop` so `tool_execution::execute_one_tool`
+    /// can sign each result.
+    receipt_generator: Option<zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator>,
+    /// Mirror of `[agent.tool_receipts] show_in_response`. When true,
+    /// `process_channel_message` renders the per-turn collector as a trailing
+    /// `Tool receipts:` block sent after the main reply.
+    show_receipts_in_response: bool,
 }
 
 #[derive(Clone)]
@@ -3132,6 +3140,11 @@ async fn process_channel_message(
     #[allow(clippy::cast_possible_truncation)]
     let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
     tracing::info!(elapsed_before_llm_ms, "⏱ Starting LLM call");
+    // Per-turn collector. `tool_execution::execute_one_tool` pushes
+    // `<tool_name>: <receipt>` here whenever a receipt is generated, so the
+    // orchestrator can render the trailing `Tool receipts:` block after the
+    // loop returns. Inert when `receipt_generator` is `None`.
+    let tool_receipts_collector: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let loop_result = tokio::select! {
@@ -3176,8 +3189,8 @@ async fn process_channel_message(
                         ctx.context_token_budget,
                         None, // shared_budget
                         target_channel.as_deref(),
-                        None, // receipt_generator
-                        None, // collected_receipts
+                        ctx.receipt_generator.as_ref(),
+                        Some(&tool_receipts_collector),
                     ),
                     ),
                     ),
@@ -3459,6 +3472,26 @@ async fn process_channel_message(
                 started_at.elapsed().as_millis(),
                 truncate_with_ellipsis(&delivered_response, 80)
             );
+            // Build the trailing `Tool receipts:` block from the per-turn
+            // collector. Empty when receipts are disabled or no tool ran.
+            let receipts_block = if ctx.show_receipts_in_response {
+                let receipts = tool_receipts_collector
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if receipts.is_empty() {
+                    None
+                } else {
+                    use std::fmt::Write as _;
+                    let mut block = String::from("---\nTool receipts:");
+                    for r in receipts.iter() {
+                        write!(block, "\n  {r}").ok();
+                    }
+                    Some(block)
+                }
+            } else {
+                None
+            };
+
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     if let Err(e) = channel
@@ -3482,6 +3515,15 @@ async fn process_channel_message(
                     .await
                 {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                }
+                // Send tool receipts as a separate message in the same thread.
+                if let Some(ref block) = receipts_block {
+                    let _ = channel
+                        .send(
+                            &SendMessage::new(block, &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await;
                 }
             }
         }
@@ -5518,6 +5560,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
         system_prompt.push_str(&deferred_section);
     }
 
+    // Append the receipt-echo instruction so the model carries
+    // `[receipt: zc-receipt-...]` markers verbatim into its response.
+    if config.agent.tool_receipts.enabled && config.agent.tool_receipts.inject_system_prompt {
+        system_prompt.push_str(
+            "\n## Tool Execution Receipts\n\n\
+             Every tool result includes a `[receipt: ...]` field. This is a cryptographic \
+             signature proving the tool actually executed. You must include the receipt \
+             verbatim when referencing tool results. Do not modify, omit, or fabricate receipts. \
+             A missing or invalid receipt indicates a fabricated tool call.\n\n",
+        );
+    }
+
     if !skills.is_empty() {
         println!(
             "  🧩 Skills:   {}",
@@ -5760,6 +5814,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
         debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
             Duration::from_millis(config.channels.debounce_ms),
         )),
+        receipt_generator: if config.agent.tool_receipts.enabled {
+            Some(zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new())
+        } else {
+            None
+        },
+        show_receipts_in_response: config.agent.tool_receipts.show_in_response,
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
@@ -6336,6 +6396,8 @@ mod tests {
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -6462,6 +6524,8 @@ mod tests {
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -6545,6 +6609,8 @@ mod tests {
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -6645,6 +6711,8 @@ mod tests {
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         };
 
         assert!(rollback_orphan_user_turn(
@@ -7246,6 +7314,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7338,6 +7408,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7444,6 +7516,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7535,6 +7609,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7636,6 +7712,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7758,6 +7836,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7861,6 +7941,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7979,6 +8061,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -8085,6 +8169,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -8181,6 +8267,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -8400,6 +8488,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
@@ -8514,6 +8604,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -8647,6 +8739,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -8777,6 +8871,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -8885,6 +8981,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -8974,6 +9072,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -9063,6 +9163,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -9858,6 +9960,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -10004,6 +10108,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -10191,6 +10297,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -10309,6 +10417,8 @@ BTC is currently around $65,000 based on latest tool output."#
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -10933,6 +11043,8 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -11031,6 +11143,8 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -11161,6 +11275,8 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 std::time::Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
         });
@@ -11339,6 +11455,8 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -11461,6 +11579,8 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -11575,6 +11695,8 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -11709,6 +11831,8 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -12025,6 +12149,8 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::ZERO,
             )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);

@@ -111,7 +111,7 @@ inject_system_prompt = true # instruct the model to echo receipts verbatim
 | Receipt appended to tool result | Shipped |
 | Debug log of receipts | Shipped |
 | `show_in_response` | Shipped |
-| System-prompt instruction to echo receipts | In flight |
+| System-prompt instruction to echo receipts | Shipped |
 | Persistent audit database of receipts | Planned |
 | Cross-session receipt verification | Not planned (see ephemeral-key design) |
 
