@@ -34,9 +34,10 @@ pub fn build_locales(root: &std::path::Path) -> anyhow::Result<()> {
             .join(" ")
     );
     inject_lang_switcher_locales(&book, &entries)?;
+    let mdbook = mdbook_program()?;
     for entry in &entries {
         run_cmd(
-            Command::new("mdbook")
+            Command::new(&mdbook)
                 .args(["build", "-d", &format!("book/{}", entry.code)])
                 .env("MDBOOK_BOOK__LANGUAGE", &entry.code)
                 .current_dir(&book),

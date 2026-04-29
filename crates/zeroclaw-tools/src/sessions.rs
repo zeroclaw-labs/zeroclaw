@@ -1,9 +1,12 @@
 //! Session-to-session messaging tools for inter-agent communication.
 //!
-//! Provides three tools:
+//! Provides six tools:
+//! - `sessions_current` — identify the currently active session
 //! - `sessions_list` — list active sessions with metadata
 //! - `sessions_history` — read message history from a specific session
 //! - `sessions_send` — send a message to a specific session
+//! - `sessions_reset` — clear a session's message history
+//! - `sessions_delete` — permanently delete a session
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -315,6 +318,72 @@ impl Tool for SessionsSendTool {
     }
 }
 
+// ── SessionsCurrentTool ────────────────────────────────────────────
+
+/// Returns the session key and metadata for the currently active session.
+/// Reads the session key from the `TOOL_LOOP_SESSION_KEY` task-local,
+/// which is scoped by the gateway WebSocket handler around each agent turn.
+pub struct SessionsCurrentTool {
+    backend: Arc<dyn SessionBackend>,
+}
+
+impl SessionsCurrentTool {
+    pub fn new(backend: Arc<dyn SessionBackend>) -> Self {
+        Self { backend }
+    }
+}
+
+#[async_trait]
+impl Tool for SessionsCurrentTool {
+    fn name(&self) -> &str {
+        "sessions_current"
+    }
+
+    fn description(&self) -> &str {
+        "Return the session key and metadata for the session this agent is currently running in."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let session_key = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+
+        let Some(key) = session_key else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "No active session context. This tool is only available during a gateway session.".into(),
+                ),
+            });
+        };
+
+        let mut output = format!("Current session: {key}\n");
+        if let Some(meta) = self.backend.get_session_metadata(&key) {
+            if let Some(name) = meta.name.filter(|name| !name.is_empty()) {
+                let _ = writeln!(output, "Name: {name}");
+            }
+            if meta.message_count > 0 {
+                let _ = writeln!(output, "Messages: {}", meta.message_count);
+            }
+        }
+
+        Ok(ToolResult {
+            success: true,
+            output,
+            error: None,
+        })
+    }
+}
+
 // ── SessionResetTool ────────────────────────────────────────────────
 
 /// Resets a session by clearing its message history. The session key
@@ -375,34 +444,23 @@ impl Tool for SessionResetTool {
             return Ok(error.into_tool_result());
         }
 
-        // TOCTOU: a message appended between load() and the last remove_last()
-        // will also be removed. Acceptable until clear_messages lands (#5701).
-        let messages = self.backend.load(session_id);
-        if messages.is_empty() {
-            return Ok(ToolResult {
+        match self.backend.clear_messages(session_id) {
+            Ok(0) => Ok(ToolResult {
                 success: true,
                 output: format!("Session '{session_id}' is already empty."),
                 error: None,
-            });
+            }),
+            Ok(count) => Ok(ToolResult {
+                success: true,
+                output: format!("Session '{session_id}' reset ({count} messages cleared)."),
+                error: None,
+            }),
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Failed to reset session: {e}")),
+            }),
         }
-
-        // Remove messages one by one via remove_last until empty
-        let msg_count = messages.len();
-        for _ in 0..msg_count {
-            if let Err(e) = self.backend.remove_last(session_id) {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to reset session: {e}")),
-                });
-            }
-        }
-
-        Ok(ToolResult {
-            success: true,
-            output: format!("Session '{session_id}' reset ({msg_count} messages cleared)."),
-            error: None,
-        })
     }
 }
 
@@ -822,6 +880,72 @@ mod tests {
         );
     }
 
+    // ── SessionsCurrentTool tests ──────────────────────────────────
+
+    #[tokio::test]
+    async fn sessions_current_returns_key_when_scoped() {
+        let (tmp, backend) = test_backend();
+        let _ = tmp;
+        backend
+            .append("gw_test-123", &ChatMessage::user("hello"))
+            .unwrap();
+
+        let tool = SessionsCurrentTool::new(backend);
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some("gw_test-123".into()), tool.execute(json!({})))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("gw_test-123"));
+        assert!(result.output.contains("Messages: 1"));
+    }
+
+    #[tokio::test]
+    async fn sessions_current_fails_without_scope() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionsCurrentTool::new(backend);
+
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("No active session context"));
+    }
+
+    #[tokio::test]
+    async fn sessions_current_includes_name() {
+        let tmp = TempDir::new().unwrap();
+        let sqlite = zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(sqlite);
+        backend
+            .append("gw_named", &ChatMessage::user("hi"))
+            .unwrap();
+        backend.set_session_name("gw_named", "My Chat").unwrap();
+
+        let tool = SessionsCurrentTool::new(backend);
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some("gw_named".into()), tool.execute(json!({})))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("My Chat"));
+    }
+
+    #[tokio::test]
+    async fn sessions_current_unknown_key_still_succeeds() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionsCurrentTool::new(backend);
+
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some("gw_unknown".into()), tool.execute(json!({})))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("gw_unknown"));
+        assert!(!result.output.contains("Messages:"));
+    }
+
     // ── SessionResetTool tests ─────────────────────────────────────
 
     #[tokio::test]
@@ -958,6 +1082,8 @@ mod tests {
 
     /// Delegates everything except delete_session, which uses the trait
     /// default (returns Ok(false) without deleting anything).
+    /// Coupled to SessionBackend's default — if that default changes,
+    /// this wrapper's behavior changes too.
     struct NoOpDeleteBackend(Arc<dyn SessionBackend>);
 
     impl SessionBackend for NoOpDeleteBackend {

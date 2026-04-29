@@ -1500,7 +1500,8 @@ async fn main() -> Result<()> {
                     info!("🔄 Restarting ZeroClaw Gateway on {addr}");
 
                     // Try to gracefully shutdown existing gateway via admin endpoint
-                    match shutdown_gateway(&host, port).await {
+                    match shutdown_gateway(&host, port, config.gateway.path_prefix.as_deref()).await
+                    {
                         Ok(()) => {
                             info!("   ✓ Existing gateway on {addr} shut down gracefully");
                             // Poll until the port is free (connection refused) or timeout
@@ -1536,7 +1537,9 @@ async fn main() -> Result<()> {
 
                     // Fetch live pairing code from running gateway
                     // If --new is specified, generate a fresh pairing code
-                    match fetch_paircode(host, port, new).await {
+                    match fetch_paircode(host, port, config.gateway.path_prefix.as_deref(), new)
+                        .await
+                    {
                         Ok(Some(code)) => {
                             println!("🔐 Gateway pairing is enabled.");
                             println!();
@@ -2661,8 +2664,8 @@ fn log_gateway_start(host: &str, port: u16) {
 
 /// Gracefully shutdown a running gateway via the admin endpoint.
 #[cfg(feature = "agent-runtime")]
-async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
-    let url = format!("http://{host}:{port}/admin/shutdown");
+async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> Result<()> {
+    let url = gateway_admin_url(host, port, path_prefix, "/admin/shutdown");
     let client = reqwest::Client::new();
 
     match client
@@ -2683,12 +2686,17 @@ async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
 /// Fetch the current pairing code from a running gateway.
 /// If `new` is true, generates a fresh pairing code via POST request.
 #[cfg(feature = "agent-runtime")]
-async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<String>> {
+async fn fetch_paircode(
+    host: &str,
+    port: u16,
+    path_prefix: Option<&str>,
+    new: bool,
+) -> Result<Option<String>> {
     let client = reqwest::Client::new();
 
     let response = if new {
         // Generate a new pairing code via POST
-        let url = format!("http://{host}:{port}/admin/paircode/new");
+        let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode/new");
         client
             .post(&url)
             .timeout(std::time::Duration::from_secs(5))
@@ -2696,7 +2704,7 @@ async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<Strin
             .await
     } else {
         // Get existing pairing code via GET
-        let url = format!("http://{host}:{port}/admin/paircode");
+        let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode");
         client
             .get(&url)
             .timeout(std::time::Duration::from_secs(5))
@@ -2726,6 +2734,12 @@ async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<Strin
         .get("pairing_code")
         .and_then(|v| v.as_str())
         .map(String::from))
+}
+
+#[cfg(feature = "agent-runtime")]
+fn gateway_admin_url(host: &str, port: u16, path_prefix: Option<&str>, admin_path: &str) -> String {
+    let prefix = path_prefix.unwrap_or("");
+    format!("http://{host}:{port}{prefix}{admin_path}")
 }
 
 // ─── Generic Pending OAuth Login ────────────────────────────────────────────
@@ -3467,6 +3481,24 @@ mod tests {
         assert!(
             has_model_flag,
             "onboard help should include --model for quick setup overrides"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn gateway_admin_url_uses_unprefixed_admin_path_by_default() {
+        assert_eq!(
+            gateway_admin_url("127.0.0.1", 42617, None, "/admin/paircode"),
+            "http://127.0.0.1:42617/admin/paircode"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn gateway_admin_url_prepends_configured_path_prefix() {
+        assert_eq!(
+            gateway_admin_url("localhost", 42617, Some("/zeroclaw"), "/admin/paircode/new"),
+            "http://localhost:42617/zeroclaw/admin/paircode/new"
         );
     }
 
