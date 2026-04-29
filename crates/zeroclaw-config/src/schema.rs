@@ -510,7 +510,7 @@ pub struct WorkspaceConfig {
 }
 
 fn default_workspaces_dir() -> String {
-    "~/.zeroclaw/workspaces".to_string()
+    default_path_under_config_dir("workspaces")
 }
 
 impl Default for WorkspaceConfig {
@@ -3109,7 +3109,7 @@ fn default_project_intel_language() -> String {
 }
 
 fn default_project_intel_report_dir() -> String {
-    "~/.zeroclaw/project-reports".into()
+    default_path_under_config_dir("project-reports")
 }
 
 fn default_project_intel_risk_sensitivity() -> String {
@@ -3431,7 +3431,7 @@ pub struct KnowledgeConfig {
 }
 
 fn default_knowledge_db_path() -> String {
-    "~/.zeroclaw/knowledge.db".into()
+    default_path_under_config_dir("knowledge.db")
 }
 
 fn default_knowledge_max_nodes() -> usize {
@@ -3550,7 +3550,7 @@ impl Default for PluginSecurityConfig {
 }
 
 fn default_plugins_dir() -> String {
-    "~/.zeroclaw/plugins".to_string()
+    default_path_under_config_dir("plugins")
 }
 
 fn default_max_plugins() -> usize {
@@ -8266,7 +8266,7 @@ pub struct EstopConfig {
 }
 
 fn default_estop_state_file() -> String {
-    "~/.zeroclaw/estop-state.json".to_string()
+    default_path_under_config_dir("estop-state.json")
 }
 
 impl Default for EstopConfig {
@@ -9270,7 +9270,7 @@ pub struct SecurityOpsConfig {
 }
 
 fn default_playbooks_dir() -> String {
-    "~/.zeroclaw/playbooks".into()
+    default_path_under_config_dir("playbooks")
 }
 
 fn default_require_approval() -> bool {
@@ -9282,7 +9282,7 @@ fn default_max_auto_severity() -> String {
 }
 
 fn default_report_output_dir() -> String {
-    "~/.zeroclaw/security-reports".into()
+    default_path_under_config_dir("security-reports")
 }
 
 impl Default for SecurityOpsConfig {
@@ -9409,6 +9409,26 @@ fn default_config_dir() -> Result<PathBuf> {
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
     Ok(home.join(".zeroclaw"))
+}
+
+/// Build a default path string by joining `relative` onto the resolved
+/// platform config dir. The form sees the resolved absolute path
+/// (`/home/<user>/.zeroclaw/<relative>` on Linux,
+/// `C:\Users\<user>\.zeroclaw\<relative>` on Windows, etc.) instead of a
+/// literal `~/...` token that doesn't expand on Windows. Falls back to
+/// `~/.zeroclaw/<relative>` if the platform dir can't be resolved (rare —
+/// e.g. no HOME and `directories::UserDirs` returns None); the runtime's
+/// `expand_tilde_path()` handles that literal at use-time.
+///
+/// Switching to platform-native config locations (`~/Library/Application
+/// Support/zeroclaw/` on macOS, `%APPDATA%\zeroclaw\` on Windows) is the
+/// schema-v3 follow-up tracked in #5947 — that needs a migration to move
+/// existing users' configs.
+fn default_path_under_config_dir(relative: &str) -> String {
+    match default_config_dir() {
+        Ok(dir) => dir.join(relative).to_string_lossy().into_owned(),
+        Err(_) => format!("~/.zeroclaw/{relative}"),
+    }
 }
 
 fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
