@@ -122,6 +122,29 @@ pub struct RecvAckParams {
     pub message_seq: u32,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WkApprovalCard {
+    #[serde(rename = "type")]
+    pub msg_type: u32,
+    pub approval_id: String,
+    pub timeout_secs: u64,
+    pub title: String,
+    pub body: WkApprovalBody,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WkApprovalBody {
+    pub content: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WkApprovalAction {
+    #[serde(rename = "type")]
+    pub msg_type: u32,
+    pub approval_id: String,
+    pub action: String,
+}
+
 type WsSink = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     WsMsg,
@@ -251,7 +274,7 @@ impl WuKongIMChannel {
         approval_id: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
         timeout_secs: u64,
-    ) -> serde_json::Value {
+    ) -> WkApprovalCard {
         // Human-readable summarization for cron_add or other tools
         let (title, content) = if request.tool_name == "cron_add" {
             let mut summary = request.arguments_summary.clone();
@@ -283,15 +306,15 @@ impl WuKongIMChannel {
 
         let content = format!("{}\n\n1批准，2拒绝 3总是允许", content);
 
-        serde_json::json!({
-            "type": 20,
-            "approval_id": approval_id,
-            "timeout_secs": timeout_secs,
-            "title": title,
-            "body": {
-                "content": content
-            }
-        })
+        WkApprovalCard {
+            msg_type: 20,
+            approval_id: approval_id.to_string(),
+            timeout_secs,
+            title: title.to_string(),
+            body: WkApprovalBody {
+                content: content.to_string(),
+            },
+        }
     }
 }
 
@@ -484,29 +507,21 @@ impl Channel for WuKongIMChannel {
                                 continue;
                             }
 
-                            // Handle type 20 interactive response
-                            if let (Some(20), Some(approval_id), Some(action)) = (
-                                payload_json.get("type").and_then(|t| t.as_u64()),
-                                payload_json.get("approval_id").and_then(|id| id.as_str()),
-                                payload_json.get("action").and_then(|a| a.as_str()),
-                            ) {
-                                let response = match action {
-                                    "approve" => {
-                                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve)
-                                    }
-                                    "deny" => {
-                                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny)
-                                    }
-                                    "always" => Some(
-                                        zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
-                                    ),
-                                    _ => None,
-                                };
-                                if let Some(resp) = response {
-                                    let mut pending = self.pending_approvals.write().await;
-                                    if let Some(tx) = pending.remove(approval_id) {
-                                        let _ = tx.send(resp);
-                                        continue;
+                            // Handle type 21 interactive response (Strict 21)
+                            if let Some(21) = payload_json.get("type").and_then(|t| t.as_u64()) {
+                                if let Ok(action_msg) = serde_json::from_value::<WkApprovalAction>(payload_json.clone()) {
+                                    let response = match action_msg.action.as_str() {
+                                        "approve" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve),
+                                        "deny" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny),
+                                        "always" => Some(zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove),
+                                        _ => None,
+                                    };
+                                    if let Some(resp) = response {
+                                        let mut pending = self.pending_approvals.write().await;
+                                        if let Some(tx) = pending.remove(&action_msg.approval_id) {
+                                            let _ = tx.send(resp);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
@@ -667,5 +682,30 @@ impl Channel for WuKongIMChannel {
                 Ok(Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_approval_structs() {
+        let card = WkApprovalCard {
+            msg_type: 20,
+            approval_id: "id123".to_string(),
+            timeout_secs: 300,
+            title: "Title".to_string(),
+            body: WkApprovalBody { content: "Body".to_string() },
+        };
+        let json = serde_json::to_string(&card).unwrap();
+        assert!(json.contains("\"type\":20"));
+        assert!(json.contains("\"approval_id\":\"id123\""));
+
+        let action_json = r#"{"type": 21, "approval_id": "id123", "action": "approve"}"#;
+        let action: WkApprovalAction = serde_json::from_str(action_json).unwrap();
+        assert_eq!(action.msg_type, 21);
+        assert_eq!(action.approval_id, "id123");
+        assert_eq!(action.action, "approve");
     }
 }
