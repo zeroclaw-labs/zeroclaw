@@ -587,7 +587,10 @@ impl GitOperationsTool {
                 };
                 self.sanitize_git_args(worktree_path)?;
 
-                let branch = args.get("branch").and_then(|v| v.as_str()).unwrap_or_default();
+                let branch = args
+                    .get("branch")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 // git worktree add <path> [<branch>]
                 let mut git_args = vec!["worktree", "add", worktree_path];
                 if !branch.is_empty() {
@@ -1150,7 +1153,9 @@ mod tests {
         assert!(result.success, "Expected success, got: {:?}", result.error);
 
         let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
-        let worktrees = parsed["worktrees"].as_array().expect("worktrees must be an array");
+        let worktrees = parsed["worktrees"]
+            .as_array()
+            .expect("worktrees must be an array");
         assert!(
             !worktrees.is_empty(),
             "Expected at least the main worktree in the list"

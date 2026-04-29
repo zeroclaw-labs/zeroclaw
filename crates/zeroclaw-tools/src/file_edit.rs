@@ -833,7 +833,10 @@ mod tests {
 
         assert!(!result.success);
         let content = tokio::fs::read_to_string(&outside).await.unwrap();
-        assert_eq!(content, "original", "file outside workspace must not be modified");
+        assert_eq!(
+            content, "original",
+            "file outside workspace must not be modified"
+        );
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }

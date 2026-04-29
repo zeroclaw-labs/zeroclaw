@@ -101,7 +101,7 @@ pub fn create_sandbox(
 /// When `runtime_kind` is `"native"` the caller has explicitly opted out of
 /// container wrapping, so Docker is excluded from consideration even if it is
 /// installed on the host.
-fn detect_best_sandbox(runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<dyn Sandbox> {
+fn detect_best_sandbox(runtime_kind: &str, #[allow(unused_variables)] workspace_dir: Option<&Path>) -> Arc<dyn Sandbox> {
     let skip_docker = runtime_kind == "native";
 
     #[cfg(target_os = "linux")]
