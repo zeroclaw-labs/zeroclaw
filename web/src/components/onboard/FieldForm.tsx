@@ -1032,9 +1032,34 @@ function ObjectArrayField({
           className="input-electric w-full px-2 py-1 mt-1 text-sm"
         />
       ) : meta.kind === 'string-array' ? (
-        <ChipListEditor
-          values={Array.isArray(rawValue) ? rawValue.map((v) => String(v)) : []}
-          onChange={(next) => onChange(next)}
+        // Same chip + text-mode editor the top-level FieldForm uses for
+        // Vec<String> fields. Bridges its JSON-string contract to/from
+        // the row object's array-typed value: rows-mode edits emit valid
+        // JSON arrays we can parse into the row property; mid-edit text
+        // mode stores the in-progress string verbatim, deferring shape
+        // validation to save time (same way the top-level path does).
+        <ArrayFieldEditor
+          inputId={`${meta.key}`}
+          value={
+            Array.isArray(rawValue)
+              ? JSON.stringify(rawValue)
+              : typeof rawValue === 'string'
+                ? rawValue
+                : '[]'
+          }
+          onChange={(s) => {
+            try {
+              const parsed = JSON.parse(s);
+              if (Array.isArray(parsed)) {
+                onChange(parsed);
+                return;
+              }
+            } catch {
+              /* fall through */
+            }
+            onChange(s);
+          }}
+          isOptional={meta.optional}
         />
       ) : meta.kind === 'object' ? (
         <KeyValueChipEditor
@@ -1055,64 +1080,6 @@ function ObjectArrayField({
           className="input-electric w-full px-2 py-1 mt-1 text-sm"
         />
       )}
-    </div>
-  );
-}
-
-// Compact chip editor for `Vec<String>` properties inside an
-// object-array row (e.g. `mcp.servers[i].args`). One row per entry,
-// `+ Add` appends, trash removes. No JSON / textarea fallback —
-// matches the top-level ArrayFieldEditor's "Rows" mode but stripped
-// down because we're already nested two levels deep in the form.
-function ChipListEditor({
-  values,
-  onChange,
-}: {
-  values: string[];
-  onChange: (next: string[]) => void;
-}) {
-  const setAt = (i: number, v: string) => {
-    onChange(values.map((x, idx) => (idx === i ? v : x)));
-  };
-  const removeAt = (i: number) => {
-    onChange(values.filter((_, idx) => idx !== i));
-  };
-  return (
-    <div className="space-y-1.5 mt-1">
-      {values.length === 0 ? (
-        <p className="text-[11px] italic" style={{ color: 'var(--pc-text-faint)' }}>
-          No entries.
-        </p>
-      ) : (
-        <ul className="space-y-1">
-          {values.map((v, i) => (
-            <li key={i} className="flex items-center gap-2">
-              <input
-                type="text"
-                value={v}
-                onChange={(e) => setAt(i, e.target.value)}
-                className="input-electric flex-1 px-2 py-1 text-sm"
-                placeholder="empty"
-              />
-              <button
-                type="button"
-                onClick={() => removeAt(i)}
-                title="Remove this entry"
-                className="btn-icon flex-shrink-0"
-              >
-                <Trash2 className="h-4 w-4" />
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-      <button
-        type="button"
-        onClick={() => onChange([...values, ''])}
-        className="btn-secondary text-xs px-2.5 py-1 inline-flex items-center gap-1"
-      >
-        <Plus className="h-3 w-3" /> Add
-      </button>
     </div>
   );
 }
