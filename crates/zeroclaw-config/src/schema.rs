@@ -17753,6 +17753,68 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[test]
+    async fn deserialized_matrix_set_prop_round_trips_vec_string() {
+        // Mirror the real-world daemon flow: config loaded from disk where
+        // [channels.matrix] is present (possibly with all default fields),
+        // then a PATCH from the dashboard hits set_prop.
+        let toml_src = r#"
+schema_version = 2
+
+[channels.matrix]
+enabled = false
+homeserver = ""
+access_token = ""
+allowed_rooms = []
+allowed_users = []
+"#;
+        let mut config: Config = toml::from_str(toml_src).expect("parse toml");
+        assert!(
+            config.channels.matrix.is_some(),
+            "matrix must be Some after deserialize"
+        );
+
+        config
+            .set_prop("channels.matrix.allowed-rooms", r#"["alice","bob"]"#)
+            .expect("set_prop should succeed against deserialized matrix");
+        assert_eq!(
+            config.channels.matrix.as_ref().unwrap().allowed_rooms,
+            vec!["alice".to_string(), "bob".to_string()],
+        );
+    }
+
+    #[test]
+    async fn init_defaults_then_set_prop_round_trips_vec_string() {
+        // Regression for #6175 Channels picker → form → save:
+        // 1. init_defaults creates channels.matrix = Some(MatrixConfig::default())
+        // 2. set_prop on channels.matrix.allowed-rooms must accept a JSON-array
+        //    string (the shape coerce_for_set_prop emits for Vec<String>).
+        // 3. get_prop reads it back.
+        let mut config = Config::default();
+        let initialized = config.init_defaults(Some("channels.matrix"));
+        assert!(initialized.contains(&"channels.matrix"));
+        assert!(config.channels.matrix.is_some());
+
+        // prop_fields must surface the kebab path so the form can render it.
+        let has_field = config
+            .prop_fields()
+            .iter()
+            .any(|f| f.name == "channels.matrix.allowed-rooms");
+        assert!(
+            has_field,
+            "channels.matrix.allowed-rooms must appear in prop_fields after init"
+        );
+
+        // set_prop with the JSON-array string the gateway PATCH path produces.
+        config
+            .set_prop("channels.matrix.allowed-rooms", r#"["alice","bob"]"#)
+            .expect("set_prop should accept JSON-array string for Vec<String>");
+        assert_eq!(
+            config.channels.matrix.as_ref().unwrap().allowed_rooms,
+            vec!["alice".to_string(), "bob".to_string()],
+        );
+    }
+
+    #[test]
     async fn init_defaults_skips_already_set() {
         let mut config = Config::default();
         config.channels.matrix = Some(test_matrix_config());

@@ -161,9 +161,15 @@ pub struct SectionsResponse {
     pub sections: Vec<SectionInfo>,
 }
 
-/// `GET /api/onboard/sections` — list onboarding sections in display order.
-/// Mirrors the TUI's section ordering. Single source of truth for what
-/// sections exist; the dashboard renders one entry per item.
+/// `GET /api/onboard/sections` — list every top-level config section.
+///
+/// Schema-driven: walks `Config::prop_fields()` and collects unique first
+/// segments, then asks `Config::map_key_sections()` for which ones have
+/// pickers. The 4 onboarding sections (`providers`, `channels`, `memory`,
+/// `tunnel`) keep their existing per-section dispatch in
+/// `handle_section_picker`; everything else (`gateway`, `observability`,
+/// `scheduler`, ...) renders as a direct form. Adding a new top-level
+/// field to `Config` makes it appear here automatically.
 pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
@@ -176,62 +182,95 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
         .cloned()
         .collect();
 
-    let sections = vec![
-        section_info(
-            "workspace",
-            "Workspace",
-            workspace_help(),
-            false,
-            &completed,
-        ),
-        section_info("providers", "Providers", providers_help(), true, &completed),
-        section_info("channels", "Channels", channels_help(), true, &completed),
-        section_info("memory", "Memory", memory_help(), true, &completed),
-        section_info("hardware", "Hardware", hardware_help(), false, &completed),
-        section_info("tunnel", "Tunnel", tunnel_help(), true, &completed),
-    ];
+    // First segment of every reachable prop path. BTreeSet for stable
+    // alphabetical order and dedup.
+    let mut roots: std::collections::BTreeSet<String> = cfg
+        .prop_fields()
+        .iter()
+        .filter_map(|f| f.name.split('.').next().map(str::to_string))
+        .collect();
+
+    // System / housekeeping fields the user never edits via the dashboard.
+    for hidden in HIDDEN_TOP_LEVEL {
+        roots.remove(*hidden);
+    }
+
+    // Map-keyed roots get pickers automatically (the picker shows existing
+    // keys / catalog entries; selecting an item opens its form).
+    let map_keyed_roots: std::collections::HashSet<&'static str> =
+        zeroclaw_config::schema::Config::map_key_sections()
+            .iter()
+            .filter_map(|s| s.path.split('.').next())
+            .collect();
+
+    let sections: Vec<SectionInfo> = roots
+        .into_iter()
+        .map(|key| {
+            let has_picker = SECTIONS_WITH_PICKER.contains(&key.as_str())
+                || map_keyed_roots.contains(key.as_str());
+            SectionInfo {
+                completed: completed.contains(&key),
+                label: humanize_section(&key),
+                help: section_help(&key).to_string(),
+                has_picker,
+                key,
+            }
+        })
+        .collect();
+
     axum::Json(SectionsResponse { sections }).into_response()
 }
 
-fn section_info(
-    key: &str,
-    label: &str,
-    help: &str,
-    has_picker: bool,
-    completed: &std::collections::HashSet<String>,
-) -> SectionInfo {
-    SectionInfo {
-        key: key.to_string(),
-        label: label.to_string(),
-        help: help.to_string(),
-        has_picker,
-        completed: completed.contains(key),
+/// Top-level fields that exist on `Config` but are never user-editable
+/// from the dashboard (schema bookkeeping, resolved at runtime).
+const HIDDEN_TOP_LEVEL: &[&str] = &[
+    "schema_version",
+    "config_path",
+    "workspace_dir",
+    "onboard_state",
+];
+
+/// Sections whose picker semantics are non-generic and live in the
+/// per-section dispatch in `handle_section_picker` (catalog of providers,
+/// memory backend list, tunnel-with-none, channel sub-table walk).
+const SECTIONS_WITH_PICKER: &[&str] = &["providers", "channels", "memory", "tunnel"];
+
+/// Humanize a section key for display (`google_workspace` → `Google workspace`).
+/// Keeps things simple and predictable; specific wording overrides go in
+/// the section-help table or per-section labels if/when we add them.
+fn humanize_section(key: &str) -> String {
+    let mut s = key.replace('_', " ").replace('-', " ");
+    if let Some(c) = s.get_mut(0..1) {
+        c.make_ascii_uppercase();
     }
+    s
 }
 
-// Section help text — lifted verbatim from the TUI's `ui.note(...)` calls so
-// the CLI and web wizard surface identical copy. If the TUI text changes,
-// these should follow. Could be extracted to a shared module of static
-// strings if drift becomes a concern.
-fn workspace_help() -> &'static str {
-    "Where ZeroClaw stores its config and runtime data. Defaults work for most setups."
-}
-fn providers_help() -> &'static str {
-    "Paste an API key (e.g. `sk-ant-...` for Anthropic, `sk-...` for OpenAI) when prompted. \
-     For OAuth-based providers run: zeroclaw auth login --provider <name>"
-}
-fn channels_help() -> &'static str {
-    "Pick which chat platforms ZeroClaw should listen on. You can configure multiple."
-}
-fn memory_help() -> &'static str {
-    "Persistent memory backend. SQLite is recommended; pick `none` to disable."
-}
-fn hardware_help() -> &'static str {
-    "Optional: hardware peripherals (Arduino, STM32, GPIO, etc.). Skip if you don't need them."
-}
-fn tunnel_help() -> &'static str {
-    "Optional: expose your gateway over the public internet via Cloudflare or ngrok. \
-     Pick `none` to keep it localhost-only."
+/// Help text for a section. Curated copy for the onboarding sections;
+/// empty string for everything else (the form's title is enough until
+/// someone writes copy).
+fn section_help(key: &str) -> &'static str {
+    match key {
+        "workspace" => {
+            "Where ZeroClaw stores its config and runtime data. Defaults work for most setups."
+        }
+        "providers" => {
+            "Paste an API key (e.g. `sk-ant-...` for Anthropic, `sk-...` for OpenAI) when prompted. \
+                        For OAuth-based providers run: zeroclaw auth login --provider <name>"
+        }
+        "channels" => {
+            "Pick which chat platforms ZeroClaw should listen on. You can configure multiple."
+        }
+        "memory" => "Persistent memory backend. SQLite is recommended; pick `none` to disable.",
+        "hardware" => {
+            "Optional: hardware peripherals (Arduino, STM32, GPIO, etc.). Skip if you don't need them."
+        }
+        "tunnel" => {
+            "Optional: expose your gateway over the public internet via Cloudflare or ngrok. \
+                     Pick `none` to keep it localhost-only."
+        }
+        _ => "",
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -290,15 +329,18 @@ pub async fn handle_section_picker(
     let cfg = state.config.lock().clone();
 
     let (items, help) = match section.as_str() {
-        "providers" => (providers_picker(&cfg), providers_help().to_string()),
-        "memory" => (memory_picker(&cfg), memory_help().to_string()),
+        "providers" => (
+            providers_picker(&cfg),
+            section_help("providers").to_string(),
+        ),
+        "memory" => (memory_picker(&cfg), section_help("memory").to_string()),
         "channels" => (
             schema_walk_picker(&cfg, "channels"),
-            channels_help().to_string(),
+            section_help("channels").to_string(),
         ),
         "tunnel" => (
             schema_walk_picker_with_none(&cfg, "tunnel", "tunnel.provider"),
-            tunnel_help().to_string(),
+            section_help("tunnel").to_string(),
         ),
         other => {
             return error_response(
@@ -580,6 +622,80 @@ mod tests {
 
     fn empty_cfg() -> zeroclaw_config::schema::Config {
         zeroclaw_config::schema::Config::default()
+    }
+
+    #[test]
+    fn handle_sections_derives_every_top_level_field_from_schema() {
+        // Regression: the section list must be schema-driven, not the old
+        // hardcoded 6. Adding a new top-level field to `Config` should make
+        // it appear here automatically.
+        let cfg = empty_cfg();
+        let mut roots: std::collections::BTreeSet<String> = cfg
+            .prop_fields()
+            .iter()
+            .filter_map(|f| f.name.split('.').next().map(str::to_string))
+            .collect();
+        for hidden in HIDDEN_TOP_LEVEL {
+            roots.remove(*hidden);
+        }
+        // The 6 onboarding sections must still be in the derived set.
+        for required in [
+            "workspace",
+            "providers",
+            "channels",
+            "memory",
+            "hardware",
+            "tunnel",
+        ] {
+            assert!(
+                roots.contains(required),
+                "derived sections must include onboarding section `{required}`; got {roots:?}",
+            );
+        }
+        // Plus a sample of the runtime sections that used to be invisible.
+        for runtime in ["gateway", "observability", "scheduler", "security"] {
+            assert!(
+                roots.contains(runtime),
+                "derived sections must include runtime section `{runtime}`; got {roots:?}",
+            );
+        }
+        // System / housekeeping fields must NOT surface.
+        for hidden in HIDDEN_TOP_LEVEL {
+            assert!(
+                !roots.contains(*hidden),
+                "hidden top-level `{hidden}` must not appear",
+            );
+        }
+    }
+
+    #[test]
+    fn channels_select_initializes_subsection_so_set_prop_works() {
+        // Regression for the channels init/set flow: after
+        // handle_section_select for channels/matrix, the in-memory config
+        // must have channels.matrix = Some(...) so a subsequent set_prop on
+        // channels.matrix.* succeeds rather than bailing "Unknown property".
+        // Calls init_defaults directly (the synchronous core of the select
+        // endpoint) to keep the test free of HTTP machinery.
+        let mut cfg = empty_cfg();
+        assert!(cfg.channels.matrix.is_none(), "fresh config: matrix unset");
+
+        let initialized = cfg.init_defaults(Some("channels.matrix"));
+        assert!(
+            initialized.contains(&"channels.matrix"),
+            "init_defaults must report channels.matrix initialized; got: {initialized:?}",
+        );
+        assert!(
+            cfg.channels.matrix.is_some(),
+            "channels.matrix must be Some after init_defaults",
+        );
+
+        // The form would issue a PATCH whose set_prop call hits this path.
+        cfg.set_prop("channels.matrix.allowed-rooms", r#"["alice","bob"]"#)
+            .expect("set_prop on initialized matrix subsection must succeed");
+        assert_eq!(
+            cfg.channels.matrix.as_ref().unwrap().allowed_rooms,
+            vec!["alice".to_string(), "bob".to_string()],
+        );
     }
 
     #[test]
