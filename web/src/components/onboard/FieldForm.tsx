@@ -518,14 +518,15 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
           <label
-            className="block text-sm font-medium"
+            className="block text-sm font-medium font-mono break-all"
             style={{ color: 'var(--pc-text-primary)' }}
             htmlFor={entry.path}
+            title={entry.type_hint}
           >
-            {fieldShortLabel(entry)}
+            {entry.path}
             {entry.is_secret && (
               <span
-                className="ml-2 text-xs"
+                className="ml-2 text-xs font-sans"
                 style={{ color: 'var(--pc-text-muted)' }}
               >
                 🔒 {entry.populated ? 'set' : 'unset'}
@@ -540,13 +541,6 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
               {description}
             </p>
           )}
-          <code
-            className="block text-[10px] mt-0.5 break-all"
-            style={{ color: 'var(--pc-text-faint)', opacity: 0.55 }}
-            title={entry.type_hint}
-          >
-            {entry.path}
-          </code>
           {drift && <DriftDiff drift={drift} />}
         </div>
         {onDelete && (
