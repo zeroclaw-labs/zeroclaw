@@ -669,7 +669,14 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         Some(|| {
                             crate::config::enum_variants::<#inner_ty>()
                                 .split(", ")
-                                .map(|s| s.to_string())
+                                .map(str::to_string)
+                                // Defensive: the helper returns a placeholder
+                                // string ("(unknown variants)") when schemars
+                                // can't enumerate variants for the type. Drop
+                                // empties and the placeholder so the dashboard
+                                // form falls back to a text input instead of
+                                // rendering a one-option dropdown of garbage.
+                                .filter(|v| !v.is_empty() && v != "(unknown variants)")
                                 .collect()
                         })
                     } else {

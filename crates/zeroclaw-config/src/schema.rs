@@ -11469,7 +11469,17 @@ impl_enum_prop_kind!(
 );
 
 impl HasPropKind for serde_json::Value {
-    const PROP_KIND: PropKind = PropKind::Enum;
+    // `serde_json::Value` is an arbitrary JSON document, not an enum.
+    // Classifying it as `Enum` previously made `enum_variants_for::<Value>()`
+    // hand back the literal placeholder `"(unknown variants)"`, and the
+    // dashboard form rendered fields like `providers.models.<key>.provider_extra`
+    // as a single-option dropdown. `String` is the closest scalar kind —
+    // the form renders a text input where the user pastes raw JSON.
+    // Round-trip via `set_prop` stays correct: serde deserializes the TOML
+    // string back into `Value::String(...)`. Power users editing complex
+    // objects still use `zeroclaw config set --json` or hand-edit the
+    // `config.toml`.
+    const PROP_KIND: PropKind = PropKind::String;
 }
 
 #[cfg(test)]
