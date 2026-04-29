@@ -133,6 +133,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': '主会话',
     'cron.allowed_tools_optional': '允许的工具（可选）',
     'cron.allowed_tools_placeholder': '例如：shell, file_read, memory_store',
+    'cron.trigger': '立即运行',
+    'cron.trigger_error': '触发任务失败',
+    'cron.dismiss': '关闭',
 
     // Integrations
     'integrations.title': '集成',
@@ -580,6 +583,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.allowed_tools_placeholder': 'e.g. shell, file_read, memory_store',
     'cron.trigger': 'Run now',
     'cron.trigger_error': 'Failed to trigger job',
+    'cron.dismiss': 'Dismiss',
 
     // Integrations
     'integrations.title': 'Integrations',
@@ -1067,6 +1071,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Ana',
     'cron.allowed_tools_optional': 'İzin Verilen Araçlar (isteğe bağlı)',
     'cron.allowed_tools_placeholder': 'ör. shell, file_read, memory_store',
+    'cron.trigger': 'Şimdi çalıştır',
+    'cron.trigger_error': 'Görev tetiklenemedi',
+    'cron.dismiss': 'Kapat',
 
     // Integrations
     'integrations.title': 'Entegrasyonlar',
@@ -1462,6 +1469,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'رئيسي',
     'cron.allowed_tools_optional': 'الأدوات المسموحة (اختياري)',
     'cron.allowed_tools_placeholder': 'مثال: shell, file_read, memory_store',
+    'cron.trigger': 'تشغيل الآن',
+    'cron.trigger_error': 'فشل تشغيل المهمة',
+    'cron.dismiss': 'إغلاق',
 
     // Integrations
     'integrations.title': 'التكاملات',
@@ -1831,6 +1841,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'প্রধান',
     'cron.allowed_tools_optional': 'অনুমোদিত সরঞ্জাম (ঐচ্ছিক)',
     'cron.allowed_tools_placeholder': 'যেমন: shell, file_read, memory_store',
+    'cron.trigger': 'এখন চালান',
+    'cron.trigger_error': 'কাজ ট্রিগার করতে ব্যর্থ',
+    'cron.dismiss': 'বন্ধ করুন',
 
     // Integrations
     'integrations.title': 'ইন্টিগ্রেশন',
@@ -2200,6 +2213,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Hlavní',
     'cron.allowed_tools_optional': 'Povolené nástroje (volitelné)',
     'cron.allowed_tools_placeholder': 'např. shell, file_read, memory_store',
+    'cron.trigger': 'Spustit nyní',
+    'cron.trigger_error': 'Spuštění úlohy selhalo',
+    'cron.dismiss': 'Zavřít',
 
     // Integrations
     'integrations.title': 'Integrace',
@@ -2569,6 +2585,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Hoved',
     'cron.allowed_tools_optional': 'Tilladte værktøjer (valgfri)',
     'cron.allowed_tools_placeholder': 'f.eks. shell, file_read, memory_store',
+    'cron.trigger': 'Kør nu',
+    'cron.trigger_error': 'Kunne ikke udløse opgave',
+    'cron.dismiss': 'Luk',
 
     // Integrations
     'integrations.title': 'Integrationer',
@@ -2938,6 +2957,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Haupt',
     'cron.allowed_tools_optional': 'Erlaubte Werkzeuge (optional)',
     'cron.allowed_tools_placeholder': 'z.B. shell, file_read, memory_store',
+    'cron.trigger': 'Jetzt ausführen',
+    'cron.trigger_error': 'Auslösen der Aufgabe fehlgeschlagen',
+    'cron.dismiss': 'Schließen',
 
     // Integrations
     'integrations.title': 'Integrationen',
@@ -3307,6 +3329,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Κύρια',
     'cron.allowed_tools_optional': 'Επιτρεπόμενα Εργαλεία (προαιρετικά)',
     'cron.allowed_tools_placeholder': 'π.χ. shell, file_read, memory_store',
+    'cron.trigger': 'Εκτέλεση τώρα',
+    'cron.trigger_error': 'Αποτυχία ενεργοποίησης εργασίας',
+    'cron.dismiss': 'Κλείσιμο',
 
     // Integrations
     'integrations.title': 'Ενσωματώσεις',
@@ -3676,6 +3701,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Principal',
     'cron.allowed_tools_optional': 'Herramientas Permitidas (opcional)',
     'cron.allowed_tools_placeholder': 'ej. shell, file_read, memory_store',
+    'cron.trigger': 'Ejecutar ahora',
+    'cron.trigger_error': 'Error al activar la tarea',
+    'cron.dismiss': 'Cerrar',
 
     // Integrations
     'integrations.title': 'Integraciones',
@@ -4045,6 +4073,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Pää',
     'cron.allowed_tools_optional': 'Sallitut Työkalut (valinnainen)',
     'cron.allowed_tools_placeholder': 'esim. shell, file_read, memory_store',
+    'cron.trigger': 'Suorita nyt',
+    'cron.trigger_error': 'Tehtävän käynnistys epäonnistui',
+    'cron.dismiss': 'Sulje',
 
     // Integrations
     'integrations.title': 'Integraatiot',
@@ -4414,6 +4445,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Principale',
     'cron.allowed_tools_optional': 'Outils Autorisés (optionnel)',
     'cron.allowed_tools_placeholder': 'ex. shell, file_read, memory_store',
+    'cron.trigger': 'Exécuter maintenant',
+    'cron.trigger_error': 'Échec du déclenchement de la tâche',
+    'cron.dismiss': 'Fermer',
 
     // Integrations
     'integrations.title': 'Intégrations',
@@ -4783,6 +4817,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'ראשי',
     'cron.allowed_tools_optional': 'כלים מותרים (אופציונלי)',
     'cron.allowed_tools_placeholder': 'לדוגמה: shell, file_read, memory_store',
+    'cron.trigger': 'הפעל עכשיו',
+    'cron.trigger_error': 'הפעלת המשימה נכשלה',
+    'cron.dismiss': 'סגור',
 
     // Integrations
     'integrations.title': 'אינטגרציות',
@@ -5152,6 +5189,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'मुख्य',
     'cron.allowed_tools_optional': 'अनुमत उपकरण (वैकल्पिक)',
     'cron.allowed_tools_placeholder': 'उदा. shell, file_read, memory_store',
+    'cron.trigger': 'अभी चलाएँ',
+    'cron.trigger_error': 'कार्य ट्रिगर करने में विफल',
+    'cron.dismiss': 'बंद करें',
 
     // Integrations
     'integrations.title': 'इंटीग्रेशन',
@@ -5521,6 +5561,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Fő',
     'cron.allowed_tools_optional': 'Engedélyezett Eszközök (opcionális)',
     'cron.allowed_tools_placeholder': 'pl. shell, file_read, memory_store',
+    'cron.trigger': 'Futtatás most',
+    'cron.trigger_error': 'A feladat indítása sikertelen',
+    'cron.dismiss': 'Bezárás',
 
     // Integrations
     'integrations.title': 'Integrációk',
@@ -5890,6 +5933,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Utama',
     'cron.allowed_tools_optional': 'Alat yang Diizinkan (opsional)',
     'cron.allowed_tools_placeholder': 'mis. shell, file_read, memory_store',
+    'cron.trigger': 'Jalankan sekarang',
+    'cron.trigger_error': 'Gagal memicu tugas',
+    'cron.dismiss': 'Tutup',
 
     // Integrations
     'integrations.title': 'Integrasi',
@@ -6259,6 +6305,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Principale',
     'cron.allowed_tools_optional': 'Strumenti Consentiti (opzionale)',
     'cron.allowed_tools_placeholder': 'es. shell, file_read, memory_store',
+    'cron.trigger': 'Esegui ora',
+    'cron.trigger_error': "Impossibile attivare l'attività",
+    'cron.dismiss': 'Chiudi',
 
     // Integrations
     'integrations.title': 'Integrazioni',
@@ -6628,6 +6677,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'メイン',
     'cron.allowed_tools_optional': '許可ツール（任意）',
     'cron.allowed_tools_placeholder': '例：shell, file_read, memory_store',
+    'cron.trigger': '今すぐ実行',
+    'cron.trigger_error': 'ジョブのトリガーに失敗しました',
+    'cron.dismiss': '閉じる',
 
     // Integrations
     'integrations.title': 'インテグレーション',
@@ -6997,6 +7049,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': '메인',
     'cron.allowed_tools_optional': '허용 도구 (선택사항)',
     'cron.allowed_tools_placeholder': '예: shell, file_read, memory_store',
+    'cron.trigger': '지금 실행',
+    'cron.trigger_error': '작업 실행 실패',
+    'cron.dismiss': '닫기',
 
     // Integrations
     'integrations.title': '통합',
@@ -7366,6 +7421,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Hoved',
     'cron.allowed_tools_optional': 'Tillatte Verktøy (valgfri)',
     'cron.allowed_tools_placeholder': 'f.eks. shell, file_read, memory_store',
+    'cron.trigger': 'Kjør nå',
+    'cron.trigger_error': 'Kunne ikke utløse jobb',
+    'cron.dismiss': 'Lukk',
 
     // Integrations
     'integrations.title': 'Integrasjoner',
@@ -7735,6 +7793,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Hoofd',
     'cron.allowed_tools_optional': 'Toegestane Hulpmiddelen (optioneel)',
     'cron.allowed_tools_placeholder': 'bijv. shell, file_read, memory_store',
+    'cron.trigger': 'Nu uitvoeren',
+    'cron.trigger_error': 'Taak uitvoeren mislukt',
+    'cron.dismiss': 'Sluiten',
 
     // Integrations
     'integrations.title': 'Integraties',
@@ -8104,6 +8165,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Główna',
     'cron.allowed_tools_optional': 'Dozwolone Narzędzia (opcjonalne)',
     'cron.allowed_tools_placeholder': 'np. shell, file_read, memory_store',
+    'cron.trigger': 'Uruchom teraz',
+    'cron.trigger_error': 'Nie udało się uruchomić zadania',
+    'cron.dismiss': 'Zamknij',
 
     // Integrations
     'integrations.title': 'Integracje',
@@ -8473,6 +8537,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Principal',
     'cron.allowed_tools_optional': 'Ferramentas Permitidas (opcional)',
     'cron.allowed_tools_placeholder': 'ex. shell, file_read, memory_store',
+    'cron.trigger': 'Executar agora',
+    'cron.trigger_error': 'Falha ao acionar tarefa',
+    'cron.dismiss': 'Fechar',
 
     // Integrations
     'integrations.title': 'Integrações',
@@ -8842,6 +8909,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Principală',
     'cron.allowed_tools_optional': 'Instrumente Permise (opțional)',
     'cron.allowed_tools_placeholder': 'ex. shell, file_read, memory_store',
+    'cron.trigger': 'Rulează acum',
+    'cron.trigger_error': 'Declanșarea sarcinii a eșuat',
+    'cron.dismiss': 'Închide',
 
     // Integrations
     'integrations.title': 'Integrări',
@@ -9211,6 +9281,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Основная',
     'cron.allowed_tools_optional': 'Разрешённые инструменты (необязательно)',
     'cron.allowed_tools_placeholder': 'напр. shell, file_read, memory_store',
+    'cron.trigger': 'Запустить сейчас',
+    'cron.trigger_error': 'Не удалось запустить задачу',
+    'cron.dismiss': 'Закрыть',
 
     // Integrations
     'integrations.title': 'Интеграции',
@@ -9580,6 +9653,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Huvud',
     'cron.allowed_tools_optional': 'Tillåtna Verktyg (valfri)',
     'cron.allowed_tools_placeholder': 't.ex. shell, file_read, memory_store',
+    'cron.trigger': 'Kör nu',
+    'cron.trigger_error': 'Kunde inte starta jobb',
+    'cron.dismiss': 'Stäng',
 
     // Integrations
     'integrations.title': 'Integrationer',
@@ -9949,6 +10025,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'หลัก',
     'cron.allowed_tools_optional': 'เครื่องมือที่อนุญาต (ไม่บังคับ)',
     'cron.allowed_tools_placeholder': 'เช่น shell, file_read, memory_store',
+    'cron.trigger': 'เรียกใช้ตอนนี้',
+    'cron.trigger_error': 'ทริกเกอร์งานล้มเหลว',
+    'cron.dismiss': 'ปิด',
 
     // Integrations
     'integrations.title': 'การเชื่อมต่อ',
@@ -10318,6 +10397,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Pangunahin',
     'cron.allowed_tools_optional': 'Pinapayagang Mga Kasangkapan (opsyonal)',
     'cron.allowed_tools_placeholder': 'hal. shell, file_read, memory_store',
+    'cron.trigger': 'Patakbuhin ngayon',
+    'cron.trigger_error': 'Nabigong i-trigger ang gawain',
+    'cron.dismiss': 'Isara',
 
     // Integrations
     'integrations.title': 'Mga Integrasyon',
@@ -10687,6 +10769,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Основна',
     'cron.allowed_tools_optional': 'Дозволені інструменти (необов\'язково)',
     'cron.allowed_tools_placeholder': 'напр. shell, file_read, memory_store',
+    'cron.trigger': 'Запустити зараз',
+    'cron.trigger_error': 'Не вдалося запустити завдання',
+    'cron.dismiss': 'Закрити',
 
     // Integrations
     'integrations.title': 'Інтеграції',
@@ -11056,6 +11141,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'مرکزی',
     'cron.allowed_tools_optional': 'اجازت یافتہ اوزار (اختیاری)',
     'cron.allowed_tools_placeholder': 'مثال: shell, file_read, memory_store',
+    'cron.trigger': 'ابھی چلائیں',
+    'cron.trigger_error': 'کام چلانے میں ناکامی',
+    'cron.dismiss': 'بند کریں',
 
     // Integrations
     'integrations.title': 'انٹیگریشنز',
@@ -11425,6 +11513,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.session_main': 'Chính',
     'cron.allowed_tools_optional': 'Công Cụ Được Phép (tùy chọn)',
     'cron.allowed_tools_placeholder': 'vd. shell, file_read, memory_store',
+    'cron.trigger': 'Chạy ngay',
+    'cron.trigger_error': 'Không thể kích hoạt tác vụ',
+    'cron.dismiss': 'Đóng',
 
     // Integrations
     'integrations.title': 'Tích hợp',

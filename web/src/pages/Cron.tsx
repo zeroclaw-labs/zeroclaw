@@ -630,7 +630,7 @@ export default function Cron() {
           <button
             onClick={() => setTriggerError(null)}
             className="btn-icon shrink-0"
-            title={t('cron.dismiss') || 'Dismiss'}
+            title={t('cron.dismiss')}
           >
             <X className="h-4 w-4" />
           </button>
