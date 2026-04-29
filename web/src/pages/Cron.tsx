@@ -656,7 +656,7 @@ export default function Cron() {
                         ) : (
                           <ChevronRight className="h-3.5 w-3.5" />
                         )}
-                        {job.id.slice(0, 8)}
+                        {job.id?.slice(0, 8) ?? job.id}
                       </button>
                     </td>
                     <td className="font-medium text-sm" style={{ color: 'var(--pc-text-primary)' }}>
