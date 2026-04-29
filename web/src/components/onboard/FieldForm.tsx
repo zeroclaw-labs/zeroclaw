@@ -19,7 +19,7 @@
 // On error: structured ApiError envelope binds inline to the field by .path.
 
 import { useEffect, useMemo, useState } from 'react';
-import { Save, Trash2 } from 'lucide-react';
+import { List as ListIcon, Plus, Save, Trash2, Type as TypeIcon } from 'lucide-react';
 import {
   ApiError,
   deleteProp,
@@ -65,6 +65,13 @@ function fieldShortLabel(entry: ListResponseEntry): string {
 
 function defaultInputValue(entry: ListResponseEntry): string {
   const v = entry.value;
+  if (entry.kind === 'string-array') {
+    // API returns the TOML/JSON array form as a string. Keep it as the
+    // canonical draft shape; the row editor parses on render.
+    if (typeof v === 'string') return v === '<unset>' ? '[]' : v;
+    if (Array.isArray(v)) return JSON.stringify(v);
+    return '[]';
+  }
   if (typeof v === 'string') return v === '<unset>' ? '' : v;
   if (typeof v === 'boolean') return v ? 'true' : 'false';
   if (Array.isArray(v)) return v.join('\n');
@@ -76,7 +83,7 @@ function parseInput(entry: ListResponseEntry, raw: string): unknown {
     case 'bool':
       return raw === 'true';
     case 'array':
-      return raw.split('\n').map((s) => s.trim()).filter(Boolean);
+      return parseArrayDraft(raw);
     case 'number': {
       const n = Number(raw);
       return Number.isNaN(n) ? raw : n;
@@ -84,6 +91,55 @@ function parseInput(entry: ListResponseEntry, raw: string): unknown {
     default:
       return raw;
   }
+}
+
+// Parse the draft string for a Vec<String> field. Accepts the JSON-array
+// form (the canonical shape both the chip editor and the textarea view
+// emit), with comma- / newline-separated as a fallback for hand-typed
+// freeform input. Trims whitespace and drops empty entries on save.
+function parseArrayDraft(raw: string): string[] {
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .map((v) => String(v))
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0);
+      }
+    } catch {
+      /* fall through to freeform split */
+    }
+  }
+  return raw
+    .split(/[\n,]/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+function parseArrayRows(value: string): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    if (Array.isArray(parsed)) return parsed.map((v) => String(v));
+  } catch {
+    // Fallback: comma- or newline-separated freeform.
+    return value
+      .split(/[\n,]/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  }
+  return [];
+}
+
+// `Option<Vec<String>>` carries a three-state distinction: None / [] / ["a"].
+// Detected via type_hint so the chip editor can offer a separate "Clear (set
+// to none)" affordance and the save path can emit `null` for empty + optional.
+function isOptionalArray(typeHint: string): boolean {
+  const compact = typeHint.replace(/\s+/g, '');
+  return compact.startsWith('Option<Vec<') || compact.startsWith('Option<HashSet<');
 }
 
 const modelsCache: Record<string, { models: string[]; live: boolean }> = {};
@@ -136,7 +192,19 @@ export default function FieldForm({ prefix, onSaved, showDelete = true, title }:
       // Secrets with empty input mean "don't change".
       if (e.is_secret && raw.length === 0) continue;
       if (raw === original) continue;
-      const op: PatchOp = { op: 'replace', path: e.path, value: parseInput(e, raw) };
+      let value: unknown = parseInput(e, raw);
+      // For Option<Vec<String>>: empty rows = "no opinion" → send null
+      // (clears the field). Mandatory Vec<String>: empty stays as [] (an
+      // explicitly empty list, distinct from None).
+      if (
+        e.kind === 'string-array'
+        && Array.isArray(value)
+        && value.length === 0
+        && isOptionalArray(e.type_hint)
+      ) {
+        value = null;
+      }
+      const op: PatchOp = { op: 'replace', path: e.path, value };
       const c = comments[e.path];
       if (c && c.length > 0) op.comment = c;
       ops.push(op);
@@ -477,13 +545,11 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
             </p>
           </>
         ) : renderer === 'array' ? (
-          <textarea
-            id={entry.path}
-            rows={3}
+          <ArrayFieldEditor
+            inputId={entry.path}
             value={value}
-            onChange={(e) => onChange(e.target.value)}
-            className="input-electric w-full px-3 py-2 text-sm font-mono resize-y"
-            placeholder="One value per line"
+            onChange={onChange}
+            isOptional={isOptionalArray(entry.type_hint)}
           />
         ) : renderer === 'number' ? (
           <input
@@ -525,6 +591,130 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
           </p>
         )}
       </div>
+    </div>
+  );
+}
+
+interface ArrayFieldEditorProps {
+  inputId: string;
+  value: string;
+  onChange: (next: string) => void;
+  isOptional: boolean;
+}
+
+// Per-row chip editor for `Vec<String>` / `Option<Vec<String>>` fields with
+// a "Rows / Text" toggle. Both views share the same underlying value (a
+// JSON array string) so toggling preserves edits. Trim + drop-empty runs
+// at save time in `parseArrayDraft`, not on every keystroke — typing a
+// space inside a chip shouldn't truncate the entry.
+function ArrayFieldEditor({ inputId, value, onChange, isOptional }: ArrayFieldEditorProps) {
+  const [mode, setMode] = useState<'rows' | 'text'>('rows');
+  const rows = useMemo(() => parseArrayRows(value), [value]);
+
+  const writeRows = (next: string[]) => {
+    onChange(JSON.stringify(next));
+  };
+
+  const setRow = (index: number, next: string) => {
+    writeRows(rows.map((r, i) => (i === index ? next : r)));
+  };
+
+  const removeRow = (index: number) => {
+    writeRows(rows.filter((_, i) => i !== index));
+  };
+
+  const addRow = () => {
+    writeRows([...rows, '']);
+  };
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>
+          {rows.length} {rows.length === 1 ? 'entry' : 'entries'}
+          {isOptional && rows.length === 0 ? ' — saves as null' : null}
+        </span>
+        <div
+          className="inline-flex rounded-md overflow-hidden border text-xs"
+          style={{ borderColor: 'var(--pc-border)' }}
+        >
+          <button
+            type="button"
+            onClick={() => setMode('rows')}
+            className="px-2 py-1 inline-flex items-center gap-1"
+            style={{
+              background: mode === 'rows' ? 'var(--pc-bg-surface-elevated)' : 'transparent',
+              color: mode === 'rows' ? 'var(--pc-text-primary)' : 'var(--pc-text-muted)',
+            }}
+            aria-pressed={mode === 'rows'}
+          >
+            <ListIcon className="h-3 w-3" /> Rows
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode('text')}
+            className="px-2 py-1 inline-flex items-center gap-1"
+            style={{
+              background: mode === 'text' ? 'var(--pc-bg-surface-elevated)' : 'transparent',
+              color: mode === 'text' ? 'var(--pc-text-primary)' : 'var(--pc-text-muted)',
+            }}
+            aria-pressed={mode === 'text'}
+          >
+            <TypeIcon className="h-3 w-3" /> Text
+          </button>
+        </div>
+      </div>
+
+      {mode === 'rows' ? (
+        <>
+          {rows.length === 0 ? (
+            <p
+              className="text-xs italic px-1 py-2"
+              style={{ color: 'var(--pc-text-faint)' }}
+            >
+              No entries. Click "+ Add" to add one.
+            </p>
+          ) : (
+            <ul className="space-y-1.5" id={inputId}>
+              {rows.map((row, i) => (
+                <li key={i} className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={row}
+                    onChange={(e) => setRow(i, e.target.value)}
+                    className="input-electric flex-1 px-3 py-1.5 text-sm"
+                    placeholder="empty"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => removeRow(i)}
+                    title="Remove this entry"
+                    className="btn-icon flex-shrink-0"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <button
+            type="button"
+            onClick={addRow}
+            className="btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1"
+          >
+            <Plus className="h-3 w-3" /> Add
+          </button>
+        </>
+      ) : (
+        <textarea
+          id={inputId}
+          rows={Math.max(3, Math.min(rows.length + 1, 10))}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="input-electric w-full px-3 py-2 text-sm font-mono resize-y"
+          placeholder='["value1", "value2"]'
+        />
+      )}
     </div>
   );
 }
