@@ -13,6 +13,10 @@ path = "src/bin/mdbook.rs"
 name = "fluent"
 path = "src/bin/fluent.rs"
 
+[[bin]]
+name = "gen-openapi"
+path = "src/bin/gen_openapi.rs"
+
 [dependencies]
 anyhow = "1.0"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
@@ -22,3 +26,4 @@ serde_json = "1.0"
 toml = "0.8"
 tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "net"] }
 tower-http = { version = "0.6", default-features = false, features = ["fs"] }
+zeroclaw-gateway = { workspace = true, features = ["schema-export"] }

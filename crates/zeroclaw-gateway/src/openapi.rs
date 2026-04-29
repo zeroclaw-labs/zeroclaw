@@ -53,8 +53,14 @@ pub async fn handle_openapi_json() -> Response {
     response
 }
 
+/// Build the OpenAPI 3.1 document. Pub so the `xtask gen-openapi` binary
+/// can render the same JSON the gateway serves and write it to the
+/// committed snapshot at `crates/zeroclaw-gateway/openapi.json`. CI
+/// staleness check (`xtask gen-openapi --check`) diffs the rendered
+/// spec against the committed file so a handler change without a spec
+/// update fails the build.
 #[cfg(feature = "schema-export")]
-fn build_spec() -> serde_json::Value {
+pub fn build_spec() -> serde_json::Value {
     use crate::api_config::{
         DriftEntry, DriftResponse, InitQuery, InitResponse, ListResponse, MigrateResponse, PatchOp,
         PatchResponse, PropPutBody, PropResponse, SecretResponse,
@@ -266,7 +272,7 @@ fn build_spec() -> serde_json::Value {
         }
     });
 
-    serde_json::json!({
+    let mut spec = serde_json::json!({
         "openapi": "3.1.0",
         "info": {
             "title": "ZeroClaw Gateway — Config CRUD",
@@ -276,11 +282,107 @@ fn build_spec() -> serde_json::Value {
         "security": [{"bearerAuth": []}],
         "paths": paths,
         "components": components,
-    })
+    });
+    flatten_defs_into_components(&mut spec);
+    spec
+}
+
+/// schemars emits nested types under each component's `$defs` and
+/// references them as `#/$defs/<Name>`. OpenAPI 3.1 tooling
+/// (openapi-typescript, Scalar, codegen) expects them at top-level
+/// `#/components/schemas/<Name>`. Hoist every `$defs` entry into
+/// `components.schemas` and rewrite refs in place so the spec validates
+/// and external tooling can walk it.
+#[cfg(feature = "schema-export")]
+fn flatten_defs_into_components(spec: &mut serde_json::Value) {
+    use serde_json::Value;
+
+    // Collect every `$defs` map across the spec — typically one per
+    // top-level component schema. Hoist entries into a single
+    // `components.schemas` map. Later entries with the same name win;
+    // the macro generates identical schemas for identical types so
+    // collisions are benign.
+    let mut hoisted: serde_json::Map<String, Value> = serde_json::Map::new();
+    collect_defs(spec, &mut hoisted);
+    if let Some(schemas) = spec
+        .pointer_mut("/components/schemas")
+        .and_then(|v| v.as_object_mut())
+    {
+        for (k, v) in hoisted {
+            schemas.entry(k).or_insert(v);
+        }
+    }
+    rewrite_refs(spec);
+    strip_defs(spec);
+}
+
+#[cfg(feature = "schema-export")]
+fn collect_defs(
+    value: &mut serde_json::Value,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::Object(defs)) = map.get("$defs") {
+                for (name, schema) in defs {
+                    out.entry(name.clone()).or_insert_with(|| schema.clone());
+                }
+            }
+            for (_, child) in map.iter_mut() {
+                collect_defs(child, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                collect_defs(child, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(feature = "schema-export")]
+fn rewrite_refs(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(s)) = map.get_mut("$ref")
+                && let Some(rest) = s.strip_prefix("#/$defs/")
+            {
+                *s = format!("#/components/schemas/{rest}");
+            }
+            for (_, child) in map.iter_mut() {
+                rewrite_refs(child);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                rewrite_refs(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(feature = "schema-export")]
+fn strip_defs(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove("$defs");
+            for (_, child) in map.iter_mut() {
+                strip_defs(child);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                strip_defs(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(not(feature = "schema-export"))]
-fn build_spec() -> serde_json::Value {
+pub fn build_spec() -> serde_json::Value {
     serde_json::json!({
         "openapi": "3.1.0",
         "info": {

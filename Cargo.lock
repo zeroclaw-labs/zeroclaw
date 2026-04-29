@@ -13070,6 +13070,7 @@ dependencies = [
  "tokio",
  "toml 0.8.2",
  "tower-http",
+ "zeroclaw-gateway",
 ]
 
 [[package]]
