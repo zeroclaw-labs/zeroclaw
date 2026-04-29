@@ -5,9 +5,8 @@
   "license": "(MIT OR Apache-2.0)",
   "type": "module",
   "scripts": {
-    "build": "npm run gen-api && tsc -b && vite build",
-    "dev": "vite",
-    "gen-api": "openapi-typescript ../crates/zeroclaw-gateway/openapi.json -o src/lib/api-generated.ts"
+    "build": "tsc -b && vite build",
+    "dev": "vite"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

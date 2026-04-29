@@ -48,8 +48,6 @@ jobs:
           --all-targets
           --features ci-all
           -- -D warnings
-      - name: OpenAPI snapshot is up to date
-        run: cargo run -p xtask --bin gen-openapi -- --check
 
   # ── Stage 2: Build + Check (parallel, gated on lint) ─────────────────────
 

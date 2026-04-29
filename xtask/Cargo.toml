@@ -14,8 +14,8 @@ name = "fluent"
 path = "src/bin/fluent.rs"
 
 [[bin]]
-name = "gen-openapi"
-path = "src/bin/gen_openapi.rs"
+name = "web"
+path = "src/bin/web.rs"
 
 [dependencies]
 anyhow = "1.0"

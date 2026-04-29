@@ -97,6 +97,7 @@
 - [Plugin protocol](./developing/plugin-protocol.md)
 - [Extension examples](./developing/extension-examples.md)
 - [Building the docs locally](./developing/building-docs.md)
+- [Building the web dashboard](./developing/web.md)
 
 # Foundations
 

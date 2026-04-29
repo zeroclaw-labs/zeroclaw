@@ -165,6 +165,12 @@
   high-level overview of authentication, discovery, secrets handling, and the
   stable error code table; live "Try it out" forms come from `/api/docs` on a
   running gateway (#6175).
+- New `cargo web` xtask (`gen-api`, `install`, `build`, `dev`, `check`) drives
+  the dashboard build from cargo. The TypeScript API client is regenerated
+  on every build by piping the gateway's runtime OpenAPI spec through
+  `openapi-typescript`; neither the spec snapshot nor the generated TS
+  (`web/src/lib/api-generated.ts`) is committed. See
+  `docs/book/src/developing/web.md` (#6175).
 
 ### Agent & Runtime
 

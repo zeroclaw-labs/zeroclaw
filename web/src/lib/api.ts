@@ -374,17 +374,13 @@ export function getCatalogModels(provider: string): Promise<ModelsResponse> {
 
 // ── Type parity with the generated OpenAPI client ──────────────────
 //
-// `api-generated.ts` is rendered by `npm run gen-api` from
-// `crates/zeroclaw-gateway/openapi.json` (committed snapshot updated by
-// `cargo xtask gen-openapi` and CI-checked for staleness). The hand-
-// maintained types below are the working types this file exposes to
-// consumers; the generated types are the canonical contract.
-//
-// Re-export `paths` / `components` so callers wanting the generated
-// shape (e.g. for openapi-fetch wrappers) can pull them through the
-// same module they already import. Adding a new `/api/config/*`
-// endpoint regenerates `api-generated.ts` on next build; tsc fails
-// here if the hand-maintained shape stops matching.
+// `api-generated.ts` is produced by `cargo web gen-api` (see
+// `xtask/src/bin/web.rs`). The xtask renders the gateway's OpenAPI 3.1
+// spec in-process from `zeroclaw_gateway::openapi::build_spec()` and
+// pipes it through `openapi-typescript`. Neither the spec nor the
+// generated TS is committed — both are regenerated on every
+// `cargo web build` / `cargo web check`. tsc fails here if the
+// hand-maintained shapes below stop matching.
 export type { paths as ApiPaths, components as ApiComponents } from './api-generated';
 
 // ── Onboard sections + picker (mirrors the TUI flow) ────────────────
