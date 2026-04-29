@@ -17,7 +17,7 @@
 // /api/config/list?prefix=<that> and PATCHes on save. Provider model
 // fields auto-fetch /api/onboard/catalog/models for the datalist.
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Check, ChevronRight } from 'lucide-react';
 import {
@@ -30,7 +30,7 @@ import {
   type PickerItem,
   type SectionInfo,
 } from '../../lib/api';
-import FieldForm from '../../components/onboard/FieldForm';
+import FieldForm, { type FieldFormHandle } from '../../components/onboard/FieldForm';
 import SectionPicker from '../../components/onboard/SectionPicker';
 
 // Note: prefix is `onboard_state` (verbatim) and the field becomes
@@ -62,6 +62,11 @@ export default function Onboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [finishing, setFinishing] = useState(false);
+  const [advancing, setAdvancing] = useState(false);
+  // Ref into the currently-rendered FieldForm (direct-form sections like
+  // Workspace, or the post-pick form for Providers/Channels/Tunnel) so
+  // breadcrumb Next/Finish can flush unsaved edits before advancing.
+  const formRef = useRef<FieldFormHandle | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -121,45 +126,75 @@ export default function Onboard() {
     }
   };
 
-  const advanceSection = async () => {
-    if (!activeSection) return;
-    // Mark current section completed server-side, then jump to the next.
+  // Save any pending form edits first; refuse to advance if the save
+  // failed (validator rejected something), so the user can fix it.
+  const flushActiveForm = async (): Promise<boolean> => {
+    if (!formRef.current) return true;
     try {
-      const current = await getProp(COMPLETED_SECTIONS_PATH).catch(() => ({ value: '[]' }));
-      const existing = parseCompleted(current.value);
-      if (!existing.includes(activeSection.key)) existing.push(activeSection.key);
-      await patchConfig([
-        { op: 'replace', path: COMPLETED_SECTIONS_PATH, value: existing },
-      ]);
-      setSections((prev) =>
-        prev.map((s) =>
-          s.key === activeSection.key ? { ...s, completed: true } : s,
-        ),
-      );
-    } catch (e) {
-      // Don't fail the flow on a marker failure — log and proceed.
-      // eslint-disable-next-line no-console
-      console.warn('Failed to persist completion marker:', e);
-    }
-    const idx = sections.findIndex((s) => s.key === activeSection.key);
-    const next = sections[idx + 1];
-    if (next) {
-      setActiveKey(next.key);
-      setPicked(null);
-    } else {
-      // Wizard done — stay on current section but clear picked state.
-      setPicked(null);
+      return await formRef.current.flushSave();
+    } catch {
+      return false;
     }
   };
 
-  // Finish: mark the last section completed, reload the daemon so any
-  // newly-configured channels / providers / tunnels actually start, then
-  // drop the user on the dashboard. The reload endpoint returns
-  // immediately; allow a beat for the gateway to rebind before navigating.
+  const advanceSection = async () => {
+    if (!activeSection) return;
+    setAdvancing(true);
+    try {
+      if (!(await flushActiveForm())) return;
+      // Mark current section completed server-side, then jump to the next.
+      try {
+        const current = await getProp(COMPLETED_SECTIONS_PATH).catch(() => ({ value: '[]' }));
+        const existing = parseCompleted(current.value);
+        if (!existing.includes(activeSection.key)) existing.push(activeSection.key);
+        await patchConfig([
+          { op: 'replace', path: COMPLETED_SECTIONS_PATH, value: existing },
+        ]);
+        setSections((prev) =>
+          prev.map((s) =>
+            s.key === activeSection.key ? { ...s, completed: true } : s,
+          ),
+        );
+      } catch (e) {
+        // Don't fail the flow on a marker failure — log and proceed.
+        // eslint-disable-next-line no-console
+        console.warn('Failed to persist completion marker:', e);
+      }
+      const idx = sections.findIndex((s) => s.key === activeSection.key);
+      const next = sections[idx + 1];
+      if (next) {
+        setActiveKey(next.key);
+        setPicked(null);
+      } else {
+        // Wizard done — stay on current section but clear picked state.
+        setPicked(null);
+      }
+    } finally {
+      setAdvancing(false);
+    }
+  };
+
+  // Finish: save the current form (if any), mark the active section
+  // completed, reload the daemon so any newly-configured channels /
+  // providers / tunnels actually start, then drop the user on the
+  // dashboard. Available at every section, not just the last — users
+  // can bail early if they don't care to walk the whole flow.
   const finishOnboarding = async () => {
+    if (!activeSection) return;
     setFinishing(true);
     try {
-      await advanceSection();
+      if (!(await flushActiveForm())) return;
+      try {
+        const current = await getProp(COMPLETED_SECTIONS_PATH).catch(() => ({ value: '[]' }));
+        const existing = parseCompleted(current.value);
+        if (!existing.includes(activeSection.key)) existing.push(activeSection.key);
+        await patchConfig([
+          { op: 'replace', path: COMPLETED_SECTIONS_PATH, value: existing },
+        ]);
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn('Failed to persist completion marker on finish:', e);
+      }
       try {
         await reloadDaemon();
         await new Promise((r) => setTimeout(r, 400));
@@ -291,56 +326,58 @@ export default function Onboard() {
                   </>
                 )}
               </div>
-              <button
-                type="button"
-                disabled={finishing}
-                onClick={() =>
-                  isLastSection(sections, activeSection.key)
-                    ? void finishOnboarding()
-                    : void advanceSection()
-                }
-                className="btn-electric inline-flex items-center gap-1.5 text-sm px-4 py-2"
-              >
-                {isLastSection(sections, activeSection.key)
-                  ? finishing
-                    ? 'Finishing…'
-                    : 'Finish'
-                  : 'Next ▶'}
-              </button>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                {/* Finish is available at every section so users can exit
+                    early — saves the current form (if any), reloads the
+                    daemon, then redirects to /. Next advances to the next
+                    section, also save-aware. On the last section Next is
+                    redundant with Finish and is hidden. */}
+                <button
+                  type="button"
+                  disabled={finishing || advancing}
+                  onClick={() => void finishOnboarding()}
+                  className="btn-secondary inline-flex items-center gap-1.5 text-sm px-3 py-2"
+                  title="Save, reload the daemon, and exit to the dashboard"
+                >
+                  {finishing ? 'Finishing…' : 'Finish'}
+                </button>
+                {!isLastSection(sections, activeSection.key) && (
+                  <button
+                    type="button"
+                    disabled={finishing || advancing}
+                    onClick={() => void advanceSection()}
+                    className="btn-electric inline-flex items-center gap-1.5 text-sm px-4 py-2"
+                    title="Save and move to the next section"
+                  >
+                    {advancing ? 'Saving…' : 'Next ▶'}
+                  </button>
+                )}
+              </div>
             </div>
 
-            {/* Picker view OR form view */}
+            {/* Picker view OR form view. Direct-form sections (Workspace,
+                Hardware) skip the picker entirely. */}
             {!activeSection.has_picker ? (
-              // Direct-form sections (Workspace, Hardware) skip the picker.
               <FieldForm
+                ref={formRef}
                 prefix={activeSection.key}
                 title={activeSection.label}
-                onSaved={advanceSection}
               />
             ) : !picked ? (
               <SectionPicker
                 sectionKey={activeSection.key}
                 help={activeSection.help}
                 onPick={(item) => void handlePick(item)}
-                doneLabel={
-                  isLastSection(sections, activeSection.key)
-                    ? finishing
-                      ? 'Finishing…'
-                      : 'Finish'
-                    : 'Next ▶'
-                }
-                onDone={
-                  isLastSection(sections, activeSection.key)
-                    ? finishOnboarding
-                    : advanceSection
-                }
+                onSkip={() => void advanceSection()}
               />
             ) : (
               <FieldForm
+                ref={formRef}
                 prefix={picked.fieldsPrefix}
                 title={picked.item.label}
                 onSaved={() => {
-                  // Return to the picker so the user can add another (or hit Done).
+                  // Return to the picker so the user can add another or
+                  // hit Next/Finish in the breadcrumb row.
                   setPicked(null);
                 }}
               />

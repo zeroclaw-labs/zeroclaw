@@ -265,13 +265,22 @@ export default function Config() {
                 }
               />
             ) : mode.kind === 'picker' ? (
-              <SectionPicker
-                sectionKey={activeSection.key}
-                help={activeSection.help}
-                onPick={(item) => void handlePick(item)}
-                doneLabel="Back to overview"
-                onDone={() => setMode({ kind: 'section-overview' })}
-              />
+              <div className="flex flex-col gap-3">
+                <button
+                  type="button"
+                  onClick={() => setMode({ kind: 'section-overview' })}
+                  className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
+                >
+                  <ArrowLeft className="h-4 w-4" />
+                  Back to {activeSection.label}
+                </button>
+                <SectionPicker
+                  sectionKey={activeSection.key}
+                  help={activeSection.help}
+                  onPick={(item) => void handlePick(item)}
+                  onSkip={() => setMode({ kind: 'section-overview' })}
+                />
+              </div>
             ) : (
               <div className="flex flex-col gap-3">
                 <button

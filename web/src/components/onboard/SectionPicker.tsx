@@ -6,8 +6,9 @@
 // Fuzzy filter is inline (web/src/lib/fuzzy.ts), no npm dep.
 //
 // Click a row → calls onPick(item.key). Configured rows show a checkmark
-// badge so the user can see what they've already set up. Done button at
-// the bottom advances (wizard) or returns to overview (config).
+// badge so the user can see what they've already set up. Advance/Finish
+// buttons are owned by the parent (Onboard / Config) so the picker stays
+// a pure list view — no duplicate buttons.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, Check } from 'lucide-react';
@@ -25,10 +26,9 @@ interface SectionPickerProps {
   help: string;
   /** Called when the user picks an item. */
   onPick: (item: PickerItem) => void;
-  /** Done button label. Wizard: "Done — next section"; Config: "Back to overview". */
-  doneLabel: string;
-  /** Called when the user clicks Done. */
-  onDone: () => void;
+  /** Esc key handler — typically the parent's "advance / next section"
+   *  action, so keyboard-only users can skip the picker without picking. */
+  onSkip?: () => void;
   /** Optional Back button (wizard: previous section; config: hide). */
   onBack?: () => void;
 }
@@ -37,8 +37,7 @@ export default function SectionPicker({
   sectionKey,
   help,
   onPick,
-  doneLabel,
-  onDone,
+  onSkip,
   onBack,
 }: SectionPickerProps) {
   const [items, setItems] = useState<PickerItem[]>([]);
@@ -94,9 +93,9 @@ export default function SectionPicker({
     } else if (e.key === 'Enter' && filtered[highlightIdx]) {
       e.preventDefault();
       onPick(filtered[highlightIdx]);
-    } else if (e.key === 'Escape') {
+    } else if (e.key === 'Escape' && onSkip) {
       e.preventDefault();
-      onDone();
+      onSkip();
     }
   };
 
@@ -223,8 +222,8 @@ export default function SectionPicker({
         )}
       </div>
 
-      <div className="flex justify-between items-center">
-        {onBack ? (
+      {onBack && (
+        <div>
           <button
             type="button"
             onClick={onBack}
@@ -233,17 +232,8 @@ export default function SectionPicker({
             <ArrowLeft className="h-4 w-4" />
             Back
           </button>
-        ) : (
-          <span />
-        )}
-        <button
-          type="button"
-          onClick={onDone}
-          className="btn-electric text-sm px-4 py-2"
-        >
-          {doneLabel}
-        </button>
-      </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -18,7 +18,7 @@
 //
 // On error: structured ApiError envelope binds inline to the field by .path.
 
-import { useEffect, useMemo, useState } from 'react';
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useState } from 'react';
 import { List as ListIcon, Plus, Save, Trash2, Type as TypeIcon } from 'lucide-react';
 import {
   ApiError,
@@ -44,6 +44,13 @@ interface FieldFormProps {
   showDelete?: boolean;
   /** Optional title rendered above the form. */
   title?: string;
+}
+
+/** Imperative handle the parent uses to flush unsaved changes before
+ *  advancing the wizard. Resolves `true` when the form was clean or the
+ *  save succeeded; `false` if the save failed (so the parent can stop). */
+export interface FieldFormHandle {
+  flushSave: () => Promise<boolean>;
 }
 
 function rendererFor(entry: ListResponseEntry): 'bool' | 'array' | 'secret' | 'select' | 'number' | 'text' {
@@ -148,7 +155,10 @@ function isOptionalArray(typeHint: string): boolean {
 
 const modelsCache: Record<string, { models: string[]; live: boolean }> = {};
 
-export default function FieldForm({ prefix, onSaved, showDelete = true, title }: FieldFormProps) {
+const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm(
+  { prefix, onSaved, showDelete = true, title },
+  ref,
+) {
   const [entries, setEntries] = useState<ListResponseEntry[]>([]);
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [comments, setComments] = useState<Record<string, string>>({});
@@ -200,7 +210,10 @@ export default function FieldForm({ prefix, onSaved, showDelete = true, title }:
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prefix]);
 
-  const handleSave = async () => {
+  // Returns true when nothing was dirty or the save succeeded; false on
+  // any error so callers (e.g. the wizard's Next button) can refuse to
+  // advance past a broken state.
+  const handleSave = async (): Promise<boolean> => {
     setSaving(true);
     setSavedAt(null);
     setTopError(null);
@@ -232,9 +245,8 @@ export default function FieldForm({ prefix, onSaved, showDelete = true, title }:
     }
 
     if (ops.length === 0) {
-      setSavedAt('No changes to save.');
       setSaving(false);
-      return;
+      return true;
     }
 
     try {
@@ -242,6 +254,7 @@ export default function FieldForm({ prefix, onSaved, showDelete = true, title }:
       setSavedAt(`Saved ${resp.results.length} field(s).`);
       await reload();
       onSaved?.();
+      return true;
     } catch (e) {
       if (e instanceof ApiError) {
         const env = e.envelope as ConfigApiError;
@@ -254,10 +267,15 @@ export default function FieldForm({ prefix, onSaved, showDelete = true, title }:
       } else {
         setTopError(`Save failed: ${e instanceof Error ? e.message : String(e)}`);
       }
+      return false;
     } finally {
       setSaving(false);
     }
   };
+
+  useImperativeHandle(ref, () => ({
+    flushSave: handleSave,
+  }));
 
   const handleDelete = async (path: string) => {
     try {
@@ -352,7 +370,7 @@ export default function FieldForm({ prefix, onSaved, showDelete = true, title }:
           style={{ borderColor: 'var(--pc-border)' }}
           onSubmit={(e) => {
             e.preventDefault();
-            void handleSave();
+            void handleSave().catch(() => undefined);
           }}
         >
           {sortedEntries.map((f) => (
@@ -418,7 +436,9 @@ export default function FieldForm({ prefix, onSaved, showDelete = true, title }:
       )}
     </div>
   );
-}
+});
+
+export default FieldForm;
 
 interface FieldRowProps {
   entry: ListResponseEntry;
