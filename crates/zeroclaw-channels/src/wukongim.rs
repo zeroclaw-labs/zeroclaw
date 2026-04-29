@@ -507,29 +507,21 @@ impl Channel for WuKongIMChannel {
                                 continue;
                             }
 
-                            // Handle type 20 interactive response
-                            if let (Some(20), Some(approval_id), Some(action)) = (
-                                payload_json.get("type").and_then(|t| t.as_u64()),
-                                payload_json.get("approval_id").and_then(|id| id.as_str()),
-                                payload_json.get("action").and_then(|a| a.as_str()),
-                            ) {
-                                let response = match action {
-                                    "approve" => {
-                                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve)
-                                    }
-                                    "deny" => {
-                                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny)
-                                    }
-                                    "always" => Some(
-                                        zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
-                                    ),
-                                    _ => None,
-                                };
-                                if let Some(resp) = response {
-                                    let mut pending = self.pending_approvals.write().await;
-                                    if let Some(tx) = pending.remove(approval_id) {
-                                        let _ = tx.send(resp);
-                                        continue;
+                            // Handle type 21 interactive response (Strict 21)
+                            if let Some(21) = payload_json.get("type").and_then(|t| t.as_u64()) {
+                                if let Ok(action_msg) = serde_json::from_value::<WkApprovalAction>(payload_json.clone()) {
+                                    let response = match action_msg.action.as_str() {
+                                        "approve" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve),
+                                        "deny" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny),
+                                        "always" => Some(zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove),
+                                        _ => None,
+                                    };
+                                    if let Some(resp) = response {
+                                        let mut pending = self.pending_approvals.write().await;
+                                        if let Some(tx) = pending.remove(&action_msg.approval_id) {
+                                            let _ = tx.send(resp);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
