@@ -596,6 +596,26 @@ pub struct ModelProviderConfig {
     /// Example: `provider_extra = { provider = { only = ["Anthropic"] } }`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_extra: Option<serde_json::Value>,
+    /// Override the Ollama `num_ctx` (context window, in tokens) sent on
+    /// every `/api/chat` request. Only consulted when this profile resolves
+    /// to the `ollama` provider. Defaults to the framework constant
+    /// (`OLLAMA_DEFAULT_NUM_CTX`) when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_num_ctx: Option<u32>,
+    /// Override the Ollama `num_predict` (max output tokens) sent on every
+    /// `/api/chat` request. Only consulted when this profile resolves to
+    /// the `ollama` provider. Defaults to the framework constant
+    /// (`OLLAMA_DEFAULT_NUM_PREDICT`) when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_num_predict: Option<i32>,
+    /// Force every Ollama `/api/chat` request to use this temperature,
+    /// overriding the per-call value passed through
+    /// `Provider::chat_with_system(.., temperature)`. When unset
+    /// (`None`, the default), the per-call temperature wins — full
+    /// backward compatibility. Only consulted when this profile
+    /// resolves to the `ollama` provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_temperature_override: Option<f64>,
 }
 
 // ── Delegate Tool Configuration ─────────────────────────────────
@@ -11881,6 +11901,36 @@ auto_save = true
         let parsed: MemoryConfig = toml::from_str(toml).unwrap();
         assert!(!parsed.postgres.vector_enabled);
         assert_eq!(parsed.postgres.vector_dimensions, 1536);
+    }
+
+    #[test]
+    async fn model_provider_config_ollama_tuning_fields_roundtrip() {
+        let toml = r#"
+            ollama_num_ctx = 16384
+            ollama_num_predict = 4096
+            ollama_temperature_override = 0.5
+        "#;
+        let parsed: ModelProviderConfig = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.ollama_num_ctx, Some(16384));
+        assert_eq!(parsed.ollama_num_predict, Some(4096));
+        assert_eq!(parsed.ollama_temperature_override, Some(0.5));
+
+        let serialized = toml::to_string(&parsed).unwrap();
+        let reparsed: ModelProviderConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.ollama_num_ctx, Some(16384));
+        assert_eq!(reparsed.ollama_num_predict, Some(4096));
+        assert_eq!(reparsed.ollama_temperature_override, Some(0.5));
+    }
+
+    #[test]
+    async fn model_provider_config_ollama_tuning_fields_default_to_none() {
+        let toml = r#"
+            api_key = "sk-test"
+        "#;
+        let parsed: ModelProviderConfig = toml::from_str(toml).unwrap();
+        assert!(parsed.ollama_num_ctx.is_none());
+        assert!(parsed.ollama_num_predict.is_none());
+        assert!(parsed.ollama_temperature_override.is_none());
     }
 
     #[test]

@@ -269,6 +269,33 @@ warning pointing at the new default. In non-TTY environments (piped output, CI w
 Use `channel_ids` (a list) in the Slack config block. `channel_id` (singular) still
 works but is deprecated in V2.
 
+### Ollama provider sends explicit `num_ctx` / `num_predict` on every request
+
+The Ollama provider now stamps `num_ctx=8192` and `num_predict=2048` into the
+`options` block of every `/api/chat` request body. Previously these fields were
+unset on the wire, defaulting to Ollama's server-side `num_ctx=2048` and
+`num_predict=128` — which silently truncated prompts and responses on any
+structured tool-calling workflow (200 OK with garbage rather than an error).
+
+For most deployments this is strictly an improvement. **Operators on tight VRAM
+budgets** should be aware that jumping from server-default `num_ctx=2048` to
+the new `8192` increases the model's context-allocation footprint and can OOM
+the GPU on small cards. Pin lower values via the new optional fields under
+`[providers.models.<name>]` if needed:
+
+```toml
+[providers.models.my-ollama-llama3]
+provider = "ollama"
+ollama_num_ctx = 4096           # default 8192
+ollama_num_predict = 1024       # default 2048
+ollama_temperature_override = 0.1   # optional; None = per-call temperature wins
+```
+
+Older Ollama versions that don't recognize `num_ctx` / `num_predict` are
+unaffected — the wire body uses `serde(skip_serializing_if = "Option::is_none")`,
+so providers stamping `None` (an explicit opt-out) emit a body without those
+keys.
+
 ### Workspace crate boundaries
 
 If you have any code that depends directly on internal ZeroClaw crate paths (e.g. for

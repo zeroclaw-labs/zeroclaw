@@ -17,10 +17,81 @@ const TIMEOUT_SECS_DEFAULT: u64 = 600;
 /// `providers.models.<name>.base-url` for remote GPU boxes or non-default ports.
 const BASE_URL: &str = "http://localhost:11434";
 
+/// Default `num_ctx` (context window, in tokens) sent in every Ollama
+/// `/api/chat` request when no operator override is supplied. Ollama's
+/// server-side default is 2048, which silently truncates prompts; we set
+/// 8192 so callers get useful context without per-call configuration.
+pub const OLLAMA_DEFAULT_NUM_CTX: u32 = 8192;
+
+/// Default `num_predict` (max output tokens) sent in every Ollama
+/// `/api/chat` request when no operator override is supplied. Ollama's
+/// server-side default is 128, which silently truncates responses.
+pub const OLLAMA_DEFAULT_NUM_PREDICT: i32 = 2048;
+
+/// Per-deployment tuning knobs for the Ollama provider. Bundled into
+/// every `/api/chat` request's `options` field so the wire payload is
+/// explicit instead of relying on Ollama server defaults.
+///
+/// Note: temperature is intentionally NOT held as a default here.
+/// `temperature_override` is `Some(v)` only when an operator explicitly
+/// sets `ollama_temperature_override` in `config.toml`; otherwise the
+/// per-call temperature passed through `Provider::chat_with_system(..)`
+/// wins (preserving backward compatibility with `TEMPERATURE_DEFAULT`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OllamaTuning {
+    pub num_ctx: u32,
+    pub num_predict: i32,
+    /// Operator-supplied override for the per-call temperature passed
+    /// through `Provider::chat_with_system(.., temperature)`. When
+    /// `Some(v)`, every Ollama `/api/chat` request uses `v` regardless
+    /// of the per-call argument — this is the wire knob behind the
+    /// `ollama_temperature_override` config field. When `None`, the
+    /// per-call temperature wins (full backward compatibility).
+    //
+    // Note: `Option<f64>` here, vs `Option<u32>`/`Option<i32>` on the
+    // runtime-override constructor's first two args, because temperature
+    // has fall-through semantics (None means "let the per-call temp win"),
+    // whereas num_ctx/num_predict unset just falls back to framework
+    // constants — there is no meaningful "let the call decide" mode for
+    // those two.
+    pub temperature_override: Option<f64>,
+}
+
+impl Default for OllamaTuning {
+    fn default() -> Self {
+        Self {
+            num_ctx: OLLAMA_DEFAULT_NUM_CTX,
+            num_predict: OLLAMA_DEFAULT_NUM_PREDICT,
+            temperature_override: None,
+        }
+    }
+}
+
+impl OllamaTuning {
+    /// Build a tuning struct from the three optional `ProviderRuntimeOptions`
+    /// fields the `ollama` factory arm consumes. Unset `num_ctx` /
+    /// `num_predict` fall back to framework constants; unset
+    /// `temperature_override` stays `None` so the per-call temperature wins.
+    #[must_use]
+    pub fn from_runtime_overrides(
+        num_ctx: Option<u32>,
+        num_predict: Option<i32>,
+        temperature_override: Option<f64>,
+    ) -> Self {
+        let defaults = Self::default();
+        Self {
+            num_ctx: num_ctx.unwrap_or(defaults.num_ctx),
+            num_predict: num_predict.unwrap_or(defaults.num_predict),
+            temperature_override,
+        }
+    }
+}
+
 pub struct OllamaProvider {
     base_url: String,
     api_key: Option<String>,
     reasoning_enabled: Option<bool>,
+    tuning: OllamaTuning,
 }
 
 // ─── Request Structures ───────────────────────────────────────────────────────
@@ -66,6 +137,10 @@ struct OutgoingFunction {
 #[derive(Debug, Serialize)]
 struct Options {
     temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_ctx: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_predict: Option<i32>,
 }
 
 // ─── Response Structures ──────────────────────────────────────────────────────
@@ -154,7 +229,22 @@ impl OllamaProvider {
             base_url: Self::normalize_base_url(base_url.unwrap_or(BASE_URL)),
             api_key,
             reasoning_enabled,
+            tuning: OllamaTuning::default(),
         }
+    }
+
+    /// Override the per-deployment tuning knobs (`num_ctx`, `num_predict`,
+    /// `temperature_override`) on this provider. Returns `self` for
+    /// chained construction.
+    #[must_use]
+    pub fn with_tuning(mut self, tuning: OllamaTuning) -> Self {
+        self.tuning = tuning;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tuning(&self) -> OllamaTuning {
+        self.tuning
     }
 
     fn is_local_endpoint(&self) -> bool {
@@ -313,7 +403,11 @@ impl OllamaProvider {
             model: model.to_string(),
             messages,
             stream: false,
-            options: Options { temperature },
+            options: Options {
+                temperature: self.tuning.temperature_override.unwrap_or(temperature),
+                num_ctx: Some(self.tuning.num_ctx),
+                num_predict: Some(self.tuning.num_predict),
+            },
             think,
             tools: tools.map(|t| t.to_vec()),
         }
@@ -1040,6 +1134,9 @@ mod tests {
 
         let json = serde_json::to_value(request).unwrap();
         assert!(json.get("think").is_none());
+        let options = json.get("options").expect("options present");
+        assert_eq!(options.get("num_ctx"), Some(&serde_json::json!(8192)));
+        assert_eq!(options.get("num_predict"), Some(&serde_json::json!(2048)));
     }
 
     #[test]
@@ -1060,6 +1157,192 @@ mod tests {
 
         let json = serde_json::to_value(request).unwrap();
         assert_eq!(json.get("think"), Some(&serde_json::json!(false)));
+        let options = json.get("options").expect("options present");
+        assert_eq!(options.get("num_ctx"), Some(&serde_json::json!(8192)));
+        assert_eq!(options.get("num_predict"), Some(&serde_json::json!(2048)));
+    }
+
+    #[test]
+    fn request_includes_default_num_ctx_and_num_predict() {
+        let provider = OllamaProvider::new(None, None);
+        let request = provider.build_chat_request(
+            vec![Message {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            }],
+            "llama3",
+            0.2,
+            None,
+        );
+
+        let json = serde_json::to_value(request).unwrap();
+        let options = json.get("options").expect("options present");
+        assert_eq!(options.get("temperature"), Some(&serde_json::json!(0.2)));
+        assert_eq!(options.get("num_ctx"), Some(&serde_json::json!(8192)));
+        assert_eq!(options.get("num_predict"), Some(&serde_json::json!(2048)));
+    }
+
+    #[test]
+    fn build_chat_request_with_think_emits_explicit_options() {
+        // Wire-shape snapshot: the JSON body of every Ollama /api/chat
+        // request MUST carry an `options` object with all three keys
+        // (`temperature`, `num_ctx`, `num_predict`) populated. Older
+        // tests cover individual fields piecemeal; this one locks the
+        // full shape so a future refactor can't silently drop a field.
+        let provider = OllamaProvider::new(None, None);
+        let request = provider.build_chat_request_with_think(
+            vec![Message {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            }],
+            "llama3",
+            0.3,
+            None,
+            Some(true),
+        );
+
+        let json = serde_json::to_value(request).unwrap();
+        let options = json
+            .get("options")
+            .expect("options object missing from request body");
+
+        assert!(
+            options.get("temperature").is_some(),
+            "options.temperature must be present on every wire request"
+        );
+        assert!(
+            options.get("num_ctx").is_some(),
+            "options.num_ctx must be present on every wire request"
+        );
+        assert!(
+            options.get("num_predict").is_some(),
+            "options.num_predict must be present on every wire request"
+        );
+
+        assert_eq!(options.get("temperature"), Some(&serde_json::json!(0.3)));
+        assert_eq!(options.get("num_ctx"), Some(&serde_json::json!(8192)));
+        assert_eq!(options.get("num_predict"), Some(&serde_json::json!(2048)));
+    }
+
+    #[test]
+    fn request_includes_overridden_tuning() {
+        let provider = OllamaProvider::new(None, None).with_tuning(OllamaTuning {
+            num_ctx: 4096,
+            num_predict: 1024,
+            temperature_override: None,
+        });
+        let request = provider.build_chat_request(
+            vec![Message {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            }],
+            "llama3",
+            0.5,
+            None,
+        );
+
+        let json = serde_json::to_value(request).unwrap();
+        let options = json.get("options").expect("options present");
+        assert_eq!(options.get("num_ctx"), Some(&serde_json::json!(4096)));
+        assert_eq!(options.get("num_predict"), Some(&serde_json::json!(1024)));
+    }
+
+    #[test]
+    fn temperature_override_replaces_per_call_temperature() {
+        let provider = OllamaProvider::new(None, None).with_tuning(OllamaTuning {
+            num_ctx: 8192,
+            num_predict: 2048,
+            temperature_override: Some(0.1),
+        });
+        let request = provider.build_chat_request(
+            vec![Message {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            }],
+            "llama3",
+            0.9,
+            None,
+        );
+
+        let json = serde_json::to_value(request).unwrap();
+        let options = json.get("options").expect("options present");
+        assert_eq!(options.get("temperature"), Some(&serde_json::json!(0.1)));
+    }
+
+    #[test]
+    fn temperature_override_unset_passes_per_call_temperature() {
+        let provider = OllamaProvider::new(None, None);
+        let request = provider.build_chat_request(
+            vec![Message {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            }],
+            "llama3",
+            0.42,
+            None,
+        );
+
+        let json = serde_json::to_value(request).unwrap();
+        let options = json.get("options").expect("options present");
+        assert_eq!(options.get("temperature"), Some(&serde_json::json!(0.42)));
+    }
+
+    #[test]
+    fn retry_path_carries_options() {
+        // The think=true → retry-without-think path in `send_request` uses the
+        // same `build_chat_request_with_think` builder for both attempts; verify
+        // the builder produces identical option fields when only `think` differs.
+        let provider =
+            OllamaProvider::new_with_reasoning(None, None, Some(true)).with_tuning(OllamaTuning {
+                num_ctx: 16384,
+                num_predict: 4096,
+                temperature_override: None,
+            });
+
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Some("hello".to_string()),
+            images: None,
+            tool_calls: None,
+            tool_name: None,
+        }];
+
+        let first = provider.build_chat_request_with_think(
+            messages.clone(),
+            "llama3",
+            0.4,
+            None,
+            Some(true),
+        );
+        let retry = provider.build_chat_request_with_think(messages, "llama3", 0.4, None, None);
+
+        let first_json = serde_json::to_value(first).unwrap();
+        let retry_json = serde_json::to_value(retry).unwrap();
+        assert_eq!(
+            first_json.get("options"),
+            retry_json.get("options"),
+            "retry must carry the same options as the first attempt"
+        );
+        assert_eq!(first_json.get("think"), Some(&serde_json::json!(true)));
+        assert!(retry_json.get("think").is_none());
+        let options = first_json.get("options").unwrap();
+        assert_eq!(options.get("num_ctx"), Some(&serde_json::json!(16384)));
+        assert_eq!(options.get("num_predict"), Some(&serde_json::json!(4096)));
     }
 
     #[test]
