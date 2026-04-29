@@ -259,8 +259,15 @@ export default function FieldForm({ prefix, onSaved, showDelete = true, title }:
   };
 
   const sortedEntries = useMemo(() => {
-    // Stable order: secrets first (most-needed), then alphabetical by short label.
+    // Stable order: `enabled` first (drives whether anything below it
+    // matters), then secrets (most-needed), then alphabetical by short
+    // label. Curating `enabled` is safe — it's a load-bearing standard
+    // field name across every section that has on/off semantics.
+    const isEnabledLeaf = (e: ListResponseEntry) => e.path.endsWith('.enabled') || e.path === 'enabled';
     return [...entries].sort((a, b) => {
+      const ea = isEnabledLeaf(a);
+      const eb = isEnabledLeaf(b);
+      if (ea !== eb) return ea ? -1 : 1;
       if (a.is_secret !== b.is_secret) return a.is_secret ? -1 : 1;
       return fieldShortLabel(a).localeCompare(fieldShortLabel(b));
     });
@@ -459,11 +466,11 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
             )}
           </label>
           <code
-            className="block text-xs mt-0.5 break-all"
-            style={{ color: 'var(--pc-text-faint)' }}
+            className="block text-[10px] mt-0.5 break-all"
+            style={{ color: 'var(--pc-text-faint)', opacity: 0.55 }}
+            title={entry.type_hint}
           >
-            {entry.path}{' '}
-            <span style={{ opacity: 0.6 }}>({entry.type_hint})</span>
+            {entry.path}
           </code>
           {drift && <DriftDiff drift={drift} />}
         </div>
@@ -584,7 +591,7 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
                 ? entry.populated
                   ? 'Leave blank to keep current value'
                   : 'Enter value'
-                : entry.type_hint
+                : ''
             }
           />
         )}

@@ -528,15 +528,29 @@ fn schema_walk_picker(cfg: &zeroclaw_config::schema::Config, section: &str) -> V
         .collect();
 
     all.into_iter()
-        .map(|name| PickerItem {
-            key: name.clone(),
-            label: name.clone(),
-            description: None,
-            badge: if configured.contains(&name) {
+        .map(|name| {
+            // Two-tier badge: `configured` = a block exists on disk for this
+            // item (auto-created on click + persisted). `active` = the block
+            // exists AND its `enabled` field is currently `true`. Items
+            // without an `enabled` field stay at `configured`. Surfaces the
+            // "is this actually doing anything?" distinction the contributor
+            // feedback on PR #6179 asked for, without changing init-on-click
+            // semantics (the macro-level fix lands in schema v3 / #5947).
+            let enabled_path = format!("{prefix_with_dot}{name}.enabled");
+            let is_active = cfg.get_prop(&enabled_path).ok().as_deref() == Some("true");
+            let badge = if is_active {
+                Some("active".to_string())
+            } else if configured.contains(&name) {
                 Some("configured".to_string())
             } else {
                 None
-            },
+            };
+            PickerItem {
+                key: name.clone(),
+                label: name.clone(),
+                description: None,
+                badge,
+            }
         })
         .collect()
 }

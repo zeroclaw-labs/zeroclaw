@@ -8,8 +8,8 @@
 // labels, dropdown options, or provider lists.
 
 import { useEffect, useMemo, useState } from 'react';
-import { useParams } from 'react-router-dom';
-import { ArrowLeft, ChevronRight, Plus } from 'lucide-react';
+import { Link, useParams } from 'react-router-dom';
+import { ArrowLeft, ChevronRight, Plus, Sparkles } from 'lucide-react';
 import {
   ApiError,
   getSections,
@@ -234,7 +234,21 @@ export default function Config() {
                   </>
                 )}
               </div>
-              <ReloadDaemonButton onReloaded={() => goToSection(activeSection.key)} />
+              <div className="flex items-center gap-2">
+                {/* Setup wizard isn't in the global navbar (it's a one-shot
+                    first-run flow), so contributors / re-installers reach it
+                    from here. Mirrors the in-progress signal Audacity88 and
+                    iLTeoooD raised on PR #6179. */}
+                <Link
+                  to="/onboard"
+                  className="btn-secondary inline-flex items-center gap-1.5 text-xs px-3 py-1.5"
+                  title="Walk the first-run setup wizard again"
+                >
+                  <Sparkles className="h-3.5 w-3.5" />
+                  Run setup again
+                </Link>
+                <ReloadDaemonButton onReloaded={() => goToSection(activeSection.key)} />
+              </div>
             </div>
 
             {/* Section overview / picker / form */}

@@ -856,7 +856,19 @@ async fn channels(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Re
         let mut options: Vec<SelectItem> = all_channels
             .iter()
             .map(|name| {
-                if configured.contains(name) {
+                // Match the providers picker's two-tier badge: `[active]`
+                // wins when the block exists AND `<channel>.enabled = true`,
+                // otherwise `[configured]` for a present-but-disabled block.
+                // Web `/onboard` renders the same tiers via
+                // `schema_walk_picker` in `crates/zeroclaw-gateway/src/api_onboard.rs`.
+                let is_active = cfg
+                    .get_prop(&format!("channels.{name}.enabled"))
+                    .ok()
+                    .as_deref()
+                    == Some("true");
+                if is_active {
+                    SelectItem::with_badge(name.clone(), "[active]")
+                } else if configured.contains(name) {
                     SelectItem::with_badge(name.clone(), "[configured]")
                 } else {
                     SelectItem::new(name.clone())

@@ -17,6 +17,7 @@ const routeTitles: Record<string, string> = {
   '/cost': 'nav.cost',
   '/logs': 'nav.logs',
   '/doctor': 'nav.doctor',
+  '/onboard': 'nav.onboard',
 };
 
 interface HeaderProps {
@@ -33,8 +34,11 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
   const [langOpen, setLangOpen] = useState(false);
   const langRef = useRef<HTMLDivElement>(null);
 
-  const titleKey = routeTitles[location.pathname] ?? 'nav.dashboard';
-  const pageTitle = t(titleKey);
+  // Fall back to a plain title for unknown routes rather than mislabeling
+  // them as "Dashboard" — e.g. early /onboard hits before the entry was
+  // mapped here showed "Dashboard" for the first-run flow.
+  const titleKey = routeTitles[location.pathname];
+  const pageTitle = titleKey ? t(titleKey) : '';
 
   // Close dropdown when clicking outside
   useEffect(() => {
