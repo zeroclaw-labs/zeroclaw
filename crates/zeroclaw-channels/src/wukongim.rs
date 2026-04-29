@@ -589,7 +589,7 @@ impl Channel for WuKongIMChannel {
 
                             let channel_msg = ChannelMessage {
                                 id: params.message_id,
-                                sender: params.from_uid.clone(),
+                                sender: target_id.clone(),
                                 reply_target: format!("{}:{}", params.channel_type, target_id),
                                 content,
                                 channel: "wukongim".to_string(),
