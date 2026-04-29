@@ -153,7 +153,7 @@ pub struct SectionInfo {
     /// Whether the user has marked the section completed in
     /// `onboard_state.completed_sections`.
     pub completed: bool,
-    /// Display group for the dashboard sidebar (`Onboarding`, `Agent`,
+    /// Display group for the dashboard sidebar (`Foundation`, `Agent`,
     /// `Tools`, etc.). Curated server-side until v3 / #5947 lands a schema
     /// attribute that encodes the grouping declaratively.
     pub group: String,
@@ -306,8 +306,10 @@ fn humanize_section(key: &str) -> String {
 /// `Config.tsx`), not this list.
 fn section_group(key: &str) -> &'static str {
     match key {
-        // The 6 onboarding sections (TUI's `Section` enum).
-        "workspace" | "providers" | "channels" | "memory" | "hardware" | "tunnel" => "Onboarding",
+        // The 6 foundation sections (TUI's `Section` enum) — every install
+        // touches these. Named for the role they play, not for the wizard
+        // that happens to walk them on first run.
+        "workspace" | "providers" | "channels" | "memory" | "hardware" | "tunnel" => "Foundation",
         // Agent loop, scheduling, and orchestration.
         "agent"
         | "autonomy"
