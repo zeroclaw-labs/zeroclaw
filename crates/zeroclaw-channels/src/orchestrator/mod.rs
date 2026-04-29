@@ -412,22 +412,25 @@ impl InFlightTaskCompletion {
 
 fn conversation_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     // Include thread_ts for per-topic memory isolation in forum groups
-    match &msg.thread_ts {
+    let raw = match &msg.thread_ts {
         Some(tid) => format!("{}_{}_{}_{}", msg.channel, tid, msg.sender, msg.id),
         None => format!("{}_{}_{}", msg.channel, msg.sender, msg.id),
-    }
+    };
+    zeroclaw_infra::session_store::sanitize_session_key(&raw)
 }
 
 pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
-    // Include reply_target for per-channel isolation (e.g. distinct Discord/Slack
-    // channels) and thread_ts for per-topic isolation in forum groups.
-    match &msg.thread_ts {
+    // Sanitize so the runtime HashMap key matches `SessionStore::list_sessions`
+    // after a restart; otherwise hydration loads sessions under the on-disk
+    // (sanitized) name while lookup keeps producing the un-sanitized form.
+    let raw = match &msg.thread_ts {
         Some(tid) => format!(
             "{}_{}_{}_{}",
             msg.channel, msg.reply_target, tid, msg.sender
         ),
         None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
-    }
+    };
+    zeroclaw_infra::session_store::sanitize_session_key(&raw)
 }
 
 fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
