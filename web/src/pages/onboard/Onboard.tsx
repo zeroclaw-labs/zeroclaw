@@ -279,7 +279,7 @@ export default function Onboard() {
                 doneLabel={
                   isLastSection(sections, activeSection.key)
                     ? 'Done'
-                    : 'Skip — next section ▶'
+                    : 'Next ▶'
                 }
                 onDone={advanceSection}
               />
