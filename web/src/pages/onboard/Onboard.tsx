@@ -33,6 +33,21 @@ import SectionPicker from '../../components/onboard/SectionPicker';
 
 const COMPLETED_SECTIONS_PATH = 'onboard-state.completed-sections';
 
+// Wizard sections in TUI order (`zeroclaw onboard`'s `Section::as_path_prefix`
+// dispatch in `crates/zeroclaw-runtime/src/onboard/mod.rs`). The dashboard
+// wizard mirrors the CLI/TUI flow exactly — only these 6 sections, walked
+// in this order. The Config explorer at `/config` and the per-section
+// editors at `/setup/<section>` are the surfaces for everything else;
+// `/onboard` stays a focused setup-completion flow.
+const ONBOARD_SECTION_ORDER = [
+  'workspace',
+  'providers',
+  'channels',
+  'memory',
+  'hardware',
+  'tunnel',
+] as const;
+
 export default function Onboard() {
   const [sections, setSections] = useState<SectionInfo[]>([]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
@@ -46,10 +61,19 @@ export default function Onboard() {
     getSections()
       .then((resp) => {
         if (cancelled) return;
-        setSections(resp.sections);
+        // Mirror the TUI flow: only the 6 onboarding sections, in their
+        // canonical order. The gateway returns every top-level config
+        // section now (#6175 schema-driven discovery) — we filter +
+        // re-order here to keep `/onboard` focused on setup completion.
+        const byKey = new Map(resp.sections.map((s) => [s.key, s] as const));
+        const ordered = ONBOARD_SECTION_ORDER.flatMap((k) => {
+          const s = byKey.get(k);
+          return s ? [s] : [];
+        });
+        setSections(ordered);
         // Open the first not-yet-completed section.
-        const next = resp.sections.find((s) => !s.completed);
-        setActiveKey(next?.key ?? resp.sections[0]?.key ?? null);
+        const next = ordered.find((s) => !s.completed);
+        setActiveKey(next?.key ?? ordered[0]?.key ?? null);
       })
       .catch((e) => {
         if (cancelled) return;
