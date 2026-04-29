@@ -12,9 +12,11 @@ import { Link, useParams } from 'react-router-dom';
 import { ArrowLeft, ChevronRight, Plus, Sparkles } from 'lucide-react';
 import {
   ApiError,
+  getDrift,
   getSections,
   selectSectionItem,
   type ConfigApiError,
+  type DriftEntry,
   type PickerItem,
   type SectionInfo,
 } from '../lib/api';
@@ -62,6 +64,20 @@ export default function Config() {
   const [mode, setMode] = useState<Mode>({ kind: 'section-overview' });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Page-level drift — visible regardless of which view (overview /
+  // picker / form) is rendered. Foundation sections like Memory and
+  // Channels land on SectionOverview, which has no FieldForm and
+  // therefore no in-form drift banner; this surfaces the signal there
+  // too. Refresh-on-mount only — there's a real "drift doesn't clear
+  // after reload" bug that's separate from this visibility issue and
+  // owned outside this file.
+  const [drifted, setDrifted] = useState<DriftEntry[]>([]);
+  useEffect(() => {
+    void getDrift()
+      .then((r) => setDrifted(r.drifted ?? []))
+      .catch(() => undefined);
+  }, []);
+
 
   useEffect(() => {
     let cancelled = false;
@@ -262,6 +278,8 @@ export default function Config() {
               </div>
             </div>
 
+            {drifted.length > 0 && <PageDriftBanner drifted={drifted} />}
+
             {/* Section overview / picker / form */}
             {!activeSection.has_picker ? (
               // Direct-form sections (Workspace, Hardware): no picker, just
@@ -311,6 +329,53 @@ export default function Config() {
           </div>
         )}
       </main>
+    </div>
+  );
+}
+
+// Page-level drift banner. Display-only — directs the user to the
+// top-right "Reload daemon" button rather than offering its own
+// inline restart, so there's exactly one place that triggers reload.
+// Lists the drifted paths so the user knows what's about to change.
+function PageDriftBanner({ drifted }: { drifted: DriftEntry[] }) {
+  return (
+    <div
+      className="rounded-xl border p-3 text-sm flex flex-col gap-2"
+      style={{
+        borderColor: 'var(--color-status-warning, #f5b400)',
+        background: 'rgba(245, 180, 0, 0.06)',
+      }}
+    >
+      <div className="flex items-center gap-2">
+        <span style={{ color: 'var(--pc-text-primary)' }}>
+          ⚠ {drifted.length} path{drifted.length === 1 ? '' : 's'} differ
+          {drifted.length === 1 ? 's' : ''} from on-disk
+        </span>
+        <span className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+          — click <strong>Reload daemon</strong> to apply.
+        </span>
+      </div>
+      <ul
+        className="text-xs flex flex-col gap-0.5"
+        style={{ color: 'var(--pc-text-muted)' }}
+      >
+        {drifted.slice(0, 6).map((d) => (
+          <li key={d.path} className="font-mono break-all">
+            {d.path}
+            {d.secret && (
+              <span style={{ color: 'var(--pc-text-faint)' }}>
+                {' '}
+                (secret — values not shown)
+              </span>
+            )}
+          </li>
+        ))}
+        {drifted.length > 6 && (
+          <li style={{ color: 'var(--pc-text-faint)' }}>
+            …and {drifted.length - 6} more
+          </li>
+        )}
+      </ul>
     </div>
   );
 }
