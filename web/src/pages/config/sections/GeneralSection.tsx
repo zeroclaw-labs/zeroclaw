@@ -148,18 +148,35 @@ const MODELS_BY_PROVIDER: Record<string, { value: string; label: string }[]> = {
   ],
 };
 
+// Read the per-provider model entry from the [providers.models.<name>] table.
+function readProviderModel(config: Record<string, unknown>, provider: string): string {
+  const providers = config.providers as Record<string, unknown> | undefined;
+  const models = providers?.models as Record<string, unknown> | undefined;
+  const entry = models?.[provider] as Record<string, unknown> | undefined;
+  return (entry?.model as string) ?? '';
+}
+
 export default function GeneralSection({ config, onUpdate }: Props) {
-  const provider = (config.default_provider as string) ?? 'openrouter';
+  // The runtime reads [providers].fallback and [providers.models.<name>].model.
+  // Older builds of this form wrote top-level `default_provider` / `default_model`
+  // which the runtime ignored, so saves silently no-op'd. See #6047.
+  const providers = config.providers as Record<string, unknown> | undefined;
+  const provider = (providers?.fallback as string) ?? 'openrouter';
   const modelOptions = MODELS_BY_PROVIDER[provider];
-  const currentModel = (config.default_model as string) ?? '';
+  const currentModel = readProviderModel(config, provider);
 
   // When provider changes, auto-select the first model for that provider
   const handleProviderChange = (v: string) => {
-    onUpdate('default_provider', v);
+    onUpdate('providers.fallback', v);
     const models = MODELS_BY_PROVIDER[v];
-    if (models && models.length > 0) {
-      onUpdate('default_model', models[0]!.value);
+    const existing = readProviderModel(config, v);
+    if (!existing && models && models.length > 0) {
+      onUpdate(`providers.models.${v}.model`, models[0]!.value);
     }
+  };
+
+  const handleModelChange = (v: string) => {
+    onUpdate(`providers.models.${provider}.model`, v);
   };
 
   return (
@@ -179,7 +196,7 @@ export default function GeneralSection({ config, onUpdate }: Props) {
         {modelOptions ? (
           <Select
             value={modelOptions.some((o) => o.value === currentModel) ? currentModel : ''}
-            onChange={(v) => onUpdate('default_model', v)}
+            onChange={handleModelChange}
             options={[
               ...(currentModel && !modelOptions.some((o) => o.value === currentModel)
                 ? [{ value: currentModel, label: currentModel }]
@@ -191,7 +208,7 @@ export default function GeneralSection({ config, onUpdate }: Props) {
           <input
             type="text"
             value={currentModel}
-            onChange={(e) => onUpdate('default_model', e.target.value)}
+            onChange={(e) => handleModelChange(e.target.value)}
             placeholder="model name"
             className="input-electric text-sm px-3 py-1.5 w-52 font-mono"
           />
