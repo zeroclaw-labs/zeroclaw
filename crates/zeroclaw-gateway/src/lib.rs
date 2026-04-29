@@ -370,6 +370,11 @@ pub struct AppState {
     pub event_buffer: Arc<sse::EventBuffer>,
     /// Shutdown signal sender for graceful shutdown
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Reload signal sender owned by the daemon. /admin/reload writes `true`
+    /// here; the daemon's wait loop reacts and re-instantiates every
+    /// subsystem in place. `None` when running standalone (`zeroclaw gateway start`)
+    /// — reload then degrades to a 503 with a clear message.
+    pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
     /// Registry of dynamically connected nodes
     pub node_registry: Arc<nodes::NodeRegistry>,
     /// Path prefix for reverse-proxy deployments (empty string = no prefix)
@@ -405,6 +410,10 @@ pub async fn run_gateway(
     port: u16,
     config: Config,
     external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    // Reload sender owned by the daemon. /admin/reload writes `true` here;
+    // the daemon's wait loop reacts via `subscribe()` and tears down to
+    // re-init. Cross-platform replacement for the SIGUSR1 hack.
+    reload_tx: Option<tokio::sync::watch::Sender<bool>>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
@@ -909,6 +918,7 @@ pub async fn run_gateway(
         event_tx,
         event_buffer,
         shutdown_tx,
+        reload_tx,
         node_registry,
         session_backend,
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
@@ -948,6 +958,7 @@ pub async fn run_gateway(
     let inner = Router::new()
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
+        .route("/admin/reload", post(handle_admin_reload))
         .route("/admin/paircode", get(handle_admin_paircode))
         .route("/admin/paircode/new", post(handle_admin_paircode_new))
         // ── Existing routes ──
@@ -2283,6 +2294,54 @@ async fn handle_admin_shutdown(
     Ok((StatusCode::OK, Json(body)))
 }
 
+/// POST /admin/reload — reload the daemon in place (localhost only).
+///
+/// Sends `true` on the reload channel the daemon owns. The daemon's main
+/// wait loop sees the change, returns `DaemonExit::Reload`, and the outer
+/// loop in `src/main.rs` re-reads config from disk and re-runs
+/// `daemon::run` — re-instantiating every subsystem (gateway / channels /
+/// heartbeat / scheduler / mqtt) with the fresh config.
+///
+/// Same PID throughout. Brief HTTP downtime while the gateway listener
+/// rebinds — typically sub-second. Clients should poll `/health` to detect
+/// when the new instance is ready.
+///
+/// Cross-platform — works identically on Linux, macOS, and Windows because
+/// the channel is in-process tokio, not an OS signal. The gateway-only
+/// `zeroclaw gateway start` (no daemon supervisor) returns 503 with a
+/// clear message because there's nothing to signal.
+async fn handle_admin_reload(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+
+    let Some(reload_tx) = state.reload_tx.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "no daemon supervisor — running as standalone gateway. \
+                          Restart the process to pick up config changes."
+            })),
+        ));
+    };
+
+    tracing::info!("🔄 Admin reload request received");
+    // Brief delay so the HTTP response flushes before tear-down begins.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let _ = reload_tx.send(true);
+    });
+
+    Ok((
+        StatusCode::OK,
+        Json(AdminResponse {
+            success: true,
+            message: "Daemon reload initiated".to_string(),
+        }),
+    ))
+}
+
 /// GET /admin/paircode — fetch current pairing code (localhost only)
 async fn handle_admin_paircode(
     State(state): State<AppState>,
@@ -2464,6 +2523,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -2537,6 +2597,7 @@ mod tests {
             event_tx,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -2936,6 +2997,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3017,6 +3079,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3110,6 +3173,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3175,6 +3239,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3245,6 +3310,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3320,6 +3386,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3392,6 +3459,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,

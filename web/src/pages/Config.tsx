@@ -18,6 +18,7 @@ import {
   type SectionInfo,
 } from '../lib/api';
 import FieldForm from '../components/onboard/FieldForm';
+import ReloadDaemonButton from '../components/onboard/ReloadDaemonButton';
 import SectionPicker from '../components/onboard/SectionPicker';
 
 type Mode =
@@ -158,33 +159,36 @@ export default function Config() {
       <main className="flex-1 overflow-y-auto p-6">
         {activeSection && (
           <div className="flex flex-col gap-4 max-w-3xl">
-            {/* Breadcrumb */}
-            <div
-              className="text-sm flex items-center gap-1.5 flex-wrap"
-              style={{ color: 'var(--pc-text-muted)' }}
-            >
-              <span style={{ color: 'var(--pc-text-secondary)' }}>Config</span>
-              <ChevronRight className="h-3 w-3" />
-              <span
-                style={{
-                  color: mode.kind === 'section-overview'
-                    ? 'var(--pc-accent)'
-                    : 'var(--pc-text-secondary)',
-                  cursor: mode.kind !== 'section-overview' ? 'pointer' : 'default',
-                  fontWeight: mode.kind === 'section-overview' ? 600 : 400,
-                }}
-                onClick={() => setMode({ kind: 'section-overview' })}
+            {/* Breadcrumb + Reload daemon button on the right */}
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <div
+                className="text-sm flex items-center gap-1.5 flex-wrap"
+                style={{ color: 'var(--pc-text-muted)' }}
               >
-                {activeSection.label}
-              </span>
-              {mode.kind === 'form' && (
-                <>
-                  <ChevronRight className="h-3 w-3" />
-                  <span style={{ color: 'var(--pc-accent)', fontWeight: 600 }}>
-                    {mode.item.label}
-                  </span>
-                </>
-              )}
+                <span style={{ color: 'var(--pc-text-secondary)' }}>Config</span>
+                <ChevronRight className="h-3 w-3" />
+                <span
+                  style={{
+                    color: mode.kind === 'section-overview'
+                      ? 'var(--pc-accent)'
+                      : 'var(--pc-text-secondary)',
+                    cursor: mode.kind !== 'section-overview' ? 'pointer' : 'default',
+                    fontWeight: mode.kind === 'section-overview' ? 600 : 400,
+                  }}
+                  onClick={() => setMode({ kind: 'section-overview' })}
+                >
+                  {activeSection.label}
+                </span>
+                {mode.kind === 'form' && (
+                  <>
+                    <ChevronRight className="h-3 w-3" />
+                    <span style={{ color: 'var(--pc-accent)', fontWeight: 600 }}>
+                      {mode.item.label}
+                    </span>
+                  </>
+                )}
+              </div>
+              <ReloadDaemonButton onReloaded={() => goToSection(activeSection.key)} />
             </div>
 
             {/* Section overview / picker / form */}

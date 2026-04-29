@@ -1728,39 +1728,66 @@ async fn main() -> Result<()> {
                 },
             ));
 
-            let subsystems = daemon::DaemonSubsystems {
-                #[cfg(feature = "gateway")]
-                gateway_start: Some(Box::new(|host, port, config, tx| {
-                    Box::pin(async move {
-                        Box::pin(zeroclaw_gateway::run_gateway(&host, port, config, tx)).await
-                    })
-                })),
-                #[cfg(not(feature = "gateway"))]
-                gateway_start: None,
-                channels_start: Some(Box::new(|config| {
-                    Box::pin(async move {
-                        Box::pin(zeroclaw_channels::orchestrator::start_channels(config)).await
-                    })
-                })),
-                mqtt_start: Some(Box::new(|mqtt_config| {
-                    Box::pin(async move {
-                        use std::sync::{Arc, Mutex};
-                        use zeroclaw_config::schema::SopConfig;
-                        use zeroclaw_memory::NoneMemory;
-                        use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
+            // Reload loop. `daemon::run` returns DaemonExit::Shutdown on
+            // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload on SIGUSR1
+            // (loop re-reads config from disk and re-runs). The PID stays
+            // the same across reloads — only the in-process subsystems
+            // tear down + re-instantiate.
+            let mut current_config = config;
+            loop {
+                let subsystems = daemon::DaemonSubsystems {
+                    #[cfg(feature = "gateway")]
+                    gateway_start: Some(Box::new(|host, port, config, tx, reload_tx| {
+                        Box::pin(async move {
+                            Box::pin(zeroclaw_gateway::run_gateway(
+                                &host, port, config, tx, reload_tx,
+                            ))
+                            .await
+                        })
+                    })),
+                    #[cfg(not(feature = "gateway"))]
+                    gateway_start: None,
+                    channels_start: Some(Box::new(|config| {
+                        Box::pin(async move {
+                            Box::pin(zeroclaw_channels::orchestrator::start_channels(config)).await
+                        })
+                    })),
+                    mqtt_start: Some(Box::new(|mqtt_config| {
+                        Box::pin(async move {
+                            use std::sync::{Arc, Mutex};
+                            use zeroclaw_config::schema::SopConfig;
+                            use zeroclaw_memory::NoneMemory;
+                            use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
 
-                        let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
-                        let audit = Arc::new(SopAuditLogger::new(Arc::new(NoneMemory)));
-                        zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
-                            &mqtt_config,
-                            engine,
-                            audit,
-                        )
-                        .await
-                    })
-                })),
-            };
-            Box::pin(daemon::run(config, host, port, subsystems)).await
+                            let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
+                            let audit = Arc::new(SopAuditLogger::new(Arc::new(NoneMemory)));
+                            zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
+                                &mqtt_config,
+                                engine,
+                                audit,
+                            )
+                            .await
+                        })
+                    })),
+                };
+                let exit = Box::pin(daemon::run(
+                    current_config.clone(),
+                    host.clone(),
+                    port,
+                    subsystems,
+                ))
+                .await?;
+                match exit {
+                    daemon::DaemonExit::Shutdown => break,
+                    daemon::DaemonExit::Reload => {
+                        info!("🔄 Daemon reload — re-reading config from disk");
+                        current_config = Box::pin(Config::load_or_init()).await?;
+                        current_config.apply_env_overrides();
+                        // Continue loop: fresh subsystems with the new config.
+                    }
+                }
+            }
+            Ok(())
         }
 
         Commands::Status { format } => {
@@ -3762,7 +3789,9 @@ async fn run_gateway_if_enabled(
     config: zeroclaw::config::Config,
     tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
 ) -> anyhow::Result<()> {
-    Box::pin(gateway::run_gateway(host, port, config, tx)).await
+    // Standalone gateway (no daemon supervisor) — pass None so /admin/reload
+    // returns 503 with a clear "no supervisor; restart manually" message.
+    Box::pin(gateway::run_gateway(host, port, config, tx, None)).await
 }
 
 #[cfg(not(feature = "gateway"))]

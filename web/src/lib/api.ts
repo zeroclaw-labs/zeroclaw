@@ -427,6 +427,24 @@ export function selectSectionItem(section: string, key: string): Promise<SelectI
   );
 }
 
+// ── Daemon admin (localhost-only on the gateway) ─────────────────────
+
+export interface AdminResponse {
+  success: boolean;
+  message: string;
+}
+
+/**
+ * Reload the daemon in place. Same PID — the daemon's main loop tears down
+ * every subsystem (gateway/channels/heartbeat/scheduler/mqtt), re-reads
+ * config from disk, and re-instantiates everything. Brief HTTP downtime
+ * while the gateway listener rebinds; clients should poll `/health` to
+ * detect when the new instance is ready.
+ */
+export function reloadDaemon(): Promise<AdminResponse> {
+  return apiFetch<AdminResponse>('/admin/reload', { method: 'POST' });
+}
+
 
 // ---------------------------------------------------------------------------
 // Tools
