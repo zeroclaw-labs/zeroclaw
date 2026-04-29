@@ -645,6 +645,16 @@ pub async fn handle_section_select(
             {
                 tracing::warn!(provider = %key, error = ?e, "failed to apply trait defaults; form will start blank");
             }
+            // Make the picked provider the runtime fallback so chat actually
+            // routes to it. Without this, picking Ollama in onboarding would
+            // create the entry but the chat path keeps using the prior
+            // fallback (or fails because none is set), and the user lands
+            // on "OpenRouter API key not set" trying to chat with a model
+            // they thought they'd configured. Mirrors `zeroclaw onboard`'s
+            // post-pick semantics.
+            if let Err(e) = working.set_prop("providers.fallback", &key) {
+                tracing::warn!(provider = %key, error = %e, "failed to set providers.fallback after pick");
+            }
             (prefix, created)
         }
         "channels" => {

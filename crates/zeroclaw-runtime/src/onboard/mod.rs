@@ -610,6 +610,14 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
             field_visibility::apply_provider_trait_defaults(cfg, &picked, &prefix)?;
         }
 
+        // Persist the picked provider as the runtime fallback so chat
+        // requests actually route to it. Without this, the runtime keeps
+        // the prior fallback (often unset or stale) and the user lands on
+        // "API key not set" for a different provider they didn't pick.
+        // Carried to disk via `persist()` so a Ctrl+C mid-flow keeps the
+        // selection.
+        persist(cfg, "providers.fallback", &picked).await?;
+
         let display_name = entries
             .iter()
             .find(|p| p.name == picked)

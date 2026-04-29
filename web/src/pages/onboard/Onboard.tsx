@@ -31,7 +31,11 @@ import {
 import FieldForm from '../../components/onboard/FieldForm';
 import SectionPicker from '../../components/onboard/SectionPicker';
 
-const COMPLETED_SECTIONS_PATH = 'onboard-state.completed-sections';
+// Note: prefix is `onboard_state` (verbatim) and the field becomes
+// `completed-sections` (snake → kebab via the macro). Matches what
+// `Config::prop_fields()` actually emits — fully-kebab `onboard-state.*`
+// is wrong and produces `path_not_found` from set_prop.
+const COMPLETED_SECTIONS_PATH = 'onboard_state.completed-sections';
 
 // Wizard sections in TUI order (`zeroclaw onboard`'s `Section::as_path_prefix`
 // dispatch in `crates/zeroclaw-runtime/src/onboard/mod.rs`). The dashboard
