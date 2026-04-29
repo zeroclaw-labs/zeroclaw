@@ -290,7 +290,7 @@ const SECTIONS_WITH_PICKER: &[&str] = &["providers", "channels", "memory", "tunn
 /// Keeps things simple and predictable; specific wording overrides go in
 /// the section-help table or per-section labels if/when we add them.
 fn humanize_section(key: &str) -> String {
-    let mut s = key.replace('_', " ").replace('-', " ");
+    let mut s = key.replace(['_', '-'], " ");
     if let Some(c) = s.get_mut(0..1) {
         c.make_ascii_uppercase();
     }
