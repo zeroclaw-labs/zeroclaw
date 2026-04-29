@@ -1,5 +1,5 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
-import { Send, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2 } from 'lucide-react';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { WsMessage } from '@/types/api';
@@ -7,7 +7,7 @@ import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
-import { getSessionMessages } from '@/lib/api';
+import { abortSession, getSessionMessages } from '@/lib/api';
 import ToolCallCard from '@/components/ToolCallCard';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import {
@@ -357,6 +357,19 @@ export default function AgentChat() {
     setMessages([]);
   }, []);
 
+  // Stop button: POST /api/sessions/{id}/abort. The gateway cancels the
+  // in-flight turn, the WS handler sends an `error` frame which our
+  // onMessage handler already maps to typing=false.
+  const handleAbort = useCallback(async () => {
+    try {
+      await abortSession(sessionIdRef.current);
+    } catch {
+      // Best-effort: surface nothing if the abort itself fails. The
+      // user can retry, and any leaked typing state clears on the next
+      // server frame.
+    }
+  }, []);
+
   const toggleCompact = useCallback(() => {
     setCompact((prev) => {
       const next = !prev;
@@ -486,31 +499,54 @@ export default function AgentChat() {
             value={input}
             onChange={handleTextareaChange}
             onKeyDown={handleKeyDown}
-            placeholder={connected ? t('agent.type_message') : t('agent.connecting')}
-            disabled={!connected}
+            placeholder={!connected
+              ? t('agent.connecting')
+              : typing
+                ? t('agent.running')
+                : t('agent.type_message')}
+            disabled={!connected || typing}
             className="input-electric flex-1 px-4 text-sm resize-none disabled:opacity-40"
             style={{ minHeight: '44px', maxHeight: '200px', paddingTop: '10px', paddingBottom: '10px' }}
           />
-          <button
-            type='button'
-            onClick={handleSend}
-            disabled={!connected || !input.trim()}
-            className="btn-electric flex-shrink-0 rounded-2xl flex items-center justify-center"
-            style={{ color: 'white', width: '40px', height: '40px' }}
-          >
-            <Send className="h-5 w-5" />
-          </button>
+          {typing ? (
+            <button
+              type="button"
+              onClick={handleAbort}
+              className="btn-danger flex-shrink-0 rounded-2xl flex items-center justify-center"
+              style={{ color: 'white', width: '40px', height: '40px' }}
+              aria-label={t('agent.stop')}
+              title={t('agent.stop')}
+            >
+              <Square className="h-4 w-4" fill="currentColor" />
+            </button>
+          ) : (
+            <button
+              type='button'
+              onClick={handleSend}
+              disabled={!connected || !input.trim()}
+              className="btn-electric flex-shrink-0 rounded-2xl flex items-center justify-center"
+              style={{ color: 'white', width: '40px', height: '40px' }}
+            >
+              <Send className="h-5 w-5" />
+            </button>
+          )}
         </div>
         <div className="flex items-center justify-center mt-2 gap-2">
           <span
             className="status-dot"
-            style={connected
-              ? { background: 'var(--color-status-success)', boxShadow: '0 0 6px var(--color-status-success)' }
-              : { background: 'var(--color-status-error)', boxShadow: '0 0 6px var(--color-status-error)' }
+            style={typing
+              ? { background: 'var(--pc-accent)', boxShadow: '0 0 6px var(--pc-accent)' }
+              : connected
+                ? { background: 'var(--color-status-success)', boxShadow: '0 0 6px var(--color-status-success)' }
+                : { background: 'var(--color-status-error)', boxShadow: '0 0 6px var(--color-status-error)' }
             }
           />
           <span className="text-[10px]" style={{ color: 'var(--pc-text-faint)' }}>
-            {connected ? t('agent.connected_status') : t('agent.disconnected_status')}
+            {typing
+              ? t('agent.running')
+              : connected
+                ? t('agent.connected_status')
+                : t('agent.disconnected_status')}
           </span>
         </div>
       </div>

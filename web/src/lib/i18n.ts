@@ -505,6 +505,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.clear_all': 'Clear all',
     'agent.delete_message': 'Delete message',
     'agent.compact_mode': 'Compact',
+    'agent.running': 'Running…',
+    'agent.stop': 'Stop',
 
     // Tools
     'tools.title': 'Available Tools',

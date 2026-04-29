@@ -339,6 +339,17 @@ export function getSessionMessages(id: string): Promise<SessionMessagesResponse>
   );
 }
 
+/**
+ * Cancel an in-flight agent turn for a session. Idempotent — returns
+ * `{ status: "no_active_response" }` when the session is idle.
+ */
+export function abortSession(id: string): Promise<{ status: string }> {
+  return apiFetch<{ status: string }>(
+    `/api/sessions/${encodeURIComponent(id)}/abort`,
+    { method: 'POST' },
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Channels (detailed)
 // ---------------------------------------------------------------------------
