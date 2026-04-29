@@ -71,8 +71,7 @@ git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 
 # Build (takes ~15–30 min on Uno Q)
-# The Uno Q has 2GB RAM. To avoid an out-of-memory kill, limit parallelism:
-export CARGO_BUILD_JOBS=1
+export CARGO_BUILD_JOBS=1 #build will be OOM-killed mid-link without this
 cargo build --release --features hardware
 
 # Install
@@ -178,7 +177,7 @@ Now when you message your Telegram bot *"Turn on the LED"* or *"Set pin 13 high"
 | 5 | `git clone https://github.com/zeroclaw-labs/zeroclaw.git && cd zeroclaw` |
 | 6 | `export CARGO_BUILD_JOBS=1 && cargo build --release --features hardware` |
 | 7 | `zeroclaw onboard --api-key KEY --provider openrouter` |
-| 8 | `zeroclaw channel setup telegram` (or `zeroclaw config set …`) |
+| 8 | `zeroclaw channel setup telegram` |
 | 9 | `zeroclaw daemon --host 127.0.0.1 --port 42617` |
 | 10 | Message your Telegram bot — it responds |
 | 11 | `zeroclaw peripheral setup-uno-q` (deploys Bridge) |
