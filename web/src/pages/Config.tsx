@@ -8,6 +8,7 @@
 // labels, dropdown options, or provider lists.
 
 import { useEffect, useMemo, useState } from 'react';
+import { useParams } from 'react-router-dom';
 import { ArrowLeft, ChevronRight, Plus } from 'lucide-react';
 import {
   ApiError,
@@ -33,8 +34,12 @@ type Mode =
 // from the gateway lands in one of these buckets (anything else falls
 // into "Other"). Schema-attribute-driven grouping replaces this in v3 /
 // #5947.
+//
+// "Onboarding" is intentionally absent — those 6 sections are promoted
+// to the top-level nav (`/setup/<section>`) so users can reach them
+// without drilling through the Config explorer. The Onboarding wizard
+// itself lives at `/onboard`.
 const GROUP_ORDER = [
-  'Onboarding',
   'Agent',
   'Multi-agent',
   'Tools',
@@ -46,6 +51,10 @@ const GROUP_ORDER = [
 ] as const;
 
 export default function Config() {
+  // `:section` route param locks the page to that single section (used by
+  // the promoted top-level routes like `/setup/providers`); without it we
+  // render the full multi-section explorer.
+  const { section: lockedSection } = useParams<{ section?: string }>();
   const [sections, setSections] = useState<SectionInfo[]>([]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [mode, setMode] = useState<Mode>({ kind: 'section-overview' });
@@ -59,7 +68,14 @@ export default function Config() {
       .then((resp) => {
         if (cancelled) return;
         setSections(resp.sections);
-        setActiveKey(resp.sections[0]?.key ?? null);
+        // Locked-section view: pick the requested section. Falls back to
+        // first available if the URL specifies an unknown key.
+        const initialKey = lockedSection
+          && resp.sections.find((s) => s.key === lockedSection)
+          ? lockedSection
+          : resp.sections[0]?.key ?? null;
+        setActiveKey(initialKey);
+        setMode({ kind: 'section-overview' });
       })
       .catch((e) => {
         if (cancelled) return;
@@ -73,7 +89,7 @@ export default function Config() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [lockedSection]);
 
   const activeSection = useMemo(
     () => sections.find((s) => s.key === activeKey) ?? null,
@@ -129,7 +145,10 @@ export default function Config() {
 
   return (
     <div className="flex h-full overflow-hidden">
-      {/* Sidebar */}
+      {/* Sidebar — hidden for the locked single-section view (the
+          top-level /setup/<section> routes). The main app sidebar
+          handles section selection in that case. */}
+      {!lockedSection && (
       <aside
         className="w-56 flex-shrink-0 border-r overflow-y-auto"
         style={{
@@ -180,6 +199,7 @@ export default function Config() {
           })}
         </nav>
       </aside>
+      )}
 
       {/* Main pane */}
       <main className="flex-1 overflow-y-auto p-6">

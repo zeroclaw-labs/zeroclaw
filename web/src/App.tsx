@@ -237,6 +237,7 @@ function AppContent() {
             <Route path="/integrations" element={<Integrations />} />
             <Route path="/memory" element={<Memory />} />
             <Route path="/config" element={<Config />} />
+            <Route path="/setup/:section" element={<Config />} />
             <Route path="/cost" element={<Cost />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/doctor" element={<Doctor />} />
