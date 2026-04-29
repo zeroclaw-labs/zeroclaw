@@ -1035,40 +1035,20 @@ function ObjectArrayField({
           className="input-electric w-full px-2 py-1 mt-1 text-sm"
         />
       ) : meta.kind === 'string-array' ? (
-        <textarea
-          rows={2}
-          value={Array.isArray(rawValue) ? JSON.stringify(rawValue) : display}
-          onChange={(e) => {
-            const t = e.target.value.trim();
-            if (!t) {
-              onChange([]);
-              return;
-            }
-            try {
-              const p = JSON.parse(t);
-              onChange(Array.isArray(p) ? p : []);
-            } catch {
-              onChange(t.split(',').map((s) => s.trim()).filter(Boolean));
-            }
-          }}
-          className="input-electric w-full px-2 py-1 mt-1 text-sm font-mono resize-y"
-          placeholder='["a", "b"]'
+        <ChipListEditor
+          values={Array.isArray(rawValue) ? rawValue.map((v) => String(v)) : []}
+          onChange={(next) => onChange(next)}
         />
       ) : meta.kind === 'object' ? (
-        <textarea
-          rows={2}
-          value={typeof rawValue === 'object' && rawValue !== null ? JSON.stringify(rawValue) : display}
-          onChange={(e) => {
-            try {
-              onChange(JSON.parse(e.target.value || '{}'));
-            } catch {
-              // Keep raw string until the user finishes editing — we can't
-              // emit a meaningful object until JSON parses, so the field
-              // value temporarily diverges from the row state.
-            }
-          }}
-          className="input-electric w-full px-2 py-1 mt-1 text-sm font-mono resize-y"
-          placeholder='{"key": "value"}'
+        <KeyValueChipEditor
+          pairs={
+            typeof rawValue === 'object' && rawValue !== null && !Array.isArray(rawValue)
+              ? Object.entries(rawValue as Record<string, unknown>).map(
+                  ([k, v]) => [k, typeof v === 'string' ? v : JSON.stringify(v)] as [string, string],
+                )
+              : []
+          }
+          onChange={(pairs) => onChange(Object.fromEntries(pairs))}
         />
       ) : (
         <input
@@ -1078,6 +1058,132 @@ function ObjectArrayField({
           className="input-electric w-full px-2 py-1 mt-1 text-sm"
         />
       )}
+    </div>
+  );
+}
+
+// Compact chip editor for `Vec<String>` properties inside an
+// object-array row (e.g. `mcp.servers[i].args`). One row per entry,
+// `+ Add` appends, trash removes. No JSON / textarea fallback —
+// matches the top-level ArrayFieldEditor's "Rows" mode but stripped
+// down because we're already nested two levels deep in the form.
+function ChipListEditor({
+  values,
+  onChange,
+}: {
+  values: string[];
+  onChange: (next: string[]) => void;
+}) {
+  const setAt = (i: number, v: string) => {
+    onChange(values.map((x, idx) => (idx === i ? v : x)));
+  };
+  const removeAt = (i: number) => {
+    onChange(values.filter((_, idx) => idx !== i));
+  };
+  return (
+    <div className="space-y-1.5 mt-1">
+      {values.length === 0 ? (
+        <p className="text-[11px] italic" style={{ color: 'var(--pc-text-faint)' }}>
+          No entries.
+        </p>
+      ) : (
+        <ul className="space-y-1">
+          {values.map((v, i) => (
+            <li key={i} className="flex items-center gap-2">
+              <input
+                type="text"
+                value={v}
+                onChange={(e) => setAt(i, e.target.value)}
+                className="input-electric flex-1 px-2 py-1 text-sm"
+                placeholder="empty"
+              />
+              <button
+                type="button"
+                onClick={() => removeAt(i)}
+                title="Remove this entry"
+                className="btn-icon flex-shrink-0"
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <button
+        type="button"
+        onClick={() => onChange([...values, ''])}
+        className="btn-secondary text-xs px-2.5 py-1 inline-flex items-center gap-1"
+      >
+        <Plus className="h-3 w-3" /> Add
+      </button>
+    </div>
+  );
+}
+
+// Compact key-value chip editor for `HashMap<String, String>`
+// properties inside an object-array row (e.g. `mcp.servers[i].env`,
+// `headers`). Pairs round-trip in insertion order; rendering preserves
+// the order they came back in from the gateway.
+function KeyValueChipEditor({
+  pairs,
+  onChange,
+}: {
+  pairs: [string, string][];
+  onChange: (next: [string, string][]) => void;
+}) {
+  const setKey = (i: number, k: string) => {
+    onChange(pairs.map((p, idx) => (idx === i ? [k, p[1]] : p)));
+  };
+  const setValue = (i: number, v: string) => {
+    onChange(pairs.map((p, idx) => (idx === i ? [p[0], v] : p)));
+  };
+  const removeAt = (i: number) => {
+    onChange(pairs.filter((_, idx) => idx !== i));
+  };
+  return (
+    <div className="space-y-1.5 mt-1">
+      {pairs.length === 0 ? (
+        <p className="text-[11px] italic" style={{ color: 'var(--pc-text-faint)' }}>
+          No entries.
+        </p>
+      ) : (
+        <ul className="space-y-1">
+          {pairs.map(([k, v], i) => (
+            <li key={i} className="flex items-center gap-2">
+              <input
+                type="text"
+                value={k}
+                onChange={(e) => setKey(i, e.target.value)}
+                className="input-electric flex-1 px-2 py-1 text-sm font-mono"
+                placeholder="key"
+              />
+              <span style={{ color: 'var(--pc-text-faint)' }}>=</span>
+              <input
+                type="text"
+                value={v}
+                onChange={(e) => setValue(i, e.target.value)}
+                className="input-electric flex-1 px-2 py-1 text-sm"
+                placeholder="value"
+              />
+              <button
+                type="button"
+                onClick={() => removeAt(i)}
+                title="Remove this entry"
+                className="btn-icon flex-shrink-0"
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <button
+        type="button"
+        onClick={() => onChange([...pairs, ['', '']])}
+        className="btn-secondary text-xs px-2.5 py-1 inline-flex items-center gap-1"
+      >
+        <Plus className="h-3 w-3" /> Add
+      </button>
     </div>
   );
 }
