@@ -9,7 +9,7 @@ use zeroclaw_config::policy::SecurityPolicy;
 /// Uses `old_string` → `new_string` precise replacement within the workspace.
 /// The `old_string` must appear exactly once in the file (zero matches = not
 /// found, multiple matches = ambiguous). `new_string` may be empty to delete
-/// the matched text.
+/// the matched text. Security checks mirror [`super::file_write::FileWriteTool`].
 pub struct FileEditTool {
     security: Arc<SecurityPolicy>,
 }
@@ -17,45 +17,6 @@ pub struct FileEditTool {
 impl FileEditTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
         Self { security }
-    }
-
-    /// Validate and resolve a caller-supplied path to an absolute candidate.
-    /// See [`super::file_write::FileWriteTool::resolve_candidate`] for details.
-    fn resolve_candidate(&self, path: &str) -> anyhow::Result<std::path::PathBuf> {
-        let workspace_dir = &self.security.workspace_dir;
-
-        if path.contains('\0') {
-            anyhow::bail!("Path not allowed: contains null byte");
-        }
-        if std::path::Path::new(path)
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            anyhow::bail!("Path not allowed by security policy: {path}");
-        }
-
-        let p = std::path::Path::new(path);
-        if p.is_absolute() {
-            let workspace_canonical = workspace_dir
-                .canonicalize()
-                .unwrap_or_else(|_| workspace_dir.clone());
-            if !p.starts_with(&workspace_canonical) && !p.starts_with(workspace_dir.as_path()) {
-                anyhow::bail!("Path not allowed by security policy: {path}");
-            }
-            return Ok(p.to_path_buf());
-        }
-
-        if let Ok(workspace_rootless) = workspace_dir.strip_prefix("/") {
-            if let Ok(stripped) = p.strip_prefix(workspace_rootless) {
-                return Ok(if stripped.as_os_str().is_empty() {
-                    workspace_dir.clone()
-                } else {
-                    workspace_dir.join(stripped)
-                });
-            }
-        }
-
-        Ok(workspace_dir.join(p))
     }
 }
 
@@ -75,7 +36,7 @@ impl Tool for FileEditTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file. Relative paths resolve from workspace root; absolute paths must be within the workspace."
+                    "description": "Path to the file. Relative paths resolve from workspace; outside paths require policy allowlist."
                 },
                 "old_string": {
                     "type": "string",
@@ -133,17 +94,16 @@ impl Tool for FileEditTool {
             });
         }
 
-        // ── 4. Resolve candidate path ──────────────────────────────
-        let full_path = match self.resolve_candidate(path) {
-            Ok(p) => p,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(e.to_string()),
-                });
-            }
-        };
+        // ── 4. Path pre-validation ─────────────────────────────────
+        if !self.security.is_path_allowed(path) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Path not allowed by security policy: {path}")),
+            });
+        }
+
+        let full_path = self.security.resolve_tool_path(path);
 
         // ── 5. Canonicalise parent ─────────────────────────────────
         let Some(parent) = full_path.parent() else {
@@ -165,18 +125,15 @@ impl Tool for FileEditTool {
             }
         };
 
-        // ── 6. Workspace boundary check ────────────────────────────
-        let workspace_canonical = self
-            .security
-            .workspace_dir
-            .canonicalize()
-            .unwrap_or_else(|_| self.security.workspace_dir.clone());
-
-        if !resolved_parent.starts_with(&workspace_canonical) {
+        // ── 6. Resolved path post-validation ───────────────────────
+        if !self.security.is_resolved_path_allowed(&resolved_parent) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Path escapes workspace directory: {path}")),
+                error: Some(
+                    self.security
+                        .resolved_path_violation_message(&resolved_parent),
+                ),
             });
         }
 
@@ -189,6 +146,17 @@ impl Tool for FileEditTool {
         };
 
         let resolved_target = resolved_parent.join(file_name);
+
+        if self.security.is_runtime_config_path(&resolved_target) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    self.security
+                        .runtime_config_violation_message(&resolved_target),
+                ),
+            });
+        }
 
         // ── 7. Symlink check ───────────────────────────────────────
         if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await

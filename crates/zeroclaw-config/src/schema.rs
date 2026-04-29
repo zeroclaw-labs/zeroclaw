@@ -459,6 +459,11 @@ pub struct Config {
     #[serde(default)]
     #[nested]
     pub shell_tool: ShellToolConfig,
+
+    /// Escalation routing configuration (`[escalation]`).
+    #[serde(default)]
+    #[nested]
+    pub escalation: EscalationConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -3016,6 +3021,26 @@ impl Default for ShellToolConfig {
             timeout_secs: default_shell_tool_timeout_secs(),
         }
     }
+}
+
+// ── Escalation routing ───────────────────────────────────────────
+
+/// Escalation routing configuration (`[escalation]` section).
+///
+/// Controls which channels receive alert notifications when
+/// `escalate_to_human` is called with high or critical urgency.
+/// Channels are identified by name (e.g. `"telegram"`, `"slack"`).
+/// Alerts are sent best-effort and do not block the escalation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "escalation"]
+pub struct EscalationConfig {
+    /// Channel names to alert on high/critical escalations (default: empty).
+    ///
+    /// Each name must match a configured channel. Unrecognised names are
+    /// logged at WARN level and skipped.
+    #[serde(default)]
+    pub alert_channels: Vec<String>,
 }
 
 // ── Web search ───────────────────────────────────────────────────
@@ -9432,6 +9457,7 @@ impl Default for Config {
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            escalation: EscalationConfig::default(),
         }
     }
 }

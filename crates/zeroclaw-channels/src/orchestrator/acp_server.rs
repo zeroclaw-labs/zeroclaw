@@ -10,7 +10,7 @@
 //!
 //! | Method            | Description                              |
 //! |-------------------|------------------------------------------|
-//! | `initialize`      | Handshake — returns server capabilities (incl. defaultModel) |
+//! | `initialize`      | Handshake — returns server capabilities (incl. defaultModel when configured) |
 //! | `session/new`     | Create an isolated agent session          |
 //! | `session/prompt`  | Send a prompt, stream back `session/update` events |
 //! | `session/stop`    | Gracefully terminate a session            |
@@ -255,7 +255,7 @@ struct Session {
 pub struct AcpServer {
     config: Config,
     acp_config: AcpServerConfig,
-    sessions: Arc<Mutex<HashMap<String, Session>>>,
+    sessions: Arc<Mutex<HashMap<String, Arc<Mutex<Session>>>>>,
     rpc: Arc<RpcOutbound>,
     /// Receiver for the writer task. Pulled out (replaced with `None`) the
     /// first time `run()` starts the writer loop.
@@ -323,12 +323,19 @@ impl AcpServer {
                 interval.tick().await;
                 let mut sessions = sessions.lock().await;
                 let before = sessions.len();
-                sessions.retain(|id, session| {
-                    let expired = session.last_active.elapsed() > timeout;
-                    if expired {
-                        debug!("Session {id} expired after inactivity");
+                sessions.retain(|id, session_arc| {
+                    // Never reap a session whose inner lock is held — it has an
+                    // active prompt turn in flight and is by definition not idle.
+                    match session_arc.try_lock() {
+                        Ok(session) => {
+                            let expired = session.last_active.elapsed() > timeout;
+                            if expired {
+                                debug!("Session {id} expired after inactivity");
+                            }
+                            !expired
+                        }
+                        Err(_) => true,
                     }
-                    !expired
                 });
                 let reaped = before - sessions.len();
                 if reaped > 0 {
@@ -453,8 +460,15 @@ impl AcpServer {
             .config
             .providers
             .fallback_provider()
-            .and_then(|e| e.model.clone())
-            .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string());
+            .and_then(|e| e.model.clone());
+
+        let mut zeroclaw_meta = serde_json::json!({
+            "maxSessions": self.acp_config.max_sessions,
+            "sessionTimeoutSecs": self.acp_config.session_timeout_secs,
+        });
+        if let Some(model) = default_model {
+            zeroclaw_meta["defaultModel"] = serde_json::json!(model);
+        }
 
         Ok(serde_json::json!({
             "protocolVersion": ACP_PROTOCOL_VERSION,
@@ -478,11 +492,7 @@ impl AcpServer {
             },
             "authMethods": [],
             "_meta": {
-                "zeroclaw": {
-                    "defaultModel": default_model,
-                    "maxSessions": self.acp_config.max_sessions,
-                    "sessionTimeoutSecs": self.acp_config.session_timeout_secs,
-                }
+                "zeroclaw": zeroclaw_meta,
             }
         }))
     }
@@ -548,11 +558,11 @@ impl AcpServer {
         let now = Instant::now();
         sessions.insert(
             session_id.clone(),
-            Session {
+            Arc::new(Mutex::new(Session {
                 agent,
                 created_at: now,
                 last_active: now,
-            },
+            })),
         );
 
         debug!("Created session {session_id} (workspace: {workspace_dir})");
@@ -589,11 +599,12 @@ impl AcpServer {
 
         let prompt = Self::parse_prompt(params)?;
 
-        // Remove the session from the map so we can take mutable ownership of
-        // the Agent for the duration of the turn. It will be reinserted after.
-        let mut session = {
-            let mut sessions = self.sessions.lock().await;
-            sessions.remove(&session_id).ok_or_else(|| RpcError {
+        // Clone the Arc so the session stays visible in the map throughout the
+        // turn. `session/stop` and the reaper can still find it; they will
+        // block on the inner Mutex until the turn completes.
+        let session_arc = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(&session_id).cloned().ok_or_else(|| RpcError {
                 code: SESSION_NOT_FOUND,
                 message: format!("Session not found: {session_id}"),
                 data: None,
@@ -602,15 +613,16 @@ impl AcpServer {
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(100);
 
-        let sessions_ref = Arc::clone(&self.sessions);
-        let sid = session_id.clone();
-
-        // Run turn_streamed in a spawned task. The task takes ownership of
-        // the whole Session and returns it alongside the result so we can
-        // put the session back into the map afterwards.
+        // Move the Arc into the spawned task and lock inside it.  The inner
+        // Mutex stays locked for the duration of the turn, preventing
+        // concurrent stop/reap from touching the agent mid-turn. The outer
+        // map entry remains in place.
         let turn_handle = tokio::spawn(async move {
+            let mut session = session_arc.lock().await;
             let result = session.agent.turn_streamed(&prompt, event_tx, None).await;
-            (session, result)
+            session.last_active = Instant::now();
+            result
+            // guard drops here, releasing the inner lock
         });
 
         // Forward events as they arrive. Use standard ACP `session/update`
@@ -622,8 +634,7 @@ impl AcpServer {
             self.write_notification(&notification).await;
         }
 
-        // Wait for the turn to complete and recover the session
-        let (mut session, turn_result) = turn_handle.await.map_err(|e| RpcError {
+        let turn_result = turn_handle.await.map_err(|e| RpcError {
             code: INTERNAL_ERROR,
             message: format!("Agent task panicked: {e}"),
             data: None,
@@ -634,13 +645,6 @@ impl AcpServer {
             message: format!("Agent turn failed: {e}"),
             data: None,
         })?;
-
-        // Put the session back
-        {
-            session.last_active = Instant::now();
-            let mut sessions = sessions_ref.lock().await;
-            sessions.insert(sid, session);
-        }
 
         Ok(serde_json::json!({
             "sessionId": session_id,
@@ -692,23 +696,26 @@ impl AcpServer {
                 data: None,
             })?;
 
-        let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.remove(session_id) {
-            // Drop the ACP back-channel from each tool's channel map so the
-            // session's RpcOutbound clone isn't kept alive by stale entries.
-            session.agent.channel_handles().unregister_channel("acp");
-            debug!("Stopped session {session_id}");
-            Ok(serde_json::json!({
-                "sessionId": session_id,
-                "stopped": true,
-            }))
-        } else {
-            Err(RpcError {
+        let session_arc = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.remove(session_id).ok_or_else(|| RpcError {
                 code: SESSION_NOT_FOUND,
                 message: format!("Session not found: {session_id}"),
                 data: None,
-            })
-        }
+            })?
+        };
+
+        // Wait for any in-flight prompt turn to finish before cleaning up.
+        // The inner lock is held by the turn task; this blocks until it drops.
+        let session = session_arc.lock().await;
+        // Drop the ACP back-channel from each tool's channel map so the
+        // session's RpcOutbound clone isn't kept alive by stale entries.
+        session.agent.channel_handles().unregister_channel("acp");
+        debug!("Stopped session {session_id}");
+        Ok(serde_json::json!({
+            "sessionId": session_id,
+            "stopped": true,
+        }))
     }
 
     /// Handle incoming `session/update` (or legacy `session/event`) notifications.
@@ -738,9 +745,17 @@ impl AcpServer {
 
         debug!("Received session update (type={event_type}) for session {session_id}");
 
-        let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.get_mut(&session_id) {
-            session.last_active = Instant::now();
+        let session_arc = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(&session_id).cloned()
+        };
+
+        if let Some(session_arc) = session_arc {
+            // Best-effort last_active update. If the inner lock is held by an
+            // active turn, skip it — the turn itself updates last_active on completion.
+            if let Ok(mut session) = session_arc.try_lock() {
+                session.last_active = Instant::now();
+            }
             Ok(serde_json::json!({
                 "sessionId": session_id,
                 "type": event_type,
@@ -1048,6 +1063,34 @@ mod tests {
     }
 
     #[test]
+    fn handle_initialize_default_model_absent_when_unconfigured() {
+        let server = AcpServer::new(Config::default(), AcpServerConfig::default());
+        let result = server.handle_initialize(&serde_json::json!({})).unwrap();
+        assert!(
+            result["_meta"]["zeroclaw"].get("defaultModel").is_none(),
+            "defaultModel must be absent when no provider is configured, got: {}",
+            result["_meta"]["zeroclaw"]["defaultModel"]
+        );
+    }
+
+    #[test]
+    fn handle_initialize_default_model_reflects_configured_provider() {
+        use zeroclaw_config::schema::ModelProviderConfig;
+        let mut config = Config::default();
+        config.providers.fallback = Some("myprovider".to_string());
+        config.providers.models.insert(
+            "myprovider".to_string(),
+            ModelProviderConfig {
+                model: Some("llama3.2".to_string()),
+                ..Default::default()
+            },
+        );
+        let server = AcpServer::new(config, AcpServerConfig::default());
+        let result = server.handle_initialize(&serde_json::json!({})).unwrap();
+        assert_eq!(result["_meta"]["zeroclaw"]["defaultModel"], "llama3.2");
+    }
+
+    #[test]
     fn session_new_defaults_to_launch_cwd_when_client_omits_cwd() {
         let config = Config {
             workspace_dir: PathBuf::from("/not/the/project"),
@@ -1078,6 +1121,17 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let config = Config {
             workspace_dir: cwd.path().to_path_buf(),
+            providers: zeroclaw_config::providers::ProvidersConfig {
+                fallback: Some("openrouter".to_string()),
+                models: HashMap::from([(
+                    "openrouter".to_string(),
+                    zeroclaw_config::schema::ModelProviderConfig {
+                        model: Some("test-model".to_string()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
             mcp: zeroclaw_config::schema::McpConfig {
                 enabled: true,
                 servers: vec![zeroclaw_config::schema::McpServerConfig {
@@ -1313,5 +1367,72 @@ mod tests {
             result_value["params"]["update"]["content"][0]["content"]["text"],
             "file1.txt\nfile2.txt"
         );
+    }
+
+    /// `session/stop` must succeed while a `session/prompt` turn is in flight.
+    ///
+    /// The session entry lives in the outer map for its entire lifetime.
+    /// The inner `Arc<Mutex<Session>>` serialises access: the prompt turn holds
+    /// the inner lock while running; `session/stop` removes the outer entry
+    /// then waits for the inner lock before cleaning up.  It must never see
+    /// SESSION_NOT_FOUND just because a turn happens to be running.
+    #[tokio::test]
+    async fn session_stop_finds_session_during_active_prompt_turn() {
+        let cwd = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace_dir: cwd.path().to_path_buf(),
+            providers: zeroclaw_config::providers::ProvidersConfig {
+                fallback: Some("anthropic".to_string()),
+                models: HashMap::from([(
+                    "anthropic".to_string(),
+                    zeroclaw_config::schema::ModelProviderConfig {
+                        model: Some("claude-haiku-4-5".to_string()),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let server = Arc::new(AcpServer::new(config, AcpServerConfig::default()));
+
+        // Create a real session via the normal path.
+        let new_result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = new_result["sessionId"].as_str().unwrap().to_string();
+
+        // Grab the inner lock to simulate an in-flight prompt turn.
+        let session_arc = {
+            let sessions = server.sessions.lock().await;
+            sessions.get(&session_id).cloned().unwrap()
+        };
+        let _guard = session_arc.lock().await;
+
+        // session/stop should find the session in the outer map.  With the
+        // inner lock held it blocks — confirm it does NOT immediately return
+        // SESSION_NOT_FOUND.
+        let server_clone = Arc::clone(&server);
+        let sid_clone = session_id.clone();
+        let stop_result = tokio::time::timeout(Duration::from_millis(100), async move {
+            server_clone
+                .handle_session_stop(&serde_json::json!({ "sessionId": sid_clone }))
+                .await
+        })
+        .await;
+
+        match stop_result {
+            Err(_timeout) => {} // expected — blocked waiting for the inner lock
+            Ok(Ok(_)) => panic!("stop returned Ok without the lock being released"),
+            Ok(Err(e)) => {
+                assert_ne!(
+                    e.code, SESSION_NOT_FOUND,
+                    "session/stop must not return SESSION_NOT_FOUND while a turn is in flight"
+                );
+            }
+        }
     }
 }

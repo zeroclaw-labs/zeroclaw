@@ -760,7 +760,10 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ask_user_tool));
 
     // Human escalation tool — always registered; channel map populated later by start_channels.
-    let escalate_tool = EscalateToHumanTool::new(security.clone(), workspace_dir.to_path_buf());
+    let escalate_tool = EscalateToHumanTool::new(
+        security.clone(),
+        root_config.escalation.alert_channels.clone(),
+    );
     let escalate_handle = escalate_tool.channel_map_handle();
     tool_arcs.push(Arc::new(escalate_tool));
 

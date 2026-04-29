@@ -695,7 +695,7 @@ impl Agent {
                     .and_then(|e| e.temperature)
                     .unwrap_or(0.7),
             )
-            .workspace_dir(config.workspace_dir.clone())
+            .workspace_dir(security.workspace_dir.clone())
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
             .route_model_by_hint(route_model_by_hint)

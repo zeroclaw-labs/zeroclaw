@@ -4,7 +4,7 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
-/// Write file contents with workspace sandboxing.
+/// Write file contents with path sandboxing
 pub struct FileWriteTool {
     security: Arc<SecurityPolicy>,
 }
@@ -12,53 +12,6 @@ pub struct FileWriteTool {
 impl FileWriteTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
         Self { security }
-    }
-
-    /// Validate and resolve a caller-supplied path to an absolute candidate.
-    ///
-    /// Relative paths are joined with `workspace_dir`.  Absolute paths are
-    /// accepted only when they already start with the (canonical) workspace
-    /// root.  Also handles the "rootless" form where an agent supplies the
-    /// workspace path with its leading `/` stripped.
-    fn resolve_candidate(&self, path: &str) -> anyhow::Result<std::path::PathBuf> {
-        let workspace_dir = &self.security.workspace_dir;
-
-        if path.contains('\0') {
-            anyhow::bail!("Path not allowed: contains null byte");
-        }
-        if std::path::Path::new(path)
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            anyhow::bail!("Path not allowed by security policy: {path}");
-        }
-
-        let p = std::path::Path::new(path);
-        if p.is_absolute() {
-            // Fast-fail: absolute path must start with workspace before any I/O.
-            let workspace_canonical = workspace_dir
-                .canonicalize()
-                .unwrap_or_else(|_| workspace_dir.clone());
-            if !p.starts_with(&workspace_canonical) && !p.starts_with(workspace_dir.as_path()) {
-                anyhow::bail!("Path not allowed by security policy: {path}");
-            }
-            return Ok(p.to_path_buf());
-        }
-
-        // Rootless-path normalisation: an agent may supply the workspace path
-        // with the leading "/" stripped (e.g. "tmp/ws/file.txt" when workspace
-        // is "/tmp/ws").  Map it back to an absolute workspace-relative path.
-        if let Ok(workspace_rootless) = workspace_dir.strip_prefix("/") {
-            if let Ok(stripped) = p.strip_prefix(workspace_rootless) {
-                return Ok(if stripped.as_os_str().is_empty() {
-                    workspace_dir.clone()
-                } else {
-                    workspace_dir.join(stripped)
-                });
-            }
-        }
-
-        Ok(workspace_dir.join(p))
     }
 }
 
@@ -78,7 +31,7 @@ impl Tool for FileWriteTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file. Relative paths resolve from workspace root; absolute paths must be within the workspace."
+                    "description": "Path to the file. Relative paths resolve from workspace; outside paths require policy allowlist."
                 },
                 "content": {
                     "type": "string",
@@ -116,16 +69,16 @@ impl Tool for FileWriteTool {
             });
         }
 
-        let full_path = match self.resolve_candidate(path) {
-            Ok(p) => p,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(e.to_string()),
-                });
-            }
-        };
+        // Security check: validate path is within workspace or allowed_roots
+        if !self.security.is_path_allowed(path) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Path not allowed by security policy: {path}")),
+            });
+        }
+
+        let full_path = self.security.resolve_tool_path(path);
 
         let Some(parent) = full_path.parent() else {
             return Ok(ToolResult {
@@ -150,17 +103,14 @@ impl Tool for FileWriteTool {
             }
         };
 
-        let workspace_canonical = self
-            .security
-            .workspace_dir
-            .canonicalize()
-            .unwrap_or_else(|_| self.security.workspace_dir.clone());
-
-        if !resolved_parent.starts_with(&workspace_canonical) {
+        if !self.security.is_resolved_path_allowed(&resolved_parent) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Path escapes workspace directory: {path}")),
+                error: Some(
+                    self.security
+                        .resolved_path_violation_message(&resolved_parent),
+                ),
             });
         }
 
@@ -174,7 +124,18 @@ impl Tool for FileWriteTool {
 
         let resolved_target = resolved_parent.join(file_name);
 
-        // Refuse to write through a symlink (TOCTOU protection).
+        if self.security.is_runtime_config_path(&resolved_target) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    self.security
+                        .runtime_config_violation_message(&resolved_target),
+                ),
+            });
+        }
+
+        // If the target already exists and is a symlink, refuse to follow it
         if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await
             && meta.file_type().is_symlink()
         {

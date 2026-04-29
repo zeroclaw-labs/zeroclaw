@@ -51,7 +51,7 @@ The server always responds `protocolVersion: 1`. If you send a client-side `prot
 
 ### `session/new`
 
-Open an isolated agent session. The optional `cwd` parameter (aliases: `workspaceDir`, `workspace_dir`) pins the per-session security sandbox root — the path the seatbelt and detect layers enforce as the allowed file-system boundary. The agent's persistent data directory (memory, identity, cron) remains the daemon-level `workspace_dir` from config.
+Open an isolated agent session. The optional `cwd` parameter (aliases: `workspaceDir`, `workspace_dir`) pins the per-session file-access boundary — it becomes the `workspace_dir` inside the `SecurityPolicy` that all file tools enforce. The agent's persistent data directory (memory, identity, cron) remains the daemon-level `workspace_dir` from config.
 
 ```json
 → {"jsonrpc":"2.0","id":2,"method":"session/new","params":{
@@ -169,7 +169,7 @@ max_sessions = 10
 session_timeout_secs = 3600       # idle sessions killed after 1 hour
 ```
 
-When running `zeroclaw acp` as a subprocess, no `enabled` flag is needed — the command starts the server unconditionally. When the daemon serves ACP over WebSocket, `enabled = true` is required to activate that path.
+When running `zeroclaw acp` as a subprocess, the command starts the server unconditionally. When running as a daemon, the gateway exposes ACP over WebSocket at `/acp` with no additional config required.
 
 ## Running
 
@@ -183,7 +183,7 @@ The binary reads stdin, writes stdout, exits on EOF.
 
 **As a WebSocket service (daemon mode):**
 
-Set `[acp] enabled = true` in your config and start the daemon. The daemon exposes ACP over WebSocket on its gateway port.
+Start the daemon normally. The gateway always exposes ACP over WebSocket at the `/acp` endpoint — no extra config flag is required.
 
 ## Version compatibility
 
@@ -196,13 +196,16 @@ ACP v0 clients (using the flat `{streaming, maxSessions, ...}` initialize respon
 
 ## Security
 
-ACP inherits the running config's autonomy level. When `[autonomy] level = "supervised"`, medium-risk tool calls trigger approval via the ACP back-channel — a `session/request_permission` outbound request the client must acknowledge. In `full` mode, tool calls execute without approval. The sandbox root is pinned to the `cwd` supplied at `session/new`.
+ACP inherits the running config's autonomy level. When `[autonomy] level = "supervised"`, medium-risk tool calls trigger approval via the ACP back-channel — a `session/request_permission` outbound request the client must acknowledge. In `full` mode, tool calls execute without approval and `workspace_only` is implicitly disabled (the agent can reach paths outside the session cwd); `forbidden_paths` still apply.
+
+The `cwd` from `session/new` becomes the `SecurityPolicy` workspace boundary used by all file and shell tools for that session. Note: the agent's system prompt currently reflects the daemon's global `workspace_dir` rather than the session `cwd` — this does not affect enforcement, only the directory the model believes it is working in.
 
 ## Code reference
 
 - ACP server: `crates/zeroclaw-channels/src/orchestrator/acp_server.rs`
 - ACP back-channel: `crates/zeroclaw-channels/src/acp_channel.rs`
-- Per-session sandbox wiring: `crates/zeroclaw-runtime/src/security/seatbelt.rs`, `detect.rs`
+- Per-session path enforcement: `crates/zeroclaw-config/src/policy.rs` (`SecurityPolicy::from_config`), `crates/zeroclaw-runtime/src/agent/agent.rs` (`from_config_with_session_cwd_and_mcp`)
+- OS-level sandbox detection/backends: `crates/zeroclaw-runtime/src/security/detect.rs`, `landlock.rs`, `bubblewrap.rs`, `seatbelt.rs`
 
 ## See also
 

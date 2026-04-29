@@ -39,7 +39,7 @@ Risk classification:
 
 ### `full`
 
-No approval gates — all tool calls flagged low/medium/high run without asking. Workspace and path rules still enforce; sandbox still applies; forbidden commands still block.
+No approval gates — all tool calls flagged low/medium/high run without asking. `workspace_only` is implicitly disabled (the agent can access paths outside the workspace); `forbidden_paths` and `forbidden_commands` still block; the OS-level sandbox still applies.
 
 This is appropriate for trusted local dev, CI, or SOPs that need to run end-to-end without a human in the loop. If you need `full` + no workspace constraints + no sandboxing, see [YOLO mode](../getting-started/yolo.md).
 

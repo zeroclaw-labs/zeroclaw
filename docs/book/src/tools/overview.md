@@ -22,7 +22,7 @@ A minimal build ships with:
 | `memory_search` | Semantic search across stored conversations |
 | `memory_pin` | Mark a fact for long-term retention |
 | `ask_user` | Send a question to the active channel and wait for a reply. Supports optional `choices` for structured responses (inline keyboard on Telegram, numbered list on CLI). On ACP, `choices` are required — free-form ask awaits the ACP elicitation RFD. Parameters: `question` (required), `choices` (optional list), `timeout_secs` (default 600). |
-| `escalate_to_human` | Send a structured escalation message with urgency routing. `high` / `critical` urgency additionally fires a Pushover mobile notification when credentials are available. Parameters: `summary` (required), `context` (optional), `urgency` (`low`/`medium`/`high`/`critical`, default `medium`), `wait_for_response` (bool, default false), `timeout_secs` (default 600). On ACP without `wait_for_response`, the tool fast-fails if no structured-choice channel is available. |
+| `escalate_to_human` | Send a structured escalation message with urgency routing. `high` / `critical` urgency additionally notifies any channels listed in `[escalation] alert_channels`. Parameters: `summary` (required), `context` (optional), `urgency` (`low`/`medium`/`high`/`critical`, default `medium`), `wait_for_response` (bool, default false), `timeout_secs` (default 600). On ACP, `wait_for_response: true` fails immediately if the channel cannot receive free-form replies (awaits ACP elicitation RFD). |
 
 Optional, feature-gated:
 
