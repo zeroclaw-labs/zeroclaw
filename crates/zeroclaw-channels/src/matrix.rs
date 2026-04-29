@@ -316,13 +316,23 @@ mod streaming {
 
     use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
 
+    use super::markers;
+
     pub(super) type DraftKey = OwnedRoomId;
 
     #[derive(Debug, Clone)]
     pub(super) struct PartialDraft {
         pub event_id: OwnedEventId,
+        pub thread_anchor: Option<OwnedEventId>,
         pub last_text: String,
         pub last_edit: Instant,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum PartialFinalizeAction {
+        EditDraft,
+        RedactDraft,
+        EmptyError,
     }
 
     /// MultiMessage streaming state. The runtime calls `update_draft` repeatedly
@@ -352,6 +362,27 @@ mod streaming {
             return false;
         }
         now.saturating_duration_since(existing.last_edit) >= min_interval
+    }
+
+    pub(super) fn partial_visible_text(text: &str) -> Option<String> {
+        let (cleaned, _) = markers::parse(text);
+        let cleaned = cleaned.trim();
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned.to_string())
+        }
+    }
+
+    pub(super) fn decide_partial_finalize_action(
+        text_is_empty_after_delivery: bool,
+        any_attachment_landed: bool,
+    ) -> PartialFinalizeAction {
+        match (text_is_empty_after_delivery, any_attachment_landed) {
+            (false, _) => PartialFinalizeAction::EditDraft,
+            (true, true) => PartialFinalizeAction::RedactDraft,
+            (true, false) => PartialFinalizeAction::EmptyError,
+        }
     }
 
     /// Find the next paragraph break (`\n\n`) in `new_text`, ignoring any
@@ -1702,6 +1733,18 @@ mod outbound {
         Failed,
     }
 
+    pub(super) struct AttachmentDelivery {
+        pub text: String,
+        pub last_attachment_id: Option<OwnedEventId>,
+        pub failed_markers: Vec<(String, MarkerFailure)>,
+    }
+
+    impl AttachmentDelivery {
+        pub(super) fn failure_kinds(&self) -> Vec<MarkerFailure> {
+            self.failed_markers.iter().map(|(_, kind)| *kind).collect()
+        }
+    }
+
     /// Pick the emoji reactions to apply to the agent's outgoing text/event
     /// based on which kinds of marker failures occurred. 🚫 means the bot
     /// refused for safety; ⚠️ means it tried and didn't make it. Both can
@@ -1878,16 +1921,11 @@ mod outbound {
         Ok(buf)
     }
 
-    pub(super) async fn send(outbox: &Outbox<'_>, message: &SendMessage) -> Result<OwnedEventId> {
-        let room =
-            resolve_joined_room(outbox.client, outbox.alias_cache, &message.recipient).await?;
-
-        let (mut text, ms) = markers::parse(&message.content);
-
-        // Build the thread anchor used by both attachment uploads and the
-        // text reply, so attachments live in the same thread instead of
-        // landing in the main timeline.
-        let thread_anchor: Option<OwnedEventId> = if outbox.reply_in_thread {
+    pub(super) fn thread_anchor_from_message(
+        outbox: &Outbox<'_>,
+        message: &SendMessage,
+    ) -> Option<OwnedEventId> {
+        if outbox.reply_in_thread {
             message
                 .thread_ts
                 .as_deref()
@@ -1895,8 +1933,17 @@ mod outbound {
                 .and_then(|s| s.parse().ok())
         } else {
             None
-        };
+        }
+    }
 
+    pub(super) async fn deliver_attachments(
+        outbox: &Outbox<'_>,
+        room: &Room,
+        mut text: String,
+        markers: &[markers::Marker],
+        attachments: &[MediaAttachment],
+        thread_anchor: Option<&OwnedEventId>,
+    ) -> Result<AttachmentDelivery> {
         // Outbound attachments. SendMessage.attachments comes from the runtime's
         // structured attachment list; missing/empty data is fatal there because
         // the bytes were already in memory. Marker-driven uploads are best-
@@ -1909,9 +1956,8 @@ mod outbound {
         // instead of an Err — otherwise the runtime would see a failure even
         // though the attachment actually landed in the room.
         let mut last_attachment_id: Option<OwnedEventId> = None;
-        for att in &message.attachments {
-            let id =
-                upload_attachment(&room, att, AttachmentKind::Auto, thread_anchor.as_ref()).await?;
+        for att in attachments {
+            let id = upload_attachment(room, att, AttachmentKind::Auto, thread_anchor).await?;
             last_attachment_id = Some(id);
         }
 
@@ -1920,7 +1966,7 @@ mod outbound {
         // fetch error, upload rejection). Drives both the textual note and
         // the emoji reactions fired below.
         let mut failed_markers: Vec<(String, MarkerFailure)> = Vec::new();
-        for marker in &ms {
+        for marker in markers {
             let kind = match marker.kind {
                 markers::MarkerKind::Image => AttachmentKind::Image,
                 markers::MarkerKind::Audio => AttachmentKind::Audio,
@@ -1975,7 +2021,7 @@ mod outbound {
                 data: bytes,
                 mime_type: Some(mime),
             };
-            match upload_attachment(&room, &att, kind, thread_anchor.as_ref()).await {
+            match upload_attachment(room, &att, kind, thread_anchor).await {
                 Ok(id) => last_attachment_id = Some(id),
                 Err(e) => {
                     warn!(
@@ -2002,18 +2048,50 @@ mod outbound {
             };
         }
 
+        Ok(AttachmentDelivery {
+            text,
+            last_attachment_id,
+            failed_markers,
+        })
+    }
+
+    pub(super) async fn send(outbox: &Outbox<'_>, message: &SendMessage) -> Result<OwnedEventId> {
+        let room =
+            resolve_joined_room(outbox.client, outbox.alias_cache, &message.recipient).await?;
+
+        let (text, ms) = markers::parse(&message.content);
+
+        // Build the thread anchor used by both attachment uploads and the
+        // text reply, so attachments live in the same thread instead of
+        // landing in the main timeline.
+        let thread_anchor = thread_anchor_from_message(outbox, message);
+
+        let delivery = deliver_attachments(
+            outbox,
+            &room,
+            text,
+            &ms,
+            &message.attachments,
+            thread_anchor.as_ref(),
+        )
+        .await?;
+
         // Decide whether to send the text, return the last attachment's
         // event_id, or surface an error. Marker-only messages used to error
         // here even though their attachment had landed; the runtime would
         // see Err and could retry, producing duplicate uploads.
-        match decide_send_outcome(text.trim().is_empty(), last_attachment_id.is_some()) {
+        match decide_send_outcome(
+            delivery.text.trim().is_empty(),
+            delivery.last_attachment_id.is_some(),
+        ) {
             SendOutcome::SendText => {}
             SendOutcome::ReturnAttachment => {
                 // Safe by construction: ReturnAttachment is only returned
                 // when last_attachment_id is Some.
-                let attachment_id = last_attachment_id
+                let kinds = delivery.failure_kinds();
+                let attachment_id = delivery
+                    .last_attachment_id
                     .expect("decide_send_outcome guarantees Some when ReturnAttachment");
-                let kinds: Vec<MarkerFailure> = failed_markers.iter().map(|(_, k)| *k).collect();
                 emit_failure_reactions(&room, &attachment_id, &kinds).await;
                 return Ok(attachment_id);
             }
@@ -2024,7 +2102,7 @@ mod outbound {
             }
         }
 
-        let content = RoomMessageEventContent::text_markdown(&text);
+        let content = RoomMessageEventContent::text_markdown(&delivery.text);
 
         let event_id = if let (true, Some(anchor)) = (
             outbox.reply_in_thread,
@@ -2035,7 +2113,7 @@ mod outbound {
             room.send(content).await?.event_id
         };
 
-        let kinds: Vec<MarkerFailure> = failed_markers.iter().map(|(_, k)| *k).collect();
+        let kinds = delivery.failure_kinds();
         emit_failure_reactions(&room, &event_id, &kinds).await;
 
         Ok(event_id)
@@ -2045,7 +2123,7 @@ mod outbound {
     /// based on which kinds of marker failures occurred. Reaction send
     /// failures are logged but never propagated — the primary message
     /// already landed.
-    async fn emit_failure_reactions(
+    pub(super) async fn emit_failure_reactions(
         room: &Room,
         event_id: &OwnedEventId,
         failures: &[MarkerFailure],
@@ -2157,7 +2235,7 @@ mod outbound {
         Ok(())
     }
 
-    async fn resolve_joined_room(
+    pub(super) async fn resolve_joined_room(
         client: &Client,
         cache: &Arc<TokioRwLock<HashMap<String, OwnedRoomId>>>,
         recipient: &str,
@@ -2365,6 +2443,9 @@ impl MatrixChannel {
     async fn partial_update(&self, recipient: &str, text: &str) -> Result<()> {
         let client = self.ensure_client().await?;
         let key = streaming_key(recipient)?;
+        let Some(visible_text) = streaming::partial_visible_text(text) else {
+            return Ok(());
+        };
         let event_id = {
             let mut state = self.streaming_state.write().await;
             let Some(draft) = state.partial.get_mut(&key) else {
@@ -2372,15 +2453,15 @@ impl MatrixChannel {
             };
             let now = Instant::now();
             let interval = Duration::from_millis(self.config.draft_update_interval_ms.max(50));
-            if !streaming::partial_should_edit(draft, text, now, interval) {
+            if !streaming::partial_should_edit(draft, &visible_text, now, interval) {
                 return Ok(());
             }
             let event_id = draft.event_id.clone();
-            draft.last_text = text.to_string();
+            draft.last_text = visible_text.clone();
             draft.last_edit = now;
             event_id
         };
-        outbound::edit(client, recipient, &event_id, text).await
+        outbound::edit(client, recipient, &event_id, &visible_text).await
     }
 
     /// MultiMessage paragraph emitter. Loops emitting one paragraph per
@@ -2511,11 +2592,14 @@ impl Channel for MatrixChannel {
                 // Send the placeholder draft now so subsequent update_draft
                 // calls have an event to edit.
                 let event_id = outbound::send(&self.outbox(client), message).await?;
+                let thread_anchor =
+                    outbound::thread_anchor_from_message(&self.outbox(client), message);
                 let mut state = self.streaming_state.write().await;
                 state.partial.insert(
                     key,
                     streaming::PartialDraft {
                         event_id: event_id.clone(),
+                        thread_anchor,
                         last_text: message.content.clone(),
                         last_edit: Instant::now(),
                     },
@@ -2572,15 +2656,85 @@ impl Channel for MatrixChannel {
         match self.config.stream_mode {
             StreamMode::Off => Ok(()),
             StreamMode::Partial => {
-                let event_id = self
-                    .streaming_state
-                    .write()
-                    .await
-                    .partial
-                    .remove(&key)
-                    .map(|d| d.event_id);
-                if let Some(eid) = event_id {
-                    outbound::edit(client, recipient, &eid, text).await?;
+                let draft = self.streaming_state.write().await.partial.remove(&key);
+                if let Some(draft) = draft {
+                    let room =
+                        outbound::resolve_joined_room(client, &self.alias_cache, recipient).await?;
+                    let (cleaned_text, markers) = markers::parse(text);
+                    let delivery = outbound::deliver_attachments(
+                        &self.outbox(client),
+                        &room,
+                        cleaned_text,
+                        &markers,
+                        &[],
+                        draft.thread_anchor.as_ref(),
+                    )
+                    .await?;
+
+                    match streaming::decide_partial_finalize_action(
+                        delivery.text.trim().is_empty(),
+                        delivery.last_attachment_id.is_some(),
+                    ) {
+                        streaming::PartialFinalizeAction::EditDraft => {
+                            let kinds = delivery.failure_kinds();
+                            let any_attachment_landed = delivery.last_attachment_id.is_some();
+                            if let Err(edit_err) =
+                                outbound::edit(client, recipient, &draft.event_id, &delivery.text)
+                                    .await
+                            {
+                                tracing::warn!(
+                                    "matrix: partial finalize edit failed: {edit_err}; sending cleaned text fallback"
+                                );
+                                let mut fallback = SendMessage::new(&delivery.text, recipient);
+                                fallback.thread_ts =
+                                    draft.thread_anchor.as_ref().map(|e| e.to_string());
+                                match outbound::send(&self.outbox(client), &fallback).await {
+                                    Ok(fallback_id) => {
+                                        outbound::emit_failure_reactions(
+                                            &room,
+                                            &fallback_id,
+                                            &kinds,
+                                        )
+                                        .await;
+                                    }
+                                    Err(send_err) if any_attachment_landed => {
+                                        tracing::warn!(
+                                            "matrix: partial finalize cleaned text fallback failed after attachment upload: {send_err}; suppressing error to avoid duplicate attachment retry"
+                                        );
+                                    }
+                                    Err(send_err) => {
+                                        return Err(edit_err).with_context(|| {
+                                            format!(
+                                                "matrix: partial finalize cleaned text fallback failed: {send_err}"
+                                            )
+                                        });
+                                    }
+                                }
+                            } else {
+                                outbound::emit_failure_reactions(&room, &draft.event_id, &kinds)
+                                    .await;
+                            }
+                        }
+                        streaming::PartialFinalizeAction::RedactDraft => {
+                            if let Err(err) = outbound::redact(
+                                client,
+                                recipient,
+                                &draft.event_id,
+                                Some("attachment-only response delivered".to_string()),
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "matrix: partial finalize redaction failed after attachment-only upload: {err}; leaving placeholder to avoid duplicate attachment retry"
+                                );
+                            }
+                        }
+                        streaming::PartialFinalizeAction::EmptyError => {
+                            return Err(anyhow!(
+                                "matrix: empty partial draft body and no successful attachment"
+                            ));
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -3022,13 +3176,17 @@ mod tests {
     }
 
     mod streaming {
-        use super::super::streaming::{PartialDraft, partial_should_edit};
+        use super::super::streaming::{
+            PartialDraft, PartialFinalizeAction, decide_partial_finalize_action,
+            partial_should_edit, partial_visible_text,
+        };
         use matrix_sdk::ruma::owned_event_id;
         use std::time::{Duration, Instant};
 
         fn draft(text: &str, last_edit: Instant) -> PartialDraft {
             PartialDraft {
                 event_id: owned_event_id!("$1:server"),
+                thread_anchor: None,
                 last_text: text.to_string(),
                 last_edit,
             }
@@ -3068,6 +3226,35 @@ mod tests {
                 now,
                 Duration::from_millis(500)
             ));
+        }
+
+        #[test]
+        fn partial_visible_text_strips_attachment_markers() {
+            assert_eq!(
+                partial_visible_text("Report ready [DOCUMENT:report.pdf]").as_deref(),
+                Some("Report ready")
+            );
+        }
+
+        #[test]
+        fn partial_visible_text_skips_marker_only_updates() {
+            assert_eq!(partial_visible_text("[DOCUMENT:report.pdf]"), None);
+        }
+
+        #[test]
+        fn marker_only_partial_finalize_redacts_placeholder_after_upload() {
+            assert_eq!(
+                decide_partial_finalize_action(true, true),
+                PartialFinalizeAction::RedactDraft
+            );
+        }
+
+        #[test]
+        fn text_partial_finalize_keeps_editing_draft_after_upload() {
+            assert_eq!(
+                decide_partial_finalize_action(false, true),
+                PartialFinalizeAction::EditDraft
+            );
         }
     }
 
