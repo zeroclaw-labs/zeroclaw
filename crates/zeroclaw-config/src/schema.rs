@@ -10301,8 +10301,12 @@ impl Config {
 
             // Entries created by migration from top-level fields use the provider
             // name as the map key and may not have explicit `name` or `base_url`
-            // (the provider factory resolves known names). Only reject entries that
-            // have no identifying information at all.
+            // (the provider factory resolves known names). An entry with no
+            // identifying information at all is almost always an in-progress
+            // onboarding state — the user picked the provider but hasn't filled
+            // anything in yet. Warn but don't bail; the runtime falls back to
+            // provider-trait defaults at use time, and a chat against the
+            // unconfigured provider fails with a clear error then.
             let has_api_key = profile
                 .api_key
                 .as_deref()
@@ -10312,9 +10316,13 @@ impl Config {
                 .as_deref()
                 .is_some_and(|v| !v.trim().is_empty());
             if !has_name && !has_base_url && !has_api_key && !has_model {
-                anyhow::bail!(
-                    "providers.models.{profile_name} must define at least one of `name`, `base_url`, `api_key`, or `model`"
+                tracing::warn!(
+                    provider = %profile_name,
+                    "providers.models.{profile_name} is empty (no name / base_url / api_key / model). \
+                     Skipping at runtime; finish onboarding via the dashboard or `zeroclaw onboard` \
+                     to make this provider usable.",
                 );
+                continue;
             }
 
             if let Some(base_url) = profile.base_url.as_deref().map(str::trim)
