@@ -274,7 +274,7 @@ impl WuKongIMChannel {
         approval_id: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
         timeout_secs: u64,
-    ) -> serde_json::Value {
+    ) -> WkApprovalCard {
         // Human-readable summarization for cron_add or other tools
         let (title, content) = if request.tool_name == "cron_add" {
             let mut summary = request.arguments_summary.clone();
@@ -306,15 +306,15 @@ impl WuKongIMChannel {
 
         let content = format!("{}\n\n1批准，2拒绝 3总是允许", content);
 
-        serde_json::json!({
-            "type": 20,
-            "approval_id": approval_id,
-            "timeout_secs": timeout_secs,
-            "title": title,
-            "body": {
-                "content": content
-            }
-        })
+        WkApprovalCard {
+            msg_type: 20,
+            approval_id: approval_id.to_string(),
+            timeout_secs,
+            title: title.to_string(),
+            body: WkApprovalBody {
+                content: content.to_string(),
+            },
+        }
     }
 }
 
