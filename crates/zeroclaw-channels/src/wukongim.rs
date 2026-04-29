@@ -511,28 +511,8 @@ impl Channel for WuKongIMChannel {
                                 }
                             }
 
-                            // Ack receipt
-                            let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
-
-                            // Extract text content
-                            let content = if let Some(c) =
-                                payload_json.get("content").and_then(|c| c.as_str())
-                            {
-                                c.to_string()
-                            } else if let Some(s) = payload_json.as_str() {
-                                s.to_string()
-                            } else {
-                                String::new()
-                            };
-                            tracing::info!(
-                                "WuKongIM: received message from {} (channel: {}:{}): {}",
-                                params.from_uid,
-                                params.channel_type,
-                                params.channel_id,
-                                content
-                            );
-
-                            // 3. Handle mention_only logic for group chats
+                            // 3. Handle mention_only logic for group chats (MUST check before sending ACK)
+                            // If we send ACK first and then skip, the message is permanently lost.
                             let is_group = params.channel_type != 1;
                             if self.mention_only && is_group {
                                 let mut mentioned = false;
@@ -564,21 +544,53 @@ impl Channel for WuKongIMChannel {
                                     }
                                 }
 
+                                // Also check text content for @mentions
+                                let content_for_check = if let Some(c) =
+                                    payload_json.get("content").and_then(|c| c.as_str())
+                                {
+                                    c.to_string()
+                                } else if let Some(s) = payload_json.as_str() {
+                                    s.to_string()
+                                } else {
+                                    String::new()
+                                };
+
                                 if !mentioned
-                                    && (content.contains(&format!("@{}", self.uid))
-                                        || content.contains("@all"))
+                                    && (content_for_check.contains(&format!("@{}", self.uid))
+                                        || content_for_check.contains("@all"))
                                 {
                                     mentioned = true;
                                 }
 
                                 if !mentioned {
                                     tracing::debug!(
-                                        "WuKongIM: ignoring non-mention message in group (uid: {})",
+                                        "WuKongIM: ignoring non-mention message in group (uid: {}), NOT sending ACK",
                                         self.uid
                                     );
                                     continue;
                                 }
                             }
+
+                            // Only send ACK after all checks pass (message will be processed)
+                            let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
+
+                            // Extract text content
+                            let content = if let Some(c) =
+                                payload_json.get("content").and_then(|c| c.as_str())
+                            {
+                                c.to_string()
+                            } else if let Some(s) = payload_json.as_str() {
+                                s.to_string()
+                            } else {
+                                String::new()
+                            };
+                            tracing::info!(
+                                "WuKongIM: received message from {} (channel: {}:{}): {}",
+                                params.from_uid,
+                                params.channel_type,
+                                params.channel_id,
+                                content
+                            );
 
                             // Determine target: for type 1 (personal), reply to from_uid. For others, reply to channel_id.
                             let target_id = if params.channel_type == 1 {
