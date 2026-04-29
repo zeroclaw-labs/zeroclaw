@@ -18,12 +18,14 @@
 // fields auto-fetch /api/onboard/catalog/models for the datalist.
 
 import { useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Check, ChevronRight } from 'lucide-react';
 import {
   ApiError,
   getProp,
   getSections,
   patchConfig,
+  reloadDaemon,
   selectSectionItem,
   type PickerItem,
   type SectionInfo,
@@ -53,11 +55,13 @@ const ONBOARD_SECTION_ORDER = [
 ] as const;
 
 export default function Onboard() {
+  const navigate = useNavigate();
   const [sections, setSections] = useState<SectionInfo[]>([]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [picked, setPicked] = useState<{ item: PickerItem; fieldsPrefix: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [finishing, setFinishing] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -145,6 +149,27 @@ export default function Onboard() {
     } else {
       // Wizard done — stay on current section but clear picked state.
       setPicked(null);
+    }
+  };
+
+  // Finish: mark the last section completed, reload the daemon so any
+  // newly-configured channels / providers / tunnels actually start, then
+  // drop the user on the dashboard. The reload endpoint returns
+  // immediately; allow a beat for the gateway to rebind before navigating.
+  const finishOnboarding = async () => {
+    setFinishing(true);
+    try {
+      await advanceSection();
+      try {
+        await reloadDaemon();
+        await new Promise((r) => setTimeout(r, 400));
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn('Daemon reload failed after onboarding; user can retry from /config:', e);
+      }
+      navigate('/');
+    } finally {
+      setFinishing(false);
     }
   };
 
@@ -268,10 +293,19 @@ export default function Onboard() {
               </div>
               <button
                 type="button"
-                onClick={() => void advanceSection()}
+                disabled={finishing}
+                onClick={() =>
+                  isLastSection(sections, activeSection.key)
+                    ? void finishOnboarding()
+                    : void advanceSection()
+                }
                 className="btn-electric inline-flex items-center gap-1.5 text-sm px-4 py-2"
               >
-                {isLastSection(sections, activeSection.key) ? 'Done' : 'Next ▶'}
+                {isLastSection(sections, activeSection.key)
+                  ? finishing
+                    ? 'Finishing…'
+                    : 'Finish'
+                  : 'Next ▶'}
               </button>
             </div>
 
@@ -290,10 +324,16 @@ export default function Onboard() {
                 onPick={(item) => void handlePick(item)}
                 doneLabel={
                   isLastSection(sections, activeSection.key)
-                    ? 'Done'
+                    ? finishing
+                      ? 'Finishing…'
+                      : 'Finish'
                     : 'Next ▶'
                 }
-                onDone={advanceSection}
+                onDone={
+                  isLastSection(sections, activeSection.key)
+                    ? finishOnboarding
+                    : advanceSection
+                }
               />
             ) : (
               <FieldForm
