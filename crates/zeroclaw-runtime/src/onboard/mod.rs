@@ -30,6 +30,7 @@ enum SkipNav {
     Back,
 }
 
+pub mod field_visibility;
 pub mod ui;
 
 /// Which slice of onboarding to run. `All` runs every section in order.
@@ -606,9 +607,7 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
         // `persist()` carries the entry — defaults included — to disk.
         if is_new_entry {
             let prefix = format!("providers.models.{picked}");
-            for trait_default in provider_trait_defaults(&picked, &prefix) {
-                cfg.set_prop(&trait_default.path, &trait_default.display)?;
-            }
+            field_visibility::apply_provider_trait_defaults(cfg, &picked, &prefix)?;
         }
 
         let display_name = entries
@@ -706,79 +705,41 @@ async fn offer_advanced_settings(
         Answer::Value(true) => {}
     }
 
-    let defaults = provider_trait_defaults(provider, prefix);
+    let defaults = provider_trait_defaults_for_prompts(provider, prefix);
 
     // Skipped: `model` (already via prompt_model), `api-key` (explicit auth
     // phase), and fields that only apply to a different provider family
     // (e.g. azure-openai-* when the user picked Anthropic).
     let mut excludes: Vec<&str> = vec!["model", "api-key"];
-    excludes.extend(provider_family_excludes(provider));
+    excludes.extend(field_visibility::provider_family_excludes(provider));
     prompt_fields_under(cfg, ui, prefix, &excludes, &defaults).await
 }
 
-/// Build the `FieldDefault` list for a provider from its trait methods.
-/// Single source of truth: used to pre-populate fresh entries during
-/// onboarding AND to surface defaults in the advanced-settings walk.
-/// A provider handle constructed with `api_key = None` can still answer
-/// the `default_*` questions — they're family-level constants, not
-/// runtime values. If construction fails (unknown / local-only provider),
-/// returns an empty vec and callers fall back to per-field display values.
-fn provider_trait_defaults(provider: &str, prefix: &str) -> Vec<FieldDefault> {
-    let Ok(handle) = zeroclaw_providers::create_provider(provider, None) else {
-        return Vec::new();
-    };
-    let mut v = vec![
-        FieldDefault {
-            path: format!("{prefix}.temperature"),
-            display: handle.default_temperature().to_string(),
-        },
-        FieldDefault {
-            path: format!("{prefix}.max-tokens"),
-            display: handle.default_max_tokens().to_string(),
-        },
-        FieldDefault {
-            path: format!("{prefix}.timeout-secs"),
-            display: handle.default_timeout_secs().to_string(),
-        },
-        FieldDefault {
-            path: format!("{prefix}.wire-api"),
-            display: handle.default_wire_api().to_string(),
-        },
-    ];
-    if let Some(url) = handle.default_base_url() {
-        v.push(FieldDefault {
-            path: format!("{prefix}.base-url"),
-            display: url.to_string(),
-        });
-    }
-    v
-}
-
-/// Exclude fields that don't apply to the selected provider family.
-///
-/// A field absent from this filter is shown for every provider. Grow the
-/// list as provider-specific fields land on `ModelProviderConfig` — the
-/// goal is to keep the advanced walk focused on fields the user might
-/// reasonably want to override for the provider they picked.
-///
-/// Follow-up (#5960 deferral): a `#[configurable(family = "...")]`
-/// attribute on the schema struct would let the `Configurable` derive
-/// emit this filter automatically. This hardcoded list is a pragmatic
-/// stand-in until that lands.
-fn provider_family_excludes(provider: &str) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    // Azure-OpenAI-only deployment routing fields.
-    if provider != "azure_openai" {
-        out.push("azure-openai-resource");
-        out.push("azure-openai-deployment");
-        out.push("azure-openai-api-version");
-    }
-    // OpenAI wire-protocol flavor + Codex auth are OpenAI-family concerns.
-    if !matches!(provider, "openai" | "openai_codex") {
-        out.push("wire-api");
-        out.push("requires-openai-auth");
-    }
-    out
+/// Build the `FieldDefault` list for the prompt walker by walking the
+/// schema fields of `zeroclaw_providers::default_provider_config(provider)`
+/// and rebasing each leaf onto `prefix`. Same source of truth the gateway's
+/// `apply_provider_trait_defaults` uses — schema-driven, no per-field
+/// names to keep in sync.
+fn provider_trait_defaults_for_prompts(provider: &str, prefix: &str) -> Vec<FieldDefault> {
+    let defaults = zeroclaw_providers::default_provider_config(provider);
+    let source_dot = format!(
+        "{}.",
+        zeroclaw_config::schema::ModelProviderConfig::configurable_prefix()
+    );
+    defaults
+        .prop_fields()
+        .into_iter()
+        .filter_map(|field| {
+            let leaf = field.name.strip_prefix(&source_dot)?;
+            if leaf.contains('.') || field.display_value == "<unset>" {
+                return None;
+            }
+            Some(FieldDefault {
+                path: format!("{prefix}.{leaf}"),
+                display: field.display_value,
+            })
+        })
+        .collect()
 }
 
 /// Prompt for the model field using the provider's live model catalog.

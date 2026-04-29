@@ -18,7 +18,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
-use zeroclaw_runtime::onboard::Section;
+use zeroclaw_runtime::onboard::{Section, field_visibility};
 
 use super::AppState;
 use super::api::require_auth;
@@ -557,6 +557,11 @@ pub async fn handle_list(
     let config = state.config.lock().clone();
     let prefix = q.prefix.as_deref();
 
+    // Drop fields that don't apply to the current shape of the config —
+    // azure_* on a non-azure provider, qdrant.* when memory.backend is
+    // sqlite, etc. Keeps the form scoped to relevant inputs only.
+    let excluded = field_visibility::excluded_paths(&config, prefix.unwrap_or(""));
+
     let entries: Vec<ListEntry> = config
         .prop_fields()
         .into_iter()
@@ -564,6 +569,7 @@ pub async fn handle_list(
             Some(p) => info.name.starts_with(p),
             None => true,
         })
+        .filter(|info| !field_visibility::is_excluded(&info.name, &excluded))
         .map(|info| {
             let populated = info.display_value != "<unset>";
             let is_sensitive = info.is_secret || info.derived_from_secret;
