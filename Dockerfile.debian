@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ── Stage 0: Frontend build ─────────────────────────────────────
-FROM node:22-alpine AS web-builder
+FROM node:24-alpine AS web-builder
 WORKDIR /web
 COPY web/package.json web/package-lock.json* ./
 RUN npm ci --ignore-scripts 2>/dev/null || npm install --ignore-scripts
