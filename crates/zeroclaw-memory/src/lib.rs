@@ -29,6 +29,7 @@ pub mod knowledge_graph;
 #[cfg(feature = "memory-postgres")]
 pub mod knowledge_graph_pg;
 pub mod lucid;
+pub mod lore_context;
 pub mod markdown;
 pub mod namespaced;
 pub mod none;
@@ -51,6 +52,7 @@ pub use backend::{
     memory_backend_profile, selectable_memory_backends,
 };
 pub use lucid::LucidMemory;
+pub use lore_context::LoreContextMemory;
 pub use markdown::MarkdownMemory;
 pub use namespaced::NamespacedMemory;
 pub use none::NoneMemory;
@@ -133,6 +135,12 @@ where
         }
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
+        }
+        MemoryBackendKind::LoreContext => {
+            anyhow::bail!(
+                "lore_context backend requires config; \
+                 call create_memory_with_storage_and_routes instead of create_memory_with_builders"
+            )
         }
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
         MemoryBackendKind::Unknown => {
@@ -432,6 +440,29 @@ pub fn create_memory_with_storage_and_routes(
         let fallback = StorageProviderConfig::default();
         let provider = storage_provider.unwrap_or(&fallback);
         return build_postgres_memory(config, provider);
+    }
+    if matches!(backend_kind, MemoryBackendKind::LoreContext) {
+        let url = config
+            .lore_context
+            .url
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var("LORE_API_URL").ok())
+            .filter(|s| !s.trim().is_empty())
+            .context(
+                "Lore Context memory backend requires url in [memory.lore_context] or LORE_API_URL env var",
+            )?;
+        let lore_api_key = config
+            .lore_context
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("LORE_API_KEY").ok())
+            .filter(|s| !s.trim().is_empty());
+        tracing::info!(
+            "📦 Lore Context memory backend configured (url: {})",
+            url
+        );
+        return Ok(Box::new(LoreContextMemory::new(&url, lore_api_key)));
     }
 
     create_memory_with_builders(

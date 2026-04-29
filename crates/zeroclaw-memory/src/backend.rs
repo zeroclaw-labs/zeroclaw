@@ -5,6 +5,7 @@ pub enum MemoryBackendKind {
     Postgres,
     Qdrant,
     Markdown,
+    LoreContext,
     None,
     Unknown,
 }
@@ -54,6 +55,15 @@ const POSTGRES_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     uses_sqlite_hygiene: false,
     sqlite_based: false,
     optional_dependency: true,
+};
+
+const LORE_CONTEXT_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "lore_context",
+    label: "Lore Context — semantic memory via Lore REST API (remote)",
+    auto_save_default: true,
+    uses_sqlite_hygiene: false,
+    sqlite_based: false,
+    optional_dependency: false,
 };
 
 const QDRANT_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
@@ -106,6 +116,7 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
         "postgres" => MemoryBackendKind::Postgres,
         "qdrant" => MemoryBackendKind::Qdrant,
         "markdown" => MemoryBackendKind::Markdown,
+        "lore_context" => MemoryBackendKind::LoreContext,
         "none" => MemoryBackendKind::None,
         _ => MemoryBackendKind::Unknown,
     }
@@ -118,6 +129,7 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
         MemoryBackendKind::Postgres => POSTGRES_PROFILE,
         MemoryBackendKind::Qdrant => QDRANT_PROFILE,
         MemoryBackendKind::Markdown => MARKDOWN_PROFILE,
+        MemoryBackendKind::LoreContext => LORE_CONTEXT_PROFILE,
         MemoryBackendKind::None => NONE_PROFILE,
         MemoryBackendKind::Unknown => CUSTOM_PROFILE,
     }

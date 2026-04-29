@@ -5243,6 +5243,33 @@ impl Default for QdrantConfig {
     }
 }
 
+/// Lore Context memory backend configuration (`[memory.lore_context]` section).
+///
+/// Used when `[memory].backend = "lore_context"`. URL and API key fall back to
+/// environment variables (`LORE_API_URL`, `LORE_API_KEY`) when not set explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "memory.lore_context"]
+pub struct LoreContextConfig {
+    /// Lore Context API base URL (e.g. `"http://localhost:3000"`).
+    /// Falls back to `LORE_API_URL` env var if not set.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Optional API key for Lore Context authentication.
+    /// Falls back to `LORE_API_KEY` env var if not set.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+impl Default for LoreContextConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            api_key: None,
+        }
+    }
+}
+
 /// Search strategy for memory recall.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -5395,6 +5422,13 @@ pub struct MemoryConfig {
     #[serde(default)]
     #[nested]
     pub postgres: PostgresMemoryConfig,
+
+    // ── Lore Context backend options ──────────────────────────
+    /// Configuration for Lore Context memory backend (`[memory.lore_context]`).
+    /// Only used when `backend = "lore_context"`.
+    #[serde(default)]
+    #[nested]
+    pub lore_context: LoreContextConfig,
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
@@ -5523,6 +5557,7 @@ impl Default for MemoryConfig {
             sqlite_open_timeout_secs: None,
             qdrant: QdrantConfig::default(),
             postgres: PostgresMemoryConfig::default(),
+            lore_context: LoreContextConfig::default(),
         }
     }
 }
