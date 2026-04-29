@@ -34,6 +34,7 @@ import {
   type ListResponseEntry,
   type PatchOp,
 } from '../../lib/api';
+import { fuzzyFilter } from '../../lib/fuzzy';
 
 interface FieldFormProps {
   /** Dotted prefix to fetch fields under, e.g. `providers.models.anthropic`. */
@@ -169,6 +170,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
   const [saving, setSaving] = useState(false);
   const [drifted, setDrifted] = useState<DriftEntry[]>([]);
   const [schema, setSchema] = useState<Record<string, unknown> | undefined>(undefined);
+  const [filter, setFilter] = useState('');
 
   // Schema is whole-Config and ETag-cached server-side; fetch once per
   // session so every form row can resolve its `///` doc-comment helper
@@ -305,6 +307,15 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
     });
   }, [entries]);
 
+  // Fuzzy-filter against the short label + dotted path; sections with
+  // a lot of fields (Agent, Channels) are otherwise a wall of inputs.
+  // Empty query falls through to the full sorted list. Matches the
+  // pattern SectionPicker uses so behavior is consistent across views.
+  const visibleEntries = useMemo(() => {
+    if (!filter.trim()) return sortedEntries;
+    return fuzzyFilter(sortedEntries, filter, (e) => `${fieldShortLabel(e)} ${e.path}`);
+  }, [sortedEntries, filter]);
+
   // Count of fields whose draft value differs from the saved display value.
   // Drives the unsaved-changes counter in the sticky save bar. Must be
   // declared above the conditional render so hook count stays stable
@@ -357,6 +368,17 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
 
       {drifted.length > 0 && <DriftBanner drifted={drifted} onApplied={reload} />}
 
+      {entries.length > 4 && (
+        <input
+          type="text"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          placeholder={`Filter ${entries.length} fields — fuzzy match on name or path`}
+          className="input-electric w-full px-3 py-2 text-sm"
+          aria-label="Filter fields"
+        />
+      )}
+
       {entries.length === 0 ? (
         <div
           className="surface-panel p-6 text-center text-sm"
@@ -373,7 +395,15 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
             void handleSave().catch(() => undefined);
           }}
         >
-          {sortedEntries.map((f) => (
+          {visibleEntries.length === 0 ? (
+            <div
+              className="px-4 py-6 text-sm text-center"
+              style={{ color: 'var(--pc-text-muted)' }}
+            >
+              No fields match <code style={{ color: 'var(--pc-text-faint)' }}>{filter}</code>.
+            </div>
+          ) : null}
+          {visibleEntries.map((f) => (
             <FieldRow
               key={f.path}
               entry={f}
