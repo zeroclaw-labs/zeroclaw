@@ -35,11 +35,13 @@ type Mode =
 // into "Other"). Schema-attribute-driven grouping replaces this in v3 /
 // #5947.
 //
-// "Onboarding" is intentionally absent — those 6 sections are promoted
-// to the top-level nav (`/setup/<section>`) so users can reach them
-// without drilling through the Config explorer. The Onboarding wizard
-// itself lives at `/onboard`.
+// Onboarding leads — Workspace / Providers / Channels / Memory /
+// Hardware / Tunnel are the most-edited sections, surfaced first inside
+// the Config explorer instead of as duplicate top-level nav entries.
+// The Onboarding wizard itself lives at /onboard (reachable via the
+// "Run setup again" link in the breadcrumb row).
 const GROUP_ORDER = [
+  'Onboarding',
   'Agent',
   'Multi-agent',
   'Tools',

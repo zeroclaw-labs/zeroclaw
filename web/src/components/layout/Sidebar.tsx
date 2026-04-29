@@ -2,18 +2,12 @@ import { NavLink } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
 import {
   Activity,
-  Briefcase,
   Brain,
   Clock,
-  Cpu,
-  Database,
   DollarSign,
-  Globe,
   LayoutDashboard,
-  MessageCircle,
   MessageSquare,
   Monitor,
-  Plug,
   Puzzle,
   Settings,
   Stethoscope,
@@ -24,10 +18,7 @@ import { t } from '@/lib/i18n';
 interface NavItem {
   to: string;
   icon: typeof LayoutDashboard;
-  // labelKey is preferred (i18n); label is a fall-through for the
-  // promoted Setup entries until i18n keys are added.
-  labelKey?: string;
-  label?: string;
+  labelKey: string;
 }
 
 const navItems: NavItem[] = [
@@ -44,17 +35,11 @@ const navItems: NavItem[] = [
   { to: '/canvas', icon: Monitor, labelKey: 'nav.canvas' },
 ];
 
-// The 6 onboarding sections promoted to top-level nav (#6175). Keys
-// match `Section::as_path_prefix` server-side so deep links round-trip
-// to the section editor.
-const setupItems: NavItem[] = [
-  { to: '/setup/workspace', icon: Briefcase, label: 'Workspace' },
-  { to: '/setup/providers', icon: Plug, label: 'Providers' },
-  { to: '/setup/channels', icon: MessageCircle, label: 'Channels' },
-  { to: '/setup/memory', icon: Database, label: 'Memory' },
-  { to: '/setup/hardware', icon: Cpu, label: 'Hardware' },
-  { to: '/setup/tunnel', icon: Globe, label: 'Tunnel' },
-];
+// The 6 onboarding sections (Workspace, Providers, Channels, Memory,
+// Hardware, Tunnel) live under /config now — they're the first group
+// inside the Config explorer's sidebar. The /setup/<section> deep-link
+// route still works for bookmarks, but no top-level nav entries point
+// at it. Run-setup-again link in /config covers the wizard re-entry.
 
 // Shared nav item sub-component — eliminates duplication between mobile & desktop nav
 function SidebarNavItem({ item, showLabel, showTooltip, onClick }: {
@@ -63,8 +48,8 @@ function SidebarNavItem({ item, showLabel, showTooltip, onClick }: {
   showTooltip: boolean;
   onClick: () => void;
 }) {
-  const { to, icon: Icon, labelKey, label } = item;
-  const text = labelKey ? t(labelKey) : (label ?? to);
+  const { to, icon: Icon, labelKey } = item;
+  const text = t(labelKey);
   return (
     <NavLink
       key={to}
@@ -105,26 +90,6 @@ function SidebarNavItem({ item, showLabel, showTooltip, onClick }: {
 // Group header label — only shown when the sidebar is expanded. In the
 // collapsed state we render a thin divider instead so the icons stay
 // aligned and the separator is still discoverable.
-function SidebarGroupLabel({ text, showLabel }: { text: string; showLabel: boolean }) {
-  if (!showLabel) {
-    return (
-      <div
-        className="h-px mx-2 my-2"
-        style={{ background: 'var(--pc-border)', opacity: 0.6 }}
-        aria-hidden
-      />
-    );
-  }
-  return (
-    <div
-      className="px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider"
-      style={{ color: 'var(--pc-text-faint)' }}
-    >
-      {text}
-    </div>
-  );
-}
-
 interface SidebarProps {
   open: boolean;
   onClose: () => void;
@@ -163,16 +128,6 @@ export default function Sidebar({ open, onClose, collapsed }: SidebarProps) {
               onClick={onClose}
             />
           ))}
-          <SidebarGroupLabel text="Setup" showLabel={!collapsed} />
-          {setupItems.map((item) => (
-            <SidebarNavItem
-              key={item.to}
-              item={item}
-              showLabel={!collapsed}
-              showTooltip={collapsed}
-              onClick={onClose}
-            />
-          ))}
         </nav>
         <SidebarFooter collapsed={collapsed} layout="desktop" />
       </aside>
@@ -189,16 +144,6 @@ export default function Sidebar({ open, onClose, collapsed }: SidebarProps) {
         <SidebarLogo collapsed={false} />
         <nav className="flex-1 overflow-y-auto py-4 px-3 space-y-1">
           {navItems.map((item) => (
-            <SidebarNavItem
-              key={item.to}
-              item={item}
-              showLabel
-              showTooltip={false}
-              onClick={onClose}
-            />
-          ))}
-          <SidebarGroupLabel text="Setup" showLabel />
-          {setupItems.map((item) => (
             <SidebarNavItem
               key={item.to}
               item={item}
@@ -259,7 +204,7 @@ function SidebarFooter({ collapsed, layout }: { collapsed: boolean; layout: 'des
         className="px-5 py-4 border-t text-[10px] uppercase tracking-wider"
         style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-faint)' }}
       >
-        ZeroClaw Runtime
+        ZeroClaw Gateway
       </div>
     );
   }
@@ -277,7 +222,7 @@ function SidebarFooter({ collapsed, layout }: { collapsed: boolean; layout: 'des
         textAlign: collapsed ? 'center' : 'left',
       }}
     >
-      {!collapsed && 'ZeroClaw Runtime'}
+      {!collapsed && 'ZeroClaw Gateway'}
     </div>
   );
 }
