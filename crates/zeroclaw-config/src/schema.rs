@@ -2,6 +2,7 @@ use crate::autonomy::AutonomyLevel;
 use crate::domain_matcher::DomainMatcher;
 use crate::provider_aliases::{is_glm_alias, is_zai_alias};
 use crate::traits::{ChannelConfig, HasPropKind, PropKind};
+use crate::validation_bail;
 use anyhow::{Context, Result};
 use directories::UserDirs;
 #[cfg(feature = "schema-export")]
@@ -4385,7 +4386,11 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
     for (i, server) in config.servers.iter().enumerate() {
         let name = server.name.trim();
         if name.is_empty() {
-            anyhow::bail!("mcp.servers[{i}].name must not be empty");
+            validation_bail!(
+                RequiredFieldEmpty,
+                format!("mcp.servers[{i}].name"),
+                "mcp.servers[{i}].name must not be empty"
+            );
         }
         if !seen_names.insert(name.to_ascii_lowercase()) {
             anyhow::bail!("mcp.servers contains duplicate name: {name}");
@@ -4393,7 +4398,11 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
 
         if let Some(timeout) = server.tool_timeout_secs {
             if timeout == 0 {
-                anyhow::bail!("mcp.servers[{i}].tool_timeout_secs must be greater than 0");
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("mcp.servers[{i}].tool_timeout_secs"),
+                    "mcp.servers[{i}].tool_timeout_secs must be greater than 0"
+                );
             }
             if timeout > MCP_MAX_TOOL_TIMEOUT_SECS {
                 anyhow::bail!(
@@ -7778,7 +7787,11 @@ impl MqttConfig {
 
         // Client ID validation
         if self.client_id.is_empty() {
-            anyhow::bail!("client_id must not be empty");
+            validation_bail!(
+                RequiredFieldEmpty,
+                "client_id",
+                "client_id must not be empty"
+            );
         }
 
         Ok(())
@@ -9108,7 +9121,11 @@ impl CloudOpsConfig {
             }
             for (i, cloud) in self.supported_clouds.iter().enumerate() {
                 if cloud.trim().is_empty() {
-                    anyhow::bail!("cloud_ops.supported_clouds[{i}] must not be empty");
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("cloud_ops.supported_clouds[{i}]"),
+                        "cloud_ops.supported_clouds[{i}] must not be empty"
+                    );
                 }
             }
             if !self.supported_clouds.contains(&self.default_cloud) {
@@ -10176,26 +10193,46 @@ impl Config {
             })?;
 
             if openvpn.config_file.trim().is_empty() {
-                anyhow::bail!("tunnel.openvpn.config_file must not be empty");
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    "tunnel.openvpn.config_file",
+                    "tunnel.openvpn.config_file must not be empty"
+                );
             }
             if openvpn.connect_timeout_secs == 0 {
-                anyhow::bail!("tunnel.openvpn.connect_timeout_secs must be greater than 0");
+                validation_bail!(
+                    InvalidNumericRange,
+                    "tunnel.openvpn.connect_timeout_secs",
+                    "tunnel.openvpn.connect_timeout_secs must be greater than 0"
+                );
             }
         }
 
         // Gateway
         if self.gateway.host.trim().is_empty() {
-            anyhow::bail!("gateway.host must not be empty");
+            validation_bail!(
+                RequiredFieldEmpty,
+                "gateway.host",
+                "gateway.host must not be empty"
+            );
         }
         if let Some(ref prefix) = self.gateway.path_prefix {
             // Validate the raw value — no silent trimming so the stored
             // value is exactly what was validated.
             if !prefix.is_empty() {
                 if !prefix.starts_with('/') {
-                    anyhow::bail!("gateway.path_prefix must start with '/'");
+                    validation_bail!(
+                        InvalidFormat,
+                        "gateway.path_prefix",
+                        "gateway.path_prefix must start with '/'"
+                    );
                 }
                 if prefix.ends_with('/') {
-                    anyhow::bail!("gateway.path_prefix must not end with '/' (including bare '/')");
+                    validation_bail!(
+                        InvalidFormat,
+                        "gateway.path_prefix",
+                        "gateway.path_prefix must not end with '/' (including bare '/')"
+                    );
                 }
                 // Reject characters unsafe for URL paths or HTML/JS injection.
                 // Whitespace is intentionally excluded from the allowed set.
@@ -10215,7 +10252,11 @@ impl Config {
 
         // Autonomy
         if self.autonomy.max_actions_per_hour == 0 {
-            anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
+            validation_bail!(
+                InvalidNumericRange,
+                "autonomy.max_actions_per_hour",
+                "autonomy.max_actions_per_hour must be greater than 0"
+            );
         }
         for (i, env_name) in self.autonomy.shell_env_passthrough.iter().enumerate() {
             if !is_valid_env_var_name(env_name) {
@@ -10227,13 +10268,25 @@ impl Config {
 
         // Security OTP / estop
         if self.security.otp.challenge_max_attempts == 0 {
-            anyhow::bail!("security.otp.challenge_max_attempts must be greater than 0");
+            validation_bail!(
+                InvalidNumericRange,
+                "security.otp.challenge_max_attempts",
+                "security.otp.challenge_max_attempts must be greater than 0"
+            );
         }
         if self.security.otp.token_ttl_secs == 0 {
-            anyhow::bail!("security.otp.token_ttl_secs must be greater than 0");
+            validation_bail!(
+                InvalidNumericRange,
+                "security.otp.token_ttl_secs",
+                "security.otp.token_ttl_secs must be greater than 0"
+            );
         }
         if self.security.otp.cache_valid_secs == 0 {
-            anyhow::bail!("security.otp.cache_valid_secs must be greater than 0");
+            validation_bail!(
+                InvalidNumericRange,
+                "security.otp.cache_valid_secs",
+                "security.otp.cache_valid_secs must be greater than 0"
+            );
         }
         if self.security.otp.cache_valid_secs < self.security.otp.token_ttl_secs {
             anyhow::bail!(
@@ -10241,12 +10294,20 @@ impl Config {
             );
         }
         if self.security.otp.challenge_max_attempts == 0 {
-            anyhow::bail!("security.otp.challenge_max_attempts must be greater than 0");
+            validation_bail!(
+                InvalidNumericRange,
+                "security.otp.challenge_max_attempts",
+                "security.otp.challenge_max_attempts must be greater than 0"
+            );
         }
         for (i, action) in self.security.otp.gated_actions.iter().enumerate() {
             let normalized = action.trim();
             if normalized.is_empty() {
-                anyhow::bail!("security.otp.gated_actions[{i}] must not be empty");
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("security.otp.gated_actions[{i}]"),
+                    "security.otp.gated_actions[{i}] must not be empty"
+                );
             }
             if !normalized
                 .chars()
@@ -10265,40 +10326,76 @@ impl Config {
             || "Invalid security.otp.gated_domains or security.otp.gated_domain_categories",
         )?;
         if self.security.estop.state_file.trim().is_empty() {
-            anyhow::bail!("security.estop.state_file must not be empty");
+            validation_bail!(
+                RequiredFieldEmpty,
+                "security.estop.state_file",
+                "security.estop.state_file must not be empty"
+            );
         }
 
         // Scheduler
         if self.scheduler.max_concurrent == 0 {
-            anyhow::bail!("scheduler.max_concurrent must be greater than 0");
+            validation_bail!(
+                InvalidNumericRange,
+                "scheduler.max_concurrent",
+                "scheduler.max_concurrent must be greater than 0"
+            );
         }
         if self.scheduler.max_tasks == 0 {
-            anyhow::bail!("scheduler.max_tasks must be greater than 0");
+            validation_bail!(
+                InvalidNumericRange,
+                "scheduler.max_tasks",
+                "scheduler.max_tasks must be greater than 0"
+            );
         }
 
         // Model routes
         for (i, route) in self.providers.model_routes.iter().enumerate() {
             if route.hint.trim().is_empty() {
-                anyhow::bail!("model_routes[{i}].hint must not be empty");
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("model_routes[{i}].hint"),
+                    "model_routes[{i}].hint must not be empty"
+                );
             }
             if route.provider.trim().is_empty() {
-                anyhow::bail!("model_routes[{i}].provider must not be empty");
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("model_routes[{i}].provider"),
+                    "model_routes[{i}].provider must not be empty"
+                );
             }
             if route.model.trim().is_empty() {
-                anyhow::bail!("model_routes[{i}].model must not be empty");
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("model_routes[{i}].model"),
+                    "model_routes[{i}].model must not be empty"
+                );
             }
         }
 
         // Embedding routes
         for (i, route) in self.providers.embedding_routes.iter().enumerate() {
             if route.hint.trim().is_empty() {
-                anyhow::bail!("embedding_routes[{i}].hint must not be empty");
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("embedding_routes[{i}].hint"),
+                    "embedding_routes[{i}].hint must not be empty"
+                );
             }
             if route.provider.trim().is_empty() {
-                anyhow::bail!("embedding_routes[{i}].provider must not be empty");
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("embedding_routes[{i}].provider"),
+                    "embedding_routes[{i}].provider must not be empty"
+                );
             }
             if route.model.trim().is_empty() {
-                anyhow::bail!("embedding_routes[{i}].model must not be empty");
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("embedding_routes[{i}].model"),
+                    "embedding_routes[{i}].model must not be empty"
+                );
             }
         }
 
@@ -10508,10 +10605,18 @@ impl Config {
         // Knowledge graph
         if self.knowledge.enabled {
             if self.knowledge.max_nodes == 0 {
-                anyhow::bail!("knowledge.max_nodes must be greater than 0");
+                validation_bail!(
+                    InvalidNumericRange,
+                    "knowledge.max_nodes",
+                    "knowledge.max_nodes must be greater than 0"
+                );
             }
             if self.knowledge.db_path.trim().is_empty() {
-                anyhow::bail!("knowledge.db_path must not be empty");
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    "knowledge.db_path",
+                    "knowledge.db_path must not be empty"
+                );
             }
         }
 
@@ -10520,7 +10625,11 @@ impl Config {
         for (i, service) in self.google_workspace.allowed_services.iter().enumerate() {
             let normalized = service.trim();
             if normalized.is_empty() {
-                anyhow::bail!("google_workspace.allowed_services[{i}] must not be empty");
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("google_workspace.allowed_services[{i}]"),
+                    "google_workspace.allowed_services[{i}] must not be empty"
+                );
             }
             if !normalized
                 .chars()
@@ -10558,7 +10667,11 @@ impl Config {
             let resource = operation.resource.trim();
 
             if service.is_empty() {
-                anyhow::bail!("google_workspace.allowed_operations[{i}].service must not be empty");
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("google_workspace.allowed_operations[{i}].service"),
+                    "google_workspace.allowed_operations[{i}].service must not be empty"
+                );
             }
             if resource.is_empty() {
                 anyhow::bail!(
@@ -10607,7 +10720,11 @@ impl Config {
             }
 
             if operation.methods.is_empty() {
-                anyhow::bail!("google_workspace.allowed_operations[{i}].methods must not be empty");
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("google_workspace.allowed_operations[{i}].methods"),
+                    "google_workspace.allowed_operations[{i}].methods must not be empty"
+                );
             }
 
             let mut seen_methods = std::collections::HashSet::new();
@@ -10677,19 +10794,39 @@ impl Config {
                 anyhow::bail!("notion.database_id must not be empty when notion.enabled = true");
             }
             if self.notion.poll_interval_secs == 0 {
-                anyhow::bail!("notion.poll_interval_secs must be greater than 0");
+                validation_bail!(
+                    InvalidNumericRange,
+                    "notion.poll_interval_secs",
+                    "notion.poll_interval_secs must be greater than 0"
+                );
             }
             if self.notion.max_concurrent == 0 {
-                anyhow::bail!("notion.max_concurrent must be greater than 0");
+                validation_bail!(
+                    InvalidNumericRange,
+                    "notion.max_concurrent",
+                    "notion.max_concurrent must be greater than 0"
+                );
             }
             if self.notion.status_property.trim().is_empty() {
-                anyhow::bail!("notion.status_property must not be empty");
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    "notion.status_property",
+                    "notion.status_property must not be empty"
+                );
             }
             if self.notion.input_property.trim().is_empty() {
-                anyhow::bail!("notion.input_property must not be empty");
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    "notion.input_property",
+                    "notion.input_property must not be empty"
+                );
             }
             if self.notion.result_property.trim().is_empty() {
-                anyhow::bail!("notion.result_property must not be empty");
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    "notion.result_property",
+                    "notion.result_property must not be empty"
+                );
             }
         }
 
@@ -10745,7 +10882,11 @@ impl Config {
         for (name, agent) in &self.agents {
             if let Some(timeout) = agent.timeout_secs {
                 if timeout == 0 {
-                    anyhow::bail!("agents.{name}.timeout_secs must be greater than 0");
+                    validation_bail!(
+                        InvalidNumericRange,
+                        format!("agents.{name}.timeout_secs"),
+                        "agents.{name}.timeout_secs must be greater than 0"
+                    );
                 }
                 if timeout > MAX_DELEGATE_TIMEOUT_SECS {
                     anyhow::bail!(
@@ -10755,7 +10896,11 @@ impl Config {
             }
             if let Some(timeout) = agent.agentic_timeout_secs {
                 if timeout == 0 {
-                    anyhow::bail!("agents.{name}.agentic_timeout_secs must be greater than 0");
+                    validation_bail!(
+                        InvalidNumericRange,
+                        format!("agents.{name}.agentic_timeout_secs"),
+                        "agents.{name}.agentic_timeout_secs must be greater than 0"
+                    );
                 }
                 if timeout > MAX_DELEGATE_TIMEOUT_SECS {
                     anyhow::bail!(
@@ -10780,10 +10925,18 @@ impl Config {
 
         // Delegate tool global defaults
         if self.delegate.timeout_secs == 0 {
-            anyhow::bail!("delegate.timeout_secs must be greater than 0");
+            validation_bail!(
+                InvalidNumericRange,
+                "delegate.timeout_secs",
+                "delegate.timeout_secs must be greater than 0"
+            );
         }
         if self.delegate.agentic_timeout_secs == 0 {
-            anyhow::bail!("delegate.agentic_timeout_secs must be greater than 0");
+            validation_bail!(
+                InvalidNumericRange,
+                "delegate.agentic_timeout_secs",
+                "delegate.agentic_timeout_secs must be greater than 0"
+            );
         }
 
         // Per-agent delegate timeout overrides
@@ -10791,12 +10944,20 @@ impl Config {
             if let Some(t) = agent.timeout_secs
                 && t == 0
             {
-                anyhow::bail!("agents.{name}.timeout_secs must be greater than 0");
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("agents.{name}.timeout_secs"),
+                    "agents.{name}.timeout_secs must be greater than 0"
+                );
             }
             if let Some(t) = agent.agentic_timeout_secs
                 && t == 0
             {
-                anyhow::bail!("agents.{name}.agentic_timeout_secs must be greater than 0");
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("agents.{name}.agentic_timeout_secs"),
+                    "agents.{name}.agentic_timeout_secs must be greater than 0"
+                );
             }
         }
 

@@ -45,6 +45,24 @@ pub enum ConfigApiCode {
     /// (e.g. an array passed where a scalar was expected, or a non-string
     /// element in a `Vec<String>`).
     ValueTypeMismatch,
+    /// A required scalar field was empty / missing / blank.
+    /// Path identifies which one (e.g. `gateway.host`,
+    /// `tunnel.openvpn.config_file`).
+    RequiredFieldEmpty,
+    /// A numeric field was out of its allowed range (zero, negative, or
+    /// above an upper bound). Path identifies which one.
+    InvalidNumericRange,
+    /// A string did not match its allowed format — invalid URL, bad
+    /// scheme, invalid path prefix, characters outside the allowed set.
+    InvalidFormat,
+    /// An enum / discriminator field carried a value not in the allowed
+    /// set (e.g. `tunnel.provider` with an unknown name).
+    InvalidEnumVariant,
+    /// A reference to another config entry pointed at something that
+    /// doesn't exist (e.g. `agents.<x>.delegate_to` naming a missing
+    /// agent). Distinct from `ProviderFallbackDangling` — that's the
+    /// specific case the dashboard surfaces for the providers section.
+    DanglingReference,
     /// Catch-all server failure not classified above. Avoid in code; log the
     /// original error and convert to a more specific code where possible.
     InternalError,
@@ -61,6 +79,11 @@ impl ConfigApiCode {
             Self::OpNotSupported => "op_not_supported",
             Self::SecretTestForbidden => "secret_test_forbidden",
             Self::ValueTypeMismatch => "value_type_mismatch",
+            Self::RequiredFieldEmpty => "required_field_empty",
+            Self::InvalidNumericRange => "invalid_numeric_range",
+            Self::InvalidFormat => "invalid_format",
+            Self::InvalidEnumVariant => "invalid_enum_variant",
+            Self::DanglingReference => "dangling_reference",
             Self::InternalError => "internal_error",
         }
     }
@@ -73,7 +96,12 @@ impl ConfigApiCode {
             | Self::ProviderFallbackDangling
             | Self::OpNotSupported
             | Self::SecretTestForbidden
-            | Self::ValueTypeMismatch => 400,
+            | Self::ValueTypeMismatch
+            | Self::RequiredFieldEmpty
+            | Self::InvalidNumericRange
+            | Self::InvalidFormat
+            | Self::InvalidEnumVariant
+            | Self::DanglingReference => 400,
             Self::ConfigChangedExternally => 409,
             Self::ReloadFailed | Self::InternalError => 500,
         }
@@ -125,11 +153,15 @@ impl ConfigApiError {
     /// known patterns from `Config::validate()`. Unrecognized text falls
     /// through to `ValidationFailed`.
     ///
-    /// This is the v1 escape hatch for the structured-error contract — true
-    /// per-bail-site coding is an incremental refactor of the 100+ existing
-    /// `anyhow::bail!(...)` sites in `Config::validate()`. Adding a new
-    /// matcher here is the safer step for now.
+    /// First tries to downcast — `Config::validate()` and friends now use
+    /// the `validation_bail!` macro to attach a structured `ConfigApiError`
+    /// directly to the anyhow chain. The classifier remains as the
+    /// fallback for any bail sites not yet converted, so the contract
+    /// degrades gracefully across the refactor.
     pub fn from_validation(err: anyhow::Error) -> Self {
+        if let Some(structured) = err.downcast_ref::<ConfigApiError>() {
+            return structured.clone();
+        }
         let msg = err.to_string();
         let code = classify_validation_message(&msg);
         Self::new(code, msg)
@@ -203,6 +235,36 @@ impl std::fmt::Display for ConfigApiError {
 }
 
 impl std::error::Error for ConfigApiError {}
+
+/// Per-bail-site shorthand for emitting a structured `ConfigApiError`
+/// inside a `validate()` chain that returns `anyhow::Result<()>`. Wraps
+/// the structured error as the anyhow source so
+/// `ConfigApiError::from_validation` downcasts to it without having to
+/// re-classify the message text. Pattern:
+///
+/// ```ignore
+/// validation_bail!(
+///     RequiredFieldEmpty,
+///     "gateway.host",
+///     "gateway.host must not be empty",
+/// );
+/// ```
+///
+/// Sites not yet converted still bail through `anyhow::bail!` — the
+/// classifier in `from_validation` covers them as fallback. Migration
+/// is incremental: each PR that touches a `validate()` site swaps the
+/// macro in.
+#[macro_export]
+macro_rules! validation_bail {
+    ($code:ident, $path:expr, $($msg:tt)*) => {{
+        let err = $crate::api_error::ConfigApiError::new(
+            $crate::api_error::ConfigApiCode::$code,
+            format!($($msg)*),
+        )
+        .with_path($path);
+        return Err(::anyhow::Error::from(err));
+    }};
+}
 
 #[cfg(test)]
 mod tests {
