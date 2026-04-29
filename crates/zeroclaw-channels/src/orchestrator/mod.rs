@@ -837,18 +837,44 @@ fn resolved_default_provider(config: &Config) -> String {
         .unwrap_or_else(|| "openrouter".to_string())
 }
 
-fn resolved_default_model(config: &Config) -> String {
-    config
+/// Three-step model resolution mirroring `agent::Agent::from_config` (#6099):
+/// (1) the fallback provider's `model`, (2) the first configured
+/// `[providers.models.*]` model with a WARN naming what to set,
+/// (3) hard fail with an actionable error. No silent vendor-default.
+fn resolved_default_model(config: &Config) -> Result<String> {
+    let provider_name = config.providers.fallback.as_deref().unwrap_or("openrouter");
+    if let Some(m) = config
         .providers
         .fallback_provider()
-        .and_then(|e| e.model.clone())
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4.6".to_string())
+        .and_then(|e| e.model.as_deref())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        return Ok(m.to_string());
+    }
+    if let Some(m) = config.providers.resolve_default_model() {
+        tracing::warn!(
+            provider = provider_name,
+            model = %m,
+            "fallback provider has no `model` set; using first configured \
+             providers.models entry as default. Set [providers.models.{provider_name}] \
+             model = \"...\" to silence this warning.",
+        );
+        return Ok(m);
+    }
+    anyhow::bail!(
+        "no model configured: providers.fallback = {:?} resolves with no model, \
+         and no [providers.models.*] entry has a `model` field set. \
+         Configure at least one [providers.models.<name>] model = \"...\" \
+         before starting channels.",
+        config.providers.fallback,
+    )
 }
 
-fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
-    ChannelRuntimeDefaults {
+fn runtime_defaults_from_config(config: &Config) -> Result<ChannelRuntimeDefaults> {
+    Ok(ChannelRuntimeDefaults {
         default_provider: resolved_default_provider(config),
-        model: resolved_default_model(config),
+        model: resolved_default_model(config)?,
         temperature: config
             .providers
             .fallback_provider()
@@ -863,7 +889,7 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
             .fallback_provider()
             .and_then(|e| e.base_url.clone()),
         reliability: config.reliability.clone(),
-    }
+    })
 }
 
 fn runtime_config_path(ctx: &ChannelRuntimeContext) -> Option<PathBuf> {
@@ -962,7 +988,7 @@ async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRu
     }
 
     parsed.apply_env_overrides();
-    Ok(runtime_defaults_from_config(&parsed))
+    runtime_defaults_from_config(&parsed)
 }
 
 async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Result<()> {
@@ -5256,7 +5282,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         store.insert(
             config.config_path.clone(),
             RuntimeConfigState {
-                defaults: runtime_defaults_from_config(&config),
+                defaults: runtime_defaults_from_config(&config)?,
                 last_applied_stamp: initial_stamp,
             },
         );
@@ -5270,7 +5296,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.autonomy,
         &config.workspace_dir,
     ));
-    let model = resolved_default_model(&config);
+    let model = resolved_default_model(&config)?;
     let temperature = config
         .providers
         .fallback_provider()
