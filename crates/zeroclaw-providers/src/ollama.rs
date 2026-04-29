@@ -47,6 +47,13 @@ pub struct OllamaTuning {
     /// of the per-call argument — this is the wire knob behind the
     /// `ollama_temperature_override` config field. When `None`, the
     /// per-call temperature wins (full backward compatibility).
+    //
+    // Note: `Option<f64>` here, vs `Option<u32>`/`Option<i32>` on the
+    // runtime-override constructor's first two args, because temperature
+    // has fall-through semantics (None means "let the per-call temp win"),
+    // whereas num_ctx/num_predict unset just falls back to framework
+    // constants — there is no meaningful "let the call decide" mode for
+    // those two.
     pub temperature_override: Option<f64>,
 }
 
@@ -1174,6 +1181,51 @@ mod tests {
         let json = serde_json::to_value(request).unwrap();
         let options = json.get("options").expect("options present");
         assert_eq!(options.get("temperature"), Some(&serde_json::json!(0.2)));
+        assert_eq!(options.get("num_ctx"), Some(&serde_json::json!(8192)));
+        assert_eq!(options.get("num_predict"), Some(&serde_json::json!(2048)));
+    }
+
+    #[test]
+    fn build_chat_request_with_think_emits_explicit_options() {
+        // Wire-shape snapshot: the JSON body of every Ollama /api/chat
+        // request MUST carry an `options` object with all three keys
+        // (`temperature`, `num_ctx`, `num_predict`) populated. Older
+        // tests cover individual fields piecemeal; this one locks the
+        // full shape so a future refactor can't silently drop a field.
+        let provider = OllamaProvider::new(None, None);
+        let request = provider.build_chat_request_with_think(
+            vec![Message {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            }],
+            "llama3",
+            0.3,
+            None,
+            Some(true),
+        );
+
+        let json = serde_json::to_value(request).unwrap();
+        let options = json
+            .get("options")
+            .expect("options object missing from request body");
+
+        assert!(
+            options.get("temperature").is_some(),
+            "options.temperature must be present on every wire request"
+        );
+        assert!(
+            options.get("num_ctx").is_some(),
+            "options.num_ctx must be present on every wire request"
+        );
+        assert!(
+            options.get("num_predict").is_some(),
+            "options.num_predict must be present on every wire request"
+        );
+
+        assert_eq!(options.get("temperature"), Some(&serde_json::json!(0.3)));
         assert_eq!(options.get("num_ctx"), Some(&serde_json::json!(8192)));
         assert_eq!(options.get("num_predict"), Some(&serde_json::json!(2048)));
     }
