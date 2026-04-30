@@ -727,12 +727,24 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             // lookup and JSON-serialize the field directly, so the dashboard
             // gets `value: [{"name":"fs",...}]` instead of `value: "[{name=...}]"`
             // (TOML inline syntax) that the per-row editor would have to parse.
+            //
+            // Empty Vec is rendered as `<unset>` to match how Option<T> empty
+            // values are surfaced — empty object-arrays carry no user signal
+            // and round-trip back to `<unset>` after a save anyway because
+            // `#[serde(skip_serializing_if = "Vec::is_empty")]` strips them
+            // from the on-disk TOML. Without this, the
+            // `every_prop_is_gettable_and_settable` round-trip test sees
+            // `set '[]' / get '<unset>'` and fails.
             prop_field_entries.push(quote! {
                 crate::config::PropFieldInfo {
                     name: #full_name_lit.to_string(),
                     category: #category_lit,
-                    display_value: serde_json::to_string(&self.#field_ident)
-                        .unwrap_or_else(|_| "[]".to_string()),
+                    display_value: if self.#field_ident.is_empty() {
+                        "<unset>".to_string()
+                    } else {
+                        serde_json::to_string(&self.#field_ident)
+                            .unwrap_or_else(|_| "[]".to_string())
+                    },
                     type_hint: #type_hint_lit,
                     kind: #kind_token,
                     is_secret: #is_secret,
