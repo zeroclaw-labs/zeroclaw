@@ -11,6 +11,9 @@ use anyhow::Result;
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::traits::{Answer, OnboardUi, PropKind, SelectItem};
 
+use crate::agent::personality::EDITABLE_PERSONALITY_FILES;
+use crate::agent::personality_templates::{TemplateContext, render as render_personality};
+
 /// Internal prompt / section navigation signal. `Done` = advance. `Back` =
 /// the user pressed Esc; rewind one step. Helpers propagate it up through
 /// `prompt_field` → `prompt_fields_under` → section fn → `run_all`.
@@ -43,6 +46,7 @@ pub enum Section {
     Memory,
     Hardware,
     Tunnel,
+    Personality,
 }
 
 impl Section {
@@ -58,6 +62,7 @@ impl Section {
             Self::Memory => Some("memory"),
             Self::Hardware => Some("hardware"),
             Self::Tunnel => Some("tunnel"),
+            Self::Personality => Some("personality"),
         }
     }
 
@@ -77,6 +82,7 @@ impl Section {
             "memory" => Some(Self::Memory),
             "hardware" => Some(Self::Hardware),
             "tunnel" => Some(Self::Tunnel),
+            "personality" => Some(Self::Personality),
             _ => None,
         }
     }
@@ -130,6 +136,10 @@ pub async fn run(
             let _ = tunnel(cfg, ui, flags).await?;
             Ok(())
         }
+        Section::Personality => {
+            let _ = personality(cfg, ui, flags).await?;
+            Ok(())
+        }
     }
 }
 
@@ -147,6 +157,10 @@ async fn run_all(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Res
             3 => memory(cfg, ui, flags).await?,
             4 => hardware(cfg, ui, flags).await?,
             5 => tunnel(cfg, ui, flags).await?,
+            // Personality lives at the end so the user has answered the
+            // structural questions (workspace, providers, memory, …)
+            // before authoring the markdown files that reference them.
+            6 => personality(cfg, ui, flags).await?,
             _ => return Ok(()),
         };
         match nav {
@@ -472,6 +486,12 @@ fn section_has_signal(cfg: &Config, section_key: &str) -> bool {
                 .is_some_and(|rest| rest.contains('.'))
         }),
         "hardware" => cfg.hardware.enabled,
+        // Personality has no config-schema fields. The signal is whether
+        // the user has authored any of the editable markdown files in
+        // their workspace.
+        "personality" => EDITABLE_PERSONALITY_FILES
+            .iter()
+            .any(|f| cfg.workspace_dir.join(f).is_file()),
         // Memory's default backend is "sqlite" and Tunnel's is "none" — both
         // are valid user choices indistinguishable from untouched defaults.
         // Marker-only for these two.
@@ -1056,6 +1076,86 @@ async fn tunnel(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Resu
         }
     }
     mark_completed(cfg, "tunnel").await?;
+    Ok(Nav::Done)
+}
+
+/// Personality — open `$EDITOR` on each markdown file the runtime
+/// injects into the system prompt at request time. Files default to
+/// the bundled starter template when they don't yet exist on disk;
+/// the user is free to overwrite or skip per file. Lives at the end
+/// of the flow on purpose: the structural sections (workspace,
+/// providers, memory, …) are answered first so the personality files
+/// can reference whatever was just configured.
+async fn personality(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> Result<Nav> {
+    ui.heading(1, "Personality");
+    match skip_if_configured(
+        cfg,
+        ui,
+        flags,
+        "personality",
+        "Personality",
+        section_has_signal(cfg, "personality"),
+    )
+    .await?
+    {
+        SkipNav::Skip => return Ok(Nav::Done),
+        SkipNav::Back => return Ok(Nav::Back),
+        SkipNav::Enter => {}
+    }
+
+    let template_ctx = TemplateContext {
+        include_memory: cfg.memory.backend.as_str() != "none",
+        ..TemplateContext::default()
+    };
+    let workspace_dir = cfg.workspace_dir.clone();
+
+    loop {
+        // Build the picker fresh on every iteration so badges reflect
+        // the on-disk state after each edit.
+        let mut items: Vec<SelectItem> = EDITABLE_PERSONALITY_FILES
+            .iter()
+            .map(|filename| {
+                let exists = workspace_dir.join(filename).is_file();
+                SelectItem::with_badge(
+                    (*filename).to_string(),
+                    if exists { "saved" } else { "not yet" },
+                )
+            })
+            .collect();
+        items.push(SelectItem::new("Done — finish personality"));
+
+        match ui
+            .select(
+                "Pick a personality file to edit (or Done to advance)",
+                &items,
+                None,
+            )
+            .await?
+        {
+            Answer::Back => return Ok(Nav::Back),
+            Answer::Value(idx) if idx == EDITABLE_PERSONALITY_FILES.len() => break,
+            Answer::Value(idx) => {
+                let filename = EDITABLE_PERSONALITY_FILES[idx];
+                let path = workspace_dir.join(filename);
+                let initial = if path.is_file() {
+                    std::fs::read_to_string(&path).unwrap_or_default()
+                } else {
+                    render_personality(filename, &template_ctx).unwrap_or_default()
+                };
+                match ui.editor(&format!("Editing {filename}"), &initial).await? {
+                    Answer::Back => continue,
+                    Answer::Value(content) => {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::write(&path, content)?;
+                    }
+                }
+            }
+        }
+    }
+
+    mark_completed(cfg, "personality").await?;
     Ok(Nav::Done)
 }
 

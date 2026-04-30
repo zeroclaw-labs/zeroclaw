@@ -54,12 +54,16 @@ const COMPLETED_SECTIONS_PATH = 'onboard_state.completed-sections';
 // `/onboard` stays a focused setup-completion flow.
 const ONBOARD_SECTION_ORDER = [
   'workspace',
-  'personality',
   'providers',
   'channels',
   'memory',
   'hardware',
   'tunnel',
+  // Personality is intentionally last — the structural sections above
+  // (workspace, providers, memory, …) are answered first so the markdown
+  // files the user authors here can reference whatever was just
+  // configured. Mirrors the CLI/TUI run_all() loop.
+  'personality',
 ] as const;
 
 // Sections handled by a dedicated component instead of the schema-driven
