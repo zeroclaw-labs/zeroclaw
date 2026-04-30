@@ -11,6 +11,8 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
+use crate::file::download_image_as_base64;
+
 const WUKONGIM_RPC_VERSION: &str = "2.0";
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
@@ -18,6 +20,8 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 pub struct WkMessageType;
 impl WkMessageType {
     pub const TEXT: u32 = 1;
+    pub const IMAGE: u32 = 2;
+    pub const MARKDOWN: u32 = 14;
     pub const INTERACTIVE_CARD: u32 = 20;
     pub const INTERACTIVE_RESPONSE: u32 = 21;
     pub const CMD: u32 = 99;
@@ -651,15 +655,78 @@ impl Channel for WuKongIMChannel {
                             // Only send ACK after all checks pass (message will be processed)
                             let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
 
-                            // Extract text content
-                            let content = if let Some(c) =
-                                payload_json.get("content").and_then(|c| c.as_str())
-                            {
-                                c.to_string()
-                            } else if let Some(s) = payload_json.as_str() {
-                                s.to_string()
-                            } else {
-                                String::new()
+                            // Extract content based on message type
+                            // type 1 = text, type 2 = image, type 5 = file
+                            let content = match msg_type {
+                                2 => {
+                                    // Image: extract URL and download
+                                    let url = payload_json.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                                    tracing::info!(
+                                        "WuKongIM: received IMAGE from {} (channel: {}:{}): url={}",
+                                        params.from_uid,
+                                        params.channel_type,
+                                        params.channel_id,
+                                        url
+                                    );
+                                    // Try to download the image and return as [IMAGE:...] marker
+                                    if let Some(marker) = self.download_image_as_marker(url).await {
+                                        marker
+                                    } else {
+                                        tracing::warn!(
+                                            "WuKongIM: failed to download image from {}, falling back to text",
+                                            url
+                                        );
+                                        format!("[图片下载失败]{}\n请直接描述图片内容", url)
+                                    }
+                                }
+                                5 => {
+                                    // File: extract URL and name
+                                    let url = payload_json.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                                    let name = payload_json.get("name").and_then(|n| n.as_str()).unwrap_or("文件");
+                                    tracing::info!(
+                                        "WuKongIM: received FILE from {} (channel: {}:{}): name={}, url={}",
+                                        params.from_uid,
+                                        params.channel_type,
+                                        params.channel_id,
+                                        name,
+                                        url
+                                    );
+                                    format!("[文件]{}: {}", name, url)
+                                }
+                                14 => {
+                                    // Markdown: extract text and process inline images
+                                    let inner = payload_json.get("content");
+                                    let text = inner.and_then(|c| c.get("text")).and_then(|t| t.as_str()).unwrap_or("");
+                                    let inner_type = inner.and_then(|c| c.get("type")).and_then(|t| t.as_str()).unwrap_or("");
+                                    tracing::info!(
+                                        "WuKongIM: received MARKDOWN from {} (channel: {}:{}): inner_type={}, text_len={}",
+                                        params.from_uid,
+                                        params.channel_type,
+                                        params.channel_id,
+                                        inner_type,
+                                        text.len()
+                                    );
+                                    // Process markdown: download inline images and replace with base64
+                                    self.process_markdown_with_images(text).await
+                                }
+                                _ => {
+                                    // Text or other: extract from content field
+                                    if let Some(c) = payload_json.get("content").and_then(|c| c.as_str()) {
+                                        c.to_string()
+                                    } else if let Some(s) = payload_json.as_str() {
+                                        s.to_string()
+                                    } else {
+                                        tracing::warn!(
+                                            "WuKongIM: received UNKNOWN type {} from {} (channel: {}:{}): {:?}",
+                                            msg_type,
+                                            params.from_uid,
+                                            params.channel_type,
+                                            params.channel_id,
+                                            payload_json
+                                        );
+                                        String::new()
+                                    }
+                                }
                             };
                             tracing::info!(
                                 "WuKongIM: received message from {} (channel: {}:{}): {}",
@@ -797,5 +864,61 @@ mod tests {
         assert_eq!(action.msg_type, WkMessageType::INTERACTIVE_RESPONSE);
         assert_eq!(action.approval_id, "id123");
         assert_eq!(action.action, "approve");
+    }
+}
+
+// Helper methods for WuKongIMChannel
+impl WuKongIMChannel {
+    /// Download image from URL and return as `[IMAGE:...]` marker.
+    async fn download_image_as_marker(&self, url: &str) -> Option<String> {
+        download_image_as_base64(url).await
+    }
+
+    /// Process markdown text, downloading inline images and replacing them with base64 markers.
+    /// Markdown image syntax: ![alt](url)
+    async fn process_markdown_with_images(&self, text: &str) -> String {
+        let mut result = text.to_string();
+
+        // Find all markdown image patterns: ![...](...)
+        // We need to handle multiple images in the text
+        for (alt_text, url) in Self::extract_markdown_images(text) {
+            if let Some(base64_marker) = download_image_as_base64(&url).await {
+                // Replace the markdown image with base64 version
+                // Format: ![alt](url) -> ![alt](data:mime;base64,...)
+                let pattern = format!("![{}]({})", alt_text, url);
+                // For LLM processing, we keep the markdown format but use base64 data URL
+                let replacement = format!("![{}]({})", alt_text, base64_marker);
+                result = result.replace(&pattern, &replacement);
+            }
+        }
+
+        result
+    }
+
+    /// Extract all markdown image URLs from text.
+    /// Returns iterator of (alt_text, url) pairs.
+    fn extract_markdown_images(text: &str) -> Vec<(String, String)> {
+        let mut images = Vec::new();
+        let mut rest = text;
+
+        while let Some(start) = rest.find("![") {
+            let after_bracket = &rest[start + 2..];
+            if let Some(close_bracket) = after_bracket.find(']') {
+                let alt = after_bracket[..close_bracket].to_string();
+                let after_close = &after_bracket[close_bracket + 1..];
+                if let Some(paren_start) = after_close.strip_prefix('(') {
+                    if let Some(paren_end) = paren_start.find(')') {
+                        let url = paren_start[..paren_end].to_string();
+                        images.push((alt, url));
+                        rest = &after_close[paren_end + 1..];
+                        continue;
+                    }
+                }
+            }
+            // No more images, break
+            break;
+        }
+
+        images
     }
 }
