@@ -1,8 +1,8 @@
 //! Channel implementations and orchestration for messaging platform integrations.
 
+pub mod file;
 pub mod orchestrator;
 pub mod util;
-pub mod file;
 
 // Always-compiled channels and utilities (no feature gate)
 pub mod cli;

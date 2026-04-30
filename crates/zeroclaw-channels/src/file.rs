@@ -66,7 +66,11 @@ pub async fn download_image_as_base64(url: &str) -> Option<String> {
     let resp = match client.get(url).send().await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("download_image_as_base64: request failed: url={}, err={}", url, e);
+            tracing::warn!(
+                "download_image_as_base64: request failed: url={}, err={}",
+                url,
+                e
+            );
             return None;
         }
     };
@@ -77,15 +81,21 @@ pub async fn download_image_as_base64(url: &str) -> Option<String> {
         let body_snippet = body_snippet.chars().take(256).collect::<String>();
         tracing::warn!(
             "download_image_as_base64: HTTP error: url={}, status={}, body={}",
-            url, status, body_snippet
+            url,
+            status,
+            body_snippet
         );
         return None;
     }
 
-    if let Some(cl) = resp.content_length() && cl > IMAGE_MAX_BYTES as u64 {
+    if let Some(cl) = resp.content_length()
+        && cl > IMAGE_MAX_BYTES as u64
+    {
         tracing::warn!(
             "download_image_as_base64: image too large: url={}, size={} bytes, limit={}",
-            url, cl, IMAGE_MAX_BYTES
+            url,
+            cl,
+            IMAGE_MAX_BYTES
         );
         return None;
     }
@@ -99,7 +109,11 @@ pub async fn download_image_as_base64(url: &str) -> Option<String> {
     let bytes = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!("download_image_as_base64: body read failed: url={}, err={}", url, e);
+            tracing::warn!(
+                "download_image_as_base64: body read failed: url={}, err={}",
+                url,
+                e
+            );
             return None;
         }
     };
@@ -107,7 +121,8 @@ pub async fn download_image_as_base64(url: &str) -> Option<String> {
     if bytes.is_empty() || bytes.len() > IMAGE_MAX_BYTES {
         tracing::warn!(
             "download_image_as_base64: body empty or too large: url={}, size={} bytes",
-            url, bytes.len()
+            url,
+            bytes.len()
         );
         return None;
     }
@@ -115,7 +130,11 @@ pub async fn download_image_as_base64(url: &str) -> Option<String> {
     let mime = match detect_image_mime(content_type.as_deref(), &bytes) {
         Some(m) => m,
         None => {
-            tracing::warn!("download_image_as_base64: unsupported image MIME for url={}: {:?}", url, content_type);
+            tracing::warn!(
+                "download_image_as_base64: unsupported image MIME for url={}: {:?}",
+                url,
+                content_type
+            );
             return None;
         }
     };
@@ -123,7 +142,8 @@ pub async fn download_image_as_base64(url: &str) -> Option<String> {
     if !SUPPORTED_IMAGE_MIMES.contains(&mime.as_str()) {
         tracing::warn!(
             "download_image_as_base64: unsupported MIME type: url={}, mime={}",
-            url, mime
+            url,
+            mime
         );
         return None;
     }
