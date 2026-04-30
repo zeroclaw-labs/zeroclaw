@@ -160,7 +160,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(on.contains("Daily notes"), "memory-on AGENTS.md must mention daily notes");
+        assert!(
+            on.contains("Daily notes"),
+            "memory-on AGENTS.md must mention daily notes"
+        );
         assert!(
             off.contains("memory.backend = \"none\""),
             "memory-off AGENTS.md must mention disabled memory"
