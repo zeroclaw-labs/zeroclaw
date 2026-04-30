@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde_json::json;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::autonomy::AutonomyLevel;
@@ -93,6 +94,64 @@ impl GitOperationsTool {
             _ => self.workspace_dir.clone(),
         };
         Ok(base)
+    }
+
+    fn candidate_path(&self, raw_path: &str) -> anyhow::Result<PathBuf> {
+        if raw_path.contains('\0') {
+            anyhow::bail!("Path not allowed: contains null byte");
+        }
+        if Path::new(raw_path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            anyhow::bail!("Path not allowed: parent-directory traversal is not allowed");
+        }
+
+        let raw = Path::new(raw_path);
+        Ok(if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            self.workspace_dir.join(raw)
+        })
+    }
+
+    fn ensure_worktree_add_target_allowed(&self, raw_path: &str) -> anyhow::Result<PathBuf> {
+        let candidate = self.candidate_path(raw_path)?;
+        let parent = candidate
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Worktree path must have a parent directory"))?;
+        let file_name = candidate
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("Worktree path must include a final path component"))?;
+        let resolved_parent = parent.canonicalize().map_err(|e| {
+            anyhow::anyhow!("Cannot resolve worktree parent '{}': {e}", parent.display())
+        })?;
+        let resolved_target = resolved_parent.join(file_name);
+
+        if !self.security.is_resolved_path_allowed(&resolved_target) {
+            anyhow::bail!(
+                "Worktree path '{}' resolves outside the workspace or allowed roots",
+                raw_path
+            );
+        }
+
+        Ok(resolved_target)
+    }
+
+    fn ensure_worktree_remove_target_allowed(&self, raw_path: &str) -> anyhow::Result<PathBuf> {
+        let candidate = self.candidate_path(raw_path)?;
+        let resolved = candidate
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("Cannot resolve worktree path '{}': {e}", raw_path))?;
+
+        if !self.security.is_resolved_path_allowed(&resolved) {
+            anyhow::bail!(
+                "Worktree path '{}' resolves outside the workspace or allowed roots",
+                raw_path
+            );
+        }
+
+        Ok(resolved)
     }
 
     async fn run_git_command(
@@ -586,6 +645,10 @@ impl GitOperationsTool {
                     None => anyhow::bail!("Missing 'worktree_path' parameter for worktree add"),
                 };
                 self.sanitize_git_args(worktree_path)?;
+                let worktree_path = self.ensure_worktree_add_target_allowed(worktree_path)?;
+                let worktree_path = worktree_path.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("Worktree path must be valid UTF-8 for git execution")
+                })?;
 
                 let branch = args
                     .get("branch")
@@ -611,6 +674,10 @@ impl GitOperationsTool {
                     None => anyhow::bail!("Missing 'worktree_path' parameter for worktree remove"),
                 };
                 self.sanitize_git_args(worktree_path)?;
+                let worktree_path = self.ensure_worktree_remove_target_allowed(worktree_path)?;
+                let worktree_path = worktree_path.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("Worktree path must be valid UTF-8 for git execution")
+                })?;
 
                 self.run_git_command(&["worktree", "remove", worktree_path], working_dir)
                     .await?;
@@ -674,7 +741,7 @@ impl Tool for GitOperationsTool {
                 },
                 "worktree_path": {
                     "type": "string",
-                    "description": "Filesystem path for the worktree (for 'worktree add' and 'worktree remove' subcommands). May be outside the workspace directory."
+                    "description": "Filesystem path for the worktree (for 'worktree add' and 'worktree remove' subcommands). Relative paths resolve under the workspace; absolute paths must stay inside the workspace or configured allowed roots."
                 },
                 "files": {
                     "type": "string",
@@ -814,6 +881,20 @@ mod tests {
     fn test_tool(dir: &std::path::Path) -> GitOperationsTool {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
+            workspace_dir: dir.to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        GitOperationsTool::new(security, dir.to_path_buf())
+    }
+
+    fn test_tool_with_allowed_root(
+        dir: &std::path::Path,
+        allowed_root: std::path::PathBuf,
+    ) -> GitOperationsTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: dir.to_path_buf(),
+            allowed_roots: vec![allowed_root],
             ..SecurityPolicy::default()
         });
         GitOperationsTool::new(security, dir.to_path_buf())
@@ -876,6 +957,58 @@ mod tests {
         assert!(tool.sanitize_git_args("--cached").is_ok());
         // Other safe flags starting with -c prefix
         assert!(tool.sanitize_git_args("-cached").is_ok());
+    }
+
+    #[test]
+    fn worktree_add_target_must_stay_inside_workspace_or_allowed_root() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let tool = test_tool(workspace.path());
+
+        assert!(
+            tool.ensure_worktree_add_target_allowed("new-worktree")
+                .is_ok()
+        );
+        assert!(
+            tool.ensure_worktree_add_target_allowed(
+                outside.path().join("new-worktree").to_str().unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn worktree_add_target_allows_configured_allowed_root() {
+        let workspace = TempDir::new().unwrap();
+        let allowed = TempDir::new().unwrap();
+        let tool = test_tool_with_allowed_root(workspace.path(), allowed.path().to_path_buf());
+
+        assert!(
+            tool.ensure_worktree_add_target_allowed(
+                allowed.path().join("new-worktree").to_str().unwrap()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn worktree_remove_target_must_stay_inside_workspace() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::create_dir(workspace.path().join("old-worktree")).unwrap();
+        std::fs::create_dir(outside.path().join("old-worktree")).unwrap();
+        let tool = test_tool(workspace.path());
+
+        assert!(
+            tool.ensure_worktree_remove_target_allowed("old-worktree")
+                .is_ok()
+        );
+        assert!(
+            tool.ensure_worktree_remove_target_allowed(
+                outside.path().join("old-worktree").to_str().unwrap()
+            )
+            .is_err()
+        );
     }
 
     #[test]

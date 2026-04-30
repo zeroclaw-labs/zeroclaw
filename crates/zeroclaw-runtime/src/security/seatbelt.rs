@@ -128,6 +128,22 @@ impl Sandbox for SeatbeltSandbox {
     }
 }
 
+fn seatbelt_string_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str(r"\\"),
+            '"' => escaped.push_str(r#"\""#),
+            '\n' => escaped.push_str(r"\n"),
+            '\r' => escaped.push_str(r"\r"),
+            '\t' => escaped.push_str(r"\t"),
+            c if c.is_control() => escaped.push('?'),
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
 /// Generate a Seatbelt `.sb` policy with restrictive defaults.
 ///
 /// The policy:
@@ -137,7 +153,7 @@ impl Sandbox for SeatbeltSandbox {
 /// - Allows reads to system paths required for process execution
 /// - Restricts process spawning to essential operations
 fn generate_policy(workspace: &Path) -> String {
-    let workspace_str = workspace.to_string_lossy();
+    let workspace_str = seatbelt_string_literal(&workspace.to_string_lossy());
     format!(
         r#"(version 1)
 
@@ -250,6 +266,15 @@ mod tests {
         let workspace = PathBuf::from("/Users/test/project");
         let policy = generate_policy(&workspace);
         assert!(policy.contains("/Users/test/project"));
+    }
+
+    #[test]
+    fn generate_policy_escapes_workspace_path_string_literal() {
+        let workspace = PathBuf::from("/tmp/zc\"quote\\slash\nnewline");
+        let policy = generate_policy(&workspace);
+
+        assert!(policy.contains(r#"(subpath "/tmp/zc\"quote\\slash\nnewline")"#));
+        assert!(!policy.contains("zc\"quote\\slash\nnewline"));
     }
 
     #[test]

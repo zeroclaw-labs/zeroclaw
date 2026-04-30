@@ -119,6 +119,20 @@ pub struct RpcOutbound {
     next_id: AtomicU64,
 }
 
+struct PendingRequestGuard<'a> {
+    pending: &'a std::sync::Mutex<HashMap<String, PendingResponder>>,
+    id: String,
+}
+
+impl Drop for PendingRequestGuard<'_> {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
 impl RpcOutbound {
     fn new(writer_tx: mpsc::Sender<String>) -> Self {
         Self {
@@ -155,6 +169,10 @@ impl RpcOutbound {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             pending.insert(id.clone(), tx);
         }
+        let _pending_guard = PendingRequestGuard {
+            pending: &self.pending,
+            id: id.clone(),
+        };
         let req = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -164,10 +182,6 @@ impl RpcOutbound {
         let body = match serde_json::to_string(&req) {
             Ok(s) => s,
             Err(e) => {
-                self.pending
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&id);
                 return Err(JsonRpcError {
                     code: INTERNAL_ERROR,
                     message: format!("Failed to encode request: {e}"),
@@ -176,10 +190,6 @@ impl RpcOutbound {
             }
         };
         if self.writer_tx.send(body).await.is_err() {
-            self.pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
             return Err(JsonRpcError {
                 code: INTERNAL_ERROR,
                 message: "ACP writer task closed".to_string(),
@@ -238,6 +248,10 @@ impl RpcOutbound {
         error: Option<JsonRpcError>,
     ) {
         self.dispatch_response(id_str, result, error);
+    }
+
+    pub fn pending_count_for_test(&self) -> usize {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -1028,6 +1042,22 @@ mod tests {
         assert!(parsed.get("result").is_some());
         assert!(parsed.get("error").is_none());
         assert_eq!(parsed["id"], 1);
+    }
+
+    #[tokio::test]
+    async fn rpc_request_timeout_drop_removes_pending_responder() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = RpcOutbound::for_testing(tx);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(10),
+            rpc.request("session/request_permission", serde_json::json!({})),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(rx.recv().await.is_some());
+        assert_eq!(rpc.pending_count_for_test(), 0);
     }
 
     #[test]
