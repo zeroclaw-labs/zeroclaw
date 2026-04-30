@@ -1541,6 +1541,47 @@ pub struct AgentConfig {
     /// behavior). Default: `2`.
     #[serde(default = "default_keep_tool_context_turns")]
     pub keep_tool_context_turns: usize,
+
+    /// HMAC tool receipt configuration for detecting LLM-fabricated tool calls.
+    #[nested]
+    #[serde(default)]
+    pub tool_receipts: ToolReceiptsConfig,
+}
+
+/// Configuration for HMAC-SHA256 tool execution receipts.
+/// When enabled, every tool invocation produces a cryptographic receipt that
+/// proves the tool actually ran. The LLM cannot forge valid receipts because
+/// it doesn't know the ephemeral session key.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent.tool_receipts"]
+pub struct ToolReceiptsConfig {
+    /// Enable HMAC-SHA256 receipt generation for tool calls. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Append a trailing "Tool receipts:" block to user-visible replies. Default: `false`.
+    #[serde(default)]
+    pub show_in_response: bool,
+
+    /// Add an instruction to the system prompt telling the model to echo receipts verbatim.
+    /// Default: `true`.
+    #[serde(default = "default_tool_receipts_inject_prompt")]
+    pub inject_system_prompt: bool,
+}
+
+fn default_tool_receipts_inject_prompt() -> bool {
+    true
+}
+
+impl Default for ToolReceiptsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            show_in_response: false,
+            inject_system_prompt: default_tool_receipts_inject_prompt(),
+        }
+    }
 }
 
 fn default_max_tool_result_chars() -> usize {
@@ -1591,6 +1632,7 @@ impl Default for AgentConfig {
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
+            tool_receipts: ToolReceiptsConfig::default(),
         }
     }
 }

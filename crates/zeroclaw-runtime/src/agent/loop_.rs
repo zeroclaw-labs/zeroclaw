@@ -2461,6 +2461,18 @@ pub async fn run(
         system_prompt.push_str(&deferred_section);
     }
 
+    // Inject tool receipt instruction when enabled.
+    if config.agent.tool_receipts.inject_system_prompt {
+        system_prompt.push_str(
+            "\n\n## Tool Execution Receipts\n\
+            \n\
+            Every tool result includes a `[receipt: ...]` field. This is a cryptographic signature \
+            proving the tool actually executed. You must include the receipt verbatim when referencing \
+            tool results. Do not modify, omit, or fabricate receipts. A missing or invalid receipt \
+            indicates a fabricated tool call.\n",
+        );
+    }
+
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = if interactive {
         Some(ApprovalManager::from_config(&config.autonomy))
@@ -2483,6 +2495,14 @@ pub async fn run(
             .map(|tracker| {
                 ToolLoopCostTrackingContext::new(tracker, Arc::new(config.cost.prices.clone()))
             });
+
+    // ── Tool receipts (HMAC proofs for tool executions) ──────────
+    let receipt_generator = if config.agent.tool_receipts.enabled {
+        Some(super::tool_receipts::ReceiptGenerator::new())
+    } else {
+        None
+    };
+    let collected_receipts = std::sync::Mutex::new(Vec::<String>::new());
 
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
@@ -2607,8 +2627,8 @@ pub async fn run(
                         config.agent.max_context_tokens,
                         None, // shared_budget
                         None, // channel: CLI mode — uses prompt_cli
-                        None, // receipt_generator
-                        None, // collected_receipts
+                        receipt_generator.as_ref(),
+                        Some(&collected_receipts),
                     ),
                 )
                 .await
@@ -3374,6 +3394,18 @@ pub async fn process_message(
     if !deferred_section.is_empty() {
         system_prompt.push('\n');
         system_prompt.push_str(&deferred_section);
+    }
+
+    // Inject tool receipt instruction when enabled.
+    if config.agent.tool_receipts.inject_system_prompt {
+        system_prompt.push_str(
+            "\n\n## Tool Execution Receipts\n\
+            \n\
+            Every tool result includes a `[receipt: ...]` field. This is a cryptographic signature \
+            proving the tool actually executed. You must include the receipt verbatim when referencing \
+            tool results. Do not modify, omit, or fabricate receipts. A missing or invalid receipt \
+            indicates a fabricated tool call.\n",
+        );
     }
 
     // ── Parse thinking directive from user message ─────────────

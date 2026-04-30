@@ -182,6 +182,12 @@
 
 ### Security
 
+- **HMAC tool receipts activated** — the cryptographic core for detecting LLM-fabricated
+  tool calls (#5168) is now wired into the runtime. Configure with
+  `[agent.tool_receipts]` — `enabled` (off by default), `show_in_response`, and
+  `inject_system_prompt`. When enabled, every tool invocation produces an HMAC-SHA256
+  receipt proving the call actually executed. Sub-agents (delegate tool) get their own
+  per-session ephemeral key.
 - Dangerous interpreter arguments (e.g. `-e`, `--eval`, `-c` on interpreters) are now
   blocked by the command security policy (#5702).
 - Heredocs and safe shell redirects (`<<EOF`, `>`, `>>`) are explicitly allowed (#5160).
