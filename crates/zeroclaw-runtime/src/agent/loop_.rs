@@ -6498,6 +6498,73 @@ mod tests {
         assert!(!context.contains("embedding prior context"));
     }
 
+    /// Captured `MemoryRecall` event used by
+    /// [`build_context_emits_memory_recall_event`].
+    struct CapturedRecall {
+        query_summary: Option<String>,
+        backend: String,
+        success: bool,
+    }
+
+    /// Counting observer that records every `MemoryRecall` event so the test
+    /// can assert that the runtime hot path emits the variant once per
+    /// `build_context` call. Locks in the wiring contract that motivated the
+    /// four #6190 commits.
+    #[derive(Default)]
+    struct RecallCountingObserver {
+        recalls: parking_lot::Mutex<Vec<CapturedRecall>>,
+    }
+
+    impl crate::observability::Observer for RecallCountingObserver {
+        fn record_event(&self, event: &crate::observability::ObserverEvent) {
+            if let crate::observability::ObserverEvent::MemoryRecall {
+                query_summary,
+                backend,
+                success,
+                ..
+            } = event
+            {
+                self.recalls.lock().push(CapturedRecall {
+                    query_summary: query_summary.clone(),
+                    backend: backend.clone(),
+                    success: *success,
+                });
+            }
+        }
+
+        fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "recall-counting-observer"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn build_context_emits_memory_recall_event() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let observer = RecallCountingObserver::default();
+
+        let _ = build_context(&mem, &observer, "any query", 0.0, None).await;
+
+        let recalls = observer.recalls.lock();
+        assert_eq!(
+            recalls.len(),
+            1,
+            "build_context must emit exactly one MemoryRecall event per call"
+        );
+        assert_eq!(recalls[0].query_summary.as_deref(), Some("any query"));
+        assert_eq!(recalls[0].backend, "sqlite");
+        assert!(
+            recalls[0].success,
+            "successful recall must report success = true"
+        );
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Recovery Tests - Tool Call Parsing Edge Cases
     // ═══════════════════════════════════════════════════════════════════════
