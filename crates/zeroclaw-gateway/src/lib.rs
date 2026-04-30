@@ -2328,9 +2328,25 @@ async fn handle_admin_reload(
     };
 
     tracing::info!("🔄 Admin reload request received");
+    // Trigger graceful shutdown of THIS gateway instance's axum::serve so
+    // its TcpListener releases the port before the daemon supervisor
+    // spawns the new instance. Without this, daemon::run aborts the
+    // gateway tokio task at the next await point — but the OLD listener
+    // can stay bound briefly, racing the NEW gateway's bind. The new
+    // bind then fails and spawn_component_supervisor backs off; in the
+    // meantime the OLD gateway keeps serving requests with stale
+    // in-memory config, and `/api/config/drift` reports drift against
+    // disk because in-memory hasn't been replaced yet. Cold restart
+    // (process exit + start) hits this path differently because the OS
+    // fully releases the listener — that's why the user observes "shut
+    // down + bring up = correct" but "/admin/reload = stale".
+    let shutdown_tx = state.shutdown_tx.clone();
     // Brief delay so the HTTP response flushes before tear-down begins.
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Drain axum first so the listener releases.
+        let _ = shutdown_tx.send(true);
+        // Then signal the daemon to re-read disk and re-spawn subsystems.
         let _ = reload_tx.send(true);
     });
 
