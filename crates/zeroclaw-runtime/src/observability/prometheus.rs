@@ -360,11 +360,15 @@ impl Observer for PrometheusObserver {
             | ObserverEvent::TurnComplete
             | ObserverEvent::LlmRequest { .. }
             | ObserverEvent::DeploymentStarted { .. }
-            | ObserverEvent::RecoveryCompleted { .. } => {}
+            | ObserverEvent::RecoveryCompleted { .. }
+            | ObserverEvent::MemoryRecall { .. }
+            | ObserverEvent::MemoryStore { .. }
+            | ObserverEvent::RagRetrieve { .. } => {}
             ObserverEvent::ToolCall {
                 tool,
                 duration,
                 success,
+                ..
             } => {
                 let success_str = if *success { "true" } else { "false" };
                 self.tool_calls
@@ -460,6 +464,9 @@ impl Observer for PrometheusObserver {
                     self.deployment_failure_rate.set(f as f64 / total as f64);
                 }
             }
+            // `ObserverEvent` is `#[non_exhaustive]` — silently ignore any
+            // future variant added by upstream `zeroclaw-api`.
+            _ => {}
         }
     }
 
@@ -552,13 +559,19 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(10),
             success: true,
+            arguments: None,
+            result: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "file_read".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(5),
             success: false,
+            arguments: None,
+            result: None,
         });
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),
@@ -590,8 +603,11 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(100),
             success: true,
+            arguments: None,
+            result: None,
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_metric(&ObserverMetric::RequestLatency(Duration::from_millis(250)));
@@ -621,18 +637,27 @@ mod tests {
 
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(10),
             success: true,
+            arguments: None,
+            result: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(10),
             success: true,
+            arguments: None,
+            result: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(10),
             success: false,
+            arguments: None,
+            result: None,
         });
 
         let output = obs.encode();

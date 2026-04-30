@@ -40,6 +40,7 @@ impl Observer for LogObserver {
                 tool,
                 duration,
                 success,
+                ..
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 info!(tool = %tool, duration_ms = ms, success = success, "tool.call");
@@ -64,6 +65,55 @@ impl Observer for LogObserver {
             }
             ObserverEvent::Error { component, message } => {
                 info!(component = %component, error = %message, "error");
+            }
+            ObserverEvent::MemoryRecall {
+                duration,
+                num_entries,
+                backend,
+                success,
+                ..
+            } => {
+                // Bounded labels only — `query_summary` intentionally omitted
+                // from the log surface to avoid forwarding scrubbed-but-still-
+                // identifying user query text into structured-log sinks
+                // (Datadog, Loki) that the OD4 analysis did not cover.
+                let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                info!(
+                    backend = %backend,
+                    num_entries = num_entries,
+                    duration_ms = ms,
+                    success = success,
+                    "memory.recall"
+                );
+            }
+            ObserverEvent::MemoryStore {
+                category,
+                backend,
+                duration,
+                success,
+            } => {
+                let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                info!(
+                    category = %category,
+                    backend = %backend,
+                    duration_ms = ms,
+                    success = success,
+                    "memory.store"
+                );
+            }
+            ObserverEvent::RagRetrieve {
+                duration,
+                num_chunks,
+                num_boards,
+                ..
+            } => {
+                let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                info!(
+                    num_chunks = num_chunks,
+                    num_boards = num_boards,
+                    duration_ms = ms,
+                    "rag.retrieve"
+                );
             }
             ObserverEvent::LlmRequest {
                 provider,
@@ -130,6 +180,9 @@ impl Observer for LogObserver {
             ObserverEvent::RecoveryCompleted { deploy_id } => {
                 info!(deploy_id = %deploy_id, "recovery.completed");
             }
+            // `ObserverEvent` is `#[non_exhaustive]` — silently ignore any
+            // future variant added by upstream `zeroclaw-api`.
+            _ => {}
         }
     }
 
@@ -232,8 +285,11 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(10),
             success: false,
+            arguments: None,
+            result: None,
         });
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),

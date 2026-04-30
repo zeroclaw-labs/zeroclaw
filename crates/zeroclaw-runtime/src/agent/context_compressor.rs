@@ -1,11 +1,13 @@
 use std::fmt::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use std::sync::Arc;
 
 use zeroclaw_api::provider::{ChatMessage, Provider};
 use zeroclaw_memory::traits::Memory;
+
+use crate::observability::{Observer, ObserverEvent};
 
 pub use zeroclaw_config::scattered_types::ContextCompressionConfig;
 
@@ -123,6 +125,7 @@ pub struct ContextCompressor {
     config: ContextCompressionConfig,
     context_window: usize,
     memory: Option<Arc<dyn Memory>>,
+    observer: Option<Arc<dyn Observer>>,
 }
 
 impl ContextCompressor {
@@ -131,6 +134,7 @@ impl ContextCompressor {
             config,
             context_window,
             memory: None,
+            observer: None,
         }
     }
 
@@ -138,6 +142,15 @@ impl ContextCompressor {
     /// old messages are discarded. Without this, compressed facts are lost.
     pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Attach an observer so compression-summary stores emit
+    /// `ObserverEvent::MemoryStore` alongside the other agent-loop write
+    /// sites. Optional — when not set, stores still happen but are
+    /// invisible to OTel/log observers.
+    pub fn with_observer(mut self, observer: Arc<dyn Observer>) -> Self {
+        self.observer = Some(observer);
         self
     }
 
@@ -358,20 +371,30 @@ impl ContextCompressor {
         // This ensures facts from compressed turns remain retrievable via memory recall.
         if let Some(ref memory) = self.memory {
             let facts_key = format!("compressed_context_{}", uuid::Uuid::new_v4());
-            if let Err(e) = memory
-                .store(
-                    &facts_key,
-                    &summary,
-                    zeroclaw_memory::traits::MemoryCategory::Daily,
-                    None,
-                )
-                .await
-            {
-                tracing::debug!("Failed to save compression summary to memory: {e}");
-            } else {
-                tracing::debug!(
-                    "Saved compression summary to memory before discarding {message_count} messages"
-                );
+            let category = zeroclaw_memory::traits::MemoryCategory::Daily;
+            let store_start = Instant::now();
+            let store_result = memory
+                .store(&facts_key, &summary, category.clone(), None)
+                .await;
+            let store_duration = store_start.elapsed();
+            let success = store_result.is_ok();
+            match &store_result {
+                Ok(_) => {
+                    tracing::debug!(
+                        "Saved compression summary to memory before discarding {message_count} messages"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to save compression summary to memory: {e}");
+                }
+            }
+            if let Some(ref observer) = self.observer {
+                observer.record_event(&ObserverEvent::MemoryStore {
+                    category: category.to_string(),
+                    backend: memory.name().to_string(),
+                    duration: store_duration,
+                    success,
+                });
             }
         }
 

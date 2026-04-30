@@ -134,6 +134,7 @@ impl MemoryLoader for StaticMemoryLoader {
     async fn load_context(
         &self,
         _memory: &dyn Memory,
+        _observer: &dyn zeroclaw::observability::Observer,
         _user_message: &str,
         _session_id: Option<&str>,
     ) -> Result<String> {

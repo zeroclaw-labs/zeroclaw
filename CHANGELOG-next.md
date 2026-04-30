@@ -126,6 +126,17 @@
 - **`otel_headers`** — new config key for passing arbitrary HTTP headers to OTLP
   endpoints. Enables authenticated exporters (e.g. Grafana Cloud, Honeycomb) without
   environment variable workarounds (#5700).
+- **OTel memory and RAG observability** — every agent turn now produces visible
+  `memory.recall`, `memory.store`, and `rag.retrieve` spans plus five OTel meter
+  instruments (`zeroclaw.memory.recall.{count,duration}`, `zeroclaw.memory.store.count`,
+  `zeroclaw.rag.retrieve.{count,duration}`). The recall/retrieve spans set
+  `gen_ai.operation.name = "retrieval"` and carry a scrubbed/truncated `query_summary`
+  on `input.value`; the store span uses `db.system` / `db.operation = "INSERT"`. These
+  are partial GenAI-compatible attributes — `SpanKind::Internal` is used (not `CLIENT`)
+  and span names are `memory.recall` / `rag.retrieve` / `memory.store` (not the
+  spec-suggested `{operation} {data_source.id}`) for compatibility with the existing
+  ZeroClaw / Langfuse retrieval views. New spans and instruments live behind the
+  existing `observability-otel` feature gate (#6190).
 
 ### Web Dashboard
 
@@ -278,6 +289,44 @@ If you have any code that depends directly on internal ZeroClaw crate paths (e.g
 embedding or testing), the crate structure has changed significantly. Refer to
 `AGENTS.md` for the current crate map and stability tiers. `zeroclaw-api` is the stable
 extension point — all other crates are Beta or Experimental.
+
+### `ObserverEvent` is now `#[non_exhaustive]`
+
+`zeroclaw_api::observability::ObserverEvent` is now annotated `#[non_exhaustive]` so
+future additive variants do not break out-of-tree observer implementations. Out-of-tree
+code that exhaustively matches on `ObserverEvent` (`match event { ObserverEvent::Foo
+{ .. } => ..., ObserverEvent::Bar { .. } => ..., }`) must add a wildcard arm:
+
+```rust
+match event {
+    ObserverEvent::Foo { .. } => { /* ... */ }
+    ObserverEvent::Bar { .. } => { /* ... */ }
+    _ => { /* future variants */ }
+}
+```
+
+Three additive variants land in this release alongside the annotation: `MemoryRecall`,
+`MemoryStore`, `RagRetrieve` (#6190).
+
+### `MemoryLoader::load_context` gains an `observer` parameter
+
+The `MemoryLoader` trait in `zeroclaw-runtime` (Beta tier) gains a required
+`observer: &dyn Observer` parameter on `load_context` so the runtime can emit
+`MemoryRecall` events at the boundary. Out-of-tree `MemoryLoader` implementors must
+update their signature; impls that do not need instrumentation can ignore the parameter:
+
+```rust
+impl MemoryLoader for MyLoader {
+    async fn load_context(
+        &self,
+        // ... existing params ...
+        _observer: &dyn zeroclaw::observability::Observer,
+    ) -> Result<...> { /* unchanged body */ }
+}
+```
+
+The runtime always passes a valid reference (`&NoopObserver` when no observer is wired)
+(#6190).
 
 ---
 
