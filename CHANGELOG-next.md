@@ -41,17 +41,6 @@
 - **Authenticated OTLP exporters** — New `otel_headers` config key lets you pass
   custom headers (e.g. `Authorization: Bearer …`) to protected OTLP endpoints (#5700).
 
-- **Config CRUD over HTTP, with secrets write-only** — The gateway now exposes
-  per-property GET / PUT / DELETE / PATCH / OPTIONS endpoints under
-  `/api/config/*` so the dashboard, third-party tooling, and the CLI all drive
-  the same `Config` mutation core. PATCH accepts a JSON Patch (RFC 6902)
-  document and applies it atomically (validate-then-save-then-swap, with
-  rollback on any failure). Secret fields are write-only over HTTP — responses
-  carry `{populated}` only, never the value or its length. The CLI gains
-  `zeroclaw config patch` for parity. Errors are stable structured codes
-  (`path_not_found`, `validation_failed`, `op_not_supported`,
-  `secret_test_forbidden`, …). Foundation for the web onboarding flow (#6175).
-
 ---
 
 ## What's New
@@ -121,16 +110,6 @@
 - Fixed: `providers.fallback` now emits a warning if it references a key that does not
   exist in `providers.models`.
 - Fixed: temperature validation restored in the `providers.models` loop.
-- New `Configurable` derive attribute `#[derived_from_secret]` reserved for fields
-  computed from secrets. Treated as secret on every read path, including the new
-  HTTP CRUD surface (#6175).
-- New CLI subcommand `zeroclaw config patch <file-or-stdin>` applies a JSON Patch
-  (RFC 6902) document atomically — same op subset and structured response shape
-  as `PATCH /api/config` (#6175).
-- New structured error type `ConfigApiError` with stable codes shared by CLI and
-  HTTP — `path_not_found`, `validation_failed`, `provider_fallback_dangling`,
-  `value_type_mismatch`, `op_not_supported`, `secret_test_forbidden`,
-  `config_changed_externally`, `reload_failed`, `internal_error` (#6175).
 - Slack config: `channel_id` deprecated in favour of `channel_ids` (plural) for V2.
 - Nostr, WhatsApp Web, and hardware wizard sections wired into the onboarding flow
   (#5640).
@@ -156,21 +135,6 @@
   (#5675, #5665).
 - Web build logic moved into the gateway crate; no-op recompiles (previously ~1 minute)
   eliminated.
-- New gateway endpoints under `/api/config/*` mirror `zeroclaw config` get / set /
-  list / init / migrate, plus `PATCH /api/config` for atomic JSON Patch
-  (RFC 6902) batches. `OPTIONS` returns the JSON Schema for the resource
-  (capabilities); `GET` returns the user's current values. Foundation for the
-  schema-driven web onboarding flow (#6175).
-- New `Gateway HTTP API` page in the docs (`docs/book/src/gateway/api.md`) —
-  high-level overview of authentication, discovery, secrets handling, and the
-  stable error code table; live "Try it out" forms come from `/api/docs` on a
-  running gateway (#6175).
-- New `cargo web` xtask (`gen-api`, `install`, `build`, `dev`, `check`) drives
-  the dashboard build from cargo. The TypeScript API client is regenerated
-  on every build by piping the gateway's runtime OpenAPI spec through
-  `openapi-typescript`; neither the spec snapshot nor the generated TS
-  (`web/src/lib/api-generated.ts`) is committed. See
-  `docs/book/src/developing/web.md` (#6175).
 
 ### Agent & Runtime
 
