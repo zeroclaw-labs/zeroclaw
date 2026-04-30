@@ -6,7 +6,7 @@
 //! (see `zeroclaw_runtime::agent::personality::load_personality`). This
 //! module is the dashboard's authoring surface for them.
 //!
-//! Sandbox: filenames are matched against the static `PERSONALITY_FILES`
+//! Sandbox: filenames are matched against the static `EDITABLE_PERSONALITY_FILES`
 //! allowlist re-exported from the runtime crate. The on-disk path is
 //! built from a `&'static str` taken from that allowlist plus the
 //! current `workspace_dir`, so user-supplied path components cannot
@@ -25,7 +25,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use zeroclaw_runtime::agent::personality::{MAX_FILE_CHARS, PERSONALITY_FILES};
+use zeroclaw_runtime::agent::personality::{EDITABLE_PERSONALITY_FILES, MAX_FILE_CHARS};
 use zeroclaw_runtime::agent::personality_templates::{TemplateContext, render_preset_default};
 
 use super::AppState;
@@ -127,7 +127,7 @@ pub struct PersonalityConflict {
 fn validate_filename(
     filename: &str,
 ) -> Result<&'static str, (StatusCode, Json<serde_json::Value>)> {
-    PERSONALITY_FILES
+    EDITABLE_PERSONALITY_FILES
         .iter()
         .copied()
         .find(|allowed| *allowed == filename)
@@ -137,7 +137,7 @@ fn validate_filename(
                 Json(serde_json::json!({
                     "error": "filename not in personality allowlist",
                     "filename": filename,
-                    "allowed": PERSONALITY_FILES,
+                    "allowed": EDITABLE_PERSONALITY_FILES,
                 })),
             )
         })
@@ -185,7 +185,7 @@ pub async fn handle_index(
         cfg.workspace_dir.clone()
     };
 
-    let files: Vec<PersonalityIndexEntry> = PERSONALITY_FILES
+    let files: Vec<PersonalityIndexEntry> = EDITABLE_PERSONALITY_FILES
         .iter()
         .copied()
         .map(|filename| {
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn validate_filename_accepts_allowlist() {
-        for f in PERSONALITY_FILES {
+        for f in EDITABLE_PERSONALITY_FILES {
             assert!(validate_filename(f).is_ok());
         }
     }

@@ -23,6 +23,21 @@ pub const PERSONALITY_FILES: &[&str] = &[
     "MEMORY.md",
 ];
 
+/// Subset of [`PERSONALITY_FILES`] that the dashboard exposes for
+/// authoring. `BOOTSTRAP.md` is deliberately excluded: it's a
+/// first-run scaffold the agent reads once and deletes, not a file
+/// the user is meant to hand-edit. The runtime still injects it when
+/// it exists on disk.
+pub const EDITABLE_PERSONALITY_FILES: &[&str] = &[
+    "SOUL.md",
+    "IDENTITY.md",
+    "USER.md",
+    "AGENTS.md",
+    "TOOLS.md",
+    "HEARTBEAT.md",
+    "MEMORY.md",
+];
+
 /// A single personality file loaded from the workspace.
 #[derive(Debug, Clone)]
 pub struct PersonalityFile {

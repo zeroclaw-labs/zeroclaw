@@ -10,7 +10,7 @@
 //! Each template is a `format!` template parameterized by the
 //! [`TemplateContext`]. The defaults below match the original wizard.
 
-use super::personality::PERSONALITY_FILES;
+use super::personality::EDITABLE_PERSONALITY_FILES;
 
 /// Per-render context — substituted into the `format!` templates.
 /// Values default to neutral placeholders the user can edit in-place
@@ -157,23 +157,12 @@ pub fn render(filename: &str, ctx: &TemplateContext) -> Option<String> {
              *Add whatever helps you do your job. This is your cheat sheet.*\n"
                 .to_string(),
         ),
-        "BOOTSTRAP.md" => Some(format!(
-            "# BOOTSTRAP.md — Hello, World\n\n\
-             *You just woke up. Time to figure out who you are.*\n\n\
-             Your human's name is **{user}** (timezone: {tz}).\n\
-             They prefer: {comm_style}\n\n\
-             ## First Conversation\n\n\
-             Don't interrogate. Don't be robotic. Just... talk.\n\
-             Introduce yourself as {agent} and get to know each other.\n\n\
-             ## After You Know Each Other\n\n\
-             Update these files with what you learned:\n\
-             - `IDENTITY.md` — your name, vibe, emoji\n\
-             - `USER.md` — their preferences, work context\n\
-             - `SOUL.md` — boundaries and behavior\n\n\
-             ## When You're Done\n\n\
-             Delete this file. You don't need a bootstrap script anymore —\n\
-             you're you now.\n"
-        )),
+        // BOOTSTRAP.md is intentionally not in this match. It's a
+        // first-run scaffold the agent reads once and deletes; the
+        // dashboard editor doesn't expose it, so a template would be
+        // unreachable. The original wizard owned BOOTSTRAP.md
+        // generation directly during workspace scaffolding (see
+        // wizard.rs in commit 0c622e607^).
         "MEMORY.md" if ctx.include_memory => Some(
             "# MEMORY.md — Long-Term Memory\n\n\
              *Your curated memories. The distilled essence, not raw logs.*\n\n\
@@ -266,7 +255,7 @@ fn render_agents(ctx: &TemplateContext) -> String {
 /// Render the full default preset for every allowlist file.
 #[must_use]
 pub fn render_preset_default(ctx: &TemplateContext) -> Vec<(&'static str, String)> {
-    PERSONALITY_FILES
+    EDITABLE_PERSONALITY_FILES
         .iter()
         .copied()
         .filter_map(|f| render(f, ctx).map(|content| (f, content)))
@@ -278,16 +267,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_preset_covers_every_allowlist_file() {
+    fn default_preset_covers_every_editable_file() {
         let ctx = TemplateContext::default();
         let rendered = render_preset_default(&ctx);
         let names: Vec<&str> = rendered.iter().map(|(n, _)| *n).collect();
-        for f in PERSONALITY_FILES {
+        for f in EDITABLE_PERSONALITY_FILES {
             assert!(
                 names.contains(f),
                 "default preset missing {f}; only had {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn bootstrap_is_not_a_template() {
+        let ctx = TemplateContext::default();
+        assert!(
+            render("BOOTSTRAP.md", &ctx).is_none(),
+            "BOOTSTRAP.md is owned by first-run scaffolding, not the editor"
+        );
     }
 
     #[test]
