@@ -6038,6 +6038,21 @@ pub async fn deliver_announcement(
         "wechat" => {
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
         }
+        #[cfg(feature = "channel-wukongim")]
+        "wukongim" => {
+            let wk = config
+                .channels
+                .wukongim
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("wukongim channel not configured"))?;
+            let ch = WuKongIMChannel::from_config(wk);
+            zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
+                .await?;
+        }
+        #[cfg(not(feature = "channel-wukongim"))]
+        "wukongim" => {
+            anyhow::bail!("WuKongIM channel requires the `channel-wukongim` feature");
+        }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
     Ok(())

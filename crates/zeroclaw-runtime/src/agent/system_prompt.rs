@@ -283,7 +283,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     let now = chrono::Local::now();
     let _ = writeln!(
         prompt,
-        "## Current Date & Time\n\n{} ({})\n",
+        "## Current Date & Time\n\n{} ({})\n*Note: When using cron_add to schedule tasks, you MUST convert this local time to UTC.*\n",
         now.format("%Y-%m-%d %H:%M:%S"),
         now.format("%Z")
     );
