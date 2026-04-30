@@ -17,6 +17,20 @@ const WUKONGIM_RPC_VERSION: &str = "2.0";
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 
+pub struct WkMessageType;
+impl WkMessageType {
+    pub const TEXT: u32 = 1;
+    pub const INTERACTIVE_CARD: u32 = 20;
+    pub const INTERACTIVE_RESPONSE: u32 = 21;
+    pub const CMD: u32 = 99;
+}
+
+pub struct WkChannelType;
+impl WkChannelType {
+    pub const PERSONAL: u8 = 1;
+    pub const GROUP: u8 = 2;
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRpcRequest<P> {
     pub jsonrpc: String,
@@ -124,6 +138,38 @@ pub struct RecvAckParams {
     pub message_seq: u32,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WkApprovalCard {
+    #[serde(rename = "type")]
+    pub msg_type: u32,
+    pub approval_id: String,
+    pub timeout_secs: u64,
+    pub title: String,
+    pub body: WkApprovalBody,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actions: Option<Vec<WkAction>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WkAction {
+    pub text: String,
+    pub value: String,
+    pub style: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WkApprovalBody {
+    pub content: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WkApprovalAction {
+    #[serde(rename = "type")]
+    pub msg_type: u32,
+    pub approval_id: String,
+    pub action: String,
+}
+
 type WsSink = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     WsMsg,
@@ -173,6 +219,17 @@ impl WuKongIMChannel {
 
     fn is_user_allowed(&self, uid: &str) -> bool {
         self.allowed_users.iter().any(|u| u == "*" || u == uid)
+    }
+
+    fn parse_recipient(&self, recipient: &str) -> (String, u8) {
+        if let Some(pos) = recipient.find(':') {
+            let (t_str, id_str) = recipient.split_at(pos);
+            let id_str = &id_str[1..]; // skip the colon
+            let t = t_str.parse::<u8>().unwrap_or(WkChannelType::PERSONAL);
+            (id_str.to_string(), t)
+        } else {
+            (recipient.to_string(), WkChannelType::PERSONAL)
+        }
     }
 
     async fn send_rpc<P: Serialize, R: DeserializeOwned>(
@@ -253,7 +310,7 @@ impl WuKongIMChannel {
         approval_id: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
         timeout_secs: u64,
-    ) -> serde_json::Value {
+    ) -> WkApprovalCard {
         // Human-readable summarization for cron_add or other tools
         let (title, content) = if request.tool_name == "cron_add" {
             let mut summary = request.arguments_summary.clone();
@@ -283,17 +340,27 @@ impl WuKongIMChannel {
             )
         };
 
-        let content = format!("{}\n\n1批准，2拒绝 3总是允许", content);
-
-        serde_json::json!({
-            "type": 20,
-            "approval_id": approval_id,
-            "timeout_secs": timeout_secs,
-            "title": title,
-            "body": {
-                "content": content
-            }
-        })
+        WkApprovalCard {
+            msg_type: WkMessageType::INTERACTIVE_CARD,
+            approval_id: approval_id.to_string(),
+            timeout_secs,
+            title: title.to_string(),
+            body: WkApprovalBody {
+                content: content.to_string(),
+            },
+            actions: Some(vec![
+                WkAction {
+                    text: "同意".to_string(),
+                    value: "approve".to_string(),
+                    style: "primary".to_string(),
+                },
+                WkAction {
+                    text: "拒绝".to_string(),
+                    value: "deny".to_string(),
+                    style: "danger".to_string(),
+                },
+            ]),
+        }
     }
 }
 
@@ -318,14 +385,7 @@ impl Channel for WuKongIMChannel {
         let payload_b64 = base64::engine::general_purpose::STANDARD.encode(payload_json);
 
         // Parse channel_type from recipient if formatted as "type:id"
-        let (channel_id, channel_type) = if let Some(pos) = message.recipient.find(':') {
-            let (t_str, id_str) = message.recipient.split_at(pos);
-            let id_str = &id_str[1..]; // skip the colon
-            let t = t_str.parse::<u8>().unwrap_or(1);
-            (id_str.to_string(), t)
-        } else {
-            (message.recipient.clone(), 1)
-        };
+        let (channel_id, channel_type) = self.parse_recipient(&message.recipient);
 
         let params = SendParams {
             from_uid: Some(self.uid.clone()),
@@ -479,43 +539,41 @@ impl Channel for WuKongIMChannel {
 
                             // 2. Filter out system commands (type 99 or presence of 'cmd')
                             let msg_type = payload_json.get("type").and_then(|t| t.as_u64()).unwrap_or(0);
-                            if msg_type == 99 || payload_json.get("cmd").is_some() {
+                            if msg_type == WkMessageType::CMD as u64 || payload_json.get("cmd").is_some() {
                                 tracing::trace!("WuKongIM: skipping system message or internal command");
                                 // Still Ack to stop server retries
                                 let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
                                 continue;
                             }
 
-                            // Handle type 20 interactive response
-                            if let (Some(20), Some(approval_id), Some(action)) = (
-                                payload_json.get("type").and_then(|t| t.as_u64()),
-                                payload_json.get("approval_id").and_then(|id| id.as_str()),
-                                payload_json.get("action").and_then(|a| a.as_str()),
-                            ) {
-                                let response = match action {
-                                    "approve" => {
-                                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve)
-                                    }
-                                    "deny" => {
-                                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny)
-                                    }
-                                    "always" => Some(
-                                        zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
-                                    ),
-                                    _ => None,
-                                };
-                                if let Some(resp) = response {
-                                    let mut pending = self.pending_approvals.write().await;
-                                    if let Some(tx) = pending.remove(approval_id) {
-                                        let _ = tx.send(resp);
-                                        continue;
+                            // Handle type 21 interactive response (Strict 21)
+                            if msg_type == WkMessageType::INTERACTIVE_RESPONSE as u64 {
+                                // Always Ack to stop server retries
+                                let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
+
+                                if let Ok(action_msg) = serde_json::from_value::<WkApprovalAction>(payload_json.clone()) {
+                                    let response = match action_msg.action.as_str() {
+                                        "approve" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve),
+                                        "deny" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny),
+                                        "always" => Some(zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove),
+                                        _ => None,
+                                    };
+                                    if let Some(resp) = response {
+                                        let mut pending = self.pending_approvals.write().await;
+                                        if let Some(tx) = pending.remove(&action_msg.approval_id) {
+                                            tracing::info!("WuKongIM: handled approval response for {}", action_msg.approval_id);
+                                            let _ = tx.send(resp);
+                                        } else {
+                                            tracing::warn!("WuKongIM: received approval response for {} but not found in pending", action_msg.approval_id);
+                                        }
                                     }
                                 }
+                                continue;
                             }
 
                             // 3. Handle mention_only logic for group chats (MUST check before sending ACK)
                             // If we send ACK first and then skip, the message is permanently lost.
-                            let is_group = params.channel_type != 1;
+                            let is_group = params.channel_type == WkChannelType::GROUP;
                             if self.mention_only && is_group {
                                 let mut mentioned = false;
 
@@ -642,7 +700,7 @@ impl Channel for WuKongIMChannel {
                             );
 
                             // Determine target: for type 1 (personal), reply to from_uid. For others, reply to channel_id.
-                            let target_id = if params.channel_type == 1 {
+                            let target_id = if params.channel_type == WkChannelType::PERSONAL {
                                 &params.from_uid
                             } else {
                                 &params.channel_id
@@ -650,7 +708,7 @@ impl Channel for WuKongIMChannel {
 
                             let channel_msg = ChannelMessage {
                                 id: params.message_id,
-                                sender: params.from_uid.clone(),
+                                sender: target_id.clone(),
                                 reply_target: format!("{}:{}", params.channel_type, target_id),
                                 content,
                                 channel: "wukongim".to_string(),
@@ -694,11 +752,13 @@ impl Channel for WuKongIMChannel {
         let payload_json = serde_json::to_string(&card)?;
         let payload_b64 = base64::engine::general_purpose::STANDARD.encode(payload_json);
 
+        let (channel_id, channel_type) = self.parse_recipient(recipient);
+
         let params = SendParams {
             from_uid: Some(self.uid.clone()),
             client_msg_no: Uuid::new_v4().to_string(),
-            channel_id: recipient.to_string(),
-            channel_type: 1, // Person
+            channel_id,
+            channel_type,
             payload: payload_b64,
             header: None,
             setting: None,
@@ -728,6 +788,34 @@ impl Channel for WuKongIMChannel {
                 Ok(Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_approval_structs() {
+        let card = WkApprovalCard {
+            msg_type: WkMessageType::INTERACTIVE_CARD,
+            approval_id: "id123".to_string(),
+            timeout_secs: 300,
+            title: "Title".to_string(),
+            body: WkApprovalBody {
+                content: "Body".to_string(),
+            },
+            actions: None,
+        };
+        let json = serde_json::to_string(&card).unwrap();
+        assert!(json.contains("\"type\":20"));
+        assert!(json.contains("\"approval_id\":\"id123\""));
+
+        let action_json = r#"{"type": 21, "approval_id": "id123", "action": "approve"}"#;
+        let action: WkApprovalAction = serde_json::from_str(action_json).unwrap();
+        assert_eq!(action.msg_type, WkMessageType::INTERACTIVE_RESPONSE);
+        assert_eq!(action.approval_id, "id123");
+        assert_eq!(action.action, "approve");
     }
 }
 
