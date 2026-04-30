@@ -15,6 +15,20 @@ const WUKONGIM_RPC_VERSION: &str = "2.0";
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 
+pub struct WkMessageType;
+impl WkMessageType {
+    pub const TEXT: u32 = 1;
+    pub const INTERACTIVE_CARD: u32 = 20;
+    pub const INTERACTIVE_RESPONSE: u32 = 21;
+    pub const CMD: u32 = 99;
+}
+
+pub struct WkChannelType;
+impl WkChannelType {
+    pub const PERSONAL: u8 = 1;
+    pub const GROUP: u8 = 2;
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRpcRequest<P> {
     pub jsonrpc: String,
@@ -209,10 +223,10 @@ impl WuKongIMChannel {
         if let Some(pos) = recipient.find(':') {
             let (t_str, id_str) = recipient.split_at(pos);
             let id_str = &id_str[1..]; // skip the colon
-            let t = t_str.parse::<u8>().unwrap_or(1);
+            let t = t_str.parse::<u8>().unwrap_or(WkChannelType::PERSONAL);
             (id_str.to_string(), t)
         } else {
-            (recipient.to_string(), 1)
+            (recipient.to_string(), WkChannelType::PERSONAL)
         }
     }
 
@@ -325,7 +339,7 @@ impl WuKongIMChannel {
         };
 
         WkApprovalCard {
-            msg_type: 20,
+            msg_type: WkMessageType::INTERACTIVE_CARD,
             approval_id: approval_id.to_string(),
             timeout_secs,
             title: title.to_string(),
@@ -342,11 +356,6 @@ impl WuKongIMChannel {
                     text: "拒绝".to_string(),
                     value: "deny".to_string(),
                     style: "danger".to_string(),
-                },
-                WkAction {
-                    text: "总是允许".to_string(),
-                    value: "always".to_string(),
-                    style: "default".to_string(),
                 },
             ]),
         }
@@ -528,7 +537,7 @@ impl Channel for WuKongIMChannel {
 
                             // 2. Filter out system commands (type 99 or presence of 'cmd')
                             let msg_type = payload_json.get("type").and_then(|t| t.as_u64()).unwrap_or(0);
-                            if msg_type == 99 || payload_json.get("cmd").is_some() {
+                            if msg_type == WkMessageType::CMD as u64 || payload_json.get("cmd").is_some() {
                                 tracing::trace!("WuKongIM: skipping system message or internal command");
                                 // Still Ack to stop server retries
                                 let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
@@ -536,7 +545,7 @@ impl Channel for WuKongIMChannel {
                             }
 
                             // Handle type 21 interactive response (Strict 21)
-                            if msg_type == 21 {
+                            if msg_type == WkMessageType::INTERACTIVE_RESPONSE as u64 {
                                 // Always Ack to stop server retries
                                 let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
 
@@ -562,7 +571,7 @@ impl Channel for WuKongIMChannel {
 
                             // 3. Handle mention_only logic for group chats (MUST check before sending ACK)
                             // If we send ACK first and then skip, the message is permanently lost.
-                            let is_group = params.channel_type != 1;
+                            let is_group = params.channel_type == WkChannelType::GROUP;
                             if self.mention_only && is_group {
                                 let mut mentioned = false;
 
@@ -642,7 +651,7 @@ impl Channel for WuKongIMChannel {
                             );
 
                             // Determine target: for type 1 (personal), reply to from_uid. For others, reply to channel_id.
-                            let target_id = if params.channel_type == 1 {
+                            let target_id = if params.channel_type == WkChannelType::PERSONAL {
                                 &params.from_uid
                             } else {
                                 &params.channel_id
@@ -740,11 +749,13 @@ mod tests {
     #[test]
     fn test_approval_structs() {
         let card = WkApprovalCard {
-            msg_type: 20,
+            msg_type: WkMessageType::INTERACTIVE_CARD,
             approval_id: "id123".to_string(),
             timeout_secs: 300,
             title: "Title".to_string(),
-            body: WkApprovalBody { content: "Body".to_string() },
+            body: WkApprovalBody {
+                content: "Body".to_string(),
+            },
         };
         let json = serde_json::to_string(&card).unwrap();
         assert!(json.contains("\"type\":20"));
@@ -752,7 +763,7 @@ mod tests {
 
         let action_json = r#"{"type": 21, "approval_id": "id123", "action": "approve"}"#;
         let action: WkApprovalAction = serde_json::from_str(action_json).unwrap();
-        assert_eq!(action.msg_type, 21);
+        assert_eq!(action.msg_type, WkMessageType::INTERACTIVE_RESPONSE);
         assert_eq!(action.approval_id, "id123");
         assert_eq!(action.action, "approve");
     }
