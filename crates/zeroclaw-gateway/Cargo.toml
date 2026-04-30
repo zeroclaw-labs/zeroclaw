@@ -33,6 +33,7 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["logg
 
 # Frontend asset MIME type detection (dashboard served from filesystem)
 mime_guess = "2"
+include_dir = { version = "0.7", optional = true }
 
 # Async runtime
 tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "signal"] }
@@ -78,3 +79,4 @@ webauthn = ["zeroclaw-runtime/webauthn"]
 observability-prometheus = ["zeroclaw-runtime/observability-prometheus"]
 channel-nostr = ["zeroclaw-channels/channel-nostr"]
 gateway-voice-duplex = []
+embedded-web = ["dep:include_dir"]

@@ -328,8 +328,8 @@ const CLOUDCODE_PA_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1inter
 const LOAD_CODE_ASSIST_ENDPOINT: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 
-/// Public API endpoint for API key users.
-const PUBLIC_API_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta";
+/// Google AI Studio's Gemini endpoint.
+const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 // ══════════════════════════════════════════════════════════════════════════════
 // TOKEN REFRESH
@@ -832,7 +832,7 @@ impl GeminiProvider {
             }
             _ => {
                 let model_name = Self::format_model_name(model);
-                let base_url = format!("{PUBLIC_API_ENDPOINT}/{model_name}:generateContent");
+                let base_url = format!("{BASE_URL}/{model_name}:generateContent");
 
                 if auth.is_api_key() {
                     format!("{base_url}?key={}", auth.api_key_credential())
@@ -1196,6 +1196,11 @@ impl GeminiProvider {
 
 #[async_trait]
 impl Provider for GeminiProvider {
+    // ── Provider-family defaults ──
+    fn default_base_url(&self) -> Option<&str> {
+        Some(BASE_URL)
+    }
+
     fn capabilities(&self) -> zeroclaw_api::provider::ProviderCapabilities {
         zeroclaw_api::provider::ProviderCapabilities {
             vision: true,
@@ -1209,8 +1214,9 @@ impl Provider for GeminiProvider {
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let system_instruction = system_prompt.map(|sys| Content {
             role: None,
             parts: vec![Part::text(sys)],
@@ -1231,8 +1237,9 @@ impl Provider for GeminiProvider {
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let mut system_parts: Vec<&str> = Vec::new();
         let mut contents: Vec<Content> = Vec::new();
 
@@ -1321,6 +1328,12 @@ impl Provider for GeminiProvider {
             }
         }
         Ok(())
+    }
+
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        // Gemini's /v1beta/models requires ?key=<api_key>. Onboard pulls the
+        // catalog from models.dev before the user has entered a key.
+        crate::models_dev::list_models_for("google").await
     }
 }
 

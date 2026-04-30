@@ -502,6 +502,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Copy message',
     'agent.connected_status': 'Connected',
     'agent.disconnected_status': 'Disconnected',
+    'agent.clear_all': 'Clear all',
+    'agent.delete_message': 'Delete message',
+    'agent.compact_mode': 'Compact',
 
     // Tools
     'tools.title': 'Available Tools',

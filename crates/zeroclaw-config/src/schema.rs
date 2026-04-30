@@ -36,6 +36,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.slack",
     "channel.telegram",
     "channel.wati",
+    "channel.wechat",
     "channel.whatsapp",
     "tool.browser",
     "tool.composio",
@@ -367,6 +368,12 @@ pub struct Config {
     #[nested]
     pub workspace: WorkspaceConfig,
 
+    /// Meta-state for `zeroclaw onboard` (which sections the user has
+    /// already walked through). Not user-facing config (`[onboard_state]`).
+    #[serde(default)]
+    #[nested]
+    pub onboard_state: OnboardStateConfig,
+
     /// Notion integration configuration (`[notion]`).
     #[serde(default)]
     #[nested]
@@ -459,29 +466,46 @@ pub struct Config {
 /// When enabled, each client engagement gets an isolated workspace with
 /// separate memory, audit, secrets, and tool restrictions.
 #[allow(clippy::struct_excessive_bools)]
+/// Opaque state the `zeroclaw onboard` flow writes so it can tell, on a
+/// re-run, which sections the user has already walked through at least
+/// once — which lets it offer "Reconfigure? [y/N]" skip gates instead of
+/// forcing users through every field again.
+///
+/// This is meta-state about the onboard process, not user-facing config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "onboard_state"]
+pub struct OnboardStateConfig {
+    /// Section keys the user has completed at least once via onboard.
+    /// Values are the lowercased Section variant names
+    /// (`"workspace"`, `"providers"`, …).
+    #[serde(default)]
+    pub completed_sections: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "workspace"]
 pub struct WorkspaceConfig {
-    /// Enable workspace isolation. Default: false.
+    /// Turn on multi-workspace profiles — each named engagement gets its own memory, secrets, and audit directories so work for one client/project never bleeds into another. Leave off for single-workspace mode where everything lives under `~/.zeroclaw/workspace`.
     #[serde(default)]
     pub enabled: bool,
-    /// Currently active workspace name.
+    /// Which workspace profile is currently active — picks the `<workspaces_dir>/<name>/` directory ZeroClaw reads from and writes to. Required when multi-workspace is enabled; ignored otherwise.
     #[serde(default)]
     pub active_workspace: Option<String>,
-    /// Base directory for workspace profiles.
+    /// Parent directory holding all workspace profiles, one subdirectory per profile. Override to keep profiles on a separate disk or inside an encrypted volume.
     #[serde(default = "default_workspaces_dir")]
     pub workspaces_dir: String,
-    /// Isolate memory databases per workspace. Default: true.
+    /// Give each profile its own `brain.db` so conversation history, notes, and memories from one engagement don't leak into another. Turn off only if you want all profiles sharing a single memory store.
     #[serde(default = "default_true")]
     pub isolate_memory: bool,
-    /// Isolate secrets namespaces per workspace. Default: true.
+    /// Scope provider API keys, channel tokens, and other secrets to the active profile — so a key added while on `client-a` isn't visible from `client-b`. Turn off only if you want all profiles sharing one secret namespace.
     #[serde(default = "default_true")]
     pub isolate_secrets: bool,
-    /// Isolate audit logs per workspace. Default: true.
+    /// Give each profile its own tool-call and channel-message audit trail, so you can hand off logs for a single engagement without exposing other work.
     #[serde(default = "default_true")]
     pub isolate_audit: bool,
-    /// Allow searching across workspaces. Default: false (security).
+    /// Let memory search span all workspaces instead of only the active one. Off by default — turning it on defeats the point of isolation and is only useful for global admin queries.
     #[serde(default)]
     pub cross_workspace_search: bool,
 }
@@ -504,57 +528,68 @@ impl Default for WorkspaceConfig {
     }
 }
 
+/// Used by `#[serde(skip_serializing_if)]` on plain `bool` fields to omit
+/// them from TOML output when they carry their struct-level default (`false`).
+/// Keeps fresh provider entries clean — a default-constructed
+/// `ModelProviderConfig` for one provider family shouldn't write flag fields
+/// that only apply to a different family.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Named provider profile definition.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models"]
 pub struct ModelProviderConfig {
-    /// API key for this provider.
+    /// Secret API token for this provider — grab it from the provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
-    /// Optional provider type/name override.
-    #[serde(default)]
+    /// Override the provider type label. Rarely needed — only useful when you run two profiles against the same provider type (e.g. two different OpenAI-compatible gateways) and want to tell them apart in logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Base URL for OpenAI-compatible endpoints.
-    #[serde(default)]
+    /// HTTPS endpoint the client hits. Override when pointing at a self-hosted gateway (LiteLLM, vLLM, Ollama), a regional endpoint, or a proxy; leave unset to use the provider's public endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    /// Custom API path suffix.
+    /// Path suffix appended to the base URL. Almost no one needs this — only touch it for custom reverse-proxy routing where your gateway mounts the API under a non-standard prefix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_path: Option<String>,
-    /// Default model for this provider.
+    /// Model identifier to send with each request — the ID string from the provider's catalog (e.g. `gpt-4o`, `claude-sonnet-4-5`, `llama-3.3-70b`). Must match a model the provider actually serves on this account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Model temperature (0.0–2.0).
+    /// Sampling temperature passed to the model. Lower values (0.0–0.3) give
+    /// deterministic, near-verbatim output — fits code, routing, summarization.
+    /// Higher values (0.7–1.2) give more varied output — fits open-ended chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
-    /// HTTP timeout in seconds for API calls.
+    /// HTTP request timeout in seconds. Bump this for slow local providers (Ollama on CPU, big local models) or high-latency networks; leave unset otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
-    /// Extra HTTP headers for API requests.
+    /// Extra HTTP headers sent with every request. Niche — used for auth bridges, corporate proxies, or custom gateways that demand a tracing header. Most users never touch this; edit `config.toml` directly if you need it.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub extra_headers: HashMap<String, String>,
-    /// Provider protocol variant ("responses" or "chat_completions").
-    #[serde(default)]
+    /// Wire protocol flavor: `"responses"` for OpenAI's Codex/Responses API, `"chat_completions"` for everything else (OpenAI chat, Anthropic, OpenRouter, Groq, local gateways). Auto-selected per provider — only override if you're forcing an unusual combination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_api: Option<String>,
-    /// If true, load OpenAI auth material (OPENAI_API_KEY or ~/.codex/auth.json).
-    #[serde(default)]
+    /// When true, the client pulls credentials from `OPENAI_API_KEY` or `~/.codex/auth.json` instead of the `api_key` field above. Turn on only for the OpenAI Codex provider; leave off for standard API-key providers.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub requires_openai_auth: bool,
-    /// Azure OpenAI resource name.
+    /// Azure OpenAI resource name (the `<resource>` part of `<resource>.openai.azure.com`). Azure-only; ignore for OpenAI, Anthropic, and everything else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azure_openai_resource: Option<String>,
-    /// Azure OpenAI deployment name.
+    /// Azure OpenAI deployment name — the deployment you created in Azure AI Studio that wraps a specific model. Azure-only; ignore for other providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azure_openai_deployment: Option<String>,
-    /// Azure OpenAI API version.
+    /// Azure OpenAI API version string (e.g. `2024-10-21`). Azure-only; must match a version your resource supports. Ignore for other providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azure_openai_api_version: Option<String>,
-    /// Maximum output tokens for API requests.
+    /// Hard cap on response length in tokens. Most models enforce sensible built-in limits already — leave unset unless you specifically need to clip long outputs for cost or latency reasons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
-    /// Merge system messages into first user message.
-    #[serde(default)]
+    /// Provider-specific quirk: fold the system prompt into the first user message instead of sending a separate system role. Only needed for models that reject (or mishandle) a standalone system role — e.g. certain older Mistral variants.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub merge_system_into_user: bool,
     /// Extra JSON parameters to include in API requests.
     /// Merged at the top level of the request body, allowing provider-specific
@@ -780,22 +815,22 @@ impl std::fmt::Display for HardwareTransport {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "hardware"]
 pub struct HardwareConfig {
-    /// Whether hardware access is enabled
+    /// Opt in to direct physical-hardware control — GPIO pins, USB-tethered microcontrollers (Arduino, ESP32, Nucleo), or SWD/JTAG debug probes. Leave off for software-only use; turning it on without the right transport configured does nothing.
     #[serde(default)]
     pub enabled: bool,
-    /// Transport mode
+    /// How ZeroClaw reaches the hardware: `native` = Linux SBC with direct GPIO access (Raspberry Pi, Orange Pi); `serial` = USB-tethered microcontroller speaking over a TTY; `probe` = SWD/JTAG debug probe driving a target chip via probe-rs; `none` = disabled.
     #[serde(default)]
     pub transport: HardwareTransport,
-    /// Serial port path (e.g. "/dev/ttyACM0")
+    /// TTY path for the `serial` transport — e.g. `/dev/ttyACM0` on Linux, `/dev/tty.usbmodem1` on macOS, `COM3` on Windows. Ignored for other transports.
     #[serde(default)]
     pub serial_port: Option<String>,
-    /// Serial baud rate
+    /// Baud rate negotiated on the serial link. 115200 matches the common Arduino / ESP32 bootloader default; bump to 230400+ when your firmware explicitly supports faster rates and you need the throughput.
     #[serde(default = "default_baud_rate")]
     pub baud_rate: u32,
-    /// Probe target chip (e.g. "STM32F401RE")
+    /// Target chip identifier for `transport = probe` (e.g. `STM32F401RE`, `nRF52840_xxAA`). Passed straight to probe-rs for flash/debug operations; must match a chip probe-rs recognizes.
     #[serde(default)]
     pub probe_target: Option<String>,
-    /// Enable workspace datasheet RAG (index PDF schematics for AI pin lookups)
+    /// Index PDF schematics and datasheets from the workspace into a local RAG store, so the agent can look up pin assignments and electrical specs inline when you ask hardware questions. Off by default — turn on once the workspace has relevant PDFs dropped in.
     #[serde(default)]
     pub workspace_datasheets: bool,
 }
@@ -4821,19 +4856,78 @@ pub async fn ws_connect_with_proxy(
 
     match proxy_url {
         None => {
-            // No proxy — delegate directly.
-            let (stream, resp) = tokio_tungstenite::connect_async(ws_url).await?;
-            // Re-wrap the inner stream into our boxed type so the caller
-            // always gets `ProxiedWsStream`.
-            let inner = stream.into_inner();
-            let boxed = BoxedIo(Box::new(inner));
-            let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
-                boxed,
-                tokio_tungstenite::tungstenite::protocol::Role::Client,
-                None,
-            )
-            .await;
-            Ok((ws, resp))
+            // No proxy — establish TCP+TLS manually, wrap in BoxedIo, then
+            // perform the WebSocket handshake over the wrapped stream.
+            //
+            // Previous implementation used `connect_async` followed by
+            // `into_inner()` + `from_raw_socket` to normalize the return
+            // type.  That pattern discards data already buffered by the
+            // tungstenite frame codec, causing channels (Slack Socket Mode,
+            // Discord, etc.) to silently miss the first frames sent by the
+            // server and all subsequent events.
+            use tokio::net::TcpStream;
+
+            let target = reqwest::Url::parse(ws_url)
+                .with_context(|| format!("Invalid WebSocket URL: {ws_url}"))?;
+            let target_host = target
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("WebSocket URL has no host: {ws_url}"))?
+                .to_string();
+            let target_port = target
+                .port_or_known_default()
+                .unwrap_or(if target.scheme() == "wss" { 443 } else { 80 });
+
+            let tcp = TcpStream::connect(format!("{target_host}:{target_port}"))
+                .await
+                .with_context(|| format!("TCP connect to {target_host}:{target_port}"))?;
+
+            let is_secure = target.scheme() == "wss";
+            let stream: BoxedIo = if is_secure {
+                let mut root_store = rustls::RootCertStore::empty();
+                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                let tls_config = std::sync::Arc::new(
+                    rustls::ClientConfig::builder()
+                        .with_root_certificates(root_store)
+                        .with_no_client_auth(),
+                );
+                let connector = tokio_rustls::TlsConnector::from(tls_config);
+                let server_name = rustls_pki_types::ServerName::try_from(target_host.clone())
+                    .with_context(|| format!("Invalid TLS server name: {target_host}"))?;
+                let tls_stream = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .with_context(|| format!("TLS handshake with {target_host}"))?;
+                BoxedIo(Box::new(tls_stream))
+            } else {
+                BoxedIo(Box::new(tcp))
+            };
+
+            let default_port = if is_secure { 443 } else { 80 };
+            let host_header = if target_port == default_port {
+                target_host.clone()
+            } else {
+                format!("{target_host}:{target_port}")
+            };
+
+            let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
+                .uri(ws_url)
+                .header("Host", host_header)
+                .header("Connection", "Upgrade")
+                .header("Upgrade", "websocket")
+                .header(
+                    "Sec-WebSocket-Key",
+                    tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+                )
+                .header("Sec-WebSocket-Version", "13")
+                .body(())
+                .with_context(|| "Failed to build WebSocket upgrade request")?;
+
+            let (ws_stream, response) =
+                tokio_tungstenite::client_async(ws_request, stream)
+                    .await
+                    .with_context(|| format!("WebSocket handshake failed for {ws_url}"))?;
+
+            Ok((ws_stream, response))
         }
         Some(proxy) => ws_connect_via_proxy(ws_url, &proxy).await,
     }
@@ -5173,41 +5267,38 @@ pub enum SearchMode {
 #[prefix = "memory"]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
-    /// "sqlite" | "lucid" | "postgres" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
-    ///
-    /// `postgres` uses `[storage.provider.config].db_url`; requires `--features memory-postgres` build.
-    /// `qdrant` uses `[memory.qdrant]` config or `QDRANT_URL` env var.
+    /// Where conversations, notes, and memories live. `sqlite` = embedded DB with optional vector + keyword hybrid search (fast, self-contained, default pick); `markdown` = plain-text files you can read and edit by hand (portable but no vector search); `lucid` = sync with the external `lucid-memory` CLI; `qdrant` = dedicated vector DB via `[memory.qdrant]` or `QDRANT_URL` env var; `none` = disable memory entirely.
     pub backend: String,
-    /// Auto-save user-stated conversation input to memory (assistant output is excluded)
+    /// Auto-save what *you* tell ZeroClaw into memory as conversation history — the agent's own replies are not saved. Turn off if you want memory to only hold things you explicitly record via the memory tool.
     pub auto_save: bool,
-    /// Run memory/session hygiene (archiving + retention cleanup)
+    /// Run the periodic hygiene pass that archives stale daily/session files and enforces retention windows. Leave on unless you want to manage cleanup yourself.
     #[serde(default = "default_hygiene_enabled")]
     pub hygiene_enabled: bool,
-    /// Archive daily/session files older than this many days
+    /// Move daily/session files to the archive directory after this many days. Keeps the hot working set small without deleting history.
     #[serde(default = "default_archive_after_days")]
     pub archive_after_days: u32,
-    /// Purge archived files older than this many days
+    /// Delete archived files permanently after this many days. Set high if you need long-term history; set low for privacy / disk-space reasons.
     #[serde(default = "default_purge_after_days")]
     pub purge_after_days: u32,
-    /// For sqlite backend: prune conversation rows older than this many days
+    /// For the sqlite backend only — drop conversation rows older than this many days to keep the DB lean. Doesn't touch core memories or notes.
     #[serde(default = "default_conversation_retention_days")]
     pub conversation_retention_days: u32,
-    /// Embedding provider: "none" | "openai" | "custom:URL"
+    /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
-    /// Embedding model name (e.g. "text-embedding-3-small")
+    /// Embedding model identifier — must match a model your chosen embedding provider serves (e.g. `text-embedding-3-small` for OpenAI). Changing this invalidates existing embeddings; you'll need to re-index.
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
-    /// Embedding vector dimensions
+    /// Vector width produced by the embedding model — must match the model's native dimension or vectors won't store correctly. Look up the number on the provider's model page.
     #[serde(default = "default_embedding_dims")]
     pub embedding_dimensions: usize,
-    /// Weight for vector similarity in hybrid search (0.0–1.0)
+    /// How heavily vector (semantic) similarity counts when `search_mode = hybrid`. Raise toward 1.0 to favor meaning-based matches; lower it to lean on keyword overlap instead.
     #[serde(default = "default_vector_weight")]
     pub vector_weight: f64,
-    /// Weight for keyword BM25 in hybrid search (0.0–1.0)
+    /// How heavily BM25 (keyword) overlap counts when `search_mode = hybrid`. Raise toward 1.0 for exact-term matching; lower it when paraphrases should still score well.
     #[serde(default = "default_keyword_weight")]
     pub keyword_weight: f64,
-    /// Search strategy: bm25 (keyword only), embedding (vector only), or hybrid (both).
+    /// How memories are retrieved: `bm25` = keyword-only (no embeddings, cheapest); `embedding` = vector similarity only (needs an embedding provider); `hybrid` = blended keyword + vector score using the weights above (most robust).
     #[serde(default)]
     pub search_mode: SearchMode,
     /// Minimum hybrid score (0.0–1.0) for a memory to be included in context.
@@ -5708,45 +5799,8 @@ impl Default for AutonomyConfig {
         Self {
             level: AutonomyLevel::Supervised,
             workspace_only: true,
-            allowed_commands: vec![
-                "git".into(),
-                "npm".into(),
-                "cargo".into(),
-                "ls".into(),
-                "cat".into(),
-                "grep".into(),
-                "find".into(),
-                "echo".into(),
-                "pwd".into(),
-                "wc".into(),
-                "head".into(),
-                "tail".into(),
-                "date".into(),
-                "python".into(),
-                "python3".into(),
-                "pip".into(),
-                "node".into(),
-            ],
-            forbidden_paths: vec![
-                "/etc".into(),
-                "/root".into(),
-                "/home".into(),
-                "/usr".into(),
-                "/bin".into(),
-                "/sbin".into(),
-                "/lib".into(),
-                "/opt".into(),
-                "/boot".into(),
-                "/dev".into(),
-                "/proc".into(),
-                "/sys".into(),
-                "/var".into(),
-                "/tmp".into(),
-                "~/.ssh".into(),
-                "~/.gnupg".into(),
-                "~/.aws".into(),
-                "~/.config".into(),
-            ],
+            allowed_commands: crate::policy::default_allowed_commands(),
+            forbidden_paths: crate::policy::default_forbidden_paths(),
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
@@ -6343,7 +6397,7 @@ impl Default for CronConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tunnel"]
 pub struct TunnelConfig {
-    /// Tunnel provider: `"none"`, `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"openvpn"`, `"pinggy"`, or `"custom"`. Default: `"none"`.
+    /// How the gateway gets exposed to the public internet so webhooks (Telegram, Slack, etc.) can reach it. `none` = keep it local, no tunnel; `cloudflare` = Cloudflare Tunnel via cloudflared (needs a Zero Trust account and token); `tailscale` = Tailscale Funnel/Serve (tailnet-only or public, no account beyond tailscale); `ngrok` = ngrok agent with auth token; `openvpn` = bring-your-own OpenVPN egress; `pinggy` = Pinggy SSH tunnels (quick one-shot URLs); `custom` = run an arbitrary command you define under `[tunnel.custom]`.
     pub provider: String,
 
     /// Cloudflare Tunnel configuration (used when `provider = "cloudflare"`).
@@ -6596,6 +6650,9 @@ pub struct ChannelsConfig {
     /// WeCom (WeChat Enterprise) Bot Webhook channel configuration.
     #[nested]
     pub wecom: Option<WeComConfig>,
+    /// WeChat personal iLink Bot channel configuration (QR code login).
+    #[nested]
+    pub wechat: Option<WeChatConfig>,
     /// QQ Official Bot channel configuration.
     #[nested]
     pub qq: Option<QQConfig>,
@@ -6769,6 +6826,10 @@ impl ChannelsConfig {
                 self.wecom.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.wechat.as_ref())),
+                self.wechat.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.qq.as_ref())),
                 self.qq.is_some()
             ),
@@ -6844,6 +6905,7 @@ impl Default for ChannelsConfig {
             feishu: None,
             dingtalk: None,
             wecom: None,
+            wechat: None,
             qq: None,
             twitter: None,
             mochat: None,
@@ -7097,6 +7159,14 @@ pub struct SlackConfig {
     /// Direct messages remain allowed.
     #[serde(default)]
     pub mention_only: bool,
+    /// When true (and `mention_only` is also true), messages inside a Slack
+    /// thread must also @-mention the bot to trigger a response. By default,
+    /// thread replies are allowed through without a mention so the bot can
+    /// keep a back-and-forth going without the user repeating @-mentions.
+    /// Set this to true in channels shared with human discussion where the
+    /// bot should stay silent unless explicitly addressed.
+    #[serde(default)]
+    pub strict_mention_in_thread: bool,
     /// Use the newer Slack `markdown` block type (12 000 char limit, richer formatting).
     /// Defaults to false (uses universally supported `section` blocks with `mrkdwn`).
     /// Enable this only if your Slack workspace supports the `markdown` block type.
@@ -7300,6 +7370,14 @@ pub struct MatrixConfig {
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// When true (default), replies are sent as thread replies. Starts a new thread from the
+    /// incoming message when none exists. When false, only continues existing threads.
+    #[serde(default = "default_true")]
+    pub reply_in_thread: bool,
+    /// When true (default), the bot sends acknowledgement reactions while processing
+    /// (👀 on receipt, ✅ on completion). Disable to keep rooms reaction-free.
+    #[serde(default = "default_true")]
+    pub ack_reactions: bool,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -7778,6 +7856,10 @@ pub struct IrcConfig {
     pub sasl_password: Option<String>,
     /// Verify TLS certificate (default: true)
     pub verify_tls: Option<bool>,
+    /// When true, only respond to messages that mention the bot.
+    /// Other messages in the channel are silently ignored.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 impl ChannelConfig for IrcConfig {
@@ -8583,6 +8665,44 @@ impl ChannelConfig for WeComConfig {
     }
 }
 
+/// WeChat personal iLink Bot channel configuration.
+///
+/// Uses the iLink Bot API (`ilinkai.weixin.qq.com`) with QR-code login.
+/// The bot token is obtained by scanning a QR code and persisted to disk
+/// so subsequent restarts do not require re-scanning.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.wechat"]
+pub struct WeChatConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allowed WeChat user IDs (e.g. `"xxx@im.wechat"`).
+    /// `"*"` = allow all. Empty = require pairing (`/bind <code>` from WeChat);
+    /// the QR-login user is auto-added at first connect.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Override the iLink API base URL. Default: `https://ilinkai.weixin.qq.com`.
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+    /// Override the CDN base URL. Default: `https://novac2c.cdn.weixin.qq.com/c2c`.
+    #[serde(default)]
+    pub cdn_base_url: Option<String>,
+    /// Directory to persist bot token and sync cursor.
+    /// Default: `~/.zeroclaw/wechat/`.
+    #[serde(default)]
+    pub state_dir: Option<String>,
+}
+
+impl ChannelConfig for WeChatConfig {
+    fn name() -> &'static str {
+        "WeChat"
+    }
+    fn desc() -> &'static str {
+        "WeChat iLink Bot"
+    }
+}
+
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -9303,6 +9423,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
             workspace: WorkspaceConfig::default(),
+            onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),
@@ -9944,6 +10065,27 @@ impl Config {
             .map(|(name, profile)| (name.clone(), profile.clone()))
     }
 
+    /// Apply Codex-app-server compatibility shims to the resolved fallback provider entry.
+    ///
+    /// Historically this method mutated `self.providers.fallback` to a "canonical" key
+    /// derived from the profile's `name` field, `wire_api`, or `base_url`. That mutation
+    /// caused two problems:
+    ///
+    /// 1. **CLI get/set divergence.** `Config::load_or_init` calls `apply_env_overrides`,
+    ///    which calls this function. After load, `providers.fallback` no longer matched
+    ///    what was on disk, so `zeroclaw config get providers.fallback` returned the
+    ///    rewritten value while the file still had the user's literal value. The next
+    ///    `save()` would then persist the rewrite, silently changing the user's config.
+    /// 2. **Orphaned references.** When the rewrite pointed at a key that did not exist
+    ///    in `providers.models` (e.g. profile had `name = "gemini"` but no
+    ///    `[providers.models.gemini]` entry), runtime `fallback_provider()` lookups
+    ///    returned `None` and downstream code fell through to a hardcoded default model.
+    ///
+    /// The fix: keep `self.providers.fallback` as the literal user-supplied key.
+    /// Propagate the profile's `base_url` / `api_path` / `max_tokens` / `api_key` onto the
+    /// resolved entry as before, and mirror the entry under any canonical alias keys so
+    /// runtime lookups by either name still resolve. The user's `[providers] fallback`
+    /// value is preserved end-to-end through load → save → load.
     fn apply_named_model_provider_profile(&mut self) {
         let Some(current_provider) = self.providers.fallback.clone() else {
             return;
@@ -10034,29 +10176,30 @@ impl Config {
             .map(str::trim)
             .filter(|value| !value.is_empty());
 
+        // Mirror the resolved entry under any canonical alias keys so that runtime
+        // lookups by the profile-implied name (e.g. wire_api → "openai-codex",
+        // explicit `name = ...`, or `custom:<base_url>`) also resolve. We do NOT
+        // rewrite `providers.fallback` itself: that is the user's literal config
+        // value and must round-trip cleanly through CLI get/set/save.
+        let mut alias_keys: Vec<String> = Vec::new();
         if normalized_wire_api == Some("responses") {
-            self.providers.fallback = Some("openai-codex".to_string());
-            return;
+            alias_keys.push("openai-codex".to_string());
         }
-
         if let Some(profile_name) = profile_name
             && !profile_name.eq_ignore_ascii_case(&profile_key)
         {
-            self.providers.fallback = Some(profile_name.to_string());
-            return;
+            alias_keys.push(profile_name.to_string());
+        }
+        if let Some(ref base_url) = base_url {
+            alias_keys.push(format!("custom:{base_url}"));
         }
 
-        if let Some(base_url) = base_url {
-            let canonical_key = format!("custom:{base_url}");
-            // Mirror the profile under the canonical key so runtime
-            // `fallback_provider()` lookups resolve — without this the rename
-            // would orphan the entry still keyed under the original profile name.
-            if !self.providers.models.contains_key(&canonical_key)
+        for alias in alias_keys {
+            if !self.providers.models.contains_key(&alias)
                 && let Some(entry) = self.providers.models.get(&profile_key).cloned()
             {
-                self.providers.models.insert(canonical_key.clone(), entry);
+                self.providers.models.insert(alias, entry);
             }
-            self.providers.fallback = Some(canonical_key);
         }
     }
 
@@ -11768,8 +11911,12 @@ auto_save = true
 
     #[test]
     async fn memory_config_pgvector_roundtrip() {
+        // `auto_save` is required on MemoryConfig and unrelated to the pgvector
+        // fields these tests exercise. Including it keeps the fixture parseable
+        // without coupling the test to schema-default behavior on auto_save.
         let toml = r#"
             backend = "postgres"
+            auto_save = true
             [postgres]
             vector_enabled = true
             vector_dimensions = 768
@@ -11786,7 +11933,10 @@ auto_save = true
 
     #[test]
     async fn memory_config_pgvector_defaults_when_omitted() {
-        let toml = r#"backend = "postgres""#;
+        let toml = r#"
+            backend = "postgres"
+            auto_save = true
+        "#;
         let parsed: MemoryConfig = toml::from_str(toml).unwrap();
         assert!(!parsed.postgres.vector_enabled);
         assert_eq!(parsed.postgres.vector_dimensions, 1536);
@@ -11908,6 +12058,7 @@ auto_save = true
                 feishu: None,
                 dingtalk: None,
                 wecom: None,
+                wechat: None,
                 qq: None,
                 twitter: None,
                 mochat: None,
@@ -11963,6 +12114,7 @@ auto_save = true
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
             workspace: WorkspaceConfig::default(),
+            onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),
@@ -12532,6 +12684,7 @@ default_temperature = 0.7
             mcp: McpConfig::default(),
             nodes: NodesConfig::default(),
             workspace: WorkspaceConfig::default(),
+            onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),
@@ -12897,6 +13050,8 @@ default_temperature = 0.7
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -12929,6 +13084,8 @@ default_temperature = 0.7
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -12952,6 +13109,17 @@ allowed_rooms = ["!ops:matrix.org"]
         assert!(parsed.user_id.is_none());
         assert!(parsed.device_id.is_none());
         assert_eq!(parsed.allowed_rooms, vec!["!ops:matrix.org"]);
+    }
+
+    #[test]
+    async fn matrix_config_reply_in_thread_defaults_to_true() {
+        let toml = r#"
+homeserver = "https://matrix.org"
+access_token = "tok"
+allowed_users = ["@u:matrix.org"]
+"#;
+        let parsed: MatrixConfig = toml::from_str(toml).unwrap();
+        assert!(parsed.reply_in_thread);
     }
 
     #[test]
@@ -13038,6 +13206,8 @@ allowed_rooms = ["!ops:matrix.org"]
                 mention_only: false,
                 password: None,
                 approval_timeout_secs: 300,
+                reply_in_thread: true,
+                ack_reactions: true,
             }),
             signal: None,
             whatsapp: None,
@@ -13052,6 +13222,7 @@ allowed_rooms = ["!ops:matrix.org"]
             feishu: None,
             dingtalk: None,
             wecom: None,
+            wechat: None,
             qq: None,
             twitter: None,
             mochat: None,
@@ -13433,6 +13604,7 @@ bot_token = "xoxb-tok"
             feishu: None,
             dingtalk: None,
             wecom: None,
+            wechat: None,
             qq: None,
             twitter: None,
             mochat: None,
@@ -14127,10 +14299,10 @@ requires_openai_auth = true
         );
 
         config.apply_env_overrides();
-        assert_eq!(
-            config.providers.fallback.as_deref(),
-            Some("custom:https://api.tonsof.blue/v1")
-        );
+        // The user's literal fallback key is preserved; we no longer rewrite it
+        // to a canonical alias. This is the round-trip-safe contract that the
+        // `zeroclaw config get/set` CLI relies on.
+        assert_eq!(config.providers.fallback.as_deref(), Some("sub2api"));
         // The original entry is still stored under its config key.
         assert_eq!(
             config
@@ -14140,8 +14312,9 @@ requires_openai_auth = true
                 .and_then(|e| e.base_url.as_deref()),
             Some("https://api.tonsof.blue/v1")
         );
-        // The entry is also mirrored under the canonical fallback key so
-        // runtime fallback_provider() lookups resolve.
+        // The entry is also mirrored under the canonical alias key so runtime
+        // lookups by `custom:<base_url>` still resolve even though the user's
+        // fallback string is the original profile key.
         assert_eq!(
             config
                 .providers
@@ -14180,7 +14353,10 @@ requires_openai_auth = true
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("OPENAI_API_KEY") };
 
-        assert_eq!(config.providers.fallback.as_deref(), Some("openai-codex"));
+        // The user's literal fallback key is preserved; we no longer rewrite it
+        // to "openai-codex". The Codex-app-server compatibility shim instead
+        // mirrors the resolved entry under that alias key for runtime lookups.
+        assert_eq!(config.providers.fallback.as_deref(), Some("sub2api"));
         // The original entry is still stored under its config key.
         let entry = config
             .providers
@@ -14189,6 +14365,175 @@ requires_openai_auth = true
             .expect("sub2api entry");
         assert_eq!(entry.base_url.as_deref(), Some("https://api.tonsof.blue"));
         assert_eq!(entry.api_key.as_deref(), Some("sk-test-codex-key"));
+        // The entry is mirrored under the "openai-codex" alias so any code
+        // path that looks providers up by that canonical key still finds it.
+        let aliased = config
+            .providers
+            .models
+            .get("openai-codex")
+            .expect("openai-codex alias entry");
+        assert_eq!(aliased.base_url.as_deref(), Some("https://api.tonsof.blue"));
+        assert_eq!(aliased.api_key.as_deref(), Some("sk-test-codex-key"));
+    }
+
+    /// Regression test for the config CLI get/set divergence bug.
+    ///
+    /// Before the fix, `apply_named_model_provider_profile` rewrote
+    /// `self.providers.fallback` to the profile's `name` field whenever they
+    /// differed. That meant:
+    ///
+    /// - `zeroclaw config get providers.fallback` returned the rewritten value
+    ///   even though the on-disk TOML still held the user's literal key.
+    /// - `zeroclaw config set providers.fallback <new>` would persist `<new>`
+    ///   to disk, but the next load mutated it back in memory, so a subsequent
+    ///   `get` reported a stale value and the daemon's resolver looked up a
+    ///   provider key that did not exist in `[providers.models.*]`.
+    ///
+    /// The fix preserves the literal fallback key end-to-end. The named-profile
+    /// shim now only mirrors the resolved entry under canonical alias keys for
+    /// runtime lookup convenience.
+    #[test]
+    async fn apply_env_overrides_preserves_user_supplied_fallback_key() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        // User configures fallback = "primary" with a profile whose `name` field
+        // differs from the key. This is the exact shape that triggered the bug.
+        config.providers.fallback = Some("primary".to_string());
+        config.providers.models.insert(
+            "primary".to_string(),
+            ModelProviderConfig {
+                name: Some("alias-name".to_string()),
+                base_url: Some("https://example.invalid/v1".to_string()),
+                model: Some("primary-model".to_string()),
+                ..Default::default()
+            },
+        );
+
+        config.apply_env_overrides();
+
+        // The literal user key must survive. This is what `config get` returns
+        // and what `config set` persists.
+        assert_eq!(
+            config.providers.fallback.as_deref(),
+            Some("primary"),
+            "providers.fallback must preserve the user's literal key after \
+             apply_env_overrides; got {:?}",
+            config.providers.fallback,
+        );
+        // Runtime resolution must still find the entry under the original key.
+        assert!(
+            config.providers.fallback_provider().is_some(),
+            "fallback_provider() must still resolve via the user's literal key",
+        );
+    }
+
+    /// Round-trip test for the config CLI: a TOML file with the user's value
+    /// must deserialize, apply env overrides, and serialize back to the same
+    /// `providers.fallback`. This is the full path that backed the user-visible
+    /// `config set` -> `config get` divergence.
+    #[test]
+    async fn fallback_round_trips_through_load_apply_serialize() {
+        let _env_guard = env_override_lock().await;
+        let toml_in = r#"
+schema_version = 1
+
+[providers]
+fallback = "primary"
+
+[providers.models.primary]
+name = "alias-name"
+base_url = "https://example.invalid/v1"
+model = "primary-model"
+"#;
+
+        let mut config: Config = toml::from_str(toml_in).expect("parse toml");
+        config.apply_env_overrides();
+
+        // What `config get providers.fallback` returns post-load.
+        assert_eq!(
+            config.get_prop("providers.fallback").unwrap(),
+            "primary",
+            "config get providers.fallback must return the user's literal value",
+        );
+
+        // What `config save` would write back to disk.
+        let toml_out = toml::to_string(&config).expect("serialize toml");
+        assert!(
+            toml_out.contains(r#"fallback = "primary""#),
+            "serialized config must keep fallback = \"primary\"; got:\n{toml_out}",
+        );
+    }
+
+    /// `set_prop` followed by `get_prop` must return the value that was set,
+    /// even when the surrounding profile shape would historically have caused
+    /// the in-memory value to be rewritten.
+    #[test]
+    async fn set_prop_then_get_prop_round_trips_for_fallback() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        config.providers.models.insert(
+            "primary".to_string(),
+            ModelProviderConfig {
+                name: Some("alias-name".to_string()),
+                model: Some("primary-model".to_string()),
+                ..Default::default()
+            },
+        );
+        // Simulate the daemon's load path before the user runs `config set`.
+        config.apply_env_overrides();
+
+        config.set_prop("providers.fallback", "primary").unwrap();
+        // Mimic any post-set normalization a future codepath might add.
+        config.apply_env_overrides();
+
+        assert_eq!(config.get_prop("providers.fallback").unwrap(), "primary");
+    }
+
+    /// `resolve_default_model` returns the fallback provider's model when set,
+    /// and falls through to the first available `models.*` entry otherwise.
+    /// Returning `None` is reserved for "no provider has any model configured",
+    /// which callers must surface as a configuration error rather than silently
+    /// substituting a vendor default.
+    #[test]
+    async fn resolve_default_model_prefers_fallback_then_first_available() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        // Empty config: no model anywhere -> None (caller errors loudly).
+        assert_eq!(config.providers.resolve_default_model(), None);
+
+        // Add an entry without a model -> still None.
+        config
+            .providers
+            .models
+            .insert("secondary".to_string(), ModelProviderConfig::default());
+        assert_eq!(config.providers.resolve_default_model(), None);
+
+        // Add an entry with a model -> first-available wins when no fallback.
+        config.providers.models.insert(
+            "tertiary".to_string(),
+            ModelProviderConfig {
+                model: Some("tertiary-model".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            config.providers.resolve_default_model().as_deref(),
+            Some("tertiary-model"),
+        );
+
+        // Set fallback to a provider with its own model -> fallback wins.
+        config.providers.fallback = Some("primary".to_string());
+        config.providers.models.insert(
+            "primary".to_string(),
+            ModelProviderConfig {
+                model: Some("primary-model".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            config.providers.resolve_default_model().as_deref(),
+            Some("primary-model"),
+        );
     }
 
     #[test]
@@ -16892,6 +17237,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
         let fields = mx.secret_fields();
         assert_eq!(fields.len(), 3);
@@ -16922,6 +17269,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
         let fields = mx.secret_fields();
         assert!(!fields[0].is_set);
@@ -16945,6 +17294,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
         mx.set_secret("channels.matrix.access-token", "new-token".into())
             .unwrap();
@@ -16969,6 +17320,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
         assert!(
             mx.set_secret("channels.matrix.nonexistent", "val".into())
@@ -17010,6 +17363,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         });
 
         let fields = config.secret_fields();
@@ -17037,6 +17392,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         });
 
         config
@@ -17064,6 +17421,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             recovery_key: None,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         });
         config
             .set_secret("channels.matrix.access-token", "sk-test".into())
@@ -17105,6 +17464,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
 
         // Encrypt
@@ -17138,6 +17499,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -17169,6 +17532,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -17195,6 +17560,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         }
     }
 
@@ -17203,7 +17570,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mx = test_matrix_config();
         let fields = mx.prop_fields();
         let by_name: std::collections::HashMap<&str, &crate::traits::PropFieldInfo> =
-            fields.iter().map(|f| (f.name, f)).collect();
+            fields.iter().map(|f| (f.name.as_str(), f)).collect();
 
         // Bool field
         let enabled = by_name["channels.matrix.enabled"];
@@ -17485,7 +17852,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
         for field in &fields {
             // get_prop must not panic or error
-            let get_result = config.get_prop(field.name);
+            let get_result = config.get_prop(&field.name);
             assert!(
                 get_result.is_ok(),
                 "get_prop failed for '{}': {}",
@@ -17499,7 +17866,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 continue;
             }
 
-            let set_result = config.set_prop(field.name, &field.display_value);
+            let set_result = config.set_prop(&field.name, &field.display_value);
             assert!(
                 set_result.is_ok(),
                 "set_prop failed for '{}' with value '{}': {}",
@@ -17509,7 +17876,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             );
 
             // Value should survive the round-trip
-            let after = config.get_prop(field.name).unwrap();
+            let after = config.get_prop(&field.name).unwrap();
             assert_eq!(
                 after, field.display_value,
                 "round-trip mismatch for '{}': set '{}', got '{}'",
@@ -17540,7 +17907,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             );
 
             for variant in &variants {
-                let result = config.set_prop(field.name, variant);
+                let result = config.set_prop(&field.name, variant);
                 assert!(
                     result.is_ok(),
                     "set_prop('{}', '{}') failed: {}",

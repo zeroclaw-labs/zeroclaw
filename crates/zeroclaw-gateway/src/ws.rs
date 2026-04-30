@@ -462,10 +462,13 @@ async fn process_chat_message(
     // instead — `turn_streamed` writes to the channel and we drain it
     // from the other branch.
     let content_owned = content.to_string();
+    let session_key_owned = session_key.to_string();
     let turn_fut = async {
-        agent
-            .turn_streamed(&content_owned, event_tx, Some(cancel_token.clone()))
-            .await
+        zeroclaw_runtime::agent::loop_::scope_session_key(
+            Some(session_key_owned),
+            agent.turn_streamed(&content_owned, event_tx, Some(cancel_token.clone())),
+        )
+        .await
     };
 
     // Drive both futures concurrently: the agent turn produces events
@@ -510,11 +513,11 @@ async fn process_chat_message(
                 TurnEvent::Thinking { delta } => {
                     serde_json::json!({ "type": "thinking", "content": delta })
                 }
-                TurnEvent::ToolCall { name, args } => {
-                    serde_json::json!({ "type": "tool_call", "name": name, "args": args })
+                TurnEvent::ToolCall { id, name, args } => {
+                    serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
                 }
-                TurnEvent::ToolResult { name, output } => {
-                    serde_json::json!({ "type": "tool_result", "name": name, "output": output })
+                TurnEvent::ToolResult { id, name, output } => {
+                    serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
                 }
             };
             let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;

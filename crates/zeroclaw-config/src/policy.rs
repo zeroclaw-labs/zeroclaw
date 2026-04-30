@@ -181,7 +181,7 @@ pub struct SecurityPolicy {
 
 /// Default allowed commands for Unix platforms.
 #[cfg(not(target_os = "windows"))]
-fn default_allowed_commands() -> Vec<String> {
+pub(crate) fn default_allowed_commands() -> Vec<String> {
     #[allow(unused_mut)]
     let mut cmds = vec![
         "git".into(),
@@ -218,7 +218,7 @@ fn default_allowed_commands() -> Vec<String> {
 /// Includes both native Windows commands and their Unix equivalents
 /// (available via Git for Windows, WSL, etc.).
 #[cfg(target_os = "windows")]
-fn default_allowed_commands() -> Vec<String> {
+pub(crate) fn default_allowed_commands() -> Vec<String> {
     vec![
         // Cross-platform tools
         "git".into(),
@@ -255,7 +255,7 @@ fn default_allowed_commands() -> Vec<String> {
 
 /// Default forbidden paths for Unix platforms.
 #[cfg(not(target_os = "windows"))]
-fn default_forbidden_paths() -> Vec<String> {
+pub(crate) fn default_forbidden_paths() -> Vec<String> {
     vec![
         "/etc".into(),
         "/root".into(),
@@ -280,7 +280,7 @@ fn default_forbidden_paths() -> Vec<String> {
 
 /// Default forbidden paths for Windows platforms.
 #[cfg(target_os = "windows")]
-fn default_forbidden_paths() -> Vec<String> {
+pub(crate) fn default_forbidden_paths() -> Vec<String> {
     vec![
         "C:\\Windows".into(),
         "C:\\Windows\\System32".into(),
@@ -548,10 +548,10 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
                 match ch {
                     '\'' => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
-                    '&' => {
-                        if chars.next_if_eq(&'&').is_none() {
-                            return true;
-                        }
+                    // This must consume the second '&' so `&&` is not later
+                    // re-read as a lone trailing '&'.
+                    '&' if chars.next_if_eq(&'&').is_none() => {
+                        return true;
                     }
                     _ => {}
                 }
