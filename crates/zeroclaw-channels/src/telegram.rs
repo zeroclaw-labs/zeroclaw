@@ -1547,6 +1547,22 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     fn extract_reply_context(&self, message: &serde_json::Value) -> Option<String> {
         let reply = message.get("reply_to_message")?;
 
+        // Skip the auto-injected topic-root reference Telegram adds to every
+        // message in a non-General forum topic. Its message_id equals the
+        // parent message's message_thread_id. Treating it as a real reply
+        // produces a spurious `> @user:\n> [Message]` blockquote prefix that
+        // downstream reply-intent classification reads as "user is replying
+        // to someone else" and rejects.
+        let reply_mid = reply.get("message_id").and_then(serde_json::Value::as_i64);
+        let thread_id = message
+            .get("message_thread_id")
+            .and_then(serde_json::Value::as_i64);
+        if let (Some(rmid), Some(tid)) = (reply_mid, thread_id)
+            && rmid == tid
+        {
+            return None;
+        }
+
         let reply_sender = reply
             .get("from")
             .and_then(|from| from.get("username"))
@@ -3272,8 +3288,10 @@ Ensure only one `zeroclaw` process is using this bot token."
     ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
-        // Parse recipient for chat_id (may contain ":thread_id" suffix).
-        let chat_id = recipient.split_once(':').map_or(recipient, |(c, _)| c);
+        // Parse recipient for chat_id + optional thread_id ("chat_id:thread_id" format).
+        let (chat_id, thread_id) = recipient
+            .split_once(':')
+            .map_or((recipient, None), |(c, t)| (c, Some(t)));
 
         // Unique key embedded in callback_data so listen() can route the tap.
         let approval_id = uuid::Uuid::new_v4().to_string();
@@ -3295,12 +3313,15 @@ Ensure only one `zeroclaw` process is using this bot token."
             ]]
         });
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "chat_id": chat_id,
             "text": text,
             "parse_mode": "HTML",
             "reply_markup": reply_markup,
         });
+        if let Some(tid) = thread_id {
+            body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+        }
 
         // Register the oneshot BEFORE sending the message to avoid a race
         // where the user taps the button before the sender is in the map.
@@ -4626,6 +4647,43 @@ mod tests {
             "text": "just a regular message"
         });
         assert!(ch.extract_reply_context(&msg).is_none());
+    }
+
+    #[test]
+    fn extract_reply_context_skips_topic_root() {
+        // Telegram auto-injects a reply_to_message pointing at the topic-root
+        // message on every message in a non-General forum topic. The injected
+        // reply's message_id equals the parent's message_thread_id. It is
+        // not a real reply and must not produce a blockquote prefix.
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        let msg = serde_json::json!({
+            "message_thread_id": 42,
+            "text": "hello in topic",
+            "reply_to_message": {
+                "message_id": 42,
+                "from": { "username": "alice" },
+                "forum_topic_created": { "name": "General Discussion", "icon_color": 0 }
+            }
+        });
+        assert!(ch.extract_reply_context(&msg).is_none());
+    }
+
+    #[test]
+    fn extract_reply_context_real_reply_in_topic() {
+        // A genuine reply inside a forum topic (reply.message_id differs from
+        // the parent's message_thread_id) should still produce a blockquote.
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        let msg = serde_json::json!({
+            "message_thread_id": 42,
+            "text": "I agree",
+            "reply_to_message": {
+                "message_id": 100,
+                "from": { "username": "alice" },
+                "text": "What do you think?"
+            }
+        });
+        let ctx = ch.extract_reply_context(&msg).unwrap();
+        assert_eq!(ctx, "> @alice:\n> What do you think?");
     }
 
     #[test]

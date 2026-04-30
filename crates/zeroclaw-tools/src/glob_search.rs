@@ -48,14 +48,9 @@ impl Tool for GlobSearchTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'pattern' parameter"))?;
 
-        // Rate limit check (fast path)
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
+        // Rate limiting and path-allowlist checks are applied by the
+        // RateLimitedTool + PathGuardedTool wrappers at registration time
+        // (see zeroclaw-runtime::tools::mod).
 
         // Security: reject absolute paths unless under an explicit allowed root.
         if (pattern.starts_with('/') || pattern.starts_with('\\'))
@@ -74,15 +69,6 @@ impl Tool for GlobSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Path traversal ('..') is not allowed in glob patterns.".into()),
-            });
-        }
-
-        // Record action to consume rate limit budget
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
             });
         }
 
@@ -360,21 +346,9 @@ mod tests {
         assert!(result.output.contains("file.txt"));
     }
 
-    #[tokio::test]
-    async fn glob_search_rate_limited() {
-        let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("file.txt"), "").unwrap();
-
-        let tool = GlobSearchTool::new(test_security_with(
-            dir.path().to_path_buf(),
-            AutonomyLevel::Supervised,
-            0,
-        ));
-        let result = tool.execute(json!({"pattern": "*.txt"})).await.unwrap();
-
-        assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("Rate limit"));
-    }
+    // Rate-limit behavior is covered by RateLimitedTool's own tests in
+    // zeroclaw-tools::wrappers; this tool delegates the concern to the wrapper
+    // at registration time.
 
     #[tokio::test]
     async fn glob_search_results_sorted() {

@@ -20,11 +20,43 @@ pub struct ParsedToolCall {
 }
 
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
-    match raw {
+    let initial = match raw {
         Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s)
             .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
         Some(value) => value.clone(),
         None => serde_json::Value::Object(serde_json::Map::new()),
+    };
+    unwrap_nested_json_strings(initial)
+}
+
+/// Recursively unwrap stringified JSON objects/arrays nested inside tool arguments.
+/// Why: Gemini (and some other providers) sometimes double-encode nested object/array
+/// parameters as JSON strings inside the outer arguments payload, which breaks tools
+/// that expect `Value::Object` / `Value::Array` at those positions.
+fn unwrap_nested_json_strings(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k, unwrap_nested_json_strings(v));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(unwrap_nested_json_strings).collect())
+        }
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim_start();
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                match serde_json::from_str::<serde_json::Value>(&s) {
+                    Ok(parsed) => unwrap_nested_json_strings(parsed),
+                    Err(_) => serde_json::Value::String(s),
+                }
+            } else {
+                serde_json::Value::String(s)
+            }
+        }
+        other => other,
     }
 }
 
@@ -69,12 +101,12 @@ pub fn canonicalize_json_for_tool_signature(value: &serde_json::Value) -> serde_
 fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     if let Some(function) = value.get("function") {
         let tool_call_id = parse_tool_call_id(value, Some(function));
-        let name = function
+        let raw_name = function
             .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or("")
-            .trim()
-            .to_string();
+            .trim();
+        let name = map_tool_name_alias(raw_name).to_string();
         if !name.is_empty() {
             let arguments = parse_arguments_value(
                 function
@@ -90,12 +122,12 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     }
 
     let tool_call_id = parse_tool_call_id(value, None);
-    let name = value
+    let raw_name = value
         .get("name")
         .and_then(|v| v.as_str())
         .unwrap_or("")
-        .trim()
-        .to_string();
+        .trim();
+    let name = map_tool_name_alias(raw_name).to_string();
 
     if name.is_empty() {
         return None;
@@ -696,6 +728,16 @@ fn parse_function_call_tool_calls(response: &str) -> Vec<ParsedToolCall> {
 /// Map tool name aliases from various LLM providers to ZeroClaw tool names.
 /// This handles variations like "fileread" -> "file_read", "bash" -> "shell", etc.
 fn map_tool_name_alias(tool_name: &str) -> &str {
+    // Strip any dotted namespace prefix (keep only the final segment).
+    // Covers Gemini-emitted `default_api.<name>` and `tools.<name>`, plus
+    // MCP-server-name prefixes like `google_workspace.search_gmail_messages`
+    // that Gemini-via-OpenRouter also emits when the tool originates from
+    // an MCP server. The registry is indexed by bare tool name, so we
+    // normalize by taking the last segment.
+    let tool_name = tool_name
+        .rsplit_once('.')
+        .map(|(_, suffix)| suffix)
+        .unwrap_or(tool_name);
     match tool_name {
         // Shell variations (including GLM aliases that map to shell)
         "shell" | "bash" | "sh" | "exec" | "command" | "cmd" | "browser_open" | "browser"
@@ -1506,6 +1548,68 @@ pub fn build_native_assistant_history_from_parsed_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_arguments_value_unwraps_nested_object_string() {
+        let raw = serde_json::json!({
+            "service": "gmail",
+            "params": "{\"maxResults\":3}"
+        });
+        let out = parse_arguments_value(Some(&raw));
+        assert_eq!(out["service"], serde_json::json!("gmail"));
+        assert_eq!(out["params"], serde_json::json!({"maxResults": 3}));
+    }
+
+    #[test]
+    fn parse_arguments_value_unwraps_nested_array_string() {
+        let raw = serde_json::json!({ "items": "[1,2,3]" });
+        let out = parse_arguments_value(Some(&raw));
+        assert_eq!(out["items"], serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn parse_arguments_value_leaves_non_json_strings_alone() {
+        let raw = serde_json::json!({
+            "greeting": "hello",
+            "answer": "42",
+            "truthy": "true",
+            "broken": "{not json"
+        });
+        let out = parse_arguments_value(Some(&raw));
+        assert_eq!(out["greeting"], serde_json::json!("hello"));
+        assert_eq!(out["answer"], serde_json::json!("42"));
+        assert_eq!(out["truthy"], serde_json::json!("true"));
+        assert_eq!(out["broken"], serde_json::json!("{not json"));
+    }
+
+    #[test]
+    fn parse_arguments_value_handles_double_encoding() {
+        let inner = r#"{"params":"{\"maxResults\":3}"}"#;
+        let raw = serde_json::Value::String(inner.to_string());
+        let out = parse_arguments_value(Some(&raw));
+        assert_eq!(out["params"], serde_json::json!({"maxResults": 3}));
+    }
+
+    #[test]
+    fn parse_tool_call_value_handles_gemini_double_encoded_params() {
+        let inner = r#"{"service":"gmail","resource":"users","sub_resource":"messages","method":"list","params":"{\"maxResults\":3}"}"#;
+        let call_json = serde_json::json!({
+            "function": {
+                "name": "google_workspace",
+                "arguments": inner
+            }
+        });
+        let parsed = parse_tool_call_value(&call_json).expect("expected a parsed call");
+        assert_eq!(parsed.name, "google_workspace");
+        assert_eq!(
+            parsed.arguments["params"],
+            serde_json::json!({"maxResults": 3})
+        );
+        assert_eq!(
+            parsed.arguments["sub_resource"],
+            serde_json::json!("messages")
+        );
+    }
 
     #[test]
     fn parse_tool_calls_extracts_multiple_calls() {
@@ -2754,6 +2858,30 @@ Let me check the result."#;
             map_tool_name_alias("totally_unknown_tool"),
             "totally_unknown_tool"
         );
+    }
+
+    #[test]
+    fn map_tool_name_alias_strips_dotted_namespaces() {
+        // Gemini-style static prefixes still work.
+        assert_eq!(map_tool_name_alias("default_api.file_read"), "file_read");
+        assert_eq!(map_tool_name_alias("tools.shell"), "shell");
+
+        // MCP-server-name prefixes (Gemini-via-OpenRouter also emits these
+        // when the tool originates from an MCP server; the registry is
+        // indexed by bare tool name, so we must strip them too).
+        assert_eq!(
+            map_tool_name_alias("google_workspace.search_gmail_messages"),
+            "search_gmail_messages"
+        );
+
+        // Only the final segment is kept even with multiple dots.
+        assert_eq!(map_tool_name_alias("a.b.c.final"), "final");
+
+        // Stripped segment still runs through the alias table.
+        assert_eq!(map_tool_name_alias("default_api.bash"), "shell");
+
+        // Names without any dot are unaffected.
+        assert_eq!(map_tool_name_alias("file_read"), "file_read");
     }
 
     #[test]
