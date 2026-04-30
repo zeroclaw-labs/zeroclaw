@@ -759,6 +759,8 @@ enum OnboardSection {
     Hardware,
     /// Public tunnel provider (cloudflare, ngrok, tailscale, …).
     Tunnel,
+    /// Edit the markdown files that shape your agent (SOUL, IDENTITY, USER, …).
+    Personality,
 }
 
 /// Stub enum that mirrors the old `props` subcommands so clap can still parse
@@ -834,6 +836,7 @@ fn resolve_onboard_target(
         OnboardSection::Memory => Section::Memory,
         OnboardSection::Hardware => Section::Hardware,
         OnboardSection::Tunnel => Section::Tunnel,
+        OnboardSection::Personality => Section::Personality,
     });
 
     let target = explicit_section
