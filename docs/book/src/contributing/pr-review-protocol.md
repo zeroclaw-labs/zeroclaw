@@ -38,22 +38,20 @@ Run all of these. The data informs every step that follows.
 
    Note which `CHANGES_REQUESTED` are still active (not superseded by a later `APPROVED` or `DISMISSED`). Check whether you've already reviewed this PR.
 
-5. **Relevant RFCs**
+5. **Relevant foundations documents**
 
-   Always fetch FND-005 (Contribution Culture, issue #5615). For other RFCs, use the relevance table below — read what applies to the PR's scope.
+   Always read FND-005 (Contribution Culture). For others, use the relevance
+   table below — read what applies to the PR's scope. The ratified versions
+   are local files; no API call needed.
 
-   ```bash
-   gh issue view <RFC-number> --repo zeroclaw-labs/zeroclaw
-   ```
-
-   | RFC | Issue |
+   | Foundation | Local file |
    |---|---|
-   | Microkernel Architecture | #5574 |
-   | Documentation Standards | #5576 |
-   | Team Governance | #5577 |
-   | CI/CD Pipeline | #5579 |
-   | Contribution Culture | #5615 |
-   | Zero Compromise in Practice | #5653 |
+   | Microkernel Architecture | `docs/book/src/foundations/fnd-001-intentional-architecture.md` |
+   | Documentation Standards | `docs/book/src/foundations/fnd-002-documentation-standards.md` |
+   | Team Governance | `docs/book/src/foundations/fnd-003-governance.md` |
+   | Engineering Infrastructure | `docs/book/src/foundations/fnd-004-engineering-infrastructure.md` |
+   | Contribution Culture | `docs/book/src/foundations/fnd-005-contribution-culture.md` |
+   | Zero Compromise in Practice | `docs/book/src/foundations/fnd-006-zero-compromise-in-practice.md` |
 
 6. **Diff**
 

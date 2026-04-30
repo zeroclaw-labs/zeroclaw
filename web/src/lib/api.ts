@@ -777,9 +777,10 @@ export function reloadDaemon(): Promise<AdminResponse> {
 // ---------------------------------------------------------------------------
 
 export function getTools(): Promise<ToolSpec[]> {
-  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>('/api/tools').then((data) =>
-    unwrapField(data, 'tools'),
-  );
+  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>('/api/tools').then((data) => {
+    const result = unwrapField(data, 'tools');
+    return Array.isArray(result) ? result : [];
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -787,9 +788,10 @@ export function getTools(): Promise<ToolSpec[]> {
 // ---------------------------------------------------------------------------
 
 export function getCronJobs(): Promise<CronJob[]> {
-  return apiFetch<CronJob[] | { jobs: CronJob[] }>('/api/cron').then((data) =>
-    unwrapField(data, 'jobs'),
-  );
+  return apiFetch<CronJob[] | { jobs: CronJob[] }>('/api/cron').then((data) => {
+    const result = unwrapField(data, 'jobs');
+    return Array.isArray(result) ? result : [];
+  });
 }
 
 export function addCronJob(body: {
@@ -835,7 +837,10 @@ export function getCronRuns(
   const params = new URLSearchParams({ limit: String(limit) });
   return apiFetch<CronRun[] | { runs: CronRun[] }>(
     `/api/cron/${encodeURIComponent(jobId)}/runs?${params}`,
-  ).then((data) => unwrapField(data, 'runs'));
+  ).then((data) => {
+    const result = unwrapField(data, 'runs');
+    return Array.isArray(result) ? result : [];
+  });
 }
 
 export interface CronSettings {
@@ -863,7 +868,10 @@ export function patchCronSettings(
 
 export function getIntegrations(): Promise<Integration[]> {
   return apiFetch<Integration[] | { integrations: Integration[] }>('/api/integrations').then(
-    (data) => unwrapField(data, 'integrations'),
+    (data) => {
+      const result = unwrapField(data, 'integrations');
+      return Array.isArray(result) ? result : [];
+    },
   );
 }
 
@@ -891,7 +899,10 @@ export function getMemory(
   if (category) params.set('category', category);
   const qs = params.toString();
   return apiFetch<MemoryEntry[] | { entries: MemoryEntry[] }>(`/api/memory${qs ? `?${qs}` : ''}`).then(
-    (data) => unwrapField(data, 'entries'),
+    (data) => {
+      const result = unwrapField(data, 'entries');
+      return Array.isArray(result) ? result : [];
+    },
   );
 }
 
@@ -927,9 +938,10 @@ export function getCost(): Promise<CostSummary> {
 // ---------------------------------------------------------------------------
 
 export function getSessions(): Promise<Session[]> {
-  return apiFetch<Session[] | { sessions: Session[] }>('/api/sessions').then((data) =>
-    unwrapField(data, 'sessions'),
-  );
+  return apiFetch<Session[] | { sessions: Session[] }>('/api/sessions').then((data) => {
+    const result = unwrapField(data, 'sessions');
+    return Array.isArray(result) ? result : [];
+  });
 }
 
 export function getSession(id: string): Promise<Session> {
@@ -948,9 +960,10 @@ export function getSessionMessages(id: string): Promise<SessionMessagesResponse>
 // ---------------------------------------------------------------------------
 
 export function getChannels(): Promise<ChannelDetail[]> {
-  return apiFetch<ChannelDetail[] | { channels: ChannelDetail[] }>('/api/channels').then((data) =>
-    unwrapField(data, 'channels'),
-  );
+  return apiFetch<ChannelDetail[] | { channels: ChannelDetail[] }>('/api/channels').then((data) => {
+    const result = unwrapField(data, 'channels');
+    return Array.isArray(result) ? result : [];
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -958,7 +971,8 @@ export function getChannels(): Promise<ChannelDetail[]> {
 // ---------------------------------------------------------------------------
 
 export function getCliTools(): Promise<CliTool[]> {
-  return apiFetch<CliTool[] | { cli_tools: CliTool[] }>('/api/cli-tools').then((data) =>
-    unwrapField(data, 'cli_tools'),
-  );
+  return apiFetch<CliTool[] | { cli_tools: CliTool[] }>('/api/cli-tools').then((data) => {
+    const result = unwrapField(data, 'cli_tools');
+    return Array.isArray(result) ? result : [];
+  });
 }

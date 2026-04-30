@@ -1,26 +1,14 @@
-import { Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom';
-import { useState, useEffect, createContext, useContext, Component, type ReactNode, type ErrorInfo } from 'react';
+import { Component, createContext, useContext, useEffect, useState, type ErrorInfo, type ReactNode } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { ThemeProvider } from './contexts/ThemeContext';
-import Layout from './components/layout/Layout';
-import Dashboard from './pages/Dashboard';
-import AgentChat from './pages/AgentChat';
-import Tools from './pages/Tools';
-import Cron from './pages/Cron';
-import Integrations from './pages/Integrations';
-import Memory from './pages/Memory';
-import Config from './pages/Config';
-import Cost from './pages/Cost';
-import Logs from './pages/Logs';
-import Doctor from './pages/Doctor';
-import Pairing from './pages/Pairing';
-import Canvas from './pages/Canvas';
-import Onboard from './pages/onboard/Onboard';
+
+import { loadLocale, saveLocale } from './contexts/ThemeContext';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
-import { setLocale, type Locale } from './lib/i18n';
-import { loadLocale, saveLocale } from './contexts/ThemeContext';
-import { basePath } from './lib/basePath';
 import { getAdminPairCode, getOnboardStatus } from './lib/api';
+import { basePath } from './lib/basePath';
+import { setLocale, type Locale } from './lib/i18n';
+import { Router } from './router/router';
 
 // Locale context
 interface LocaleContextType {
@@ -30,7 +18,7 @@ interface LocaleContextType {
 
 export const LocaleContext = createContext<LocaleContextType>({
   locale: 'en',
-  setAppLocale: () => {},
+  setAppLocale: () => { },
 });
 
 export const useLocaleContext = () => useContext(LocaleContext);
@@ -202,11 +190,8 @@ function AppContent() {
 
   // Listen for 401 events to force logout
   useEffect(() => {
-    const handler = () => {
-      logout();
-    };
-    window.addEventListener('zeroclaw-unauthorized', handler);
-    return () => window.removeEventListener('zeroclaw-unauthorized', handler);
+    window.addEventListener('zeroclaw-unauthorized', logout);
+    return () => window.removeEventListener('zeroclaw-unauthorized', logout);
   }, [logout]);
 
   if (loading) {
@@ -228,26 +213,7 @@ function AppContent() {
     <DraftContext.Provider value={draftStore}>
       <LocaleContext.Provider value={{ locale, setAppLocale }}>
         <FreshInstallRedirect />
-        <Routes>
-          <Route element={<Layout />}>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/agent" element={<AgentChat />} />
-            <Route path="/tools" element={<Tools />} />
-            <Route path="/cron" element={<Cron />} />
-            <Route path="/integrations" element={<Integrations />} />
-            <Route path="/memory" element={<Memory />} />
-            <Route path="/config" element={<Config />} />
-            <Route path="/config/:section" element={<Config />} />
-            <Route path="/setup/:section" element={<Config />} />
-            <Route path="/cost" element={<Cost />} />
-            <Route path="/logs" element={<Logs />} />
-            <Route path="/doctor" element={<Doctor />} />
-            <Route path="/pairing" element={<Pairing />} />
-            <Route path="/canvas" element={<Canvas />} />
-            <Route path="/onboard" element={<Onboard />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Route>
-        </Routes>
+        <Router />
       </LocaleContext.Provider>
     </DraftContext.Provider>
   );

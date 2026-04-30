@@ -7,12 +7,18 @@
 //! Everything writes through `Config::set_prop` (or its helpers); direct
 //! struct-field assignment is off-limits per the DRY contract (#5951).
 
-use anyhow::Result;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::traits::{Answer, OnboardUi, PropKind, SelectItem};
 
 use crate::agent::personality::EDITABLE_PERSONALITY_FILES;
 use crate::agent::personality_templates::{TemplateContext, render as render_personality};
+
+const CUSTOM_OPENAI_COMPAT_LABEL: &str = "Custom OpenAI-compatible endpoint";
+const OPENAI_COMPAT_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Internal prompt / section navigation signal. `Done` = advance. `Back` =
 /// the user pressed Esc; rewind one step. Helpers propagate it up through
@@ -35,6 +41,16 @@ enum SkipNav {
 
 pub mod field_visibility;
 pub mod ui;
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModelsResponse {
+    data: Vec<OpenAiModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModel {
+    id: String,
+}
 
 /// Which slice of onboarding to run. `All` runs every section in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -499,6 +515,133 @@ fn section_has_signal(cfg: &Config, section_key: &str) -> bool {
     }
 }
 
+fn is_known_provider_name(provider: &str) -> bool {
+    let provider = provider.trim();
+    zeroclaw_providers::list_providers().iter().any(|entry| {
+        entry.name.eq_ignore_ascii_case(provider)
+            || entry
+                .aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(provider))
+    })
+}
+
+fn openai_compat_models_endpoint(base_url: &str) -> Result<reqwest::Url> {
+    let raw = base_url.trim();
+    if raw.is_empty() {
+        anyhow::bail!("OpenAI-compatible model discovery requires a base URL");
+    }
+
+    let mut endpoint = reqwest::Url::parse(raw)
+        .with_context(|| format!("OpenAI-compatible base URL is invalid: {raw}"))?;
+    if !matches!(endpoint.scheme(), "http" | "https") {
+        anyhow::bail!("OpenAI-compatible base URL must use http:// or https://");
+    }
+
+    let path = endpoint.path().trim_end_matches('/');
+    if path.ends_with("/models") {
+        endpoint.set_query(None);
+        endpoint.set_fragment(None);
+        return Ok(endpoint);
+    }
+
+    let suffix = if path.ends_with("/v1") || path.contains("/v1/") {
+        "models"
+    } else {
+        "v1/models"
+    };
+    let next_path = if path.is_empty() {
+        format!("/{suffix}")
+    } else {
+        format!("{path}/{suffix}")
+    };
+    endpoint.set_path(&next_path);
+    endpoint.set_query(None);
+    endpoint.set_fragment(None);
+    Ok(endpoint)
+}
+
+async fn discover_openai_compat_models(
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<String>> {
+    discover_openai_compat_models_with_timeout(base_url, api_key, OPENAI_COMPAT_MODELS_TIMEOUT)
+        .await
+}
+
+async fn discover_openai_compat_models_with_timeout(
+    base_url: &str,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<Vec<String>> {
+    let endpoint = openai_compat_models_endpoint(base_url)?;
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("failed to build OpenAI-compatible discovery client")?;
+
+    let mut request = client.get(endpoint.clone());
+    if let Some(key) = api_key.map(str::trim).filter(|key| !key.is_empty()) {
+        request = request.bearer_auth(key);
+    }
+
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("OpenAI-compatible model discovery request failed: {endpoint}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("OpenAI-compatible model discovery failed at {endpoint}: HTTP {status}");
+    }
+
+    let payload: OpenAiModelsResponse = response.json().await.with_context(|| {
+        format!("OpenAI-compatible model discovery returned invalid JSON: {endpoint}")
+    })?;
+    let models: Vec<String> = payload
+        .data
+        .into_iter()
+        .map(|model| model.id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    if models.is_empty() {
+        anyhow::bail!("OpenAI-compatible model discovery returned no model ids: {endpoint}");
+    }
+    Ok(models)
+}
+
+fn openai_compat_discovery_base_url(
+    provider: &str,
+    configured_base_url: Option<&str>,
+) -> Option<String> {
+    configured_base_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            provider
+                .trim()
+                .strip_prefix("custom:")
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(ToString::to_string)
+        })
+}
+
+async fn prompt_custom_openai_base_url(ui: &mut dyn OnboardUi) -> Result<Option<String>> {
+    loop {
+        match ui.string("OpenAI-compatible base URL", None).await? {
+            Answer::Back => return Ok(None),
+            Answer::Value(value) => {
+                let normalized = value.trim().trim_end_matches('/').to_string();
+                if openai_compat_models_endpoint(&normalized).is_ok() {
+                    return Ok(Some(normalized));
+                }
+                ui.note("Enter an http:// or https:// URL for an OpenAI-compatible API base.");
+            }
+        }
+    }
+}
+
 /// Record that a section finished so the next run's skip gate can fire.
 async fn mark_completed(cfg: &mut Config, section_key: &str) -> Result<()> {
     if cfg
@@ -595,8 +738,8 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
     loop {
         let current_fallback = cfg.providers.fallback.clone().unwrap_or_default();
 
-        let picked = match &flags.provider {
-            Some(forced) => forced.clone(),
+        let (picked, selected_base_url) = match &flags.provider {
+            Some(forced) => (forced.clone(), None),
             None => {
                 let current_idx = entries.iter().position(|p| p.name == current_fallback);
                 let mut options: Vec<SelectItem> = entries
@@ -615,6 +758,8 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
                         }
                     })
                     .collect();
+                let custom_idx = options.len();
+                options.push(SelectItem::new(CUSTOM_OPENAI_COMPAT_LABEL));
                 // "Done" lets the user exit providers without picking one —
                 // matches the channels picker's escape hatch. Highlight it
                 // by default when no fallback is set yet (first-time setup).
@@ -628,7 +773,14 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
                 if idx == done_idx {
                     break;
                 }
-                entries[idx].name.to_string()
+                if idx == custom_idx {
+                    let Some(base_url) = prompt_custom_openai_base_url(ui).await? else {
+                        continue;
+                    };
+                    (format!("custom:{base_url}"), Some(base_url))
+                } else {
+                    (entries[idx].name.to_string(), None)
+                }
             }
         };
 
@@ -648,6 +800,9 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
             let prefix = format!("providers.models.{picked}");
             field_visibility::apply_provider_trait_defaults(cfg, &picked, &prefix)?;
         }
+        if let Some(base_url) = selected_base_url.as_deref() {
+            cfg.set_prop(&format!("providers.models.{picked}.base-url"), base_url)?;
+        }
 
         // Persist the picked provider as the runtime fallback so chat
         // requests actually route to it. Without this, the runtime keeps
@@ -661,7 +816,13 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
             .iter()
             .find(|p| p.name == picked)
             .map(|p| p.display_name)
-            .unwrap_or(picked.as_str());
+            .unwrap_or_else(|| {
+                if picked.starts_with("custom:") {
+                    CUSTOM_OPENAI_COMPAT_LABEL
+                } else {
+                    picked.as_str()
+                }
+            });
         ui.heading(2, display_name);
 
         // Apply CLI-flag overrides up front, then skip those names in the
@@ -721,6 +882,10 @@ async fn providers(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) -> R
                 continue;
             }
             Nav::Done => {}
+        }
+
+        if cfg.providers.fallback.as_deref() != Some(picked.as_str()) {
+            persist(cfg, "providers.fallback", &picked).await?;
         }
 
         break;
@@ -798,8 +963,14 @@ async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, provider: &str) 
     let model_path = format!("providers.models.{provider}.model");
     let current = cfg.get_prop(&model_path).unwrap_or_default();
     let is_set = !current.is_empty() && current != "<unset>";
+    let profile = cfg.providers.models.get(provider);
+    let api_key = profile.and_then(|entry| entry.api_key.as_deref());
+    let configured_base_url = profile.and_then(|entry| entry.base_url.as_deref());
+    let discovery_base_url = openai_compat_discovery_base_url(provider, configured_base_url);
+    let should_try_openai_compat =
+        provider.trim().starts_with("custom:") || !is_known_provider_name(provider);
 
-    let live_models = match zeroclaw_providers::create_provider(provider, None) {
+    let catalog_models = match zeroclaw_providers::create_provider(provider, None) {
         Ok(handle) => {
             ui.status("Fetching models...");
             match handle.list_models().await {
@@ -819,8 +990,31 @@ async fn prompt_model(cfg: &mut Config, ui: &mut dyn OnboardUi, provider: &str) 
             None
         }
     };
+    let live_models = match catalog_models.filter(|ms| !ms.is_empty()) {
+        Some(models) => Some(models),
+        None if should_try_openai_compat => {
+            if let Some(base_url) = discovery_base_url.as_deref() {
+                ui.status("Fetching models from /v1/models...");
+                match discover_openai_compat_models(base_url, api_key).await {
+                    Ok(models) => Some(models),
+                    Err(e) => {
+                        tracing::debug!(
+                            provider,
+                            base_url,
+                            error = ?e,
+                            "OpenAI-compatible model discovery failed"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
 
-    let new_value = match live_models.filter(|ms| !ms.is_empty()) {
+    let new_value = match live_models {
         Some(models) => {
             let items: Vec<SelectItem> = models.iter().map(SelectItem::new).collect();
             let current_idx = models.iter().position(|m| m == &current);
@@ -1159,7 +1353,12 @@ async fn personality(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) ->
 mod tests {
     use super::*;
     use crate::onboard::ui::quick::QuickUi;
+    use axum::Router;
+    use axum::http::{StatusCode, header};
+    use axum::routing::get;
+    use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::net::TcpListener;
     use zeroclaw_config::schema::{Config, ModelProviderConfig};
 
     /// Build a `Config` whose `config_path` / `workspace_dir` live inside a
@@ -1170,6 +1369,36 @@ mod tests {
             workspace_dir: temp.path().join("workspace"),
             ..Default::default()
         }
+    }
+
+    async fn spawn_models_endpoint(
+        status: StatusCode,
+        body: &'static str,
+        delay: Option<Duration>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = Arc::new(body.to_string());
+        let app = Router::new().route(
+            "/v1/models",
+            get(move || {
+                let body = body.clone();
+                async move {
+                    if let Some(delay) = delay {
+                        tokio::time::sleep(delay).await;
+                    }
+                    (
+                        status,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        body.to_string(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://localhost:{port}")
     }
 
     #[tokio::test]
@@ -1309,6 +1538,176 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result, SkipNav::Enter);
+    }
+
+    #[tokio::test]
+    async fn discover_openai_compat_models_parses_valid_models_payload() {
+        let base_url = spawn_models_endpoint(
+            StatusCode::OK,
+            r#"{"object":"list","data":[{"id":"llama-3.3"},{"id":" qwen3-coder "}]}"#,
+            None,
+        )
+        .await;
+
+        let models = discover_openai_compat_models(&base_url, Some("sk-test"))
+            .await
+            .unwrap();
+
+        assert_eq!(models, vec!["llama-3.3", "qwen3-coder"]);
+    }
+
+    #[tokio::test]
+    async fn discover_openai_compat_models_rejects_malformed_json() {
+        let base_url = spawn_models_endpoint(StatusCode::OK, r#"{"data":["#, None).await;
+
+        let err = discover_openai_compat_models(&base_url, Some("sk-test"))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("invalid JSON"),
+            "unexpected discovery error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_openai_compat_models_reports_unauthorized() {
+        let base_url =
+            spawn_models_endpoint(StatusCode::UNAUTHORIZED, r#"{"error":"bad key"}"#, None).await;
+
+        let err = discover_openai_compat_models(&base_url, Some("sk-test"))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("HTTP 401"),
+            "unexpected discovery error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_openai_compat_models_reports_not_found() {
+        let base_url =
+            spawn_models_endpoint(StatusCode::NOT_FOUND, r#"{"error":"nope"}"#, None).await;
+
+        let err = discover_openai_compat_models(&base_url, Some("sk-test"))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("HTTP 404"),
+            "unexpected discovery error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_openai_compat_models_reports_server_error() {
+        let base_url = spawn_models_endpoint(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"boom"}"#,
+            None,
+        )
+        .await;
+
+        let err = discover_openai_compat_models(&base_url, Some("sk-test"))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("HTTP 500"),
+            "unexpected discovery error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_openai_compat_models_reports_network_timeout() {
+        let base_url = spawn_models_endpoint(
+            StatusCode::OK,
+            r#"{"data":[{"id":"slow-model"}]}"#,
+            Some(Duration::from_millis(200)),
+        )
+        .await;
+
+        let err = discover_openai_compat_models_with_timeout(
+            &base_url,
+            Some("sk-test"),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("request failed"),
+            "unexpected discovery error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn providers_custom_openai_endpoint_discovers_models() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+        let base_url = spawn_models_endpoint(
+            StatusCode::OK,
+            r#"{"data":[{"id":"llama-local"},{"id":"qwen-local"}]}"#,
+            None,
+        )
+        .await;
+        let provider = format!("custom:{base_url}");
+
+        let flags = Flags {
+            provider: Some(provider.clone()),
+            api_key: Some("sk-custom-test".into()),
+            ..Default::default()
+        };
+        let mut ui = QuickUi::new().with("Model", "qwen-local");
+
+        run(&mut cfg, &mut ui, Section::Providers, &flags)
+            .await
+            .unwrap();
+
+        assert_eq!(cfg.providers.fallback.as_deref(), Some(provider.as_str()));
+        let model_cfg = cfg
+            .providers
+            .models
+            .get(&provider)
+            .expect("custom provider entry should be seeded");
+        assert_eq!(model_cfg.api_key.as_deref(), Some("sk-custom-test"));
+        assert_eq!(model_cfg.model.as_deref(), Some("qwen-local"));
+    }
+
+    #[tokio::test]
+    async fn prompt_model_unknown_provider_with_base_url_discovers_models() {
+        let temp = TempDir::new().unwrap();
+        let mut cfg = test_cfg(&temp);
+        let base_url = spawn_models_endpoint(
+            StatusCode::OK,
+            r#"{"data":[{"id":"gateway-small"},{"id":"gateway-large"}]}"#,
+            None,
+        )
+        .await;
+        cfg.providers.models.insert(
+            "my-gateway".into(),
+            ModelProviderConfig {
+                api_key: Some("sk-gateway-test".into()),
+                base_url: Some(base_url),
+                ..Default::default()
+            },
+        );
+        let mut ui = QuickUi::new().with("Model", "gateway-large");
+
+        prompt_model(&mut cfg, &mut ui, "my-gateway").await.unwrap();
+
+        let model_cfg = cfg
+            .providers
+            .models
+            .get("my-gateway")
+            .expect("unknown provider entry should remain configured");
+        assert_eq!(model_cfg.model.as_deref(), Some("gateway-large"));
     }
 
     /// Providers section driven entirely by CLI flags: the `--provider`,

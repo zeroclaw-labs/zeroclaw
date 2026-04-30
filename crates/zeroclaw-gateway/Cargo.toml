@@ -33,6 +33,7 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["logg
 
 # Frontend asset MIME type detection (dashboard served from filesystem)
 mime_guess = "2"
+include_dir = { version = "0.7", optional = true }
 
 # Schemars JSON Schema generation for OPTIONS responses; matches the version
 # zeroclaw-config already pulls.
@@ -88,3 +89,4 @@ gateway-voice-duplex = []
 # on; turning it off omits OPTIONS schema bodies (returns a small placeholder)
 # and saves a bit of build time. Mirrors zeroclaw-config's `schema-export`.
 schema-export = ["zeroclaw-config/schema-export", "dep:schemars"]
+embedded-web = ["dep:include_dir"]

@@ -576,7 +576,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         if ctx.is_empty() {
                             None
                         } else {
-                            Some(format!("[Memory context]\n{ctx}\n"))
+                            Some(format!("[Memory context]\n{ctx}\n[/Memory context]\n\n"))
                         }
                     }
                     _ => None,
