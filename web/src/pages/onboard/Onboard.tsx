@@ -17,7 +17,7 @@
 // /api/config/list?prefix=<that> and PATCHes on save. Provider model
 // fields auto-fetch /api/onboard/catalog/models for the datalist.
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Check, ChevronRight } from 'lucide-react';
 import {
@@ -33,6 +33,13 @@ import {
 import FieldForm, { type FieldFormHandle } from '../../components/onboard/FieldForm';
 import SectionPicker from '../../components/onboard/SectionPicker';
 
+// Personality pulls in CodeMirror + markdown rendering (~270KB gzipped).
+// Lazy-load so the cost isn't paid until the user actually opens that
+// section. Other onboard sections stay synchronous.
+const PersonalityEditor = lazy(
+  () => import('../../components/onboard/PersonalityEditor'),
+);
+
 // Note: prefix is `onboard_state` (verbatim) and the field becomes
 // `completed-sections` (snake → kebab via the macro). Matches what
 // `Config::prop_fields()` actually emits — fully-kebab `onboard-state.*`
@@ -47,12 +54,28 @@ const COMPLETED_SECTIONS_PATH = 'onboard_state.completed-sections';
 // `/onboard` stays a focused setup-completion flow.
 const ONBOARD_SECTION_ORDER = [
   'workspace',
+  'personality',
   'providers',
   'channels',
   'memory',
   'hardware',
   'tunnel',
 ] as const;
+
+// Sections handled by a dedicated component instead of the schema-driven
+// FieldForm. The gateway's /api/onboard/sections doesn't enumerate
+// these — they're synthesized client-side and slotted into the same
+// sidebar/breadcrumb/Next/Finish flow as the schema-backed sections.
+const SYNTHETIC_SECTIONS: Record<string, SectionInfo> = {
+  personality: {
+    key: 'personality',
+    label: 'Personality',
+    help: 'Edit the markdown files that shape your agent — SOUL, IDENTITY, USER, etc.',
+    has_picker: false,
+    completed: false,
+    group: 'Onboarding',
+  },
+};
 
 export default function Onboard() {
   const navigate = useNavigate();
@@ -80,7 +103,7 @@ export default function Onboard() {
         // re-order here to keep `/onboard` focused on setup completion.
         const byKey = new Map(resp.sections.map((s) => [s.key, s] as const));
         const ordered = ONBOARD_SECTION_ORDER.flatMap((k) => {
-          const s = byKey.get(k);
+          const s = byKey.get(k) ?? SYNTHETIC_SECTIONS[k];
           return s ? [s] : [];
         });
         setSections(ordered);
@@ -357,7 +380,11 @@ export default function Onboard() {
 
             {/* Picker view OR form view. Direct-form sections (Workspace,
                 Hardware) skip the picker entirely. */}
-            {!activeSection.has_picker ? (
+            {activeSection.key === 'personality' ? (
+              <Suspense fallback={<EditorLoading />}>
+                <PersonalityEditor />
+              </Suspense>
+            ) : !activeSection.has_picker ? (
               <FieldForm
                 ref={formRef}
                 prefix={activeSection.key}
@@ -385,6 +412,23 @@ export default function Onboard() {
           </div>
         )}
       </main>
+    </div>
+  );
+}
+
+function EditorLoading() {
+  return (
+    <div
+      className="flex items-center justify-center rounded-xl border p-12"
+      style={{
+        borderColor: 'var(--pc-border)',
+        background: 'var(--pc-bg-surface)',
+      }}
+    >
+      <div
+        className="h-6 w-6 border-2 rounded-full animate-spin"
+        style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
+      />
     </div>
   );
 }

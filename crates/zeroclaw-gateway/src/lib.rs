@@ -11,6 +11,7 @@ pub mod api;
 pub mod api_config;
 pub mod api_onboard;
 pub mod api_pairing;
+pub mod api_personality;
 #[cfg(feature = "plugins-wasm")]
 pub mod api_plugins;
 #[cfg(feature = "webauthn")]
@@ -1007,6 +1008,15 @@ pub async fn run_gateway(
         .route(
             "/api/onboard/sections/{section}/items/{key}",
             post(api_onboard::handle_section_select),
+        )
+        .route("/api/personality", get(api_personality::handle_index))
+        .route(
+            "/api/personality/templates",
+            get(api_personality::handle_templates),
+        )
+        .route(
+            "/api/personality/{filename}",
+            get(api_personality::handle_get).put(api_personality::handle_put),
         )
         .route("/api/config/init", post(api_config::handle_init))
         .route("/api/config/migrate", post(api_config::handle_migrate))

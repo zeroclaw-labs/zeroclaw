@@ -9,11 +9,21 @@
     "dev": "vite"
   },
   "dependencies": {
+    "@codemirror/lang-markdown": "^6.5.0",
+    "@codemirror/language": "^6.12.3",
+    "@codemirror/state": "^6.6.0",
+    "@codemirror/view": "^6.41.1",
+    "@lezer/highlight": "^1.2.3",
+    "@tailwindcss/typography": "^0.5.19",
+    "@uiw/codemirror-theme-github": "^4.25.9",
+    "@uiw/react-codemirror": "^4.25.9",
+    "highlight.js": "^11.11.1",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-markdown": "^10.1.0",
     "react-router-dom": "^7.1.1",
+    "rehype-highlight": "^7.0.2",
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {

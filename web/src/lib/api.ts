@@ -298,6 +298,132 @@ export function getOpenApiSchema(): Promise<unknown> {
   return apiFetch<unknown>('/api/openapi.json');
 }
 
+// ── Personality files ────────────────────────────────────────────────
+
+export interface PersonalityIndexEntry {
+  filename: string;
+  exists: boolean;
+  size: number;
+  mtime_ms: number | null;
+}
+
+export interface PersonalityIndex {
+  files: PersonalityIndexEntry[];
+  max_chars: number;
+}
+
+export interface PersonalityFile {
+  filename: string;
+  content: string;
+  exists: boolean;
+  truncated: boolean;
+  mtime_ms: number | null;
+}
+
+export interface PersonalityPutResult {
+  bytes_written: number;
+  mtime_ms: number | null;
+}
+
+export interface PersonalityConflict {
+  error: 'personality_disk_drift';
+  filename: string;
+  current_content: string;
+  current_mtime_ms: number | null;
+}
+
+function agentQuery(agent?: string): string {
+  return agent ? `?agent=${encodeURIComponent(agent)}` : '';
+}
+
+export interface PersonalityTemplate {
+  filename: string;
+  content: string;
+}
+
+export interface PersonalityTemplatesResponse {
+  preset: string;
+  files: PersonalityTemplate[];
+}
+
+export interface PersonalityTemplateOverrides {
+  agent_name?: string;
+  user_name?: string;
+  timezone?: string;
+  communication_style?: string;
+  include_memory?: boolean;
+}
+
+export function getPersonalityTemplates(
+  overrides: PersonalityTemplateOverrides = {},
+  preset = 'default',
+  agent?: string,
+): Promise<PersonalityTemplatesResponse> {
+  const params = new URLSearchParams();
+  params.set('preset', preset);
+  if (agent) params.set('agent', agent);
+  if (overrides.agent_name) params.set('agent_name', overrides.agent_name);
+  if (overrides.user_name) params.set('user_name', overrides.user_name);
+  if (overrides.timezone) params.set('timezone', overrides.timezone);
+  if (overrides.communication_style)
+    params.set('communication_style', overrides.communication_style);
+  if (overrides.include_memory !== undefined)
+    params.set('include_memory', String(overrides.include_memory));
+  return apiFetch<PersonalityTemplatesResponse>(`/api/personality/templates?${params}`);
+}
+
+export function getPersonalityIndex(agent?: string): Promise<PersonalityIndex> {
+  return apiFetch<PersonalityIndex>(`/api/personality${agentQuery(agent)}`);
+}
+
+export function getPersonalityFile(filename: string, agent?: string): Promise<PersonalityFile> {
+  return apiFetch<PersonalityFile>(
+    `/api/personality/${encodeURIComponent(filename)}${agentQuery(agent)}`,
+  );
+}
+
+export class PersonalityConflictError extends Error {
+  constructor(public conflict: PersonalityConflict) {
+    super(`personality file changed on disk: ${conflict.filename}`);
+    this.name = 'PersonalityConflictError';
+  }
+}
+
+/** Resolves with the put result on success; throws `PersonalityConflictError` on 409. */
+export async function putPersonalityFile(
+  filename: string,
+  content: string,
+  expectedMtimeMs: number | null,
+  agent?: string,
+): Promise<PersonalityPutResult> {
+  const url = `/api/personality/${encodeURIComponent(filename)}${agentQuery(agent)}`;
+  const token = getToken();
+  const headers = new Headers({ 'Content-Type': 'application/json' });
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  const response = await fetch(`${apiOrigin}${basePath}${url}`, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify({ content, expected_mtime_ms: expectedMtimeMs ?? null }),
+  });
+  if (response.status === 401) {
+    clearToken();
+    window.dispatchEvent(new Event('zeroclaw-unauthorized'));
+    throw new UnauthorizedError();
+  }
+  if (response.status === 409) {
+    const body = (await response.json().catch(() => null)) as PersonalityConflict | null;
+    if (body && body.error === 'personality_disk_drift') {
+      throw new PersonalityConflictError(body);
+    }
+    throw new Error('API 409: personality file changed on disk');
+  }
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`API ${response.status}: ${text || response.statusText}`);
+  }
+  return (await response.json()) as PersonalityPutResult;
+}
+
 // ── Config schema descriptions ───────────────────────────────────────
 //
 // `OPTIONS /api/config` returns the schemars-derived JSON Schema for the

@@ -7,7 +7,7 @@
 // SectionPicker + FieldForm components. NO hardcoded section names, field
 // labels, dropdown options, or provider lists.
 
-import { useEffect, useMemo, useState } from 'react';
+import { Suspense, lazy, useEffect, useMemo, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, ChevronRight, Plus, Sparkles } from 'lucide-react';
 import {
@@ -23,6 +23,26 @@ import {
 import FieldForm from '../components/onboard/FieldForm';
 import ReloadDaemonButton from '../components/onboard/ReloadDaemonButton';
 import SectionPicker from '../components/onboard/SectionPicker';
+
+// Personality pulls in CodeMirror + markdown rendering (~270KB gzipped).
+// Lazy-load so the cost isn't paid until the user opens that section.
+const PersonalityEditor = lazy(
+  () => import('../components/onboard/PersonalityEditor'),
+);
+
+// Synthetic sections that aren't backed by a config-schema prefix. They
+// render a dedicated component instead of the generic FieldForm/picker
+// flow but otherwise slot into the same group/sidebar/breadcrumb plumbing.
+const SYNTHETIC_SECTIONS: SectionInfo[] = [
+  {
+    key: 'personality',
+    label: 'Personality',
+    help: 'Edit the markdown files that shape your agent — SOUL, IDENTITY, USER, etc.',
+    has_picker: false,
+    completed: false,
+    group: 'Foundation',
+  },
+];
 
 type Mode =
   | { kind: 'section-overview' }
@@ -96,14 +116,20 @@ export default function Config() {
     getSections()
       .then((resp) => {
         if (cancelled) return;
-        setSections(resp.sections);
+        const merged = [
+          ...resp.sections,
+          ...SYNTHETIC_SECTIONS.filter(
+            (synth) => !resp.sections.some((s) => s.key === synth.key),
+          ),
+        ];
+        setSections(merged);
         // URL-supplied section (either locked /setup/<x> or
         // navigable /config/<x>) wins when it exists in the schema.
         // Falls back to the first available section.
         const initialKey = sectionParam
-          && resp.sections.find((s) => s.key === sectionParam)
+          && merged.find((s) => s.key === sectionParam)
           ? sectionParam
-          : resp.sections[0]?.key ?? null;
+          : merged[0]?.key ?? null;
         setActiveKey(initialKey);
         setMode({ kind: 'section-overview' });
       })
@@ -331,7 +357,29 @@ export default function Config() {
             )}
 
             {/* Section overview / picker / form */}
-            {!activeSection.has_picker ? (
+            {activeSection.key === 'personality' ? (
+              <Suspense
+                fallback={
+                  <div
+                    className="flex items-center justify-center rounded-xl border p-12"
+                    style={{
+                      borderColor: 'var(--pc-border)',
+                      background: 'var(--pc-bg-surface)',
+                    }}
+                  >
+                    <div
+                      className="h-6 w-6 border-2 rounded-full animate-spin"
+                      style={{
+                        borderColor: 'var(--pc-border)',
+                        borderTopColor: 'var(--pc-accent)',
+                      }}
+                    />
+                  </div>
+                }
+              >
+                <PersonalityEditor />
+              </Suspense>
+            ) : !activeSection.has_picker ? (
               // Direct-form sections (Workspace, Hardware): no picker, just
               // show the form rooted at the section's path prefix.
               <FieldForm
