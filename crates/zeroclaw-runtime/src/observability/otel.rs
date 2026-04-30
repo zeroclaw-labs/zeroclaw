@@ -286,7 +286,12 @@ impl Observer for OtelObserver {
                     KeyValue::new("memory.hits", *num_entries as i64),
                     KeyValue::new("memory.success", *success),
                     KeyValue::new("duration_s", secs),
-                    // OTel GenAI semantic conventions
+                    // Partial GenAI-compatible attributes. The retrieval
+                    // operation value is canonical, but the surrounding
+                    // span (`SpanKind::Internal` and the `memory.recall`
+                    // name rather than `{operation} {data_source.id}`) is
+                    // shaped for ZeroClaw / Langfuse compatibility, not
+                    // strict OTel GenAI conformance.
                     KeyValue::new("gen_ai.operation.name", "retrieval"),
                     KeyValue::new("gen_ai.system", backend.clone()),
                 ];

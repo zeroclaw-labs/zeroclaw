@@ -234,10 +234,11 @@ static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// Build a `query_summary` field for memory observability events from a raw
 /// user query.
 ///
-/// Applies [`scrub_credentials`] first, then truncates to ≤200 chars via
-/// [`truncate_with_ellipsis`]. The order matters: `scrub_credentials` may
-/// insert placeholder substrings, so truncating first risks chopping a
-/// half-token.
+/// Applies [`scrub_credentials`] first, then truncates to ≤200 content
+/// chars via [`truncate_with_ellipsis`] (which appends a 3-char `...`
+/// ellipsis when truncation occurred, so summaries are ≤203 chars total).
+/// The order matters: `scrub_credentials` may insert placeholder
+/// substrings, so truncating first risks chopping a half-token.
 ///
 /// Returns `None` for empty input so observers can distinguish "no query
 /// recorded" from "empty query string". Always call this helper at memory
@@ -6562,6 +6563,82 @@ mod tests {
         assert!(
             recalls[0].success,
             "successful recall must report success = true"
+        );
+    }
+
+    /// Memory backend whose `recall` always returns `Err`. Used to exercise
+    /// the failure arm of `build_context`'s explicit match — the runtime
+    /// swallows the error and returns an empty context, but observers must
+    /// still see a `MemoryRecall { success: false }` event.
+    struct FailingRecallMemory;
+
+    #[async_trait]
+    impl zeroclaw_memory::Memory for FailingRecallMemory {
+        fn name(&self) -> &str {
+            "failing-recall"
+        }
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+            anyhow::bail!("simulated recall failure")
+        }
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<zeroclaw_memory::MemoryEntry>> {
+            Ok(None)
+        }
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn health_check(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn build_context_emits_memory_recall_event_on_failure() {
+        let mem = FailingRecallMemory;
+        let observer = RecallCountingObserver::default();
+
+        let context = build_context(&mem, &observer, "any query", 0.0, None).await;
+        assert!(
+            context.is_empty(),
+            "recall failure must still produce empty context (swallow behavior)"
+        );
+
+        let recalls = observer.recalls.lock();
+        assert_eq!(
+            recalls.len(),
+            1,
+            "build_context must emit exactly one MemoryRecall event even on Err"
+        );
+        assert_eq!(recalls[0].query_summary.as_deref(), Some("any query"));
+        assert_eq!(recalls[0].backend, "failing-recall");
+        assert!(
+            !recalls[0].success,
+            "failed recall must report success = false"
         );
     }
 
