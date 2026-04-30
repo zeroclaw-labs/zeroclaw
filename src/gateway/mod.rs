@@ -50,7 +50,7 @@ pub const MAX_BODY_SIZE: usize = 65_536;
 /// LLM-driven path (/webhook, /api/chat, channel webhooks) in the middle
 /// of an agent loop — multi-turn tool calls easily run 30-120s. Slow-loris
 /// is normally handled at the reverse proxy (nginx client_body_timeout
-/// + read_timeout); 300s here lets agent loops complete while still
+/// and read_timeout); 300s here lets agent loops complete while still
 /// bounding pathological hangs.
 pub const REQUEST_TIMEOUT_SECS: u64 = 300;
 /// Sliding window used by gateway rate limiting.
@@ -321,8 +321,7 @@ pub struct AppState {
     /// Persistent conversation history for the `/api/chat` REST endpoint.
     /// One daemon serves at most one user (by design), so a single global
     /// history vector is sufficient — no session id needed.
-    pub api_chat_history:
-        Arc<Mutex<Vec<crate::providers::ChatMessage>>>,
+    pub api_chat_history: Arc<Mutex<Vec<crate::providers::ChatMessage>>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -991,8 +990,11 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
 
 /// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
 async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow::Result<String> {
+    // process_message future is large (~20KB stack); box it to keep the
+    // gateway task stack from blowing up when this is awaited inside a
+    // long async chain (clippy::large_futures).
     let config = state.config.lock().clone();
-    crate::agent::process_message(config, message).await
+    Box::pin(crate::agent::process_message(config, message)).await
 }
 
 /// Webhook request body
@@ -1291,12 +1293,13 @@ async fn handle_api_chat(
     // ToolCall/ToolCallStart events through the supplied observer (which is the
     // SSE broadcast observer in production), so we don't need to emit AgentStart
     // here ourselves.
-    let result = crate::agent::process_message_with_history(
+    // Boxed: agent loop future is large; avoid clippy::large_futures.
+    let result = Box::pin(crate::agent::process_message_with_history(
         config,
         message,
         prior_history,
         Some(state.observer.clone()),
-    )
+    ))
     .await;
 
     let duration = started_at.elapsed();
@@ -1468,7 +1471,7 @@ async fn handle_whatsapp_message(
                 .await;
         }
 
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match Box::pin(run_gateway_chat_with_tools(&state, &msg.content)).await {
             Ok(response) => {
                 // Send reply via WhatsApp
                 if let Err(e) = wa
@@ -1576,7 +1579,7 @@ async fn handle_linq_webhook(
         }
 
         // Call the LLM
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match Box::pin(run_gateway_chat_with_tools(&state, &msg.content)).await {
             Ok(response) => {
                 // Send reply via Linq
                 if let Err(e) = linq
@@ -1668,7 +1671,7 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
         }
 
         // Call the LLM
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match Box::pin(run_gateway_chat_with_tools(&state, &msg.content)).await {
             Ok(response) => {
                 // Send reply via WATI
                 if let Err(e) = wati
@@ -1772,7 +1775,7 @@ async fn handle_nextcloud_talk_webhook(
                 .await;
         }
 
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match Box::pin(run_gateway_chat_with_tools(&state, &msg.content)).await {
             Ok(response) => {
                 if let Err(e) = nextcloud_talk
                     .send(&SendMessage::new(response, &msg.reply_target))
@@ -1924,8 +1927,11 @@ mod tests {
     }
 
     #[test]
-    fn security_timeout_is_30_seconds() {
-        assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+    fn security_timeout_matches_constant() {
+        // Bumped from 30s to 300s in commit e2051da2 — slow-loris is now
+        // handled at the reverse proxy, the inner deadline only needs to
+        // bound pathological agent loops.
+        assert_eq!(REQUEST_TIMEOUT_SECS, 300);
     }
 
     #[test]
@@ -1982,6 +1988,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            api_chat_history: Arc::new(Mutex::new(Vec::new())),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2032,6 +2039,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            api_chat_history: Arc::new(Mutex::new(Vec::new())),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2407,6 +2415,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            api_chat_history: Arc::new(Mutex::new(Vec::new())),
         };
 
         let mut headers = HeaderMap::new();
@@ -2472,6 +2481,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            api_chat_history: Arc::new(Mutex::new(Vec::new())),
         };
 
         let headers = HeaderMap::new();
@@ -2549,6 +2559,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            api_chat_history: Arc::new(Mutex::new(Vec::new())),
         };
 
         let response = handle_webhook(
@@ -2598,6 +2609,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            api_chat_history: Arc::new(Mutex::new(Vec::new())),
         };
 
         let mut headers = HeaderMap::new();
@@ -2652,6 +2664,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            api_chat_history: Arc::new(Mutex::new(Vec::new())),
         };
 
         let mut headers = HeaderMap::new();
@@ -2711,6 +2724,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            api_chat_history: Arc::new(Mutex::new(Vec::new())),
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2766,6 +2780,7 @@ mod tests {
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            api_chat_history: Arc::new(Mutex::new(Vec::new())),
         };
 
         let mut headers = HeaderMap::new();
