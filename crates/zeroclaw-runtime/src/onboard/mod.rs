@@ -1312,7 +1312,7 @@ async fn personality(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) ->
                 let exists = workspace_dir.join(filename).is_file();
                 SelectItem::with_badge(
                     (*filename).to_string(),
-                    if exists { "saved" } else { "not yet" },
+                    if exists { "saved" } else { "not saved" },
                 )
             })
             .collect();
