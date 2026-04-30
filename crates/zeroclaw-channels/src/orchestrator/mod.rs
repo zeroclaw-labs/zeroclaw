@@ -220,6 +220,16 @@ const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 
+#[cfg(feature = "channel-wechat")]
+fn expand_tilde_in_path(path: &str) -> PathBuf {
+    if let Some(stripped) = path.strip_prefix("~/")
+        && let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())
+    {
+        return home.join(stripped);
+    }
+    PathBuf::from(path)
+}
+
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
 }
@@ -4260,7 +4270,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     wc.allowed_users.clone(),
                     wc.api_base_url.clone(),
                     wc.cdn_base_url.clone(),
-                    wc.state_dir.as_ref().map(std::path::PathBuf::from),
+                    wc.state_dir.as_ref().map(|s| expand_tilde_in_path(s)),
                 )?
                 .with_workspace_dir(config.workspace_dir.clone()),
             ))
@@ -5025,7 +5035,7 @@ fn collect_configured_channels(
                 wechat.allowed_users.clone(),
                 wechat.api_base_url.clone(),
                 wechat.cdn_base_url.clone(),
-                wechat.state_dir.as_ref().map(std::path::PathBuf::from),
+                wechat.state_dir.as_ref().map(|s| expand_tilde_in_path(s)),
             ) {
                 Ok(channel) => {
                     channels.push(ConfiguredChannel {
@@ -5943,7 +5953,7 @@ pub async fn deliver_announcement(
                 wc.allowed_users.clone(),
                 wc.api_base_url.clone(),
                 wc.cdn_base_url.clone(),
-                wc.state_dir.as_ref().map(std::path::PathBuf::from),
+                wc.state_dir.as_ref().map(|s| expand_tilde_in_path(s)),
             )?
             .with_workspace_dir(config.workspace_dir.clone());
             zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
