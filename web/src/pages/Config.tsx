@@ -8,7 +8,7 @@
 // labels, dropdown options, or provider lists.
 
 import { useEffect, useMemo, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, ChevronRight, Plus, Sparkles } from 'lucide-react';
 import {
   ApiError,
@@ -55,10 +55,15 @@ const GROUP_ORDER = [
 ] as const;
 
 export default function Config() {
-  // `:section` route param locks the page to that single section (used by
-  // the promoted top-level routes like `/setup/providers`); without it we
-  // render the full multi-section explorer.
-  const { section: lockedSection } = useParams<{ section?: string }>();
+  // `/config/:section` preserves the active section in the URL so a page
+  // refresh lands the user back on whichever section they were editing.
+  // `/setup/:section` is the legacy locked single-section view (no inner
+  // sidebar) used by the promoted top-level routes. Both feed `:section`
+  // into the same `useParams`; we distinguish via the path prefix.
+  const { section: sectionParam } = useParams<{ section?: string }>();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const lockedSection = location.pathname.startsWith('/setup/') ? sectionParam : undefined;
   const [sections, setSections] = useState<SectionInfo[]>([]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [mode, setMode] = useState<Mode>({ kind: 'section-overview' });
@@ -92,11 +97,12 @@ export default function Config() {
       .then((resp) => {
         if (cancelled) return;
         setSections(resp.sections);
-        // Locked-section view: pick the requested section. Falls back to
-        // first available if the URL specifies an unknown key.
-        const initialKey = lockedSection
-          && resp.sections.find((s) => s.key === lockedSection)
-          ? lockedSection
+        // URL-supplied section (either locked /setup/<x> or
+        // navigable /config/<x>) wins when it exists in the schema.
+        // Falls back to the first available section.
+        const initialKey = sectionParam
+          && resp.sections.find((s) => s.key === sectionParam)
+          ? sectionParam
           : resp.sections[0]?.key ?? null;
         setActiveKey(initialKey);
         setMode({ kind: 'section-overview' });
@@ -113,7 +119,24 @@ export default function Config() {
     return () => {
       cancelled = true;
     };
-  }, [lockedSection]);
+    // Mount-only fetch. URL changes are reconciled in the next effect
+    // without re-flipping `loading`, which would otherwise collapse
+    // the whole page to a spinner and remount the inner sidebar at
+    // scrollTop=0 on every section click.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Reconcile activeKey with the URL `:section` param without
+  // re-fetching sections. Fires on initial param presence and any
+  // subsequent navigation between `/config/<a>` and `/config/<b>`.
+  useEffect(() => {
+    if (!sectionParam || sections.length === 0) return;
+    if (sections.some((s) => s.key === sectionParam) && sectionParam !== activeKey) {
+      setActiveKey(sectionParam);
+      setMode({ kind: 'section-overview' });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sectionParam, sections]);
 
   const activeSection = useMemo(
     () => sections.find((s) => s.key === activeKey) ?? null,
@@ -123,6 +146,12 @@ export default function Config() {
   const goToSection = (key: string) => {
     setActiveKey(key);
     setMode({ kind: 'section-overview' });
+    // Mirror the active section into the URL so a refresh restores
+    // the user's place. Skip when locked (the /setup/<key> route owns
+    // its URL and the inner sidebar is hidden anyway).
+    if (!lockedSection) {
+      navigate(`/config/${encodeURIComponent(key)}`, { replace: true });
+    }
   };
 
   const handlePick = async (item: PickerItem) => {
