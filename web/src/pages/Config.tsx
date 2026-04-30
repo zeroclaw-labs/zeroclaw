@@ -77,6 +77,13 @@ export default function Config() {
   };
   useEffect(fetchDrift, [activeKey]);
 
+  // Bumped after a successful daemon reload — used as `key` on
+  // <FieldForm> so React fully remounts and the new instance refetches
+  // values from the freshly-loaded gateway. Without this, an unchanged
+  // prefix prop leaves FieldForm's `useEffect([prefix])` dormant and
+  // the form keeps displaying values from before the reload.
+  const [reloadKey, setReloadKey] = useState(0);
+
 
   useEffect(() => {
     let cancelled = false;
@@ -277,6 +284,7 @@ export default function Config() {
                   onReloaded={() => {
                     goToSection(activeSection.key);
                     fetchDrift();
+                    setReloadKey((n) => n + 1);
                   }}
                 />
               </div>
@@ -288,6 +296,7 @@ export default function Config() {
                 onReloaded={() => {
                   goToSection(activeSection.key);
                   fetchDrift();
+                  setReloadKey((n) => n + 1);
                 }}
               />
             )}
@@ -297,6 +306,7 @@ export default function Config() {
               // Direct-form sections (Workspace, Hardware): no picker, just
               // show the form rooted at the section's path prefix.
               <FieldForm
+                key={reloadKey}
                 prefix={activeSection.key}
                 title={activeSection.label}
                 onSaved={fetchDrift}
@@ -337,6 +347,7 @@ export default function Config() {
                   Back to {activeSection.label}
                 </button>
                 <FieldForm
+                  key={reloadKey}
                   prefix={mode.fieldsPrefix}
                   title={mode.item.label}
                   onSaved={fetchDrift}
