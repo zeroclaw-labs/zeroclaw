@@ -2,6 +2,7 @@
 
 pub mod orchestrator;
 pub mod util;
+pub mod file;
 
 // Always-compiled channels and utilities (no feature gate)
 pub mod cli;

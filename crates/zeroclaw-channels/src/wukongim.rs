@@ -11,6 +11,8 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
+use crate::file::download_image_as_base64;
+
 const WUKONGIM_RPC_VERSION: &str = "2.0";
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
@@ -574,15 +576,62 @@ impl Channel for WuKongIMChannel {
                             // Only send ACK after all checks pass (message will be processed)
                             let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
 
-                            // Extract text content
-                            let content = if let Some(c) =
-                                payload_json.get("content").and_then(|c| c.as_str())
-                            {
-                                c.to_string()
-                            } else if let Some(s) = payload_json.as_str() {
-                                s.to_string()
-                            } else {
-                                String::new()
+                            // Extract content based on message type
+                            // type 1 = text, type 2 = image, type 5 = file
+                            let content = match msg_type {
+                                2 => {
+                                    // Image: extract URL and download
+                                    let url = payload_json.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                                    tracing::info!(
+                                        "WuKongIM: received IMAGE from {} (channel: {}:{}): url={}",
+                                        params.from_uid,
+                                        params.channel_type,
+                                        params.channel_id,
+                                        url
+                                    );
+                                    // Try to download the image and return as [IMAGE:...] marker
+                                    if let Some(marker) = self.download_image_as_marker(url).await {
+                                        marker
+                                    } else {
+                                        tracing::warn!(
+                                            "WuKongIM: failed to download image from {}, falling back to text",
+                                            url
+                                        );
+                                        format!("[图片下载失败]{}\n请直接描述图片内容", url)
+                                    }
+                                }
+                                5 => {
+                                    // File: extract URL and name
+                                    let url = payload_json.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                                    let name = payload_json.get("name").and_then(|n| n.as_str()).unwrap_or("文件");
+                                    tracing::info!(
+                                        "WuKongIM: received FILE from {} (channel: {}:{}): name={}, url={}",
+                                        params.from_uid,
+                                        params.channel_type,
+                                        params.channel_id,
+                                        name,
+                                        url
+                                    );
+                                    format!("[文件]{}: {}", name, url)
+                                }
+                                _ => {
+                                    // Text or other: extract from content field
+                                    if let Some(c) = payload_json.get("content").and_then(|c| c.as_str()) {
+                                        c.to_string()
+                                    } else if let Some(s) = payload_json.as_str() {
+                                        s.to_string()
+                                    } else {
+                                        tracing::warn!(
+                                            "WuKongIM: received UNKNOWN type {} from {} (channel: {}:{}): {:?}",
+                                            msg_type,
+                                            params.from_uid,
+                                            params.channel_type,
+                                            params.channel_id,
+                                            payload_json
+                                        );
+                                        String::new()
+                                    }
+                                }
                             };
                             tracing::info!(
                                 "WuKongIM: received message from {} (channel: {}:{}): {}",
@@ -679,5 +728,13 @@ impl Channel for WuKongIMChannel {
                 Ok(Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny))
             }
         }
+    }
+}
+
+// Helper methods for WuKongIMChannel
+impl WuKongIMChannel {
+    /// Download image from URL and return as `[IMAGE:...]` marker.
+    async fn download_image_as_marker(&self, url: &str) -> Option<String> {
+        download_image_as_base64(url).await
     }
 }
