@@ -101,6 +101,9 @@
   fail for some channel types (#5506).
 - Telegram and Matrix implementations moved out of the orchestrator into their own
   modules (#5639).
+- **Slack**: new `strict_mention_in_thread` flag — when combined with `mention_only`,
+  requires the bot to be @-mentioned again within a thread (not just at thread root).
+  Default off, preserves existing behavior (#5992).
 
 ### Configuration
 

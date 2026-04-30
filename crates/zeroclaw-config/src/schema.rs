@@ -7184,6 +7184,14 @@ pub struct SlackConfig {
     /// Direct messages remain allowed.
     #[serde(default)]
     pub mention_only: bool,
+    /// When true (and `mention_only` is also true), messages inside a Slack
+    /// thread must also @-mention the bot to trigger a response. By default,
+    /// thread replies are allowed through without a mention so the bot can
+    /// keep a back-and-forth going without the user repeating @-mentions.
+    /// Set this to true in channels shared with human discussion where the
+    /// bot should stay silent unless explicitly addressed.
+    #[serde(default)]
+    pub strict_mention_in_thread: bool,
     /// Use the newer Slack `markdown` block type (12 000 char limit, richer formatting).
     /// Defaults to false (uses universally supported `section` blocks with `mrkdwn`).
     /// Enable this only if your Slack workspace supports the `markdown` block type.
