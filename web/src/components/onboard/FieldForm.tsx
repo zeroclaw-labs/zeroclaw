@@ -30,6 +30,7 @@ import {
   objectArrayElementProps,
   patchConfig,
   type ConfigApiError,
+  type DriftEntry,
   type ListResponseEntry,
   type ObjectArrayPropMeta,
   type PatchOp,
@@ -45,6 +46,10 @@ interface FieldFormProps {
   showDelete?: boolean;
   /** Optional title rendered above the form. */
   title?: string;
+  /** Drift entries from the page-level fetch — passed through so each
+   *  drifted field renders an inline `in-memory: [...] / on-disk: [...]`
+   *  comparison next to its label. Empty / undefined when nothing drifted. */
+  drift?: DriftEntry[];
 }
 
 /** Imperative handle the parent uses to flush unsaved changes before
@@ -171,7 +176,7 @@ function isOptionalArray(typeHint: string): boolean {
 const modelsCache: Record<string, { models: string[]; live: boolean }> = {};
 
 const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm(
-  { prefix, onSaved, showDelete = true, title },
+  { prefix, onSaved, showDelete = true, title, drift },
   ref,
 ) {
   const [entries, setEntries] = useState<ListResponseEntry[]>([]);
@@ -424,6 +429,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
               elementProps={
                 f.kind === 'object-array' ? objectArrayElementProps(schema, f.path) : null
               }
+              drift={drift?.find((d) => d.path === f.path) ?? null}
             />
           ))}
         </form>
@@ -491,9 +497,11 @@ interface FieldRowProps {
   description: string | null;
   /** Per-element property metadata for `kind === 'object-array'` fields. */
   elementProps?: ObjectArrayPropMeta[] | null;
+  /** Drift entry for this path (in-memory ≠ on-disk). `null` when no drift. */
+  drift: DriftEntry | null;
 }
 
-function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onDelete, description, elementProps }: FieldRowProps) {
+function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onDelete, description, elementProps, drift }: FieldRowProps) {
   const renderer = rendererFor(entry);
   const [providerModels, setProviderModels] = useState<string[] | null>(null);
   const [modelsFetchFailed, setModelsFetchFailed] = useState(false);
@@ -550,6 +558,7 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
               {description}
             </p>
           )}
+          {drift && <DriftDiff drift={drift} />}
         </div>
         {onDelete && (
           <button
@@ -1218,5 +1227,49 @@ function KeyValueChipEditor({
       )}
     </div>
   );
+}
+
+// Per-field drift indicator: small inline pill showing in-memory vs
+// on-disk values side by side. Secret-marked paths surface only the
+// fact of drift — values never leave the server (server-side hash
+// compare in `compute_drift`).
+function DriftDiff({ drift }: { drift: DriftEntry }) {
+  if (drift.secret) {
+    return (
+      <p
+        className="text-xs mt-1 inline-flex items-center gap-1"
+        style={{ color: 'var(--color-status-warning, #f5b400)' }}
+      >
+        ⚠ secret value differs from on-disk
+      </p>
+    );
+  }
+  const inMem = formatDriftValue(drift.in_memory_value);
+  const onDisk = formatDriftValue(drift.on_disk_value);
+  return (
+    <div
+      className="text-xs mt-1 flex flex-wrap gap-x-3 gap-y-0.5"
+      style={{ color: 'var(--color-status-warning, #f5b400)' }}
+    >
+      <span>
+        in-memory:{' '}
+        <code style={{ color: 'var(--pc-text-secondary)' }}>{inMem}</code>
+      </span>
+      <span>
+        on-disk:{' '}
+        <code style={{ color: 'var(--pc-text-secondary)' }}>{onDisk}</code>
+      </span>
+    </div>
+  );
+}
+
+function formatDriftValue(value: unknown): string {
+  if (value === null || value === undefined) return '<unset>';
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 

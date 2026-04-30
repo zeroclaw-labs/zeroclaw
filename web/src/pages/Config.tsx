@@ -310,6 +310,7 @@ export default function Config() {
                 prefix={activeSection.key}
                 title={activeSection.label}
                 onSaved={fetchDrift}
+                drift={drifted}
               />
             ) : mode.kind === 'section-overview' ? (
               <SectionOverview
@@ -351,6 +352,7 @@ export default function Config() {
                   prefix={mode.fieldsPrefix}
                   title={mode.item.label}
                   onSaved={fetchDrift}
+                  drift={drifted}
                 />
               </div>
             )}
