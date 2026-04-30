@@ -330,10 +330,10 @@ export default function Config() {
                 <Link
                   to="/onboard"
                   className="btn-secondary inline-flex items-center gap-1.5 text-xs px-3 py-1.5"
-                  title="Walk the first-run setup wizard again"
+                  title="Walk the first-run onboarding wizard again"
                 >
                   <Sparkles className="h-3.5 w-3.5" />
-                  Run setup again
+                  Run onboarding again
                 </Link>
                 <ReloadDaemonButton
                   onReloaded={() => {
