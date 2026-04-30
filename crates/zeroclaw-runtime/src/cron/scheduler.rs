@@ -303,7 +303,7 @@ async fn run_agent_job(
                     if ctx.is_empty() {
                         String::new()
                     } else {
-                        format!("[Memory context]\n{ctx}\n\n")
+                        format!("[Memory context]\n{ctx}\n[/Memory context]\n\n")
                     }
                 }
                 _ => String::new(),
@@ -521,10 +521,23 @@ pub async fn deliver_announcement(
         )
         .await
     } else {
+        // No handler registered: this is a runtime-level state (the binary
+        // hasn't called `register_delivery_fn`), not a per-job failure.
+        // Returning `Err` here would force every announce-mode job to set
+        // `best_effort=true` just to survive a system that legitimately has
+        // no delivery wired (e.g. headless test runs, gateway-only deployments
+        // where channel orchestration lives elsewhere).
+        //
+        // We log loudly via `tracing::warn` so operators see the dropped
+        // delivery in their logs, then return `Ok(())` so `persist_job_result`
+        // records the job execution itself as successful. Operators that
+        // actively rely on delivery wire a handler at startup; absence is a
+        // configuration signal, not a delivery error.
         tracing::warn!(
             channel = %channel,
             target = %target,
-            "Cron delivery skipped: no delivery handler registered"
+            "Cron delivery skipped: no delivery handler registered \
+             (register_delivery_fn was not called by the binary)"
         );
         Ok(())
     }
@@ -1271,21 +1284,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_if_configured_announce_stub_returns_ok() {
+    async fn deliver_announcement_returns_ok_when_no_handler_registered() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
-        let mut job = test_job("echo ok");
-        job.delivery = DeliveryConfig {
-            mode: "announce".into(),
-            channel: Some("telegram".into()),
-            to: Some("123456".into()),
-            best_effort: true,
-        };
-
-        // deliver_announcement is a stub that logs a warning and returns Ok.
-        // Once delivery is wired through the orchestrator callback, these
-        // tests should be updated to verify actual delivery behaviour.
-        assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
+        // No registered handler is a runtime-level state, not a delivery
+        // failure. The caller (persist_job_result) should record the job
+        // execution as successful; the missing handler is logged via
+        // tracing::warn for operator visibility.
+        deliver_announcement(&config, "telegram", "chat-id", "payload")
+            .await
+            .expect("missing delivery handler should be Ok with a warn log");
     }
 
     #[test]

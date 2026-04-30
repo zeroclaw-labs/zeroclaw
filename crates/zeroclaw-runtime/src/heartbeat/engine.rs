@@ -249,7 +249,7 @@ impl HeartbeatEngine {
             .filter(HeartbeatTask::is_runnable)
             .collect();
         // Sort by priority descending (High > Medium > Low)
-        tasks.sort_by(|a, b| b.priority.cmp(&a.priority));
+        tasks.sort_by_key(|task| std::cmp::Reverse(task.priority));
         Ok(tasks)
     }
 
@@ -325,14 +325,18 @@ impl HeartbeatEngine {
 
     /// Build the Phase 1 LLM decision prompt for two-phase heartbeat.
     pub fn build_decision_prompt(tasks: &[HeartbeatTask]) -> String {
-        let mut prompt = String::from(
+        let now = chrono::Utc::now();
+        let mut prompt = format!(
             "You are a heartbeat scheduler. Review the following periodic tasks and decide \
              whether any should be executed right now.\n\n\
+             Current time: {} UTC ({})\n\n\
              Consider:\n\
              - Task priority (high tasks are more urgent)\n\
              - Whether the task is time-sensitive or can wait\n\
              - Whether running the task now would provide value\n\n\
              Tasks:\n",
+            now.format("%Y-%m-%d %H:%M:%S"),
+            now.format("%A"),
         );
 
         for (i, task) in tasks.iter().enumerate() {
@@ -585,6 +589,10 @@ mod tests {
         assert!(prompt.contains("2. [medium] Review calendar"));
         assert!(prompt.contains("skip"));
         assert!(prompt.contains("run:"));
+        assert!(
+            prompt.contains("Current time:"),
+            "prompt must include current datetime for time-sensitive decisions"
+        );
     }
 
     #[test]

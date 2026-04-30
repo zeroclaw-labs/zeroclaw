@@ -348,8 +348,9 @@ impl Provider for AzureOpenAiProvider {
         system_prompt: Option<&str>,
         message: &str,
         _model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Azure OpenAI API key not set. Set AZURE_OPENAI_API_KEY or edit config.toml."
@@ -401,8 +402,9 @@ impl Provider for AzureOpenAiProvider {
         &self,
         request: ProviderChatRequest<'_>,
         _model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Azure OpenAI API key not set. Set AZURE_OPENAI_API_KEY or edit config.toml."
@@ -451,8 +453,9 @@ impl Provider for AzureOpenAiProvider {
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
         _model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let temperature = temperature.unwrap_or(self.default_temperature());
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Azure OpenAI API key not set. Set AZURE_OPENAI_API_KEY or edit config.toml."
@@ -582,7 +585,7 @@ mod tests {
     #[tokio::test]
     async fn chat_fails_without_key() {
         let p = AzureOpenAiProvider::new(None, "resource", "deployment", None);
-        let result = p.chat_with_system(None, "hello", "gpt-4o", 0.7).await;
+        let result = p.chat_with_system(None, "hello", "gpt-4o", Some(0.7)).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
     }
@@ -591,7 +594,7 @@ mod tests {
     async fn chat_with_system_fails_without_key() {
         let p = AzureOpenAiProvider::new(None, "resource", "deployment", None);
         let result = p
-            .chat_with_system(Some("You are ZeroClaw"), "test", "gpt-4o", 0.5)
+            .chat_with_system(Some("You are ZeroClaw"), "test", "gpt-4o", Some(0.5))
             .await;
         assert!(result.is_err());
     }
@@ -708,7 +711,9 @@ mod tests {
                 }
             }
         })];
-        let result = p.chat_with_tools(&messages, &tools, "gpt-4o", 0.7).await;
+        let result = p
+            .chat_with_tools(&messages, &tools, "gpt-4o", Some(0.7))
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
     }

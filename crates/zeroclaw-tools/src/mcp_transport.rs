@@ -771,7 +771,7 @@ impl McpTransportConn for SseTransport {
         let mut last_status = None;
 
         for (i, url) in std::iter::once(primary_url)
-            .chain(secondary_url.into_iter())
+            .chain(secondary_url)
             .enumerate()
         {
             let has_accept = self

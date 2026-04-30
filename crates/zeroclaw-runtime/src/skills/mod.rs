@@ -27,6 +27,12 @@ const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
 const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
 const MAX_CLAWHUB_ZIP_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
 
+// ─── Skills registry (zeroclaw-skills) ────────────────────────────────────────
+const SKILLS_REGISTRY_REPO_URL: &str = "https://github.com/zeroclaw-labs/zeroclaw-skills";
+const SKILLS_REGISTRY_DIR_NAME: &str = "skills-registry";
+const SKILLS_REGISTRY_SYNC_MARKER: &str = ".zeroclaw-skills-registry-sync";
+const SKILLS_REGISTRY_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24;
+
 /// A skill is a user-defined or community-built capability.
 /// Skills live in `~/.zeroclaw/workspace/skills/<name>/SKILL.md`
 /// and can include tool definitions, prompts, and automation scripts.
@@ -80,6 +86,8 @@ struct SkillMeta {
     author: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    prompts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -122,6 +130,37 @@ fn warn_skipped_skill(path: &Path, summary: &str, allow_scripts: bool) {
     }
 }
 
+fn warn_metadata_drift(skill_dir: &Path, toml_skill: &Skill, md_path: &Path) {
+    if !md_path.exists() {
+        return;
+    }
+    let Ok(md_content) = std::fs::read_to_string(md_path) else {
+        return;
+    };
+    let parsed = parse_skill_markdown(&md_content);
+    let dir_name = skill_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+    if let Some(ref md_name) = parsed.meta.name
+        && md_name != &toml_skill.name
+    {
+        tracing::warn!(
+            "skill '{}': name mismatch between TOML ('{}') and SKILL.md ('{}')",
+            dir_name,
+            toml_skill.name,
+            md_name,
+        );
+    }
+    if let Some(ref md_desc) = parsed.meta.description {
+        let md_desc = md_desc.trim();
+        if !md_desc.is_empty() && md_desc != ">-" && md_desc != toml_skill.description.trim() {
+            tracing::warn!(
+                "skill '{}': description mismatch between TOML and SKILL.md — TOML takes precedence",
+                dir_name,
+            );
+        }
+    }
+}
+
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
     load_skills_with_open_skills_config(workspace_dir, None, None, None)
@@ -132,12 +171,18 @@ pub fn load_skills_with_config(
     workspace_dir: &Path,
     config: &zeroclaw_config::schema::Config,
 ) -> Vec<Skill> {
-    load_skills_with_open_skills_config(
+    #[allow(unused_mut)]
+    let mut skills = load_skills_with_open_skills_config(
         workspace_dir,
         Some(config.skills.open_skills_enabled),
         config.skills.open_skills_dir.as_deref(),
         Some(config.skills.allow_scripts),
-    )
+    );
+
+    #[cfg(feature = "plugins-wasm")]
+    skills.extend(load_plugin_skills_from_config(config));
+
+    skills
 }
 
 /// Load skills using explicit open-skills settings.
@@ -214,12 +259,22 @@ pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec
             }
         }
 
-        // Try SKILL.toml first, then SKILL.md
-        let manifest_path = path.join("SKILL.toml");
+        // Try SKILL.toml first, then manifest.toml (registry format), then SKILL.md
+        let skill_toml_path = path.join("SKILL.toml");
+        let manifest_toml_path = path.join("manifest.toml");
         let md_path = path.join("SKILL.md");
 
-        if manifest_path.exists() {
-            if let Ok(skill) = load_skill_toml(&manifest_path) {
+        let toml_path = if skill_toml_path.exists() {
+            Some(skill_toml_path)
+        } else if manifest_toml_path.exists() {
+            Some(manifest_toml_path)
+        } else {
+            None
+        };
+
+        if let Some(toml_path) = toml_path {
+            if let Ok(skill) = load_skill_toml(&toml_path) {
+                warn_metadata_drift(&path, &skill, &md_path);
                 skills.push(skill);
             }
         } else if md_path.exists()
@@ -278,11 +333,21 @@ fn load_open_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Ve
             }
         }
 
-        let manifest_path = path.join("SKILL.toml");
+        let skill_toml_path = path.join("SKILL.toml");
+        let manifest_toml_path = path.join("manifest.toml");
         let md_path = path.join("SKILL.md");
 
-        if manifest_path.exists() {
-            if let Ok(skill) = load_skill_toml(&manifest_path) {
+        let toml_path = if skill_toml_path.exists() {
+            Some(skill_toml_path)
+        } else if manifest_toml_path.exists() {
+            Some(manifest_toml_path)
+        } else {
+            None
+        };
+
+        if let Some(toml_path) = toml_path {
+            if let Ok(skill) = load_skill_toml(&toml_path) {
+                warn_metadata_drift(&path, &skill, &md_path);
                 skills.push(finalize_open_skill(skill));
             }
         } else if md_path.exists()
@@ -539,6 +604,13 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
     let manifest: SkillManifest = toml::from_str(&content)?;
 
+    // Merge prompts from both locations: inside the [skill] table (natural
+    // location for per-skill prompts) and at the manifest root (historical
+    // location). Previously, prompts placed inside [skill] were silently
+    // dropped because SkillMeta had no `prompts` field. Fixes #5721.
+    let mut prompts = manifest.skill.prompts;
+    prompts.extend(manifest.prompts);
+
     Ok(Skill {
         name: manifest.skill.name,
         description: manifest.skill.description,
@@ -546,7 +618,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         author: manifest.skill.author,
         tags: manifest.skill.tags,
         tools: manifest.tools,
-        prompts: manifest.prompts,
+        prompts,
         location: Some(path.to_path_buf()),
     })
 }
@@ -639,7 +711,33 @@ fn parse_skill_markdown(content: &str) -> ParsedSkillMarkdown {
 fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
     let mut meta = SkillMarkdownMeta::default();
     let mut collecting_tags = false;
+    let mut collecting_multiline: Option<String> = None;
+    let mut multiline_parts: Vec<String> = Vec::new();
+
+    let flush_multiline = |key: &str, parts: &[String], meta: &mut SkillMarkdownMeta| {
+        let joined = parts.join(" ");
+        let val = joined.trim();
+        if !val.is_empty() {
+            match key {
+                "description" => meta.description = Some(val.to_string()),
+                "name" => meta.name = Some(val.to_string()),
+                _ => {}
+            }
+        }
+    };
+
     for line in s.lines() {
+        // Collect indented continuation lines for YAML block scalars (>- or |)
+        if let Some(ref key) = collecting_multiline {
+            if line.starts_with(' ') || line.starts_with('\t') {
+                multiline_parts.push(line.trim().to_string());
+                continue;
+            }
+            flush_multiline(key, &multiline_parts, &mut meta);
+            collecting_multiline = None;
+            multiline_parts.clear();
+        }
+
         // Handle YAML list items under `tags:` (e.g. "  - parser")
         if collecting_tags {
             let trimmed = line.trim();
@@ -658,6 +756,12 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
         };
         let key = key.trim();
         let val = val.trim().trim_matches('"').trim_matches('\'');
+        // YAML block scalar indicators — collect continuation lines
+        if val == ">-" || val == ">" || val == "|" || val == "|-" {
+            collecting_multiline = Some(key.to_string());
+            multiline_parts.clear();
+            continue;
+        }
         match key {
             "name" => meta.name = Some(val.to_string()),
             "description" => meta.description = Some(val.to_string()),
@@ -679,6 +783,9 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
             }
             _ => {}
         }
+    }
+    if let Some(ref key) = collecting_multiline {
+        flush_multiline(key, &multiline_parts, &mut meta);
     }
     meta
 }
@@ -1338,8 +1445,9 @@ pub fn install_clawhub_skill_source(
         std::io::copy(&mut entry, &mut out_file)?;
     }
 
-    let has_manifest =
-        installed_dir.join("SKILL.md").exists() || installed_dir.join("SKILL.toml").exists();
+    let has_manifest = installed_dir.join("SKILL.md").exists()
+        || installed_dir.join("SKILL.toml").exists()
+        || installed_dir.join("manifest.toml").exists();
     if !has_manifest {
         std::fs::write(
             installed_dir.join("SKILL.toml"),
@@ -1356,5 +1464,357 @@ pub fn install_clawhub_skill_source(
             let _ = std::fs::remove_dir_all(&installed_dir);
             Err(err)
         }
+    }
+}
+
+// ─── Skills registry resolution ───────────────────────────────────────────────
+
+pub fn is_registry_source(source: &str) -> bool {
+    if source.is_empty() {
+        return false;
+    }
+    if source.contains('/') || source.contains('\\') || source.contains("..") {
+        return false;
+    }
+    if source.contains("://") || source.contains(':') {
+        return false;
+    }
+    if source.starts_with('.') || source.starts_with('~') {
+        return false;
+    }
+    source
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
+    if let Some(parent) = registry_dir.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create registry parent: {}", parent.display()))?;
+    }
+
+    let output = Command::new("git")
+        .args(["clone", "--depth", "1", repo_url])
+        .arg(registry_dir)
+        .output()
+        .context("failed to run git clone for skills registry")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("failed to clone skills registry: {stderr}");
+    }
+
+    tracing::info!("cloned skills registry to {}", registry_dir.display());
+    mark_skills_registry_synced(registry_dir)?;
+    Ok(())
+}
+
+fn pull_skills_registry(registry_dir: &Path) -> bool {
+    if !registry_dir.join(".git").exists() {
+        return true;
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(registry_dir)
+        .args(["pull", "--ff-only"])
+        .output();
+
+    match output {
+        Ok(result) if result.status.success() => true,
+        Ok(result) => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            tracing::warn!("failed to pull skills registry updates: {stderr}");
+            false
+        }
+        Err(err) => {
+            tracing::warn!("failed to run git pull for skills registry: {err}");
+            false
+        }
+    }
+}
+
+fn should_sync_skills_registry(registry_dir: &Path) -> bool {
+    let marker = registry_dir.join(SKILLS_REGISTRY_SYNC_MARKER);
+    let Ok(metadata) = std::fs::metadata(marker) else {
+        return true;
+    };
+    let Ok(modified_at) = metadata.modified() else {
+        return true;
+    };
+    let Ok(age) = SystemTime::now().duration_since(modified_at) else {
+        return true;
+    };
+    age >= Duration::from_secs(SKILLS_REGISTRY_SYNC_INTERVAL_SECS)
+}
+
+fn mark_skills_registry_synced(registry_dir: &Path) -> Result<()> {
+    std::fs::write(registry_dir.join(SKILLS_REGISTRY_SYNC_MARKER), b"synced")?;
+    Ok(())
+}
+
+fn ensure_skills_registry(workspace_dir: &Path, registry_url: Option<&str>) -> Result<PathBuf> {
+    let registry_dir = workspace_dir.join(SKILLS_REGISTRY_DIR_NAME);
+    let repo_url = registry_url.unwrap_or(SKILLS_REGISTRY_REPO_URL);
+
+    if !registry_dir.exists() {
+        clone_skills_registry(&registry_dir, repo_url)?;
+        return Ok(registry_dir);
+    }
+
+    if should_sync_skills_registry(&registry_dir) {
+        if pull_skills_registry(&registry_dir) {
+            let _ = mark_skills_registry_synced(&registry_dir);
+        } else {
+            tracing::warn!(
+                "skills registry update failed; using local copy from {}",
+                registry_dir.display()
+            );
+        }
+    }
+
+    Ok(registry_dir)
+}
+
+fn list_registry_skill_names(registry_dir: &Path) -> Vec<String> {
+    let skills_parent = registry_dir.join("skills");
+    let Ok(entries) = std::fs::read_dir(&skills_parent) else {
+        return vec![];
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    names
+}
+
+pub fn install_registry_skill_source(
+    source: &str,
+    skills_path: &Path,
+    allow_scripts: bool,
+    workspace_dir: &Path,
+    registry_url: Option<&str>,
+) -> Result<(PathBuf, usize)> {
+    let registry_dir = ensure_skills_registry(workspace_dir, registry_url)?;
+    let skill_dir = registry_dir.join("skills").join(source);
+
+    if !skill_dir.is_dir() {
+        let available = list_registry_skill_names(&registry_dir);
+        if available.is_empty() {
+            anyhow::bail!("skill '{source}' not found in the registry and no skills are available");
+        }
+        anyhow::bail!(
+            "skill '{source}' not found in the registry.\nAvailable skills: {}",
+            available.join(", ")
+        );
+    }
+
+    install_local_skill_source(
+        skill_dir.to_str().with_context(|| {
+            format!("registry path is not valid UTF-8: {}", skill_dir.display())
+        })?,
+        skills_path,
+        allow_scripts,
+    )
+}
+
+// ─── Plugin-shipped skills (plugins-wasm only) ───────────────────────────────
+
+/// Load skills from skill-capable plugins discovered by the plugin host.
+///
+/// Each plugin's `skills/` directory is fed to the existing skill loader, and
+/// every loaded skill is renamed to `plugin:<plugin>/<skill>` to avoid
+/// collisions with user-authored skills and between bundles. The `plugin:<name>`
+/// tag is also added so prompts can distinguish plugin skills.
+#[cfg(feature = "plugins-wasm")]
+pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) -> Vec<Skill> {
+    if !config.plugins.enabled {
+        return Vec::new();
+    }
+
+    let plugins_dir = expand_plugins_dir(&config.plugins.plugins_dir);
+    let parent = match plugins_dir.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return Vec::new(),
+    };
+
+    let signature_mode = zeroclaw_plugins::host::PluginHost::parse_signature_mode(
+        &config.plugins.security.signature_mode,
+    );
+    let trusted_keys = config.plugins.security.trusted_publisher_keys.clone();
+
+    let host = match zeroclaw_plugins::host::PluginHost::with_security(
+        &parent,
+        signature_mode,
+        trusted_keys,
+    ) {
+        Ok(host) => host,
+        Err(err) => {
+            tracing::warn!("failed to discover plugin skills: {err}");
+            return Vec::new();
+        }
+    };
+
+    let allow_scripts = config.skills.allow_scripts;
+    let mut skills = Vec::new();
+    for (manifest, skills_dir) in host.skill_plugin_details() {
+        for raw in load_skills_from_directory(&skills_dir, allow_scripts) {
+            skills.push(namespace_plugin_skill(&manifest.name, raw));
+        }
+    }
+    skills
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn expand_plugins_dir(plugins_dir: &str) -> PathBuf {
+    if let Some(rest) = plugins_dir.strip_prefix("~/")
+        && let Some(dirs) = UserDirs::new()
+    {
+        return dirs.home_dir().join(rest);
+    }
+    PathBuf::from(plugins_dir)
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn namespace_plugin_skill(plugin_name: &str, mut skill: Skill) -> Skill {
+    let qualified = format!("plugin:{}/{}", plugin_name, skill.name);
+    skill.name = qualified;
+    let plugin_tag = format!("plugin:{plugin_name}");
+    if !skill.tags.iter().any(|t| t == &plugin_tag) {
+        skill.tags.push(plugin_tag);
+    }
+    skill
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[test]
+    fn test_is_registry_source_accepts_bare_names() {
+        assert!(is_registry_source("auto-coder"));
+        assert!(is_registry_source("web-researcher"));
+        assert!(is_registry_source("telegram-assistant"));
+        assert!(is_registry_source("data_analyst"));
+        assert!(is_registry_source("ci-helper"));
+        assert!(is_registry_source("selfimproving"));
+    }
+
+    #[test]
+    fn test_is_registry_source_rejects_empty() {
+        assert!(!is_registry_source(""));
+    }
+
+    #[test]
+    fn test_is_registry_source_rejects_paths() {
+        assert!(!is_registry_source("./my-skill"));
+        assert!(!is_registry_source("../my-skill"));
+        assert!(!is_registry_source("/abs/path"));
+        assert!(!is_registry_source("skills/auto-coder"));
+        assert!(!is_registry_source("some\\path"));
+        assert!(!is_registry_source("~/.zeroclaw/skills/foo"));
+    }
+
+    #[test]
+    fn test_is_registry_source_rejects_urls() {
+        assert!(!is_registry_source("https://github.com/foo/bar"));
+        assert!(!is_registry_source("http://example.com"));
+        assert!(!is_registry_source("ssh://git@host/repo"));
+        assert!(!is_registry_source("git://host/repo"));
+        assert!(!is_registry_source("git@github.com:user/repo"));
+    }
+
+    #[test]
+    fn test_is_registry_source_rejects_clawhub() {
+        assert!(!is_registry_source("clawhub:my-skill"));
+    }
+
+    #[test]
+    fn test_is_registry_source_rejects_traversal() {
+        assert!(!is_registry_source(".."));
+        assert!(!is_registry_source("foo..bar"));
+    }
+
+    #[test]
+    fn test_is_registry_source_rejects_special_chars() {
+        assert!(!is_registry_source(".hidden"));
+        assert!(!is_registry_source("~tilde"));
+    }
+}
+
+#[cfg(test)]
+mod prompts_section_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_manifest(dir: &Path, toml: &str) -> std::path::PathBuf {
+        let p = dir.join("SKILL.toml");
+        std::fs::write(&p, toml).unwrap();
+        p
+    }
+
+    #[test]
+    fn prompts_inside_skill_section_are_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+[skill]
+name = "probe"
+description = "test"
+version = "0.1.0"
+prompts = ["If asked about XYZZY, respond YES"]
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert_eq!(
+            skill.prompts,
+            vec!["If asked about XYZZY, respond YES".to_string()]
+        );
+    }
+
+    #[test]
+    fn prompts_at_root_level_still_work() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+[skill]
+name = "probe"
+description = "test"
+version = "0.1.0"
+
+prompts = ["legacy root-level prompt"]
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert_eq!(skill.prompts, vec!["legacy root-level prompt".to_string()]);
+    }
+
+    #[test]
+    fn prompts_in_both_locations_are_merged_skill_first() {
+        // Root-level prompts must precede the [skill] header in TOML.
+        // Per the fix, [skill]-section prompts appear first in the merged
+        // list, with root-level prompts appended after.
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+prompts = ["from-root"]
+
+[skill]
+name = "probe"
+description = "test"
+version = "0.1.0"
+prompts = ["from-skill-section"]
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert_eq!(
+            skill.prompts,
+            vec!["from-skill-section".to_string(), "from-root".to_string(),]
+        );
     }
 }

@@ -1,14 +1,14 @@
 //! Tool subsystem for agent-callable capabilities.
 //!
 //! This module implements the tool execution surface exposed to the LLM during
-//! agentic loops. Each tool implements the [`Tool`] trait defined in [`traits`],
-//! which requires a name, description, JSON parameter schema, and an async
-//! `execute` method returning a structured [`ToolResult`].
+//! agentic loops. Each tool implements the [`Tool`] trait defined in the
+//! `traits` submodule, which requires a name, description, JSON parameter
+//! schema, and an async `execute` method returning a structured [`ToolResult`].
 //!
 //! Tools are assembled into registries by [`default_tools`] (shell, file read/write)
 //! and [`all_tools`] (full set including memory, browser, cron, HTTP, delegation,
 //! and optional integrations). Security policy enforcement is injected via
-//! [`SecurityPolicy`](crate::security::SecurityPolicy) at construction time.
+//! [`SecurityPolicy`] at construction time.
 //!
 //! # Extension
 //!
@@ -98,7 +98,10 @@ pub use zeroclaw_tools::pushover::PushoverTool;
 pub use zeroclaw_tools::reaction::ReactionTool;
 pub use zeroclaw_tools::report_template_tool::ReportTemplateTool;
 pub use zeroclaw_tools::screenshot::ScreenshotTool;
-pub use zeroclaw_tools::sessions::{SessionsHistoryTool, SessionsListTool, SessionsSendTool};
+pub use zeroclaw_tools::sessions::{
+    SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
+    SessionsListTool, SessionsSendTool,
+};
 pub use zeroclaw_tools::swarm::SwarmTool;
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
@@ -223,8 +226,14 @@ pub fn default_tools_with_runtime(
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security.clone())),
         Box::new(FileEditTool::new(security.clone())),
-        Box::new(GlobSearchTool::new(security.clone())),
-        Box::new(ContentSearchTool::new(security)),
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
+            security,
+        )),
     ]
 }
 
@@ -331,7 +340,8 @@ pub fn all_tools_with_runtime(
     Option<ChannelMapHandle>,
 ) {
     let has_shell_access = runtime.has_shell_access();
-    let sandbox = create_sandbox(&root_config.security);
+    let runtime_kind = root_config.runtime.kind.as_str();
+    let sandbox = create_sandbox(&root_config.security, runtime_kind);
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
@@ -344,8 +354,14 @@ pub fn all_tools_with_runtime(
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
-        Arc::new(GlobSearchTool::new(security.clone())),
-        Arc::new(ContentSearchTool::new(security.clone())),
+        Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
+        Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
+            security.clone(),
+        )),
         Arc::new(CronAddTool::new(config.clone(), security.clone())),
         Arc::new(CronListTool::new(config.clone())),
         Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
@@ -670,16 +686,25 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
-    // Session-to-session messaging tools (always available when sessions dir exists)
+    // Session tools (JSONL path). If a separate SQLite registration path is
+    // added, these tools need to be registered there too.
     if let Ok(session_store) = zeroclaw_infra::session_store::SessionStore::new(workspace_dir) {
         let backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
             Arc::new(session_store);
+        tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsHistoryTool::new(
             backend.clone(),
             security.clone(),
         )));
         tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+        // NOTE: SessionResetTool and SessionDeleteTool are available via
+        // zeroclaw_tools::sessions but NOT registered by default. They are
+        // destructive operations (clear/delete conversation history) and
+        // should only be enabled by callers that explicitly need them
+        // (e.g., orchestration dashboards). To enable:
+        //   tool_arcs.push(Arc::new(SessionResetTool::new(backend.clone(), security.clone())));
+        //   tool_arcs.push(Arc::new(SessionDeleteTool::new(backend, security.clone())));
     }
 
     // LinkedIn integration (config-gated)

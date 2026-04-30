@@ -938,6 +938,9 @@ mod tests {
             recovery_key: None,
             password: None,
             mention_only: false,
+            approval_timeout_secs: 300,
+            reply_in_thread: true,
+            ack_reactions: true,
         });
         let entries = all_integrations();
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();

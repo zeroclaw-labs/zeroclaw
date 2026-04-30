@@ -29,6 +29,10 @@ const PROBE_TIERS: &[usize] = &[
     2_000_000, 1_000_000, 512_000, 200_000, 128_000, 64_000, 32_000,
 ];
 
+/// Low temperature for near-deterministic summarization; history compression
+/// must faithfully reflect the source conversation, not invent or embellish.
+const SUMMARIZER_TEMPERATURE: f64 = 0.1;
+
 fn next_probe_tier(current: usize) -> usize {
     PROBE_TIERS
         .iter()
@@ -325,7 +329,12 @@ impl ContextCompressor {
         let timeout = Duration::from_secs(self.config.timeout_secs);
         let summary_raw = match tokio::time::timeout(
             timeout,
-            provider.chat_with_system(Some(SUMMARIZER_SYSTEM), &user_prompt, summary_model, 0.1),
+            provider.chat_with_system(
+                Some(SUMMARIZER_SYSTEM),
+                &user_prompt,
+                summary_model,
+                Some(SUMMARIZER_TEMPERATURE),
+            ),
         )
         .await
         {
@@ -392,15 +401,35 @@ fn align_boundary_forward(messages: &[ChatMessage], idx: usize) -> usize {
     i
 }
 
-/// Move boundary backward past any tool_call-bearing assistant messages at the end
-/// so their results stay in the protected tail.
+/// Move the tail boundary backward past any orphan-creating split.
+///
+/// First step past any leading `tool` messages — their owning assistant
+/// is earlier and must travel with them into the protected tail.
+///
+/// Second, if we land on an assistant that owns `tool_calls`, back up
+/// past it as well. Otherwise that assistant gets summarized while its
+/// already-protected `tool_result` blocks remain in the tail, creating
+/// the 400 "unexpected tool_use_id in tool_result blocks" failure mode
+/// at the root of #5813.
 fn align_boundary_backward(messages: &[ChatMessage], idx: usize) -> usize {
     let mut i = idx;
-    // If the message just before the boundary is an assistant message that likely
-    // contains tool calls (heuristic: followed by a tool result), pull the boundary back.
-    while i > 0 && i < messages.len() && messages[i].role == "tool" {
-        // The tool result at `i` belongs to a tool_call before it — move boundary past it
-        i -= 1;
+    loop {
+        while i > 0 && messages[i].role == "tool" {
+            i -= 1;
+        }
+        if messages[i].role == "assistant"
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&messages[i].content)
+            && v.get("tool_calls")
+                .and_then(|a| a.as_array())
+                .is_some_and(|a| !a.is_empty())
+        {
+            if i == 0 {
+                break;
+            }
+            i -= 1;
+            continue;
+        }
+        break;
     }
     i
 }
@@ -593,6 +622,47 @@ mod tests {
         ];
         repair_tool_pairs(&mut messages);
         assert_eq!(messages.len(), 5); // no change
+    }
+
+    /// Regression test for the root-cause #5813 fix: when the tail
+    /// boundary lands on an assistant with `tool_calls`, the function
+    /// must back up past it so the assistant travels with its
+    /// `tool_result` blocks into the protected tail. Otherwise the
+    /// assistant gets summarized while its results survive, creating an
+    /// orphan and producing the 400 "unexpected tool_use_id" failure.
+    #[test]
+    fn test_align_boundary_backward_backs_up_past_tool_call_assistant() {
+        let messages = vec![
+            msg("system", "sys"),
+            msg("user", "q1"),
+            msg("assistant", "old reply 1"),
+            msg("user", "q2"),
+            msg(
+                "assistant",
+                r#"{"content":null,"tool_calls":[{"id":"toolu_X","name":"shell","arguments":"{}"}]}"#,
+            ),
+            msg("tool", r#"{"tool_call_id":"toolu_X","content":"result"}"#),
+            msg("user", "follow-up"),
+        ];
+        // Initial boundary lands on the assistant(tool_calls) at index 4.
+        // The function must back up past it so the pair stays in the tail.
+        let aligned = align_boundary_backward(&messages, 4);
+        assert!(
+            aligned < 4,
+            "boundary should retreat past assistant(tool_calls) at idx 4, got {aligned}"
+        );
+    }
+
+    #[test]
+    fn test_align_boundary_backward_noop_on_plain_assistant() {
+        let messages = vec![
+            msg("system", "sys"),
+            msg("user", "q"),
+            msg("assistant", "plain text reply"),
+            msg("user", "next"),
+        ];
+        // No tool_calls on the assistant — boundary should not retreat.
+        assert_eq!(align_boundary_backward(&messages, 2), 2);
     }
 
     #[test]

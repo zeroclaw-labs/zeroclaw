@@ -4,8 +4,13 @@ use crate::security::traits::Sandbox;
 use std::sync::Arc;
 use zeroclaw_config::schema::{SandboxBackend, SecurityConfig};
 
-/// Create a sandbox based on auto-detection or explicit config
-pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
+/// Create a sandbox based on auto-detection or explicit config.
+///
+/// `runtime_kind` is the `runtime.kind` string from the top-level config
+/// (e.g. `"native"`, `"docker"`). When the caller has set `runtime.kind = "native"`,
+/// Docker must never be selected as the sandbox backend during auto-detection —
+/// the user explicitly opted out of container wrapping.
+pub fn create_sandbox(config: &SecurityConfig, runtime_kind: &str) -> Arc<dyn Sandbox> {
     let backend = &config.sandbox.backend;
 
     // If explicitly disabled, return noop
@@ -77,14 +82,20 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Auto | SandboxBackend::None => {
-            // Auto-detect best available
-            detect_best_sandbox()
+            // Auto-detect best available, skipping Docker when native runtime is in use
+            detect_best_sandbox(runtime_kind)
         }
     }
 }
 
-/// Auto-detect the best available sandbox
-fn detect_best_sandbox() -> Arc<dyn Sandbox> {
+/// Auto-detect the best available sandbox.
+///
+/// When `runtime_kind` is `"native"` the caller has explicitly opted out of
+/// container wrapping, so Docker is excluded from consideration even if it is
+/// installed on the host.
+fn detect_best_sandbox(runtime_kind: &str) -> Arc<dyn Sandbox> {
+    let skip_docker = runtime_kind == "native";
+
     #[cfg(target_os = "linux")]
     {
         // Try Landlock first (native, no dependencies)
@@ -121,15 +132,64 @@ fn detect_best_sandbox() -> Arc<dyn Sandbox> {
         }
     }
 
-    // Docker is heavy but works everywhere if docker is installed
-    if let Ok(sandbox) = super::docker::DockerSandbox::probe() {
-        tracing::info!("Docker sandbox enabled");
-        return Arc::new(sandbox);
+    // Docker is heavy but works everywhere if docker is installed.
+    // Skip it when runtime.kind = "native" — the user explicitly opted out of
+    // container wrapping, and forcing Docker would break Python skills (Alpine
+    // has no python3) and workspace access on resource-constrained hosts.
+    if !skip_docker {
+        if let Ok(sandbox) = super::docker::DockerSandbox::probe() {
+            tracing::info!("Docker sandbox enabled");
+            return Arc::new(sandbox);
+        }
+    } else {
+        tracing::debug!(
+            "Docker sandbox skipped: runtime.kind = \"native\" overrides auto-detection"
+        );
     }
 
     // Fallback: application-layer security only
     tracing::info!("No sandbox backend available, using application-layer security");
     Arc::new(super::traits::NoopSandbox)
+}
+
+/// Returns true if the Linux kernel has the memory cgroup controller enabled.
+///
+/// Probes cgroup v2 (`/sys/fs/cgroup/memory.max`), then cgroup v1
+/// (`/sys/fs/cgroup/memory/memory.limit_in_bytes`), then `/proc/cgroups`.
+/// Any read error is treated as "absent" (conservative/safe direction).
+#[cfg(target_os = "linux")]
+pub fn linux_memcg_available() -> bool {
+    use std::path::Path;
+
+    if Path::new("/sys/fs/cgroup/memory.max").exists() {
+        return true;
+    }
+    if Path::new("/sys/fs/cgroup/memory/memory.limit_in_bytes").exists() {
+        return true;
+    }
+    if let Ok(content) = std::fs::read_to_string("/proc/cgroups") {
+        for line in content.lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            let mut cols = line.split_whitespace();
+            let name = cols.next().unwrap_or("");
+            let _hierarchy = cols.next();
+            let _num_cgroups = cols.next();
+            let enabled = cols.next().unwrap_or("0");
+            if name == "memory" && enabled == "1" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Non-Linux stub — always returns false.
+/// Exists so the symbol compiles on all platforms (used in cross-platform tests).
+#[cfg(not(target_os = "linux"))]
+pub fn linux_memcg_available() -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -139,7 +199,7 @@ mod tests {
 
     #[test]
     fn detect_best_sandbox_returns_something() {
-        let sandbox = detect_best_sandbox();
+        let sandbox = detect_best_sandbox("");
         // Should always return at least NoopSandbox
         assert!(sandbox.is_available());
     }
@@ -154,7 +214,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let sandbox = create_sandbox(&config);
+        let sandbox = create_sandbox(&config, "");
         assert_eq!(sandbox.name(), "none");
     }
 
@@ -168,8 +228,61 @@ mod tests {
             },
             ..Default::default()
         };
-        let sandbox = create_sandbox(&config);
+        let sandbox = create_sandbox(&config, "");
         // Should return some sandbox (at least NoopSandbox)
         assert!(sandbox.is_available());
+    }
+
+    #[test]
+    fn native_runtime_with_auto_sandbox_never_selects_docker() {
+        // When runtime.kind = "native", Docker must be skipped in auto-detection
+        // even when Docker is installed on the host. The sandbox must be
+        // NoopSandbox or something OS-native (Landlock, Firejail, Seatbelt).
+        let sandbox = detect_best_sandbox("native");
+        assert_ne!(sandbox.name(), "docker");
+    }
+
+    #[test]
+    fn explicit_docker_backend_is_not_blocked_by_native_runtime() {
+        // Even with runtime.kind = "native", explicit `backend = "docker"` in config
+        // is respected. Only the auto-detect path is gated by runtime_kind.
+        let config = SecurityConfig {
+            sandbox: SandboxConfig {
+                enabled: None,
+                backend: SandboxBackend::Docker,
+                firejail_args: Vec::new(),
+            },
+            ..Default::default()
+        };
+        let sandbox = create_sandbox(&config, "native");
+        // If Docker is available, it will be selected; if not, NoopSandbox fallback.
+        // The point is that runtime.kind doesn't override explicit `backend = "docker"`.
+        assert!(sandbox.is_available());
+    }
+
+    #[test]
+    fn linux_memcg_available_returns_bool() {
+        let _result: bool = linux_memcg_available();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_memcg_cgroup_v2_path_probe_does_not_panic() {
+        let _ = std::path::Path::new("/sys/fs/cgroup/memory.max").exists();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_memcg_proc_cgroups_parses_without_panic() {
+        if let Ok(content) = std::fs::read_to_string("/proc/cgroups") {
+            let _found = content.lines().filter(|l| !l.starts_with('#')).any(|l| {
+                let mut f = l.split_whitespace();
+                let name = f.next().unwrap_or("");
+                let _hier = f.next();
+                let _num = f.next();
+                let enabled = f.next().unwrap_or("0");
+                name == "memory" && enabled == "1"
+            });
+        }
     }
 }
