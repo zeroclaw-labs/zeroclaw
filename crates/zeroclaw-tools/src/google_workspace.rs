@@ -136,7 +136,12 @@ impl Tool for GoogleWorkspaceTool {
 
     fn description(&self) -> &str {
         "Interact with Google Workspace services (Drive, Gmail, Calendar, Sheets, Docs, etc.) \
-         via the gws CLI. Requires gws to be installed and authenticated."
+         via the gws CLI. Requires gws to be installed and authenticated. \
+         IMPORTANT: Gmail commands are 4-segment and REQUIRE sub_resource. \
+         To list Gmail messages, use service=gmail, resource=users, sub_resource=messages, method=list \
+         (this becomes `gws gmail users messages list`). \
+         Without sub_resource, Gmail calls will fail. \
+         Drive, Calendar, and Sheets are 3-segment and do NOT use sub_resource."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -149,7 +154,7 @@ impl Tool for GoogleWorkspaceTool {
                 },
                 "resource": {
                     "type": "string",
-                    "description": "Service resource (e.g. files, messages, events, spreadsheets)"
+                    "description": "Top-level resource. For Gmail this is always 'users'. For Drive use 'files'. For Calendar use 'events' or 'calendars'. For Sheets use 'spreadsheets'."
                 },
                 "method": {
                     "type": "string",
@@ -157,11 +162,11 @@ impl Tool for GoogleWorkspaceTool {
                 },
                 "sub_resource": {
                     "type": "string",
-                    "description": "Optional sub-resource for nested operations"
+                    "description": "Sub-resource for 4-segment gws commands. REQUIRED for Gmail: use 'messages', 'threads', 'drafts', or 'labels' (e.g. gmail/users/messages/list). Omit for 3-segment services like Drive, Calendar, and Sheets."
                 },
                 "params": {
                     "type": "object",
-                    "description": "URL/query parameters as key-value pairs (passed as --params JSON)"
+                    "description": "URL/query parameters as key-value pairs (passed as --params JSON). For Gmail, ALWAYS include `userId: \"me\"` to refer to the authenticated user (e.g. {\"userId\":\"me\",\"maxResults\":10}). For Calendar events.list, include `calendarId: \"primary\"`."
                 },
                 "body": {
                     "type": "object",
