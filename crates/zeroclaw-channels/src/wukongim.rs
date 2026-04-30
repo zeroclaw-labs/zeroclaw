@@ -315,17 +315,36 @@ impl WuKongIMChannel {
             // Basic cleanup of common patterns in cron_add summary
             summary = summary
                 .replace("job_type: agent, ", "任务类型: 智能体, ")
+                .replace("job_type: shell, ", "任务类型: 脚本, ")
                 .replace("name: ", "任务名称: ")
                 .replace("prompt: ", "提示词: ")
+                .replace("command: ", "执行命令: ")
                 .replace("schedule: ", "\n执行计划: ");
+
+            // Try to extract a prettier time from the "at" JSON if possible
+            let mut time_info = summary
+                .split("\n执行计划: ")
+                .last()
+                .unwrap_or("按计划执行")
+                .to_string();
+            if time_info.contains("\"at\":") {
+                // Simple heuristic to pull out the timestamp: "at":"2026-04-30T14:39:46Z"
+                if let Some(start) = time_info.find("\"at\":\"") {
+                    let rest = &time_info[start + 6..];
+                    if let Some(end) = rest.find('"') {
+                        time_info = rest[..end]
+                            .to_string()
+                            .replace('T', " ")
+                            .replace('Z', " (UTC)");
+                    }
+                }
+            }
 
             (
                 "📋 任务执行审批",
                 format!(
                     "1. **执行的是什么**\n添加定时任务: **{}**\n\n2. **执行的时间相关信息**\n{}\n\n3. **执行内容的总结**\n{}",
-                    request.tool_name,
-                    summary.split("\n执行计划: ").last().unwrap_or("按计划执行"),
-                    summary
+                    request.tool_name, time_info, summary
                 ),
             )
         } else {
@@ -756,7 +775,18 @@ mod tests {
             body: WkApprovalBody {
                 content: "Body".to_string(),
             },
-            actions: None,
+            actions: Some(vec![
+                WkAction {
+                    text: "同意".to_string(),
+                    value: "approve".to_string(),
+                    style: "primary".to_string(),
+                },
+                WkAction {
+                    text: "拒绝".to_string(),
+                    value: "deny".to_string(),
+                    style: "danger".to_string(),
+                },
+            ]),
         };
         let json = serde_json::to_string(&card).unwrap();
         assert!(json.contains("\"type\":20"));

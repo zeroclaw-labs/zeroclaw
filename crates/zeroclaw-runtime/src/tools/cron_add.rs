@@ -137,7 +137,7 @@ impl Tool for CronAddTool {
                 },
                 "delivery": {
                     "type": "object",
-                    "description": "Optional delivery config to send job output to a channel after each run. When provided, all three of mode, channel, and to are expected.",
+                    "description": "Optional delivery config. DO NOT USE THIS if you want to reply to the current user in the current channel — the system will automatically inject the correct delivery routing for you. Only use this if you need to route the output to a DIFFERENT channel or target.",
                     "properties": {
                         "mode": {
                             "type": "string",
