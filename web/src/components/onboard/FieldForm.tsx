@@ -29,9 +29,7 @@ import {
   listProps,
   objectArrayElementProps,
   patchConfig,
-  reloadDaemon,
   type ConfigApiError,
-  type DriftEntry,
   type ListResponseEntry,
   type ObjectArrayPropMeta,
   type PatchOp,
@@ -184,7 +182,6 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [drifted, setDrifted] = useState<DriftEntry[]>([]);
   const [schema, setSchema] = useState<Record<string, unknown> | undefined>(undefined);
   const [filter, setFilter] = useState('');
 
@@ -208,10 +205,6 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
       const seed: Record<string, string> = {};
       for (const e of resp.entries) seed[e.path] = defaultInputValue(e);
       setDraft(seed);
-      // Drift summary on the same response — shown as an inline banner
-      // above the form so the user knows the on-disk file diverged from
-      // in-memory state and a daemon restart is needed to apply it.
-      setDrifted(resp.drifted ?? []);
     } catch (e) {
       if (e instanceof ApiError) {
         setTopError(`[${e.envelope.code}] ${e.envelope.message}`);
@@ -382,8 +375,6 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
         </h2>
       )}
 
-      {drifted.length > 0 && <DriftBanner drifted={drifted} onApplied={reload} />}
-
       {entries.length > 4 && (
         <input
           type="text"
@@ -429,7 +420,6 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(function FieldForm
               onCommentChange={(v) => setComments((c) => ({ ...c, [f.path]: v }))}
               error={fieldErrors[f.path]}
               onDelete={showDelete ? () => handleDelete(f.path) : undefined}
-              drift={drifted.find((d) => d.path === f.path) ?? null}
               description={descriptionForPath(schema, f.path)}
               elementProps={
                 f.kind === 'object-array' ? objectArrayElementProps(schema, f.path) : null
@@ -497,15 +487,13 @@ interface FieldRowProps {
   onCommentChange: (v: string) => void;
   error: ConfigApiError | undefined;
   onDelete?: () => void;
-  /** Drift entry for this path (in-memory ≠ on-disk). `null` when no drift. */
-  drift: DriftEntry | null;
   /** `///` doc comment resolved from the cached JSON Schema for this path. */
   description: string | null;
   /** Per-element property metadata for `kind === 'object-array'` fields. */
   elementProps?: ObjectArrayPropMeta[] | null;
 }
 
-function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onDelete, drift, description, elementProps }: FieldRowProps) {
+function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onDelete, description, elementProps }: FieldRowProps) {
   const renderer = rendererFor(entry);
   const [providerModels, setProviderModels] = useState<string[] | null>(null);
   const [modelsFetchFailed, setModelsFetchFailed] = useState(false);
@@ -562,7 +550,6 @@ function FieldRow({ entry, value, onChange, comment, onCommentChange, error, onD
               {description}
             </p>
           )}
-          {drift && <DriftDiff drift={drift} />}
         </div>
         {onDelete && (
           <button
@@ -1233,126 +1220,3 @@ function KeyValueChipEditor({
   );
 }
 
-interface DriftBannerProps {
-  drifted: DriftEntry[];
-  onApplied: () => void | Promise<void>;
-}
-
-// Inline drift summary rendered above the form. Lists every path where
-// the on-disk file diverged from in-memory state and offers a single
-// "Restart daemon" button. Clicking it goes through the same atomic
-// reload mechanism as the per-section ReloadDaemonButton — daemon stays
-// the same PID, gateway listener rebinds, channels respawn, in-memory
-// config re-reads from disk. After the reload settles, parent reloads
-// the form so values + drift summary refresh together.
-function DriftBanner({ drifted, onApplied }: DriftBannerProps) {
-  const [restarting, setRestarting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const handleRestart = async () => {
-    setRestarting(true);
-    setError(null);
-    try {
-      await reloadDaemon();
-      // The reload endpoint returns immediately; allow a beat for the
-      // gateway listener to rebind before refreshing the form.
-      await new Promise((resolve) => setTimeout(resolve, 400));
-      await onApplied();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRestarting(false);
-    }
-  };
-
-  return (
-    <div
-      className="rounded-xl border p-3 text-sm flex flex-col gap-2"
-      style={{
-        borderColor: 'var(--color-status-warning, #f5b400)',
-        background: 'rgba(245, 180, 0, 0.06)',
-      }}
-    >
-      <div className="flex items-center justify-between gap-3">
-        <span style={{ color: 'var(--pc-text-primary)' }}>
-          ⚠ {drifted.length} path{drifted.length === 1 ? '' : 's'} differ
-          {drifted.length === 1 ? 's' : ''} from on-disk
-        </span>
-        <button
-          type="button"
-          onClick={() => void handleRestart()}
-          disabled={restarting}
-          className="btn-secondary text-xs px-3 py-1.5"
-        >
-          {restarting ? 'Restarting…' : 'Restart daemon to apply'}
-        </button>
-      </div>
-      <ul className="text-xs flex flex-col gap-0.5" style={{ color: 'var(--pc-text-muted)' }}>
-        {drifted.slice(0, 8).map((d) => (
-          <li key={d.path} className="font-mono break-all">
-            {d.path}
-            {d.secret && (
-              <span style={{ color: 'var(--pc-text-faint)' }}> (secret — values not shown)</span>
-            )}
-          </li>
-        ))}
-        {drifted.length > 8 && (
-          <li style={{ color: 'var(--pc-text-faint)' }}>
-            …and {drifted.length - 8} more
-          </li>
-        )}
-      </ul>
-      {error && (
-        <p className="text-xs" style={{ color: 'var(--color-status-error)' }}>
-          Restart failed: {error}
-        </p>
-      )}
-    </div>
-  );
-}
-
-interface DriftDiffProps {
-  drift: DriftEntry;
-}
-
-// Per-field drift indicator: a small inline pill showing the in-memory
-// vs on-disk values side by side. For secret-marked paths we surface
-// only the fact of drift — the values themselves never leave the
-// server (server-side SHA-256 hash compare).
-function DriftDiff({ drift }: DriftDiffProps) {
-  if (drift.secret) {
-    return (
-      <p
-        className="text-xs mt-1 inline-flex items-center gap-1"
-        style={{ color: 'var(--color-status-warning, #f5b400)' }}
-      >
-        ⚠ secret value differs from on-disk
-      </p>
-    );
-  }
-  const inMem = formatDriftValue(drift.in_memory_value);
-  const onDisk = formatDriftValue(drift.on_disk_value);
-  return (
-    <div
-      className="text-xs mt-1 flex flex-wrap gap-x-3 gap-y-0.5"
-      style={{ color: 'var(--color-status-warning, #f5b400)' }}
-    >
-      <span>
-        in-memory: <code style={{ color: 'var(--pc-text-secondary)' }}>{inMem}</code>
-      </span>
-      <span>
-        on-disk: <code style={{ color: 'var(--pc-text-secondary)' }}>{onDisk}</code>
-      </span>
-    </div>
-  );
-}
-
-function formatDriftValue(value: unknown): string {
-  if (value === null || value === undefined) return '<unset>';
-  if (typeof value === 'string') return value;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}

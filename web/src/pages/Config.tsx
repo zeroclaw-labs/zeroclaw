@@ -64,19 +64,18 @@ export default function Config() {
   const [mode, setMode] = useState<Mode>({ kind: 'section-overview' });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  // Page-level drift — visible regardless of which view (overview /
-  // picker / form) is rendered. Foundation sections like Memory and
-  // Channels land on SectionOverview, which has no FieldForm and
-  // therefore no in-form drift banner; this surfaces the signal there
-  // too. Refresh-on-mount only — there's a real "drift doesn't clear
-  // after reload" bug that's separate from this visibility issue and
-  // owned outside this file.
+  // Single page-level drift state. Refreshed on every section change,
+  // after a daemon reload (ReloadDaemonButton.onReloaded), and after
+  // any successful save in a rendered FieldForm (onSaved). One source,
+  // four refresh points. FieldForm is drift-agnostic — no in-form
+  // banner or per-field indicator.
   const [drifted, setDrifted] = useState<DriftEntry[]>([]);
-  useEffect(() => {
+  const fetchDrift = () => {
     void getDrift()
       .then((r) => setDrifted(r.drifted ?? []))
       .catch(() => undefined);
-  }, []);
+  };
+  useEffect(fetchDrift, [activeKey]);
 
 
   useEffect(() => {
@@ -274,17 +273,34 @@ export default function Config() {
                   <Sparkles className="h-3.5 w-3.5" />
                   Run setup again
                 </Link>
-                <ReloadDaemonButton onReloaded={() => goToSection(activeSection.key)} />
+                <ReloadDaemonButton
+                  onReloaded={() => {
+                    goToSection(activeSection.key);
+                    fetchDrift();
+                  }}
+                />
               </div>
             </div>
 
-            {drifted.length > 0 && <PageDriftBanner drifted={drifted} />}
+            {drifted.length > 0 && (
+              <PageDriftBanner
+                drifted={drifted}
+                onReloaded={() => {
+                  goToSection(activeSection.key);
+                  fetchDrift();
+                }}
+              />
+            )}
 
             {/* Section overview / picker / form */}
             {!activeSection.has_picker ? (
               // Direct-form sections (Workspace, Hardware): no picker, just
               // show the form rooted at the section's path prefix.
-              <FieldForm prefix={activeSection.key} title={activeSection.label} />
+              <FieldForm
+                prefix={activeSection.key}
+                title={activeSection.label}
+                onSaved={fetchDrift}
+              />
             ) : mode.kind === 'section-overview' ? (
               <SectionOverview
                 section={activeSection}
@@ -323,6 +339,7 @@ export default function Config() {
                 <FieldForm
                   prefix={mode.fieldsPrefix}
                   title={mode.item.label}
+                  onSaved={fetchDrift}
                 />
               </div>
             )}
@@ -333,11 +350,17 @@ export default function Config() {
   );
 }
 
-// Page-level drift banner. Display-only — directs the user to the
-// top-right "Reload daemon" button rather than offering its own
-// inline restart, so there's exactly one place that triggers reload.
-// Lists the drifted paths so the user knows what's about to change.
-function PageDriftBanner({ drifted }: { drifted: DriftEntry[] }) {
+// Single page-level drift banner. Embeds `<ReloadDaemonButton>`
+// directly so the inline reload action is the same component the
+// top-right toolbar uses — same modal, same /health poll, same
+// onReloaded callback, no parallel reload code.
+function PageDriftBanner({
+  drifted,
+  onReloaded,
+}: {
+  drifted: DriftEntry[];
+  onReloaded: () => void;
+}) {
   return (
     <div
       className="rounded-xl border p-3 text-sm flex flex-col gap-2"
@@ -346,14 +369,12 @@ function PageDriftBanner({ drifted }: { drifted: DriftEntry[] }) {
         background: 'rgba(245, 180, 0, 0.06)',
       }}
     >
-      <div className="flex items-center gap-2">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
         <span style={{ color: 'var(--pc-text-primary)' }}>
           ⚠ {drifted.length} path{drifted.length === 1 ? '' : 's'} differ
           {drifted.length === 1 ? 's' : ''} from on-disk
         </span>
-        <span className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-          — click <strong>Reload daemon</strong> to apply.
-        </span>
+        <ReloadDaemonButton onReloaded={onReloaded} />
       </div>
       <ul
         className="text-xs flex flex-col gap-0.5"
