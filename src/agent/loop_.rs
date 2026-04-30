@@ -3642,9 +3642,8 @@ async fn process_message_inner(
     prior_history: Option<Vec<ChatMessage>>,
     external_observer: Option<Arc<dyn Observer>>,
 ) -> Result<(String, Vec<ChatMessage>)> {
-    let observer: Arc<dyn Observer> = external_observer.unwrap_or_else(|| {
-        Arc::from(observability::create_observer(&config.observability))
-    });
+    let observer: Arc<dyn Observer> = external_observer
+        .unwrap_or_else(|| Arc::from(observability::create_observer(&config.observability)));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
     let security = Arc::new(SecurityPolicy::from_config(

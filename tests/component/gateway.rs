@@ -137,13 +137,16 @@ fn gateway_body_limit_is_reasonable() {
     );
 }
 
-/// Gateway timeout constant is reasonable.
+/// Gateway timeout constant matches what the deployment expects.
+/// Raised from 30 to 300 in commit e2051da2: nginx now handles
+/// slow-loris, so the inner deadline only needs to bound long
+/// agent loops.
 #[test]
 fn gateway_timeout_is_reasonable() {
     assert_eq!(
         zeroclaw::gateway::REQUEST_TIMEOUT_SECS,
-        30,
-        "Request timeout should be 30 seconds"
+        300,
+        "Request timeout should be 300 seconds"
     );
 }
 
