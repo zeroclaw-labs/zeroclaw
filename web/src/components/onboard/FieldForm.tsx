@@ -1086,8 +1086,10 @@ function ObjectArrayField({
 
 // Compact key-value chip editor for `HashMap<String, String>`
 // properties inside an object-array row (e.g. `mcp.servers[i].env`,
-// `headers`). Pairs round-trip in insertion order; rendering preserves
-// the order they came back in from the gateway.
+// `headers`). Mirrors `ArrayFieldEditor`'s Rows / Text toggle so a
+// power user can hand-edit the JSON object form when chips get
+// unwieldy. Mid-edit invalid JSON is preserved in the textarea (no
+// input fight); pairs only update when the buffer parses to an object.
 function KeyValueChipEditor({
   pairs,
   onChange,
@@ -1095,6 +1097,12 @@ function KeyValueChipEditor({
   pairs: [string, string][];
   onChange: (next: [string, string][]) => void;
 }) {
+  const [mode, setMode] = useState<'rows' | 'text'>('rows');
+  // Local textarea buffer — only consulted in `text` mode. Reset when
+  // the user re-enters text mode so the buffer reflects current pairs;
+  // cleared when leaving text mode so re-entry shows fresh JSON.
+  const [textDraft, setTextDraft] = useState<string | null>(null);
+
   const setKey = (i: number, k: string) => {
     onChange(pairs.map((p, idx) => (idx === i ? [k, p[1]] : p)));
   };
@@ -1104,50 +1112,123 @@ function KeyValueChipEditor({
   const removeAt = (i: number) => {
     onChange(pairs.filter((_, idx) => idx !== i));
   };
+
+  const switchToRows = () => {
+    setTextDraft(null);
+    setMode('rows');
+  };
+  const switchToText = () => {
+    setTextDraft(JSON.stringify(Object.fromEntries(pairs), null, 2));
+    setMode('text');
+  };
+
   return (
     <div className="space-y-1.5 mt-1">
-      {pairs.length === 0 ? (
-        <p className="text-[11px] italic" style={{ color: 'var(--pc-text-faint)' }}>
-          No entries.
-        </p>
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>
+          {pairs.length} {pairs.length === 1 ? 'entry' : 'entries'}
+        </span>
+        <div
+          className="inline-flex rounded-md overflow-hidden border text-xs"
+          style={{ borderColor: 'var(--pc-border)' }}
+        >
+          <button
+            type="button"
+            onClick={switchToRows}
+            className="px-2 py-1 inline-flex items-center gap-1"
+            style={{
+              background: mode === 'rows' ? 'var(--pc-bg-surface-elevated)' : 'transparent',
+              color: mode === 'rows' ? 'var(--pc-text-primary)' : 'var(--pc-text-muted)',
+            }}
+            aria-pressed={mode === 'rows'}
+          >
+            <ListIcon className="h-3 w-3" /> Rows
+          </button>
+          <button
+            type="button"
+            onClick={switchToText}
+            className="px-2 py-1 inline-flex items-center gap-1"
+            style={{
+              background: mode === 'text' ? 'var(--pc-bg-surface-elevated)' : 'transparent',
+              color: mode === 'text' ? 'var(--pc-text-primary)' : 'var(--pc-text-muted)',
+            }}
+            aria-pressed={mode === 'text'}
+          >
+            <TypeIcon className="h-3 w-3" /> Text
+          </button>
+        </div>
+      </div>
+
+      {mode === 'text' ? (
+        <textarea
+          rows={Math.max(3, Math.min(pairs.length + 2, 10))}
+          value={textDraft ?? JSON.stringify(Object.fromEntries(pairs), null, 2)}
+          onChange={(e) => {
+            const v = e.target.value;
+            setTextDraft(v);
+            try {
+              const parsed = JSON.parse(v);
+              if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                onChange(
+                  Object.entries(parsed as Record<string, unknown>).map(
+                    ([k, val]) =>
+                      [k, typeof val === 'string' ? val : JSON.stringify(val)] as [string, string],
+                  ),
+                );
+              }
+            } catch {
+              /* keep textDraft until valid JSON */
+            }
+          }}
+          className="input-electric w-full px-3 py-2 text-sm font-mono resize-y"
+          placeholder='{"key": "value"}'
+        />
       ) : (
-        <ul className="space-y-1">
-          {pairs.map(([k, v], i) => (
-            <li key={i} className="flex items-center gap-2">
-              <input
-                type="text"
-                value={k}
-                onChange={(e) => setKey(i, e.target.value)}
-                className="input-electric flex-1 px-2 py-1 text-sm font-mono"
-                placeholder="key"
-              />
-              <span style={{ color: 'var(--pc-text-faint)' }}>=</span>
-              <input
-                type="text"
-                value={v}
-                onChange={(e) => setValue(i, e.target.value)}
-                className="input-electric flex-1 px-2 py-1 text-sm"
-                placeholder="value"
-              />
-              <button
-                type="button"
-                onClick={() => removeAt(i)}
-                title="Remove this entry"
-                className="btn-icon flex-shrink-0"
-              >
-                <Trash2 className="h-4 w-4" />
-              </button>
-            </li>
-          ))}
-        </ul>
+        <>
+          {pairs.length === 0 ? (
+            <p className="text-[11px] italic" style={{ color: 'var(--pc-text-faint)' }}>
+              No entries.
+            </p>
+          ) : (
+            <ul className="space-y-1">
+              {pairs.map(([k, v], i) => (
+                <li key={i} className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={k}
+                    onChange={(e) => setKey(i, e.target.value)}
+                    className="input-electric flex-1 px-2 py-1 text-sm font-mono"
+                    placeholder="key"
+                  />
+                  <span style={{ color: 'var(--pc-text-faint)' }}>=</span>
+                  <input
+                    type="text"
+                    value={v}
+                    onChange={(e) => setValue(i, e.target.value)}
+                    className="input-electric flex-1 px-2 py-1 text-sm"
+                    placeholder="value"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => removeAt(i)}
+                    title="Remove this entry"
+                    className="btn-icon flex-shrink-0"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <button
+            type="button"
+            onClick={() => onChange([...pairs, ['', '']])}
+            className="btn-secondary text-xs px-2.5 py-1 inline-flex items-center gap-1"
+          >
+            <Plus className="h-3 w-3" /> Add
+          </button>
+        </>
       )}
-      <button
-        type="button"
-        onClick={() => onChange([...pairs, ['', '']])}
-        className="btn-secondary text-xs px-2.5 py-1 inline-flex items-center gap-1"
-      >
-        <Plus className="h-3 w-3" /> Add
-      </button>
     </div>
   );
 }
