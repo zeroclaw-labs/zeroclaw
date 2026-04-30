@@ -84,11 +84,11 @@ pub enum ObserverEvent {
     /// A memory recall (search) operation has completed.
     ///
     /// Emitted at the runtime boundary after a hybrid-search query against
-    /// the brain DB. Carries an optional opaque `query_summary` for
-    /// diagnostics — never the raw user query (the runtime applies
-    /// `scrub_credentials` and truncates to ≤200 content chars, with a
-    /// 3-char `...` ellipsis appended when truncation occurred, before
-    /// emission).
+    /// the brain DB. Carries an optional `query_summary` for diagnostics —
+    /// scrubbed and truncated user text, not a privacy-clean token. The
+    /// runtime applies `scrub_credentials` first and then truncates to ≤200
+    /// content chars (with a 3-char `...` ellipsis appended when truncation
+    /// occurred); short non-credential queries pass through unchanged.
     MemoryRecall {
         /// Scrubbed and truncated query summary. `None` when the caller has
         /// no meaningful query to record (e.g., session-scoped fetches).
