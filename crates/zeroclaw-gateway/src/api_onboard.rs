@@ -274,12 +274,7 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
 
 /// Top-level fields that exist on `Config` but are never user-editable
 /// from the dashboard (schema bookkeeping, resolved at runtime).
-const HIDDEN_TOP_LEVEL: &[&str] = &[
-    "schema_version",
-    "config_path",
-    "workspace_dir",
-    "onboard_state",
-];
+const HIDDEN_TOP_LEVEL: &[&str] = &["schema-version", "onboard-state"];
 
 /// Sections whose picker semantics are non-generic and live in the
 /// per-section dispatch in `handle_section_picker` (catalog of providers,
