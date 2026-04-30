@@ -62,7 +62,7 @@ pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()>
         bail!("delivery.channel is required for announce mode");
     };
     match channel.to_ascii_lowercase().as_str() {
-        "telegram" | "discord" | "slack" | "mattermost" | "signal" | "matrix" | "qq" => {}
+        "telegram" | "discord" | "slack" | "mattermost" | "signal" | "matrix" | "qq" | "whatsapp" => {}
         other => bail!("unsupported delivery channel: {other}"),
     }
 
@@ -252,6 +252,9 @@ mod tests {
                 command: command.map(Into::into),
                 name: name.map(Into::into),
                 allowed_tools: vec![],
+                delivery_channel: None,
+                delivery_to: None,
+                delivery_none: false,
             },
             config,
         )
@@ -617,6 +620,8 @@ mod tests {
                 tz: None,
                 agent: true,
                 allowed_tools: vec![],
+                delivery_channel: None,
+                delivery_to: None,
                 command: "Check server health: disk space, memory, CPU load".into(),
             },
             &config,
@@ -648,6 +653,8 @@ mod tests {
                 tz: None,
                 agent: true,
                 allowed_tools: vec![],
+                delivery_channel: None,
+                delivery_to: None,
                 command: "Check server health: disk space, memory, CPU load".into(),
             },
             &config,
@@ -670,6 +677,8 @@ mod tests {
                 tz: None,
                 agent: true,
                 allowed_tools: vec!["file_read".into(), "web_search".into()],
+                delivery_channel: None,
+                delivery_to: None,
                 command: "Check server health".into(),
             },
             &config,
@@ -712,6 +721,9 @@ mod tests {
                 command: None,
                 name: None,
                 allowed_tools: vec!["shell".into()],
+                delivery_channel: None,
+                delivery_to: None,
+                delivery_none: false,
             },
             &config,
         )
@@ -732,6 +744,8 @@ mod tests {
                 tz: None,
                 agent: false,
                 allowed_tools: vec![],
+                delivery_channel: None,
+                delivery_to: None,
                 command: "echo ok".into(),
             },
             &config,

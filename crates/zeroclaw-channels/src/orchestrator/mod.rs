@@ -5859,12 +5859,39 @@ pub async fn deliver_announcement(
         zeroclaw_runtime::security::LeakResult::Clean => output.to_string(),
     };
 
+    // `target` may be a single recipient or a comma-separated list. Fan out
+    // and send the same message to each. Empty entries are skipped. The first
+    // error wins; per-recipient best-effort is the cron job's responsibility
+    // via the existing `delivery.best_effort` flag.
+    let recipients: Vec<&str> = target
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if recipients.is_empty() {
+        anyhow::bail!("delivery.to is empty after splitting recipients");
+    }
+
     // Use the live channel instance when available — critical for Matrix E2EE which must
     // reuse the authenticated client rather than re-running session restore per delivery.
     if let Some(registry) = CRON_CHANNEL_REGISTRY.get()
         && let Some(ch) = registry.get(channel.to_ascii_lowercase().as_str())
     {
-        return ch.send(&SendMessage::new(&safe_output, target)).await;
+        let mut last_err: Option<anyhow::Error> = None;
+        for recipient in &recipients {
+            if let Err(e) = ch.send(&SendMessage::new(&safe_output, *recipient)).await {
+                tracing::warn!(
+                    channel = %channel,
+                    recipient = %*recipient,
+                    error = %e,
+                    "Cron delivery to recipient failed"
+                );
+                if last_err.is_none() {
+                    last_err = Some(e);
+                }
+            }
+        }
+        return last_err.map_or(Ok(()), Err);
     }
 
     match channel.to_ascii_lowercase().as_str() {

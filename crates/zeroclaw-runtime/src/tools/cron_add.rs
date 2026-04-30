@@ -146,12 +146,12 @@ impl Tool for CronAddTool {
                         },
                         "channel": {
                             "type": "string",
-                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq"],
+                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "whatsapp"],
                             "description": "Channel type to deliver output to"
                         },
                         "to": {
                             "type": "string",
-                            "description": "Destination ID: Discord channel ID, Telegram chat ID, Slack channel name, etc."
+                            "description": "Destination ID: Discord channel ID, Telegram chat ID, Slack channel name, WhatsApp phone (e.g. +491733091474), etc. Comma-separated for fan-out (e.g. \"+491111,+492222\")."
                         },
                         "best_effort": {
                             "type": "boolean",

@@ -347,6 +347,12 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// Announce job output to this channel (e.g. telegram, discord, whatsapp). Requires --delivery-to.
+        #[arg(long = "delivery-channel")]
+        delivery_channel: Option<String>,
+        /// Recipient identifier for announce delivery (chat ID, phone number, etc.). Comma-separated for fan-out (e.g. "+491111,+492222"). Requires --delivery-channel.
+        #[arg(long = "delivery-to")]
+        delivery_to: Option<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -368,6 +374,12 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// Announce job output to this channel (e.g. telegram, discord, whatsapp). Requires --delivery-to.
+        #[arg(long = "delivery-channel")]
+        delivery_channel: Option<String>,
+        /// Recipient identifier for announce delivery (chat ID, phone number, etc.). Comma-separated for fan-out (e.g. "+491111,+492222"). Requires --delivery-channel.
+        #[arg(long = "delivery-to")]
+        delivery_to: Option<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -389,6 +401,12 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// Announce job output to this channel (e.g. telegram, discord, whatsapp). Requires --delivery-to.
+        #[arg(long = "delivery-channel")]
+        delivery_channel: Option<String>,
+        /// Recipient identifier for announce delivery (chat ID, phone number, etc.). Comma-separated for fan-out (e.g. "+491111,+492222"). Requires --delivery-channel.
+        #[arg(long = "delivery-to")]
+        delivery_to: Option<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -412,6 +430,12 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// Announce job output to this channel (e.g. telegram, discord, whatsapp). Requires --delivery-to.
+        #[arg(long = "delivery-channel")]
+        delivery_channel: Option<String>,
+        /// Recipient identifier for announce delivery (chat ID, phone number, etc.). Comma-separated for fan-out (e.g. "+491111,+492222"). Requires --delivery-channel.
+        #[arg(long = "delivery-to")]
+        delivery_to: Option<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -448,6 +472,15 @@ Examples:
         /// Replace the agent job allowlist with the specified tool names (repeatable)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// Set/replace the announce delivery channel (e.g. telegram, whatsapp). Requires --delivery-to.
+        #[arg(long = "delivery-channel")]
+        delivery_channel: Option<String>,
+        /// Set/replace the announce delivery recipient. Comma-separated for fan-out. Requires --delivery-channel.
+        #[arg(long = "delivery-to")]
+        delivery_to: Option<String>,
+        /// Disable announce delivery for this job (clears any existing delivery config).
+        #[arg(long = "delivery-none", conflicts_with_all = ["delivery_channel", "delivery_to"])]
+        delivery_none: bool,
     },
     /// Pause a scheduled task
     Pause {

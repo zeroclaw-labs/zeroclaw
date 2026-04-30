@@ -3,6 +3,33 @@ pub use zeroclaw_runtime::cron::*;
 use crate::config::Config;
 use anyhow::{Result, bail};
 
+fn build_delivery(
+    channel: Option<String>,
+    to: Option<String>,
+) -> Result<Option<DeliveryConfig>> {
+    match (channel, to) {
+        (None, None) => Ok(None),
+        (Some(c), Some(t)) => Ok(Some(DeliveryConfig {
+            mode: "announce".to_string(),
+            channel: Some(c),
+            to: Some(t),
+            best_effort: true,
+        })),
+        (Some(_), None) => bail!("--delivery-to is required when --delivery-channel is set"),
+        (None, Some(_)) => bail!("--delivery-channel is required when --delivery-to is set"),
+    }
+}
+
+fn print_delivery_summary(delivery: &DeliveryConfig) {
+    if delivery.mode.eq_ignore_ascii_case("announce") {
+        println!(
+            "  Deliver: {} → {}",
+            delivery.channel.as_deref().unwrap_or("?"),
+            delivery.to.as_deref().unwrap_or("?"),
+        );
+    }
+}
+
 pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
     match command {
         crate::CronCommands::List => {
@@ -34,6 +61,13 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 if let Some(prompt) = &job.prompt {
                     println!("    prompt: {prompt}");
                 }
+                if job.delivery.mode.eq_ignore_ascii_case("announce") {
+                    println!(
+                        "    deliver: {} → {}",
+                        job.delivery.channel.as_deref().unwrap_or("?"),
+                        job.delivery.to.as_deref().unwrap_or("?"),
+                    );
+                }
             }
             Ok(())
         }
@@ -42,12 +76,15 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             tz,
             agent,
             allowed_tools,
+            delivery_channel,
+            delivery_to,
             command,
         } => {
             let schedule = Schedule::Cron {
                 expr: expression,
                 tz,
             };
+            let delivery = build_delivery(delivery_channel, delivery_to)?;
             if agent {
                 let job = add_agent_job(
                     config,
@@ -56,7 +93,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     false,
                     if allowed_tools.is_empty() {
                         None
@@ -68,15 +105,17 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 println!("  Expr  : {}", job.expression);
                 println!("  Next  : {}", job.next_run.to_rfc3339());
                 println!("  Prompt: {}", job.prompt.as_deref().unwrap_or_default());
+                print_delivery_summary(&job.delivery);
             } else {
                 if !allowed_tools.is_empty() {
                     bail!("--allowed-tool is only supported with --agent cron jobs");
                 }
-                let job = add_shell_job(config, None, schedule, &command)?;
+                let job = add_shell_job_with_approval(config, None, schedule, &command, delivery, false)?;
                 println!("✅ Added cron job {}", job.id);
                 println!("  Expr: {}", job.expression);
                 println!("  Next: {}", job.next_run.to_rfc3339());
                 println!("  Cmd : {}", job.command);
+                print_delivery_summary(&job.delivery);
             }
             Ok(())
         }
@@ -84,12 +123,15 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             at,
             agent,
             allowed_tools,
+            delivery_channel,
+            delivery_to,
             command,
         } => {
             let at = chrono::DateTime::parse_from_rfc3339(&at)
                 .map_err(|e| anyhow::anyhow!("Invalid RFC3339 timestamp for --at: {e}"))?
                 .with_timezone(&chrono::Utc);
             let schedule = Schedule::At { at };
+            let delivery = build_delivery(delivery_channel, delivery_to)?;
             if agent {
                 let job = add_agent_job(
                     config,
@@ -98,7 +140,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     true,
                     if allowed_tools.is_empty() {
                         None
@@ -109,14 +151,16 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 println!("✅ Added one-shot agent cron job {}", job.id);
                 println!("  At    : {}", job.next_run.to_rfc3339());
                 println!("  Prompt: {}", job.prompt.as_deref().unwrap_or_default());
+                print_delivery_summary(&job.delivery);
             } else {
                 if !allowed_tools.is_empty() {
                     bail!("--allowed-tool is only supported with --agent cron jobs");
                 }
-                let job = add_shell_job(config, None, schedule, &command)?;
+                let job = add_shell_job_with_approval(config, None, schedule, &command, delivery, false)?;
                 println!("✅ Added one-shot cron job {}", job.id);
                 println!("  At  : {}", job.next_run.to_rfc3339());
                 println!("  Cmd : {}", job.command);
+                print_delivery_summary(&job.delivery);
             }
             Ok(())
         }
@@ -124,9 +168,12 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             every_ms,
             agent,
             allowed_tools,
+            delivery_channel,
+            delivery_to,
             command,
         } => {
             let schedule = Schedule::Every { every_ms };
+            let delivery = build_delivery(delivery_channel, delivery_to)?;
             if agent {
                 let job = add_agent_job(
                     config,
@@ -135,7 +182,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     false,
                     if allowed_tools.is_empty() {
                         None
@@ -147,15 +194,17 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 println!("  Every(ms): {every_ms}");
                 println!("  Next     : {}", job.next_run.to_rfc3339());
                 println!("  Prompt   : {}", job.prompt.as_deref().unwrap_or_default());
+                print_delivery_summary(&job.delivery);
             } else {
                 if !allowed_tools.is_empty() {
                     bail!("--allowed-tool is only supported with --agent cron jobs");
                 }
-                let job = add_shell_job(config, None, schedule, &command)?;
+                let job = add_shell_job_with_approval(config, None, schedule, &command, delivery, false)?;
                 println!("✅ Added interval cron job {}", job.id);
                 println!("  Every(ms): {every_ms}");
                 println!("  Next     : {}", job.next_run.to_rfc3339());
                 println!("  Cmd      : {}", job.command);
+                print_delivery_summary(&job.delivery);
             }
             Ok(())
         }
@@ -163,12 +212,15 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             delay,
             agent,
             allowed_tools,
+            delivery_channel,
+            delivery_to,
             command,
         } => {
+            let delivery = build_delivery(delivery_channel, delivery_to)?;
+            let duration = parse_delay(&delay)?;
+            let at = chrono::Utc::now() + duration;
+            let schedule = Schedule::At { at };
             if agent {
-                let duration = parse_delay(&delay)?;
-                let at = chrono::Utc::now() + duration;
-                let schedule = Schedule::At { at };
                 let job = add_agent_job(
                     config,
                     None,
@@ -176,7 +228,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     true,
                     if allowed_tools.is_empty() {
                         None
@@ -187,14 +239,16 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 println!("✅ Added one-shot agent cron job {}", job.id);
                 println!("  At    : {}", job.next_run.to_rfc3339());
                 println!("  Prompt: {}", job.prompt.as_deref().unwrap_or_default());
+                print_delivery_summary(&job.delivery);
             } else {
                 if !allowed_tools.is_empty() {
                     bail!("--allowed-tool is only supported with --agent cron jobs");
                 }
-                let job = add_once(config, &delay, &command)?;
+                let job = add_shell_job_with_approval(config, None, schedule, &command, delivery, false)?;
                 println!("✅ Added one-shot cron job {}", job.id);
                 println!("  At  : {}", job.next_run.to_rfc3339());
                 println!("  Cmd : {}", job.command);
+                print_delivery_summary(&job.delivery);
             }
             Ok(())
         }
@@ -205,15 +259,25 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             command,
             name,
             allowed_tools,
+            delivery_channel,
+            delivery_to,
+            delivery_none,
         } => {
+            let delivery_patch = if delivery_none {
+                Some(DeliveryConfig::default())
+            } else {
+                build_delivery(delivery_channel, delivery_to)?
+            };
+
             if expression.is_none()
                 && tz.is_none()
                 && command.is_none()
                 && name.is_none()
                 && allowed_tools.is_empty()
+                && delivery_patch.is_none()
             {
                 bail!(
-                    "At least one of --expression, --tz, --command, --name, or --allowed-tool must be provided"
+                    "At least one of --expression, --tz, --command, --name, --allowed-tool, --delivery-channel, or --delivery-none must be provided"
                 );
             }
 
@@ -254,10 +318,15 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 }
             }
 
+            if let Some(d) = delivery_patch.as_ref() {
+                validate_delivery_config(Some(d))?;
+            }
+
             let patch = CronJobPatch {
                 schedule,
                 command,
                 name,
+                delivery: delivery_patch,
                 allowed_tools: if allowed_tools.is_empty() {
                     None
                 } else {
@@ -271,6 +340,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             println!("  Expr: {}", job.expression);
             println!("  Next: {}", job.next_run.to_rfc3339());
             println!("  Cmd : {}", job.command);
+            print_delivery_summary(&job.delivery);
             Ok(())
         }
         crate::CronCommands::Remove { id } => remove_job(config, &id),
