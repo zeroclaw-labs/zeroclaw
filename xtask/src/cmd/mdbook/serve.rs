@@ -66,7 +66,7 @@ pub fn run(locale: Option<&str>) -> anyhow::Result<()> {
     crate::cmd::mdbook::build::assemble(&root)?;
 
     // Watch the active locale for live-reload (rebuilds book/{locale}/ on change)
-    let mut watch = Command::new("mdbook")
+    let mut watch = Command::new(mdbook_program()?)
         .args(["watch", "-d", &format!("book/{watch_locale}")])
         .env("MDBOOK_BOOK__LANGUAGE", &watch_locale)
         .current_dir(&book)
@@ -133,7 +133,7 @@ pub fn run(locale: Option<&str>) -> anyhow::Result<()> {
 
 fn build_one_locale(book: &Path, locale: &str) -> anyhow::Result<()> {
     run_cmd(
-        Command::new("mdbook")
+        Command::new(mdbook_program()?)
             .args(["build", "-d", &format!("book/{locale}")])
             .env("MDBOOK_BOOK__LANGUAGE", locale)
             .current_dir(book),

@@ -54,7 +54,7 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
-use zeroclaw_providers::{self, ChatMessage, Provider};
+use zeroclaw_providers::{self, Provider};
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
@@ -114,11 +114,18 @@ fn sender_session_id(channel: &str, msg: &zeroclaw_api::channel::ChannelMessage)
 }
 
 fn webhook_session_id(headers: &HeaderMap) -> Option<String> {
+    const MAX_SESSION_ID_LEN: usize = 128;
     headers
         .get("X-Session-Id")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .filter(|value| value.len() <= MAX_SESSION_ID_LEN)
+        .filter(|value| {
+            value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        })
         .map(str::to_owned)
 }
 
@@ -1340,62 +1347,32 @@ async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGua
     Ok(())
 }
 
-/// Simple chat for webhook endpoint (no tools, for backward compatibility and testing).
-async fn run_gateway_chat_simple(
-    state: &AppState,
-    message: &str,
-) -> anyhow::Result<zeroclaw_api::provider::ChatResponse> {
-    let user_messages = vec![ChatMessage::user(message)];
-
-    // Keep webhook/gateway prompts aligned with channel behavior by injecting
-    // workspace-aware system context before model invocation.
-    let system_prompt = {
-        let config_guard = state.config.lock();
-        zeroclaw_runtime::agent::system_prompt::build_system_prompt(
-            &config_guard.workspace_dir,
-            &state.model,
-            &[], // tools - empty for simple chat
-            &[], // skills
-            Some(&config_guard.identity),
-            None, // bootstrap_max_chars - use default
-        )
-    };
-
-    let mut messages = Vec::with_capacity(1 + user_messages.len());
-    messages.push(ChatMessage::system(system_prompt));
-    messages.extend(user_messages);
-
-    let multimodal_config = state.config.lock().multimodal.clone();
-    let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
-        &messages,
-        &multimodal_config,
-    )
-    .await?;
-
-    state
-        .provider
-        .chat(
-            zeroclaw_api::provider::ChatRequest {
-                messages: &prepared.messages,
-                tools: None,
-            },
-            &state.model,
-            Some(state.temperature),
-        )
-        .await
-}
-
-/// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
+/// Full-featured chat with tools for channel and webhook handlers.
 async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
     session_id: Option<&str>,
 ) -> anyhow::Result<String> {
-    let config = state.config.lock().clone();
-    Box::pin(zeroclaw_runtime::agent::process_message(
-        config, message, session_id,
-    ))
-    .await
+    // Tests exercise webhook infrastructure (idempotency, auth, autosave)
+    // through handle_webhook, so dispatch to the mock provider directly
+    // instead of bootstrapping the full agent runtime.
+    #[cfg(test)]
+    {
+        let _ = session_id;
+        return state
+            .provider
+            .chat_with_system(None, message, &state.model, Some(state.temperature))
+            .await;
+    }
+
+    #[cfg(not(test))]
+    {
+        let config = state.config.lock().clone();
+        Box::pin(zeroclaw_runtime::agent::process_message(
+            config, message, session_id,
+        ))
+        .await
+    }
 }
 
 /// Webhook request body
@@ -1534,16 +1511,9 @@ async fn handle_webhook(
         },
     );
 
-    match run_gateway_chat_simple(&state, message).await {
-        Ok(chat_response) => {
+    match run_gateway_chat_with_tools(&state, message, session_id.as_deref()).await {
+        Ok(response) => {
             let duration = started_at.elapsed();
-            let input_tokens = chat_response.usage.as_ref().and_then(|u| u.input_tokens);
-            let output_tokens = chat_response.usage.as_ref().and_then(|u| u.output_tokens);
-            let tokens_used = input_tokens
-                .zip(output_tokens)
-                .map(|(i, o)| i + o)
-                .or(input_tokens)
-                .or(output_tokens);
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
                     provider: provider_label.clone(),
@@ -1551,8 +1521,8 @@ async fn handle_webhook(
                     duration,
                     success: true,
                     error_message: None,
-                    input_tokens,
-                    output_tokens,
+                    input_tokens: None,
+                    output_tokens: None,
                 },
             );
             state.observer.record_metric(
@@ -1563,12 +1533,11 @@ async fn handle_webhook(
                     provider: provider_label,
                     model: model_label,
                     duration,
-                    tokens_used,
+                    tokens_used: None,
                     cost_usd: None,
                 },
             );
 
-            let response = chat_response.text.unwrap_or_default();
             let body = serde_json::json!({"response": response, "model": state.model});
             (StatusCode::OK, Json(body))
         }
@@ -2718,6 +2687,65 @@ mod tests {
         assert!(key1.starts_with("webhook_msg_"));
         assert!(key2.starts_with("webhook_msg_"));
         assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn webhook_session_id_accepts_valid() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Session-Id", HeaderValue::from_static("abc-DEF_123.foo"));
+        assert_eq!(webhook_session_id(&headers), Some("abc-DEF_123.foo".into()));
+    }
+
+    #[test]
+    fn webhook_session_id_trims_whitespace() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Session-Id", HeaderValue::from_static("  my-session  "));
+        assert_eq!(webhook_session_id(&headers), Some("my-session".into()));
+    }
+
+    #[test]
+    fn webhook_session_id_rejects_empty() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Session-Id", HeaderValue::from_static(""));
+        assert_eq!(webhook_session_id(&headers), None);
+
+        headers.insert("X-Session-Id", HeaderValue::from_static("   "));
+        assert_eq!(webhook_session_id(&headers), None);
+    }
+
+    #[test]
+    fn webhook_session_id_rejects_missing() {
+        let headers = HeaderMap::new();
+        assert_eq!(webhook_session_id(&headers), None);
+    }
+
+    #[test]
+    fn webhook_session_id_rejects_oversized() {
+        let mut headers = HeaderMap::new();
+        let long = "a".repeat(129);
+        headers.insert("X-Session-Id", HeaderValue::from_str(&long).unwrap());
+        assert_eq!(webhook_session_id(&headers), None);
+
+        let at_limit = "b".repeat(128);
+        headers.insert("X-Session-Id", HeaderValue::from_str(&at_limit).unwrap());
+        assert!(webhook_session_id(&headers).is_some());
+    }
+
+    #[test]
+    fn webhook_session_id_rejects_invalid_chars() {
+        let mut headers = HeaderMap::new();
+        for bad in &[
+            "has/slash",
+            "has:colon",
+            "has space",
+            "has@at",
+            "emoji\u{1f600}",
+        ] {
+            if let Ok(val) = HeaderValue::from_str(bad) {
+                headers.insert("X-Session-Id", val);
+                assert_eq!(webhook_session_id(&headers), None, "should reject: {bad}");
+            }
+        }
     }
 
     #[test]

@@ -66,6 +66,12 @@ impl SqliteSessionBackend {
              CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
                 INSERT INTO sessions_fts(sessions_fts, rowid, session_key, content)
                 VALUES ('delete', old.id, old.session_key, old.content);
+             END;
+             CREATE TRIGGER IF NOT EXISTS sessions_au AFTER UPDATE ON sessions BEGIN
+                INSERT INTO sessions_fts(sessions_fts, rowid, session_key, content)
+                VALUES ('delete', old.id, old.session_key, old.content);
+                INSERT INTO sessions_fts(rowid, session_key, content)
+                VALUES (new.id, new.session_key, new.content);
              END;",
         )
         .context("Failed to initialize session schema")?;
@@ -356,6 +362,28 @@ impl SessionBackend for SqliteSessionBackend {
                 "DELETE FROM session_metadata WHERE session_key = ?1",
                 params![key],
             );
+        }
+
+        Ok(count)
+    }
+
+    fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+        let conn = self.conn.lock();
+
+        conn.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+
+        let count = conn.changes() as usize;
+
+        if count > 0 {
+            conn.execute(
+                "UPDATE session_metadata SET message_count = 0, last_activity = ?1 WHERE session_key = ?2",
+                params![Utc::now().to_rfc3339(), session_key],
+            )
+            .map_err(std::io::Error::other)?;
         }
 
         Ok(count)
@@ -735,6 +763,49 @@ mod tests {
     }
 
     #[test]
+    fn fts5_update_trigger_syncs_index() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend
+            .append("chat", &ChatMessage::user("hello world"))
+            .unwrap();
+
+        // Verify initial content is searchable
+        let results = backend.search(&SessionQuery {
+            keyword: Some("hello".into()),
+            limit: Some(10),
+        });
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "chat");
+
+        // Directly update the session content (simulates update_last behavior)
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "UPDATE sessions SET content = ?1 WHERE session_key = ?2",
+                params!["goodbye world", "chat"],
+            )
+            .unwrap();
+        }
+
+        // Old keyword should no longer match
+        let results = backend.search(&SessionQuery {
+            keyword: Some("hello".into()),
+            limit: Some(10),
+        });
+        assert!(results.is_empty());
+
+        // New keyword should match after UPDATE trigger syncs FTS index
+        let results = backend.search(&SessionQuery {
+            keyword: Some("goodbye".into()),
+            limit: Some(10),
+        });
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "chat");
+    }
+
+    #[test]
     fn cleanup_stale_removes_old_sessions() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
@@ -763,6 +834,62 @@ mod tests {
         let sessions = backend.list_sessions();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0], "new_session");
+    }
+
+    #[test]
+    fn clear_messages_removes_rows_keeps_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.append("s1", &ChatMessage::assistant("hi")).unwrap();
+        backend.set_session_name("s1", "My Session").unwrap();
+
+        let cleared = backend.clear_messages("s1").unwrap();
+        assert_eq!(cleared, 2);
+        assert!(backend.load("s1").is_empty());
+        // Session still exists in metadata with name preserved
+        let meta = backend.list_sessions_with_metadata();
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].message_count, 0);
+        assert_eq!(meta[0].name.as_deref(), Some("My Session"));
+    }
+
+    #[test]
+    fn clear_messages_empty_returns_zero() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(backend.clear_messages("nonexistent").unwrap(), 0);
+    }
+
+    #[test]
+    fn clear_messages_does_not_affect_other_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.append("s2", &ChatMessage::user("world")).unwrap();
+
+        backend.clear_messages("s1").unwrap();
+        assert!(backend.load("s1").is_empty());
+        assert_eq!(backend.load("s2").len(), 1);
+    }
+
+    #[test]
+    fn clear_messages_then_append_works() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("old")).unwrap();
+        backend.clear_messages("s1").unwrap();
+        backend.append("s1", &ChatMessage::user("new")).unwrap();
+
+        let messages = backend.load("s1");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "new");
+        // Metadata count should reflect the new message
+        let meta = backend.list_sessions_with_metadata();
+        assert_eq!(meta[0].message_count, 1);
     }
 
     #[test]

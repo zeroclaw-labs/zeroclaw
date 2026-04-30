@@ -31,6 +31,7 @@ pub struct IrcChannel {
     nickserv_password: Option<String>,
     sasl_password: Option<String>,
     verify_tls: bool,
+    mention_only: bool,
     /// Shared write half of the TLS stream for sending messages.
     writer: Arc<Mutex<Option<WriteHalf>>>,
 }
@@ -233,6 +234,7 @@ pub struct IrcChannelConfig {
     pub nickserv_password: Option<String>,
     pub sasl_password: Option<String>,
     pub verify_tls: bool,
+    pub mention_only: bool,
 }
 
 impl IrcChannel {
@@ -249,6 +251,7 @@ impl IrcChannel {
             nickserv_password: cfg.nickserv_password,
             sasl_password: cfg.sasl_password,
             verify_tls: cfg.verify_tls,
+            mention_only: cfg.mention_only,
             writer: Arc::new(Mutex::new(None)),
         }
     }
@@ -260,6 +263,11 @@ impl IrcChannel {
         self.allowed_users
             .iter()
             .any(|u| u.eq_ignore_ascii_case(nick))
+    }
+
+    fn is_mentioned(my_nick: &str, text: &str) -> bool {
+        text.to_ascii_lowercase()
+            .contains(&my_nick.to_ascii_lowercase())
     }
 
     /// Create a TLS connection to the IRC server.
@@ -532,6 +540,7 @@ impl Channel for IrcChannel {
                     let target = msg.params.first().map_or("", String::as_str);
                     let text = msg.params.get(1).map_or("", String::as_str);
                     let sender_nick = msg.nick().unwrap_or("unknown");
+                    let is_channel = target.starts_with('#') || target.starts_with('&');
 
                     // Skip messages from NickServ/ChanServ
                     if sender_nick.eq_ignore_ascii_case("NickServ")
@@ -544,9 +553,12 @@ impl Channel for IrcChannel {
                         continue;
                     }
 
+                    if self.mention_only && is_channel && !Self::is_mentioned(&current_nick, text) {
+                        continue;
+                    }
+
                     // Determine reply target: if sent to a channel, reply to channel;
                     // if DM (target == our nick), reply to sender
-                    let is_channel = target.starts_with('#') || target.starts_with('&');
                     let reply_target = if is_channel {
                         target.to_string()
                     } else {
@@ -820,6 +832,7 @@ mod tests {
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            mention_only: false,
         });
         assert!(ch.is_user_allowed("alice"));
         assert!(ch.is_user_allowed("bob"));
@@ -839,6 +852,7 @@ mod tests {
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            mention_only: false,
         });
         assert!(ch.is_user_allowed("alice"));
         assert!(ch.is_user_allowed("ALICE"));
@@ -858,8 +872,44 @@ mod tests {
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            mention_only: false,
         });
         assert!(!ch.is_user_allowed("anyone"));
+    }
+
+    // ── Mention only ────────────────────────────────────────
+
+    #[test]
+    fn mention_only_case_insensitive() {
+        assert!(IrcChannel::is_mentioned("bot", "Hello, bot!"));
+        assert!(IrcChannel::is_mentioned("bot", "HI BOT!"));
+        assert!(IrcChannel::is_mentioned("bot", "Bot: how are you doing?"));
+        assert!(!IrcChannel::is_mentioned(
+            "bot",
+            "This one doesn't mention."
+        ));
+    }
+
+    #[test]
+    fn mention_only_filters_channel_messages() {
+        // With mention_only = true: channel messages that don't mention the
+        // nick are silently dropped; messages that do mention it pass through.
+        assert!(
+            !IrcChannel::is_mentioned("bot", "anyone see the game last night?"),
+            "non-mention should not pass the filter"
+        );
+        assert!(
+            IrcChannel::is_mentioned("bot", "bot: what time is it?"),
+            "direct address should pass the filter"
+        );
+        assert!(
+            IrcChannel::is_mentioned("bot", "hey BOT, help me out"),
+            "case-insensitive mention should pass the filter"
+        );
+        // DMs are never gated by mention_only (is_channel = false for DMs),
+        // so the filtering branch does not run for private messages.
+        // That invariant is documented here, not separately tested, because
+        // listen() is async and cannot be unit-tested without a live IRC socket.
     }
 
     // ── Constructor ─────────────────────────────────────────
@@ -877,6 +927,7 @@ mod tests {
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            mention_only: false,
         });
         assert_eq!(ch.username, "mybot");
     }
@@ -894,6 +945,7 @@ mod tests {
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            mention_only: false,
         });
         assert_eq!(ch.username, "customuser");
         assert_eq!(ch.nickname, "mybot");
@@ -918,6 +970,7 @@ mod tests {
             nickserv_password: Some("nspass".into()),
             sasl_password: Some("saslpass".into()),
             verify_tls: false,
+            mention_only: false,
         });
         assert_eq!(ch.server, "irc.example.com");
         assert_eq!(ch.port, 6697);
@@ -929,6 +982,7 @@ mod tests {
         assert_eq!(ch.nickserv_password.as_deref(), Some("nspass"));
         assert_eq!(ch.sasl_password.as_deref(), Some("saslpass"));
         assert!(!ch.verify_tls);
+        assert!(!ch.mention_only);
     }
 
     // ── Config serde ────────────────────────────────────────
@@ -949,6 +1003,7 @@ mod tests {
             nickserv_password: Some("secret".into()),
             sasl_password: None,
             verify_tls: Some(true),
+            mention_only: false,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -963,6 +1018,7 @@ mod tests {
         assert_eq!(parsed.nickserv_password.as_deref(), Some("secret"));
         assert!(parsed.sasl_password.is_none());
         assert_eq!(parsed.verify_tls, Some(true));
+        assert!(!parsed.mention_only);
     }
 
     #[test]
@@ -984,6 +1040,7 @@ nickname = "bot"
         assert!(parsed.nickserv_password.is_none());
         assert!(parsed.sasl_password.is_none());
         assert!(parsed.verify_tls.is_none());
+        assert!(!parsed.mention_only);
     }
 
     #[test]
@@ -1009,6 +1066,7 @@ nickname = "bot"
             nickserv_password: None,
             sasl_password: None,
             verify_tls: true,
+            mention_only: false,
         })
     }
 }

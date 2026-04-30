@@ -27,7 +27,7 @@ pub fn run(
     // Step 1: extract English msgids
     println!("==> Extracting English msgids → {}", pot.display());
     run_cmd(
-        Command::new("mdbook")
+        Command::new(mdbook_program()?)
             .args(["build", "-d", "po-extract"])
             .env("MDBOOK_OUTPUT__XGETTEXT__POT_FILE", "messages.pot")
             .current_dir(&book),

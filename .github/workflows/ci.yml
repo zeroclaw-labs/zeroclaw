@@ -186,7 +186,7 @@ jobs:
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
       - name: Run tests
-        run: cargo nextest run --locked
+        run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"

@@ -110,8 +110,8 @@ export default function ConfigTomlEditor({ value, onChange }: ConfigTomlEditorPr
         <pre
           ref={preRef}
           aria-hidden="true"
-          className="absolute inset-0 text-sm p-4 font-mono overflow-auto whitespace-pre pointer-events-none m-0"
-          style={{ background: 'var(--pc-bg-base)', tabSize: 4 }}
+          className="absolute inset-0 p-4 overflow-auto pointer-events-none m-0"
+          style={{ ...EDITOR_METRICS, background: 'var(--pc-bg-base)' }}
           dangerouslySetInnerHTML={{ __html: highlightToml(value) }}
         />
         <textarea
@@ -130,10 +130,26 @@ export default function ConfigTomlEditor({ value, onChange }: ConfigTomlEditorPr
             }
           }}
           spellCheck={false}
-          className="absolute inset-0 w-full h-full text-sm p-4 resize-none focus:outline-none font-mono caret-white"
-          style={{ background: 'transparent', color: 'transparent', tabSize: 4 }}
+          wrap="off"
+          className="absolute inset-0 w-full h-full p-4 resize-none focus:outline-none caret-white"
+          style={{ ...EDITOR_METRICS, background: 'transparent', color: 'transparent' }}
         />
       </div>
     </div>
   );
 }
+
+// Both the highlighter <pre> and the typing <textarea> must render text with
+// pixel-identical metrics, otherwise the visible characters from the pre and
+// the caret position from the textarea drift apart. See #6073. Apply the same
+// inline style object to both layers; do not mix Tailwind text/font utilities
+// with inline overrides on one side only.
+const EDITOR_METRICS: React.CSSProperties = {
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+  fontSize: '14px',
+  lineHeight: '20px',
+  letterSpacing: '0',
+  tabSize: 4,
+  whiteSpace: 'pre',
+  fontVariantLigatures: 'none',
+};

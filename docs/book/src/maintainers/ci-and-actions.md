@@ -13,7 +13,7 @@ Fires on every PR targeting `master`. Composite job with multiple matrix legs:
 - **check** — all features + no-default-features
 - **check-32bit** — `i686-unknown-linux-gnu` with no default features
 - **bench** — benchmarks compile check
-- **test** — `cargo nextest run --locked` on Linux
+- **test** — `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux
 - **security** — `cargo deny check`
 
 `CI Required Gate` is the composite job branch protection pins. A PR cannot merge until this is green.

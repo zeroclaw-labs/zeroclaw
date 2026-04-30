@@ -77,6 +77,36 @@ fn tool_on_path(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve the real `mdbook` binary on PATH, skipping the xtask's own build dir.
+/// The xtask itself is named `mdbook`; Cargo prepends `target/debug` and
+/// `target/debug/deps` to PATH for `cargo run`, and on Windows `Command::new`
+/// also searches the parent process's directory first — so without this guard
+/// the xtask would recursively spawn itself.
+pub fn mdbook_program() -> anyhow::Result<PathBuf> {
+    let exclude = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_owned))
+        .and_then(|p| std::fs::canonicalize(&p).ok());
+    let paths = std::env::var_os("PATH")
+        .ok_or_else(|| anyhow::anyhow!("PATH environment variable is unset"))?;
+    for dir in std::env::split_paths(&paths) {
+        if let (Some(ex), Ok(canon)) = (exclude.as_deref(), std::fs::canonicalize(&dir))
+            && canon.starts_with(ex)
+        {
+            continue;
+        }
+        for name in ["mdbook", "mdbook.exe"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    anyhow::bail!(
+        "'mdbook' not found on PATH\n  install: cargo install mdbook --version 0.5.0 --locked"
+    )
+}
+
 pub fn run_cmd(cmd: &mut Command) -> anyhow::Result<()> {
     let status = cmd.status()?;
     if !status.success() {

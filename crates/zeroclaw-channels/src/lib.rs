@@ -66,6 +66,8 @@ pub mod voice_wake;
 pub mod wati;
 #[cfg(feature = "channel-webhook")]
 pub mod webhook;
+#[cfg(feature = "channel-wechat")]
+pub mod wechat;
 #[cfg(feature = "channel-wecom")]
 pub mod wecom;
 #[cfg(feature = "channel-whatsapp-cloud")]
