@@ -1318,10 +1318,7 @@ async fn personality(cfg: &mut Config, ui: &mut dyn OnboardUi, flags: &Flags) ->
             .collect();
         items.push(SelectItem::new("Done"));
 
-        match ui
-            .select("Personality file to edit", &items, None)
-            .await?
-        {
+        match ui.select("Personality file to edit", &items, None).await? {
             Answer::Back => return Ok(Nav::Back),
             Answer::Value(idx) if idx == EDITABLE_PERSONALITY_FILES.len() => break,
             Answer::Value(idx) => {
