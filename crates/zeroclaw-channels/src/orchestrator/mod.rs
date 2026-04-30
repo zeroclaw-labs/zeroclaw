@@ -46,6 +46,8 @@ pub use crate::nostr::NostrChannel;
 pub use crate::notion::NotionChannel;
 pub use crate::qq::QQChannel;
 pub use crate::reddit::RedditChannel;
+#[cfg(feature = "channel-rocketchat")]
+pub use crate::rocketchat::RocketChatChannel;
 pub use crate::signal::SignalChannel;
 pub use crate::slack::SlackChannel;
 pub use crate::transcription;
@@ -374,6 +376,7 @@ struct ChannelRuntimeContext {
     model_routes: Arc<Vec<zeroclaw_config::schema::ModelRouteConfig>>,
     query_classification: zeroclaw_config::schema::QueryClassificationConfig,
     ack_reactions: bool,
+    force_reply: bool,
     show_tool_calls: bool,
     session_store: Option<Arc<zeroclaw_infra::session_store::SessionStore>>,
     /// Non-interactive approval manager for channel-driven runs.
@@ -2897,15 +2900,19 @@ async fn process_channel_message(
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
-    let reply_intent = classify_channel_reply_intent(
-        active_provider.as_ref(),
-        history[0].content.as_str(),
-        &history,
-        route.model.as_str(),
-        runtime_defaults.temperature,
-    )
-    .await
-    .unwrap_or(AssistantChannelOutcome::Reply(String::new()));
+    let reply_intent = if ctx.force_reply {
+        AssistantChannelOutcome::Reply(String::new())
+    } else {
+        classify_channel_reply_intent(
+            active_provider.as_ref(),
+            history[0].content.as_str(),
+            &history,
+            route.model.as_str(),
+            runtime_defaults.temperature,
+        )
+        .await
+        .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
+    };
 
     if let AssistantChannelOutcome::NoReply { kind, reason } = reply_intent {
         let history_response = AssistantChannelOutcome::NoReply {
@@ -4104,6 +4111,33 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 mm.mention_only.unwrap_or(false),
             )))
         }
+        #[cfg(feature = "channel-rocketchat")]
+        "rocketchat" => {
+            let rc = config
+                .channels
+                .rocketchat
+                .as_ref()
+                .context("Rocket.Chat channel is not configured")?;
+            Ok(Arc::new(
+                RocketChatChannel::new(
+                    rc.server_url.clone(),
+                    rc.user_id.clone(),
+                    rc.auth_token.clone(),
+                    rc.allowed_rooms.clone(),
+                    rc.allowed_users.clone(),
+                    rc.dm_replies,
+                    rc.mention_only,
+                    rc.thread_replies,
+                    rc.discussion_replies,
+                    rc.typing_indicator,
+                    rc.poll_interval_ms,
+                    rc.download_media,
+                    rc.max_media_bytes,
+                )
+                .with_proxy_url(rc.proxy_url.clone())
+                .with_thinking_placeholder(rc.thinking_placeholder),
+            ))
+        }
         "signal" => {
             let sg = config
                 .channels
@@ -4429,9 +4463,10 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             }
         }
         other => anyhow::bail!(
-            "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
-            matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, nextcloud_talk, wati, linq, \
-            email, gmail_push, irc, twitter, mochat, discord_history, imessage, line, voice-call"
+            "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, \
+            rocketchat, signal, matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, \
+            nextcloud_talk, wati, linq, email, gmail_push, irc, twitter, mochat, \
+            discord_history, imessage, line, voice-call"
         ),
     }
 }
@@ -4614,6 +4649,36 @@ fn collect_configured_channels(
             });
         } else {
             tracing::info!("Mattermost channel configured but disabled (enabled = false)");
+        }
+    }
+
+    #[cfg(feature = "channel-rocketchat")]
+    if let Some(ref rc) = config.channels.rocketchat {
+        if rc.enabled {
+            channels.push(ConfiguredChannel {
+                display_name: "Rocket.Chat",
+                channel: Arc::new(
+                    RocketChatChannel::new(
+                        rc.server_url.clone(),
+                        rc.user_id.clone(),
+                        rc.auth_token.clone(),
+                        rc.allowed_rooms.clone(),
+                        rc.allowed_users.clone(),
+                        rc.dm_replies,
+                        rc.mention_only,
+                        rc.thread_replies,
+                        rc.discussion_replies,
+                        rc.typing_indicator,
+                        rc.poll_interval_ms,
+                        rc.download_media,
+                        rc.max_media_bytes,
+                    )
+                    .with_proxy_url(rc.proxy_url.clone())
+                    .with_thinking_placeholder(rc.thinking_placeholder),
+                ),
+            });
+        } else {
+            tracing::info!("Rocket.Chat channel configured but disabled (enabled = false)");
         }
     }
 
@@ -5729,6 +5794,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model_routes: Arc::new(config.providers.model_routes.clone()),
         query_classification: config.query_classification.clone(),
         ack_reactions: config.channels.ack_reactions,
+        force_reply: config.channels.force_reply,
         show_tool_calls: config.channels.show_tool_calls,
         session_store: if config.channels.session_persistence {
             match zeroclaw_infra::session_store::SessionStore::new(&config.workspace_dir) {

@@ -50,6 +50,8 @@ pub mod notion;
 pub mod qq;
 #[cfg(feature = "channel-reddit")]
 pub mod reddit;
+#[cfg(feature = "channel-rocketchat")]
+pub mod rocketchat;
 #[cfg(feature = "channel-signal")]
 pub mod signal;
 #[cfg(feature = "channel-slack")]

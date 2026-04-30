@@ -74,3 +74,4 @@ rust_out
 
 # Auto-generated Tauri schemas
 apps/tauri/gen/schemas/
+.agents/*

@@ -1,6 +1,6 @@
 import { useRef, useCallback } from 'react';
 import {
-  Zap, Bot, Server, DollarSign, Brain, Search, HeartPulse,
+  Zap, Bot, Server, DollarSign, Brain, Search, HeartPulse, MessageSquareText,
 } from 'lucide-react';
 import GeneralSection from './sections/GeneralSection';
 import AgentSection from './sections/AgentSection';
@@ -9,6 +9,7 @@ import CostSection from './sections/CostSection';
 import MemorySection from './sections/MemorySection';
 import WebSearchSection from './sections/WebSearchSection';
 import HeartbeatSection from './sections/HeartbeatSection';
+import ChannelsSection from './sections/ChannelsSection';
 import { t } from '@/lib/i18n';
 
 interface ConfigFormViewProps {
@@ -20,6 +21,7 @@ const NAV_ITEMS = [
   { key: 'general', icon: Zap, label: () => t('config.section.general') },
   { key: 'memory', icon: Brain, label: () => t('config.section.memory') },
   { key: 'heartbeat', icon: HeartPulse, label: () => t('config.section.heartbeat') },
+  { key: 'channels', icon: MessageSquareText, label: () => t('config.section.channels') },
   { key: 'web_search', icon: Search, label: () => t('config.section.web_search') },
   { key: 'cost', icon: DollarSign, label: () => t('config.section.cost') },
   { key: 'agent', icon: Bot, label: () => t('config.section.agent') },
@@ -73,6 +75,9 @@ export default function ConfigFormView({ config, onUpdate }: ConfigFormViewProps
         </div>
         <div ref={setRef('heartbeat')}>
           <HeartbeatSection config={config} onUpdate={onUpdate} />
+        </div>
+        <div ref={setRef('channels')}>
+          <ChannelsSection config={config} onUpdate={onUpdate} />
         </div>
         <div ref={setRef('web_search')}>
           <WebSearchSection config={config} onUpdate={onUpdate} />

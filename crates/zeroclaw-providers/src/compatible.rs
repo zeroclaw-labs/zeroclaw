@@ -649,6 +649,35 @@ impl ResponseMessage {
     }
 }
 
+fn unwrap_embedded_response_message(mut message: ResponseMessage) -> ResponseMessage {
+    if message.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty()) {
+        return message;
+    }
+
+    let Some(content) = message.content.as_deref().map(str::trim) else {
+        return message;
+    };
+    if !content.starts_with('{') {
+        return message;
+    }
+
+    let Ok(mut embedded) = serde_json::from_str::<ResponseMessage>(content) else {
+        return message;
+    };
+
+    let looks_like_assistant_message = embedded.content.is_some()
+        || embedded.reasoning_content.is_some()
+        || embedded.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty());
+    if !looks_like_assistant_message {
+        return message;
+    }
+
+    if embedded.reasoning_content.is_none() {
+        embedded.reasoning_content = message.reasoning_content.take();
+    }
+    embedded
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct ToolCall {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1517,15 +1546,20 @@ impl OpenAiCompatibleProvider {
                         })
                         .collect::<Vec<_>>();
 
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|value| MessageContent::Text(value.to_string()));
-
                     let reasoning_content = value
                         .get("reasoning_content")
                         .and_then(serde_json::Value::as_str)
                         .map(ToString::to_string);
+
+                    let content = value
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|content| {
+                            reasoning_content
+                                .as_deref()
+                                .map_or(true, |reasoning| content.trim() != reasoning.trim())
+                        })
+                        .map(|value| MessageContent::Text(value.to_string()));
 
                     return NativeMessage {
                         role: "assistant".to_string(),
@@ -1665,7 +1699,8 @@ impl OpenAiCompatibleProvider {
     }
 
     fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
-        let text = message.effective_content_optional();
+        let message = unwrap_embedded_response_message(message);
+        let mut text = message.effective_content_optional();
         let reasoning_content = message.reasoning_content.clone();
         let tool_calls = message
             .tool_calls
@@ -1692,6 +1727,14 @@ impl OpenAiCompatibleProvider {
                 })
             })
             .collect::<Vec<_>>();
+
+        if !tool_calls.is_empty()
+            && let (Some(candidate), Some(reasoning)) =
+                (text.as_deref(), reasoning_content.as_deref())
+            && candidate.trim() == reasoning.trim()
+        {
+            text = None;
+        }
 
         ProviderChatResponse {
             text,
@@ -2040,31 +2083,9 @@ impl Provider for OpenAiCompatibleProvider {
             .next()
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
-        let text = choice.message.effective_content_optional();
-        let reasoning_content = choice.message.reasoning_content;
-        let tool_calls = choice
-            .message
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|tc| {
-                let function = tc.function?;
-                let name = function.name?;
-                let arguments = function.arguments.unwrap_or_else(|| "{}".to_string());
-                Some(ProviderToolCall {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    name,
-                    arguments,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        Ok(ProviderChatResponse {
-            text,
-            tool_calls,
-            usage,
-            reasoning_content,
-        })
+        let mut result = Self::parse_native_response(choice.message);
+        result.usage = usage;
+        Ok(result)
     }
 
     async fn chat(
@@ -4047,6 +4068,61 @@ mod tests {
     }
 
     #[test]
+    fn parse_native_response_unwraps_embedded_tool_message_without_reasoning_leak() {
+        let embedded = serde_json::json!({
+            "content": "I should call the search tool first.",
+            "reasoning_content": "I should call the search tool first.",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "memory_recall",
+                    "arguments": "{\"query\":\"rocket\"}"
+                }
+            }]
+        });
+        let message = ResponseMessage {
+            content: Some(embedded.to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+        };
+
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        assert_eq!(
+            parsed.reasoning_content.as_deref(),
+            Some("I should call the search tool first.")
+        );
+        assert!(parsed.text.is_none());
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].id, "call_1");
+        assert_eq!(parsed.tool_calls[0].name, "memory_recall");
+        assert_eq!(parsed.tool_calls[0].arguments, r#"{"query":"rocket"}"#);
+    }
+
+    #[test]
+    fn parse_native_response_keeps_embedded_user_visible_content() {
+        let embedded = serde_json::json!({
+            "content": "I'll search that now.",
+            "reasoning_content": "Need a lookup.",
+            "tool_calls": [{
+                "id": "call_2",
+                "name": "memory_recall",
+                "arguments": "{\"query\":\"pipeline\"}"
+            }]
+        });
+        let message = ResponseMessage {
+            content: Some(embedded.to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+        };
+
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        assert_eq!(parsed.text.as_deref(), Some("I'll search that now."));
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("Need a lookup."));
+        assert_eq!(parsed.tool_calls.len(), 1);
+    }
+
+    #[test]
     fn parse_native_response_none_reasoning_content_for_normal_model() {
         let message = ResponseMessage {
             content: Some("hello".to_string()),
@@ -4079,6 +4155,29 @@ mod tests {
         assert_eq!(
             native[0].reasoning_content.as_deref(),
             Some("Let me think about this...")
+        );
+        assert!(native[0].tool_calls.is_some());
+    }
+
+    #[test]
+    fn convert_messages_for_native_drops_reasoning_echo_content() {
+        let history_json = serde_json::json!({
+            "content": "Need to inspect memory first.",
+            "reasoning_content": "Need to inspect memory first.",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "memory_recall",
+                "arguments": "{\"query\":\"rocket\"}"
+            }]
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+        assert_eq!(native.len(), 1);
+        assert!(native[0].content.is_none());
+        assert_eq!(
+            native[0].reasoning_content.as_deref(),
+            Some("Need to inspect memory first.")
         );
         assert!(native[0].tool_calls.is_some());
     }

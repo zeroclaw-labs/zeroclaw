@@ -82,6 +82,8 @@ fn handle_http_request(
     let req: HttpRequest = serde_json::from_str(&request_json)
         .map_err(|e| Error::msg(format!("invalid HTTP request JSON: {e}")))?;
 
+    tracing::debug!(method = %req.method, url = %req.url, "plugin HTTP request");
+
     // 120s ceiling covers legitimate slow cases: large file downloads and slow
     // model-inference endpoints (fal.ai image generation routinely takes 20-60s
     // on cold models). A per-plugin override or tighter default is a candidate
@@ -115,9 +117,13 @@ fn handle_http_request(
 
     let resp = builder
         .send()
-        .map_err(|e| Error::msg(format!("HTTP request failed: {e}")))?;
+        .map_err(|e| {
+            tracing::warn!(url = %req.url, error = %e, "plugin HTTP request failed");
+            Error::msg(format!("HTTP request failed: {e}"))
+        })?;
 
     let status = resp.status().as_u16();
+    tracing::debug!(url = %req.url, status, "plugin HTTP response");
     let headers: std::collections::HashMap<String, String> = resp
         .headers()
         .iter()
@@ -158,8 +164,11 @@ fn handle_env_read(
 
     let var_name: String = plugin.memory_get_val(&inputs[0])?;
 
-    let value = std::env::var(&var_name)
-        .map_err(|_| Error::msg(format!("environment variable '{var_name}' not set")))?;
+    let value = std::env::var(&var_name).map_err(|_| {
+        tracing::warn!(var = %var_name, "plugin env read: variable not set");
+        Error::msg(format!("environment variable '{var_name}' not set"))
+    })?;
+    tracing::debug!(var = %var_name, "plugin env read: ok");
 
     plugin.memory_set_val(&mut outputs[0], value)?;
 

@@ -1051,6 +1051,9 @@ fn mask_sensitive_fields(
     if let Some(mattermost) = masked.channels.mattermost.as_mut() {
         mask_required_secret(&mut mattermost.bot_token);
     }
+    if let Some(rocketchat) = masked.channels.rocketchat.as_mut() {
+        mask_required_secret(&mut rocketchat.auth_token);
+    }
     if let Some(webhook) = masked.channels.webhook.as_mut() {
         mask_optional_secret(&mut webhook.secret);
     }
@@ -1189,6 +1192,12 @@ fn restore_masked_sensitive_fields(
         current.channels.mattermost.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
+    }
+    if let (Some(incoming_ch), Some(current_ch)) = (
+        incoming.channels.rocketchat.as_mut(),
+        current.channels.rocketchat.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_ch.auth_token, &current_ch.auth_token);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels.webhook.as_mut(),
@@ -1601,6 +1610,8 @@ pub async fn handle_api_session_abort(
     }
 }
 
+// ── Channels endpoint ─────────────────────────────────────────────
+
 // ── Claude Code hook endpoint ────────────────────────────────────
 
 /// POST /hooks/claude-code — receives HTTP hook events from Claude Code
@@ -1819,6 +1830,23 @@ mod tests {
             default_subject: "ZeroClaw Message".to_string(),
             max_attachment_bytes: 25 * 1024 * 1024,
         });
+        cfg.channels.rocketchat = Some(zeroclaw_config::schema::RocketChatConfig {
+            enabled: true,
+            server_url: "https://chat.example.com".to_string(),
+            user_id: "bot-user".to_string(),
+            auth_token: "rocket-token-secret".to_string(),
+            allowed_rooms: vec!["GENERAL".to_string()],
+            allowed_users: vec!["*".to_string()],
+            dm_replies: true,
+            mention_only: true,
+            thread_replies: true,
+            discussion_replies: true,
+            typing_indicator: true,
+            poll_interval_ms: 1500,
+            download_media: true,
+            max_media_bytes: 25 * 1024 * 1024,
+            proxy_url: None,
+        });
         cfg.providers.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
             hint: "reasoning".to_string(),
             provider: "openrouter".to_string(),
@@ -1910,6 +1938,14 @@ mod tests {
             parsed.channels.email.as_ref().map(|v| v.password.as_str()),
             Some(MASKED_SECRET)
         );
+        assert_eq!(
+            parsed
+                .channels
+                .rocketchat
+                .as_ref()
+                .map(|v| v.auth_token.as_str()),
+            Some(MASKED_SECRET)
+        );
     }
 
     #[test]
@@ -1974,6 +2010,23 @@ mod tests {
             default_subject: "ZeroClaw Message".to_string(),
             max_attachment_bytes: 25 * 1024 * 1024,
         });
+        current.channels.rocketchat = Some(zeroclaw_config::schema::RocketChatConfig {
+            enabled: true,
+            server_url: "https://chat.example.com".to_string(),
+            user_id: "bot-user".to_string(),
+            auth_token: "rocket-token-real".to_string(),
+            allowed_rooms: vec!["GENERAL".to_string()],
+            allowed_users: vec!["*".to_string()],
+            dm_replies: true,
+            mention_only: true,
+            thread_replies: true,
+            discussion_replies: true,
+            typing_indicator: true,
+            poll_interval_ms: 1500,
+            download_media: true,
+            max_media_bytes: 25 * 1024 * 1024,
+            proxy_url: None,
+        });
         current.providers.model_routes = vec![
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "reasoning".to_string(),
@@ -2029,6 +2082,10 @@ mod tests {
         }
         if let Some(email) = incoming.channels.email.as_mut() {
             email.password = MASKED_SECRET.to_string();
+        }
+        if let Some(rocketchat) = incoming.channels.rocketchat.as_mut() {
+            rocketchat.auth_token = MASKED_SECRET.to_string();
+            rocketchat.allowed_rooms = vec!["support".to_string()];
         }
         incoming.providers.model_routes[1].api_key = Some("route-model-key-2-new".to_string());
         incoming.providers.embedding_routes[1].api_key = Some("route-embed-key-2-new".to_string());
@@ -2138,6 +2195,13 @@ mod tests {
                 .map(|v| v.password.as_str()),
             Some("email-password-real")
         );
+        let rocketchat = hydrated
+            .channels
+            .rocketchat
+            .as_ref()
+            .expect("rocketchat channel should be retained");
+        assert_eq!(rocketchat.auth_token, "rocket-token-real");
+        assert_eq!(rocketchat.allowed_rooms, vec!["support".to_string()]);
     }
 
     #[test]

@@ -31,6 +31,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.matrix",
     "channel.mattermost",
     "channel.nextcloud_talk",
+    "channel.rocketchat",
     "channel.qq",
     "channel.signal",
     "channel.slack",
@@ -6602,6 +6603,9 @@ pub struct ChannelsConfig {
     /// Mattermost bot channel configuration.
     #[nested]
     pub mattermost: Option<MattermostConfig>,
+    /// Rocket.Chat bot channel configuration.
+    #[nested]
+    pub rocketchat: Option<RocketChatConfig>,
     /// Webhook channel configuration.
     #[nested]
     pub webhook: Option<WebhookConfig>,
@@ -6719,6 +6723,11 @@ pub struct ChannelsConfig {
     /// as a single concatenated message. `0` disables debouncing. Default: `0`.
     #[serde(default)]
     pub debounce_ms: u64,
+    /// Skip the no-reply precheck and always send a response to every inbound
+    /// message. Useful for DM-only bots where every message should get a reply.
+    /// Default: `false`.
+    #[serde(default)]
+    pub force_reply: bool,
 }
 
 impl ChannelsConfig {
@@ -6768,6 +6777,10 @@ impl ChannelsConfig {
             (
                 Box::new(ConfigWrapper::new(self.mattermost.as_ref())),
                 self.mattermost.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(self.rocketchat.as_ref())),
+                self.rocketchat.is_some(),
             ),
             (
                 Box::new(ConfigWrapper::new(self.imessage.as_ref())),
@@ -6889,6 +6902,7 @@ impl Default for ChannelsConfig {
             discord_history: None,
             slack: None,
             mattermost: None,
+            rocketchat: None,
             webhook: None,
             imessage: None,
             matrix: None,
@@ -6926,6 +6940,7 @@ impl Default for ChannelsConfig {
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+            force_reply: false,
         }
     }
 }
@@ -7240,6 +7255,85 @@ impl ChannelConfig for MattermostConfig {
     }
     fn desc() -> &'static str {
         "connect to your bot"
+    }
+}
+
+fn default_rocketchat_poll_interval_ms() -> u64 {
+    1500
+}
+
+fn default_rocketchat_max_media_bytes() -> u64 {
+    25 * 1024 * 1024
+}
+
+/// Rocket.Chat bot channel configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.rocketchat"]
+pub struct RocketChatConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Rocket.Chat server URL (e.g. `"https://chat.example.com"`).
+    #[serde(default)]
+    pub server_url: String,
+    /// Rocket.Chat bot user ID. Can also be supplied by `RocketChat_USER_ID`.
+    #[serde(default)]
+    pub user_id: String,
+    /// Rocket.Chat auth token. Can also be supplied by `RocketChat_TOKEN`.
+    #[secret]
+    #[serde(default)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub auth_token: String,
+    /// Room IDs or names the bot is allowed to read and answer in. Empty = deny all.
+    #[serde(default)]
+    pub allowed_rooms: Vec<String>,
+    /// User IDs or usernames the bot is allowed to answer. Empty = deny all.
+    /// Use `"*"` to allow all users.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// When true, the bot also polls direct-message rooms for each user in `allowed_users`.
+    /// If `allowed_users` contains `"*"`, all subscribed DMs are polled via `im.list`.
+    #[serde(default)]
+    pub dm_replies: bool,
+    /// When true, only respond to messages that @-mention the bot.
+    #[serde(default)]
+    pub mention_only: bool,
+    /// When true, replies stay in the originating Rocket.Chat thread.
+    #[serde(default = "default_true")]
+    pub thread_replies: bool,
+    /// When true, discussion rooms are treated as scoped conversations.
+    #[serde(default = "default_true")]
+    pub discussion_replies: bool,
+    /// When true, publish Rocket.Chat typing indicators while the agent is responding.
+    #[serde(default = "default_true")]
+    pub typing_indicator: bool,
+    /// Polling interval for REST history reads.
+    #[serde(default = "default_rocketchat_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    /// Download inbound media attachments into the workspace media pipeline.
+    #[serde(default = "default_true")]
+    pub download_media: bool,
+    /// Maximum inbound media attachment size to download.
+    #[serde(default = "default_rocketchat_max_media_bytes")]
+    pub max_media_bytes: u64,
+    /// Send a "⏳ thinking..." placeholder message when the bot starts processing,
+    /// then edit it with the real reply when done. Useful when `typing_indicator`
+    /// is unsupported (RC < 5.0). Default: false.
+    #[serde(default)]
+    pub thinking_placeholder: bool,
+    /// Per-channel proxy URL (http, https, socks5, socks5h).
+    /// Overrides the global `[proxy]` setting for this channel only.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+}
+
+impl ChannelConfig for RocketChatConfig {
+    fn name() -> &'static str {
+        "Rocket.Chat"
+    }
+    fn desc() -> &'static str {
+        "connect your Rocket.Chat bot"
     }
 }
 
@@ -9824,6 +9918,23 @@ fn read_codex_openai_api_key() -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn read_nonempty_env(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn normalize_rocketchat_server_url(url: &str) -> String {
+    url.trim()
+        .trim_end_matches('/')
+        .trim_end_matches("/api/v1")
+        .trim_end_matches("/api")
+        .to_string()
+}
+
 /// Ensure that essential bootstrap files exist in the workspace directory.
 ///
 /// When the workspace is created outside of `zeroclaw onboard` (e.g., non-tty
@@ -11126,6 +11237,26 @@ impl Config {
         {
             self.storage.provider.config.connect_timeout_secs = Some(timeout_secs);
         }
+
+        let rocketchat_url = read_nonempty_env(&["RocketChat_URL", "ROCKETCHAT_URL"]);
+        let rocketchat_user_id = read_nonempty_env(&["RocketChat_USER_ID", "ROCKETCHAT_USER_ID"]);
+        let rocketchat_token = read_nonempty_env(&["RocketChat_TOKEN", "ROCKETCHAT_TOKEN"]);
+        if rocketchat_url.is_some() || rocketchat_user_id.is_some() || rocketchat_token.is_some() {
+            let rc = self
+                .channels
+                .rocketchat
+                .get_or_insert_with(Default::default);
+            if let Some(url) = rocketchat_url {
+                rc.server_url = normalize_rocketchat_server_url(&url);
+            }
+            if let Some(user_id) = rocketchat_user_id {
+                rc.user_id = user_id;
+            }
+            if let Some(token) = rocketchat_token {
+                rc.auth_token = token;
+            }
+        }
+
         // Proxy enabled flag: ZEROCLAW_PROXY_ENABLED
         let explicit_proxy_enabled = std::env::var("ZEROCLAW_PROXY_ENABLED")
             .ok()
@@ -12034,6 +12165,7 @@ auto_save = true
                 discord_history: None,
                 slack: None,
                 mattermost: None,
+                rocketchat: None,
                 webhook: None,
                 imessage: None,
                 matrix: None,
@@ -13177,6 +13309,7 @@ allowed_users = ["@u:matrix.org"]
             discord_history: None,
             slack: None,
             mattermost: None,
+            rocketchat: None,
             webhook: None,
             imessage: Some(IMessageConfig {
                 enabled: true,
@@ -13392,6 +13525,61 @@ bot_token = "xoxb-tok"
     }
 
     #[test]
+    async fn rocketchat_config_deserializes_dashboard_fields() {
+        let toml = r#"
+enabled = true
+server_url = "https://chat.example.com"
+user_id = "bot-user"
+auth_token = "token"
+allowed_rooms = ["GENERAL", "support"]
+allowed_users = ["alice", "bob"]
+dm_replies = true
+mention_only = true
+thread_replies = true
+discussion_replies = true
+typing_indicator = true
+poll_interval_ms = 1500
+download_media = true
+max_media_bytes = 26214400
+"#;
+        let parsed: RocketChatConfig = toml::from_str(toml).unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.server_url, "https://chat.example.com");
+        assert_eq!(parsed.user_id, "bot-user");
+        assert_eq!(parsed.auth_token, "token");
+        assert_eq!(parsed.allowed_rooms, vec!["GENERAL", "support"]);
+        assert_eq!(parsed.allowed_users, vec!["alice", "bob"]);
+        assert!(parsed.dm_replies);
+        assert!(parsed.mention_only);
+        assert!(parsed.thread_replies);
+        assert!(parsed.discussion_replies);
+        assert!(parsed.typing_indicator);
+        assert_eq!(parsed.poll_interval_ms, 1500);
+        assert!(parsed.download_media);
+        assert_eq!(parsed.max_media_bytes, 26_214_400);
+    }
+
+    #[test]
+    async fn rocketchat_auth_token_is_config_secret() {
+        assert!(RocketChatConfig::prop_is_secret(
+            "channels.rocketchat.auth-token"
+        ));
+        assert!(!RocketChatConfig::prop_is_secret(
+            "channels.rocketchat.server-url"
+        ));
+    }
+
+    #[test]
+    async fn channels_config_includes_rocketchat_section() {
+        let mut config = Config::default();
+        assert!(config.channels.rocketchat.is_none());
+
+        let initialized = config.init_defaults(Some("channels.rocketchat"));
+        assert!(initialized.contains(&"channels.rocketchat"));
+        assert!(config.channels.rocketchat.is_some());
+    }
+
+    #[test]
     async fn webhook_config_with_secret() {
         let json = r#"{"port":8080,"secret":"my-secret-key"}"#;
         let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
@@ -13561,6 +13749,7 @@ bot_token = "xoxb-tok"
             discord_history: None,
             slack: None,
             mattermost: None,
+            rocketchat: None,
             webhook: None,
             imessage: None,
             matrix: None,
@@ -13967,6 +14156,42 @@ default_temperature = 0.7
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::remove_var(key) };
         }
+    }
+
+    #[test]
+    async fn env_override_rocketchat_credentials() {
+        let _env_guard = env_override_lock().await;
+        for key in [
+            "RocketChat_URL",
+            "RocketChat_USER_ID",
+            "RocketChat_TOKEN",
+            "ROCKETCHAT_URL",
+            "ROCKETCHAT_USER_ID",
+            "ROCKETCHAT_TOKEN",
+        ] {
+            unsafe { std::env::remove_var(key) };
+        }
+
+        let mut config = Config::default();
+        assert!(config.channels.rocketchat.is_none());
+
+        unsafe { std::env::set_var("RocketChat_URL", "https://chat.example.com/api/v1") };
+        unsafe { std::env::set_var("RocketChat_USER_ID", "bot-user") };
+        unsafe { std::env::set_var("RocketChat_TOKEN", "bot-token") };
+
+        config.apply_env_overrides();
+        let rc = config
+            .channels
+            .rocketchat
+            .as_ref()
+            .expect("Rocket.Chat config should be initialized by env vars");
+        assert_eq!(rc.server_url, "https://chat.example.com");
+        assert_eq!(rc.user_id, "bot-user");
+        assert_eq!(rc.auth_token, "bot-token");
+
+        unsafe { std::env::remove_var("RocketChat_URL") };
+        unsafe { std::env::remove_var("RocketChat_USER_ID") };
+        unsafe { std::env::remove_var("RocketChat_TOKEN") };
     }
 
     #[test]

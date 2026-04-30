@@ -114,12 +114,23 @@ impl Tool for WasmTool {
         let wasm_path = self.wasm_path.clone();
         let permissions = self.permissions.clone();
         let args_json = serde_json::to_vec(&args)?;
+        let tool_name = self.name.clone();
+
+        tracing::warn!(tool = %tool_name, args = %args, "WASM tool invoked");
 
         // Extism Plugin is !Send, so we must create it inside spawn_blocking.
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let mut plugin = runtime::create_plugin(&wasm_path, &permissions)?;
             runtime::call_execute(&mut plugin, &args_json)
         })
-        .await?
+        .await?;
+
+        match &result {
+            Ok(r) if r.success => tracing::warn!(tool = %tool_name, "WASM tool succeeded"),
+            Ok(r) => tracing::warn!(tool = %tool_name, error = ?r.error, output = %r.output, "WASM tool returned failure"),
+            Err(e) => tracing::warn!(tool = %tool_name, error = %e, "WASM tool execution error"),
+        }
+
+        result
     }
 }
