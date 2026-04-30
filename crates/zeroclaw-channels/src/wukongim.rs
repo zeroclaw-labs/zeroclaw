@@ -756,6 +756,7 @@ mod tests {
             body: WkApprovalBody {
                 content: "Body".to_string(),
             },
+            actions: None,
         };
         let json = serde_json::to_string(&card).unwrap();
         assert!(json.contains("\"type\":20"));
