@@ -1063,6 +1063,52 @@ pub fn ingest_case_to(
         );
     }
 
+    // ── 적용법조 복합 slug + 태그 ──
+    //
+    // 모든 적용법조(참조조문)에 대해:
+    //   - vault_aliases: case::{사건번호}::{법명}{조} 형태의 복합 slug
+    //   - vault_tags applied_statute: 형식적 적용법조 포함 전체
+    //
+    // 쟁점 적용법조 판별은 인제스트 시점이 아닌 그래프 쿼리 시점에
+    // graph_query::issue_analysis()에서 수행한다. 이유:
+    //   - 참조조문 중 본문에 언급되지 않은 법조도 쟁점일 수 있음
+    //   - AI 기반 판결요지 분석이 필요한 경우도 있음
+    //   - 그래프 degree centrality 분석이 가장 신뢰도 높은 방법
+    // 따라서 인제스트는 모든 적용법조를 동등하게 기록하고,
+    // 쟁점 분류는 읽기 시점의 issue_analysis()에 위임한다.
+    for cite in &doc.statute_citations {
+        let art_key = super::slug::article_key(cite.article, cite.article_sub);
+        // Compact form: 민법750, 근로기준법36, 상법368-2
+        let compact = format!("{}{}", cite.law_name, art_key);
+        let composite_alias = format!("{}::{}", doc.slug, compact);
+        let _ = tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO {schema}.vault_aliases (doc_id, alias) VALUES (?1, ?2)"
+            ),
+            params![doc_id, composite_alias],
+        );
+        // Human-readable alias: "case::2024노3424::민법 제750조"
+        let readable_alias = format!(
+            "{}::{}",
+            doc.slug,
+            super::slug::statute_display(&cite.law_name, cite.article, cite.article_sub)
+        );
+        let _ = tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO {schema}.vault_aliases (doc_id, alias) VALUES (?1, ?2)"
+            ),
+            params![doc_id, readable_alias],
+        );
+        // Tag: applied::{법명}::{조} for set-based filtering
+        let _ = insert_tag(
+            &tx,
+            schema,
+            doc_id,
+            &format!("applied::{}::{}", cite.law_name, art_key),
+            Some("applied_statute"),
+        );
+    }
+
     // Tags.
     insert_tag(&tx, schema, doc_id, "domain:legal", Some("domain"))?;
     insert_tag(&tx, schema, doc_id, "kind:case", Some("kind"))?;
