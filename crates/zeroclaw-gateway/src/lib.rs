@@ -9,7 +9,10 @@
 
 pub mod acp;
 pub mod api;
+pub mod api_config;
+pub mod api_onboard;
 pub mod api_pairing;
+pub mod api_personality;
 #[cfg(feature = "plugins-wasm")]
 pub mod api_plugins;
 #[cfg(feature = "webauthn")]
@@ -19,6 +22,7 @@ pub mod canvas;
 pub mod hardware_context;
 pub mod node_tool;
 pub mod nodes;
+pub mod openapi;
 pub mod session_queue;
 pub mod sse;
 pub mod static_files;
@@ -34,7 +38,7 @@ use axum::{
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post},
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -396,6 +400,11 @@ pub struct AppState {
     pub event_buffer: Arc<sse::EventBuffer>,
     /// Shutdown signal sender for graceful shutdown
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Reload signal sender owned by the daemon. /admin/reload writes `true`
+    /// here; the daemon's wait loop reacts and re-instantiates every
+    /// subsystem in place. `None` when running standalone (`zeroclaw gateway start`)
+    /// — reload then degrades to a 503 with a clear message.
+    pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
     /// Registry of dynamically connected nodes
     pub node_registry: Arc<nodes::NodeRegistry>,
     /// Path prefix for reverse-proxy deployments (empty string = no prefix)
@@ -431,6 +440,10 @@ pub async fn run_gateway(
     port: u16,
     config: Config,
     external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    // Reload sender owned by the daemon. /admin/reload writes `true` here;
+    // the daemon's wait loop reacts via `subscribe()` and tears down to
+    // re-init. Cross-platform replacement for the SIGUSR1 hack.
+    reload_tx: Option<tokio::sync::watch::Sender<bool>>,
     canvas_store: Option<CanvasStore>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
@@ -941,6 +954,7 @@ pub async fn run_gateway(
         event_tx,
         event_buffer,
         shutdown_tx,
+        reload_tx,
         node_registry,
         session_backend,
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
@@ -976,15 +990,11 @@ pub async fn run_gateway(
         },
     };
 
-    // Config PUT needs larger body limit (1MB)
-    let config_put_router = Router::new()
-        .route("/api/config", put(api::handle_api_config_put))
-        .layer(RequestBodyLimitLayer::new(1_048_576));
-
     // Build router with middleware
     let inner = Router::new()
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
+        .route("/admin/reload", post(handle_admin_reload))
         .route("/admin/paircode", get(handle_admin_paircode))
         .route("/admin/paircode/new", post(handle_admin_paircode_new))
         // ── Existing routes ──
@@ -1004,7 +1014,49 @@ pub async fn run_gateway(
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
-        .route("/api/config", get(api::handle_api_config_get))
+        .route(
+            "/api/config",
+            patch(api_config::handle_patch).options(api_config::handle_options_config),
+        )
+        .route(
+            "/api/config/prop",
+            get(api_config::handle_prop_get)
+                .put(api_config::handle_prop_put)
+                .delete(api_config::handle_prop_delete)
+                .options(api_config::handle_options_prop),
+        )
+        .route("/api/config/list", get(api_config::handle_list))
+        .route("/api/config/drift", get(api_config::handle_drift))
+        .route("/api/config/templates", get(api_config::handle_templates))
+        .route("/api/config/map-key", post(api_config::handle_map_key))
+        .route("/api/onboard/catalog", get(api_onboard::handle_catalog))
+        .route(
+            "/api/onboard/catalog/models",
+            get(api_onboard::handle_catalog_models),
+        )
+        .route("/api/onboard/status", get(api_onboard::handle_onboard_status))
+        .route("/api/onboard/sections", get(api_onboard::handle_sections))
+        .route(
+            "/api/onboard/sections/{section}",
+            get(api_onboard::handle_section_picker),
+        )
+        .route(
+            "/api/onboard/sections/{section}/items/{key}",
+            post(api_onboard::handle_section_select),
+        )
+        .route("/api/personality", get(api_personality::handle_index))
+        .route(
+            "/api/personality/templates",
+            get(api_personality::handle_templates),
+        )
+        .route(
+            "/api/personality/{filename}",
+            get(api_personality::handle_get).put(api_personality::handle_put),
+        )
+        .route("/api/config/init", post(api_config::handle_init))
+        .route("/api/config/migrate", post(api_config::handle_migrate))
+        .route("/api/openapi.json", get(openapi::handle_openapi_json))
+        .route("/api/docs", get(openapi::handle_docs))
         .route("/api/tools", get(api::handle_api_tools))
         .route("/api/cron", get(api::handle_api_cron_list))
         .route("/api/cron", post(api::handle_api_cron_add))
@@ -1116,8 +1168,6 @@ pub async fn run_gateway(
         .route("/ws/nodes", get(nodes::handle_ws_nodes))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
-        // ── Config PUT with larger body limit ──
-        .merge(config_put_router)
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback))
         .with_state(state.clone())
@@ -2272,6 +2322,70 @@ async fn handle_admin_shutdown(
     Ok((StatusCode::OK, Json(body)))
 }
 
+/// POST /admin/reload — reload the daemon in place (localhost only).
+///
+/// Sends `true` on the reload channel the daemon owns. The daemon's main
+/// wait loop sees the change, returns `DaemonExit::Reload`, and the outer
+/// loop in `src/main.rs` re-reads config from disk and re-runs
+/// `daemon::run` — re-instantiating every subsystem (gateway / channels /
+/// heartbeat / scheduler / mqtt) with the fresh config.
+///
+/// Same PID throughout. Brief HTTP downtime while the gateway listener
+/// rebinds — typically sub-second. Clients should poll `/health` to detect
+/// when the new instance is ready.
+///
+/// Cross-platform — works identically on Linux, macOS, and Windows because
+/// the channel is in-process tokio, not an OS signal. The gateway-only
+/// `zeroclaw gateway start` (no daemon supervisor) returns 503 with a
+/// clear message because there's nothing to signal.
+async fn handle_admin_reload(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+
+    let Some(reload_tx) = state.reload_tx.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "no daemon supervisor — running as standalone gateway. \
+                          Restart the process to pick up config changes."
+            })),
+        ));
+    };
+
+    tracing::info!("🔄 Admin reload request received");
+    // Trigger graceful shutdown of THIS gateway instance's axum::serve so
+    // its TcpListener releases the port before the daemon supervisor
+    // spawns the new instance. Without this, daemon::run aborts the
+    // gateway tokio task at the next await point — but the OLD listener
+    // can stay bound briefly, racing the NEW gateway's bind. The new
+    // bind then fails and spawn_component_supervisor backs off; in the
+    // meantime the OLD gateway keeps serving requests with stale
+    // in-memory config, and `/api/config/drift` reports drift against
+    // disk because in-memory hasn't been replaced yet. Cold restart
+    // (process exit + start) hits this path differently because the OS
+    // fully releases the listener — that's why the user observes "shut
+    // down + bring up = correct" but "/admin/reload = stale".
+    let shutdown_tx = state.shutdown_tx.clone();
+    // Brief delay so the HTTP response flushes before tear-down begins.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Drain axum first so the listener releases.
+        let _ = shutdown_tx.send(true);
+        // Then signal the daemon to re-read disk and re-spawn subsystems.
+        let _ = reload_tx.send(true);
+    });
+
+    Ok((
+        StatusCode::OK,
+        Json(AdminResponse {
+            success: true,
+            message: "Daemon reload initiated".to_string(),
+        }),
+    ))
+}
+
 /// GET /admin/paircode — fetch current pairing code (localhost only)
 async fn handle_admin_paircode(
     State(state): State<AppState>,
@@ -2465,6 +2579,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -2538,6 +2653,7 @@ mod tests {
             event_tx,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -2996,6 +3112,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3077,6 +3194,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3170,6 +3288,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3235,6 +3354,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3305,6 +3425,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3380,6 +3501,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
@@ -3452,6 +3574,7 @@ mod tests {
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             web_dist_dir: None,
