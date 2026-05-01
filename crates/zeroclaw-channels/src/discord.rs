@@ -18,7 +18,8 @@ use zeroclaw_api::channel::{
 /// Discord channel — connects via Gateway WebSocket for real-time messages
 pub struct DiscordChannel {
     bot_token: String,
-    guild_id: Option<String>,
+    /// Empty = listen across all guilds the bot is invited to.
+    guild_ids: Vec<String>,
     allowed_users: Vec<String>,
     listen_to_bots: bool,
     mention_only: bool,
@@ -52,14 +53,14 @@ pub struct DiscordChannel {
 impl DiscordChannel {
     pub fn new(
         bot_token: String,
-        guild_id: Option<String>,
+        guild_ids: Vec<String>,
         allowed_users: Vec<String>,
         listen_to_bots: bool,
         mention_only: bool,
     ) -> Self {
         Self {
             bot_token,
-            guild_id,
+            guild_ids,
             allowed_users,
             listen_to_bots,
             mention_only,
@@ -1002,7 +1003,7 @@ impl Channel for DiscordChannel {
             }
         });
 
-        let guild_filter = self.guild_id.clone();
+        let guild_filter = self.guild_ids.clone();
 
         // --- Stall watchdog --------------------------------------------------
         let watchdog = if self.stall_timeout_secs > 0 {
@@ -1125,14 +1126,15 @@ impl Channel for DiscordChannel {
                         continue;
                     }
 
-                    // Guild filter
-                    if let Some(ref gid) = guild_filter {
+                    // Guild allowlist. Empty list = accept all guilds.
+                    // DMs have no guild_id, so they always pass through.
+                    if !guild_filter.is_empty() {
                         let msg_guild = d.get("guild_id").and_then(serde_json::Value::as_str);
-                        // DMs have no guild_id — let them through; for guild messages, enforce the filter
                         if let Some(g) = msg_guild
-                            && g != gid {
-                                continue;
-                            }
+                            && !guild_filter.iter().any(|allowed| allowed == g)
+                        {
+                            continue;
+                        }
                     }
 
                     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -1203,7 +1205,7 @@ impl Channel for DiscordChannel {
                     if !message_id.is_empty() && !channel_id.is_empty() {
                         let reaction_channel = DiscordChannel::new(
                             self.bot_token.clone(),
-                            self.guild_id.clone(),
+                            self.guild_ids.clone(),
                             self.allowed_users.clone(),
                             self.listen_to_bots,
                             self.mention_only,
@@ -1712,7 +1714,7 @@ mod tests {
 
     #[test]
     fn discord_channel_name() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), vec![], vec![], false, false);
         assert_eq!(ch.name(), "discord");
     }
 
@@ -1733,14 +1735,14 @@ mod tests {
 
     #[test]
     fn empty_allowlist_denies_everyone() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), vec![], vec![], false, false);
         assert!(!ch.is_user_allowed("12345"));
         assert!(!ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn wildcard_allows_everyone() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["*".into()], false, false);
+        let ch = DiscordChannel::new("fake".into(), vec![], vec!["*".into()], false, false);
         assert!(ch.is_user_allowed("12345"));
         assert!(ch.is_user_allowed("anyone"));
     }
@@ -1749,7 +1751,7 @@ mod tests {
     fn specific_allowlist_filters() {
         let ch = DiscordChannel::new(
             "fake".into(),
-            None,
+            vec![],
             vec!["111".into(), "222".into()],
             false,
             false,
@@ -1762,7 +1764,7 @@ mod tests {
 
     #[test]
     fn allowlist_is_exact_match_not_substring() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
+        let ch = DiscordChannel::new("fake".into(), vec![], vec!["111".into()], false, false);
         assert!(!ch.is_user_allowed("1111"));
         assert!(!ch.is_user_allowed("11"));
         assert!(!ch.is_user_allowed("0111"));
@@ -1770,7 +1772,7 @@ mod tests {
 
     #[test]
     fn allowlist_empty_string_user_id() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
+        let ch = DiscordChannel::new("fake".into(), vec![], vec!["111".into()], false, false);
         assert!(!ch.is_user_allowed(""));
     }
 
@@ -1778,7 +1780,7 @@ mod tests {
     fn allowlist_with_wildcard_and_specific() {
         let ch = DiscordChannel::new(
             "fake".into(),
-            None,
+            vec![],
             vec!["111".into(), "*".into()],
             false,
             false,
@@ -1789,7 +1791,7 @@ mod tests {
 
     #[test]
     fn allowlist_case_sensitive() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["ABC".into()], false, false);
+        let ch = DiscordChannel::new("fake".into(), vec![], vec!["ABC".into()], false, false);
         assert!(ch.is_user_allowed("ABC"));
         assert!(!ch.is_user_allowed("abc"));
         assert!(!ch.is_user_allowed("Abc"));
@@ -2028,14 +2030,14 @@ mod tests {
 
     #[test]
     fn typing_handles_start_empty() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), vec![], vec![], false, false);
         let guard = ch.typing_handles.lock();
         assert!(guard.is_empty());
     }
 
     #[tokio::test]
     async fn start_typing_sets_handle() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), vec![], vec![], false, false);
         let _ = ch.start_typing("123456").await;
         let guard = ch.typing_handles.lock();
         assert!(guard.contains_key("123456"));
@@ -2043,7 +2045,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_typing_clears_handle() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), vec![], vec![], false, false);
         let _ = ch.start_typing("123456").await;
         let _ = ch.stop_typing("123456").await;
         let guard = ch.typing_handles.lock();
@@ -2052,14 +2054,14 @@ mod tests {
 
     #[tokio::test]
     async fn stop_typing_is_idempotent() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), vec![], vec![], false, false);
         assert!(ch.stop_typing("123456").await.is_ok());
         assert!(ch.stop_typing("123456").await.is_ok());
     }
 
     #[tokio::test]
     async fn concurrent_typing_handles_are_independent() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), vec![], vec![], false, false);
         let _ = ch.start_typing("111").await;
         let _ = ch.start_typing("222").await;
         {
@@ -2374,10 +2376,10 @@ mod tests {
     fn supports_draft_updates_respects_stream_mode() {
         use zeroclaw_config::schema::StreamMode;
 
-        let off = DiscordChannel::new("t".into(), None, vec![], false, false);
+        let off = DiscordChannel::new("t".into(), vec![], vec![], false, false);
         assert!(!off.supports_draft_updates());
 
-        let partial = DiscordChannel::new("t".into(), None, vec![], false, false).with_streaming(
+        let partial = DiscordChannel::new("t".into(), vec![], vec![], false, false).with_streaming(
             StreamMode::Partial,
             750,
             800,
@@ -2385,7 +2387,7 @@ mod tests {
         assert!(partial.supports_draft_updates());
         assert_eq!(partial.draft_update_interval_ms, 750);
 
-        let multi = DiscordChannel::new("t".into(), None, vec![], false, false).with_streaming(
+        let multi = DiscordChannel::new("t".into(), vec![], vec![], false, false).with_streaming(
             StreamMode::MultiMessage,
             1000,
             600,
@@ -2399,11 +2401,11 @@ mod tests {
         use zeroclaw_api::channel::SendMessage;
         use zeroclaw_config::schema::StreamMode;
 
-        let off = DiscordChannel::new("t".into(), None, vec![], false, false);
+        let off = DiscordChannel::new("t".into(), vec![], vec![], false, false);
         let msg = SendMessage::new("hello", "123");
         assert!(off.send_draft(&msg).await.unwrap().is_none());
 
-        let multi = DiscordChannel::new("t".into(), None, vec![], false, false).with_streaming(
+        let multi = DiscordChannel::new("t".into(), vec![], vec![], false, false).with_streaming(
             StreamMode::MultiMessage,
             1000,
             800,
@@ -2419,7 +2421,7 @@ mod tests {
     async fn update_draft_rate_limit_short_circuits() {
         use zeroclaw_config::schema::StreamMode;
 
-        let ch = DiscordChannel::new("t".into(), None, vec![], false, false).with_streaming(
+        let ch = DiscordChannel::new("t".into(), vec![], vec![], false, false).with_streaming(
             StreamMode::Partial,
             60_000,
             800,
@@ -2439,7 +2441,7 @@ mod tests {
     async fn cancel_draft_cleans_up_tracking() {
         use zeroclaw_config::schema::StreamMode;
 
-        let ch = DiscordChannel::new("t".into(), None, vec![], false, false).with_streaming(
+        let ch = DiscordChannel::new("t".into(), vec![], vec![], false, false).with_streaming(
             StreamMode::Partial,
             1000,
             800,
@@ -2511,7 +2513,7 @@ mod tests {
     }
 
     fn make_discord_channel() -> DiscordChannel {
-        DiscordChannel::new("token".into(), None, vec![], false, false)
+        DiscordChannel::new("token".into(), vec![], vec![], false, false)
     }
 
     #[test]

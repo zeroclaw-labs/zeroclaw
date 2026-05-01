@@ -1075,8 +1075,10 @@ mod tests {
         config.channels.mattermost = Some(zeroclaw_config::schema::MattermostConfig {
             enabled: true,
             url: "https://mattermost.example.com".into(),
-            bot_token: "token".into(),
-            channel_id: Some("channel-id".into()),
+            bot_token: Some("token".into()),
+            login_id: None,
+            password: None,
+            channel_ids: vec!["channel-id".into()],
             allowed_users: vec!["*".into()],
             thread_replies: Some(true),
             mention_only: Some(false),

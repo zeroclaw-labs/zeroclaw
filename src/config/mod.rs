@@ -86,7 +86,7 @@ mod tests {
         let discord = DiscordConfig {
             enabled: true,
             bot_token: "token".into(),
-            guild_id: Some("123".into()),
+            guild_ids: vec!["123".into()],
             allowed_users: vec![],
             listen_to_bots: false,
             interrupt_on_new_message: false,
@@ -136,7 +136,7 @@ mod tests {
         };
 
         assert_eq!(telegram.allowed_users.len(), 1);
-        assert_eq!(discord.guild_id.as_deref(), Some("123"));
+        assert_eq!(discord.guild_ids, vec!["123".to_string()]);
         assert_eq!(lark.app_id, "app-id");
         assert_eq!(feishu.app_id, "app-id");
         assert_eq!(nextcloud_talk.base_url, "https://cloud.example.com");

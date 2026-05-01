@@ -4053,7 +4053,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             Ok(Arc::new(
                 DiscordChannel::new(
                     dc.bot_token.clone(),
-                    dc.guild_id.clone(),
+                    dc.guild_ids.clone(),
                     dc.allowed_users.clone(),
                     dc.listen_to_bots,
                     dc.mention_only,
@@ -4098,7 +4098,9 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             Ok(Arc::new(MattermostChannel::new(
                 mm.url.clone(),
                 mm.bot_token.clone(),
-                mm.channel_id.clone(),
+                mm.login_id.clone(),
+                mm.password.clone(),
+                mm.channel_ids.clone(),
                 mm.allowed_users.clone(),
                 mm.thread_replies.unwrap_or(true),
                 mm.mention_only.unwrap_or(false),
@@ -4114,7 +4116,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 SignalChannel::new(
                     sg.http_url.clone(),
                     sg.account.clone(),
-                    sg.group_id.clone(),
+                    sg.group_ids.clone(),
+                    sg.dm_only,
                     sg.allowed_from.clone(),
                     sg.ignore_attachments,
                     sg.ignore_stories,
@@ -4518,7 +4521,7 @@ fn collect_configured_channels(
                 channel: Arc::new(
                     DiscordChannel::new(
                         dc.bot_token.clone(),
-                        dc.guild_id.clone(),
+                        dc.guild_ids.clone(),
                         dc.allowed_users.clone(),
                         dc.listen_to_bots,
                         dc.mention_only,
@@ -4604,7 +4607,9 @@ fn collect_configured_channels(
                     MattermostChannel::new(
                         mm.url.clone(),
                         mm.bot_token.clone(),
-                        mm.channel_id.clone(),
+                        mm.login_id.clone(),
+                        mm.password.clone(),
+                        mm.channel_ids.clone(),
                         mm.allowed_users.clone(),
                         mm.thread_replies.unwrap_or(true),
                         mm.mention_only.unwrap_or(false),
@@ -4672,7 +4677,8 @@ fn collect_configured_channels(
                     SignalChannel::new(
                         sig.http_url.clone(),
                         sig.account.clone(),
-                        sig.group_id.clone(),
+                        sig.group_ids.clone(),
+                        sig.dm_only,
                         sig.allowed_from.clone(),
                         sig.ignore_attachments,
                         sig.ignore_stories,
@@ -5101,7 +5107,7 @@ fn collect_configured_channels(
                 rd.client_secret.clone(),
                 rd.refresh_token.clone(),
                 rd.username.clone(),
-                rd.subreddit.clone(),
+                rd.subreddits.clone(),
             )),
         });
     }
@@ -5900,7 +5906,7 @@ pub async fn deliver_announcement(
                 .ok_or_else(|| anyhow::anyhow!("discord channel not configured"))?;
             let ch = DiscordChannel::new(
                 dc.bot_token.clone(),
-                dc.guild_id.clone(),
+                dc.guild_ids.clone(),
                 dc.allowed_users.clone(),
                 dc.listen_to_bots,
                 dc.mention_only,
@@ -5933,7 +5939,8 @@ pub async fn deliver_announcement(
             let ch = SignalChannel::new(
                 sg.http_url.clone(),
                 sg.account.clone(),
-                sg.group_id.clone(),
+                sg.group_ids.clone(),
+                sg.dm_only,
                 sg.allowed_from.clone(),
                 sg.ignore_attachments,
                 sg.ignore_stories,
@@ -10631,8 +10638,10 @@ This is an example JSON object for profile settings."#;
         config.channels.mattermost = Some(zeroclaw_config::schema::MattermostConfig {
             enabled: true,
             url: "https://mattermost.example.com".to_string(),
-            bot_token: "test-token".to_string(),
-            channel_id: Some("channel-1".to_string()),
+            bot_token: Some("test-token".to_string()),
+            login_id: None,
+            password: None,
+            channel_ids: vec!["channel-1".to_string()],
             allowed_users: vec![],
             thread_replies: Some(true),
             mention_only: Some(false),
