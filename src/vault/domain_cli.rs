@@ -144,6 +144,22 @@ pub async fn install(config: &Config, manifest_src: &str) -> Result<()> {
         style("✓").green(),
         placed.display()
     );
+
+    // Stamp the baseline-meta keys so PR 2's update decision tree can
+    // tell `current_version` from a stale manifest. For v1 manifests
+    // the baseline IS the bundle, so its version + sha go straight in.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    domain::write_baseline_meta(
+        &placed,
+        &manifest.version,
+        &manifest.bundle.sha256,
+        now,
+    )
+    .context("stamping baseline meta on installed domain.db")?;
+
     let info = domain::info(&config.workspace_dir)?;
     println!(
         "  {} {} docs, {} links, {} bytes",
@@ -155,13 +171,37 @@ pub async fn install(config: &Config, manifest_src: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the registry URL the client should poll. Order:
+///   1. `[domain].registry_url` in `config.toml` (the supported way).
+///   2. `MOA_DOMAIN_MANIFEST_URL` env var (legacy / ops override).
+/// Returns `Ok(None)` when neither is set — the caller is expected to
+/// treat that as a friendly no-op (general-public MoA build).
+fn resolve_registry_url(config: &Config) -> Option<String> {
+    if let Some(url) = config.domain.registry_url.as_ref() {
+        let trimmed = url.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    std::env::var("MOA_DOMAIN_MANIFEST_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 pub async fn update(config: &Config) -> Result<()> {
-    let url = std::env::var("MOA_DOMAIN_MANIFEST_URL").map_err(|_| {
-        anyhow::anyhow!(
-            "no manifest URL configured; set `MOA_DOMAIN_MANIFEST_URL` or use \
-             `vault domain install --from <url>` directly"
-        )
-    })?;
+    let Some(url) = resolve_registry_url(config) else {
+        // No corpus subscribed. This is the general-public MoA build's
+        // happy path — no network, no error, no surprise. Stays
+        // intentionally quiet so the weekly cron output looks clean.
+        println!(
+            "{} no domain registry configured (skipped)",
+            style("vault domain update:").dim()
+        );
+        return Ok(());
+    };
+    // PR 1 still routes update → install (full re-download). PR 2
+    // replaces this with the manifest-v2 decision tree.
     install(config, &url).await
 }
 
@@ -628,5 +668,97 @@ mod tests {
         assert_eq!(human_size(2048), "2.00 KB");
         assert_eq!(human_size(2 * 1024 * 1024), "2.00 MB");
         assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.00 GB");
+    }
+
+    // ── registry_url resolution ─────────────────────────────────────
+
+    /// Guards `MOA_DOMAIN_MANIFEST_URL` so concurrent tests in this
+    /// module don't observe each other's env mutations. The whole
+    /// resolution function reads/writes process-global state, so we
+    /// serialise the relevant tests through a Mutex.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_clean_env<F: FnOnce() -> R, R>(f: F) -> R {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("MOA_DOMAIN_MANIFEST_URL").ok();
+        std::env::remove_var("MOA_DOMAIN_MANIFEST_URL");
+        let out = f();
+        match prev {
+            Some(v) => std::env::set_var("MOA_DOMAIN_MANIFEST_URL", v),
+            None => std::env::remove_var("MOA_DOMAIN_MANIFEST_URL"),
+        }
+        out
+    }
+
+    #[test]
+    fn resolve_registry_url_returns_none_when_unset() {
+        with_clean_env(|| {
+            let cfg = Config::default();
+            assert!(resolve_registry_url(&cfg).is_none());
+        });
+    }
+
+    #[test]
+    fn resolve_registry_url_prefers_config_over_env() {
+        with_clean_env(|| {
+            let mut cfg = Config::default();
+            cfg.domain.registry_url = Some("https://from-config.example.com/m.json".into());
+            std::env::set_var(
+                "MOA_DOMAIN_MANIFEST_URL",
+                "https://from-env.example.com/m.json",
+            );
+            assert_eq!(
+                resolve_registry_url(&cfg).as_deref(),
+                Some("https://from-config.example.com/m.json")
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_registry_url_falls_back_to_env() {
+        with_clean_env(|| {
+            std::env::set_var(
+                "MOA_DOMAIN_MANIFEST_URL",
+                "https://from-env.example.com/m.json",
+            );
+            let cfg = Config::default();
+            assert_eq!(
+                resolve_registry_url(&cfg).as_deref(),
+                Some("https://from-env.example.com/m.json")
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_registry_url_treats_empty_string_as_unset() {
+        with_clean_env(|| {
+            let mut cfg = Config::default();
+            cfg.domain.registry_url = Some("   ".into());
+            std::env::set_var("MOA_DOMAIN_MANIFEST_URL", "");
+            assert!(resolve_registry_url(&cfg).is_none());
+        });
+    }
+
+    #[tokio::test]
+    async fn update_with_no_registry_is_a_silent_no_op() {
+        with_clean_env(|| {
+            // The async block has to capture the lock-free copy; we
+            // simulate by checking resolve directly here, then call the
+            // actual update in a separate guarded scope.
+        });
+        // Now run the real update — env is already clean.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("MOA_DOMAIN_MANIFEST_URL").ok();
+        std::env::remove_var("MOA_DOMAIN_MANIFEST_URL");
+
+        let cfg = Config::default();
+        // Should return Ok(()) and touch nothing. Any network call
+        // would fail because no URL is configured.
+        let res = update(&cfg).await;
+        assert!(res.is_ok(), "update should succeed silently: {:?}", res);
+
+        if let Some(v) = prev {
+            std::env::set_var("MOA_DOMAIN_MANIFEST_URL", v);
+        }
     }
 }

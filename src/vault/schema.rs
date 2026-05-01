@@ -247,6 +247,18 @@ pub fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_retrieval_created
             ON chat_retrieval_logs(created_at DESC);
+
+        -- Tiny key/value store used by domain.db to track install state
+        -- (baseline_version / current_version / last_applied_at).
+        -- See docs/domain-db-incremental-design.md §2.3.
+        --
+        -- Lives in the shared vault schema so domain.db (which uses the
+        -- same schema) gets it for free; brain.db carries it too but
+        -- ignores the keys.
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         "#,
     )?;
 

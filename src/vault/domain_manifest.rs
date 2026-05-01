@@ -49,9 +49,17 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Current manifest schema version. Clients refuse manifests with
-/// unknown versions to surface incompatibilities loudly.
+/// Current v1 manifest schema version. Clients refuse v1 manifests
+/// with unknown versions to surface incompatibilities loudly. v2 has
+/// its own constant — see [`MANIFEST_SCHEMA_VERSION_V2`].
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+
+/// v2 manifest schema version (baseline + delta chain).
+///
+/// PR 1 (foundation): the data model and parser ship; the v2 client
+/// behaviour (decision tree in `vault domain update`) is wired up in
+/// PR 2. Until then, v1 install/update paths are unchanged.
+pub const MANIFEST_SCHEMA_VERSION_V2: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DomainManifest {
@@ -223,6 +231,200 @@ pub async fn download_bundle(manifest: &DomainManifest, dest_dir: &Path) -> Resu
     Ok(staging)
 }
 
+// ── Manifest v2 (baseline + cumulative delta chain) ─────────────────
+//
+// See `docs/domain-db-incremental-design.md` for the protocol.
+// PR 1 ships only the data model + parser + validator + fetcher. The
+// `vault domain update` decision tree that consumes these types lives
+// in PR 2. Until then, v1 install/update paths are unchanged and
+// callers that try to apply a v2 manifest get a clean error.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainManifestV2 {
+    pub schema_version: u32,
+    pub name: String,
+    /// Top-level publication identity. Equals `baseline.version` when
+    /// `deltas` is empty, otherwise equals the newest delta's version.
+    pub version: String,
+    pub generated_at: String,
+    #[serde(default)]
+    pub generator: Option<String>,
+    pub baseline: BaselineSpec,
+    #[serde(default)]
+    pub deltas: Vec<DeltaSpec>,
+    #[serde(default)]
+    pub stats: ManifestStats,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaselineSpec {
+    /// Immutable until the next annual cut (default: every Jan 15).
+    pub version: String,
+    pub url: String,
+    /// Lower-case hex SHA-256 of the baseline DB bytes.
+    pub sha256: String,
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub stats: ManifestStats,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeltaSpec {
+    pub version: String,
+    /// Must equal the sibling `baseline.version`. The client refuses
+    /// to apply a delta whose `applies_to_baseline` doesn't match the
+    /// installed baseline — that's the safety belt against mid-year
+    /// schema drift or operator misconfiguration.
+    pub applies_to_baseline: String,
+    pub url: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub generated_at: Option<String>,
+    /// Optional hint for ops dashboards / changelog. Not used for
+    /// integrity decisions — the SHA gate is authoritative.
+    #[serde(default)]
+    pub ops: DeltaOps,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeltaOps {
+    #[serde(default)]
+    pub upsert: u64,
+    #[serde(default)]
+    pub delete: u64,
+}
+
+impl DomainManifestV2 {
+    /// The newest delta in the chain, or `None` when there are no
+    /// deltas yet (e.g. a freshly published annual baseline).
+    pub fn latest_delta(&self) -> Option<&DeltaSpec> {
+        self.deltas.last()
+    }
+}
+
+/// Fetch and parse a v2 manifest from `url_or_path`. URL handling is
+/// identical to [`fetch`] (the v1 entry point) — the difference is
+/// the schema this returns and accepts.
+pub async fn fetch_v2(url_or_path: &str) -> Result<DomainManifestV2> {
+    let raw = read_manifest_text(url_or_path).await?;
+    let manifest: DomainManifestV2 = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing v2 manifest JSON from {url_or_path}"))?;
+    validate_v2(&manifest)?;
+    Ok(manifest)
+}
+
+/// Validate a parsed v2 manifest. Mirrors the v1 invariants plus the
+/// delta-chain shape rules.
+pub fn validate_v2(m: &DomainManifestV2) -> Result<()> {
+    if m.schema_version != MANIFEST_SCHEMA_VERSION_V2 {
+        anyhow::bail!(
+            "unsupported v2 manifest schema_version {}; this build only knows {}",
+            m.schema_version,
+            MANIFEST_SCHEMA_VERSION_V2
+        );
+    }
+    if m.name.is_empty() {
+        anyhow::bail!("manifest.name is empty");
+    }
+    if m.version.is_empty() {
+        anyhow::bail!("manifest.version is empty");
+    }
+    validate_baseline(&m.baseline)?;
+
+    // Delta-chain shape: every delta must apply to *this* baseline,
+    // and must carry a non-empty version + valid SHA + non-zero size.
+    for (idx, d) in m.deltas.iter().enumerate() {
+        if d.version.is_empty() {
+            anyhow::bail!("manifest.deltas[{idx}].version is empty");
+        }
+        if d.applies_to_baseline != m.baseline.version {
+            anyhow::bail!(
+                "manifest.deltas[{idx}].applies_to_baseline `{}` does not match \
+                 baseline.version `{}`",
+                d.applies_to_baseline,
+                m.baseline.version
+            );
+        }
+        if d.url.is_empty() {
+            anyhow::bail!("manifest.deltas[{idx}].url is empty");
+        }
+        if !is_lower_hex_64(&d.sha256) {
+            anyhow::bail!(
+                "manifest.deltas[{idx}].sha256 must be a 64-char hex digest; got `{}`",
+                d.sha256
+            );
+        }
+        if d.size_bytes == 0 {
+            anyhow::bail!("manifest.deltas[{idx}].size_bytes must be > 0");
+        }
+    }
+
+    // Top-level `version` should equal the newest delta's version, or
+    // the baseline when no deltas exist. We surface the inconsistency
+    // as a hard error so the operator notices on publish.
+    let expected_version = match m.deltas.last() {
+        Some(last) => &last.version,
+        None => &m.baseline.version,
+    };
+    if &m.version != expected_version {
+        anyhow::bail!(
+            "manifest.version `{}` does not match the chain head `{}` \
+             (must equal the newest delta's version, or the baseline's \
+             version when deltas is empty)",
+            m.version,
+            expected_version
+        );
+    }
+    Ok(())
+}
+
+fn validate_baseline(b: &BaselineSpec) -> Result<()> {
+    if b.version.is_empty() {
+        anyhow::bail!("manifest.baseline.version is empty");
+    }
+    if b.url.is_empty() {
+        anyhow::bail!("manifest.baseline.url is empty");
+    }
+    if !is_lower_hex_64(&b.sha256) {
+        anyhow::bail!(
+            "manifest.baseline.sha256 must be a 64-char hex digest; got `{}`",
+            b.sha256
+        );
+    }
+    if b.size_bytes == 0 {
+        anyhow::bail!("manifest.baseline.size_bytes must be > 0");
+    }
+    Ok(())
+}
+
+fn is_lower_hex_64(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+async fn read_manifest_text(url_or_path: &str) -> Result<String> {
+    if url_or_path.starts_with("http://") || url_or_path.starts_with("https://") {
+        let client = http_client()?;
+        let res = client
+            .get(url_or_path)
+            .send()
+            .await
+            .with_context(|| format!("GET {url_or_path}"))?;
+        if !res.status().is_success() {
+            anyhow::bail!(
+                "manifest fetch failed: HTTP {} from {url_or_path}",
+                res.status().as_u16()
+            );
+        }
+        res.text()
+            .await
+            .with_context(|| format!("reading manifest body from {url_or_path}"))
+    } else {
+        std::fs::read_to_string(url_or_path)
+            .with_context(|| format!("reading manifest file {url_or_path}"))
+    }
+}
+
 /// Compute SHA-256 of a file streamingly (kept here so `vault domain
 /// build` can produce manifest entries without re-implementing the
 /// digest). Returns lower-case hex.
@@ -392,5 +594,163 @@ mod tests {
         let expected = hex::encode(Sha256::digest(&bytes));
         assert_eq!(digest, expected);
         assert_eq!(size, bytes.len() as u64);
+    }
+
+    // ── v2 manifest tests ────────────────────────────────────────────
+
+    fn good_baseline() -> BaselineSpec {
+        BaselineSpec {
+            version: "2026.01.15".into(),
+            url: "https://r2.example.com/baseline.db".into(),
+            sha256: "0".repeat(64),
+            size_bytes: 1_000_000,
+            stats: ManifestStats::default(),
+        }
+    }
+
+    fn good_v2_manifest_no_deltas() -> DomainManifestV2 {
+        DomainManifestV2 {
+            schema_version: 2,
+            name: "korean-legal".into(),
+            version: "2026.01.15".into(), // == baseline.version when deltas empty
+            generated_at: "2026-01-15T00:00:00Z".into(),
+            generator: Some("zeroclaw test".into()),
+            baseline: good_baseline(),
+            deltas: vec![],
+            stats: ManifestStats::default(),
+        }
+    }
+
+    fn good_delta(version: &str) -> DeltaSpec {
+        DeltaSpec {
+            version: version.into(),
+            applies_to_baseline: "2026.01.15".into(),
+            url: format!("https://r2.example.com/delta-{version}.sqlite"),
+            sha256: "a".repeat(64),
+            size_bytes: 4_096,
+            generated_at: Some(format!("{version}T00:00:00Z")),
+            ops: DeltaOps {
+                upsert: 5,
+                delete: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn validate_v2_accepts_well_formed_no_deltas() {
+        let m = good_v2_manifest_no_deltas();
+        validate_v2(&m).unwrap();
+    }
+
+    #[test]
+    fn validate_v2_accepts_well_formed_with_deltas() {
+        let mut m = good_v2_manifest_no_deltas();
+        m.deltas = vec![good_delta("2026.01.22"), good_delta("2026.04.22")];
+        m.version = "2026.04.22".into(); // chain head
+        validate_v2(&m).unwrap();
+    }
+
+    #[test]
+    fn validate_v2_rejects_unknown_schema_version() {
+        let mut m = good_v2_manifest_no_deltas();
+        m.schema_version = 999;
+        let err = validate_v2(&m).unwrap_err();
+        assert!(err.to_string().contains("schema_version"));
+    }
+
+    #[test]
+    fn validate_v2_rejects_baseline_with_short_sha() {
+        let mut m = good_v2_manifest_no_deltas();
+        m.baseline.sha256 = "deadbeef".into();
+        let err = validate_v2(&m).unwrap_err();
+        assert!(err.to_string().contains("baseline.sha256"));
+    }
+
+    #[test]
+    fn validate_v2_rejects_baseline_with_zero_size() {
+        let mut m = good_v2_manifest_no_deltas();
+        m.baseline.size_bytes = 0;
+        let err = validate_v2(&m).unwrap_err();
+        assert!(err.to_string().contains("size_bytes"));
+    }
+
+    #[test]
+    fn validate_v2_rejects_delta_with_mismatched_baseline() {
+        let mut m = good_v2_manifest_no_deltas();
+        let mut bad = good_delta("2026.04.22");
+        bad.applies_to_baseline = "2025.07.01".into();
+        m.deltas = vec![bad];
+        m.version = "2026.04.22".into();
+        let err = validate_v2(&m).unwrap_err();
+        assert!(err.to_string().contains("applies_to_baseline"));
+    }
+
+    #[test]
+    fn validate_v2_rejects_top_version_not_matching_chain_head() {
+        // deltas exist but `version` != newest delta's version.
+        let mut m = good_v2_manifest_no_deltas();
+        m.deltas = vec![good_delta("2026.01.22")];
+        m.version = "2026.99.99".into(); // wrong
+        let err = validate_v2(&m).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("does not match the chain head"));
+    }
+
+    #[test]
+    fn validate_v2_rejects_top_version_when_no_deltas() {
+        // No deltas → top version must equal baseline.version.
+        let mut m = good_v2_manifest_no_deltas();
+        m.version = "drift".into();
+        let err = validate_v2(&m).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("does not match the chain head"));
+    }
+
+    #[test]
+    fn latest_delta_returns_last_or_none() {
+        let mut m = good_v2_manifest_no_deltas();
+        assert!(m.latest_delta().is_none());
+        m.deltas = vec![good_delta("2026.01.22"), good_delta("2026.04.22")];
+        assert_eq!(m.latest_delta().unwrap().version, "2026.04.22");
+    }
+
+    #[tokio::test]
+    async fn fetch_v2_reads_local_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("manifest.json");
+        let m = good_v2_manifest_no_deltas();
+        std::fs::write(&path, serde_json::to_string(&m).unwrap()).unwrap();
+        let out = fetch_v2(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(out.name, "korean-legal");
+        assert_eq!(out.schema_version, 2);
+        assert!(out.deltas.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_v2_rejects_v1_manifest_cleanly() {
+        // A v1 manifest must not be silently accepted as v2 — caller
+        // is expected to dispatch on schema_version (PR 2). For now,
+        // fetch_v2 must surface a clear error. We walk the anyhow
+        // source chain because the top-level context is the file
+        // name; the actual reason (missing `baseline`) is one level
+        // down in the serde error.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("manifest.json");
+        let v1 = good_manifest("http://x".into(), "0".repeat(64), 1);
+        std::fs::write(&path, serde_json::to_string(&v1).unwrap()).unwrap();
+        let err = fetch_v2(path.to_str().unwrap()).await.unwrap_err();
+        let mut chain_text = String::new();
+        for cause in err.chain() {
+            chain_text.push_str(&cause.to_string());
+            chain_text.push('\n');
+        }
+        assert!(
+            chain_text.contains("baseline")
+                || chain_text.contains("schema_version")
+                || chain_text.contains("missing field"),
+            "unexpected error chain:\n{chain_text}"
+        );
     }
 }

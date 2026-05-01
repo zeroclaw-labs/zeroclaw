@@ -568,6 +568,18 @@ pub struct Config {
     #[serde(default)]
     pub platform_routing: PlatformRoutingConfig,
 
+    /// Swappable domain corpus settings (`[domain]`).
+    ///
+    /// Controls the per-domain `domain.db` lifecycle (legal/medical/etc.).
+    /// In the **general-public MoA build** this section is intentionally
+    /// blank — `registry_url` defaults to `None`, which makes
+    /// `vault domain update` a friendly no-op and the weekly cron skip
+    /// without contacting any network. Specialized forks (lawpro, medpro)
+    /// override `registry_url` in their bundled config to enable
+    /// automatic corpus updates. See `docs/domain-db-incremental-design.md`.
+    #[serde(default)]
+    pub domain: DomainConfig,
+
     /// Stripe secret key for international credit card payments.
     #[serde(default)]
     pub stripe_secret_key: Option<String>,
@@ -7873,6 +7885,7 @@ impl Default for Config {
             voice: VoiceConfig::default(),
             coding: CodingConfig::default(),
             platform_routing: PlatformRoutingConfig::default(),
+            domain: DomainConfig::default(),
             stripe_secret_key: None,
             stripe_webhook_secret: None,
             toss_secret_key: None,
@@ -12173,6 +12186,7 @@ ws_url = "ws://127.0.0.1:3002"
             llm_proxy_token: None,
             wasm: WasmConfig::default(),
             platform_routing: PlatformRoutingConfig::default(),
+            domain: DomainConfig::default(),
             stripe_secret_key: None,
             stripe_webhook_secret: None,
             toss_secret_key: None,
@@ -12567,6 +12581,7 @@ tool_dispatcher = "xml"
             llm_proxy_token: None,
             wasm: WasmConfig::default(),
             platform_routing: PlatformRoutingConfig::default(),
+            domain: DomainConfig::default(),
             stripe_secret_key: None,
             stripe_webhook_secret: None,
             toss_secret_key: None,
@@ -17504,4 +17519,41 @@ impl Default for SyncConfig {
             home_timezone: default_home_timezone(),
         }
     }
+}
+
+// ── Domain corpus (swappable second-brain corpus) ────────────────────
+//
+// See `docs/domain-db-incremental-design.md` for the full protocol.
+// The general-public MoA build leaves every field at the Default value,
+// which makes the weekly poll a no-op. Forks (lawpro, medpro) override
+// `registry_url` in their bundled `config.toml`.
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct DomainConfig {
+    /// HTTP(S) URL of the manifest JSON for this fork's domain corpus.
+    /// `None` means "no corpus subscribed" — the entire update path is
+    /// skipped, no network is contacted, and the Settings UI hides the
+    /// domain panel.
+    #[serde(default)]
+    pub registry_url: Option<String>,
+
+    /// When `true` (default), the weekly background task runs `vault
+    /// domain update` automatically. Set to `false` to require manual
+    /// invocation only — useful on metered connections.
+    #[serde(default = "default_domain_auto_update")]
+    pub auto_update: bool,
+
+    /// Override the weekly cron expression. Default: Sunday 03:00 in
+    /// the user's home timezone. Empty string disables the cron.
+    #[serde(default = "default_domain_update_cron")]
+    pub update_cron: String,
+}
+
+fn default_domain_auto_update() -> bool {
+    true
+}
+
+fn default_domain_update_cron() -> String {
+    // 03:00 every Sunday — quiet hours on most user devices.
+    "0 0 3 * * SUN".to_string()
 }
