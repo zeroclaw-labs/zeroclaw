@@ -1516,6 +1516,23 @@ pub async fn handle_api_session_delete(
     };
 
     let session_key = format!("gw_{id}");
+
+    // If a turn is in flight for this session, cancel it and evict the entry
+    // from `cancel_tokens` here rather than leaving the WebSocket handler's
+    // post-`tokio::join!` cleanup (`ws.rs:535`) as the only path. Without
+    // this, deleting a session mid-turn leaks the map entry until the
+    // streaming task happens to wake up — and on a process crash the
+    // entry is lost entirely (#5835).
+    let token = state
+        .cancel_tokens
+        .lock()
+        .expect("cancel_tokens lock poisoned")
+        .remove(&session_key);
+    if let Some(token) = token {
+        token.cancel();
+        tracing::info!(session_key, "cancelled in-flight turn for deleted session");
+    }
+
     match backend.delete_session(&session_key) {
         Ok(true) => Json(serde_json::json!({"deleted": true, "session_id": id})).into_response(),
         Ok(false) => (
