@@ -1,45 +1,46 @@
-# Changelog — v0.6.9 → v0.7.3
+# Changelog — v0.7.3 → v0.7.4
 
-> Changes since the **v0.6.9** stable release. This release represents the largest
-> structural overhaul in ZeroClaw's history: the entire codebase has been split into a
-> proper Cargo workspace of focused crates, a new config schema has shipped with a live
-> migration path, and a wave of channel, provider, and security improvements have landed
-> on top of that foundation.
+> The first patch release on top of the v0.7.x workspace foundation. v0.7.4 lands a
+> clean-room Matrix rewrite, a Mozilla Fluent i18n pipeline with multi-locale docs, a
+> ground-up rewrite of the onboarding flow, recovers the WeChat iLink Bot channel, and
+> adds HMAC tool-execution receipts. Around 110 commits from 36 contributors covering
+> channels, providers, web dashboard, security, and developer experience.
 
 ---
 
 ## Highlights
 
-- **Workspace split complete** — ZeroClaw is now a multi-crate Cargo workspace. The
-  monolithic source tree has been decomposed into 12+ focused crates
-  (`zeroclaw-api`, `zeroclaw-runtime`, `zeroclaw-gateway`, `zeroclaw-channels`,
-  `zeroclaw-tools`, `zeroclaw-memory`, `zeroclaw-providers`, `zeroclaw-infra`,
-  `zeroclaw-config`, `zeroclaw-tui`, `zeroclaw-plugins`, `zeroclaw-hardware`).
-  The foundation binary now builds at **6.6 MB** with `--no-default-features`.
+- **Matrix channel rewritten** — A clean-room reimplementation on `matrix-rust-sdk 0.16`
+  replaces the long-running patch pile. E2EE auto-verification of `allowed_users` is
+  preserved, and the channel is markedly simpler to operate (#6112).
 
-- **Config V2 schema with automatic migration** — Provider config has moved to a cleaner
-  layout. Running `zeroclaw config migrate` upgrades your existing config in-place,
-  preserving comments. The old `props` subcommand still works but is now deprecated in
-  favour of `zeroclaw config`.
+- **Multi-locale docs and i18n pipeline** — A Mozilla Fluent-based i18n pipeline now
+  drives a multi-locale mdBook, alongside a comprehensive docs overhaul (#5788). Header
+  links point at the upstream repo (#6124) and the CNAME is preserved on every Pages
+  deploy (#6142).
 
-- **OpenRouter streaming** — OpenRouterProvider now streams responses token-by-token
-  instead of waiting for the full response, matching the experience of native providers.
+- **Onboarding clean-slate rewrite** — `zeroclaw onboard` is now schema-driven,
+  idempotent, and DRY (#5960). It picks up a generic OpenAI-compatible `/v1/models`
+  fallback for unknown providers (#6056) and uses container-aware URLs for local AI
+  providers running in Docker (#5552).
 
-- **Web dashboard decoupled from the binary** — The dashboard is now built separately
-  and embedded at release time. `cargo install` and AUR/Homebrew packages include it.
-  A new **voice mode** and **plugins page** have been added to the dashboard.
+- **HMAC tool-execution receipts** — Each tool run now produces a tamper-evident receipt
+  that the agent can use to detect hallucinated tool output (#5168).
 
-- **LINE channel** — LINE Messaging API is now a supported channel.
+- **Session management surface** — New `SessionResetTool`, `SessionDeleteTool`, and
+  `SessionsCurrentTool` give the agent first-class control over its own sessions
+  (#5696, #6033). The gateway gained a session abort endpoint with incremental streaming
+  persistence (#5705).
 
-- **Matrix improvements** — Mention-only filtering (the agent only responds when
-  mentioned), encrypted media download restored, outbound attachment support added, and
-  onboarding wizard preservation.
+- **WeChat iLink Bot channel recovered** — The previously reverted iLink Bot
+  integration is back, ported to current trait surfaces (#6130). `request_approval()`
+  is now implemented across Discord, Slack, Signal, Matrix, and WhatsApp.
 
-- **GitHub Copilot onboarding** — GitHub Copilot is now selectable as a provider
-  through the onboarding wizard and `zeroclaw config` flow (#5321).
+- **Voice foundation** — A new `Vad` trait and `VoiceEvent` protocol land behind a
+  `gateway-voice-duplex` feature flag, paving the way for live voice channels (#5942).
 
-- **Authenticated OTLP exporters** — New `otel_headers` config key lets you pass
-  custom headers (e.g. `Authorization: Bearer …`) to protected OTLP endpoints (#5700).
+- **PostgreSQL memory backend** — Memory can now be persisted to PostgreSQL via a new
+  `memory-postgres` backend.
 
 ---
 
@@ -47,271 +48,227 @@
 
 ### Architecture & Workspace
 
-- Extracted 12 workspace crates from the monolith, implementing the microkernel RFC
-  roadmap (RFC D1–D5). Every subsystem — providers, channels, tools, memory, infra,
-  config, gateway, TUI, plugins, hardware — now lives in its own crate with explicit
-  dependency boundaries enforced by the compiler.
-- Foundation binary (`--no-default-features`) compiles clean at 6.6 MB.
-- `agent-runtime` feature flag gates the full agent loop; the kernel binary builds
-  without it.
-- Switched TLS from `aws-lc-rs` to `ring` and stripped `.eh_frame` sections, reducing
-  binary size further.
-- `schemars` is now optional behind a `schema-export` feature flag — no longer a
-  mandatory compile dependency.
-- 28 per-channel feature flags with forwarding chains so unused channels add zero
-  compile time.
-- Workspace-wide `[workspace.dependencies]` and `[workspace.package]` inheritance
-  eliminates version duplication across `Cargo.toml` files.
-- RFC Rev 2 compliance: stability tiers, versioning policy, and release profile are now
-  wired into the workspace.
-
-### Providers
-
-- **OpenRouterProvider** now supports streaming (#5717). Responses appear token-by-token
-  instead of arriving all at once.
-- **GitHub Copilot** is now available as a selectable provider in the onboarding wizard
-  and `zeroclaw config` interactive flow (#5321).
-- Fixed: native tool-call messages are now stripped before sending to providers that
-  have `native_tool_calling = false`, preventing provider errors (#5762).
-- Fixed: `tool_stream` events are no longer forwarded to non-Z.AI providers in the
-  streaming path, preventing unexpected provider errors (#5806).
-- Fixed: DeepSeek V3.2 system prompt escaping and token estimation corrected (#5454).
-
-### Channels
-
-- **LINE Messaging API** channel added (#5642).
-- **Matrix**: mention-only filtering — the agent can be configured to respond only when
-  directly mentioned. Encrypted media download restored. Outbound attachment support
-  added. Onboarding wizard settings now preserved across restarts (#5166, #5727).
-- **Telegram**: tool approval requests now include `inline_keyboard` markup, giving
-  users interactive approve/deny buttons instead of plain text (#5790).
-- Sender user ID is now propagated into the channel system prompt, giving the agent
-  context about who it is talking to (#5526).
-- Email and VoiceCall channels now have an `enabled` field and are correctly wired into
-  the orchestrator (#5659).
-- `<think>` tags are stripped from streaming draft updates before they reach the client
-  (#5505).
-- Fixed: missing channels in `build_channel_by_id` caused `sessions_send` to silently
-  fail for some channel types (#5506).
-- Telegram and Matrix implementations moved out of the orchestrator into their own
-  modules (#5639).
-- **Slack**: new `strict_mention_in_thread` flag — when combined with `mention_only`,
-  requires the bot to be @-mentioned again within a thread (not just at thread root).
-  Default off, preserves existing behavior (#5992).
-
-### Configuration
-
-- **Config V2 schema** with a new provider layout (`providers.models`,
-  `providers.fallback`, `model_routes`, `embedding_routes`).
-- `zeroclaw config migrate` upgrades a V1 config to V2 in-place, preserving comments
-  and formatting.
-- `zeroclaw config` replaces `zeroclaw props`. The old `props` subcommand is deprecated
-  but still functional.
-- Onboarding wizard updated to write V2 provider format directly.
-- Fixed: false "Unknown config key" warnings for `Option<T>` fields and config aliases
-  (#5510).
-- Fixed: `providers.fallback` now emits a warning if it references a key that does not
-  exist in `providers.models`.
-- Fixed: temperature validation restored in the `providers.models` loop.
-- Slack config: `channel_id` deprecated in favour of `channel_ids` (plural) for V2.
-- Nostr, WhatsApp Web, and hardware wizard sections wired into the onboarding flow
-  (#5640).
-- Fresh `[providers.models.<name>]` entries no longer serialize family-irrelevant
-  default flags: `requires_openai_auth = false`, `merge_system_into_user = false`,
-  and empty `name`/`base_url`/`wire_api` entries are now omitted when they carry
-  their struct-level defaults. Existing configs deserialize unchanged.
-
-### Observability
-
-- **`otel_headers`** — new config key for passing arbitrary HTTP headers to OTLP
-  endpoints. Enables authenticated exporters (e.g. Grafana Cloud, Honeycomb) without
-  environment variable workarounds (#5700).
-
-### Web Dashboard
-
-- Voice mode added to the dashboard.
-- Plugins management page added.
-- Theme mode switch fixed — light/dark selection now applies correctly on load (#5724).
-- Visual preview swatches added to the theme mode selector (#5767).
-- Dashboard is now decoupled from the main binary — built separately and embedded at
-  release time. Included in binary releases, AUR, Homebrew, and `cargo install`
-  (#5675, #5665).
-- Web build logic moved into the gateway crate; no-op recompiles (previously ~1 minute)
-  eliminated.
+- Decoupled `gateway` and `tui-onboarding` from `agent-runtime`, so each can be
+  compiled without dragging in the full agent loop (#5735).
+- `SessionBackend` trait gained `clear_messages()` for O(1) session reset (#5900) and
+  `get_session_metadata(key)` for typed metadata access (#6043).
+- Hardware crate: wizard UI moved from `main.rs` into `zeroclaw_hardware::wizard` for
+  reuse outside the binary (#6041).
+- Web router refactor for clearer route ownership (#6176).
+- Tools: rate-limiting delegated to wrappers for `glob_search` and `content_search`
+  (#5772); session validation now uses typed errors (#6135).
 
 ### Agent & Runtime
 
-- CLI channel factory now registered for interactive mode — `zeroclaw` interactive
-  sessions work again after the workspace split (#5802).
-- Duplicate `ToolCall` events in `turn_streamed` deduplicated; clients no longer see the
-  same tool call reported twice (#5746).
-- Empty successful tool output is now normalised before being returned to the provider,
-  preventing downstream parse errors on blank responses (#5565).
-- Session integrity improvements: streaming refactor and history pruning for long
-  conversations (#5167).
-- Cron agent jobs no longer trigger `auto_save`, preventing runaway memory consolidation
-  on scheduled tasks (#5664).
-- Fixed: `cron_run` tool output was not being delivered to configured channels.
-- Windows: the shell console window is now hidden when running as a background process
-  (#5563).
-- `zeroclaw onboard` now defaults to the ratatui TUI backend. Pass `--cli` to force the
-  terminal-prompt backend; `--tui` is accepted as a deprecated no-op for one release.
-  Falls back to the terminal-prompt backend automatically when stdout isn't a TTY or
-  ratatui init fails.
-- `zeroclaw onboard` advanced-settings walk now filters out fields that don't apply to
-  the selected provider family — no more `azure_openai_*` prompts when configuring
-  Anthropic, no more `wire_api` / `requires_openai_auth` prompts outside the OpenAI
-  family.
-- `zeroclaw onboard` model-catalog fetch failures now name the provider in the fallback
-  note (`"Catalog lookup failed for <provider> — enter a model id manually"`) and log
-  the underlying error at `debug` level instead of swallowing it entirely.
-- `zeroclaw models` restored — routes to the same live model-probe output as
-  `zeroclaw doctor models`, preserving the `--provider` flag for `models list` /
-  `models refresh` subcommands.
-- Fixed: `TermUi::editor` close-without-save now returns `Answer::Back` (rewind)
-  instead of accepting the unchanged buffer silently. Matches the navigation contract
-  every other prompt method honors.
-- Fixed: `channels.mochat` now respects its `enabled` flag. Previously the orchestrator
-  registered the Mochat channel whenever the `[channels.mochat]` section existed,
-  producing `Mochat: poll request error: builder error` log spam on invalid or empty
-  URLs. Matches the WeCom / ClawdTalk enabled-gate pattern.
+- HMAC tool-execution receipts let the agent detect tool-output hallucination (#5168).
+- `prune_history` Phase 1 now treats mixed-protection tool groups as atomic, preventing
+  partial pruning that left the conversation in an invalid state (#5828).
+- Self-heals orphaned `tool_result` blocks on session load and on compaction (#5853).
+- Sandbox auto-detection now respects `runtime.kind = "native"` (#5904).
+- `runtime.kind` is detected for memcg availability at daemon startup (#5906).
 
-### Skills (Claude Code)
+### Providers
 
-- `github-issue-triage` skill added — automates structured triage of GitHub issues using
-  Claude Code (#5780).
-- `squash-merge` skill added — preserves clean commit history when merging upstream
-  changes (#5782).
+- **OpenRouter**: `extra_body` passthrough for arbitrary request params (#5623); the
+  upstream stream task is now aborted when the consumer drops the stream (#5830).
+- **MiniMax** native tool calling is now enabled (#6027).
+- **Bedrock** omits `temperature` for Opus 4.7, matching the model's API contract
+  (#6144).
+- **Gemini / OpenRouter** tool-call compatibility fixes plus clearer
+  `google_workspace` schema (#5975).
+- **Groq**: native tool calling is now disabled where it was misbehaving (#5848).
+- `strip_native_tool_messages` now coalesces adjacent assistant turns (#5829).
 
-### Security
+### Channels
 
-- Dangerous interpreter arguments (e.g. `-e`, `--eval`, `-c` on interpreters) are now
-  blocked by the command security policy (#5702).
-- Heredocs and safe shell redirects (`<<EOF`, `>`, `>>`) are explicitly allowed (#5160).
+- **Matrix**: clean-room rewrite on `matrix-rust-sdk 0.16` replacing the prior
+  long-running patch series (#6112).
+- **WeChat iLink Bot**: channel recovered from the bulk revert in PR #4221 (#6130).
+- **Slack**: `strict_mention_in_thread` option lets you require an @-mention even in
+  threads where the agent has previously replied (#5992).
+- **IRC**: `mention_only` config option for IRC channels (#5998).
+- **Telegram**: bot command list updated (#5691); `request_approval` now forwards the
+  `message_thread_id` (#5970); auto-injected topic-root reply context is skipped in
+  forum topics (#5969).
+- **IMAP**: polling fallback for servers that don't support IDLE (#5712).
+- **ACP**: `defaultModel` resolves from config and is null when unconfigured (#6013);
+  tool output formatting corrected (#6035); INFO logs suppressed and missing ACP spec
+  protocol implemented (#5c81d4e).
+- **Discord, Slack, Signal, Matrix, WhatsApp**: `request_approval()` implemented across
+  the channel set, unblocking approval-gated tool flows on every supported chat
+  platform.
+- **Feishu**: `mention_only` config wired through (#5848).
+
+### Tools & Skills
+
+- `SessionResetTool` and `SessionDeleteTool` for in-agent session management (#5696).
+- `SessionsCurrentTool` exposes the active session identity (#6033).
+- Skills: registry-based bare-name install (#6045); review-session skill ships and
+  retires the old `github-pr-review` skill (#5910); pr-review-session skill
+  deidentified with milestone-alignment checks (#6023); changelog-generation skill and
+  protocol reference (#5819).
+
+### Plugins
+
+- Extism WASM execution bridge wired up (Phase 2 D2 plumbing) (#5913).
+- `image-gen-fal` WASM plugin added as the fal.ai Flux reference plugin (#5921).
+- Markdown-only plugin bundles can now declare a `skill` capability (#6141).
+
+### Voice
+
+- New `Vad` trait and `VoiceEvent` protocol behind the `gateway-voice-duplex` feature
+  flag (#5942).
+
+### Memory
+
+- PostgreSQL backend re-introduced as `memory-postgres`.
+- `is_user_autosave_key` detector identifies per-turn user message keys (#5631), and
+  these keys are now skipped in every memory context path (#5632).
+
+### Web Dashboard
+
+- Chat message deletion, clear-all, and a compact mode (#6083).
+- Cron job configuration UI (#5936).
+- Embedded web build for the `pack` bin (#6181).
+- Bug-fix bundle: Overview crash, model save, editor caret, chat CPU usage (#6161).
+- Array-returning API helpers now guard against non-array responses (#6162).
+- WebSocket session ID persists in `localStorage` across page reloads (#5641).
+
+### Configuration
+
+- `Vec<String>` fields are now exposed via `zeroclaw config get/set/list` (#5950),
+  including JSON-array syntax in `config set` (#0e9b9c2).
+- User-supplied `providers.fallback` is preserved through load/save (#6099) and
+  mirrored under the canonical fallback key (#321e96f).
+- WebSocket buffer is preserved in the non-proxy `ws_connect_with_proxy` path (#5794).
+- `[skill]` TOML sections may now contain prompts (#5972).
+
+### Onboarding
+
+- Clean-slate rewrite: schema-driven, idempotent, DRY (#5960).
+- Generic OpenAI-compatible `/v1/models` fallback for unknown providers (#6056).
+- Container-aware URLs for local AI providers (#5552).
+- Windows: `setup.bat` issues fixed (#6137).
+
+### Gateway & Runtime
+
+- Session abort endpoint plus incremental streaming persistence (#5705).
+- Tool support enabled in the webhook endpoint (#6080).
+- Token usage emitted from the webhook handler (#5793).
+- Missing `/api/channels` route added (#6069).
+
+### Cron
+
+- Memory snowball accumulation in agent jobs prevented (#5817).
+- `deliver_announcement` returns `Err` when no delivery handler is registered (#5827).
+- Closing tag added to the memory context block in cron and daemon paths (#3b24f81).
+
+### Documentation
+
+- Mozilla Fluent i18n pipeline + multi-locale mdBook + full docs overhaul (#5788).
+- ZeroClaw Maturity Framework ratified and committed (#5911).
+- Manual release runbook (#5920).
+- AGENTS code-style rules clarified (#6163).
+- mdBook header links point to the upstream repo (#6124).
 
 ### Installation & Distribution
 
-- `install.sh` rewritten from scratch for the workspace split — correctly handles the
-  new crate layout and binary paths (#5666).
-- AUR package migrated from `zeroclaw` to `zeroclawlabs` (#5544).
-- Daemon supervisor and onboarding launch checks now include the webhook channel (#5799).
+- OpenShift / Kubernetes deployment manifests (#5880).
+- Docker images now include the web dashboard (release image #5996, debian local-dev
+  image #6025).
+- Install script prompts for pre-built vs source, defaulting to pre-built on
+  `curl | bash` (#5968).
+- Windows `cargo test` unbroken; self-update target triples added (#6050).
 
-### Dependencies & Security Advisories
+### Improvements
 
-- `rustls-webpki` and `rumqttc` bumped to resolve RUSTSEC-2026-0098 and
-  RUSTSEC-2026-0099 (#5786).
+- Refactor: web router (#6176); rate-limiting wrappers for filesystem tools (#5772);
+  typed session validation errors (#6135); hardware wizard relocation (#6041).
 
-### Deployment
+### Security & Dependencies
 
-- Sample Kubernetes and OpenShift deployment manifests added in `deploy-k8s/` with
-  hardened security context (`runAsNonRoot`, `readOnlyRootFilesystem`, `drop ALL` caps,
-  `seccompProfile: RuntimeDefault`) and pairing auth enabled by default (#5880).
+- `cargo update` and `deny.toml` audit (2026-04-27) (#6152).
+- `rustls-webpki` updated to v0.103.13; unfixable v0.102.8 copy ignored (#6011).
+- Patches applied for `rand`; `picomatch` ReDoS fixed; `wasmtime` and `glib` ignores
+  documented (#5971).
+- Daily advisory scan workflow added (#5928).
+- `rand` bumped from 0.10.0 to 0.10.1 (#5713).
+- `postcss` bumped from 8.5.6 to 8.5.10 in `/web` (#6084).
 
 ---
 
-## Bug Fixes (summary)
+## Bug Fixes
 
 | Area | Fix |
-|------|-----|
-| Provider | Strip native tool messages for non-native-tool-calling providers |
-| Provider | `tool_stream` events forwarded to non-Z.AI providers in streaming path |
-| Provider | DeepSeek V3.2 system prompt escaping and token estimation |
-| Agent | CLI channel factory missing in interactive mode |
-| Agent | Duplicate ToolCall events in streaming turns |
-| Agent | Normalize empty successful tool output |
-| Matrix | Encrypted media download; outbound attachments |
-| Channels | Missing Arc Provider forwarding methods |
-| Channels | `<think>` tag leaking into streaming draft updates |
-| Telegram | `inline_keyboard` missing from tool approval requests |
-| Cron | `cron_run` tool output not delivered to configured channels |
-| Config | False "Unknown config key" warnings on Option fields |
-| Config | Temperature validation missing from providers loop |
-| Config | Fallback key references nonexistent provider — now warns |
-| Session | Integrity, streaming refactor, history pruning |
-| Cron | auto_save causing recursive memory bloat on scheduled jobs |
-| Security | Dangerous interpreter flags not blocked |
-| Install | install.sh broken after workspace split |
-| Runtime | Windows console window visible in background mode |
-| Distribution | Web dashboard missing from AUR and cargo install builds |
-| Docker | Workspace crate manifests missing from multi-stage build after workspace split (#5879) |
-| Agent | Streamed reasoning content lost during tool replay (#5606) |
-| Web | Theme mode switch not applying light/dark correctly |
-| Web | Theme mode selector missing visual preview swatches |
-
----
-
-## Breaking Changes
-
-### Config schema (V1 → V2)
-
-The provider section of `config.toml` has a new layout. V1 configs are still loaded and
-automatically understood, but the recommended path is to run the migration:
-
-```sh
-zeroclaw config migrate
-```
-
-This rewrites your config to V2 in-place. The old format will continue to work in this
-release but will not be supported indefinitely.
-
-### `zeroclaw props` deprecated
-
-Use `zeroclaw config` instead. The `props` subcommand still works and will not be
-removed in this release, but it will emit a deprecation notice.
-
-### `zeroclaw onboard` defaults to TUI
-
-`zeroclaw onboard` now launches the ratatui TUI backend by default. Users who were
-relying on the old terminal-prompt behavior should pass `--cli` explicitly. The
-previous `--tui` flag is accepted for one release as a deprecated no-op and emits a
-warning pointing at the new default. In non-TTY environments (piped output, CI without
-`--quick`) onboarding automatically falls back to the terminal-prompt backend.
-
-### Slack `channel_id` deprecated
-
-Use `channel_ids` (a list) in the Slack config block. `channel_id` (singular) still
-works but is deprecated in V2.
-
-### Workspace crate boundaries
-
-If you have any code that depends directly on internal ZeroClaw crate paths (e.g. for
-embedding or testing), the crate structure has changed significantly. Refer to
-`AGENTS.md` for the current crate map and stability tiers. `zeroclaw-api` is the stable
-extension point — all other crates are Beta or Experimental.
+|---|---|
+| Tauri desktop | Install rustls crypto provider to prevent crash (#5997); replace PNG-as-ICO with a real Windows ICO to unblock Win11 builds (#5966) |
+| Telegram | Forward `message_thread_id` in `request_approval` (#5970); skip auto-injected topic-root reply context in forum topics (#5969) |
+| Skills (config) | Allow prompts inside `[skill]` TOML section (#5972) |
+| Providers | Gemini/OpenRouter tool-call compatibility + `google_workspace` schema clarity (#5975); MiniMax native tool calling enabled (#6027); Bedrock omits temperature for Opus 4.7 (#6144); Groq native tools disabled where misbehaving (#5848); coalesce adjacent assistant turns in `strip_native_tool_messages` (#5829); abort OpenRouter stream task when consumer drops (#5830) |
+| CI | `nextest` now runs across all workspace crates (#6197); CNAME persisted on every Pages deploy (#6142) |
+| Bulk revert recovery | Recover 4 small fixes lost in bulk revert c3ff635 (#6169) |
+| Runtime | Align tool-call text preservation test (#6204); detect memcg availability at daemon startup (#5906); self-heal orphaned tool_result blocks on load + compact (#5853); register skill tools and apply excluded filter in gateway path (#5774); drop redundant narration push before AssistantToolCalls (#6093); unbreak pre-existing test failures on master (#6108); respect `runtime.kind = "native"` in sandbox auto-detection (#5904) |
+| Infrastructure | SQLite FTS UPDATE trigger for `sessions_fts` (#5985) |
+| xtask | Resolve real `mdbook` binary, avoid xtask self-spawn (#6171) |
+| Web | Dashboard bug-fix bundle (#6161); guard array-returning API helpers (#6162); persist WebSocket session ID across reloads (#5641) |
+| Memory | Add closing tag to memory context in cron and daemon (#3b24f81); skip user autosave keys in all memory context paths (#5632) |
+| Gateway | Enable tool support in webhook endpoint (#6080); add missing `/api/channels` route (#6069); emit token usage from webhook handler (#5793) |
+| Channels (ACP) | Resolve `defaultModel` from config (#6013); correct tool output formatting (#6035); suppress INFO logs and implement missing ACP spec protocol (#5c81d4e) |
+| Channels (Feishu) | Wire `mention_only` config (#5848) |
+| Config | Preserve `providers.fallback` through load/save (#6099); mirror provider entry under canonical fallback key (#321e96f); preserve WebSocket buffer in non-proxy path (#5794); parse JSON array syntax in `config set` for `Vec<String>` fields (#0e9b9c2) |
+| Cron | Prevent memory snowball accumulation in agent jobs (#5817); return Err when no delivery handler registered (#5827) |
+| Multimodal | Harden image-marker parser against non-path payloads (#5864) |
+| Tools | Multiply embedding score by 100 before percent formatting (#5857) |
+| Shell | Skip expansion guard when all commands allowed (#5773) |
+| Onboarding | Use container-aware URLs for local AI providers (#5552) |
+| Docs | mdBook header links point to upstream repo (#6124) |
+| Install | Prompt for pre-built vs source, default to pre-built on `curl | bash` (#5968) |
+| Docker | Include web dashboard in release image (#5996) and Dockerfile.debian local-dev image (#6025) |
+| Windows | Fix `setup.bat` issues (#6137); unbreak `cargo test` and add self-update target triples (#6050) |
+| rag-pdf | Unbreak `--features rag-pdf` end-to-end and restore Windows tests (#6076) |
+| Security | `rustls-webpki` v0.103.13 (#6011); `rand` patches + `picomatch` ReDoS (#5971); cargo update + deny.toml audit (#6152) |
 
 ---
 
 ## Contributors
 
-Thank you to everyone who contributed to this release:
-
-- @abhijeet117
-- @aliasliao
-- @ArgenisDLR
+- @akhilesharora
 - @Audacity88
-- @c98
-- @DaBlitzStein
-- @freeekanayaka
-- @guitaripod
+- @david1gp
+- @DengHaoke
+- @flyin1600
+- @fresh-fx59
+- @hurtdidit
 - @ilteoood
+- @itripn
+- @jokemanfire
 - @JordanTheJet
-- @kunalk16
-- @markuman
-- @micookie
-- @nayrosk
-- @niedbalski
+- @justjuangui
+- @kmsquire
+- @MGSE97
+- @nanookclaw
 - @ninenox
+- @NiuBlibing
+- @OmkumarSolanki
 - @pavelanni
+- @perlowja
+- @rareba
+- @rpodgorny
+- @RyanHoldren
+- @RyanSquared
+- @shaun0927
 - @singlerider
 - @theonlyhennygod
-- @titulus
-- @tompro
-- @UtopiaX
+- @tidux
+- @tonsiasy
 - @vernonstinebaker
 - @WareWolf-MoonWall
-- @wlh320
+- @xydigit-sj
+- @yijunyu
+- @yusufsyaifudin
 - @zavertiaev
+- @zuyopme
 
 ---
 
-*Full diff: `git log v0.6.9..HEAD --oneline`*
+*Full diff: `git log v0.7.3..v0.7.4 --oneline`*
