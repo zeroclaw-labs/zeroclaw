@@ -200,6 +200,24 @@ export function deleteCronJob(id: string): Promise<void> {
     method: 'DELETE',
   });
 }
+
+export interface CronTriggerResult {
+  status: string;
+  job_id: string;
+  success: boolean;
+  output: string;
+  duration_ms: number;
+  started_at: string;
+  finished_at: string;
+}
+
+/** Manually trigger a cron job and wait for the result. */
+export function triggerCronJob(id: string): Promise<CronTriggerResult> {
+  return apiFetch<CronTriggerResult>(`/api/cron/${encodeURIComponent(id)}/run`, {
+    method: 'POST',
+  });
+}
+
 export function patchCronJob(
   id: string,
   patch: { name?: string; schedule?: string; command?: string; prompt?: string },
@@ -336,6 +354,17 @@ export function getSession(id: string): Promise<Session> {
 export function getSessionMessages(id: string): Promise<SessionMessagesResponse> {
   return apiFetch<SessionMessagesResponse>(
     `/api/sessions/${encodeURIComponent(id)}/messages`,
+  );
+}
+
+/**
+ * Cancel an in-flight agent turn for a session. Idempotent — returns
+ * `{ status: "no_active_response" }` when the session is idle.
+ */
+export function abortSession(id: string): Promise<{ status: string }> {
+  return apiFetch<{ status: string }>(
+    `/api/sessions/${encodeURIComponent(id)}/abort`,
+    { method: 'POST' },
   );
 }
 

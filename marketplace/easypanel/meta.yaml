@@ -48,7 +48,7 @@ schema:
     appServiceImage:
       type: string
       title: App Service Image
-      default: ghcr.io/zeroclaw-labs/zeroclaw:0.7.1
+      default: ghcr.io/zeroclaw-labs/zeroclaw:0.7.4
     apiKey:
       type: string
       title: LLM Provider API Key

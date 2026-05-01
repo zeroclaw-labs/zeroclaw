@@ -1413,6 +1413,28 @@ async fn main() -> Result<()> {
     }
 
     #[cfg(feature = "agent-runtime")]
+    {
+        // Wire cron delivery to the channels orchestrator. Registered before
+        // dispatch so that *any* command path that may execute cron jobs —
+        // `daemon`, `gateway start`, or a one-shot `cron run` — has a working
+        // delivery handler. Previously this lived only inside the daemon
+        // branch, which left `zeroclaw gateway start` unable to deliver
+        // manually-triggered cron announcements ("no delivery handler
+        // registered"). `register_delivery_fn` is idempotent (backed by
+        // `OnceLock::set`), so calling it once here is safe.
+        zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
+            |config, channel, target, output| {
+                Box::pin(async move {
+                    zeroclaw_channels::orchestrator::deliver_announcement(
+                        &config, &channel, &target, &output,
+                    )
+                    .await
+                })
+            },
+        ));
+    }
+
+    #[cfg(feature = "agent-runtime")]
     match cli.command {
         Commands::Onboard { .. }
         | Commands::Completions { .. }
@@ -1645,31 +1667,43 @@ async fn main() -> Result<()> {
                 })
             }));
 
-            // Wire cron delivery to the channels orchestrator
-            #[cfg(feature = "agent-runtime")]
-            zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
-                |config, channel, target, output| {
-                    Box::pin(async move {
-                        zeroclaw_channels::orchestrator::deliver_announcement(
-                            &config, &channel, &target, &output,
-                        )
-                        .await
-                    })
-                },
-            ));
+            // Cron delivery is registered earlier (before the command match)
+            // so it works for both `daemon` and `gateway start`.
+
+            // Single canvas store shared between the gateway HTTP / WebSocket
+            // surface and the channel-server agents so canvas frames pushed
+            // from Telegram / Discord / Slack reach the same subscribers the
+            // web UI serves. Without this, channels build an orphaned
+            // CanvasStore::default() and frames are silently dropped (#5356).
+            let canvas_store = zeroclaw_runtime::tools::CanvasStore::new();
+            let canvas_store_for_gateway = canvas_store.clone();
+            let canvas_store_for_channels = canvas_store.clone();
 
             let subsystems = daemon::DaemonSubsystems {
                 #[cfg(feature = "gateway")]
-                gateway_start: Some(Box::new(|host, port, config, tx| {
+                gateway_start: Some(Box::new(move |host, port, config, tx| {
+                    let canvas_store = canvas_store_for_gateway.clone();
                     Box::pin(async move {
-                        Box::pin(zeroclaw_gateway::run_gateway(&host, port, config, tx)).await
+                        Box::pin(zeroclaw_gateway::run_gateway(
+                            &host,
+                            port,
+                            config,
+                            tx,
+                            Some(canvas_store),
+                        ))
+                        .await
                     })
                 })),
                 #[cfg(not(feature = "gateway"))]
                 gateway_start: None,
-                channels_start: Some(Box::new(|config| {
+                channels_start: Some(Box::new(move |config| {
+                    let canvas_store = canvas_store_for_channels.clone();
                     Box::pin(async move {
-                        Box::pin(zeroclaw_channels::orchestrator::start_channels(config)).await
+                        Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                            config,
+                            Some(canvas_store),
+                        ))
+                        .await
                     })
                 })),
                 mqtt_start: Some(Box::new(|mqtt_config| {
@@ -1929,7 +1963,7 @@ async fn main() -> Result<()> {
         },
 
         Commands::Channel { channel_command } => match channel_command {
-            ChannelCommands::Start => Box::pin(channels::start_channels(config)).await,
+            ChannelCommands::Start => Box::pin(channels::start_channels(config, None)).await,
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => Box::pin(channels::handle_command(other, &config)).await,
         },
@@ -3428,7 +3462,7 @@ async fn run_gateway_if_enabled(
     config: zeroclaw::config::Config,
     tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
 ) -> anyhow::Result<()> {
-    Box::pin(gateway::run_gateway(host, port, config, tx)).await
+    Box::pin(gateway::run_gateway(host, port, config, tx, None)).await
 }
 
 #[cfg(not(feature = "gateway"))]
